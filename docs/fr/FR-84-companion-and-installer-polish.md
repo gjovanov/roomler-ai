@@ -156,6 +156,40 @@ is outside systemd's `RestartPreventExitStatus=7 8`). Rate-limited to one per 30
 `local_restart_enabled = false` disables it. Remote configuration still never restarts a
 daemon — this verb is LocalAPI-only.
 
+As built (`agents/roomlerd/src/supervision.rs`, `localapi_state.rs::restart_daemon`), with
+what building it added to the design above:
+
+- **systemd is proven twice.** `INVOCATION_ID` is inherited by every shell under GNOME
+  Terminal, so detection also requires this process's cgroup leaf to be one of OUR units, by
+  exact name; and before accepting, the daemon reads the unit's *effective* policy back from
+  systemd (`systemctl show`: `MainPID`, `Restart`, `Restart{Prevent,Force}ExitStatus`,
+  `SuccessExitStatus`) — this pid must be the unit's main process and the policy must
+  restart exit 9. Any failure to get that answer refuses.
+- **The 30 s record is on disk** (`restart-request.json` beside the config the daemon loaded,
+  never inside `config.toml`), written with fsync + rename BEFORE the answer; a restart that
+  cannot be recorded is refused, because the record is the loop bound — it binds the
+  relaunched process too.
+- **The answer reaches the caller before the shutdown starts**: the verb only arms the
+  restart; the LocalAPI connection loop calls `restart_commit` after writing
+  `DaemonRestarting` (a 5 s fallback commits if that loop never gets there).
+- **The exit happens after the runtime is gone**, exactly as an auto-update's exit tears it
+  down; only the code differs. An OS stop (`systemctl stop`, `launchctl bootout`) racing an
+  accepted restart wins — the process leaves with its ordinary code.
+- **More refusals:** a screen recording in progress (a restart would end it — the same work
+  the updater defers for), a restart already under way, and — FR-43 only — a worker younger
+  than 30 s (its supervisor counts an earlier exit as a failed start and gives up after five).
+- **The Scheduled Task's relaunch is the caller's, and a pid says when it is done.**
+  `NodeStatus.pid` and `DaemonRestarting.pid` let a caller tell the relaunched daemon from the
+  one that is leaving (the old process keeps answering for a moment after it says yes); with
+  `restart_by: caller` the caller runs `roomlerd service start` whenever nothing answers,
+  again every 3 s — the task's `IgnoreNew` drops a start that lands while the old instance is
+  still exiting. One implementation (`roomler_localapi::wait_for_restart`) serves the CLI and
+  the companion; the companion spawns `service start` with `CreateProcessW` and no inherited
+  handles (#1035).
+- **`local_restart_enabled` is live** (read from the file per request): an owner's OFF is in
+  force for the very next request, and turning it back ON does not need the restart it
+  enables.
+
 ### D4 — Overview: what this device can encode, and where received files go
 
 `Request::EncoderCaps` returns the probed cells (`ready`), `not_probed` before the first

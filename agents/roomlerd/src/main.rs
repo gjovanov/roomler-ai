@@ -161,6 +161,16 @@ enum Command {
         /// readable via `ps`, while the pipe is only the parent's.
         #[arg(long, hide = true)]
         supervised: bool,
+        /// FR-84 D3 (Windows) — which spawner started this worker: `scm` (the
+        /// SCM service host's supervisor, `win_service::worker_args`) or
+        /// `task` (the per-user Scheduled Task's action, `service.rs`). It is
+        /// the worker's only evidence that an exit for `RestartDaemon` will
+        /// be answered by a relaunch; a bare `run` is an orphan and refuses.
+        /// Hidden: a person passing it by hand is lying to the daemon about
+        /// who will bring it back. Ignored on every other platform
+        /// (`supervision::detect_here`).
+        #[arg(long, hide = true, value_parser = ["scm", "task"])]
+        supervisor: Option<String>,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -727,6 +737,18 @@ enum ServiceAction {
         #[arg(long)]
         as_service: bool,
     },
+    /// Start the registered daemon NOW, through its service manager:
+    /// `schtasks /Run` the Scheduled Task, `systemctl --user start` the unit,
+    /// `launchctl kickstart` the LaunchAgent. The daemon is spawned by the
+    /// OS, never as a child of this command. Harmless when it is already
+    /// running. This is the caller half of a restart under the Scheduled
+    /// Task (FR-84 D3, `roomler restart`, the companion's "Apply now").
+    Start {
+        /// Windows-only: start the `Roomler` SCM service instead (and wait
+        /// for RUNNING). Requires elevation on a stock install.
+        #[arg(long)]
+        as_service: bool,
+    },
 }
 
 /// rc.52: pure config-path precedence ladder. `exists` is injected so
@@ -952,6 +974,9 @@ fn main() -> Result<()> {
                 tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
                 std::process::exit(1);
             }
+            // FR-84 D3 — a requested restart leaves with its own code (launchd
+            // relaunches only a non-zero exit). Diverges when it applies.
+            exit_for_requested_restart();
             // The daemon returning normally is a shutdown. The main thread is
             // inside AppKit and will not notice, so say so explicitly.
             std::process::exit(0);
@@ -970,10 +995,25 @@ fn main() -> Result<()> {
     roomlerd::indicator::mac::run_main_loop();
 }
 
+/// Exactly what `#[tokio::main]` expanded to — a multi-thread runtime with
+/// every driver enabled, `block_on` the daemon, drop the runtime — spelled out
+/// for one reason: FR-84 D3's requested restart must pick its exit code only
+/// AFTER the runtime is gone, so its teardown is the one every other clean
+/// exit (an auto-update, a SIGTERM) already gets. Nothing else changes.
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    daemon_main().await
+fn main() -> Result<()> {
+    // The runtime is a temporary: it is dropped at the end of this statement,
+    // cancelling every task still running and waiting on blocking work.
+    let res = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(daemon_main());
+    if res.is_ok() {
+        // Diverges when a restart was requested; otherwise a no-op.
+        exit_for_requested_restart();
+    }
+    res
 }
 
 async fn daemon_main() -> Result<()> {
@@ -1132,6 +1172,8 @@ async fn daemon_main() -> Result<()> {
         // A bare `roomlerd` is never a supervised worker: the supervisor always
         // spawns `run --supervised` explicitly.
         supervised: false,
+        // Likewise the Windows spawners always say which one they are.
+        supervisor: None,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1178,7 +1220,22 @@ async fn daemon_main() -> Result<()> {
         Command::Run {
             encoder,
             supervised,
-        } => run_cmd(&config_path, encoder.as_deref(), supervised).await,
+            supervisor,
+        } => run_cmd(
+            &config_path,
+            encoder.as_deref(),
+            supervised,
+            supervisor.as_deref(),
+        )
+        .await
+        .map(|restart| {
+            // FR-84 D3 — `run` ended through the graceful path a requested
+            // restart started. `main` exits with this code, but only once the
+            // runtime is gone (see `exit_for_requested_restart`).
+            if let Some(code) = restart {
+                let _ = REQUESTED_RESTART_EXIT.set(code);
+            }
+        }),
         Command::CapsProbe => {
             roomlerd::encode::caps::print_probe_result();
             Ok(())
@@ -1401,6 +1458,41 @@ async fn daemon_main() -> Result<()> {
     }
     let _ = is_worker_run; // silence unused on non-windows
     res
+}
+
+/// FR-84 D3 — the exit code a requested restart leaves with. Set by the `run`
+/// arm of [`daemon_main`] when `run_cmd` came back from the graceful shutdown
+/// a `RestartDaemon` started; read by `main` only after the runtime is gone.
+static REQUESTED_RESTART_EXIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+/// FR-84 D3 — leave for the supervisor to relaunch us, if a restart was
+/// requested; otherwise return and let `main` end the process as it always
+/// has.
+///
+/// By the time this runs, `run_cmd` has completed the SAME graceful path an
+/// auto-update's exit takes (internal shutdown, `mark_clean_shutdown` — no
+/// crash counted, nothing for the rollback detector), and on every platform
+/// but the AppKit one the runtime has been dropped too, so every task still
+/// running was cancelled and its teardown ran. The one thing that differs from
+/// an update's exit is the code: `0` under the Windows SCM supervisor,
+/// `RESTART_REQUESTED_EXIT_CODE` everywhere else
+/// (`supervision::Supervision::restart_exit_code`).
+fn exit_for_requested_restart() {
+    let Some(&code) = REQUESTED_RESTART_EXIT.get() else {
+        return;
+    };
+    // Belt, not load-bearing: the teardown above already ran. A requested
+    // restart must never leave the host blackholed for the seconds until the
+    // relaunched daemon's own boot reconciler runs (P5/A2).
+    roomlerd::purge_exit_routes();
+    tracing::info!(
+        exit_code = code,
+        "requested restart: exiting for the supervisor to relaunch this daemon"
+    );
+    // The file layer is non-blocking and its guard lives in a static that is
+    // never dropped; give it a moment to write the line above.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::process::exit(code);
 }
 
 // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still
@@ -2500,7 +2592,18 @@ fn macos_permission_preflight() {
     );
 }
 
-async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: bool) -> Result<()> {
+/// The daemon. `Ok(Some(code))` = it ended through the graceful path a
+/// requested restart (FR-84 D3, `Request::RestartDaemon`) started, and the
+/// process must leave with `code` for its supervisor to relaunch it;
+/// `Ok(None)` = every other clean end.
+async fn run_cmd(
+    config_path: &PathBuf,
+    cli_encoder: Option<&str>,
+    supervised: bool,
+    supervisor_flag: Option<&str>,
+) -> Result<Option<i32>> {
+    // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
+    let process_started = std::time::Instant::now();
     if !config_path.exists() {
         bail!(
             "no config found at {}. Run `roomlerd enroll` first.",
@@ -2524,10 +2627,22 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                  or stop the running instance before starting a new one.)"
                 );
                 tracing::warn!("single-instance lock held by another process; exiting");
-                return already_running_exit();
+                return already_running_exit().map(|()| None);
             }
         };
     let mut cfg = config::load(config_path).context("loading config")?;
+
+    // FR-84 D3 — who will relaunch this process if it exits, decided once,
+    // from evidence the supervisor left (argv, environment, cgroup) — never
+    // from the config file. `none` is the answer for a hand-run `roomlerd
+    // run`, and it is the one that makes "Apply now" refuse instead of
+    // taking the device offline.
+    let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    tracing::info!(
+        supervisor = supervision.wire(),
+        detail = ?supervision,
+        "supervision: who relaunches this daemon if it exits (FR-84 D3)"
+    );
 
     #[cfg(target_os = "macos")]
     macos_permission_preflight();
@@ -2922,7 +3037,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                     // spawn_installer_with_watch) will record the
                     // verdict in last-install.json; the new binary
                     // can surface it on next start.
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             updater::CheckOutcome::Skipped(reason) => {
@@ -3352,6 +3467,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     #[cfg(not(unix))]
     let delegation_role = roomlerd::delegate::Delegation::Off;
 
+    // FR-84 D3 — "Apply now": the LocalAPI's `RestartDaemon` verb, the ONLY
+    // way this process restarts itself. It rides the internal-shutdown path
+    // the auto-updater uses (the `shutdown_tx` below), so a restart is
+    // graceful by construction; the select at the end of this function reads
+    // back whether one was accepted. Remote configuration never reaches it —
+    // there is no server message that restarts a daemon (docs/remote-config.md
+    // §7b).
+    let restart = localapi_state::RestartHandle::new(
+        supervision,
+        shutdown_tx.clone(),
+        process_started,
+        roomlerd::supervision::restart_record_path(config_path),
+    );
     let daemon_state = localapi_state::DaemonState::new(
         cfg.agent_id.clone(),
         cfg.machine_name.clone(),
@@ -3368,6 +3496,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // The rename verb persists through the daemon's own resolved
     // config path + the P6 write lock (profile-correct under SYSTEM).
     .with_config_persist(config_path.clone(), cfg_write_lock.clone())
+    // FR-84 D3 — the restart verb (reads `local_restart_enabled` through the
+    // config path above, fresh on every request).
+    .with_restart(restart.clone())
     // …and the live gate-4 flags, so a `config set` here is in force
     // as fast as a pushed one (docs/remote-config.md).
     .with_remote_config(remote_cfg.clone())
@@ -3854,14 +3985,31 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
+            // FR-84 D3 — an accepted restart leaves through the graceful door
+            // whatever the signalling loop did on its way out (an error, even
+            // a panic): the shutdown is our own, and a crash counted here
+            // would put a button press on the rollback detector's ladder. If
+            // the loop ended in the instant between the verb accepting and the
+            // LocalAPI committing, commit now — the shutdown flag is what makes
+            // this exit graceful below, and an ungraceful one would leave with
+            // 0, which launchd does NOT relaunch.
+            let restarting = restart.accepted_exit_code().is_some();
+            if restarting {
+                restart.commit();
+            }
             if let Ok(Err(e)) = res {
-                tracing::error!(error = %e, "signaling task exited with error");
-                return Err(e);
+                if !restarting {
+                    tracing::error!(error = %e, "signaling task exited with error");
+                    return Err(e);
+                }
+                tracing::warn!(error = %e,
+                    "signaling task ended with an error during a requested restart; restarting anyway");
             }
             // sig_task exited successfully. The only way that happens
             // is via `shutdown_tx.send(true)` from inside the agent
-            // (auto-updater spawning the installer, or rollback path
-            // pinning a previous version). Treat that as graceful so
+            // (auto-updater spawning the installer, rollback path
+            // pinning a previous version, or FR-84 D3's requested
+            // restart). Treat that as graceful so
             // the next startup doesn't false-positive a crash counter
             // increment. M5 finding #2 (the field-test host 2026-05-02): every
             // auto-update bumped `crash_count` by 1; three rapid
@@ -3930,7 +4078,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             }
         }
     }
-    Ok(())
+    // FR-84 D3 — leave with the code the supervisor relaunches on, now that
+    // the clean shutdown is on disk. Only through the graceful door (a
+    // requested restart is always our own internal shutdown), and never
+    // against an OS stop that landed in the same instant: `systemctl stop`,
+    // a `launchctl bootout`, an admin's `kill` asked this process to STAY
+    // down, and relaunching it would fight them.
+    let restart_exit = if graceful_shutdown && !os_initiated_stop {
+        restart.accepted_exit_code()
+    } else {
+        None
+    };
+    Ok(restart_exit)
 }
 
 async fn service_cmd(action: ServiceAction) -> Result<()> {
@@ -3950,10 +4109,29 @@ async fn service_cmd(action: ServiceAction) -> Result<()> {
             println!("Auto-start: {s}");
             Ok(())
         }
+        ServiceAction::Start { as_service: false } => {
+            service::start().context("starting the auto-start hook")?;
+            println!("Start requested; the service manager launches the daemon.");
+            Ok(())
+        }
         ServiceAction::Install { as_service: true } => service_install_as_service(),
         ServiceAction::Uninstall { as_service: true } => service_uninstall_as_service(),
         ServiceAction::Status { as_service: true } => service_status_as_service(),
+        ServiceAction::Start { as_service: true } => service_start_as_service(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn service_start_as_service() -> Result<()> {
+    win_service::environment::start_service(std::time::Duration::from_secs(30))
+        .context("starting the Roomler service")?;
+    println!("{}: running", win_service::NEW_SERVICE_NAME);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn service_start_as_service() -> Result<()> {
+    bail!("`service start --as-service` is Windows-only.");
 }
 
 #[cfg(target_os = "windows")]

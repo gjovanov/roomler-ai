@@ -94,6 +94,41 @@ pub fn uninstall() -> Result<()> {
     }
 }
 
+/// FR-84 D3 — start the registered auto-start hook NOW: `schtasks /Run` the
+/// task, `systemctl --user start` the unit, `launchctl kickstart` the agent.
+///
+/// The caller half of `Request::RestartDaemon` (`restart_by: "caller"`): the
+/// Scheduled Task's own `<RestartOnFailure>` is a minute away at best, so the
+/// companion / `roomler restart` runs this once the old daemon is gone. In
+/// every flavour the daemon is then spawned by the OS's scheduler / service
+/// manager — never as a child of the process calling this — so nothing of
+/// the caller's is inherited by the daemon (#1035 is the reverse direction:
+/// the daemon spawning the companion).
+///
+/// Harmless to repeat, which the caller relies on: a start that lands while
+/// the old instance is still exiting is dropped by the task's `IgnoreNew`
+/// policy, a running unit is a no-op, and a running LaunchAgent is left
+/// alone (`kickstart` without `-k`). So the caller simply asks again until a
+/// NEW daemon answers.
+pub fn start() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::start()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::start()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::start()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        bail!("auto-start is not supported on this platform")
+    }
+}
+
 /// Query whether the auto-start hook is currently registered.
 pub fn status() -> Result<AutostartStatus> {
     #[cfg(target_os = "windows")]
@@ -204,6 +239,37 @@ mod windows {
         // half-migrated host (both).
         delete_task(NEW_TASK_NAME)?;
         delete_task(LEGACY_TASK_NAME)?;
+        Ok(())
+    }
+
+    /// FR-84 D3 — `schtasks /Run` the task: the canonical name, or the
+    /// legacy one on a host that still runs it. A non-admin user may run a
+    /// task registered under their own account, which is how the perUser
+    /// MSI registers it. The scheduler spawns the daemon; this process is
+    /// not its parent.
+    pub fn start() -> Result<()> {
+        let name = if task_exists(NEW_TASK_NAME) {
+            NEW_TASK_NAME
+        } else if task_exists(LEGACY_TASK_NAME) {
+            LEGACY_TASK_NAME
+        } else {
+            bail!(
+                "no auto-start task is registered (run `roomlerd service install` first, \
+                 or start the service from an elevated prompt)"
+            );
+        };
+        let output = Command::new("schtasks")
+            .args(["/Run", "/TN", name])
+            .output()
+            .context("running schtasks /Run")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "schtasks /Run /TN {name} failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
         Ok(())
     }
 
@@ -404,7 +470,7 @@ mod windows {
   <Actions Context="Author">
     <Exec>
       <Command>{exe_xml}</Command>
-      <Arguments>run</Arguments>
+      <Arguments>run --supervisor task</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -591,6 +657,12 @@ mod linux {
         Ok(())
     }
 
+    /// FR-84 D3 — start the per-user unit now (the resolved name, so a host
+    /// still on the legacy unit starts that one). systemd spawns the daemon.
+    pub fn start() -> Result<()> {
+        systemctl(&["--user", "start", resolved_unit()])
+    }
+
     pub fn status() -> Result<AutostartStatus> {
         // Either name counts as installed (an upgraded host may still run
         // the legacy-named unit until its next `service install`).
@@ -716,6 +788,30 @@ mod macos {
         let _ = Command::new("launchctl")
             .args(["unload", "-w", plist.to_string_lossy().as_ref()])
             .output();
+        Ok(())
+    }
+
+    /// FR-84 D3 — `launchctl kickstart gui/<uid>/com.roomler.agent`: start
+    /// the loaded LaunchAgent now (no `-k`: a running one is left alone).
+    /// launchd spawns the daemon. Fails when the agent is not bootstrapped —
+    /// `service install` is the remedy, and the error says so.
+    pub fn start() -> Result<()> {
+        // SAFETY: `getuid` takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let target = format!("gui/{uid}/{PLIST}");
+        let output = Command::new("launchctl")
+            .args(["kickstart", &target])
+            .output()
+            .context("running launchctl kickstart")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "launchctl kickstart {target} failed ({}): {} (is the LaunchAgent loaded? \
+                 `roomlerd service install` loads it)",
+                output.status,
+                stderr.trim()
+            );
+        }
         Ok(())
     }
 
