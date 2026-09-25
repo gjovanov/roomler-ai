@@ -2,14 +2,16 @@
 // Copyright (C) 2026 G ROX EOOD
 /*
  * Overview view: this device's identity + health at a glance, the exit-node
- * card (P5), and the update check/apply flow.
+ * card (P5), what this device can encode and where dropped files land
+ * (FR-84 D4), and the update check/apply flow.
  *
- * Renders from the central store (app.js polls `cmd_status` + `cmd_device_view`);
- * no polling of its own. All dynamic strings land via textContent.
+ * Renders from the central store (app.js polls `cmd_status` + `cmd_device_view`).
+ * The one poll of its own is the encoder card's, and only while the service
+ * has not probed yet. All dynamic strings land via textContent.
  */
 (function () {
   'use strict';
-  const { $, invoke, show, hide, setText, on, get, navigate } = window.Roomler;
+  const { $, invoke, show, hide, setText, on, get, navigate, currentView } = window.Roomler;
 
   let routesActive = null; // painted by tunnels.js via the shared event below
 
@@ -142,6 +144,382 @@
     show(el);
   }
 
+  /* ── FR-84 D4: what this device can encode ─────────────────────────
+   *
+   * `cmd_encoder_caps` reads the service's CACHED probe; the service probes
+   * at its first server connection, never because this card asked. Before
+   * that the answer is `not_probed`, and only then does the card poll (5 s),
+   * stopping as soon as the answer can no longer change by itself. It is
+   * re-read when the service comes back or changes (version / node).
+   */
+
+  const CODEC_ROWS = [
+    ['h264', 'H.264'],
+    ['hevc', 'HEVC'],
+    ['vp9', 'VP9'],
+    ['av1', 'AV1'],
+  ];
+  const BACKEND_ORDER = [
+    'nvenc', 'qsv', 'amf', 'vaapi', 'd3d12', 'vulkan', 'videotoolbox', 'mf', 'openh264', 'libvpx',
+  ];
+  const BACKEND_LABEL = {
+    nvenc: 'NVENC',
+    qsv: 'Quick Sync',
+    amf: 'AMF',
+    vaapi: 'VA-API',
+    d3d12: 'D3D12',
+    vulkan: 'Vulkan',
+    videotoolbox: 'VideoToolbox',
+    mf: 'Media Foundation',
+    openh264: 'OpenH264',
+    libvpx: 'libvpx',
+  };
+  const CHROMA_LABEL = { yuv420: '4:2:0', yuv444: '4:4:4' };
+  const ENC_POLL_MS = 5000;
+
+  let encTimer = null;
+  let encInflight = false;
+  let encLast = null;
+  let lastDaemonKey = null;
+
+  // The answer can still change by itself only before the first probe.
+  function encPending(view) {
+    return !!(view && view.available && view.caps && view.caps.state === 'not_probed');
+  }
+
+  function stopEncPoll() {
+    if (encTimer !== null) {
+      clearTimeout(encTimer);
+      encTimer = null;
+    }
+  }
+
+  async function refreshEncoderCaps() {
+    if (encInflight) return;
+    encInflight = true;
+    stopEncPoll();
+    let view;
+    try {
+      view = await invoke('cmd_encoder_caps');
+    } catch (e) {
+      view = { available: false, reason: String(e) };
+    } finally {
+      encInflight = false;
+    }
+    encLast = view;
+    paintEncoderCaps(view);
+    // Poll only while nothing has been probed AND someone is looking; the
+    // tray-resident window keeps its timers running when hidden, and a
+    // service that cannot reach its server can stay unprobed for days.
+    if (encPending(view)) {
+      encTimer = setTimeout(() => {
+        encTimer = null;
+        if (currentView() === 'overview' && !document.hidden) void refreshEncoderCaps();
+      }, ENC_POLL_MS);
+    }
+  }
+
+  function encChip(text, cls) {
+    const chip = $('ov-enc-chip');
+    if (!chip) return;
+    chip.textContent = text;
+    chip.className = 'chip ' + cls;
+  }
+
+  function encNote(text) {
+    const note = $('ov-enc-note');
+    if (!note) return;
+    note.textContent = text || '';
+    note.hidden = !text;
+  }
+
+  function paintEncoderCaps(view) {
+    const matrix = $('ov-enc-matrix');
+    const foot = $('ov-enc-foot');
+    const deniedLine = $('ov-enc-denied');
+    const raw = $('ov-enc-raw');
+    hide(matrix);
+    hide(foot);
+    hide(deniedLine);
+    hide(raw);
+
+    if (!view.available) {
+      if (view.reason === 'old_daemon') {
+        encChip('Unavailable', 'chip-muted');
+        encNote('The device service predates this view — update the service to see this.');
+      } else if (view.reason === 'daemon_unreachable') {
+        encChip('Offline', 'chip-muted');
+        encNote('The device service is not running.');
+      } else {
+        encChip('Error', 'chip-warn');
+        encNote('Could not read the encoders: ' + (view.reason || 'unknown error'));
+      }
+      return;
+    }
+    const caps = view.caps || {};
+    if (caps.state === 'unsupported') {
+      encChip('None', 'chip-muted');
+      encNote('This build of the device service has no video encoders (signalling only).');
+      return;
+    }
+    if (caps.state === 'not_probed') {
+      encChip('Not probed yet', 'chip-muted');
+      encNote(
+        'The service tests its encoders when it first connects to the server. ' +
+          'Checking again every ' + ENC_POLL_MS / 1000 + ' s.',
+      );
+      return;
+    }
+    if (caps.state !== 'ready') {
+      encChip('Unknown', 'chip-muted');
+      encNote('The service answered with a state this app does not know (' + caps.state + ').');
+      return;
+    }
+
+    const cells = caps.cells || [];
+    const hwCount = cells.filter((c) => c.hardware).length;
+    encChip(
+      hwCount ? 'Hardware' : cells.length ? 'Software only' : 'No encoder',
+      hwCount ? 'chip-ok' : 'chip-warn',
+    );
+    encNote(cells.length ? '' : 'No encoder opened on this device — remote sessions cannot stream video.');
+    if (cells.length) paintMatrix(cells, view.denied_cells || []);
+    paintEncFooter(caps);
+  }
+
+  function paintMatrix(cells, deniedCells) {
+    // Columns: the backends the probe opened something on, in a fixed order
+    // (unknown future backends last, alphabetically).
+    const present = new Set(cells.map((c) => c.backend));
+    const backends = BACKEND_ORDER.filter((b) => present.has(b)).concat(
+      [...present].filter((b) => !BACKEND_ORDER.includes(b)).sort(),
+    );
+    const head = $('ov-enc-head');
+    head.textContent = '';
+    const corner = document.createElement('th');
+    corner.textContent = 'Codec';
+    head.appendChild(corner);
+    for (const b of backends) {
+      const th = document.createElement('th');
+      th.textContent = BACKEND_LABEL[b] || b;
+      head.appendChild(th);
+    }
+
+    const rows = $('ov-enc-rows');
+    rows.textContent = '';
+    for (const [codec, label] of CODEC_ROWS) {
+      const tr = document.createElement('tr');
+      const name = document.createElement('td');
+      name.textContent = label;
+      tr.appendChild(name);
+      for (const b of backends) {
+        const td = document.createElement('td');
+        const cell = cells.find((c) => c.codec === codec && c.backend === b);
+        const opened = new Set((cell && cell.chroma) || []);
+        for (const chroma of (cell && cell.chroma) || []) {
+          const span = document.createElement('span');
+          span.className = 'enc-cell ' + (cell.hardware ? 'enc-hw' : 'enc-sw');
+          span.textContent = CHROMA_LABEL[chroma] || chroma;
+          span.title = (cell.hardware ? 'Hardware' : 'Software') + ' ' + codec + ' on ' + (BACKEND_LABEL[b] || b);
+          td.appendChild(span);
+        }
+        // A denied cell is never opened, so it is not in `cells`: struck
+        // through where the probe would otherwise have tried it.
+        for (const d of deniedCells) {
+          if (d.codec !== codec || d.backend !== b || opened.has(d.chroma)) continue;
+          const span = document.createElement('span');
+          span.className = 'enc-cell enc-denied';
+          span.textContent = CHROMA_LABEL[d.chroma] || d.chroma;
+          span.title = 'Denied by encoder_cells_deny (' + d.entry + ') — never opened';
+          td.appendChild(span);
+        }
+        if (!td.childNodes.length) {
+          td.textContent = '—';
+          td.className = 'muted';
+        }
+        tr.appendChild(td);
+      }
+      rows.appendChild(tr);
+    }
+    show($('ov-enc-matrix'));
+  }
+
+  function paintEncFooter(caps) {
+    const parts = [];
+    if (caps.probe_ms != null) parts.push('probed in ' + caps.probe_ms + ' ms');
+    parts.push(caps.probe_cached ? 'from the probe cache' : 'fresh probe');
+    if (caps.encoder_preference) parts.push('preference: ' + caps.encoder_preference);
+    const foot = $('ov-enc-foot');
+    foot.textContent = parts.join(' · ');
+    show(foot);
+
+    const denied = caps.denied || [];
+    const deniedLine = $('ov-enc-denied');
+    deniedLine.textContent = denied.length
+      ? 'Denied by encoder_cells_deny: ' + denied.join(', ')
+      : 'encoder_cells_deny: nothing denied';
+    show(deniedLine);
+
+    setText('ov-enc-hw', (caps.hw_encoders || []).join(', ') || '—');
+    setText('ov-enc-codecs', (caps.codecs || []).join(', ') || '—');
+    show($('ov-enc-raw'));
+  }
+
+  // Re-read both D4 cards when the service appears, disappears, or is a
+  // different process (an update changes the version, a re-enroll the node);
+  // between those, keep the drop folder current from the 2 s poll.
+  function watchDaemon(dv) {
+    const st = (dv && dv.available && dv.status) || null;
+    const key = st ? (st.version || '') + '|' + (st.node_id || '') : 'offline';
+    if (key !== lastDaemonKey) {
+      lastDaemonKey = key;
+      void refreshEncoderCaps();
+      void refreshFilesDir();
+      return;
+    }
+    if (st && filesView && filesView.available && st.files_dir && st.files_dir !== filesView.effective) {
+      filesView.effective = st.files_dir;
+      paintFilesDir();
+    }
+  }
+
+  /* ── FR-84 D4: where dropped files land ─────────────────────────────
+   *
+   * `cmd_files_dir_view` = the service's effective folder + the configured
+   * value, read on entry and after a change; the 2 s device-view poll keeps
+   * the effective folder current in between. Every change goes through the
+   * service (it knows whom it writes as); its refusals show verbatim.
+   */
+
+  let filesView = null;
+  let filesBusy = false;
+
+  // Windows paths compare case- and separator-insensitively; POSIX ones
+  // exactly (a trailing separator aside).
+  function samePath(a, b) {
+    if (!a || !b) return false;
+    const windows = /^[A-Za-z]:|^\\\\/.test(a);
+    const norm = (s) => {
+      const t = s.replace(/[\\/]+$/, '');
+      return windows ? t.replace(/\//g, '\\').toLowerCase() : t;
+    };
+    return norm(a) === norm(b);
+  }
+
+  function filesMsg(text, isError) {
+    const el = $('ov-files-msg');
+    if (!el) return;
+    el.textContent = text || '';
+    el.hidden = !text;
+    el.classList.toggle('error', !!isError);
+  }
+
+  function setFilesButtons(enabled) {
+    for (const id of ['ov-files-open', 'ov-files-change', 'ov-files-default']) {
+      const b = $(id);
+      if (b) b.disabled = !enabled || filesBusy;
+    }
+  }
+
+  async function refreshFilesDir() {
+    try {
+      filesView = await invoke('cmd_files_dir_view');
+    } catch (e) {
+      filesView = { available: false, reason: String(e) };
+    }
+    paintFilesDir();
+  }
+
+  function paintFilesDir() {
+    const v = filesView;
+    const chip = $('ov-files-chip');
+    const note = $('ov-files-note');
+    const actions = $('ov-files-actions');
+    const setChip = (text, cls) => {
+      if (!chip) return;
+      chip.textContent = text;
+      chip.className = 'chip ' + cls;
+    };
+    const setNote = (text) => {
+      if (!note) return;
+      note.textContent = text || '';
+      note.hidden = !text;
+    };
+    if (!v) return;
+    if (!v.available) {
+      setChip(v.reason === 'daemon_unreachable' ? 'Offline' : 'Error', 'chip-muted');
+      setText('ov-files-path', '—');
+      setText('ov-files-setting', '—');
+      setNote(
+        v.reason === 'daemon_unreachable'
+          ? 'The device service is not running.'
+          : 'Could not read the setting: ' + (v.reason || 'unknown error'),
+      );
+      setFilesButtons(false);
+      return;
+    }
+    if (!v.supported) {
+      setChip('Unavailable', 'chip-muted');
+      setText('ov-files-path', v.effective || '—');
+      setText('ov-files-setting', '—');
+      setNote('The device service predates this setting — update the service to choose where incoming files land.');
+      hide(actions);
+      return;
+    }
+    show(actions);
+    setText('ov-files-path', v.effective || '…');
+    if (!v.configured) {
+      setChip('Default', 'chip-muted');
+      setText('ov-files-setting', "Default — the signed-in user's Downloads folder");
+      setNote('');
+    } else {
+      const perUser = v.configured.startsWith('~');
+      setText(
+        'ov-files-setting',
+        v.configured + (perUser ? ' (inside the profile of whoever is signed in)' : ''),
+      );
+      if (v.effective && v.configured_resolved && !samePath(v.effective, v.configured_resolved)) {
+        setChip('Not in use', 'chip-warn');
+        setNote(
+          'The chosen folder cannot be used right now, so files land in the default folder instead. ' +
+            'The service log says why.',
+        );
+      } else {
+        setChip('Custom', 'chip-ok');
+        setNote('');
+      }
+    }
+    setFilesButtons(true);
+  }
+
+  async function filesAction(run) {
+    if (filesBusy) return;
+    filesBusy = true;
+    setFilesButtons(false);
+    filesMsg('');
+    try {
+      const text = await run();
+      if (text) filesMsg(text, false);
+    } catch (e) {
+      // The service's own words: a refusal names the rule it applied.
+      filesMsg(String(e), true);
+    } finally {
+      filesBusy = false;
+      await refreshFilesDir();
+    }
+  }
+
+  function savedText(entry, value) {
+    const where = value || (entry && entry.value) || 'the default folder';
+    return (
+      'Saved: ' +
+      where +
+      (entry && entry.restart_required
+        ? ' — takes effect after the service restarts.'
+        : ' — in effect now, for the next file dropped.')
+    );
+  }
+
   /*
    * macOS permission banner.
    *
@@ -173,6 +551,40 @@
   document.addEventListener('DOMContentLoaded', () => {
     on('status', paintStatus);
     on('deviceView', paintDeviceView);
+    // FR-84 D4 — the encoder matrix and the drop folder.
+    on('deviceView', watchDaemon);
+    document.addEventListener('roomler:view', (ev) => {
+      if (ev.detail !== 'overview' || lastDaemonKey === null) return;
+      // A change made on the Settings page shows up on the way back, and a
+      // matrix still waiting for the first probe resumes its poll.
+      void refreshFilesDir();
+      if (encPending(encLast) && encTimer === null) void refreshEncoderCaps();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && currentView() === 'overview' && encPending(encLast) && encTimer === null) {
+        void refreshEncoderCaps();
+      }
+    });
+    $('ov-files-open').addEventListener('click', () =>
+      filesAction(async () => {
+        await invoke('cmd_open_files_dir');
+        return '';
+      }),
+    );
+    $('ov-files-change').addEventListener('click', () =>
+      filesAction(async () => {
+        const r = await invoke('cmd_pick_files_dir');
+        return r.cancelled ? '' : savedText(r.entry, r.value);
+      }),
+    );
+    $('ov-files-default').addEventListener('click', () =>
+      filesAction(async () => {
+        const entry = await invoke('cmd_files_dir_default');
+        return entry.restart_required
+          ? 'Back to the default folder after the service restarts.'
+          : 'Back to the default folder — in effect now.';
+      }),
+    );
 
     refreshPermissions();
     window.addEventListener('focus', refreshPermissions);
