@@ -312,7 +312,8 @@ overlay lease.
 |---|---|
 | `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (24 h timer + startup cooldown), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. Admins can force it fleet-wide or per device (`POST …/agent/update`). Crash-looping updates roll back to the last known-good version |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
-| `roomler-desktop` / wizard | Refreshed by the daemon's MSI on Windows; wizard is fetch-latest by nature |
+| `roomler-desktop` | **Windows**: no MSI carries it. At startup the daemon swaps it to its own version from its own release tag, and restarts it if it was running (`companion::refresh_if_stale`). **macOS**: inside the `.pkg`, whose postinstall stops every running copy however it was started, then relaunches it (#1617). **Linux**: its own `.deb`, installed once by `install.sh` and ⚠️ **not updated afterwards**, since the updater refuses it and there is no apt source (FR-27 phase 10). The device grid flags a companion that is behind (`desktop v<x>`) and one still running an older build than the one installed (**desktop app needs a restart**, `remote-control.md`) |
+| wizard | fetch-latest by nature |
 
 ## Verifying what you install
 

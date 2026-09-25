@@ -1578,6 +1578,10 @@ async fn connect_once(
                     // FR-27 — cached for 10 min inside, so this is a map lookup
                     // on all but one heartbeat in twenty.
                     companion_version: crate::companion::installed_version(),
+                    // FR-27 phase 9 — the last measurement; a due one runs in
+                    // the background, so this never waits on `lsof`.
+                    companion_running: crate::companion::running_state()
+                        .map(|s| s.wire().to_string()),
                     caps,
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {

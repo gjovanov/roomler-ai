@@ -630,6 +630,24 @@ device auto-grant is a device-owner decision the server cannot make for it.
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
 
+⚠️ **The companion updates separately from the daemon and can fall behind in
+two ways. The device grid shows both.**
+
+| Field (heartbeat) | What it reads | Grid shows | Blind to |
+|---|---|---|---|
+| `companion_version` | the INSTALLED version: the Windows sidecar marker, the macOS bundle's `Info.plist`, dpkg on Linux (`companion::installed_version`) | `desktop v<x>` when it differs from the daemon | a copy that kept running through an update |
+| `companion_running` (FR-27 phase 9) | whether each RUNNING copy is the installed file, by comparing executable device + inode: `lsof -FDin` on macOS, `/proc/<pid>/exe` on Linux (`companion::running_state`) | **desktop app needs a restart** on `stale` | Windows (not measured: its own refresh kills and respawns the copy it swaps) |
+
+The second row exists because the first was wrong for 17 days on a Mac. A
+companion a person had opened ran 0.4.92 through nine updates while its row
+read 0.4.101 (FR-27 finding 11). #1617 fixed the cause.
+
+- `companion_running` is absent when not measured, and absent never means
+  `current`. The server stores only `none`, `current` and `stale`.
+- `ROOMLERD_COMPANION_RUNNING_PROBE=0` stops the probe.
+- On Linux, nothing upgrades the companion `.deb` after install (FR-27
+  phase 10).
+
 ⚠️ **A virtual-desktop host declines the native surface, even though its X
 display connects.**
 <!-- RETIRED-NAME-ANCHOR: the LEGACY env spelling FR-21 P3 kept working, and
