@@ -623,23 +623,40 @@ const PROBE_HEIGHT: u32 = 270;
 /// cached result.
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
-        .get_or_init(|| {
-            let mut caps = cached_or_probed();
-            // The RPC verbs are config-derived, not driver-probed: compute
-            // them HERE, where the config fallbacks are registered,
-            // whatever the child (or the cache) saw.
-            caps.rpc = rpc_caps();
-            // FR-56 AC10 (review of #1667) — the Remote Apps verbs likewise,
-            // and for a second reason: on a cache MISS `cached_or_probed` is
-            // the caps-probe CHILD's struct wholesale, and the child loads no
-            // config and must not run a privilege-dropped desktop walk. Until
-            // this line, `[virtual_desktop_apps] enabled = false` did not stop
-            // the hello advertising `list` on every release's first boot, or
-            // on any boot of a host with no hardware cell (never cached).
-            caps.apps = apps_caps();
-            caps
-        })
+        .get_or_init(|| with_config_lists(cached_or_probed()))
         .clone()
+}
+
+/// The config-derived lists, assigned by the DAEMON over whatever
+/// `cached_or_probed` answered — the caps-probe child's struct on a miss, the
+/// merged cache on a hit, the driver-free fallback when the child died. All
+/// three arrive here by this one line, and every list is OVERWRITTEN, never
+/// merged: the child loads no config, so anything it carried in these fields
+/// was computed against the built-in defaults.
+///
+/// - `rpc` — config-derived, not driver-probed (`relay_server_enabled` is an
+///   opt-in), so it is computed where the config fallbacks are registered.
+/// - `apps` — FR-56 AC10 (review of #1667): until it moved here,
+///   `[virtual_desktop_apps] enabled = false` did not stop the hello
+///   advertising `list` on every release's first boot, or on any boot of a
+///   host with no hardware cell (never cached). And the child must not run a
+///   privilege-dropped desktop walk.
+/// - `files` — #1672, the same hole: `browse` follows `enable_remote_browse`,
+///   and the child's flag is the built-in default (`true`). Set once at
+///   startup and never live, so a boot-time snapshot here is exactly as fresh
+///   as the flag itself.
+///
+/// A named seam rather than three lines inside the `OnceLock` closure so a
+/// test can lock EACH assignment (`the_daemon_assigns_every_config_list`):
+/// with the lines inline, deleting `caps.files = files_caps()` left every lib
+/// test green while every hello shipped an empty `files` and every browser
+/// fell back to upload-only — `detect()` itself cannot be called from a unit
+/// test without spawning the probe child.
+fn with_config_lists(mut caps: AgentCaps) -> AgentCaps {
+    caps.rpc = rpc_caps();
+    caps.apps = apps_caps();
+    caps.files = files_caps();
+    caps
 }
 
 /// FR-77 P3 — the probe cache in front of the child probe. A hit reuses the
@@ -726,8 +743,10 @@ fn cached_or_probed() -> AgentCaps {
 }
 
 /// A cache hit: the driver-derived fields from the cache, everything else
-/// computed fresh by THIS process (permissions, the GUI session, the file /
-/// clipboard / app verbs change without any driver changing).
+/// computed fresh by THIS process (permissions, the GUI session and the
+/// clipboard verbs change without any driver changing). The config-derived
+/// lists — `rpc`, `apps`, `files` — are neither cached nor computed here:
+/// `detect()` assigns them after the merge, by the same line a miss takes.
 fn merge_cached(hit: super::caps_cache::CacheFile) -> AgentCaps {
     let mut fresh = compute_caps(false, false);
     let cached = hit.caps;
@@ -1284,27 +1303,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         }
     }
 
-    // File-DC v2 capability list. Always advertise upload + download
-    // + download-folder (always built in this agent). `browse` is
-    // gated on the runtime `enable_remote_browse` flag so old
-    // browsers that see an empty `files` array fall back to
-    // `supports_file_transfer` (upload-only) and new browsers
-    // grey out the drawer button when the host has browse disabled.
-    //
-    // File-DC v3 (rc.19) adds `resume` — the agent stages uploads
-    // under `<dest_dir>/.roomler-partial/<id>/` and can resume a
-    // mid-flight transfer after a DC drop (auto-update mid-upload,
-    // network blip, agent crash). Browsers that don't see `resume`
-    // fall back to the rc.18 fail-fast path.
-    let mut files = vec![
-        "upload".to_string(),
-        "download".to_string(),
-        "download-folder".to_string(),
-        "resume".to_string(),
-    ];
-    if crate::files::is_remote_browse_enabled() {
-        files.push("browse".to_string());
-    }
+    // File-DC verbs: deliberately NOT computed here. `detect()` assigns them
+    // from `files_caps()` in the daemon — `browse` follows a config flag the
+    // caps-probe child never loads (#1672); see that function.
 
     // rc.61 — surface VP9 chroma format in caps so the browser worker
     // picks the right codec string for VideoDecoder.configure(). Empty
@@ -1421,7 +1422,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // ordered. Advertised unconditionally: it is a property of the
         // code, not of the host or its hardware.
         video: vec!["chunk-framing".to_string()],
-        files,
+        // Empty in the child's struct BY DESIGN; `detect()` fills it in the
+        // daemon (`files_caps`). A test locks this.
+        files: Vec::new(),
         vp9_chroma,
         hevc_chroma,
         audio,
@@ -1498,6 +1501,52 @@ fn apps_caps_for(cfg: &crate::apps::VirtualDesktopAppsConfig) -> Vec<String> {
         apps.push("launch".into());
     }
     apps
+}
+
+/// #1672 — the file-DC verbs, assigned by [`detect`] in the DAEMON and never
+/// computed inside `compute_caps`.
+///
+/// The same hole #1667 closed for `apps`. On a caps-cache MISS the hello takes
+/// the caps-probe child's struct wholesale, and the child loads no config, so
+/// a files block inside `compute_caps` read `REMOTE_BROWSE_ENABLED` at its
+/// built-in default (`true`) and advertised `browse` on a device whose owner
+/// had set `enable_remote_browse = false` (or `ROOMLERD_DISABLE_BROWSE`) — on
+/// every release's first boot and on every boot of a host with no hardware
+/// cell (a no-hardware answer is never cached). The `files:dir` handler still
+/// refused, so the controller drew a Browse affordance that failed when used:
+/// a false capability, not an access hole.
+///
+/// `upload` / `download` / `download-folder` are always built into this agent;
+/// `resume` (rc.19) says the agent stages uploads under
+/// `<dest_dir>/.roomler-partial/<id>/` and can resume a mid-flight transfer
+/// after a DC drop, and a browser that does not see it keeps the rc.18
+/// fail-fast path. `browse` alone follows the config. Old browsers that see
+/// an empty `files` list fall back to `supports_file_transfer` (upload-only),
+/// which is why the daemon must fill the list and not merely append to it.
+///
+/// A boot-time snapshot in `detect()` is the honest home: the flag is stored
+/// once by `main.rs::run_cmd` before the signalling loop starts and is not
+/// live (`config_surface.rs` says so; no LocalAPI `ConfigSet` re-seeds it) —
+/// unlike `record`, whose gate IS live and is therefore filled at every
+/// announcement by `signaling::stub_caps`.
+fn files_caps() -> Vec<String> {
+    files_caps_for(crate::files::is_remote_browse_enabled())
+}
+
+/// [`files_caps`] against an explicit flag — testable without touching the
+/// process-global one (a test that flipped it would leak into every other
+/// test in the process).
+fn files_caps_for(browse_enabled: bool) -> Vec<String> {
+    let mut files = vec![
+        "upload".to_string(),
+        "download".to_string(),
+        "download-folder".to_string(),
+        "resume".to_string(),
+    ];
+    if browse_enabled {
+        files.push("browse".to_string());
+    }
+    files
 }
 
 /// Fleet-RPC + roomler-SSH verb capabilities.
@@ -1948,12 +1997,12 @@ mod tests {
 
         // ...but the agent is still a working agent: the parts that never
         // depended on a driver survive, so a probe fault degrades the host
-        // rather than disabling it.
-        assert!(
-            caps.files.iter().any(|f| f == "upload"),
-            "file transfer must survive a probe failure: {:?}",
-            caps.files
-        );
+        // rather than disabling it. File transfer is the clearest case, and
+        // since #1672 it is not even IN the probe's answer: `detect()` assigns
+        // `files` in the daemon after the probe has answered or failed, so no
+        // probe outcome can reach it. The "upload survives" assertion that
+        // used to sit here moved to `the_daemon_assigns_every_config_list`,
+        // which runs this same fallback struct through that assignment.
         assert!(caps.max_simultaneous_sessions > 0);
 
         // FR-77 — no hardware cell without a probe, and no probe time either
@@ -2113,12 +2162,109 @@ mod tests {
     /// the resume path for every rc.19+ browser — lock here.
     #[test]
     fn detect_advertises_resume_files_cap() {
-        // File caps never depended on a probe — and must survive one failing.
+        // File caps never depended on a probe, and since #1672 they are the
+        // daemon's list (`files_caps`), whatever the browse flag says.
+        for browse in [false, true] {
+            let files = files_caps_for(browse);
+            assert!(
+                files.iter().any(|s| s == "resume"),
+                "rc.19 caps.files must include \"resume\" (browse={browse}); got {files:?}"
+            );
+        }
+    }
+
+    /// #1672 — `files` is the DAEMON's to assign, in `detect()`, never the
+    /// caps-probe child's to compute. On a cache miss `cached_or_probed`
+    /// returns the child's struct wholesale, and the child loads no config:
+    /// with the files block inside `compute_caps`, `browse` rode the flag's
+    /// built-in default (`true`) and a device with `enable_remote_browse =
+    /// false` advertised it on every release's first boot and on every boot
+    /// of a host with no hardware cell. So what the child runs must leave the
+    /// field empty — a re-added block here is exactly the regression, and
+    /// this is red on it.
+    #[test]
+    fn files_are_assigned_by_the_daemon_never_by_the_probe_child() {
         let caps = compute_caps(false, false);
         assert!(
-            caps.files.iter().any(|s| s == "resume"),
-            "rc.19 caps.files must include \"resume\"; got {:?}",
+            caps.files.is_empty(),
+            "compute_caps is what the caps-probe child runs; it must leave `files` to \
+             detect(), which reads the browse flag in the daemon — got {:?}",
             caps.files
+        );
+    }
+
+    /// #1672 — the daemon's list follows the CONFIG: `browse` present exactly
+    /// when remote browse is enabled, and the four build-constant verbs in
+    /// both cases (an empty or shortened list would send browsers back to
+    /// the upload-only fallback). Driven through `files_caps_for` so the
+    /// process-global flag is never flipped under the other tests.
+    #[test]
+    fn files_caps_follow_the_config() {
+        let off = files_caps_for(false);
+        assert_eq!(
+            off,
+            vec!["upload", "download", "download-folder", "resume"],
+            "browse disabled: the four always-built verbs and nothing else"
+        );
+        let on = files_caps_for(true);
+        assert_eq!(
+            on,
+            vec!["upload", "download", "download-folder", "resume", "browse"],
+            "browse enabled: the same four, plus `browse`"
+        );
+    }
+
+    /// #1672 (review of #1679) — the daemon's side of the split, locked. The
+    /// two `files_*` tests above prove the child carries nothing and the seam
+    /// follows the config; neither proves `detect()` ASSIGNS it. With the
+    /// three assignments inline in the `OnceLock` closure, deleting
+    /// `caps.files = files_caps()` left every lib test green while every hello
+    /// shipped an empty `files` and every browser fell back to upload-only —
+    /// and the same latent gap sat under `apps` (#1667) and `rpc`. `detect()`
+    /// cannot be called here (it spawns the probe child), so its closure is
+    /// the named seam `with_config_lists`, and this drives the exact struct
+    /// the driver-free fallback hands it, with the three lists poisoned so an
+    /// assignment that is skipped shows as `stale` surviving. Also the home of
+    /// the "file transfer survives a probe failure" assertion.
+    ///
+    /// ⚠️ On Linux `apps_caps()` performs the daemon's own read-only session
+    /// discovery (`loginctl`, then `wmctrl -m` per candidate display). The
+    /// assertion on `apps` does not depend on what it finds — `status` is a
+    /// property of the build — which is what makes calling the real seam,
+    /// rather than a copy with the sources injected, the honest choice here.
+    #[test]
+    fn the_daemon_assigns_every_config_list() {
+        let mut base = compute_caps(false, false);
+        base.rpc = vec!["stale".into()];
+        base.apps = vec!["stale".into()];
+        base.files = vec!["stale".into()];
+        let caps = with_config_lists(base);
+
+        assert_eq!(
+            caps.files,
+            files_caps(),
+            "`files` must be the daemon's list, assigned over whatever the probe path carried"
+        );
+        assert!(
+            caps.files.iter().any(|f| f == "upload") && caps.files.iter().any(|f| f == "resume"),
+            "file transfer must survive a probe failure — this IS the fallback struct: {:?}",
+            caps.files
+        );
+        assert_eq!(
+            caps.rpc,
+            rpc_caps(),
+            "`rpc` must be the daemon's list, assigned over whatever the probe path carried"
+        );
+        assert!(
+            !caps.apps.iter().any(|a| a == "stale"),
+            "`apps` must be overwritten by the daemon, never kept from the probe path: {:?}",
+            caps.apps
+        );
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        assert!(
+            caps.apps.iter().any(|a| a == "status"),
+            "a build with a Remote Apps backend advertises `status` whatever the host is doing: {:?}",
+            caps.apps
         );
     }
 
@@ -2262,8 +2408,16 @@ mod tests {
         assert_eq!(merged.probe_ms, Some(3986));
         assert!(merged.probe_cached);
         assert!(
-            merged.files.iter().any(|f| f == "upload"),
-            "files are recomputed, never cached: {:?}",
+            !merged.files.iter().any(|f| f == "stale"),
+            "files never come from the cache: {:?}",
+            merged.files
+        );
+        // #1672 — and the merge does not compute them either: like `apps`
+        // and `rpc`, `detect()` assigns them in the daemon after the merge,
+        // so a hit and a miss reach the hello by the same line.
+        assert!(
+            merged.files.is_empty(),
+            "the merge leaves `files` to detect(): {:?}",
             merged.files
         );
         assert_ne!(
