@@ -321,6 +321,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Ask the OS to stay awake so this device stays reachable (FR-55). `on-ac` is the setting a laptop usually wants. A live remote-control or SSH session ALWAYS holds the machine awake regardless of this. ⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS limit, not a setting. Default: never.",
     },
     KeyMeta {
+        key: "companion_autostart",
+        group: Group::Device,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "FR-84 - whether the service opens the desktop companion once after installation (the Welcome tour) and keeps it registered to start at login (Windows: the `Roomler Desktop` Run value). Off = neither; the companion still runs when someone opens it. A person's own 'Start at login' choice is separate and needs no admin. Takes effect at the next service start. Default: on.",
+    },
+    KeyMeta {
         key: "remote_config_enabled",
         group: Group::Access,
         tier: Tier::Essential,
@@ -1580,6 +1588,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         } else {
             cfg.power_policy.clone()
         }),
+        "companion_autostart" => Some(fmt_bool(cfg.companion_autostart)),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "local_restart_enabled" => Some(fmt_bool(cfg.local_restart_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
@@ -1795,6 +1804,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
             cfg.power_policy = v;
         }
+        // FR-84 D6 — clearing returns to ON, the built-in default.
+        "companion_autostart" => cfg.companion_autostart = parse_bool_or(value, true)?,
         // Same fail-safe direction, and note WHERE this is settable from:
         // locally (this surface — CLI, desktop companion), never from a
         // server push. A future config-push handler must reject this field
@@ -3915,6 +3926,61 @@ mod localapi_pipe_pool_surface_tests {
             current_value(&cfg, "localapi_pipe_pool"),
             None,
             "empty clears too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod companion_autostart_surface_tests {
+    use super::{apply, current_value, entry_for};
+
+    /// FR-84 D6 — `companion_autostart` is the kill switch for the whole of
+    /// D6's launch behaviour, so it has to be a real surface key: default ON,
+    /// echoed as a plain bool, a restart-bound Device key (the Run value is
+    /// synced and the post-install launch decided at service start), and
+    /// clearing it returns to ON rather than OFF. Written against the surface
+    /// API only, so on a tree that does not register the key it compiles and
+    /// fails with "unknown or non-editable config key".
+    #[test]
+    fn companion_autostart_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        let entry = entry_for(&cfg, "companion_autostart").expect("a registered surface key");
+        assert_eq!(entry.kind, "bool");
+        assert_eq!(entry.group, "device");
+        assert_eq!(entry.tier, "standard");
+        assert!(
+            entry.restart_required,
+            "read at service start: the Run-value sync and the launch-once"
+        );
+        assert_eq!(entry.default.as_deref(), Some("true"), "on by default");
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true")
+        );
+
+        apply(&mut cfg, "companion_autostart", Some("false")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "companion_autostart", Some(" ON ")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true")
+        );
+
+        apply(&mut cfg, "companion_autostart", Some("off")).unwrap();
+        assert!(apply(&mut cfg, "companion_autostart", Some("sometimes")).is_err());
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("false"),
+            "a rejected set is a no-op"
+        );
+        apply(&mut cfg, "companion_autostart", None).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true"),
+            "cleared = the built-in default, which is ON"
         );
     }
 }

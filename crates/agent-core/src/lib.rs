@@ -23,9 +23,14 @@
 pub mod acl;
 pub mod appdirs;
 pub mod apps_config;
+/// FR-84 D6 — the companion's login-start registration (Run value, XDG
+/// entry), shared so the daemon and the companion spell it identically.
+pub mod companion_autostart;
 pub mod config;
 pub mod config_surface;
 pub mod crash_recorder;
+/// FR-84 D6 — the companion's per-user state (Welcome done, login opt-out).
+pub mod desktop_state;
 pub mod enrollment;
 /// FR-84 D4 — the `files_dir` validator: shape (shared with the config
 /// surface), placement (the SYSTEM/root-inside-the-active-profile rule) and

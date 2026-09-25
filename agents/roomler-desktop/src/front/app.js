@@ -9,8 +9,11 @@
  *
  * Views are sections of index.html (`#view-<name>`), one visible at a
  * time. Routes are `#/overview`, `#/devices`, `#/tunnels`, `#/recordings`,
- * `#/settings`, `#/onboarding`; tray.rs navigates by evaluating
- * `location.hash`.
+ * `#/settings`, `#/onboarding`, `#/welcome`; tray.rs navigates by evaluating
+ * `location.hash`. FR-84 D6: the view the app was LAUNCHED on (`--view=`,
+ * `--first-run`, a first run's Welcome) comes from `cmd_launch_intent`, read
+ * once before the first route is applied — an eval from Rust during setup can
+ * run before this page exists and be lost.
  *
  * Central pollers (one LocalAPI/status source instead of one per view):
  *   - `cmd_status` every 10 s      → store key `status`
@@ -88,7 +91,7 @@ window.Roomler = (function () {
 
   /* ── router ─────────────────────────────────────────────────────── */
 
-  const VIEWS = ['overview', 'devices', 'tunnels', 'recordings', 'settings', 'onboarding'];
+  const VIEWS = ['overview', 'devices', 'tunnels', 'recordings', 'settings', 'onboarding', 'welcome'];
   // The pre-overhaul front was one page per file and tray.rs navigated by
   // filename hash; map those so any stale caller still lands somewhere sane.
   const LEGACY = {
@@ -155,8 +158,28 @@ window.Roomler = (function () {
 
   /* ── boot ───────────────────────────────────────────────────────── */
 
-  document.addEventListener('DOMContentLoaded', () => {
+  /* FR-84 D6 — the view this process was launched on, asked for ONCE. An
+   * older/absent command (a stale front against a newer shell, or the test
+   * harness) just means "no intent". */
+  async function applyLaunchIntent() {
+    try {
+      const intent = await invoke('cmd_launch_intent');
+      if (intent && typeof intent.view === 'string' && VIEWS.includes(intent.view)) {
+        const target = '#/' + intent.view;
+        if (window.location.hash !== target) {
+          // replaceState: the launch view is where the app starts, not a
+          // step a Back gesture should undo.
+          history.replaceState(null, '', target);
+        }
+      }
+    } catch (e) {
+      console.debug('no launch intent', e);
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', async () => {
     window.addEventListener('hashchange', applyRoute);
+    await applyLaunchIntent();
     applyRoute();
 
     on('status', paintChrome);
@@ -182,5 +205,8 @@ window.Roomler = (function () {
     navigate,
     currentView,
     refreshStatus: pollStatus,
+    // FR-84 D6 — the Welcome's "waiting for an address" loop asks for a fresh
+    // device view instead of waiting out the 2 s poll.
+    refreshDeviceView: pollDeviceView,
   };
 })();

@@ -1402,7 +1402,7 @@ async fn daemon_main() -> Result<()> {
         Command::Displays => displays_cmd().await,
         #[cfg(feature = "system-context")]
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
-        Command::Service { action } => service_cmd(action).await,
+        Command::Service { action } => service_cmd(action, &config_path).await,
         Command::ServiceRun => service_run_cmd().await,
         Command::Netd => netd_cmd().await,
         Command::CleanupLegacyInstall {
@@ -3117,7 +3117,47 @@ async fn run_cmd(
         };
         #[cfg(not(all(target_os = "windows", feature = "system-context")))]
         let respawn_ctx = roomlerd::companion::RespawnContext::UserSession;
-        tokio::spawn(roomlerd::companion::refresh_if_stale(respawn_ctx));
+
+        // FR-84 D6 — after the refresh, in the same task (a launch must never
+        // race a swap of the file it launches): the per-user login-start
+        // self-heal and the one-shot post-install launch. On Windows a
+        // registered SCM service owns both — its host reads this same config,
+        // is the one process that can write HKLM, and launches with the
+        // console user's own non-elevated token where this worker may hold
+        // the elevated one. Everywhere else (the per-user Scheduled Task, the
+        // Linux systemd unit) the worker is the launcher.
+        // RUNNING, not merely registered: a stopped leftover registration
+        // (a per-user install over a half-removed per-machine one) has no
+        // host to do it, and this worker must.
+        #[cfg(target_os = "windows")]
+        let scm_owns_companion = matches!(
+            roomlerd::win_service::status(),
+            Ok(roomlerd::win_service::InstalledStatus::Running
+                | roomlerd::win_service::InstalledStatus::StartPending)
+        );
+        #[cfg(not(target_os = "windows"))]
+        let scm_owns_companion = false;
+        let companion_autostart = cfg.companion_autostart;
+        let launch_owner =
+            (!scm_owns_companion).then(|| roomlerd::companion::LaunchOwner::Worker {
+                config_path: config_path.clone(),
+                companion_autostart,
+                // Read NOW, before this run can promote it five minutes in.
+                lkgv_unset: cfg.last_known_good_version.is_none(),
+            });
+        tokio::spawn(async move {
+            roomlerd::companion::refresh_if_stale(respawn_ctx).await;
+            #[cfg(target_os = "windows")]
+            if !scm_owns_companion {
+                let _ = tokio::task::spawn_blocking(move || {
+                    roomlerd::companion::sync_user_autostart_logged(companion_autostart)
+                })
+                .await;
+            }
+            if let Some(owner) = launch_owner {
+                roomlerd::companion::launch_once_after_install(owner).await;
+            }
+        });
     }
 
     // Install the liveness watchdog. Pumps tick after every iteration;
@@ -4115,16 +4155,34 @@ async fn run_cmd(
     Ok(restart_exit)
 }
 
-async fn service_cmd(action: ServiceAction) -> Result<()> {
+async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()> {
     match action {
         ServiceAction::Install { as_service: false } => {
             service::install().context("installing auto-start hook")?;
             println!("Auto-start registered. The agent will launch on next login.");
+            // FR-84 D6 — the per-user install's companion login start
+            // (`HKCU\…\Run`): the MSI's RegisterAutostart CA runs this as the
+            // installing user. A fresh install has no companion beside us yet
+            // (the installer places it after the MSI) and writes nothing; the
+            // worker's own start and the companion's first run add it then.
+            #[cfg(target_os = "windows")]
+            roomlerd::companion::sync_user_autostart_logged(
+                config::read_if_present(config_path).is_none_or(|c| c.companion_autostart),
+            );
+            #[cfg(not(target_os = "windows"))]
+            let _ = config_path;
             Ok(())
         }
         ServiceAction::Uninstall { as_service: false } => {
             service::uninstall().context("removing auto-start hook")?;
             println!("Auto-start removed.");
+            // FR-84 D6 — and the companion's per-user login start with it.
+            #[cfg(target_os = "windows")]
+            match roomlerd::companion::remove_login_autostart(false) {
+                Ok(true) => println!("Companion login start removed."),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "companion login start"),
+            }
             Ok(())
         }
         ServiceAction::Status { as_service: false } => {
@@ -4168,6 +4226,14 @@ fn service_install_as_service() -> Result<()> {
         win_service::SERVICE_DISPLAY_NAME,
         win_service::NEW_SERVICE_NAME
     );
+    // FR-84 D6 — the machine-wide companion login start (`HKLM\…\Run`),
+    // written here because this is the elevated step every perMachine install
+    // and upgrade runs (the MSI's RegisterService CA, as LocalSystem). A fresh
+    // install has no companion beside us yet and writes nothing; the SCM
+    // host's start-up self-heal adds it once the installer has placed it.
+    roomlerd::companion::sync_machine_autostart_logged(
+        roomlerd::companion::scm_companion_autostart(),
+    );
     Ok(())
 }
 
@@ -4183,6 +4249,12 @@ fn service_install_as_service() -> Result<()> {
 fn service_uninstall_as_service() -> Result<()> {
     win_service::uninstall().context("deregistering Roomler")?;
     println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
+    // FR-84 D6 — no service, no machine-wide companion login start.
+    match roomlerd::companion::remove_login_autostart(true) {
+        Ok(true) => println!("Companion login start removed."),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "companion login start"),
+    }
     Ok(())
 }
 
