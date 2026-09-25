@@ -8449,6 +8449,7 @@ dependencies = [
  "directories",
  "gethostname 0.5.0",
  "roomler-cli",
+ "roomler-node-core",
  "roomler-setup-core",
  "roomlerd",
  "serde",

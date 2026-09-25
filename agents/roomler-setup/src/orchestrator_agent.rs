@@ -100,6 +100,17 @@ impl AdvancedOptions {
         Ok(())
     }
 
+    /// FR-84 S2 — resolve the options the SPA left unset from the install
+    /// flavour, before [`Self::apply_to`]. Today that is one key: the
+    /// overlay follows the flavour (see [`overlay_enabled_default`]). The
+    /// SPA sends the box as the operator saw it, so this is a belt for a
+    /// caller that never sent the field — and a second place the default
+    /// is written down, next to the one that consumes it.
+    fn with_flavour_defaults(mut self, flavour: WindowsInstallFlavour) -> Self {
+        self.overlay_enabled = overlay_enabled_default(self.overlay_enabled, flavour);
+        self
+    }
+
     /// Write the selected options into the freshly-enrolled config via
     /// the same per-key registry the desktop editor uses.
     fn apply_to(&self, cfg: &mut roomlerd::config::AgentConfig) -> Result<(), String> {
@@ -484,8 +495,9 @@ async fn run_install_inner(
         .await
         .map_err(|e| format!("enrollment: {e}"))?;
     // S2 — fold the wizard's advanced options into the enrolled config
-    // before it's written (route lists already validated pre-MSI).
-    advanced.apply_to(&mut cfg)?;
+    // before it's written (route lists already validated pre-MSI). An
+    // overlay choice the SPA did not send follows the flavour (FR-84 S2).
+    advanced.with_flavour_defaults(wfx).apply_to(&mut cfg)?;
     let agent_id = cfg.agent_id.clone();
     let tenant_id = cfg.tenant_id.clone();
     roomlerd::config::save(&config_path, &cfg).map_err(|e| format!("write config.toml: {e}"))?;
@@ -677,6 +689,25 @@ pub fn force_kill_msi() -> Result<(), String> {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// FR-84 S2 — the overlay default when the wizard sent no explicit choice.
+///
+/// A perMachine install runs the daemon as an SCM service, which can create
+/// the overlay's Wintun adapter, so the private network is ON unless the
+/// operator turned it off: the mesh is the reason the always-on daemon
+/// exists, and an install that leaves it off by default was the first thing
+/// every operator had to go back and fix. A perUser install's worker runs
+/// with the interactive user's UAC-filtered token (`RunLevel` LeastPrivilege
+/// on its Scheduled Task) and `WintunCreateAdapter` refuses it, so the key
+/// is left UNTOUCHED there — the agent's own default (off) — rather than
+/// written as a promise the daemon cannot keep. An explicit choice always
+/// wins: the box the operator saw is the box that lands in config.toml.
+fn overlay_enabled_default(explicit: Option<bool>, flavour: WindowsInstallFlavour) -> Option<bool> {
+    explicit.or(match flavour {
+        WindowsInstallFlavour::PerMachine => Some(true),
+        WindowsInstallFlavour::PerUser => None,
+    })
+}
 
 /// Map a daemon [`Role`] to the agent's install-flavour enum + the
 /// SystemContext flag — the typed successor of the legacy
@@ -1040,5 +1071,76 @@ mod tests {
         let (wfx, sysctx) = flavour_parts(Role::DaemonSystem).expect("map");
         assert_eq!(wfx, WindowsInstallFlavour::PerMachine);
         assert!(sysctx);
+    }
+
+    // ----- FR-84 S2: the overlay default follows the install flavour -----
+
+    #[test]
+    fn permachine_without_a_choice_turns_the_overlay_on() {
+        assert_eq!(
+            overlay_enabled_default(None, WindowsInstallFlavour::PerMachine),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn peruser_without_a_choice_leaves_the_overlay_untouched() {
+        // Untouched, not `Some(false)`: the wizard writes no promise the
+        // per-user daemon cannot keep, and the agent's own default (off)
+        // stays the one source of that answer.
+        assert_eq!(
+            overlay_enabled_default(None, WindowsInstallFlavour::PerUser),
+            None
+        );
+    }
+
+    #[test]
+    fn an_explicit_overlay_choice_wins_over_the_flavour_default() {
+        assert_eq!(
+            overlay_enabled_default(Some(false), WindowsInstallFlavour::PerMachine),
+            Some(false)
+        );
+        assert_eq!(
+            overlay_enabled_default(Some(true), WindowsInstallFlavour::PerUser),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn overlay_flavour_default_lands_in_the_enrolled_config() {
+        // Through the real apply path on a real config: the belt is only
+        // worth having if the key actually reaches config.toml.
+        let mut cfg = roomlerd::config::test_fixture();
+        cfg.overlay_enabled = false;
+        AdvancedOptions::default()
+            .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
+            .apply_to(&mut cfg)
+            .expect("apply");
+        assert!(cfg.overlay_enabled, "perMachine + no choice → overlay on");
+
+        let mut cfg = roomlerd::config::test_fixture();
+        cfg.overlay_enabled = false;
+        AdvancedOptions::default()
+            .with_flavour_defaults(WindowsInstallFlavour::PerUser)
+            .apply_to(&mut cfg)
+            .expect("apply");
+        assert!(
+            !cfg.overlay_enabled,
+            "perUser + no choice → untouched (off)"
+        );
+
+        let mut cfg = roomlerd::config::test_fixture();
+        cfg.overlay_enabled = false;
+        AdvancedOptions {
+            overlay_enabled: Some(false),
+            ..Default::default()
+        }
+        .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
+        .apply_to(&mut cfg)
+        .expect("apply");
+        assert!(
+            !cfg.overlay_enabled,
+            "an explicit off on perMachine is respected"
+        );
     }
 }

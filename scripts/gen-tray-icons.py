@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the desktop companion's icons from the product's brand mark.
+"""Generate the desktop companion's and the setup wizard's icons from the
+product's brand mark.
 
 Why this exists: the icons shipped as 1x1 PLACEHOLDERS (67-byte PNGs). Windows
 tolerated them; macOS did not — `tao`'s tray setup panics before the app
@@ -9,17 +10,26 @@ window ever appears:
     pixels supplied by the `rgba` argument (0)
 
 and a panic in that callback "cannot unwind", so the process aborts. The
-companion could not start on macOS at all.
+companion could not start on macOS at all. The setup wizard carried the same
+1x1 placeholders for its whole life (its build.rs still writes them when the
+files are missing), so the one EXE a new user double-clicks had a blank icon
+in Explorer and the taskbar — FR-84 S2 gave it a real one.
 
 Generated rather than hand-drawn so the mark stays in step with
 `ui/public/favicon.svg` (a #1565C0 rounded square with a white R) and so
 regenerating is a command rather than an afternoon in a paint program.
 
-    python3 scripts/gen-tray-icons.py
+    python3 scripts/gen-tray-icons.py                   # the companion (default)
+    python3 scripts/gen-tray-icons.py --target setup    # the setup wizard
 
-Requires Pillow. Writes into agents/roomler-desktop/icons/.
+Requires Pillow. `desktop` writes agents/roomler-desktop/icons/ (app icon,
+menu-bar template, .ico). `setup` writes agents/roomler-setup/icons/ — the
+same R on GREEN (#2E7D32), so a wizard and a companion side by side in a
+taskbar are told apart at a glance; app icon + .ico only, the wizard has no
+tray. CI asserts both sets are real (ci.yml "Assert the icons are real").
 """
 
+import argparse
 import pathlib
 import sys
 
@@ -28,8 +38,21 @@ try:
 except ImportError:  # pragma: no cover - developer tooling
     sys.exit("this needs Pillow:  pip install pillow")
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "agents/roomler-desktop/icons"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 BRAND = (21, 101, 192, 255)  # #1565C0, from favicon.svg
+SETUP = (46, 125, 50, 255)  # #2E7D32 — the wizard's green (operator, 2026-09-25)
+WHITE = (255, 255, 255, 255)
+
+# target → (output dir, background, whether a menu-bar/tray icon is written)
+TARGETS = {
+    "desktop": (ROOT / "agents/roomler-desktop/icons", BRAND, True),
+    "setup": (ROOT / "agents/roomler-setup/icons", SETUP, False),
+}
+
+# The classic Windows sizes, in one file. 256 is stored with a width byte of
+# 0 — what the CI guard looks for.
+ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)]
+
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -70,25 +93,38 @@ def _mark(size: int, fg, bg):
     return img.resize((size, size), Image.LANCZOS)
 
 
-def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--target",
+        choices=sorted(TARGETS),
+        default="desktop",
+        help="which icon set to write (default: desktop, the companion)",
+    )
+    args = ap.parse_args(argv)
+    out, bg, with_tray = TARGETS[args.target]
+    out.mkdir(parents=True, exist_ok=True)
 
     # App icon — full colour.
-    _mark(512, (255, 255, 255, 255), BRAND).save(OUT / "icon.png")
+    _mark(512, WHITE, bg).save(out / "icon.png")
+    written = ["icon.png"]
 
-    # Menu-bar icon. macOS TEMPLATE images use the alpha channel only and are
-    # tinted by the system, so this is black-on-transparent: one asset that is
-    # correct in both the light and the dark menu bar. 44px = 22pt @2x.
-    tray = _mark(44, (0, 0, 0, 0), (0, 0, 0, 255))
-    tray.save(OUT / "tray.png")
+    if with_tray:
+        # Menu-bar icon. macOS TEMPLATE images use the alpha channel only and
+        # are tinted by the system, so this is black-on-transparent: one asset
+        # that is correct in both the light and the dark menu bar. 44px =
+        # 22pt @2x.
+        tray = _mark(44, (0, 0, 0, 0), (0, 0, 0, 255))
+        tray.save(out / "tray.png")
+        written.append("tray.png")
 
     # Windows wants the classic sizes in one file.
-    _mark(256, (255, 255, 255, 255), BRAND).save(
-        OUT / "icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)]
-    )
+    _mark(256, WHITE, bg).save(out / "icon.ico", sizes=ICO_SIZES)
+    written.append("icon.ico")
 
-    for f in ("icon.png", "tray.png", "icon.ico"):
-        p = OUT / f
+    print(f"{args.target} -> {out}")
+    for f in written:
+        p = out / f
         with Image.open(p) as im:
             print(f"  {f}: {im.size[0]}x{im.size[1]} {im.mode}, {p.stat().st_size} bytes")
 
