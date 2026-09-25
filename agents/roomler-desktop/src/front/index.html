@@ -185,12 +185,14 @@
         </div>
       </section>
 
-      <!-- Devices -->
+      <!-- Devices (FR-84 D5c): the devices this one's private network lets it
+           see, as the server lists them (devices.js + grid.js), and the mesh
+           graph of the same set (mesh.js). -->
       <section id="view-devices" class="view" hidden>
         <div class="view-head"><h2>Devices</h2></div>
         <p class="view-sub">
-          Devices in your network and how this one reaches them, live from the
-          device service.
+          The devices your private network lets this one see — itself included —
+          and how it reaches each of them right now.
         </p>
 
         <div id="devices-unavailable" class="banner banner-warn" hidden>
@@ -204,24 +206,84 @@
         </div>
 
         <div id="devices-content" hidden>
-          <div class="card">
-            <p id="dv-peers-empty" class="muted small" style="margin: 0" hidden></p>
+          <div class="card" id="dv-card">
+            <div class="card-title-row">
+              <h3>Devices</h3>
+              <span id="dv-total" class="muted small"></span>
+            </div>
+            <div class="dv-toolbar">
+              <input
+                type="search"
+                id="dv-search"
+                placeholder="Search name, tag, IP, MagicDNS…"
+                aria-label="Search devices"
+                spellcheck="false"
+                autocapitalize="off"
+                autocomplete="off"
+              />
+              <select id="dv-org" aria-label="Organization" title="Organization" hidden></select>
+              <label class="dv-size muted small">
+                Rows
+                <select id="dv-page-size" aria-label="Rows per page">
+                  <option value="10">10</option>
+                  <option value="25" selected>25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+              <button type="button" id="dv-cols-btn" class="sm" title="Show, hide and reorder columns">
+                Columns
+              </button>
+              <button type="button" id="dv-refresh" class="sm">Refresh</button>
+            </div>
+            <p id="dv-grid-status" class="muted small dv-note" hidden></p>
+            <p id="dv-grid-error" class="banner banner-warn small" hidden></p>
             <div class="tbl-wrap">
-              <table id="dv-peers-table" class="tbl" hidden>
-                <thead>
-                  <tr>
-                    <th>Device</th>
-                    <th>Overlay IP</th>
-                    <th>Connection</th>
-                    <th>Ping</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody id="dv-peers-body"></tbody>
+              <table id="dv-grid" class="tbl dv-grid">
+                <thead></thead>
+                <tbody></tbody>
               </table>
+            </div>
+            <div class="dv-pager">
+              <span id="dv-pager-range" class="muted small"></span>
+              <button type="button" id="dv-prev" class="sm" aria-label="Previous page">‹ Prev</button>
+              <button type="button" id="dv-next" class="sm" aria-label="Next page">Next ›</button>
+            </div>
+          </div>
+
+          <div class="card" id="dv-mesh-card">
+            <div class="card-title-row">
+              <h3>Mesh</h3>
+              <span id="dv-mesh-meta" class="muted small"></span>
+            </div>
+            <p id="dv-mesh-note" class="muted small dv-note">Loading the mesh graph…</p>
+            <div id="dv-mesh-body" hidden>
+              <div id="dv-mesh-controls" class="mesh-controls"></div>
+              <div id="dv-mesh-wrap" class="mesh-wrap">
+                <svg id="dv-mesh" class="mesh-svg" role="img" aria-label="Mesh graph"></svg>
+                <div id="dv-mesh-tip" class="mesh-tooltip" hidden></div>
+              </div>
+              <div id="dv-mesh-legend" class="mesh-legend muted small"></div>
             </div>
           </div>
         </div>
+
+        <!-- The column chooser (grid.js): tick to show, drag or ▲▼ to reorder —
+             the buttons because drag-and-drop is unreliable in WebKitGTK. -->
+        <dialog id="dv-cols-dialog" class="cols-dialog" aria-label="Columns">
+          <form method="dialog">
+            <h3>Columns</h3>
+            <p class="muted small" style="margin: 0">
+              Tick to show a column; drag a row or use ▲ ▼ to reorder. Saved per
+              organization on this computer.
+            </p>
+            <ul data-role="list" class="cols-list"></ul>
+            <div class="actions">
+              <button type="button" data-role="reset">Reset</button>
+              <button type="submit" value="done" class="primary">Done</button>
+            </div>
+          </form>
+        </dialog>
       </section>
 
       <!-- Tunnels -->
@@ -620,6 +682,11 @@
 
     <script src="app.js"></script>
     <script src="overview.js"></script>
+    <!-- FR-84 D5c: the mesh helpers (generated from ui/src/utils/mesh.ts), the
+         grid and the graph, then the page that uses them. -->
+    <script src="mesh-util.js"></script>
+    <script src="grid.js"></script>
+    <script src="mesh.js"></script>
     <script src="devices.js"></script>
     <script src="tunnels.js"></script>
     <script src="recordings.js"></script>

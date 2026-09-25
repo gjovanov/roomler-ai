@@ -3270,6 +3270,21 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         }
         std::sync::Arc::new(std::sync::Mutex::new(rows))
     };
+    // FR-84 D5b — the same enrollments' HTTP identities (server URL + agent
+    // token), for the LocalAPI `Devices` / `Mesh` verbs the companion's
+    // Devices page asks. Seeded from the SAME config rows as the status
+    // registry above, so the list is asked with exactly the credential the
+    // org's WS loop runs on; an entry the daemon refused to run is disabled.
+    let org_http: roomlerd::self_view::OrgHttpRegistry = {
+        let mut rows = vec![roomlerd::self_view::OrgHttp::primary(&cfg)];
+        for (org, problem) in org_partition.iter() {
+            rows.push(roomlerd::self_view::OrgHttp::secondary(
+                org,
+                problem.is_none(),
+            ));
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(rows))
+    };
 
     // FR-27 — ONE registry for the whole daemon; each signalling loop stores
     // its own kill channel per session, so a multi-org host routes a Disconnect
@@ -3363,6 +3378,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     .with_rc_sessions(rc_sessions.clone())
     .with_orgs(org_registry.clone())
     .with_org_views(org_views.clone())
+    // FR-84 D5b — each enrollment's server + agent token, for the
+    // companion's device list and mesh.
+    .with_org_http(org_http.clone())
     // FR-51 P4 — surface the enrollment's nature in `roomler status`.
     .with_ephemeral(cfg.ephemeral);
     // FR-85 — the local recording verbs: this daemon launches `roomlerd
@@ -3537,6 +3555,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         let shutdown = shutdown_rx.clone();
         let broker = consent_broker.clone();
         let registry = org_registry.clone();
+        let org_http_for_join = org_http.clone();
         let org_views_for_join = org_views.clone();
         let enc = encoder_preference;
         let config_path_for_join = config_path.clone();
@@ -3606,6 +3625,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                         overlay_mode: org.overlay_mode.wire(),
                     });
                 }
+                // FR-84 D5b — and its HTTP identity, replacing any row for
+                // the same label (a re-spawn must not keep the old token).
+                roomlerd::self_view::upsert(
+                    &org_http_for_join,
+                    roomlerd::self_view::OrgHttp::secondary(&org, true),
+                );
                 // The per-org config is synthesized from the CURRENT on-disk
                 // config, so operator knobs (including `overlay_multi_org`)
                 // apply to the newcomer exactly as they do to boot-time orgs.

@@ -585,14 +585,24 @@ pub async fn cmd_open_roomler(app: tauri::AppHandle) -> Result<(), String> {
     open_web_or_browser(&app, &url)
 }
 
-/// S2/S7 — open the remote-control viewer for one of THIS tenant's
-/// agent-backed devices (`{server}/tenant/{tid}/agent/{aid}/remote`) —
+/// S2/S7 — open the remote-control viewer for one of the agent-backed
+/// devices this one can see (`{server}/tenant/{tid}/agent/{aid}/remote`) —
 /// in-app on Windows, default browser elsewhere. The URL is constructed
 /// ONLY from this device's own configured server origin + hex-validated
 /// ids — never from peer-supplied strings — so a hostile device name
 /// can't steer the view to a foreign site.
+///
+/// FR-84 D5c — `org` names the enrollment the device belongs to (the Devices
+/// page lists one org at a time). A secondary org's device lives on THAT
+/// org's server and tenant, which are read from this device's own
+/// `[[orgs]]` entry — still never from anything the page or a peer supplied.
+/// Absent / empty / `primary` = the primary enrollment, as before.
 #[tauri::command]
-pub async fn cmd_open_remote(app: tauri::AppHandle, agent_id: String) -> Result<(), String> {
+pub async fn cmd_open_remote(
+    app: tauri::AppHandle,
+    agent_id: String,
+    org: Option<String>,
+) -> Result<(), String> {
     let aid = agent_id.trim().to_ascii_lowercase();
     if aid.len() != 24 || !aid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid agent id".to_string());
@@ -601,19 +611,42 @@ pub async fn cmd_open_remote(app: tauri::AppHandle, agent_id: String) -> Result<
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let tid = cfg.tenant_id.trim().to_ascii_lowercase();
-        if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("this device's config has no valid tenant id".to_string());
-        }
-        let server = cfg.server_url.trim().trim_end_matches('/').to_string();
-        if !server.starts_with("https://") && !server.starts_with("http://") {
-            return Err("this device's config has no valid server URL".to_string());
-        }
-        Ok(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
+        let (server, tid) = remote_target(&cfg, org.as_deref())?;
+        Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
     .await
     .map_err(|e| format!("task join: {e}"))??;
     open_web_or_browser(&app, &url)
+}
+
+/// The `(server origin, tenant id)` a "View screen" for a device in `org`
+/// opens against — the primary's scalar identity, or the named `[[orgs]]`
+/// entry's. Both validated: an http(s) origin and a 24-hex tenant id. Pure
+/// over the loaded config, so the resolution is unit-tested.
+fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String), String> {
+    let label = org
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL);
+    let (server, tid) = match label {
+        None => (cfg.server_url.as_str(), cfg.tenant_id.as_str()),
+        Some(label) => {
+            let entry = cfg
+                .orgs
+                .iter()
+                .find(|o| o.label == label)
+                .ok_or_else(|| format!("this device has no enrollment labelled {label:?}"))?;
+            (entry.server_url.as_str(), entry.tenant_id.as_str())
+        }
+    };
+    let tid = tid.trim().to_ascii_lowercase();
+    if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("this device's config has no valid tenant id for that organization".into());
+    }
+    let server = server.trim().trim_end_matches('/').to_string();
+    if !server.starts_with("https://") && !server.starts_with("http://") {
+        return Err("this device's config has no valid server URL for that organization".into());
+    }
+    Ok((server, tid))
 }
 
 /// S2 — what [`cmd_tail_log`] returns to the log-viewer card.
@@ -1438,6 +1471,99 @@ pub async fn cmd_pick_record_dir(
     .map_err(|e| format!("task join: {e}"))?
 }
 
+// ─── the Devices page (FR-84 D5c) ──────────────────────────────────
+
+/// What a rejected [`cmd_devices`] / [`cmd_mesh`] carries: a JSON string
+/// `{code, message, status?}`, so the page picks its fallback by CAUSE — an
+/// old service or an old server falls back to the peers table with an
+/// "update" note; anything else keeps the last good page and says why —
+/// instead of sniffing prose.
+#[derive(Debug, Serialize)]
+struct DirectoryFailure<'a> {
+    code: &'a str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+}
+
+/// Shape a [`localapi::DirectoryError`] for the page, and record it in the
+/// refresh ledger so a failing list is in the desktop log (rate-limited).
+fn directory_failure(surface: &'static str, stage: &str, e: localapi::DirectoryError) -> String {
+    let message = match &e {
+        localapi::DirectoryError::Upstream { message, .. } => message.clone(),
+        localapi::DirectoryError::UnsupportedDaemon { .. } => {
+            "The device service on this machine predates the device list — update it to see \
+             every device your network lets this one see."
+                .to_string()
+        }
+        localapi::DirectoryError::Io(io) => describe_io(stage, io),
+    };
+    let failure = DirectoryFailure {
+        code: e.code(),
+        message,
+        status: e.status(),
+    };
+    refresh_failed(surface, format!("{}: {}", failure.code, failure.message));
+    serde_json::to_string(&failure).unwrap_or_else(|_| {
+        r#"{"code":"daemon_error","message":"unencodable failure"}"#.to_string()
+    })
+}
+
+/// FR-84 D5c — one page of the devices THIS device's private network lets
+/// it see, itself included, as the org's server lists them (asked by the
+/// daemon with the org's agent token — the companion never holds one).
+/// Search, sort and paging run on the server. `org` = an enrollment label;
+/// absent = the primary.
+///
+/// Rejects with a [`DirectoryFailure`] JSON string. An old daemon's "unknown
+/// variant" arrives as `unsupported_daemon`, a server without the route as
+/// `unsupported_server`.
+#[tauri::command]
+pub async fn cmd_devices(
+    org: Option<String>,
+    page: Option<u64>,
+    per_page: Option<u64>,
+    q: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
+) -> Result<localapi::DevicesPage, String> {
+    const SURFACE: &str = "devices";
+    let mut client = localapi::connect()
+        .await
+        .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
+    let query = localapi::DevicesQuery {
+        page: page.unwrap_or(0),
+        per_page: per_page.unwrap_or(0),
+        q,
+        sort,
+        dir,
+    };
+    match client.devices(org.as_deref().unwrap_or(""), &query).await {
+        Ok(p) => {
+            refresh_ok(SURFACE);
+            Ok(p)
+        }
+        Err(e) => Err(directory_failure(SURFACE, "devices", e)),
+    }
+}
+
+/// FR-84 D5c — the mesh graph for the same set. `enabled: false` in the
+/// answer is the server's statistics being off (data, not a failure).
+#[tauri::command]
+pub async fn cmd_mesh(org: Option<String>) -> Result<localapi::MeshView, String> {
+    const SURFACE: &str = "mesh";
+    let mut client = localapi::connect()
+        .await
+        .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
+    match client.mesh(org.as_deref().unwrap_or("")).await {
+        Ok(v) => {
+            refresh_ok(SURFACE);
+            Ok(v)
+        }
+        Err(e) => Err(directory_failure(SURFACE, "mesh", e)),
+    }
+}
+
 // ─── refresh failures: said once, on the page and in the log ───────
 
 /// One line naming WHAT failed (`stage`) and HOW — the io error kind and,
@@ -1973,6 +2099,100 @@ mod tests {
             explain_route_edit_error("no declared route with id 'x'"),
             "no declared route with id 'x'",
             "a real daemon refusal surfaces verbatim"
+        );
+    }
+
+    fn two_org_config() -> AgentConfig {
+        serde_json::from_value(serde_json::json!({
+            "server_url": "https://roomler.ai/",
+            "agent_token": "tok",
+            "agent_id": "a1a1a1a1a1a1a1a1a1a1a1a1",
+            "tenant_id": "AAAAAAAAAAAAAAAAAAAAAAAA",
+            "machine_id": "m",
+            "machine_name": "neo",
+            "orgs": [{
+                "label": "acme",
+                "server_url": "https://acme.example",
+                "agent_token": "tok-acme",
+                "agent_id": "b2b2b2b2b2b2b2b2b2b2b2b2",
+                "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb"
+            }, {
+                "label": "broken",
+                "server_url": "ftp://nope",
+                "agent_token": "t",
+                "agent_id": "c3c3c3c3c3c3c3c3c3c3c3c3",
+                "tenant_id": "not-hex"
+            }]
+        }))
+        .expect("a minimal two-org config parses")
+    }
+
+    /// FR-84 D5c — "View screen" on a device of a SECONDARY org opens that
+    /// org's server and tenant, read from this device's own `[[orgs]]` entry;
+    /// no org (or `primary`) is the primary, exactly as before.
+    #[test]
+    fn remote_target_follows_the_devices_org() {
+        let cfg = two_org_config();
+        let primary = (
+            "https://roomler.ai".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        assert_eq!(remote_target(&cfg, None).unwrap(), primary);
+        assert_eq!(remote_target(&cfg, Some("")).unwrap(), primary);
+        assert_eq!(remote_target(&cfg, Some("primary")).unwrap(), primary);
+        assert_eq!(
+            remote_target(&cfg, Some("acme")).unwrap(),
+            (
+                "https://acme.example".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+            )
+        );
+        let unknown = remote_target(&cfg, Some("ghost")).unwrap_err();
+        assert!(unknown.contains("no enrollment labelled"), "{unknown}");
+        // A malformed entry is refused, never opened.
+        assert!(remote_target(&cfg, Some("broken")).is_err());
+    }
+
+    /// FR-84 D5c — a rejected `cmd_devices` is `{code, message, status?}`,
+    /// with the cause the page keys its fallback on.
+    #[test]
+    fn directory_failures_are_json_with_the_cause() {
+        let parse = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap() };
+
+        let v = parse(directory_failure(
+            "devices",
+            "devices",
+            localapi::DirectoryError::Upstream {
+                code: "unauthorized".into(),
+                message: "refused".into(),
+                status: Some(401),
+            },
+        ));
+        assert_eq!(
+            v,
+            serde_json::json!({"code": "unauthorized", "message": "refused", "status": 401})
+        );
+
+        let v = parse(directory_failure(
+            "devices",
+            "devices",
+            localapi::DirectoryError::UnsupportedDaemon {
+                message: "bad request: unknown variant `devices`".into(),
+            },
+        ));
+        assert_eq!(v["code"], "unsupported_daemon");
+        assert!(v.get("status").is_none());
+        assert!(v["message"].as_str().unwrap().contains("predates"));
+
+        let v = parse(directory_failure(
+            "mesh",
+            "connect",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no pipe").into(),
+        ));
+        assert_eq!(v["code"], "daemon_unreachable");
+        assert_eq!(
+            v["message"],
+            "device service not running (no LocalAPI endpoint)"
         );
     }
 }
