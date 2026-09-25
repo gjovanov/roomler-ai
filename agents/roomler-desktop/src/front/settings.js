@@ -54,16 +54,110 @@
    *   bool / tribool / enum:<a|b|c> → a <select>, applied on change;
    *   string / list / json          → text input or textarea + Save.
    * Everything is built with createElement + textContent (no innerHTML).
+   *
+   * FR-84 D2: an entry also carries `group` / `group_label` / `tier` /
+   * `default`, and a per-key `restart_required` that is the daemon's own
+   * truth (before D2 this file kept a LIVE_KEYS set of its own — a copy
+   * that would have gone stale the day a third key went live). With the
+   * metadata the page renders an Essentials section (open) and one
+   * collapsible section per group, in the order the daemon lists them;
+   * without it — a daemon older than D2 — it renders the flat list.
    */
   let cfgLoaded = false;
 
-  /* Keys the daemon puts into force WITHOUT a restart. Kept in sync with
-   * `localclient.rs::config_set` and `RemoteConfigServices::adopt_local`;
-   * everything else on this surface really is read at startup only. */
-  const LIVE_KEYS = new Set(['exec_enabled', 'remote_config_enabled']);
+  /* Which sections the person left open, remembered per user. No record
+   * yet = the defaults: Essentials open, every group collapsed. */
+  const OPEN_GROUPS_KEY = 'roomler-desktop:settings:open-groups';
+  const ESSENTIALS_ID = '__essentials';
+
+  function readOpenGroups() {
+    try {
+      const raw = localStorage.getItem(OPEN_GROUPS_KEY);
+      if (raw === null) return null;
+      const arr = JSON.parse(raw);
+      return new Set(Array.isArray(arr) ? arr.filter((s) => typeof s === 'string') : []);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeOpenGroups(set) {
+    try { localStorage.setItem(OPEN_GROUPS_KEY, JSON.stringify([...set])); } catch {}
+  }
+
+  function defaultOpen(id) {
+    const remembered = readOpenGroups();
+    return remembered ? remembered.has(id) : id === ESSENTIALS_ID;
+  }
+
+  /* `toggle` fires (asynchronously) for programmatic open/close too — a
+   * search opening the sections it matched, the initial render — and none
+   * of those is a preference. Count the programmatic changes and release
+   * the guard on a later task, which runs after the queued toggle events. */
+  let programmaticToggles = 0;
+  function withProgrammaticToggles(fn) {
+    programmaticToggles += 1;
+    try { fn(); } finally {
+      setTimeout(() => { programmaticToggles -= 1; }, 0);
+    }
+  }
+
+  /* Keys saved this session whose change waits for a service restart. The
+   * sticky bar above the cards counts them. FR-84 D3 mounts its "Apply
+   * now" control in `actionsSlot()` and calls `clear()` once the daemon is
+   * back — the hook is `window.Roomler.settingsPendingRestart`. */
+  const pendingRestart = new Set();
+
+  function paintRestartBar() {
+    const bar = $('cfg-restart-bar');
+    if (!bar) return;
+    const n = pendingRestart.size;
+    if (n === 0) { hide(bar); return; }
+    setText(
+      'cfg-restart-text',
+      n === 1
+        ? '1 change takes effect after the service restarts.'
+        : n + ' changes take effect after the service restarts.',
+    );
+    show(bar);
+  }
+
+  window.Roomler.settingsPendingRestart = {
+    keys: () => [...pendingRestart],
+    add(key) { pendingRestart.add(key); paintRestartBar(); },
+    clear() { pendingRestart.clear(); paintRestartBar(); },
+    actionsSlot: () => $('cfg-restart-actions'),
+  };
 
   function cfgRowStatus(row) {
     return row.querySelector('.cfg-row-status');
+  }
+
+  /* "Modified" = the value differs from the built-in default the daemon
+   * reports. `default` is absent both for a key that is unset by default
+   * (the tribools) and from a daemon older than D2 — so the claim is only
+   * made once `group` says the metadata is there at all. */
+  function isModified(entry) {
+    if (!entry.group) return false;
+    const v = entry.value == null ? null : String(entry.value);
+    const d = entry.default == null ? null : String(entry.default);
+    return v !== d;
+  }
+
+  function paintModified(row, entry) {
+    const chip = row.querySelector('.cfg-row-mod');
+    if (!chip) return;
+    chip.hidden = !isModified(entry);
+    const group = row.closest('details.cfg-group');
+    if (group) refreshGroupBadge(group);
+  }
+
+  function refreshGroupBadge(group) {
+    const changed = group.querySelectorAll('.cfg-row-mod:not([hidden])').length;
+    const badge = group.querySelector('.cfg-group-changed');
+    if (!badge) return;
+    badge.hidden = changed === 0;
+    badge.textContent = changed + ' changed';
   }
 
   async function applyCfg(key, raw, row) {
@@ -73,16 +167,21 @@
     const status = cfgRowStatus(row);
     try {
       const entry = await invoke('cmd_config_set', { key, value });
-      // `exec_enabled` and `remote_config_enabled` are LIVE — the daemon
-      // re-seeds them from the file it just wrote (docs/remote-config.md §7b).
-      // Saying "restart" would be wrong in the direction that matters: the
-      // person switching one OFF would believe their refusal is not in force
-      // yet, and either restart a healthy daemon for nothing or assume they
-      // are still exposed.
-      status.textContent = LIVE_KEYS.has(key)
-        ? 'Saved — in effect now, no restart needed.'
-        : 'Saved — takes effect after the service restarts.';
+      // The daemon says per key whether the change is in force already
+      // (the gate-4 flags it re-seeds from the file it just wrote,
+      // docs/remote-config.md §7b) or waits for a restart. Saying "restart"
+      // for a live key would be wrong in the direction that matters: the
+      // person switching one OFF would believe their refusal is not in
+      // force yet, and either restart a healthy daemon for nothing or
+      // assume they are still exposed.
+      if (entry.restart_required) {
+        status.textContent = 'Saved — takes effect after the service restarts.';
+        window.Roomler.settingsPendingRestart.add(key);
+      } else {
+        status.textContent = 'Saved — in effect now, no restart needed.';
+      }
       status.classList.remove('error');
+      paintModified(row, entry);
       return entry;
     } catch (e) {
       status.textContent = String(e);
@@ -107,12 +206,20 @@
     const row = document.createElement('div');
     row.className = 'cfg-row';
     row.style.margin = '10px 0 0';
+    row.dataset.key = entry.key;
+    // What the search box matches against: the key and the description.
+    row.dataset.search = (entry.key + ' ' + (entry.description || '')).toLowerCase();
 
     const head = document.createElement('div');
     const key = document.createElement('span');
     key.className = 'mono small';
     key.textContent = entry.key;
     head.appendChild(key);
+    const mod = document.createElement('span');
+    mod.className = 'chip cfg-chip-mod cfg-row-mod';
+    mod.textContent = 'modified';
+    mod.hidden = !isModified(entry);
+    head.appendChild(mod);
     row.appendChild(head);
 
     const desc = document.createElement('p');
@@ -215,14 +322,142 @@
     return row;
   }
 
+  /* One collapsible section. `entries` are rendered in the order given —
+   * the daemon's display order — and the summary carries the key count and
+   * a "N changed" badge. */
+  function cfgGroup(id, label, entries, open, hint) {
+    const det = document.createElement('details');
+    det.className = 'cfg-group';
+    det.dataset.group = id;
+
+    const sum = document.createElement('summary');
+    const name = document.createElement('span');
+    name.className = 'cfg-group-name';
+    name.textContent = label;
+    const count = document.createElement('span');
+    count.className = 'muted small cfg-group-count';
+    count.textContent = entries.length + (entries.length === 1 ? ' key' : ' keys');
+    const changed = document.createElement('span');
+    changed.className = 'chip cfg-chip-mod cfg-group-changed';
+    changed.hidden = true;
+    sum.append(name, count, changed);
+    det.appendChild(sum);
+
+    if (hint) {
+      const p = document.createElement('p');
+      p.className = 'muted small';
+      p.style.margin = '0';
+      p.textContent = hint;
+      det.appendChild(p);
+    }
+    const body = document.createElement('div');
+    body.className = 'cfg-group-body';
+    for (const entry of entries) body.appendChild(cfgRow(entry));
+    det.appendChild(body);
+    refreshGroupBadge(det);
+
+    det.addEventListener('toggle', () => {
+      if (programmaticToggles > 0) return;
+      const set = readOpenGroups() || new Set([ESSENTIALS_ID]);
+      if (det.open) set.add(id);
+      else set.delete(id);
+      writeOpenGroups(set);
+    });
+    withProgrammaticToggles(() => { det.open = open; });
+    return det;
+  }
+
+  function renderCfg(entries) {
+    const container = $('cfg-rows');
+    const searchWrap = $('cfg-search-wrap');
+    container.replaceChildren();
+    const grouped = entries.some((e) => e.group);
+    if (!grouped) {
+      // A daemon older than FR-84 D2 names no groups: the flat list, as before.
+      hide(searchWrap);
+      for (const entry of entries) container.appendChild(cfgRow(entry));
+      return;
+    }
+    show(searchWrap);
+
+    // Essentials first and open: the handful of keys a person decides on.
+    const essentials = entries.filter((e) => e.tier === 'essential');
+    container.appendChild(
+      cfgGroup(
+        ESSENTIALS_ID,
+        'Essentials',
+        essentials,
+        defaultOpen(ESSENTIALS_ID),
+        'The switches most people decide on. Everything else is below, grouped.',
+      ),
+    );
+
+    // Then one section per group, collapsed, in the order the daemon lists
+    // them (it emits the surface in its display order, so no order table
+    // lives here). Essentials are not repeated inside their group.
+    const groups = new Map();
+    for (const e of entries) {
+      if (e.tier === 'essential') continue;
+      if (!groups.has(e.group)) groups.set(e.group, { label: e.group_label || e.group, entries: [] });
+      groups.get(e.group).entries.push(e);
+    }
+    for (const [id, g] of groups) {
+      container.appendChild(cfgGroup(id, g.label, g.entries, defaultOpen(id)));
+    }
+    applySearch();
+  }
+
+  /* Filters rows by key + description across every section, opens the
+   * sections that hold a match and hides the ones that don't; clearing the
+   * box brings every row back and restores the remembered open state. */
+  let searching = false;
+
+  function applySearch() {
+    const input = $('cfg-search');
+    const container = $('cfg-rows');
+    if (!input || !container) return;
+    const q = input.value.trim().toLowerCase();
+    const wasSearching = searching;
+    searching = q !== '';
+    const groups = container.querySelectorAll('details.cfg-group');
+    if (!searching) {
+      withProgrammaticToggles(() => {
+        for (const det of groups) {
+          det.hidden = false;
+          for (const row of det.querySelectorAll('.cfg-row')) row.hidden = false;
+          if (wasSearching) det.open = defaultOpen(det.dataset.group);
+        }
+      });
+      setText('cfg-search-count', '');
+      return;
+    }
+    let total = 0;
+    withProgrammaticToggles(() => {
+      for (const det of groups) {
+        let hits = 0;
+        for (const row of det.querySelectorAll('.cfg-row')) {
+          const hit = (row.dataset.search || '').includes(q);
+          row.hidden = !hit;
+          if (hit) hits += 1;
+        }
+        det.hidden = hits === 0;
+        if (hits > 0) det.open = true;
+        total += hits;
+      }
+    });
+    setText(
+      'cfg-search-count',
+      total === 0 ? 'No keys match.' : total + (total === 1 ? ' key matches' : ' keys match'),
+    );
+  }
+
   async function loadCfg(force) {
     if (cfgLoaded && !force) return;
     const container = $('cfg-rows');
     if (!container) return;
     try {
       const entries = await invoke('cmd_config_entries');
-      container.replaceChildren();
-      for (const entry of entries) container.appendChild(cfgRow(entry));
+      renderCfg(entries);
       cfgLoaded = true;
     } catch (e) {
       container.replaceChildren();
@@ -351,6 +586,16 @@
         showResult('Could not open the config folder: ' + e, true);
       }
     });
+
+    // FR-84 D2 — the configuration search box (shown once a daemon with
+    // grouped entries has answered).
+    const search = $('cfg-search');
+    if (search) {
+      search.addEventListener('input', applySearch);
+      search.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { search.value = ''; applySearch(); }
+      });
+    }
 
     // S2 — log viewer wiring.
     $('btn-log-refresh').addEventListener('click', () => void refreshLog());

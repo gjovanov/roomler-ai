@@ -892,8 +892,12 @@ impl LocalApiState for DaemonState {
                 if let Some(rc) = self.remote_config.as_ref() {
                     rc.adopt_local(&cfg);
                 }
+                // The surface says per key whether that re-seed made the
+                // change live (FR-84 D2) — log the same truth the client
+                // shows, never a blanket "on restart".
                 tracing::info!(key = %entry.key, value = ?entry.value,
-                    "localapi: config key updated (takes effect on restart)");
+                    applies = if entry.restart_required { "restart" } else { "live" },
+                    "localapi: config key updated");
                 Response::ConfigUpdated { entry }
             }
             Err(message) => Response::Error { message },
