@@ -320,6 +320,163 @@
       >
         <v-icon>mdi-content-copy</v-icon>
       </v-btn>
+      <!-- FR-85 P3c — record the remote screen. The recording is made and kept
+           on the device (a banner shows there while it runs); the menu starts
+           and stops it and downloads what this controller recorded. Offered
+           only when the session's grant holds RECORD. -->
+      <v-chip
+        v-if="rc.phase.value === 'connected' && recRunning"
+        color="error"
+        size="small"
+        variant="flat"
+        class="mr-1"
+        data-testid="rc-rec-chip"
+      >
+        <v-icon start size="x-small">mdi-record</v-icon>
+        REC {{ fmtClock(rec.durationMs.value) }}
+      </v-chip>
+      <v-menu
+        v-if="rc.phase.value === 'connected' && rc.recordGranted.value"
+        :close-on-content-click="false"
+        location="bottom end"
+      >
+        <template #activator="{ props: menuProps }">
+          <v-btn
+            v-bind="menuProps"
+            icon
+            variant="text"
+            size="small"
+            class="mr-1"
+            :color="recRunning ? 'error' : undefined"
+            aria-label="Record this screen"
+            title="Record this screen"
+            data-testid="rc-record-btn"
+            @click="rec.list()"
+          >
+            <v-icon>{{ recRunning ? 'mdi-record-circle' : 'mdi-record-circle-outline' }}</v-icon>
+          </v-btn>
+        </template>
+        <v-card min-width="320" max-width="440" data-testid="rc-record-menu">
+          <v-card-title class="text-subtitle-1">Record this screen</v-card-title>
+          <v-card-text>
+            <p class="text-caption mb-3">
+              The recording is saved on the device, and a banner shows there while it runs.
+            </p>
+            <div v-if="recRunning" class="d-flex align-center ga-2">
+              <v-chip color="error" size="small" variant="flat">
+                <v-icon start size="x-small">mdi-record</v-icon>
+                {{ fmtClock(rec.durationMs.value) }} · {{ formatFileSize(rec.bytes.value) }}
+              </v-chip>
+              <v-btn size="small" color="error" data-testid="rc-record-stop" @click="rec.stop()">
+                Stop
+              </v-btn>
+            </div>
+            <div v-else-if="rec.state.value === 'pending_consent'" class="text-body-2">
+              Waiting for the person at the device to allow it…
+            </div>
+            <div v-else>
+              <v-checkbox
+                v-model="recAudio"
+                label="Include what the computer plays"
+                density="compact"
+                hide-details
+              />
+              <v-btn
+                size="small"
+                color="primary"
+                class="mt-1"
+                data-testid="rc-record-start"
+                @click="rec.start(recAudio)"
+              >
+                Start recording
+              </v-btn>
+            </div>
+            <p
+              v-if="rec.reason.value && !recRunning"
+              class="text-caption mt-2"
+              data-testid="rc-record-reason"
+            >
+              {{ rec.state.value === 'stopped' ? 'Stopped: ' : 'Not recording: ' }}{{ describeRecordReason(rec.reason.value) }}
+            </p>
+            <v-divider class="my-3" />
+            <div class="text-subtitle-2 mb-1">Your recordings on this device</div>
+            <v-list v-if="rec.items.value.length" density="compact" class="py-0">
+              <v-list-item
+                v-for="it in rec.items.value"
+                :key="it.name"
+                :title="it.name"
+                :subtitle="`${fmtClock(it.duration_ms)} · ${formatFileSize(it.bytes)}`"
+              >
+                <template #append>
+                  <v-btn
+                    icon
+                    size="small"
+                    variant="text"
+                    :aria-label="`Download ${it.name}`"
+                    :disabled="rec.download.value?.status === 'active'"
+                    @click="onDownloadRecording(it)"
+                  >
+                    <v-icon>mdi-download</v-icon>
+                  </v-btn>
+                </template>
+              </v-list-item>
+            </v-list>
+            <p v-else class="text-caption">None yet.</p>
+            <div v-if="rec.download.value" class="mt-2" data-testid="rc-record-download">
+              <v-progress-linear
+                :model-value="
+                  rec.download.value.size
+                    ? (100 * rec.download.value.received) / rec.download.value.size
+                    : 0
+                "
+                :color="rec.download.value.status === 'error' ? 'error' : 'primary'"
+                height="6"
+                rounded
+              />
+              <div class="text-caption mt-1">
+                {{ rec.download.value.name }} · {{ formatFileSize(rec.download.value.received) }}
+                <template v-if="rec.download.value.size">
+                  of {{ formatFileSize(rec.download.value.size) }}
+                </template>
+                ·
+                <template v-if="rec.download.value.status === 'done'">
+                  saved{{ rec.download.value.verified ? ', checksum verified' : '' }}
+                </template>
+                <template v-else-if="rec.download.value.status === 'paused'">
+                  paused — it resumes when the session reconnects
+                </template>
+                <template v-else-if="rec.download.value.status === 'active'">downloading…</template>
+                <template v-else>{{ describeRecordReason(rec.download.value.error) }}</template>
+              </div>
+              <div
+                v-if="rec.download.value.status === 'done' && rec.download.value.verified === null"
+                class="text-caption text-medium-emphasis"
+                style="word-break: break-all"
+              >
+                SHA-256 on the device: {{ rec.download.value.sha256 }}
+              </div>
+              <v-btn
+                v-if="rec.download.value.status === 'active' || rec.download.value.status === 'paused'"
+                size="x-small"
+                variant="text"
+                class="mt-1"
+                @click="rec.cancelDownload()"
+              >
+                Cancel
+              </v-btn>
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-menu>
+      <span
+        v-else-if="rc.phase.value === 'connected' && rc.recordRefused.value"
+        :title="`Recording unavailable: ${describeRecordReason(rc.recordRefused.value)}`"
+        data-testid="rc-record-refused"
+      >
+        <v-btn icon variant="text" size="small" class="mr-1" disabled aria-label="Recording unavailable">
+          <v-icon>mdi-record-circle-outline</v-icon>
+        </v-btn>
+      </span>
       <!-- Transfers chip — in-progress uploads/downloads popover.
            Conditionally rendered so it never clutters the toolbar. -->
       <v-menu
@@ -1665,6 +1822,7 @@ import {
 } from '@/composables/videoCells'
 import { useI18n } from 'vue-i18n'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { describeRecordReason, type RemoteRecordingItem } from '@/composables/useRemoteRecording'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 
@@ -1690,6 +1848,30 @@ const { mobile } = useDisplay()
 // viewport, replacing the desktop inline Row 2 + the mobile bottom-sheet).
 const settingsOpen = ref(false)
 const clipboardBusy = ref(false)
+
+// FR-85 P3c — recording the remote screen (docs/recording.md §10). The file is
+// made and kept on the device; this starts and stops it and downloads it.
+const rec = rc.recording
+const recAudio = ref(false)
+const recRunning = computed(() => rec.state.value === 'recording')
+function fmtClock(ms: number): string {
+  const s = Math.floor(Math.max(0, ms) / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = String(s % 60).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
+}
+async function onDownloadRecording(it: RemoteRecordingItem) {
+  try {
+    // Straight from the click: the save dialog must open inside the gesture.
+    await rec.downloadRecording(it.name, it.bytes)
+  } catch (e) {
+    const code = e instanceof Error ? e.message : String(e)
+    // Closing the save dialog is a choice, not an error to report.
+    if (/abort/i.test(code)) return
+    showError(`Download failed: ${describeRecordReason(code)}`)
+  }
+}
 
 // Push the controller's local clipboard to the agent's OS clipboard.
 // Driven by a toolbar button so the `navigator.clipboard.readText()`
