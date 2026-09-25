@@ -1,0 +1,82 @@
+# FR acceptance-criteria debt — regenerate with scripts/fr-verification-debt.sh --update-baseline
+#
+# Every line is a CLOSED FR whose spec still carries unticked acceptance
+# criteria. An FR closes on field verification, so each of these is either a
+# record that was never updated or a verification that never happened, and
+# the entry must say WHICH. Counts are pinned exactly, both directions.
+#
+# ⚠️ Adding a line here is not how an FR closes. It is how an ALREADY-closed
+#    FR's debt is made attributable instead of invisible.
+#
+# ── how this file was first populated, and what its reasons are worth ────────
+#
+# Seeded 2026-09-23 from the audit that introduced the guard. The split below
+# is ONE measurement: whether the issue carries a `## Result` / "field-verified"
+# comment at all.
+#
+#   ⚠️ That is evidence ABOUT THE ISSUE, not about these criteria. A Result
+#      comment proves something was verified; it does not prove THIS unticked
+#      box was. Absence is the stronger signal of the two — an FR closed with
+#      no recorded field evidence anywhere is the case the workflow forbids.
+#
+# So every reason below is PROVISIONAL and names its evidence rather than
+# claiming a verdict. Each needs the FR's owner to either tick the criteria
+# against linked evidence (and drop the line) or restate the reason. The guard
+# does not care which — it cares that the count stops moving unobserved.
+#
+# Measured trend, which is why the guard exists at all:
+#   2026-09-01   8 closed FRs /28 criteria
+#   2026-09-23  19 closed FRs /74 criteria   <- unobserved for three weeks
+
+# ── A. closed with NO recorded field evidence on the issue ───────────────────
+# The sharp five. Each criterion here was written down because someone judged
+# it necessary, and then the issue closed without it and without a Result.
+FR-2=1    # A.1 #770 no Result comment. The one criterion is the PROD field check (a stale pin => 409); never recorded.
+FR-10=1   # A.2 #783 no Result comment. The open criterion is the `relay_idr_thrift=0` ROLLBACK path — a kill switch never exercised.
+FR-11=8   # A.3 #784 no Result comment, and NOT ONE of its 8 criteria is ticked. The ledger calls it shipped + field-verified on prod 2026-08-27; nothing in the record supports that.
+FR-13=6   # A.4 #789 no Result comment. Includes "Field: verified on a real Windows-viewer -> macOS-host session" — a cross-OS keyboard path, exactly the class that regresses silently.
+FR-37=1   # A.5 #928 no Result comment. One nightly run settles it: does the nightly write its `LATEST` line from the new path.
+
+# ── B. deliberately not met, and the spec says so ────────────────────────────
+FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addressable by P1" (fps under sustained motion). Honest and intentional. Owed: a child FR or an in-spec waiver, so a later reader does not have to infer it.
+
+# ── C. closed WITH field evidence on the issue; the record lagged ────────────
+# Each of these has a Result / field-verified comment. The likeliest reading is
+# that the work was verified and nobody walked back to the checkboxes — but see
+# the warning above: the comment does not attest to THESE boxes.
+FR-7=1    # C.1  #778 Apple Developer ID + notarisation. Code signing has since gone live on all three platforms (team 4TG7586MY5) — almost certainly tickable from that evidence today.
+FR-12=5   # C.2  #788 P1 and P2 spotlight tours both shipped (#797, #1117); no criterion was ticked for either.
+FR-32=7   # C.3  #898 14 comments and a field-verified Result; 0 of 7 ticked.
+FR-34=3   # C.4  #917 Result present; 3 of 6 remain, incl. "the controller is TOLD the host is locked".
+FR-39=2   # C.5  #951 Result present; the self-host compose criterion overlaps FR-42's.
+FR-41=7   # C.6  #965 the 90-second demo. Result present; 0 of 7 ticked.
+FR-42=1   # C.7  #967 Result present; the remaining one is `docker compose down -v` leaving the machine clean.
+FR-49=8   # C.8  #1084 Result present; 0 of 8 ticked (per-org overlay mode across `org ls` / `status` / `peers`).
+FR-50=6   # C.9  #1083 Result present; 0 of 6 ticked (the served installer naming its own server).
+FR-53=5   # C.10 #1123 Result present; 0 of 5 ticked (rollback sentinel lifecycle).
+FR-54=4   # C.11 #1130 Result present; 0 of 4 ticked (orphaned-network reporting).
+FR-57=6   # C.12 #1161 Result present; 0 of 6 ticked (multi-arch manifest).
+FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — and "docs before close" is a standing operator rule (2026-09-05). The only breach of it in the tree, and nothing could see it.
+
+# ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
+#
+# The rule (PR #1401, merged 2026-09-05T20:49:42Z) makes a docs criterion
+# mandatory in every spec. An FR is bound by it if its issue opened, or it
+# closed, after that moment. These are bound and carry no such criterion, so
+# the debt pins above cannot see their docs at all — there is no box to be
+# unticked. Each line is removed the day its spec gains the criterion.
+#
+# Four were found when the check was written. FR-74 and FR-81, both still
+# OPEN, were given the criterion in the same PR (#1598), so the debt pins can
+# now see their docs. The two below are CLOSED, and they cannot be fixed the
+# same way: an unticked criterion on a closed FR only moves it from this list
+# to the debt list above, and a ticked one without the docs would be a false
+# record. The honest fix for each is to write the docs, then add the criterion
+# ticked, with a link to them.
+#
+# ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
+#    reader-facing docs — the close the operator made the rule ABOUT — and its
+#    owed docs landed in #1401 itself. It is the reason the boundary is a
+#    timestamp and not a date.
+nodocs FR-7    # closed 2026-09-08, three days after the rule. docs/code-signing.md exists and has a docs/README.md row, but carries NO mermaid diagram (the rule requires them) and the spec never recorded a docs criterion.
+nodocs FR-66   # closed 2026-09-06, the day after the rule. A severity fix (a missing machine-global config logged ERROR). No doc mentions the change; whether it warranted docs was never written down.
