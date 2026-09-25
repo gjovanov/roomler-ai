@@ -197,7 +197,9 @@ What two more weeks of shadow say (2026-09-24, CORPLAP-2, three hours over
 push-back**, while the transport stalled 118 times with no number attached.
 Whether V5 should read `capacity_bps`, and what a transit stall should feed
 into the belief, is the open question the shadow exists to answer; do not
-build on the anchor's semantics until it has.
+build on the anchor's semantics until it has. FR-74 P5's gate was read against
+this shadow on 2026-09-25 — the result, and the floor-damping interaction it
+found, are under [§ The direct path](#the-direct-path-fr-74--a-ceiling-that-is-a-bound-a-gate-that-measures-lag).
 
 ## The Priority dial
 
@@ -242,7 +244,7 @@ Each DC video pump runs these, owned by `encode::governor::RateGovernor`
 |---|---|---|---|
 | **CQ + HRD** | encoder-internal | per-frame QP | every frame, zero cost |
 | **AIMD bitrate** (`encode::aimd`) | send-channel occupancy + byte budget | `set_bitrate` → ladder-coarsened maxrate | MD ≤1/500 ms, AI ≤1/5 s |
-| **Byte-budget queue gate** (rc.442) | bytes in flight vs `constrained_queue_ms` (450 ms) of the relay ceiling | skip producing a frame | every loop iteration |
+| **Byte-budget queue gate** (rc.442; FR-74 P1b on direct paths) | relay: bytes in flight vs `constrained_queue_ms` (450 ms) of the relay ceiling. Direct: the **measured send wait** vs `direct_queue_ms` (150 ms) once bytes exceed 150 ms of the ceiling; bytes alone gate only at the encoder's HRD reservoir ([§ The direct path](#the-direct-path-fr-74--a-ceiling-that-is-a-bound-a-gate-that-measures-lag)) | skip producing a frame | every loop iteration |
 | **Viewer-rate divisor** (`encode::viewer_rate`) | browser's decoded-fps + struggling report | send every Nth frame | 1 s windows |
 | **Encode pressure + auto tier** (`encode::encode_pressure`) | avg encode ms | maxrate factor; long-edge cap when encode-bound | 2 s heartbeat |
 | **Goodput estimate** (`encode::goodput`, rc.453) | blocked-send goodput from the send task, folded **only when the validity gate accepts the window** (§ above) | the measured-ceiling clamp (stage 1), FR-59 P1/P6 and V5's `stall_is_ours` via `pipe_bps`, the pair memory's write-back | folded on the viewer window |
@@ -264,6 +266,156 @@ Rebuilds also reuse the session's **proven encoder name** first instead of
 re-walking the vendor cascade (a failed tiered open of an absent vendor's
 encoder costs 100–300 ms), and open at `min(ceiling, AIMD target)` so the
 governor's forced reapply cannot trigger an immediate second rebuild.
+
+## The direct path (FR-74) — a ceiling that is a bound, a gate that measures lag
+
+Everything above is about paths that push back. A direct path on a LAN or a
+good WAN mostly does not, and until `agent-v0.4.77` the controller there was
+fighting itself. The operator's own test that opened FR-74 (2026-09-06,
+CORPLAP-3, `av1_qsv` 1920×1200 at 4 ms RTT, a Notepad++ scroll — the record is
+[`fr/FR-74-text-clarity-on-direct-paths.md`](fr/FR-74-text-clarity-on-direct-paths.md)):
+the direct ceiling was a constant, `0.07 bpp × 1920 × 1200 × 60 = 9.68 Mbps`,
+and Sharper was 100 % of it; every scroll burst overran it; the send queue
+crossed a byte budget denominated in the **applied** target; the gate skipped
+frames; and the AIMD read its own cap as congestion — three ×0.85 cuts in six
+seconds, ~40 s of additive climb back, and on QSV a rebuild plus an IDR at
+every ladder crossing (37 swaps and 35 settle keyframes in 11 minutes). The
+budget was self-reinforcing: at 2.5 Mbps it was ~47 KB, one text frame tripped
+it, and a session sat at 2–3.7 Mbps for minutes.
+
+Two changes fixed it, both on the direct branch of the FFmpeg pump, relay
+paths untouched byte for byte, and **no new switch** — the operator's overrides
+(`FFMPEG_MAXRATE_KBPS`, `direct_queue_ms`) are the way back in both directions.
+
+### P1 (0.4.77) — the ceiling is a content-generous bound
+
+`rate_profile::ffmpeg_maxrate_bps_scaled`
+(`agents/roomlerd/src/encode/rate_profile.rs:193`) uses **0.25 bpp/s on a
+direct path** (0.07 on a constrained one, min'd with the relay clamp as
+before), clamped to **[3, 48] Mbps × the codec/chroma factor**
+(`codec_rate_factor_pct`, `:129` — AV1 100, HEVC and VP9 125, H.264 150;
+`chroma_rate_factor_pct`, `:155`, for 4:4:4 cells). The fleet's heartbeats
+show the products: 34.56 M for AV1 at 1920×1200 @ 60, 43.2 M for HEVC and
+`vp9_qsv` there, 38.88 M for HEVC at 1920×1080. It is a **ceiling, never a
+target**: the encoders run constant quality under `maxrate`, so a settled
+desktop spends almost nothing and only motion approaches the bound.
+
+`policy::rate_plan` (`encode/policy.rs:220`) finishes the chain: × the dial
+(`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
+encode-pressure factor (`governor.encode_factor()`, `governor.rs:1469`),
+floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:231`). On a direct
+transport `effective_ceiling` is the plan's value unchanged (`governor.rs:503`
+— the learner lifts it on constrained sessions only); the shared-pipeline split
+divides it by the follower count; and the result is both the AIMD's ceiling
+and the gate's reference rate (`last_ceiling_bps`, `peer.rs:6658`).
+
+⚠️ The encode-pressure factor multiplies the bound, so a host whose encoder is
+struggling lowers its own ceiling with no path evidence in it. On 2026-09-25
+CORPLAP-3's ceiling fell to 13.82 M (0.4 ×) at 4 ms of viewer age and 0 bytes
+in flight while its `av1_qsv` passes took 120–170 ms and the cadence was paced
+60 → 20 fps, and it was back at 27.8 M eleven seconds later. Read
+`ceiling_bps` on the `set_bitrate` line before calling a `target_bps` drop a
+path event.
+
+### P1b (0.4.79) — the gate is the measured wait's call
+
+P1's budget (150 ms of the ceiling) still tripped once on 0.4.77: AV1's HRD
+window is floored at 200 % of `maxrate` (Intel's VDENC hangs on a forced IDR
+larger than its reservoir — the rc.443 incident), so the encoder was
+*configured* to emit an 8.6 MB burst against a 648 KB budget, and the
+controller cut on a burst it had itself legalised, at ≤ 20 ms of viewer age.
+Bytes cannot tell a burst the wire is draining from a backlog the viewer
+feels; the send wait can, and it is the quantity `direct_queue_ms` was always
+meant to bound.
+
+| piece | rule | anchor |
+|---|---|---|
+| soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:525` (`direct_queue_budget_bytes`) |
+| hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:544` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
+| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6054`–`6092`; set and cleared by the send task at `:5478`, `:5546` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:563` (`direct_gate_trips`), called at `peer.rs:6094` |
+| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6109`, `:6124` |
+| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6023`–`6036` |
+
+```mermaid
+flowchart TB
+    subgraph ceiling["the ceiling — a bound, never an operating point"]
+        G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:193"]
+        C --> D["× dial 70 / 85 / 100 %"]
+        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:220"]
+        E --> S["÷ followers (shared split)"]
+        S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
+    end
+    subgraph gate["the direct gate — one pass, before capture (peer.rs:6044–6124)"]
+        CEIL --> SOFT["soft = 150 ms × ceiling"]
+        CEIL --> HARD["hard = max(soft, HRD reservoir)"]
+        W["wait = max(EMA of completed waits,<br/>age of the head-of-queue frame)"]
+        Q["bytes in flight"] --> H{"≥ hard?"}
+        HARD --> H
+        H -- yes --> TRIP["skip the frame · AIMD ×0.85"]
+        H -- no --> SQ{"≥ soft AND<br/>wait ≥ 150 ms?"}
+        SOFT --> SQ
+        W --> SQ
+        SQ -- yes --> TRIP
+        SQ -- no --> PASS["capture → encode → send"]
+    end
+    TRIP -.->|"target ≤ ceiling"| CEIL
+```
+
+**Field.** The P1b gate on the release's defaults (0.4.79, 2026-09-07,
+CORPLAP-3, the operator judging): no blur on AV1, VP9 4:2:0 or H.264, and the
+sessions' heartbeats read 0 cuts, 0 gate skips and 0 gate lines at 20–36 Mbps
+and 30–47 fps; the rate ladder stopped firing on direct paths altogether (0
+swaps in 17 sessions on three hosts, where the baseline had 37 in 11 minutes),
+which retired the planned QSV hysteresis. What the gate deliberately does not
+see: a pipe throttled **below the socket** (an OS QoS policy, a thin Wi-Fi
+driver queue) queues where `bytes_inflight` cannot look — measured 2026-09-07
+with `roomlerd.exe` capped at 15 Mbps, the gate shed nothing and the cost
+surfaced as 160–380 ms of viewer age instead. That standing lag is the viewer
+age's call (FR-15), not this gate's.
+
+The libvpx VP9 4:4:4 pump is a different machine and got its own fix in the
+same arc (P3, 0.4.80: `rc_max_quantizer` 16 on direct transports, because
+libvpx resets q to the worst on every wheel notch — [encoders.md](encoders.md)),
+and the viewer's pixel chain, which no encoder setting can undo, got the
+display-scale pill (P4 — [remote-control.md](remote-control.md) §18.6.1).
+
+### P5 — the ceiling follows the path: decided, refined, and NOT built
+
+A higher constant is still a constant. On 2026-09-10 a direct HEVC session on
+another host (the Regal cell, 1920×1080 at 6–11 ms of paint age) ran for hours
+between a 38.88 M ceiling with no measurement in it and a path that pushed
+back at ~6 M: 4.5 minutes to first reach the ceiling, then a collapse to the
+measurement every two to three minutes, every collapse a visible softening.
+The decision (FR-74 §P5, refined 2026-09-15): the bpp product becomes a
+**cap**, and the ceiling follows the FR-79 V3b belief above — with the
+asymmetry that **only a refusal (`capacity`) may lower the ceiling, a delivery
+(`floor`) may only raise it**, and the capacity trace decays upward while
+nothing pushes back, so the loop has no ratchet in either direction.
+
+It is gated on the shadow reading sane, and the gate was read on 2026-09-25
+from the hosts' own daemon log files over Fleet RPC (agents 0.4.99–0.4.102;
+four hosts; 104,698 heartbeats in 37 sessions, 09-11 → 09-25; the exec-enabled
+population only — three corp laptops and the Regal cell):
+
+| the gate asked | what the shadow said |
+|---|---|
+| on relay hosts the anchor is not `None` | **holds** — the two relay sessions (5,240 constrained windows) carried a floor within their first five windows and an anchor of 3.5–5.2 M for the rest (`pipe_belief_n` 9,912 / 1 over three hours, 155 / 0 over three minutes) |
+| a quiet screen must not read as a thin pipe | **holds since 0.4.99 (V3b-2)** — 19 of 19 push-back-free direct sessions ended at their maximum floor, and each of the 7 whose floor fell carried a push-back; CORPLAP-3 held 34.27 M through 3.5 min of idle after one scroll. The 0.4.98 control on the same host: 16.4 M → 13.5 kbps over 4.3 h with no push-back |
+| on a direct session the anchor tracks the path, not the content | **not as written, and not meetable** — before the first burst the anchor *is* the content's weight (the Regal sessions open at 0.07–2.4 M and take 4 s to 2.2 h to reach half their eventual floor; a 4.6-min CORPLAP-3 session never rose above 3.5 M on a path that carries 34 M). Nothing measures capacity on an uncongested direct path. The refinement already makes this harmless: a delivery never lowers the ceiling |
+| the push-backs are real refusals | on the LAN-class hosts the only capacities are the encoder's burst drain **at the cap** (34.3 M against a 34.56 M ceiling; 45.6–59.7 M against 43.2 M) — not refusals, and `limit ≥ bound` leaves the ceiling alone. On the Regal cell: **14 accepted push-backs in ~51 h of sessions, 0.85–19.9 M**, send waits up to 1.36 s around them (two ≥ 1 s hard stalls); at every one the target had already collapsed from 38.88 M to 1.5–17.0 M (median 3.9 M) — today's sawtooth, at one accepted fold per ~3.6 h rather than the 2–3 min period of 09-10 |
+| the floor guard holds | **it erodes** — V3b-2 damps the floor by half the gap on *every* push-back below it, whatever the spacing: 28.84 → 18.09 → 11.82 → 7.76 M on three push-backs 5.5 h apart; 38.90 → 22.26 → 14.04 → 8.57 → 9.78 → 14.21 M on five in 1.6 h, the demonstration re-arming to 16–25 M between them. The refined law's "never below what the path has demonstrably carried" assumed an undamped demonstration; with the damped floor, P5's ceiling on that cell would have sat at 8–18 M for hours of sessions whose path also carried 24–39 M, and an encoder under an 8 M ceiling cannot demonstrate 25 M, so recovery would rest on the upward decay alone |
+
+⚠️ So P5 is **not built**. Whether a ceiling at 8–18 M beats the constant with
+its ~90 % collapses cannot be read from the belief alone — it needs the
+viewer's outcome under both laws, and the 09-23 daytime viewer on that cell
+reported no paint age at all. What unblocks it, in order: (1) a decision on the
+guard — an undamped demonstrated maximum kept beside the damped floor, or a
+time-aware damping — a `Pipe` change and FR-79's to make; (2) the two numbers
+the design leaves open, `HEADROOM` and the upward-decay rate (FR-70 P1's law);
+(3) a replay of the Regal 09-25 arc in `encode::sim` under both laws, before
+any release; (4) the release, and an A/B on that cell with a viewer that
+reports age — the same log sweep reads the after.
 
 ## Crisp at rest
 
@@ -294,6 +446,10 @@ All keys live in the agent config (`roomler config set …`) with
 | `gpu_scale` / `scale_threads` | on / 1 | HW-downscale Phase A/B levers (only active when something scales) |
 | `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
 | `ROOMLERD_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
+| `direct_queue_ms` | 150 | FR-74 P1/P1b — the direct gate's **lag bound**: bytes over 150 ms of the ceiling gate only once the measured send wait has also crossed 150 ms; 0 disables the gate ([§ The direct path](#the-direct-path-fr-74--a-ceiling-that-is-a-bound-a-gate-that-measures-lag)) |
+| `direct_hrd_pct` | 100 | HRD window for direct sessions, % of maxrate ([25, 200]); also the gate's hard budget. ⚠ `av1_*` encoders stay at 200 regardless (the rc.443 hang) |
+| `ROOMLERD_FFMPEG_MAXRATE_KBPS` | unset | Env only — replaces the computed ceiling in both directions (the FR-74 P0 A/B knob and the way back from P1) |
+| `ROOMLERD_VP9_DIRECT_MAX_Q` | 16 | FR-74 P3 — the libvpx VP9 4:4:4 pump's worst quality on direct transports (q-index 64); 63 = the pre-P3 behaviour |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
