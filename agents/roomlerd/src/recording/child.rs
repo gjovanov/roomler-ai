@@ -219,7 +219,7 @@ pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) 
 /// parent that parsed every line would choke on the first log line.
 pub const EVENT_PREFIX: &str = "ROOMLER_REC_JSON:";
 
-fn emit(value: &serde_json::Value) {
+pub(crate) fn emit(value: &serde_json::Value) {
     let mut out = std::io::stdout().lock();
     // EPIPE (the parent went away) must not abort the finalize that follows.
     let _ = writeln!(out, "{EVENT_PREFIX}{value}");
@@ -262,7 +262,11 @@ fn software_encoder(
 ///   a session's), and nothing else: asked for hardware, a host without it
 ///   refuses rather than quietly recording in software;
 /// - `auto`: hardware, then software.
-fn encoder_factory(pref: &str, fps: u32, gop_seconds: u32) -> Result<(EncoderFactory, bool)> {
+pub(crate) fn encoder_factory(
+    pref: &str,
+    fps: u32,
+    gop_seconds: u32,
+) -> Result<(EncoderFactory, bool)> {
     let gop = fps * gop_seconds.max(1);
     let prefer_hw = match pref {
         "software" => {

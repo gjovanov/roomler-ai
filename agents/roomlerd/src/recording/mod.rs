@@ -23,11 +23,20 @@ pub mod annexb;
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod child;
+/// FR-85 P5 — the edit list and its exact time map.
+pub mod edit;
+/// FR-85 P5a — the export engine (it decodes with openh264, so it comes with
+/// the software encoder's feature).
+#[cfg(feature = "openh264-encoder")]
+pub mod export;
 pub mod folder;
 /// FR-85 P1e — who the recorder runs as (the person signed in at the
 /// device, at normal integrity), and launching it as that.
 pub mod launch;
 pub mod manager;
+/// FR-85 P5a — `roomlerd media probe|export`, the engine as its own process.
+#[cfg(feature = "openh264-encoder")]
+pub mod media;
 pub mod mp4;
 pub mod pacer;
 pub mod recorder;

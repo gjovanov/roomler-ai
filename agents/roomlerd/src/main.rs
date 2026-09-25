@@ -356,6 +356,15 @@ enum Command {
         #[arg(long, hide = true)]
         whoami: bool,
     },
+    /// FR-85 P5 — the editor's engine, launched by roomler-desktop as the
+    /// person: `probe` a recording, `export` one through its edit list.
+    /// JSON events on stdout, like `record`.
+    #[cfg(all(feature = "recording", feature = "openh264-encoder"))]
+    #[command(hide = true, name = "media")]
+    Media {
+        #[command(subcommand)]
+        action: MediaAction,
+    },
     CaptureSmoke {
         /// How many frames to pull before reporting.
         #[arg(long, default_value_t = 10)]
@@ -714,6 +723,25 @@ enum OrgAction {
         /// privilege. `tun` shares the primary's adapter and needs
         /// `overlay_multi_org` plus the same control plane.
         mode: String,
+    },
+}
+
+/// FR-85 P5 — `roomlerd media …`.
+#[cfg(all(feature = "recording", feature = "openh264-encoder"))]
+#[derive(Debug, Subcommand)]
+enum MediaAction {
+    /// Length, size, and whether this build can edit the recording.
+    Probe { file: PathBuf },
+    /// Export a recording through its edit list, beside it, as
+    /// `<name> (edited).mp4`. `{"cmd":"cancel"}` on stdin stops it.
+    Export {
+        /// The edit list, `<name>.edit.json`; it names its recording, in its
+        /// own folder.
+        #[arg(long)]
+        edl: PathBuf,
+        /// `auto` | `hardware` | `software`.
+        #[arg(long, default_value = "auto")]
+        encoder: String,
     },
 }
 
@@ -1387,6 +1415,13 @@ async fn daemon_main() -> Result<()> {
             )
             .await
         }
+        #[cfg(all(feature = "recording", feature = "openh264-encoder"))]
+        Command::Media { action } => match action {
+            MediaAction::Probe { file } => roomlerd::recording::media::probe(&file),
+            MediaAction::Export { edl, encoder } => {
+                roomlerd::recording::media::export(&edl, &encoder).await
+            }
+        },
         Command::CaptureSmoke {
             frames,
             dump,
