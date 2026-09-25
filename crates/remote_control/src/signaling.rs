@@ -487,6 +487,34 @@ pub enum ClientMsg {
         session_secs: u64,
     },
 
+    /// FR-85 P3 — the device reports one thing that happened to a REMOTE
+    /// recording: the host's answer to the just-in-time prompt, a start, a
+    /// stop (bytes, length, why), a download. The host's CLAIM, kept apart
+    /// from the server's DECISION (`remote_audit`'s grant) exactly as
+    /// `ssh_activity` is kept apart from `ssh_audit`.
+    ///
+    /// Fire-and-forget, like [`Self::SshActivity`]: an older server ignores
+    /// the frame. ⚠️ `tenant_id` / `agent_id` come from the authenticated WS,
+    /// and the server records it only for a live session of THIS agent whose
+    /// grant holds `RECORD` — never content, only the fact.
+    #[serde(rename = "rc:recording.activity")]
+    RecordingActivity {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        kind: crate::models::RecordingActivityKind,
+        /// The recording's file name (no path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// A stop reason or refusal code (the closed sets in
+        /// `docs/recording.md`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Device reports one thing that happened inside an SSH session (P8).
     ///
     /// Fire-and-forget: no reply, and the server drops it silently if the
@@ -1325,6 +1353,7 @@ impl ClientMsg {
             ClientMsg::RpcExecRequest { .. } => "rc:rpc.request",
             ClientMsg::SshRequest { .. } => "rc:ssh.request",
             ClientMsg::SshActivity { .. } => "rc:ssh.activity",
+            ClientMsg::RecordingActivity { .. } => "rc:recording.activity",
             ClientMsg::SshGrantAck { .. } => "rc:ssh.grant_ack",
             ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
@@ -1382,7 +1411,8 @@ impl ClientMsg {
             | ClientMsg::SdpAnswer { .. }
             | ClientMsg::Ice { .. }
             | ClientMsg::Terminate { .. }
-            | ClientMsg::SessionStats { .. } => Owner::Remote,
+            | ClientMsg::SessionStats { .. }
+            | ClientMsg::RecordingActivity { .. } => Owner::Remote,
             ClientMsg::RelayProbeReport { .. }
             | ClientMsg::DerpTicketRequest { .. }
             | ClientMsg::SshRequest { .. }
@@ -1428,6 +1458,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:agent.heartbeat", Owner::Fleet),
     ("rc:relay.probe_report", Owner::Network),
     ("rc:session.stats", Owner::Remote),
+    ("rc:recording.activity", Owner::Remote),
     ("rc:relay.derp_ticket_request", Owner::Network),
     ("rc:rpc.result", Owner::Fleet),
     ("rc:rpc.request", Owner::Fleet),
@@ -1611,6 +1642,15 @@ pub enum ServerMsg {
         /// contract); serde-default so old viewers ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permissions: Option<crate::permissions::Permissions>,
+        /// FR-85 P3 — why `RECORD` was taken out of the requested grant, when
+        /// it was: `controller_not_allowed` (not the device's owner, an
+        /// ADMINISTRATOR or a `RECORD_REMOTE_SCREEN` holder — or a
+        /// break-glass session) or `device_not_opted_in` (the device's owner
+        /// has not switched remote recording on). The viewer says so rather
+        /// than just hiding a button. Additive: absent = not requested, or
+        /// granted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_refused: Option<String>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -3439,6 +3479,7 @@ mod tests {
             session_id,
             agent_id,
             permissions: None,
+            record_refused: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(

@@ -59,7 +59,15 @@ purpose. Because the reconcile in §3 hands out whatever the table says,
 would open exec-as-SYSTEM on every existing org at the next boot, with no
 migration to review and no admin action to audit.
 
-⚠️ `owner` holds both bits, as part of `ALL`. That is not an exception to the
+⚠️ **`RECORD_REMOTE_SCREEN` (bit 31, FR-85) follows the same rule, for a
+different reason.** It runs nothing as SYSTEM/root; what it makes is a **copy**.
+A controlled screen is visible to whoever is at it and ends with the session,
+but a recording outlives both. The same test checks it, and
+`admins_can_read_the_audits_without_gaining_the_powers` keeps it out of
+`DEFAULT_ADMIN`. The session bit it gates, and the other gates in the chain, are
+in [recording.md](recording.md) §10.
+
+⚠️ `owner` holds these bits, as part of `ALL`. That is not an exception to the
 rule so much as outside it: the row carries `ADMINISTRATOR`, so `has()` already
 answers true for every bit, and the two bits confer nothing there. The test
 skips any row with the bypass for exactly that reason — a check that fails on
@@ -281,6 +289,8 @@ The catalogue splits powers that look adjacent, and each split was paid for:
 | `EXEC_DEVICE` | `SSH_DEVICE` | a bounded command is not an interactive session that lasts and grows file transfer and port forwarding |
 | `VIEW_EXEC_AUDIT` | `EXEC_DEVICE` | an admin should see every command the fleet ran without silently gaining the power to run one |
 | `VIEW_SSH_AUDIT` | `SSH_DEVICE` | same asymmetry, and `VIEW_SSH_AUDIT` *is* in `DEFAULT_ADMIN` while `SSH_DEVICE` is not |
+| `REMOTE_CONTROL` | `RECORD_REMOTE_SCREEN` | watching a screen ends with the session; a recording is a copy that outlives it (FR-85) |
+| `ADMINISTRATOR` under break-glass | recording | break-glass skips the host's consent, so a recording made under it would be covert — the hub strips `RECORD` whatever the mask says |
 | any bit below `ADMINISTRATOR` | `MANAGE_TENANT` | configuring the org is the owner's job — nothing in `DEFAULT_ADMIN` reaches it, only the bypass does |
 
 And the escalation rule that ties them together: **you cannot grant a permission
