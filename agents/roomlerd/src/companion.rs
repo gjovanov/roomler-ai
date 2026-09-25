@@ -75,27 +75,10 @@ pub fn scm_companion_autostart() -> bool {
 /// SCM host, `service install --as-service`). Logs a change, not a no-op.
 #[cfg(target_os = "windows")]
 pub fn sync_machine_autostart_logged(companion_autostart: bool) {
-    use roomler_node_core::companion_autostart::{
-        RunKeyAction, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME, desired_run_value,
-        registry::{Hive, sync_value},
-    };
-    let Some(exe) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(DESKTOP_EXE)))
-    else {
-        return;
-    };
-    let desired = desired_run_value(companion_autostart, &exe, exe.exists(), false);
-    match sync_value(
-        Hive::LocalMachine,
-        WINDOWS_RUN_SUBKEY,
-        WINDOWS_RUN_VALUE_NAME,
-        desired.as_deref(),
-    ) {
-        Ok(RunKeyAction::Keep) => {}
-        Ok(action) => tracing::info!(?action, "companion login start (HKLM Run) updated"),
-        Err(e) => tracing::warn!(error = %e, "companion login start (HKLM Run): could not update"),
-    }
+    use roomler_node_core::companion_autostart::registry::Hive;
+    // A person's opt-out never removes the MACHINE value — it serves every
+    // account; the companion honours the opt-out at `--autostart` instead.
+    sync_login_autostart(Hive::LocalMachine, companion_autostart, false);
 }
 
 /// FR-84 D6 — `HKCU\…\Run\Roomler Desktop` for a per-user install: present
@@ -103,9 +86,20 @@ pub fn sync_machine_autostart_logged(companion_autostart: bool) {
 /// has not switched "Start at login" off (the companion's own state).
 #[cfg(target_os = "windows")]
 pub fn sync_user_autostart_logged(companion_autostart: bool) {
+    use roomler_node_core::companion_autostart::registry::Hive;
+    let opted_out = roomler_node_core::desktop_state::load().autostart_opt_out;
+    sync_login_autostart(Hive::CurrentUser, companion_autostart, opted_out);
+}
+
+#[cfg(target_os = "windows")]
+fn sync_login_autostart(
+    hive: roomler_node_core::companion_autostart::registry::Hive,
+    companion_autostart: bool,
+    opted_out: bool,
+) {
     use roomler_node_core::companion_autostart::{
         RunKeyAction, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME, desired_run_value,
-        registry::{Hive, sync_value},
+        registry::sync_value,
     };
     let Some(exe) = std::env::current_exe()
         .ok()
@@ -113,17 +107,18 @@ pub fn sync_user_autostart_logged(companion_autostart: bool) {
     else {
         return;
     };
-    let opted_out = roomler_node_core::desktop_state::load().autostart_opt_out;
     let desired = desired_run_value(companion_autostart, &exe, exe.exists(), opted_out);
     match sync_value(
-        Hive::CurrentUser,
+        hive,
         WINDOWS_RUN_SUBKEY,
         WINDOWS_RUN_VALUE_NAME,
         desired.as_deref(),
     ) {
         Ok(RunKeyAction::Keep) => {}
-        Ok(action) => tracing::info!(?action, "companion login start (HKCU Run) updated"),
-        Err(e) => tracing::warn!(error = %e, "companion login start (HKCU Run): could not update"),
+        Ok(action) => tracing::info!(?hive, ?action, "companion login start (Run value) updated"),
+        Err(e) => {
+            tracing::warn!(?hive, error = %e, "companion login start (Run value): could not update")
+        }
     }
 }
 
