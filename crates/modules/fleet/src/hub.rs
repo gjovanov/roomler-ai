@@ -694,6 +694,12 @@ impl Hub {
         // Multi-org — display name of the requesting org, for the host's
         // consent prompt. See `ServerMsg::Request::tenant_name`.
         tenant_name: Option<String>,
+        // FR-52 P4 — `Some` for an EXTERNAL session: the login the device must
+        // bind it to, forwarded in `ServerMsg::Request`. Passed only by the
+        // extauth relay (`roomler_ai_mod_remote::extauth`), after it found the
+        // principal's verified login and checked the device advertises
+        // `external-session`; `dispatch` always passes `None`.
+        external: Option<roomler_ai_remote_control::signaling::ExternalGrant>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -775,7 +781,12 @@ impl Hub {
             // as a ghost.
             let _ = controller_tx.try_send(ServerMsg::SessionCreated {
                 session_id: existing_id,
-                agent_id,
+                // FR-52 P4 — an outsider never needs the internal id.
+                agent_id: if external.is_some() {
+                    ObjectId::from_bytes([0; 12])
+                } else {
+                    agent_id
+                },
                 permissions: Some(existing_perms),
             });
             return Ok(existing_id);
@@ -802,7 +813,13 @@ impl Hub {
         // toolbar against a P3 agent; new viewers request FILES explicitly,
         // and any OTHER combination (a genuine view-only watcher, a narrowed
         // grant) is taken literally. Remove once pre-P3 viewers age out.
-        let permissions = if permissions == Permissions::default() {
+        //
+        // ⚠️ FR-52 P4 — NEVER for an external session. Its grant was clamped
+        // to the org's ceiling before it got here, and a ceiling of exactly
+        // VIEW|INPUT|CLIPBOARD would come out of this line with FILES added:
+        // file transfer for an outsider that no admin granted. There are no
+        // pre-P3 external viewers to grandfather.
+        let permissions = if external.is_none() && permissions == Permissions::default() {
             permissions | Permissions::FILES
         } else {
             permissions
@@ -875,9 +892,17 @@ impl Hub {
 
         // Tell the controller the session id + its EFFECTIVE grant (which the
         // single-INPUT-holder rule above may have narrowed).
+        //
+        // FR-52 P4 — an EXTERNAL controller gets a zero agent id: it named the
+        // device by connect code, and an outsider never needs the internal id
+        // (the property `rc:extauth.session` is shaped around).
         let _ = controller_tx.try_send(ServerMsg::SessionCreated {
             session_id,
-            agent_id,
+            agent_id: if external.is_some() {
+                ObjectId::from_bytes([0; 12])
+            } else {
+                agent_id
+            },
             permissions: Some(permissions),
         });
 
@@ -926,6 +951,10 @@ impl Hub {
             input_mode,
             // Multi-org — so the host prompt names the asking organization.
             tenant_name,
+            // FR-52 P4 — and, for an outsider, the login the device must bind
+            // this session to. Kept in `pending_request` below, so a re-push
+            // after an agent-socket flap carries it too.
+            external,
         };
         // Keep the Request while consent is pending so `register_agent` can
         // re-push it if the agent's control WS flaps before `rc:consent`
@@ -1155,7 +1184,15 @@ impl Hub {
     // ─── SDP / ICE forwarding ────────────────────────────────────────
 
     /// Forward controller's SDP offer to the agent.
-    pub fn forward_offer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
+    /// `extauth_mac` (FR-52 P4) is relayed verbatim: the server never holds the
+    /// key to check it and must never drop it — the device refuses an external
+    /// offer without one.
+    pub fn forward_offer(
+        &self,
+        session_id: ObjectId,
+        sdp: String,
+        extauth_mac: Option<String>,
+    ) -> Result<()> {
         let (agent_id, local_relay, region) = self.with_session(session_id, |s| {
             // The negotiating reaper stands down once an offer exists — from
             // here on the ICE layer owns liveness.
@@ -1202,12 +1239,19 @@ impl Hub {
                 session_id,
                 sdp,
                 ice_servers: ice,
+                extauth_mac,
             })
             .map_err(|_| Error::SendFailed)
     }
 
-    /// Forward agent's SDP answer to the controller.
-    pub fn forward_answer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
+    /// Forward agent's SDP answer to the controller. `extauth_mac` (FR-52 P4)
+    /// relayed verbatim, as for the offer.
+    pub fn forward_answer(
+        &self,
+        session_id: ObjectId,
+        sdp: String,
+        extauth_mac: Option<String>,
+    ) -> Result<()> {
         let (controller_tx, user_id, region) = {
             let arc = self
                 .inner
@@ -1231,6 +1275,7 @@ impl Hub {
             session_id,
             sdp,
             ice_servers: ice,
+            extauth_mac,
         })
         .map_err(|_| Error::SendFailed)?;
 
@@ -1687,16 +1732,37 @@ impl Hub {
                     local_relay,
                     ctx.input_mode,
                     ctx.tenant_name.clone(),
+                    // FR-52 P4 — a session a controller REQUESTED is never
+                    // external. The one caller that passes `Some` is the
+                    // extauth relay, which calls `create_session` directly
+                    // after finding the principal's verified login — so no
+                    // frame a controller sends can make a session external,
+                    // or an external one ordinary.
+                    None,
                 )?;
                 Ok(())
             }
-            (Role::Controller, ClientMsg::SdpOffer { session_id, sdp }) => {
+            (
+                Role::Controller,
+                ClientMsg::SdpOffer {
+                    session_id,
+                    sdp,
+                    extauth_mac,
+                },
+            ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.forward_offer(session_id, sdp)
+                self.forward_offer(session_id, sdp, extauth_mac)
             }
-            (Role::Agent, ClientMsg::SdpAnswer { session_id, sdp }) => {
+            (
+                Role::Agent,
+                ClientMsg::SdpAnswer {
+                    session_id,
+                    sdp,
+                    extauth_mac,
+                },
+            ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.forward_answer(session_id, sdp)
+                self.forward_answer(session_id, sdp, extauth_mac)
             }
             (
                 Role::Agent,
@@ -1832,6 +1898,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
         hub.deliver_consent(sid_a, true, None).unwrap();
@@ -1858,6 +1925,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
@@ -1917,8 +1985,82 @@ mod tests {
             None, // local_relay
             None, // input_mode
             None, // tenant_name
+            None, // external (FR-52 P4)
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
+    }
+
+    /// FR-52 P4 — an EXTERNAL session: the outsider is never told the device's
+    /// internal id (they named a connect code), the device is told which login
+    /// to bind the session to, and the FILES grandfather rule — which widens
+    /// exactly VIEW|INPUT|CLIPBOARD — leaves an outsider's clamped grant alone.
+    #[tokio::test]
+    async fn an_external_session_names_its_login_and_keeps_its_grant() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let grant = roomler_ai_remote_control::signaling::ExternalGrant {
+            attempt_id: "a1".into(),
+        };
+        let clamped = Permissions::default(); // VIEW | INPUT | CLIPBOARD
+        hub.create_session(
+            agent_id,
+            ObjectId::new(),
+            "Outsider".into(),
+            ctl_tx,
+            clamped,
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            ConsentMode::Prompt,
+            None,
+            None,
+            None,
+            None,
+            Some(grant.clone()),
+        )
+        .unwrap();
+        match ctl_rx.recv().await {
+            Some(ServerMsg::SessionCreated {
+                agent_id: told,
+                permissions,
+                ..
+            }) => {
+                assert_eq!(told, ObjectId::from_bytes([0; 12]));
+                assert_eq!(
+                    permissions,
+                    Some(clamped),
+                    "no FILES for an outsider no admin granted it to"
+                );
+            }
+            other => panic!("expected rc:session.created, got {other:?}"),
+        }
+        loop {
+            match agent_rx.recv().await {
+                Some(ServerMsg::Request {
+                    external,
+                    permissions,
+                    ..
+                }) => {
+                    assert_eq!(external, Some(grant));
+                    assert_eq!(permissions, clamped);
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("the agent channel closed before the Request"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1952,6 +2094,7 @@ mod tests {
                 None, // local_relay
                 None, // input_mode
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
@@ -2000,6 +2143,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
         // Original connection got the Request…
@@ -2063,6 +2207,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
         let _created = ctl_rx.recv().await.unwrap();
@@ -2113,6 +2258,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
         let _created = ctl_rx.recv().await.unwrap();
@@ -2121,7 +2267,7 @@ mod tests {
         // Drain the agent's Request so the offer forward has room.
         let _req = agent_rx.recv().await.unwrap();
 
-        hub.forward_offer(sid, "v=0".into()).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None).unwrap();
         tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
         assert!(
             ctl_rx.try_recv().is_err(),
@@ -2166,6 +2312,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
@@ -2194,6 +2341,7 @@ mod tests {
             ClientMsg::SdpOffer {
                 session_id: sid,
                 sdp: "v=0".into(),
+                extauth_mac: None,
             },
             ClientMsg::Ice {
                 session_id: sid,
@@ -2211,6 +2359,7 @@ mod tests {
             ClientMsg::SdpAnswer {
                 session_id: sid,
                 sdp: "v=0".into(),
+                extauth_mac: None,
             },
             ClientMsg::Consent {
                 session_id: sid,
@@ -2308,6 +2457,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
         };
         let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
@@ -2383,6 +2533,7 @@ mod tests {
                 None,
                 Some(roomler_ai_remote_control::models::InputMode::Exclusive),
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
         };
         let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
@@ -2452,6 +2603,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
         let sid_b = hub
@@ -2471,6 +2623,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
@@ -2528,6 +2681,7 @@ mod tests {
                 None, // local_relay
                 None, // input_mode
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
         drop(ctl_rx_a); // controller gone → the session's controller_tx.is_closed()
@@ -2551,6 +2705,7 @@ mod tests {
             None, // local_relay
             None, // input_mode
             None, // tenant_name
+            None, // external (FR-52 P4)
         );
         assert!(
             res_b.is_ok(),
@@ -2594,6 +2749,7 @@ mod tests {
             None, // local_relay
             None, // input_mode
             None, // tenant_name
+            None, // external (FR-52 P4)
         );
         assert!(
             matches!(res_c, Err(Error::AgentBusy)),
@@ -2646,6 +2802,7 @@ mod tests {
                 None, // local_relay
                 None, // input_mode
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
         // The retry: same connection, second request.
@@ -2666,6 +2823,7 @@ mod tests {
                 None, // local_relay
                 None, // input_mode
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
         assert_eq!(
@@ -2723,6 +2881,7 @@ mod tests {
                 None, // local_relay
                 None, // input_mode
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
         assert_ne!(
@@ -2772,10 +2931,11 @@ mod tests {
                 }),
                 None,
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
-        hub.forward_offer(sid, "v=0".into()).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None).unwrap();
 
         // Drain the agent queue; the SdpOffer must carry the overlay relay.
         let mut turn_urls: Vec<String> = Vec::new();
@@ -2834,10 +2994,11 @@ mod tests {
                 }),
                 None,
                 None, // tenant_name
+                None, // external (FR-52 P4)
             )
             .unwrap();
 
-        hub.forward_offer(sid, "v=0".into()).unwrap();
+        hub.forward_offer(sid, "v=0".into(), None).unwrap();
 
         let mut saw_turn = false;
         while let Ok(msg) = agent_rx.try_recv() {

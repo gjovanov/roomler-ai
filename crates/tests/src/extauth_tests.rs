@@ -140,11 +140,35 @@ struct Device {
 }
 
 async fn device(app: &TestApp, seeded: &SeededTenant, machine: &str, password: &str) -> Device {
+    device_with(app, seeded, machine, password, Terms::default()).await
+}
+
+/// P4 — the device's own terms for an external session, in its config file.
+#[derive(Default, Clone, Copy)]
+struct Terms {
+    /// `external_consent_mode`. The tests that open a session say `auto`: the
+    /// test agent has no prompt surface, and `prompt` would wait out the
+    /// attended window. The ordering of consent and offer is proven where it
+    /// can be made deterministic — the device's and the Hub's unit tests.
+    consent: Option<&'static str>,
+    /// `external_max_permissions`.
+    ceiling: Option<&'static str>,
+}
+
+async fn device_with(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine: &str,
+    password: &str,
+    terms: Terms,
+) -> Device {
     let mut cfg = enrol(app, seeded, machine).await;
     let (cred, _) = set_password(None, password).expect("registration");
     cfg.external_access_enabled = true;
     cfg.external_access_setup = Some(cred.setup);
     cfg.external_access_verifier = Some(cred.verifier);
+    cfg.external_consent_mode = terms.consent.map(str::to_string);
+    cfg.external_max_permissions = terms.ceiling.map(str::to_string);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     roomlerd::config::save(&path, &cfg).unwrap();
@@ -553,5 +577,423 @@ async fn an_outsider_on_the_other_pod_still_logs_in() {
         result.get("refused").is_none(),
         "verified across pods — the attempt lives on pod 1, the socket on pod 2: {result}"
     );
+    let _ = dev.stop.send(true);
+}
+
+// ─── P4 — the session a verified login opens ─────────────────────────────────
+//
+// The browser's half is written here from the SPEC, not from the device's code:
+// the AppKey derivation, the MAC and the fingerprint normalisation below are an
+// independent implementation (HKDF from two HMACs, per RFC 5869), so a device
+// that drifted from the spec fails these tests instead of agreeing with itself.
+
+/// `HKDF-SHA512(salt = none, ikm = the OPAQUE session key)`, expanded under the
+/// label and the two length-prefixed fields — the browser's AppKey.
+fn app_key(session_key: &[u8], attempt_id: &str, principal: &str) -> [u8; 32] {
+    use hmac::Mac as _;
+    type H = hmac::Hmac<sha2::Sha512>;
+    // Extract with no salt: a hash-length block of zeros (RFC 5869 §2.2).
+    let mut extract = <H as hmac::Mac>::new_from_slice(&[0u8; 64]).unwrap();
+    extract.update(session_key);
+    let prk = extract.finalize().into_bytes();
+    // Expand, one block: T(1) = HMAC(PRK, info ‖ 0x01), truncated to 32.
+    let mut info = b"roomler-extauth-v1 app-key".to_vec();
+    for field in [attempt_id.as_bytes(), principal.as_bytes()] {
+        info.extend_from_slice(&(field.len() as u16).to_be_bytes());
+        info.extend_from_slice(field);
+    }
+    let mut expand = <H as hmac::Mac>::new_from_slice(&prk).unwrap();
+    expand.update(&info);
+    expand.update(&[1u8]);
+    expand.finalize().into_bytes()[..32].try_into().unwrap()
+}
+
+/// `HMAC-SHA256(AppKey, label ‖ u16be ‖ role ‖ u16be ‖ fingerprint)`, base64url.
+fn transport_mac(key: &[u8; 32], role: &str, fingerprint: &str) -> String {
+    use hmac::Mac as _;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key).unwrap();
+    mac.update(b"roomler-extauth-v1 transport");
+    for field in [role.as_bytes(), fingerprint.as_bytes()] {
+        mac.update(&(field.len() as u16).to_be_bytes());
+        mac.update(field);
+    }
+    b64url().encode(mac.finalize().into_bytes())
+}
+
+/// The SDP's one certificate fingerprint: `lowercase(hash) + " " + UPPERCASE(hex)`.
+fn fingerprint(sdp: &str) -> String {
+    let value = sdp
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("a=fingerprint:"))
+        .expect("an SDP with a DTLS fingerprint");
+    let (hash, hex) = value.trim().split_once(' ').unwrap();
+    format!(
+        "{} {}",
+        hash.to_ascii_lowercase(),
+        hex.trim().to_ascii_uppercase()
+    )
+}
+
+/// A whole login as a browser runs it: the attempt, and the key the BROWSER
+/// derives from its own side of the exchange.
+async fn login(ws: &mut Ws, code: &str, password: &str, principal: &str) -> (String, [u8; 32]) {
+    let (state, ke1) = client_ke1(password);
+    send(
+        ws,
+        json!({"t": "rc:extauth.start", "connect_code": code, "ke1": ke1}),
+    )
+    .await;
+    let challenge = next_of(ws, &["rc:extauth.challenge", "rc:extauth.result"]).await;
+    assert_eq!(challenge["t"], "rc:extauth.challenge", "{challenge}");
+    let attempt_id = challenge["attempt_id"].as_str().unwrap().to_string();
+    let ke2 = b64url().decode(challenge["ke2"].as_str().unwrap()).unwrap();
+    let done = state
+        .finish(
+            &mut OsRng,
+            password.as_bytes(),
+            CredentialResponse::<Suite>::deserialize(&ke2).unwrap(),
+            ClientLoginFinishParameters::default(),
+        )
+        .expect("the right password opens the device's KE2");
+    send(
+        ws,
+        json!({
+            "t": "rc:extauth.finish",
+            "connect_code": code,
+            "attempt_id": attempt_id,
+            "ke3": b64url().encode(done.message.serialize()),
+        }),
+    )
+    .await;
+    let result = next_of(ws, &["rc:extauth.result"]).await;
+    assert!(result.get("refused").is_none(), "not verified: {result}");
+    let key = app_key(&done.session_key, &attempt_id, principal);
+    (attempt_id, key)
+}
+
+/// A browser-side peer and its offer: a data channel, so the offer has an
+/// m-section, and so a DTLS fingerprint.
+async fn browser_offer() -> (
+    std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+    String,
+) {
+    use webrtc::api::APIBuilder;
+    use webrtc::api::media_engine::MediaEngine;
+    use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+    let mut media = MediaEngine::default();
+    media.register_default_codecs().unwrap();
+    let api = APIBuilder::new().with_media_engine(media).build();
+    let pc = std::sync::Arc::new(
+        api.new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap(),
+    );
+    let _dc = pc
+        .create_data_channel("control", Some(RTCDataChannelInit::default()))
+        .await
+        .unwrap();
+    let offer = pc.create_offer(None).await.unwrap();
+    pc.set_local_description(offer.clone()).await.unwrap();
+    (pc, offer.sdp)
+}
+
+/// Ask for the session a verified login earned; wait for `rc:session.created`
+/// and `rc:ready` (the device consents by itself: `external_consent_mode =
+/// auto`). Returns the session id.
+async fn open_session(ws: &mut Ws, code: &str, attempt_id: &str, permissions: &str) -> String {
+    send(
+        ws,
+        json!({
+            "t": "rc:extauth.session",
+            "connect_code": code,
+            "attempt_id": attempt_id,
+            "permissions": permissions,
+        }),
+    )
+    .await;
+    let created = next_of(ws, &["rc:session.created", "rc:extauth.result", "rc:error"]).await;
+    assert_eq!(created["t"], "rc:session.created", "{created}");
+    assert_eq!(
+        created["agent_id"], "000000000000000000000000",
+        "an outsider named a connect code, and is never told the internal id: {created}"
+    );
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+    let ready = next_of(ws, &["rc:ready", "rc:terminate", "rc:error"]).await;
+    assert_eq!(
+        ready["t"], "rc:ready",
+        "the device admitted the session and consented: {ready}"
+    );
+    session_id
+}
+
+/// The device's terms for the tests that open a session.
+fn unattended() -> Terms {
+    Terms {
+        consent: Some("auto"),
+        ..Terms::default()
+    }
+}
+
+/// THE P4 proof, end to end through the real server and the real agent: a
+/// verified login opens a session; the offer carries a MAC over the browser's
+/// certificate, under a key only the two ends hold; the device answers with a
+/// MAC over ITS certificate under the same key; and the org's log has a
+/// `session` row naming the session and the login it spent.
+#[tokio::test]
+async fn an_outsider_opens_a_session_bound_to_their_login() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-session").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-session",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extsession").await;
+
+    let (attempt_id, key) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session_id = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+
+    let (pc, offer) = browser_offer().await;
+    send(
+        &mut ws,
+        json!({
+            "t": "rc:sdp.offer",
+            "session_id": session_id,
+            "sdp": offer,
+            "extauth_mac": transport_mac(&key, "offer", &fingerprint(&offer)),
+        }),
+    )
+    .await;
+    let answer = next_of(&mut ws, &["rc:sdp.answer", "rc:terminate", "rc:error"]).await;
+    assert_eq!(
+        answer["t"], "rc:sdp.answer",
+        "the device accepted the sealed offer: {answer}"
+    );
+    let answer_sdp = answer["sdp"].as_str().unwrap();
+    assert_eq!(
+        answer["extauth_mac"].as_str(),
+        Some(transport_mac(&key, "answer", &fingerprint(answer_sdp)).as_str()),
+        "the answer is sealed over the DEVICE's certificate, under the login's key"
+    );
+    assert_ne!(
+        fingerprint(answer_sdp),
+        fingerprint(&offer),
+        "two certificates, one per end"
+    );
+    pc.set_remote_description(
+        webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(
+            answer_sdp.to_string(),
+        )
+        .unwrap(),
+    )
+    .await
+    .expect("the browser accepts the device's answer");
+
+    // The org sees who got in, on which login, into which session.
+    let audit = url(&seeded, "/external-rc-audit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let body: Value = app
+            .auth_get(&audit, &seeded.admin.access_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["action"] == "session" && i["attempt_id"] == json!(attempt_id))
+            .cloned();
+        if let Some(row) = row {
+            assert!(row.get("login_refused").is_none(), "admitted: {row}");
+            assert_eq!(row["session_id"], json!(session_id), "{row}");
+            assert_eq!(row["user_id"], json!(principal), "{row}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no `session` audit row: {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = pc.close().await;
+    let _ = dev.stop.send(true);
+}
+
+/// The binding is enforced BY THE DEVICE: an offer that does not carry the
+/// login's MAC over its own certificate — a key from nowhere, no MAC at all, or
+/// the right key over a swapped certificate — ends the session, and no answer
+/// ever comes back. This is what stops a server that relays the signalling from
+/// substituting its own DTLS endpoint for the browser's.
+#[tokio::test]
+async fn an_offer_the_login_did_not_seal_ends_the_session() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-badmac").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-badmac",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extbadmac").await;
+
+    // A genuine tag over a certificate that is not the offer's: what an
+    // interloper who saw a real offer could replay onto its own.
+    const NOT_THE_OFFERS: &str = "sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+                                  11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00";
+    for forgery in ["another key", "no mac", "swapped certificate"] {
+        let (attempt_id, key) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+        let session_id = open_session(&mut ws, &dev.code, &attempt_id, "VIEW").await;
+        let (pc, offer) = browser_offer().await;
+        let mac = match forgery {
+            "another key" => Some(transport_mac(&[0x42; 32], "offer", &fingerprint(&offer))),
+            "no mac" => None,
+            _ => Some(transport_mac(&key, "offer", NOT_THE_OFFERS)),
+        };
+        let mut frame = json!({"t": "rc:sdp.offer", "session_id": session_id, "sdp": offer});
+        if let Some(mac) = mac {
+            frame["extauth_mac"] = json!(mac);
+        }
+        send(&mut ws, frame).await;
+        let verdict = next_of(&mut ws, &["rc:sdp.answer", "rc:terminate", "rc:error"]).await;
+        assert_eq!(
+            verdict["t"], "rc:terminate",
+            "{forgery}: the device must end the session, never answer it: {verdict}"
+        );
+        assert_eq!(
+            verdict["session_id"],
+            json!(session_id),
+            "{forgery}: {verdict}"
+        );
+        assert_eq!(
+            verdict["reason"], "agent_hangup",
+            "{forgery}: ended by the device's own act: {verdict}"
+        );
+        let _ = pc.close().await;
+    }
+    let _ = dev.stop.send(true);
+}
+
+/// One verified login opens ONE session, and only for the principal who logged
+/// in: another outsider holding the attempt id, a second ask on the same login,
+/// and an attempt nobody verified are all `unknown_attempt`.
+#[tokio::test]
+async fn a_login_opens_one_session_for_its_own_principal() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-once").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-once",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws_a) = outsider(&app, "extoncea").await;
+    let (_b, mut ws_b) = outsider(&app, "extonceb").await;
+
+    let (attempt_id, _key) = login(&mut ws_a, &dev.code, &pw("device"), &principal).await;
+    let ask = |attempt: &str| {
+        json!({
+            "t": "rc:extauth.session",
+            "connect_code": dev.code,
+            "attempt_id": attempt,
+            "permissions": "VIEW",
+        })
+    };
+
+    send(&mut ws_b, ask(&attempt_id)).await;
+    let stolen = next_of(&mut ws_b, &["rc:extauth.result", "rc:session.created"]).await;
+    assert_eq!(stolen["refused"], "unknown_attempt", "{stolen}");
+
+    // A's login survived B's try.
+    let _session = open_session(&mut ws_a, &dev.code, &attempt_id, "VIEW").await;
+
+    send(&mut ws_a, ask(&attempt_id)).await;
+    let twice = next_of(&mut ws_a, &["rc:extauth.result", "rc:session.created"]).await;
+    assert_eq!(
+        twice["refused"], "unknown_attempt",
+        "one login, one session: {twice}"
+    );
+
+    send(&mut ws_a, ask("66f0c0ffee0000000000abcd")).await;
+    let never = next_of(&mut ws_a, &["rc:extauth.result", "rc:session.created"]).await;
+    assert_eq!(never["refused"], "unknown_attempt", "{never}");
+    let _ = dev.stop.send(true);
+}
+
+/// P4 across pods — the outsider on pod 2, the device on pod 1. The session is
+/// opened on pod 1 with the relay's proxy sender, and every later frame of it
+/// (the sealed offer, the sealed answer) crosses the PR-2 relay in both
+/// directions with its MAC intact: the server carries a field it cannot check
+/// and must not drop.
+///
+/// ⚠️ Needs a cluster bus (Redis). Without one it says so loudly rather than
+/// passing on nothing.
+#[tokio::test]
+async fn an_outsider_on_the_other_pod_opens_a_sealed_session() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!(
+            "SKIPPED an_outsider_on_the_other_pod_opens_a_sealed_session: no Redis — P4 \
+             cross-pod unproven here"
+        );
+        return;
+    }
+    for _ in 0..40 {
+        let (a, b) = (
+            app1.state.cluster_bus.as_ref().unwrap(),
+            app2.state.cluster_bus.as_ref().unwrap(),
+        );
+        if a.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+            && b.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let seeded = app1.seed_tenant("extauth-xpod-session").await;
+    let dev = device_with(
+        &app1,
+        &seeded,
+        "mach-extauth-xpod-session",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app2, "extxpodsession").await;
+
+    let (attempt_id, key) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session_id = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    let (pc, offer) = browser_offer().await;
+    send(
+        &mut ws,
+        json!({
+            "t": "rc:sdp.offer",
+            "session_id": session_id,
+            "sdp": offer,
+            "extauth_mac": transport_mac(&key, "offer", &fingerprint(&offer)),
+        }),
+    )
+    .await;
+    let answer = next_of(&mut ws, &["rc:sdp.answer", "rc:terminate", "rc:error"]).await;
+    assert_eq!(
+        answer["t"], "rc:sdp.answer",
+        "the offer crossed to pod 1 with its MAC, the answer came back: {answer}"
+    );
+    let answer_sdp = answer["sdp"].as_str().unwrap();
+    assert_eq!(
+        answer["extauth_mac"].as_str(),
+        Some(transport_mac(&key, "answer", &fingerprint(answer_sdp)).as_str()),
+        "the seal survived the relay"
+    );
+    let _ = pc.close().await;
     let _ = dev.stop.send(true);
 }

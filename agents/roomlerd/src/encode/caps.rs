@@ -1439,6 +1439,16 @@ fn rpc_caps() -> Vec<String> {
         // ack is sent even when the device refuses — that is the point.
         caps.push(RpcCap::SshGrantAck);
     }
+    // FR-52 P4 — this build can ADMIT an external session: bind it to a
+    // verified login, check its offer's MAC, seal its answer. The server opens
+    // an external session only on a device that says so, because one that
+    // cannot would ignore `Request.external` and serve an outsider as an
+    // ordinary controller — the password proven but never bound to anything.
+    // A property of the BUILD, like `external-access`: gate 3 is the device's
+    // own, and is read when the request arrives.
+    if cfg!(feature = "external-access") {
+        caps.push(RpcCap::ExternalSession);
+    }
     // FR-19 — advertise the org-relay SERVER only when this device has opted
     // in (`relay_server_enabled`, gate 4). The server never installs a session
     // on a device that does not advertise this, so a device that has not opted
@@ -1664,6 +1674,19 @@ mod tests {
              agent can tell the person at the machine that a controller is \
              from outside their organization, which is what makes gate 2 \
              approvable at all"
+        );
+
+        // FR-52 P4 — but `external-session` exactly when the build can bind a
+        // session to a login. Advertised without it, the server would open
+        // external sessions a device then refuses every time; withheld from a
+        // build that has it, the feature is dark on that device.
+        assert_eq!(
+            advertised
+                .iter()
+                .any(|v| v == RpcCap::ExternalSession.wire()),
+            cfg!(feature = "external-access"),
+            "external-session must be advertised exactly when the external-access \
+             stack is built"
         );
     }
 

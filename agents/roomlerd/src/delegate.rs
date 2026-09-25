@@ -1008,6 +1008,7 @@ mod routing_tests {
             session_id: oid(),
             sdp: String::new(),
             ice_servers: Vec::new(),
+            extauth_mac: None,
         }));
         assert!(delegable_inbound(&ServerMsg::Ice {
             session_id: oid(),
@@ -1031,6 +1032,7 @@ mod routing_tests {
         assert!(delegable_outbound(&ClientMsg::SdpAnswer {
             session_id: oid(),
             sdp: String::new(),
+            extauth_mac: None,
         }));
         assert!(delegable_outbound(&ClientMsg::Ice {
             session_id: oid(),
@@ -1132,6 +1134,7 @@ mod role_tests {
         tx.send(ClientMsg::SdpAnswer {
             session_id: sid,
             sdp: "v=0".into(),
+            extauth_mac: None,
         })
         .await
         .unwrap();

@@ -134,6 +134,17 @@ impl Permissions {
             .collect::<Vec<_>>()
             .join(" | ")
     }
+
+    /// The inverse of [`Self::wire_names`]: the same parser the serde impl
+    /// uses, so a stored setting and a wire field cannot disagree about what
+    /// a name means. `None` if ANY name is unknown — a typo fails loudly
+    /// rather than quietly granting less (or, for a ceiling, more) than meant.
+    ///
+    /// FR-52 P4: the device parses its own `external_max_permissions` with it,
+    /// at `config set` time and again when a session arrives.
+    pub fn from_wire_names(s: &str) -> Option<Self> {
+        parse_wire_names(s)
+    }
 }
 
 #[cfg(test)]

@@ -618,6 +618,13 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
+        /// FR-52 P4 — on an EXTERNAL session, the device's MAC over its own
+        /// DTLS fingerprint under the verified login's key. The browser checks
+        /// it before trusting the transport: without it, a server that answered
+        /// the offer itself could pose as the device — show a fake screen and
+        /// read what the outsider types.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extauth_mac: Option<String>,
     },
 
     /// Agent decision on a control request.
@@ -736,6 +743,13 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
+        /// FR-52 P4 — on an EXTERNAL session, the controller's MAC over its own
+        /// DTLS fingerprint under the verified login's key. The device refuses
+        /// an external offer without a valid one: this is what binds "someone
+        /// proved the password" to "this transport" — without it the relaying
+        /// server could open the session with a peer of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extauth_mac: Option<String>,
     },
 
     // ─── either side → server ────────────────────────────────────────
@@ -1333,6 +1347,48 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_secs: Option<u32>,
     },
+    /// FR-52 P4 — controller → server: open a session on the strength of a
+    /// login the device VERIFIED (`attempt_id`, from this principal's own
+    /// `rc:extauth.start` / `.finish`).
+    ///
+    /// Its own frame rather than new fields on `rc:session.request`, for two
+    /// properties a type can hold better than a check:
+    /// - it names the device by connect code, never by agent id — an outsider
+    ///   never needs the internal id;
+    /// - it has NO `local_relay` and NO `override_reason`. FR-52 finding F4: a
+    ///   relay descriptor is validated as *an* overlay address, not *the
+    ///   caller's*, so from someone outside the org it would be a probe into
+    ///   the org's mesh. Absent from the frame, it cannot be smuggled in.
+    ///
+    /// The media fields mirror `rc:session.request` and mean the same thing.
+    #[serde(rename = "rc:extauth.session")]
+    ExtauthSession {
+        connect_code: String,
+        attempt_id: String,
+        /// What the outsider asks for. The server narrows it to the org's
+        /// ceiling (gate 2); the DEVICE narrows it again to its own.
+        permissions: Permissions,
+        #[serde(default)]
+        browser_caps: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preferred_transport: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chroma_pref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
+        #[serde(default)]
+        audio_enabled: bool,
+    },
+}
+
+/// FR-52 P4 — carried in `rc:request` when the session is an EXTERNAL one:
+/// opened on a verified login, not on org membership.
+///
+/// The principal is the request's `controller_user_id`; this names the login
+/// the device must find verified for that principal, single-use.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExternalGrant {
+    pub attempt_id: String,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1429,6 +1485,7 @@ impl ClientMsg {
             ClientMsg::ExtauthFinish { .. } => "rc:extauth.finish",
             ClientMsg::ExtauthKe2 { .. } => "rc:extauth.ke2",
             ClientMsg::ExtauthOutcome { .. } => "rc:extauth.outcome",
+            ClientMsg::ExtauthSession { .. } => "rc:extauth.session",
         }
     }
 
@@ -1456,7 +1513,8 @@ impl ClientMsg {
             | ClientMsg::ExtauthStart { .. }
             | ClientMsg::ExtauthFinish { .. }
             | ClientMsg::ExtauthKe2 { .. }
-            | ClientMsg::ExtauthOutcome { .. } => Owner::Remote,
+            | ClientMsg::ExtauthOutcome { .. }
+            | ClientMsg::ExtauthSession { .. } => Owner::Remote,
             ClientMsg::RelayProbeReport { .. }
             | ClientMsg::DerpTicketRequest { .. }
             | ClientMsg::SshRequest { .. }
@@ -1547,6 +1605,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:extauth.finish", Owner::Remote),
     ("rc:extauth.ke2", Owner::Remote),
     ("rc:extauth.outcome", Owner::Remote),
+    ("rc:extauth.session", Owner::Remote),
 ];
 
 #[cfg(test)]
@@ -1659,6 +1718,16 @@ mod namespace_tests {
                 attempt_id: "a1".into(),
                 refused: None,
                 retry_after_secs: None,
+            },
+            ClientMsg::ExtauthSession {
+                connect_code: "ABCD-EFGH-JKMN".into(),
+                attempt_id: "a1".into(),
+                permissions: Permissions::VIEW,
+                browser_caps: vec![],
+                preferred_transport: None,
+                chroma_pref: None,
+                chunk_framing: None,
+                audio_enabled: false,
             },
         ];
         for m in &samples {
@@ -1802,6 +1871,17 @@ pub enum ServerMsg {
         /// (the pre-multi-org behaviour).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant_name: Option<String>,
+        /// FR-52 P4 — present when this is an EXTERNAL session: the controller
+        /// is not in the device's organization, and was admitted on a login
+        /// the device verified. The device must bind the session to that
+        /// login, apply its OWN ceiling and consent mode for outsiders, and
+        /// say "outside your organization" in the prompt.
+        ///
+        /// ⚠️ An agent that predates this field would IGNORE it and run an
+        /// ordinary session — which is why the server sends it only to an
+        /// agent advertising `RpcCap::ExternalSession`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external: Option<ExternalGrant>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -1811,6 +1891,10 @@ pub enum ServerMsg {
         session_id: ObjectId,
         sdp: String,
         ice_servers: Vec<IceServer>,
+        /// FR-52 P4 — relayed verbatim from the controller's offer. The server
+        /// cannot check it (it never holds the key) and must not drop it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extauth_mac: Option<String>,
     },
 
     /// Server forwards SDP answer from agent → controller.
@@ -1820,6 +1904,9 @@ pub enum ServerMsg {
         session_id: ObjectId,
         sdp: String,
         ice_servers: Vec<IceServer>,
+        /// FR-52 P4 — relayed verbatim from the device's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extauth_mac: Option<String>,
     },
 
     /// Forward ICE candidate to the peer.

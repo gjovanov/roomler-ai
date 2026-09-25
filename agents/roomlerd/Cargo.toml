@@ -205,6 +205,9 @@ opaque-ke = { version = "4", default-features = false, features = [
 # surface the browser must reproduce byte-for-byte, and it gets a known-answer
 # test against an independent HKDF.
 hkdf = { version = "0.12", optional = true }
+# FR-52 P4 — the transport binding: HMAC-SHA256 over each side's DTLS
+# fingerprint under the verified login's key. In the graph via hkdf: +0 crates.
+hmac = { workspace = true, optional = true }
 
 # ⚠️ NO direct `argon2` dependency, on purpose (FR-52 P3a). The KSF uses
 # `opaque_ke::argon2` — the crate opaque-ke's own hashing was written against —
@@ -707,7 +710,7 @@ ssh-server = ["dep:russh", "overlay-netstack"]
 # password one. Gating the verb here would make a build without the feature
 # un-approvable AND indistinguishable from an agent too old to have it: two
 # different fixes behind one symptom, which is the split P2a exists to keep.
-external-access = ["dep:opaque-ke", "dep:rand_opaque", "dep:hkdf"]
+external-access = ["dep:opaque-ke", "dep:rand_opaque", "dep:hkdf", "dep:hmac"]
 
 # build.rs embeds a Windows VERSIONINFO resource into roomlerd.exe.
 # `[target.'cfg(windows)'.build-dependencies]` resolves against the HOST
