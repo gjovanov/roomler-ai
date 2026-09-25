@@ -249,6 +249,100 @@ fn print_dark_orgs(orgs: &[tunnel_core::localapi::OrgStatus], peers: &[PeerInfo]
     }
 }
 
+/// FR-84 D5b — the flags of `roomler devices`.
+#[derive(Debug, Clone, Default)]
+pub struct DevicesArgs {
+    /// An enrollment label (`primary` or an `[[orgs]]` label); `None` = the
+    /// primary.
+    pub org: Option<String>,
+    pub q: Option<String>,
+    pub sort: Option<String>,
+    pub desc: bool,
+    pub page: u64,
+    pub per_page: u64,
+    pub json: bool,
+}
+
+/// `roomler devices` — FR-84 D5b: the devices this device's private network
+/// lets it see, itself included, as the SERVER lists them (display names,
+/// OS, version, presence, MagicDNS), with this node's live carrier merged in
+/// from `peers`.
+///
+/// Different from `roomler peers` on purpose: `peers` is what the overlay
+/// engine currently holds (the netmap's names, carriers, RTTs); this is the
+/// org's own record of the same set, asked by the daemon with the org's agent
+/// token. Search, sort and paging run on the server. `--json` is the page
+/// verbatim, without the merge.
+pub async fn devices(args: DevicesArgs) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let query = localapi::DevicesQuery {
+        page: args.page,
+        per_page: args.per_page,
+        q: args.q.clone(),
+        sort: args.sort.clone(),
+        dir: args.desc.then(|| "desc".to_string()),
+    };
+    let org = args.org.clone().unwrap_or_default();
+    let page = client
+        .devices(&org, &query)
+        .await
+        .map_err(explain_directory_error)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+    // The live carrier column, best effort: the list is still worth printing
+    // when the peer read fails.
+    let peers = client.peers().await.unwrap_or_default();
+    let peers = peers_of_org(peers, &page.org);
+    let searched = args.q.as_deref().is_some_and(|q| !q.trim().is_empty());
+    print_devices(&page, &peers, searched);
+    Ok(())
+}
+
+/// A peer list scoped to one enrollment. A single-org daemon stamps no `org`
+/// on its peers, and those are the primary's.
+fn peers_of_org(peers: Vec<PeerInfo>, org: &str) -> Vec<PeerInfo> {
+    let primary = org.is_empty() || org == "primary";
+    peers
+        .into_iter()
+        .filter(|p| p.org == org || (p.org.is_empty() && primary))
+        .collect()
+}
+
+/// A [`localapi::DirectoryError`] as the one line an operator acts on.
+fn explain_directory_error(e: localapi::DirectoryError) -> anyhow::Error {
+    match e.code() {
+        "daemon_unreachable" => anyhow!("roomler daemon not running (is the service started?)"),
+        "unsupported_daemon" => anyhow!(
+            "the roomler daemon on this machine predates `roomler devices` — update it \
+             (`roomler peers` lists what its mesh carries)"
+        ),
+        "unsupported_server" => anyhow!(
+            "this device's server predates the device list (HTTP 404) — update the server; \
+             `roomler peers` lists what this device's mesh carries"
+        ),
+        "unknown_org" | "org_disabled" | "unsupported" => anyhow!("{}", upstream_message(&e)),
+        code => match e.status() {
+            Some(s) => anyhow!(
+                "the server did not give the list ({code}, HTTP {s}): {}",
+                upstream_message(&e)
+            ),
+            None => anyhow!(
+                "the server did not give the list ({code}): {}",
+                upstream_message(&e)
+            ),
+        },
+    }
+}
+
+fn upstream_message(e: &localapi::DirectoryError) -> String {
+    match e {
+        localapi::DirectoryError::Upstream { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// `roomler why <peer>` — F: explain, for ONE pair, why it rides the carrier
 /// it rides.
 ///
@@ -1998,6 +2092,170 @@ fn print_peers(peers: &[PeerInfo], now_ms: u64) {
     }
 }
 
+/// FR-84 D5b — the `devices` table, one row per listed device, then the page
+/// footer and (when the list is short for a reason) why.
+fn print_devices(page: &localapi::DevicesPage, peers: &[PeerInfo], searched: bool) {
+    let name_w = page
+        .items
+        .iter()
+        .map(|r| device_name(r).chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 34);
+    println!(
+        "  {:<name_w$} {:<8} {:<9} {:<8} {:<15} {:<30} CONN",
+        "NAME", "OS", "VERSION", "STATUS", "OVERLAY IP", "DNS"
+    );
+    if page.items.is_empty() {
+        println!("(no devices)");
+    }
+    for r in &page.items {
+        println!("{}", fmt_device_row(r, peer_for_row(r, peers), name_w));
+    }
+    let noun = if page.total == 1 { "device" } else { "devices" };
+    println!();
+    println!(
+        "page {} of {} · {} {noun} · overlay {} · acl {}{}",
+        page.page.max(1),
+        page.total_pages.max(1),
+        page.total,
+        if page.overlay.is_empty() {
+            DASH
+        } else {
+            &page.overlay
+        },
+        if page.acl_mode.is_empty() {
+            DASH
+        } else {
+            &page.acl_mode
+        },
+        if page.org.is_empty() || page.org == "primary" {
+            String::new()
+        } else {
+            format!(" · org {}", page.org)
+        },
+    );
+    if let Some(hint) = devices_hint(page, searched) {
+        println!("{hint}");
+    }
+}
+
+/// The name a person reads: the admin's display name, else the machine name,
+/// and a marker on the row that is this device.
+fn device_name(r: &localapi::DeviceRowLite) -> String {
+    let base = r
+        .display_name
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(&r.name);
+    let base = if base.is_empty() {
+        short_id(&r.id)
+    } else {
+        base.to_string()
+    };
+    if r.is_self {
+        format!("{base} (this device)")
+    } else {
+        base
+    }
+}
+
+/// The local peer behind a listed device: by overlay node id, else by the
+/// backing agent id.
+fn peer_for_row<'a>(r: &localapi::DeviceRowLite, peers: &'a [PeerInfo]) -> Option<&'a PeerInfo> {
+    if let Some(node) = r.overlay_node_id.as_deref()
+        && let Some(p) = peers.iter().find(|p| p.node_id == node)
+    {
+        return Some(p);
+    }
+    if r.kind == "agent" && !r.id.is_empty() {
+        return peers
+            .iter()
+            .find(|p| p.agent_id.as_deref() == Some(r.id.as_str()));
+    }
+    None
+}
+
+/// One `devices` table row — pure, so the column rules are unit-tested.
+fn fmt_device_row(r: &localapi::DeviceRowLite, peer: Option<&PeerInfo>, name_w: usize) -> String {
+    let glyph = match r.presence.as_str() {
+        "online" => '●',
+        "stale" => '◐',
+        _ => '○',
+    };
+    let mut name = device_name(r);
+    if name.chars().count() > name_w {
+        name = name
+            .chars()
+            .take(name_w.saturating_sub(1))
+            .collect::<String>()
+            + "…";
+    }
+    let dns = r
+        .magic_dns_fqdn
+        .as_deref()
+        .or(r.magic_dns_name.as_deref())
+        .unwrap_or(DASH);
+    let conn = if r.is_self {
+        "self".to_string()
+    } else {
+        match peer {
+            Some(p) => {
+                let base = if p.stalled
+                    && matches!(p.connection, ConnectionType::Direct | ConnectionType::Relay)
+                {
+                    "stalled".to_string()
+                } else {
+                    relay_qualified_label(p)
+                };
+                match p.rtt_ms {
+                    Some(ms) => format!("{base} · {ms} ms"),
+                    None => base,
+                }
+            }
+            None => DASH.to_string(),
+        }
+    };
+    let or_dash = |s: &str| {
+        if s.is_empty() {
+            DASH.to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    format!(
+        "{glyph} {name:<name_w$} {:<8} {:<9} {:<8} {:<15} {:<30} {conn}",
+        or_dash(&r.os),
+        or_dash(&r.version),
+        or_dash(&r.presence),
+        opt(r.overlay_ip.as_deref()),
+        dns,
+    )
+}
+
+/// Why a list is short, when the envelope says so — a device off the private
+/// network lists only itself, which must not read as "the org is empty". A
+/// search that matched one row says nothing about the ACL, so `searched`
+/// silences that hint.
+fn devices_hint(page: &localapi::DevicesPage, searched: bool) -> Option<&'static str> {
+    match page.overlay.as_str() {
+        "no_node" => Some(
+            "this device is not on the private network (overlay off), so it lists only \
+             itself — `roomler config set overlay_enabled true` and restart the service",
+        ),
+        "no_network" => {
+            Some("the organization has no private network yet — only this device is listed")
+        }
+        "unavailable" => {
+            Some("the server has no private-network module — only this device is listed")
+        }
+        "ok" if page.acl_mode == "enforce" && page.total <= 1 && !searched => Some(
+            "the organization's access rules (ACL enforce) let this device see no other devices",
+        ),
+        _ => None,
+    }
+}
+
 /// Multi-org — group peers by org in FIRST-APPEARANCE order (the daemon emits
 /// the primary's mesh first, then each secondary). `None` as the group key
 /// means "print no header": that is the single-org case, where every row has
@@ -2738,5 +2996,150 @@ mod route_edit_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("nothing to change"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod devices_tests {
+    use super::*;
+
+    fn row(name: &str) -> localapi::DeviceRowLite {
+        localapi::DeviceRowLite {
+            kind: "agent".into(),
+            id: "0123456789abcdef01234567".into(),
+            name: name.into(),
+            os: "linux".into(),
+            version: "0.4.103".into(),
+            presence: "online".into(),
+            is_online: true,
+            overlay_ip: Some("100.64.0.3".into()),
+            overlay_node_id: Some("76543210fedcba9876543210".into()),
+            magic_dns_name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    fn peer(node: &str, agent: Option<&str>, conn: ConnectionType, rtt: Option<u32>) -> PeerInfo {
+        let mut p: PeerInfo = serde_json::from_str(
+            r#"{"node_id":"x","name":"x","online":true,"connection":"direct"}"#,
+        )
+        .unwrap();
+        p.node_id = node.into();
+        p.agent_id = agent.map(str::to_string);
+        p.connection = conn;
+        p.rtt_ms = rtt;
+        p
+    }
+
+    /// The NAME column is the admin's display name when there is one, and
+    /// this device says so.
+    #[test]
+    fn names_prefer_the_display_name_and_mark_this_device() {
+        let mut r = row("bravo-box");
+        assert_eq!(device_name(&r), "bravo-box");
+        r.display_name = Some("Kilo".into());
+        assert_eq!(device_name(&r), "Kilo");
+        r.display_name = Some("   ".into());
+        assert_eq!(device_name(&r), "bravo-box", "a blank label is no label");
+        r.is_self = true;
+        assert_eq!(device_name(&r), "bravo-box (this device)");
+    }
+
+    /// CONN comes from THIS node's live peer view, joined by overlay node id
+    /// and, failing that, by the backing agent id; a device the engine holds
+    /// no carrier for shows a dash, never a guessed state.
+    #[test]
+    fn conn_is_the_local_carrier_joined_by_node_then_agent() {
+        let r = row("kilo");
+        let by_node = [peer(
+            "76543210fedcba9876543210",
+            None,
+            ConnectionType::Direct,
+            Some(4),
+        )];
+        let line = fmt_device_row(&r, peer_for_row(&r, &by_node), 12);
+        assert!(line.ends_with("direct · 4 ms"), "{line}");
+
+        let by_agent = [peer(
+            "other-node",
+            Some("0123456789abcdef01234567"),
+            ConnectionType::Relay,
+            None,
+        )];
+        let line = fmt_device_row(&r, peer_for_row(&r, &by_agent), 12);
+        assert!(line.ends_with("relay"), "{line}");
+
+        let line = fmt_device_row(&r, peer_for_row(&r, &[]), 12);
+        assert!(line.ends_with(DASH), "{line}");
+
+        let mut me = row("me");
+        me.is_self = true;
+        assert!(fmt_device_row(&me, None, 20).ends_with("self"));
+    }
+
+    /// A single-org daemon stamps no org on its peers — those are the
+    /// primary's; a multi-org daemon's other orgs are filtered out.
+    #[test]
+    fn peers_are_scoped_to_the_listed_org() {
+        let mut a = peer("n1", None, ConnectionType::Direct, None);
+        let mut b = peer("n2", None, ConnectionType::Direct, None);
+        let c = peer("n3", None, ConnectionType::Direct, None);
+        a.org = "primary".into();
+        b.org = "acme".into();
+        let all = vec![a, b, c];
+        let prim: Vec<String> = peers_of_org(all.clone(), "primary")
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
+        assert_eq!(prim, ["n1", "n3"]);
+        let acme: Vec<String> = peers_of_org(all, "acme")
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
+        assert_eq!(acme, ["n2"]);
+    }
+
+    /// A short list says why — and a search that matched one row does not
+    /// get blamed on the ACL.
+    #[test]
+    fn a_short_list_explains_itself() {
+        let mut page = localapi::DevicesPage {
+            total: 1,
+            overlay: "no_node".into(),
+            acl_mode: "off".into(),
+            ..Default::default()
+        };
+        assert!(devices_hint(&page, false).unwrap().contains("overlay off"));
+        page.overlay = "ok".into();
+        page.acl_mode = "enforce".into();
+        assert!(devices_hint(&page, false).unwrap().contains("ACL enforce"));
+        assert_eq!(devices_hint(&page, true), None);
+        page.total = 5;
+        assert_eq!(devices_hint(&page, false), None);
+    }
+
+    /// Each cause reads as the thing to do about it.
+    #[test]
+    fn directory_errors_read_as_actions() {
+        let up = |code: &str, status: Option<u16>| localapi::DirectoryError::Upstream {
+            code: code.into(),
+            message: "m".into(),
+            status,
+        };
+        let msg = explain_directory_error(localapi::DirectoryError::UnsupportedDaemon {
+            message: "unknown variant".into(),
+        })
+        .to_string();
+        assert!(msg.contains("predates `roomler devices`"), "{msg}");
+        let msg = explain_directory_error(up("unsupported_server", Some(404))).to_string();
+        assert!(msg.contains("update the server"), "{msg}");
+        let msg = explain_directory_error(up("unauthorized", Some(401))).to_string();
+        assert!(msg.contains("unauthorized, HTTP 401"), "{msg}");
+        let msg = explain_directory_error(localapi::DirectoryError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "x",
+        )))
+        .to_string();
+        assert!(msg.contains("not running"), "{msg}");
     }
 }
