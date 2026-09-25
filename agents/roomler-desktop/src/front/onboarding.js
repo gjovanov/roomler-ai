@@ -74,6 +74,15 @@
     });
     actions.appendChild(install);
 
+    // FR-84 D6 — enrolled from the Welcome tour (a first run): back into it.
+    if (window.Roomler.welcomePending) {
+      const tour = document.createElement('button');
+      tour.type = 'button';
+      tour.textContent = 'Continue the Welcome tour';
+      tour.addEventListener('click', () => navigate('welcome'));
+      actions.appendChild(tour);
+    }
+
     const done = document.createElement('button');
     done.type = 'button';
     done.textContent = 'Go to Overview';

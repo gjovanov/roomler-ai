@@ -275,6 +275,13 @@ function Install-Daemon {
         Say "restarting the 'Roomler' service so it picks up the enrollment"
         try { Restart-Service -Name Roomler -Force } catch { Warn "Restart-Service Roomler: $_" }
     }
+    # FR-84 D6: the daemon opens the companion ONCE after a fresh install (the
+    # Welcome tour) in the signed-in desktop session, and registers it to start
+    # at login ('Roomler Desktop' under ...\CurrentVersion\Run). Nothing to do
+    # here -- say so, so an unattended run's log explains the window.
+    if (-not $SkipDesktop) {
+        Say "on a fresh install the Roomler app opens on the signed-in desktop in a few seconds (Welcome tour)"
+    }
 }
 
 # The desktop companion is a standalone release EXE (not in the MSI).
@@ -389,6 +396,20 @@ function Uninstall-Roomler {
         Say ("uninstalling '" + $p.Name + "' " + $p.Version + " (" + $p.Code + ", " + $p.Hive + ")")
         $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ("/x " + $p.Code + " /qn /norestart") -Wait -PassThru
         if ($proc.ExitCode -ne 0) { Warn ("msiexec /x exited " + $proc.ExitCode) } else { Say "uninstalled." }
+    }
+
+    # 1b) FR-84 D6: the companion's login start. The MSI's uninstall custom
+    #     action removes it (service uninstall); this is the belt for a host
+    #     whose MSI record was already gone. HKCU always; HKLM needs elevation.
+    $runKeys = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
+    if (Test-Elevated) { $runKeys += 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' }
+    foreach ($rk in $runKeys) {
+        if (Get-ItemProperty -Path $rk -Name 'Roomler Desktop' -ErrorAction SilentlyContinue) {
+            try {
+                Remove-ItemProperty -Path $rk -Name 'Roomler Desktop' -ErrorAction Stop
+                Say "removed the Roomler Desktop login start ($rk)"
+            } catch { Warn "could not remove the Roomler Desktop login start in ${rk}: $_" }
+        }
     }
 
     # 2) Script-copied leftovers the MSI never owned: roomler-desktop.exe

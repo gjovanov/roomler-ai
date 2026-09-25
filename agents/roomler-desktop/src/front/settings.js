@@ -161,43 +161,71 @@
     });
   }
 
+  /* The ONE restart flow in the app — Settings' Apply now and the Welcome
+   * tour (FR-84 D6) both call it, as `window.Roomler.restartDaemon`. Ask,
+   * then wait for a DIFFERENT process. Resolves (never rejects):
+   *   {ok: true}                               the new daemon answers;
+   *   {ok: false, stage, message}              refused ('refused', verbatim),
+   *                                            not asked ('ask'), or not back
+   *                                            ('wait');
+   *   {ok: false, manual: true, stage, message} the service predates the verb.
+   * `progress(text)` receives each stage for the caller's status line. On
+   * success every key that was waiting for a restart is in force, so the
+   * shared pending set clears here, whoever asked. */
+  async function restartDaemon(reason, progress) {
+    const say = typeof progress === 'function' ? progress : () => {};
+    say('Asking the service to restart…');
+    let r;
+    try {
+      r = await invoke('cmd_restart_daemon', { reason });
+    } catch (e) {
+      return { ok: false, stage: 'ask', message: 'Could not ask the service to restart: ' + e };
+    }
+    if (!r.started) {
+      return {
+        ok: false,
+        manual: !!r.predates,
+        stage: 'refused',
+        message: restartRefusalText(r),
+      };
+    }
+    say(
+      r.restart_by === 'caller'
+        ? 'Restarting the service — starting it again…'
+        : 'Restarting the service (' + r.supervisor + ')…',
+    );
+    try {
+      await waitForDaemon(r);
+    } catch (e) {
+      void refreshStatus();
+      return {
+        ok: false,
+        stage: 'wait',
+        message: 'The service has not come back: ' + e + ' — check Background service.',
+      };
+    }
+    window.Roomler.settingsPendingRestart.clear();
+    void refreshStatus();
+    return { ok: true };
+  }
+  window.Roomler.restartDaemon = restartDaemon;
+
   async function applyNow(btn) {
     if (applying) return;
     applying = true;
     const keys = window.Roomler.settingsPendingRestart.keys();
     btn.disabled = true;
-    setText('cfg-restart-text', 'Asking the service to restart…');
     try {
-      let r;
-      try {
-        r = await invoke('cmd_restart_daemon', {
-          reason: keys.length ? 'settings: ' + keys.join(', ') : 'settings',
-        });
-      } catch (e) {
-        setText('cfg-restart-text', 'Could not ask the service to restart: ' + e);
-        return;
-      }
-      if (!r.started) {
-        setText('cfg-restart-text', restartRefusalText(r));
-        return;
-      }
-      setText(
-        'cfg-restart-text',
-        r.restart_by === 'caller'
-          ? 'Restarting the service — starting it again…'
-          : 'Restarting the service (' + r.supervisor + ')…',
+      const res = await restartDaemon(
+        keys.length ? 'settings: ' + keys.join(', ') : 'settings',
+        (text) => setText('cfg-restart-text', text),
       );
-      try {
-        await waitForDaemon(r);
-      } catch (e) {
-        setText('cfg-restart-text', 'The service has not come back: ' + e + ' — check Background service.');
-        void refreshStatus();
+      if (!res.ok) {
+        setText('cfg-restart-text', res.message);
         return;
       }
-      window.Roomler.settingsPendingRestart.clear();
       await loadCfg(true);
       showResult('Service restarted — your changes are in effect.', false);
-      void refreshStatus();
     } finally {
       applying = false;
       btn.disabled = false;
