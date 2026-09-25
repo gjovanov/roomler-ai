@@ -3023,6 +3023,9 @@ pub struct RemoteSession {
     pub controller_user_id: ObjectId,
     #[serde(default)]
     pub watchers: Vec<ObjectId>,
+    /// Names from the `to_document` projection in `audit.rs`, bits from any
+    /// typed `insert_one` — a stored field reads both, explicitly (#1630).
+    #[serde(deserialize_with = "crate::permissions::deserialize_stored")]
     pub permissions: Permissions,
     pub phase: SessionPhase,
     pub created_at: DateTime,
@@ -3056,7 +3059,11 @@ pub enum AuditKind {
         controller_user_id: ObjectId,
         #[serde(default)]
         controller_name: String,
-        #[serde(default)]
+        /// Stored as `Int32` bits by the driver's typed `insert_many` and read
+        /// back through serde's tagged-enum buffering, which hides the format
+        /// from `Permissions`' own impl — the explicit opt-in is what makes
+        /// this field readable at all (#1630).
+        #[serde(default, deserialize_with = "crate::permissions::deserialize_stored")]
         permissions: Permissions,
     },
     ConsentPrompted,
@@ -3083,6 +3090,8 @@ pub enum AuditKind {
     },
     KeyframeRequested,
     PermissionsChanged {
+        /// Same as `SessionRequested::permissions` (#1630).
+        #[serde(deserialize_with = "crate::permissions::deserialize_stored")]
         permissions: Permissions,
     },
     WatcherJoined {
@@ -4723,6 +4732,135 @@ mod tests {
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));
+    }
+
+    // ── #1630: an audit row must read back through the driver's own pair ───
+
+    fn audit_row(event: AuditKind) -> RemoteAuditEvent {
+        RemoteAuditEvent {
+            id: None,
+            session_id: ObjectId::new(),
+            agent_id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            at: bson::DateTime::now(),
+            event,
+        }
+    }
+
+    fn event_permissions(ev: &AuditKind) -> Permissions {
+        match ev {
+            AuditKind::SessionRequested { permissions, .. }
+            | AuditKind::PermissionsChanged { permissions } => *permissions,
+            other => panic!("not a permissions-carrying event: {other:?}"),
+        }
+    }
+
+    /// `AuditSink::flush` → `insert_many` → `bson::to_raw_document_buf`; the
+    /// audit route → typed cursor → `bson::from_slice`. Byte-for-byte the
+    /// production pair, with no database. RED before the `deserialize_stored`
+    /// opt-ins: the raw serializer stores `Int32` bits, and serde's
+    /// tagged-enum buffering made the read look human-readable, so the wire
+    /// rule refused them (#1630).
+    #[test]
+    fn audit_rows_the_driver_writes_read_back_through_the_driver_path() {
+        for event in [
+            AuditKind::SessionRequested {
+                controller_user_id: ObjectId::new(),
+                controller_name: "op".into(),
+                permissions: Permissions::default(),
+            },
+            AuditKind::PermissionsChanged {
+                permissions: Permissions::VIEW,
+            },
+        ] {
+            let want = event_permissions(&event);
+            let raw = bson::to_raw_document_buf(&audit_row(event)).unwrap();
+            // Pin the on-disk shape: the driver's raw serializer stores bits,
+            // which is what every remote_audit row in prod holds.
+            let stored = raw
+                .get_document("event")
+                .unwrap()
+                .get("permissions")
+                .unwrap()
+                .expect("permissions present");
+            assert_eq!(
+                stored.element_type(),
+                bson::spec::ElementType::Int32,
+                "{stored:?}"
+            );
+            let back: RemoteAuditEvent = bson::from_slice(raw.as_bytes())
+                .expect("the cursor must read what insert_many wrote");
+            assert_eq!(event_permissions(&back.event), want);
+        }
+    }
+
+    /// The other shape keeps reading — a row a `to_document` writer produced,
+    /// or one an operator repaired by hand.
+    #[test]
+    fn name_shaped_audit_rows_read_back_too() {
+        let doc = bson::doc! {
+            "session_id": ObjectId::new(),
+            "agent_id": ObjectId::new(),
+            "tenant_id": ObjectId::new(),
+            "at": bson::DateTime::now(),
+            "event": { "kind": "permissions_changed", "permissions": "VIEW | FILES" },
+        };
+        let back: RemoteAuditEvent = bson::from_slice(&bson::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(
+            event_permissions(&back.event),
+            Permissions::VIEW | Permissions::FILES
+        );
+    }
+
+    /// A pre-P3 audit row has no `permissions` at all and still defaults.
+    #[test]
+    fn pre_p3_session_requested_rows_still_default() {
+        let doc = bson::doc! {
+            "session_id": ObjectId::new(),
+            "agent_id": ObjectId::new(),
+            "tenant_id": ObjectId::new(),
+            "at": bson::DateTime::now(),
+            "event": { "kind": "session_requested" },
+        };
+        let back: RemoteAuditEvent = bson::from_slice(&bson::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(event_permissions(&back.event), Permissions::default());
+    }
+
+    /// `remote_sessions`: names from the `to_document` projection in
+    /// `audit.rs` (every row in prod) and bits from a typed `insert_one`, both
+    /// through the cursor's `from_slice`.
+    #[test]
+    fn remote_session_rows_read_back_in_both_shapes() {
+        let row = RemoteSession {
+            id: Some(ObjectId::new()),
+            agent_id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            controller_user_id: ObjectId::new(),
+            watchers: Vec::new(),
+            permissions: Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD,
+            phase: SessionPhase::AwaitingConsent,
+            created_at: bson::DateTime::now(),
+            started_at: None,
+            ended_at: None,
+            end_reason: None,
+            recording_url: None,
+            stats: SessionStats::default(),
+        };
+        let names = bson::to_document(&row).unwrap();
+        assert_eq!(
+            names.get_str("permissions").unwrap(),
+            "VIEW | INPUT | CLIPBOARD"
+        );
+        let back: RemoteSession = bson::from_slice(&bson::to_vec(&names).unwrap()).unwrap();
+        assert_eq!(back.permissions, row.permissions);
+
+        let bits = bson::to_raw_document_buf(&row).unwrap();
+        assert_eq!(
+            bits.get("permissions").unwrap().unwrap().element_type(),
+            bson::spec::ElementType::Int32
+        );
+        let back: RemoteSession = bson::from_slice(bits.as_bytes()).unwrap();
+        assert_eq!(back.permissions, row.permissions);
     }
 }
 
