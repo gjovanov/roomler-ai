@@ -15,7 +15,7 @@
 
 #![cfg(all(feature = "recording", feature = "openh264-encoder"))]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -399,6 +399,7 @@ async fn no_frame_refuses_the_start() {
 mod process {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
     use std::process::{Child, ChildStdin, Command, Stdio};
 
     struct Rec {
