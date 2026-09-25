@@ -2335,32 +2335,80 @@ fn probe_service_state() -> (String, bool) {
     let Ok(exe) = agent_exe_path() else {
         return ("none".to_string(), false);
     };
-    // Scheduled Task probe — works for both flavours' status query.
-    let task_status = no_window_command(&exe)
-        .args(["service", "status"])
-        .output()
-        .ok();
-    if let Some(out) = task_status {
-        let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-        if s.contains("running") {
-            return ("scheduledTask".to_string(), true);
-        }
+    let stdout_of = |args: &[&str]| {
+        no_window_command(&exe)
+            .args(args)
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // The SCM service first: when one is registered it is this machine's
+    // daemon, whatever else a cross-flavour history left behind.
+    let scm = stdout_of(&["service", "status", "--as-service"]);
+    if matches!(
+        scm.as_deref().and_then(scm_answer),
+        Some(ScmAnswer::Running)
+    ) {
+        return ("scmService".to_string(), true);
     }
-    // SCM service probe (perMachine).
-    let svc_status = no_window_command(&exe)
-        .args(["service", "status", "--as-service"])
-        .output()
-        .ok();
-    if let Some(out) = svc_status {
-        let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-        if s.contains("running") {
-            return ("scmService".to_string(), true);
-        }
-        if s.contains("stopped") {
-            return ("scmService".to_string(), false);
-        }
-    }
-    ("none".to_string(), false)
+    let task = stdout_of(&["service", "status"]);
+    classify_service_state(task.as_deref(), scm.as_deref())
+}
+
+/// What `roomlerd service status --as-service` answered: its
+/// `Roomler: <InstalledStatus:?>` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScmAnswer {
+    Running,
+    /// Registered but not running (stopped, start/stop pending, other).
+    Registered,
+    NotInstalled,
+}
+
+/// #1681 — a probe is read from its ANSWER line only. `roomlerd` writes its
+/// tracing INFO lines to STDOUT for these subcommands, and one of them —
+/// logged on every start while this companion runs, i.e. on every probe —
+/// says "migration skipped: desktop companion is running". The substring
+/// match this replaced read that as the service state, so every Windows
+/// host looked like a running per-user task: a SystemContext install (its
+/// config under %PROGRAMDATA%) read the per-user config and showed "Not
+/// enrolled", and the Welcome offered a perMachine host userspace mode.
+fn answer_line(stdout: &str, prefix: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower
+            .strip_prefix(prefix)
+            .map(|rest| rest.trim().to_string())
+    })
+}
+
+fn scm_answer(stdout: &str) -> Option<ScmAnswer> {
+    // `println!("{}: {:?}", NEW_SERVICE_NAME, status)` — "Roomler: Running".
+    let state = answer_line(stdout, "roomler:")?;
+    Some(match state.as_str() {
+        "running" => ScmAnswer::Running,
+        "notinstalled" => ScmAnswer::NotInstalled,
+        _ => ScmAnswer::Registered,
+    })
+}
+
+/// `service status` prints `Auto-start: installed | not installed | unknown`
+/// (`AutostartStatus`'s Display) — it never says "running". Whether the
+/// task's daemon runs is not in its answer, so it is not claimed.
+fn classify_service_state(task: Option<&str>, scm: Option<&str>) -> (String, bool) {
+    let scm = scm.and_then(scm_answer);
+    let task_installed =
+        task.and_then(|t| answer_line(t, "auto-start:")).as_deref() == Some("installed");
+    let (kind, running) = match (scm, task_installed) {
+        // A running machine-wide service IS this machine's daemon.
+        (Some(ScmAnswer::Running), _) => ("scmService", true),
+        // Otherwise a registered per-user task is (a stopped SCM service
+        // beside it is a cross-flavour leftover).
+        (_, true) => ("scheduledTask", false),
+        (Some(ScmAnswer::Registered), false) => ("scmService", false),
+        _ => ("none", false),
+    };
+    (kind.to_string(), running)
 }
 
 // RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping
@@ -2499,6 +2547,91 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1681 — stdout as `roomlerd service status [--as-service]` really prints
+    // it: tracing INFO lines (ANSI and all) on STDOUT, the answer last. The
+    // noise line is the one every probe carries while this companion runs.
+    const NOISE: &str = "\u{1b}[2m2026-09-26T08:23:47.814093Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+        appdirs legacy-tree migration \u{1b}[3mnote\u{1b}[0m\u{1b}[2m=\u{1b}[0mmigration skipped: \
+        desktop companion is running (will retry next start)\n\
+        \u{1b}[2m2026-09-26T08:23:47.814973Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m config: resolved load path\n";
+
+    fn out(answer: &str) -> String {
+        format!("{NOISE}{answer}\n")
+    }
+
+    #[test]
+    fn a_running_machine_wide_service_is_not_read_as_a_per_user_task() {
+        // The SystemContext / attended perMachine host the vmtest probe caught:
+        // no task, the SCM service running, the noise in BOTH outputs.
+        let got = classify_service_state(
+            Some(&out("Auto-start: not installed")),
+            Some(&out("Roomler: Running")),
+        );
+        assert_eq!(got, ("scmService".to_string(), true));
+    }
+
+    #[test]
+    fn a_per_user_task_is_read_from_its_answer_line() {
+        let got = classify_service_state(
+            Some(&out("Auto-start: installed")),
+            Some(&out("Roomler: NotInstalled")),
+        );
+        assert_eq!(got, ("scheduledTask".to_string(), false));
+        // `--as-service` failing outright (no answer line at all) is the same.
+        let got = classify_service_state(Some(&out("Auto-start: installed")), Some(NOISE));
+        assert_eq!(got, ("scheduledTask".to_string(), false));
+    }
+
+    #[test]
+    fn log_noise_alone_is_no_service_at_all() {
+        // Neither probe answered: the word "running" in a log line is not a state.
+        assert_eq!(
+            classify_service_state(Some(NOISE), Some(NOISE)),
+            ("none".to_string(), false)
+        );
+        assert_eq!(
+            classify_service_state(
+                Some(&out("Auto-start: not installed")),
+                Some(&out("Roomler: NotInstalled"))
+            ),
+            ("none".to_string(), false)
+        );
+        assert_eq!(
+            classify_service_state(None, None),
+            ("none".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn a_stopped_or_pending_machine_wide_service_is_still_the_service() {
+        for state in ["Stopped", "StartPending", "StopPending", "Other(7)"] {
+            assert_eq!(
+                classify_service_state(
+                    Some(&out("Auto-start: not installed")),
+                    Some(&out(&format!("Roomler: {state}")))
+                ),
+                ("scmService".to_string(), false),
+                "{state}"
+            );
+        }
+        // A registered task beside a STOPPED service is the daemon; a running
+        // service beside a task is.
+        assert_eq!(
+            classify_service_state(
+                Some(&out("Auto-start: installed")),
+                Some(&out("Roomler: Stopped"))
+            ),
+            ("scheduledTask".to_string(), false)
+        );
+        assert_eq!(
+            classify_service_state(
+                Some(&out("Auto-start: installed")),
+                Some(&out("Roomler: Running"))
+            ),
+            ("scmService".to_string(), true)
+        );
+    }
 
     /// FR-85 — the page hands the companion a NAME to open, never a path.
     #[test]
