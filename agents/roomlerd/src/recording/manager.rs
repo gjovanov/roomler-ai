@@ -486,6 +486,16 @@ impl RecordingManager {
         self.snapshot()
     }
 
+    /// FR-85 P3b-2 — the folder recordings go to, for serving a download.
+    /// `None` when it cannot be resolved: never a fallback directory, which
+    /// would be a folder of files this device did not decide to serve.
+    pub async fn folder(&self) -> Option<PathBuf> {
+        let configured = self.configured_dir();
+        tokio::task::spawn_blocking(move || folder::resolve(configured.as_deref()).dir)
+            .await
+            .ok()
+    }
+
     /// The folder recordings go to, and the finished recordings in it.
     pub async fn list(&self) -> Response {
         let configured = self.configured_dir();
@@ -612,7 +622,7 @@ fn apply_event(s: &mut RecordingState, ev: &serde_json::Value) -> bool {
 
 /// A recording's file name, from a client: a bare `*.mp4` name, nothing that
 /// could leave the folder.
-fn check_recording_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_recording_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.contains(['/', '\\', ':'])
         || name.contains("..")
