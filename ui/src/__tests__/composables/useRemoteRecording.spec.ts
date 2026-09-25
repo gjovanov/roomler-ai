@@ -202,9 +202,12 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     ch.deliver({ t: 'rc:record.file', id: get.id, offset: 0, size: 3 })
     ch.deliver(content.buffer.slice(0))
     ch.deliver({ t: 'rc:record.done', id: get.id, bytes: 3, size: 3, sha256: good })
-    await settle()
-    await settle()
-    expect(r.download.value).toMatchObject({ status: 'done', verified: true })
+    // ⚠️ Wait for the OUTCOME, not a number of ticks: the check reads the
+    // Blob and runs WebCrypto's digest, several async hops that two
+    // `setTimeout(0)` did not always cover on a loaded CI runner.
+    await vi.waitFor(() =>
+      expect(r.download.value).toMatchObject({ status: 'done', verified: true }),
+    )
     expect(saved).toHaveBeenCalledTimes(1)
 
     // The same bytes against a different hash: nothing is saved.
@@ -217,9 +220,13 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     two.ch.deliver({ t: 'rc:record.file', id: get.id, offset: 0, size: 3 })
     two.ch.deliver(content.buffer.slice(0))
     two.ch.deliver({ t: 'rc:record.done', id: get.id, bytes: 3, size: 3, sha256: '00'.repeat(32) })
-    await settle()
-    await settle()
-    expect(r2.download.value).toMatchObject({ status: 'error', error: 'hash_mismatch', verified: false })
+    await vi.waitFor(() =>
+      expect(r2.download.value).toMatchObject({
+        status: 'error',
+        error: 'hash_mismatch',
+        verified: false,
+      }),
+    )
     expect(saved).toHaveBeenCalledTimes(1)
   })
 
