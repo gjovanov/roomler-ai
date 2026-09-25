@@ -186,6 +186,20 @@ audiopus = { version = "0.3.0-rc.0", optional = true }
 # file on stop — no FFmpeg muxer, so it works on the arm64 build that has no
 # FFmpeg at all. MIT OR Apache-2.0.
 mp4-atom = { version = "0.16", optional = true }
+# FR-85 P5b — background music for an export: the file a person picks, decoded
+# in pure Rust. A user-chosen file is untrusted input, which is why it is not
+# FFmpeg's C parsers. Only the formats people bring (MP3, AAC/M4A, FLAC, Ogg
+# Vorbis, WAV); no video, no container we do not need. MPL-2.0.
+symphonia = { version = "0.5", optional = true, default-features = false, features = [
+    "mp3",
+    "aac",
+    "isomp4",
+    "flac",
+    "ogg",
+    "vorbis",
+    "wav",
+    "pcm",
+] }
 
 # Option B HEVC plan (rc.65+). `ffmpeg-next` is the safe Rust wrapper
 # over FFmpeg's libav*. We use it to dispatch HEVC + H.264 + VP9 to
@@ -525,7 +539,8 @@ viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundatio
 audio = ["dep:audiopus", "dep:cpal"]
 # FR-85 — HQ screen recording: the `roomlerd record` child (own capturer, CFR
 # pacer, recording encoder profile, fragmented MP4 + remux on stop), the local
-# verbs, and the device's half of remote recording.
+# verbs, and the device's half of remote recording. `symphonia` decodes an
+# export's background music (P5b).
 #
 # ⚠️ NOT in `full`, and so in no release build: taken back out before any
 # release carried it (the operator, 2026-09-26). It rejoins once the field
@@ -534,7 +549,7 @@ audio = ["dep:audiopus", "dep:cpal"]
 # someone opens the Recordings view, the pattern EDR watches for. Then macOS
 # TCC for that child. CI names the feature explicitly. Where it is compiled
 # in, every gate is closed and `ROOMLERD_RECORDING=0` switches it all off.
-recording = ["dep:mp4-atom"]
+recording = ["dep:mp4-atom", "dep:symphonia"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
 # Full media pipeline including the MF hardware encoder. Production

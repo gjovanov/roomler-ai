@@ -501,6 +501,13 @@ jobs:
         # index, exported through keep / cut / 4× / keep, decoded back frame
         # for frame (the oracle is proven against the unedited source), plus
         # the real `roomlerd media probe|export` process.
+        #
+        # FR-85 P5b — `export` again WITH `audio`: the recording's own sound
+        # through the same edit (a stepped tone, so every second of the export
+        # names the second of the recording it came from), muted under a
+        # speed-up, and music looped, faded and mixed under it. Without
+        # `audio` the same binary proves a recording's sound is reported
+        # `not_carried`, never dropped in silence.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
@@ -508,6 +515,7 @@ jobs:
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test export
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
