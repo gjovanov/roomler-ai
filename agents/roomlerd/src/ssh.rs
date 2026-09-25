@@ -1834,7 +1834,18 @@ mod sshd {
                 "nobody approved this session at the device within {}s",
                 timeout.as_secs()
             ),
-            _ => "the operator at this device denied this session".to_string(),
+            // #1632 — nothing withdraws an SSH prompt today (the cancel path is
+            // the RC `Terminate`), but "denied" would be the wrong story if
+            // one ever did: nobody said no.
+            crate::consent::Decision::Cancelled => {
+                "the request was withdrawn before the operator at this device answered".to_string()
+            }
+            // `Granted` returned `Ok` above; only `Denied` reaches this arm.
+            // Spelled out rather than `_` so a new variant fails to compile
+            // instead of quietly reading as a refusal.
+            crate::consent::Decision::Granted | crate::consent::Decision::Denied => {
+                "the operator at this device denied this session".to_string()
+            }
         })
     }
 
