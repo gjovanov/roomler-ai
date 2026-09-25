@@ -83,26 +83,59 @@ jobs:
       #
       # Cheap, and it fails on the commit that reintroduces a stub rather than
       # on someone's Mac. Regenerate with scripts/gen-tray-icons.py.
-      - name: Assert the companion's icons are real
+      #
+      # FR-84 S2 extended it to the SETUP WIZARD's icons, which were the same
+      # 1x1 placeholders for the wizard's whole life (its build.rs writes them
+      # when the files are missing, so nothing ever failed): the one EXE a new
+      # user double-clicks showed a blank icon. The .ico is what reaches the
+      # EXE resource (tauri-build takes the first .ico in bundle.icon), so it
+      # is checked structurally: an icon SET (≥ 5 entries, one of them 256 px,
+      # which the format stores as a width byte of 0) rather than a stub.
+      - name: Assert the icons are real
         run: |
           python3 - <<'PY'
           import sys, struct, pathlib
-          icons = pathlib.Path("agents/roomler-desktop/icons")
+
           bad = []
-          for name in ("tray.png", "icon.png"):
-              p = icons / name
+
+          def check_png(p, min_px):
               raw = p.read_bytes()
               if raw[:8] != b"\x89PNG\r\n\x1a\n":
-                  bad.append(f"{name}: not a PNG"); continue
+                  bad.append(f"{p}: not a PNG"); return
               # IHDR is always the first chunk: width/height at bytes 16..24.
               w, h = struct.unpack(">II", raw[16:24])
-              if min(w, h) < 16:
-                  bad.append(f"{name}: {w}x{h} — a placeholder, not an icon")
+              if min(w, h) < min_px:
+                  bad.append(f"{p}: {w}x{h} — a placeholder, not an icon (need >= {min_px} px)")
+
+          def check_ico(p):
+              raw = p.read_bytes()
+              # ICONDIR: reserved u16 (0), type u16 (1 = icon), count u16; then
+              # 16-byte ICONDIRENTRYs whose first byte is the width (0 == 256).
+              if len(raw) < 6 or struct.unpack("<HH", raw[:4]) != (0, 1):
+                  bad.append(f"{p}: not an ICO"); return
+              count = struct.unpack("<H", raw[4:6])[0]
+              widths = [raw[6 + 16 * i] for i in range(count) if 6 + 16 * i < len(raw)]
+              if count < 5:
+                  bad.append(f"{p}: {count} entries — a placeholder, not an icon set (need >= 5)")
+              if 0 not in widths:
+                  bad.append(f"{p}: no 256 px entry (widths {widths})")
+              if len(raw) <= 4096:
+                  bad.append(f"{p}: {len(raw)} bytes — a placeholder, not an icon set (need > 4 KiB)")
+
+          desktop = pathlib.Path("agents/roomler-desktop/icons")
+          check_png(desktop / "tray.png", 16)
+          check_png(desktop / "icon.png", 128)
+          check_ico(desktop / "icon.ico")
+
+          setup = pathlib.Path("agents/roomler-setup/icons")
+          check_png(setup / "icon.png", 128)
+          check_ico(setup / "icon.ico")
+
           if bad:
               print("::error::" + "; ".join(bad))
-              print("regenerate with: python3 scripts/gen-tray-icons.py")
+              print("regenerate with: python3 scripts/gen-tray-icons.py [--target setup]")
               sys.exit(1)
-          print("  companion icons OK")
+          print("  companion + wizard icons OK")
           PY
 
       # P5 (invariant I5) — the vendored webrtc-ice must equal pristine
@@ -292,6 +325,10 @@ jobs:
       # `remote_control` holds the `rc:*` wire locks CLAUDE.md calls
       # load-bearing, `mod-network` the SSH gates and the grant-ack table,
       # `agent-core` the config round-trips. One invocation, one build graph.
+      # `roomler-setup` (the wizard app, lib `wizard_app`) joined with FR-84
+      # S2: its orchestrator now decides the overlay default per install
+      # flavour, and that rule ran in no lane either. `--lib` only — its
+      # bin is `test = false` by the UAC lib-naming rule.
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -299,7 +336,7 @@ jobs:
           -p roomler-node-core -p roomler-cli -p roomler-localapi
           -p roomler-ai-services -p roomler-ai-db -p roomler-ai-config
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
-          -p tcp-turn-conn -p roomler-setup-core
+          -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
 
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat

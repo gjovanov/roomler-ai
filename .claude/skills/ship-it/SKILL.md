@@ -134,3 +134,44 @@ roomler peers
 online. Query the server for the denominator.
 ⚠️ `roomler exec` on a host that restarts its own service answers "no answer
 within 45 s" — the command ran.
+
+## 6 · The wizard ships in lockstep (FR-84 S1)
+
+`/api/setup/{windows,linux,macos}` — the landing page's download button and the
+admin UI's install link — serve the **newest `setup-v*` release**
+(`setup_release.rs::pick_release_for`). Nothing cut one between `setup-v0.4.48`
+(2026-09-02) and `agent-v0.4.102`: 54 agent releases shipped while every new
+install downloaded a three-week-old wizard, and `/api/setup/macos` answered 404
+the whole time. A lane a human has to remember is a lane that drifts.
+
+So **every `agent-v<V>` release also publishes `setup-v<V>`, at the same
+commit**: `release-agent.yml`'s `dispatch-setup-release` job (after `release`,
+so it can never block the agent) tags `setup-v<V>` at the built commit and
+dispatches `release-setup.yml --ref setup-v<V>`. Two GitHub rules shape it: a
+tag pushed with `GITHUB_TOKEN` triggers **no** workflow, and `workflow_dispatch`
+is the documented exception — hence the explicit dispatch. The wizard lane
+builds all three platforms (macOS is no longer skippable), pins the release's
+`target_commitish` to the built commit, and opens/closes a
+"roomler-setup release failed" issue like the agent lane's seed alert.
+
+```bash
+# Verify a lockstep roll — both must hold
+gh release view setup-v<V> --json assets,targetCommitish   # 3 platforms + sidecars; commitish = the agent-v<V> commit
+for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>
+
+# Re-run after a failure (the tag already exists at the agent commit; idempotent)
+gh workflow run release-setup.yml --ref setup-v<V> -f version=<V> -f publish_release=true
+```
+
+⚠️ **Never re-cut a wizard under a number that already shipped.** The resolver
+serves by number, so the bytes behind one download URL would change underneath
+everyone who already fetched them — bump the version and release again. The
+lockstep job refuses a `setup-v<V>` that exists at a *different* commit for the
+same reason.
+⚠️ The kill switch is the repo variable **`SETUP_LOCKSTEP=false`** (skips the
+job; nothing else changes). With it set, a wizard release is a human pushing a
+`setup-v*` tag again — and the drift above is the failure mode you are opting
+back into.
+⚠️ `/api/setup/*` is served from the same per-pod release cache as the agent
+feed; the wizard lane's `refresh-release-cache` busts it, and the 15 min TTL is
+the backstop.

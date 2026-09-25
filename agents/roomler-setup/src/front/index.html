@@ -117,10 +117,18 @@
            value stays editable later in the desktop app's Settings. -->
       <details id="advanced-wrap" class="card">
         <summary>Advanced options (optional)</summary>
+        <!-- FR-84 S2: the box follows the role until the operator touches it —
+             on for the service roles, off for a per-user install (app.js
+             renderServer). The Rust orchestrator applies the same default when
+             the option is absent. -->
         <label class="field checkline">
           <input id="adv-overlay" type="checkbox">
           <span>Join the overlay network (private mesh between your devices)</span>
         </label>
+        <p id="adv-overlay-hint" class="muted" hidden>The private network's TUN
+        adapter needs a service install: a per-user daemon runs with limited
+        rights and cannot create it, so the mesh will not come up on this install.
+        Pick a service role above if this machine should join it.</p>
         <label class="field checkline">
           <input id="adv-local-subnets" type="checkbox" checked>
           <span>Advertise directly-connected subnets (admin approval required before use)</span>
