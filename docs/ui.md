@@ -136,6 +136,15 @@ nodes) · `MagicDnsSection` · `TunnelPoliciesSection` · `MembersSection` ·
 
 **Plugin order** (`main.ts`): i18n → vuetify → pinia → router.
 
+**A view that owns per-subject state remounts when its subject changes.** Vue Router
+reuses the mounted component when only a param changes, so a view that resolves its
+subject once in `onMounted` kept showing the previous subject under the new URL (#1631:
+the remote viewer stayed on device A after the nav picked B, and Connect dialled A).
+The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
+(`plugins/router.ts`), read by `components/layout/KeyedRouterView.vue`, keys the view by
+that one param. Every other route stays unkeyed on purpose — several views rewrite
+`route.query` in place and must not remount — so never key by `fullPath`.
+
 **Stores** use the Pinia setup pattern: `defineStore('name', () => { … })`.
 
 **Vuetify** runs light + dark themes with auto-import tree-shaking via

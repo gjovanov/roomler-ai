@@ -712,6 +712,17 @@ measured on mars twice — throwing away the agent's reason and reporting every
 dead agent, not a peer of a live one; the number on the wire is unchanged, so
 the on-host prompt still stands for exactly the announced window.
 
+⚠️ **A session that ends while its prompt stands takes the prompt with it**
+(#1632). The controller closing the tab, switching device, or the server timing the
+session out all reach the agent as `ServerMsg::Terminate`; the agent then cancels the
+running prompt (`ConsentBroker::cancel` → `Decision::Cancelled`), which sends **no**
+`rc:consent` — the server has already forgotten the session, and a `granted:false`
+would be a refusal nobody made — and takes down the native panel and the companion's
+`.pending` marker. Before this, the person at the machine was asked to decide about a
+session that no longer existed until the window ran out. The cancel runs ahead of the
+FR-43 delegation gate, because the prompt is always the daemon's even when the session
+media was handed to the GUI worker.
+
 ### 11.3 Recording & audit consent
 
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.
@@ -1371,7 +1382,10 @@ to-activate, so the browser never sees a bait-and-switch.
   64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
   `files:end` → agent writes into the controlled host's Downloads
   folder. Filename sanitization + collision-safe rename + 2 GiB
-  per-transfer cap.
+  per-transfer cap. Since FR-84 D4 the folder is **`files_dir`** (live; `~`
+  per the active user; a SYSTEM/root writer is confined to the active user's
+  profile), shown and changed from the companion's Overview —
+  [desktop-companion.md](desktop-companion.md) §9 has the rules.
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
