@@ -133,8 +133,8 @@ pub(crate) enum LaunchOutcome {
     /// The marker could not be written: NOTHING was launched.
     MarkerFailed(String),
     /// The marker was written but the spawn failed; the marker is released
-    /// again so a later start can try (nobody saw a window, so there is
-    /// nothing to "resurrect").
+    /// again so a later look — or a later start — can try (nobody saw a
+    /// window, so there is nothing to "resurrect").
     SpawnFailed(String),
 }
 
@@ -205,6 +205,10 @@ const LAUNCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 6
 /// Between looks. Every look is a few stats and, only when everything else is
 /// ready, one process listing.
 const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+/// After a spawn that FAILED (the marker was released): a transient cause —
+/// a profile still loading at logon, `CreateEnvironmentBlock` refusing — gets
+/// another try inside the window, at a pace that does not flood the log.
+const RETRY_AFTER_SPAWN_FAILURE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Who runs the launch, and what it knows.
 pub enum LaunchOwner {
@@ -233,6 +237,8 @@ struct Step {
     marker: std::path::PathBuf,
     /// Set when the step acted (`Adopt`, `RecordRunning`, `Launch`).
     note: Option<String>,
+    /// The launch was attempted and FAILED, releasing the marker: look again.
+    retry: bool,
 }
 
 /// Run the launcher to its end: a launch, a recorded decision, the kill
@@ -270,19 +276,19 @@ pub async fn run(owner: LaunchOwner) {
                 log_step(&step);
                 last = Some(step.decision);
             }
-            match step.decision {
-                LaunchDecision::Wait(reason) => {
-                    if started.elapsed() >= LAUNCH_WINDOW {
-                        tracing::info!(
-                            ?reason,
-                            "companion launch-once: gave up waiting — the login start covers it"
-                        );
-                        return;
-                    }
-                }
+            let pause = match step.decision {
+                LaunchDecision::Wait(_) => POLL,
+                LaunchDecision::Launch if step.retry => RETRY_AFTER_SPAWN_FAILURE,
                 _ => return,
+            };
+            if started.elapsed() >= LAUNCH_WINDOW {
+                tracing::info!(
+                    decision = ?step.decision,
+                    "companion launch-once: gave up — the login start covers it"
+                );
+                return;
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep(pause).await;
         }
     }
 }
@@ -307,32 +313,50 @@ fn log_step(step: &Step) {
     }
 }
 
+/// What acting on a decision did.
+#[cfg(not(target_os = "macos"))]
+struct Acted {
+    note: Option<String>,
+    /// A launch was attempted and failed; the marker is released.
+    retry: bool,
+}
+
 /// Act on a terminal decision: record it, or launch behind the marker.
 #[cfg(not(target_os = "macos"))]
 fn act(
     decision: LaunchDecision,
     marker: &Path,
     spawn: impl FnOnce() -> anyhow::Result<()>,
-) -> Option<String> {
+) -> Acted {
     let recorded = |outcome: &str| match record(marker, outcome) {
         Ok(true) => format!("recorded: {outcome}"),
         Ok(false) => "already recorded".to_string(),
         Err(e) => format!("could not record {outcome}: {e}"),
     };
+    let done = |note: String| Acted {
+        note: Some(note),
+        retry: false,
+    };
     match decision {
-        LaunchDecision::Adopt => Some(recorded("adopted")),
-        LaunchDecision::RecordRunning => Some(recorded("already_running")),
-        LaunchDecision::Launch => Some(match launch_behind_marker(marker, spawn) {
-            LaunchOutcome::Launched => "launched the companion with --first-run".to_string(),
-            LaunchOutcome::AlreadyDecided => "another launcher decided first".to_string(),
+        LaunchDecision::Adopt => done(recorded("adopted")),
+        LaunchDecision::RecordRunning => done(recorded("already_running")),
+        LaunchDecision::Launch => match launch_behind_marker(marker, spawn) {
+            LaunchOutcome::Launched => done("launched the companion with --first-run".into()),
+            LaunchOutcome::AlreadyDecided => done("another launcher decided first".into()),
             LaunchOutcome::MarkerFailed(e) => {
-                format!("marker not written ({e}) — launching NOTHING")
+                done(format!("marker not written ({e}) — launching NOTHING"))
             }
-            LaunchOutcome::SpawnFailed(e) => {
-                format!("spawn failed ({e}) — marker released for a later start")
-            }
-        }),
-        _ => None,
+            LaunchOutcome::SpawnFailed(e) => Acted {
+                note: Some(format!(
+                    "spawn failed ({e}) — marker released; trying again shortly"
+                )),
+                retry: true,
+            },
+        },
+        _ => Acted {
+            note: None,
+            retry: false,
+        },
     }
 }
 
@@ -374,7 +398,7 @@ fn worker_step(facts: LaunchFacts, marker: std::path::PathBuf) -> Step {
         session: true,
         ..facts
     });
-    let (facts, decision, note) = if matches!(pre, LaunchDecision::Launch) {
+    let (facts, decision, acted) = if matches!(pre, LaunchDecision::Launch) {
         platform_worker_launch(facts, &marker)
     } else {
         (facts, pre, act(pre, &marker, || Ok(())))
@@ -383,7 +407,8 @@ fn worker_step(facts: LaunchFacts, marker: std::path::PathBuf) -> Step {
         decision,
         facts,
         marker,
-        note,
+        note: acted.note,
+        retry: acted.retry,
     }
 }
 
@@ -391,7 +416,7 @@ fn worker_step(facts: LaunchFacts, marker: std::path::PathBuf) -> Step {
 fn platform_worker_launch(
     facts: LaunchFacts,
     marker: &Path,
-) -> (LaunchFacts, LaunchDecision, Option<String>) {
+) -> (LaunchFacts, LaunchDecision, Acted) {
     windows::worker_launch(facts, marker)
 }
 
@@ -399,7 +424,7 @@ fn platform_worker_launch(
 fn platform_worker_launch(
     facts: LaunchFacts,
     marker: &Path,
-) -> (LaunchFacts, LaunchDecision, Option<String>) {
+) -> (LaunchFacts, LaunchDecision, Acted) {
     linux::worker_launch(facts, marker)
 }
 
@@ -451,6 +476,7 @@ mod windows {
                 },
                 marker,
                 note: None,
+                retry: false,
             };
         }
         let session = supervisor::active_console_session_id();
@@ -478,7 +504,7 @@ mod windows {
             facts.companion_running = desktop_running_in_session(sid);
             decision = decide(&facts);
         }
-        let note = act(decision, &marker, || {
+        let acted = act(decision, &marker, || {
             let (Some(token), Some(exe)) = (token.as_ref(), exe.as_ref()) else {
                 anyhow::bail!("no user token or companion path");
             };
@@ -497,14 +523,15 @@ mod windows {
             decision,
             facts,
             marker,
-            note,
+            note: acted.note,
+            retry: acted.retry,
         }
     }
 
     pub(super) fn worker_launch(
         mut facts: LaunchFacts,
         marker: &Path,
-    ) -> (LaunchFacts, LaunchDecision, Option<String>) {
+    ) -> (LaunchFacts, LaunchDecision, Acted) {
         let exe = sibling_companion();
         facts.companion_present = exe.as_ref().is_some_and(|p| p.exists());
         // Session 0 is services' session: nothing there is visible.
@@ -515,7 +542,7 @@ mod windows {
             facts.companion_running = desktop_running_in_session(sid);
             decision = decide(&facts);
         }
-        let note = act(decision, marker, || {
+        let acted = act(decision, marker, || {
             let exe = exe
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no companion path"))?;
@@ -523,7 +550,7 @@ mod windows {
             tracing::info!(pid, "companion launch-once: started (no inherited handles)");
             Ok(())
         });
-        (facts, decision, note)
+        (facts, decision, acted)
     }
 }
 
@@ -535,7 +562,7 @@ mod linux {
     pub(super) fn worker_launch(
         mut facts: LaunchFacts,
         marker: &Path,
-    ) -> (LaunchFacts, LaunchDecision, Option<String>) {
+    ) -> (LaunchFacts, LaunchDecision, Acted) {
         let exe = crate::companion::linux_companion_path();
         facts.companion_present = exe.is_some();
         // A root daemon opens it in whoever's graphical session is active; a
@@ -551,7 +578,7 @@ mod linux {
             facts.companion_running = crate::companion::companion_running_for_uid(s.uid);
             decision = decide(&facts);
         }
-        let note = act(decision, marker, || {
+        let acted = act(decision, marker, || {
             let (Some(exe), Some(s)) = (exe.as_ref(), sess.as_ref()) else {
                 anyhow::bail!("no companion path or graphical session");
             };
@@ -566,7 +593,7 @@ mod linux {
             }
             Ok(())
         });
-        (facts, decision, note)
+        (facts, decision, acted)
     }
 }
 
