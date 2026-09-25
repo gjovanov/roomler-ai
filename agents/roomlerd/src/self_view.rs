@@ -198,10 +198,12 @@ type CacheKey = (&'static str, String, String);
 /// share (`Arc` it).
 pub struct SelfView {
     registry: OrgHttpRegistry,
-    /// `Err` when the HTTP client could not be built (a TLS backend that
-    /// failed to initialise) — every ask then names that, rather than the
-    /// daemon refusing to start over a page nobody may open.
-    http: Result<reqwest::Client, String>,
+    /// Built on the FIRST ask, not at daemon start: most daemons in a fleet
+    /// never serve a Devices page (headless nodes, servers), and building the
+    /// client loads the platform's TLS roots. `Err` when it could not be built
+    /// (a TLS backend that failed to initialise) — every ask then names that,
+    /// rather than the daemon refusing to start over a page nobody may open.
+    http: std::sync::OnceLock<Result<reqwest::Client, String>>,
     fresh: Freshness,
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
     /// The last outcome per (verb, org): `None` = answered, `Some(code)` =
@@ -222,12 +224,9 @@ fn build_client() -> Result<reqwest::Client, String> {
 }
 
 impl SelfView {
+    /// The daemon's instance: the production client, built on first use.
     pub fn new(registry: OrgHttpRegistry) -> Self {
-        let http = build_client();
-        if let Err(e) = &http {
-            tracing::warn!(error = %e, "localapi self-view: no HTTP client — the device list will report server_unreachable");
-        }
-        Self::with_client(registry, http, Freshness::default())
+        Self::assemble(registry, std::sync::OnceLock::new(), Freshness::default())
     }
 
     /// Tests: a client of their own (no proxy, short budgets) and short
@@ -237,6 +236,14 @@ impl SelfView {
         http: Result<reqwest::Client, String>,
         fresh: Freshness,
     ) -> Self {
+        Self::assemble(registry, std::sync::OnceLock::from(http), fresh)
+    }
+
+    fn assemble(
+        registry: OrgHttpRegistry,
+        http: std::sync::OnceLock<Result<reqwest::Client, String>>,
+        fresh: Freshness,
+    ) -> Self {
         Self {
             registry,
             http,
@@ -244,6 +251,17 @@ impl SelfView {
             cache: Mutex::new(HashMap::new()),
             outcomes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The HTTP client, built the first time anyone asks.
+    fn http(&self) -> &Result<reqwest::Client, String> {
+        self.http.get_or_init(|| {
+            let built = build_client();
+            if let Err(e) = &built {
+                tracing::warn!(error = %e, "localapi self-view: no HTTP client — the device list will report server_unreachable");
+            }
+            built
+        })
     }
 
     /// `GET /api/agent/self/devices` for `org` (empty / `primary` = the
@@ -405,7 +423,7 @@ impl SelfView {
         params: &[(&'static str, String)],
     ) -> Result<Vec<u8>, Upstream> {
         let http = self
-            .http
+            .http()
             .as_ref()
             .map_err(|e| Upstream::new("server_unreachable", e.clone()))?;
         let base = org.server_url.trim().trim_end_matches('/');
@@ -953,6 +971,19 @@ mod tests {
     #[test]
     fn the_production_client_builds() {
         assert!(build_client().is_ok());
+    }
+
+    /// A daemon that never serves a Devices page never builds the client
+    /// (TLS roots and all): nothing at start, nothing for a request the
+    /// registry refuses, and exactly once on the first real ask.
+    #[tokio::test]
+    async fn the_client_is_built_on_the_first_real_ask() {
+        let view = SelfView::new(registry("http://127.0.0.1:9"));
+        assert!(view.http.get().is_none(), "built at start");
+        let _ = view.devices("ghost", &DevicesQuery::default()).await;
+        assert!(view.http.get().is_none(), "built for a refused org");
+        assert!(view.http().is_ok());
+        assert!(view.http.get().is_some());
     }
 
     #[test]
