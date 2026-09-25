@@ -586,6 +586,18 @@ relay — coturn or DERP — is a blind pipe. Compromising it yields traffic tim
 and volume, never content. On tiers 1–3 the server isn't in the data path at
 all.
 
+### What a node may learn about the other nodes
+
+The netmap is also the boundary of what a **node** may be told about its
+tenant. The companion app's Devices page asks the server, with the device's
+agent token, for `GET /api/agent/self/{devices,mesh}` (FR-84 D5), and the answer
+is exactly **this node ∪ the peers its netmap carries** — computed by the same
+join-time ACL shaping (`shape_full_netmap`), so under `enforce` a withheld peer is
+absent from the list and the mesh graph as well as from the netmap. It adds
+display names, OS and version; machine ids, owner ids and keys never leave the
+server. Detail and the negative-control test:
+[desktop-companion.md](desktop-companion.md) §6.
+
 ---
 
 ## 8. Failure handling
