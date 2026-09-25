@@ -176,3 +176,4 @@
     boot()
   }
 })()
+// ci-probe: a ui/docs-only change to test the licence gate trigger. Never merged.
