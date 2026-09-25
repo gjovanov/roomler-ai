@@ -15,6 +15,7 @@
 //!   roomler diagnose [--agent <agent_id>]
 //!   roomler status [--json]     # local daemon's node state (LocalAPI)
 //!   roomler peers  [--json]     # peers + connection types (LocalAPI)
+//!   roomler devices [--json]    # the devices this one may see, server-listed (LocalAPI)
 //!   roomler flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
 
 use anyhow::{Context, Result, bail};
@@ -216,6 +217,39 @@ enum Command {
         /// personal one is unusable on a shared screen or in a bug report.
         #[arg(long)]
         org: Option<String>,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// List the devices this device's private network lets it see — itself
+    /// included — as the SERVER records them: display names, OS, version,
+    /// presence, overlay IP and MagicDNS, with this node's live carrier in
+    /// CONN. Search, sort and paging run on the server; the local daemon asks
+    /// it with this device's own credentials (FR-84).
+    ///
+    ///   roomler devices
+    ///   roomler devices -q build --sort last_seen_at --desc
+    Devices {
+        /// Enrollment to list (`roomlerd org ls`; `primary` for the scalar
+        /// identity). Default: the primary.
+        #[arg(long)]
+        org: Option<String>,
+        /// Search text (name, display name, tags, OS, version, overlay IP,
+        /// MagicDNS), matched by the server.
+        #[arg(short = 'q', long = "query")]
+        q: Option<String>,
+        /// Sort key: name | kind | os | status | version | overlay_ip |
+        /// magic_dns | last_seen_at. Default: online first, then name.
+        #[arg(long)]
+        sort: Option<String>,
+        /// Sort descending.
+        #[arg(long)]
+        desc: bool,
+        /// Page number (1-based).
+        #[arg(long, default_value_t = 1)]
+        page: u64,
+        /// Rows per page (the server caps it at 100).
+        #[arg(long, default_value_t = 50)]
+        per_page: u64,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -737,6 +771,26 @@ where
             fmt,
         } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
         Command::Peers { org, fmt } => localclient::peers(fmt.json, org).await,
+        Command::Devices {
+            org,
+            q,
+            sort,
+            desc,
+            page,
+            per_page,
+            fmt,
+        } => {
+            localclient::devices(localclient::DevicesArgs {
+                org,
+                q,
+                sort,
+                desc,
+                page,
+                per_page,
+                json: fmt.json,
+            })
+            .await
+        }
         Command::Why { peer, fmt } => localclient::why(&peer, fmt.json).await,
         Command::Netcheck { fmt } => localclient::netcheck(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
@@ -1113,6 +1167,64 @@ mod tests {
                 ("flows", Command::Flows { fmt }) => assert!(!fmt.json),
                 (v, other) => panic!("verb {v} parsed as {other:?}"),
             }
+        }
+    }
+
+    /// FR-84 D5b — `devices` with every flag, and with none (the primary,
+    /// page 1, the server's default order).
+    #[test]
+    fn parses_devices() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "devices",
+            "--org",
+            "acme",
+            "-q",
+            "build box",
+            "--sort",
+            "last_seen_at",
+            "--desc",
+            "--page",
+            "2",
+            "--per-page",
+            "10",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Devices {
+                org,
+                q,
+                sort,
+                desc,
+                page,
+                per_page,
+                fmt,
+            } => {
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert_eq!(q.as_deref(), Some("build box"));
+                assert_eq!(sort.as_deref(), Some("last_seen_at"));
+                assert!(desc);
+                assert_eq!((page, per_page), (2, 10));
+                assert!(fmt.json);
+            }
+            other => panic!("expected Devices, got {other:?}"),
+        }
+        match Cli::try_parse_from(["roomler", "devices"]).unwrap().command {
+            Command::Devices {
+                org,
+                q,
+                sort,
+                desc,
+                page,
+                per_page,
+                fmt,
+            } => {
+                assert!(org.is_none() && q.is_none() && sort.is_none());
+                assert!(!desc && !fmt.json);
+                assert_eq!((page, per_page), (1, 50));
+            }
+            other => panic!("expected Devices, got {other:?}"),
         }
     }
 
