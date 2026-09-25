@@ -157,11 +157,16 @@ pub async fn ingest_agent(
     Ok((StatusCode::CREATED, Json(json!({ "status": "accepted" }))))
 }
 
-/// POST `/api/log/browser` — ingest a batch from the browser console
-/// uploader. Auth: user JWT. The user's active tenant is resolved
-/// from a `tenant_id` query / form param (not yet wired — punted to
-/// rc.59 where the browser-side composable lands). For now the body
-/// must include `tenant_id`.
+/// POST `/api/log/browser` — ingest a batch from the browser. Auth: user
+/// JWT; the body names the `tenant_id`, and the caller must be a member of
+/// it (the user JWT alone pins no tenant).
+///
+/// First caller, FR-22 part 4 (2026-09-25): the RC viewer's connect-timing
+/// record — one batch of one `rc.connect` line per connect attempt
+/// (`ui/src/composables/rcConnectTimingUpload.ts`). The route had existed
+/// since rc.58 with no caller at all, so `agent_logs` held zero browser rows
+/// for as long as it had a browser source. The exact JSON that caller emits
+/// is locked to parse here by `browser_connect_timing_record_parses`.
 pub async fn ingest_browser(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -427,6 +432,108 @@ mod tests {
         let batch = build_batch(tid, None, None, payload).expect("build_batch");
         assert!(batch.lines[0].msg.contains("[REDACTED_BEARER]"));
         assert!(!batch.lines[0].msg.contains("somelongtokenvaluehere"));
+    }
+
+    /// FR-22 part 4 — the RC viewer's connect-timing record, in exactly the
+    /// shape `ui/src/composables/rcConnectTimingUpload.ts` emits. The browser
+    /// has no other way to learn that its `ts` (canonical extended JSON —
+    /// what `bson::DateTime` round-trips through `serde_json`) and its
+    /// `fields` document parse on this route: a POST that 422s is swallowed
+    /// by design, so a shape drift would show up as `agent_logs` staying
+    /// empty — which is indistinguishable from nobody connecting.
+    #[test]
+    fn browser_connect_timing_record_parses() {
+        let raw = r#"{
+            "tenant_id": "69f0000000000000000000a1",
+            "source": "browser",
+            "session_id": "69f0000000000000000000b2",
+            "lines": [{
+                "ts": {"$date": {"$numberLong": "1758826800000"}},
+                "level": "INFO",
+                "target": "rc.connect",
+                "msg": "attempt 1 ttff 2736ms — ws_ready:+12 turn_ready:+64 probes_ready:+28 request_sent:+3 session_created:+43 ready:+53 offer_sent:+9 answer:+214 pc_connected:+1150 dc_open:+788 first_frame:+372",
+                "fields": {
+                    "v": 1,
+                    "outcome": "first_frame",
+                    "attempt": 1,
+                    "after_drop": false,
+                    "hidden": false,
+                    "stalled_at": null,
+                    "ttff_ms": 2736,
+                    "agent_id": "69f0000000000000000000c3",
+                    "marks": {"ws_ready": 12, "turn_ready": 76, "first_frame": 2736}
+                }
+            }]
+        }"#;
+        let payload: BrowserLogBatchPayload =
+            serde_json::from_str(raw).expect("the viewer's record must parse");
+        assert_eq!(payload.inner.source, LogSource::Browser);
+        assert_eq!(
+            payload.inner.session_id.as_deref(),
+            Some("69f0000000000000000000b2")
+        );
+        let tid = ObjectId::parse_str(&payload.tenant_id).expect("tenant hex");
+        let batch =
+            build_batch(tid, None, Some(ObjectId::new()), payload.inner).expect("build_batch");
+        assert_eq!(batch.line_count, 1);
+        let line = &batch.lines[0];
+        assert_eq!(line.ts.timestamp_millis(), 1_758_826_800_000);
+        assert_eq!(line.level, LogLevel::Info);
+        assert_eq!(line.target, "rc.connect");
+        assert_eq!(line.fields.get_str("outcome"), Ok("first_frame"));
+        assert_eq!(line.fields.get_bool("hidden"), Ok(false));
+        assert!(matches!(
+            line.fields.get("stalled_at"),
+            Some(bson::Bson::Null)
+        ));
+        let marks = line.fields.get_document("marks").expect("marks doc");
+        // serde_json hands an integer to bson as i64 or i32 depending on the
+        // path; the record only promises "a number of milliseconds".
+        let first_frame = match marks.get("first_frame") {
+            Some(bson::Bson::Int32(v)) => i64::from(*v),
+            Some(bson::Bson::Int64(v)) => *v,
+            other => panic!("first_frame should be an integer, got {other:?}"),
+        };
+        assert_eq!(first_frame, 2736);
+        // An unreached mark is ABSENT, never zero: its absence is the finding.
+        assert!(marks.get("answer").is_none());
+    }
+
+    /// The abandoned shape: no `session_id` (a `requesting` stall never got
+    /// one), `WARN`, and `stalled_at` naming the wait that never completed.
+    #[test]
+    fn browser_connect_timing_abandoned_record_parses() {
+        let raw = r#"{
+            "tenant_id": "69f0000000000000000000a1",
+            "source": "browser",
+            "lines": [{
+                "ts": {"$date": {"$numberLong": "1758826804000"}},
+                "level": "WARN",
+                "target": "rc.connect",
+                "msg": "attempt 1 INCOMPLETE (stalled waiting for session_created) — ws_ready:+12 turn_ready:+64 probes_ready:+28 request_sent:+3 session_created:— ready:— offer_sent:— answer:— pc_connected:— dc_open:— first_frame:—",
+                "fields": {
+                    "v": 1,
+                    "outcome": "abandoned",
+                    "attempt": 1,
+                    "after_drop": false,
+                    "hidden": true,
+                    "stalled_at": "session_created",
+                    "ttff_ms": null,
+                    "agent_id": "69f0000000000000000000c3",
+                    "marks": {"ws_ready": 12, "turn_ready": 76, "probes_ready": 104, "request_sent": 107}
+                }
+            }]
+        }"#;
+        let payload: BrowserLogBatchPayload = serde_json::from_str(raw).expect("parse");
+        assert_eq!(payload.inner.session_id, None);
+        let tid = ObjectId::parse_str(&payload.tenant_id).expect("tenant hex");
+        let batch =
+            build_batch(tid, None, Some(ObjectId::new()), payload.inner).expect("build_batch");
+        let line = &batch.lines[0];
+        assert_eq!(line.level, LogLevel::Warn);
+        assert_eq!(line.fields.get_str("stalled_at"), Ok("session_created"));
+        assert_eq!(line.fields.get_bool("hidden"), Ok(true));
+        assert!(matches!(line.fields.get("ttff_ms"), Some(bson::Bson::Null)));
     }
 
     #[test]
