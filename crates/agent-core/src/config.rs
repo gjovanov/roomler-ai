@@ -68,6 +68,19 @@ pub struct AgentConfig {
     #[serde(default)]
     pub update_check_interval_h: Option<u32>,
 
+    /// FR-84 D1 — how many LocalAPI named-pipe instances the daemon keeps
+    /// LISTENING at once (Windows; the unix socket has a kernel backlog and
+    /// ignores this). Every thin client — the companion's pollers, the
+    /// `roomler` CLI, the wizard — opens the pipe fresh per request, and a
+    /// client that finds no listening instance is refused with
+    /// `ERROR_PIPE_BUSY` on the spot: the Routes page blanking every few
+    /// seconds was three such opens racing ONE instance. `None` = the
+    /// built-in default (4, `roomler_localapi::DEFAULT_PIPE_POOL`); `1` =
+    /// one instance, the pre-FR-84 behaviour (the kill switch). Clamped to
+    /// 1..=16; read once at startup (restart required).
+    #[serde(default)]
+    pub localapi_pipe_pool: Option<u32>,
+
     /// Whether the agent answers `files:dir` (filesystem browse)
     /// requests from the browser controller. Default `true` to
     /// preserve self-controlled-host auto-grant semantics
@@ -2003,6 +2016,7 @@ pub fn test_fixture() -> AgentConfig {
         ephemeral: false,
         encoder_preference: EncoderPreferenceChoice::Auto,
         update_check_interval_h: None,
+        localapi_pipe_pool: None,
         enable_remote_browse: true,
         auto_grant_session: true,
         exec_enabled: false,

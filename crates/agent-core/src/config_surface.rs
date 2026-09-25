@@ -378,6 +378,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Hours between self-update checks (1-8760). Empty = built-in default (24 h).",
     },
     KeyMeta {
+        key: "localapi_pipe_pool",
+        group: Group::Device,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "FR-84 - LocalAPI named-pipe instances kept listening at once (Windows; 1-16). Every companion poll, `roomler` call and wizard step opens the pipe fresh, and a client that finds no listening instance is refused with ERROR_PIPE_BUSY on the spot - the Routes page blanking every few seconds was three opens racing one instance. 1 = one instance (the pre-FR-84 behaviour, the kill switch). Empty = built-in default (4). Restart required.",
+    },
+    KeyMeta {
         key: "overlay_quic",
         group: Group::NetworkCarriers,
         tier: Tier::Advanced,
@@ -1558,6 +1566,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_netmon" => cfg.overlay_netmon.map(fmt_bool),
         "overlay_netmon_debounce_ms" => cfg.overlay_netmon_debounce_ms.map(|v| v.to_string()),
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
+        "localapi_pipe_pool" => cfg.localapi_pipe_pool.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
         "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
         "overlay_iface_metric" => cfg.overlay_iface_metric.map(|v| v.to_string()),
@@ -1934,6 +1943,13 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     Some(n)
                 }
             }
+        }
+        // FR-84 D1 — the listener pool is sized once, at bind time; 1 is the
+        // pre-FR-84 single instance, 16 the ceiling `serve_with_pool` clamps
+        // to anyway (refused here so a typo is a failed set, not a silent
+        // clamp).
+        "localapi_pipe_pool" => {
+            cfg.localapi_pipe_pool = parse_u32_range("localapi_pipe_pool", value, 1, 16)?
         }
         "rc_max_sessions" => {
             cfg.rc_max_sessions = match value.map(str::trim).filter(|s| !s.is_empty()) {
@@ -3577,5 +3593,68 @@ mod netstack_port_surface_tests {
 
         apply(&mut cfg, "ssh_max_privilege", None).unwrap();
         assert_eq!(cfg.ssh_max_privilege, None, "clearing returns to no limit");
+    }
+}
+
+#[cfg(test)]
+mod localapi_pipe_pool_surface_tests {
+    use super::{apply, current_value, entry_for};
+
+    /// FR-84 D1 — the listener-pool kill switch is a real config key: it
+    /// round-trips through the surface, refuses anything outside 1..=16, and
+    /// clears back to the built-in default. Written against the surface API
+    /// only (no field access), so it compiles — and fails with "unknown or
+    /// non-editable config key" — on a tree that does not register the key.
+    #[test]
+    fn localapi_pipe_pool_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        let entry = entry_for(&cfg, "localapi_pipe_pool").expect("a registered surface key");
+        assert_eq!(entry.kind, "number");
+        assert!(
+            entry.restart_required,
+            "the pool is sized once, at bind time"
+        );
+        assert_eq!(
+            current_value(&cfg, "localapi_pipe_pool"),
+            None,
+            "unset = built-in default"
+        );
+
+        apply(&mut cfg, "localapi_pipe_pool", Some("1")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "localapi_pipe_pool").as_deref(),
+            Some("1"),
+            "1 = the pre-FR-84 single instance"
+        );
+        apply(&mut cfg, "localapi_pipe_pool", Some(" 16 ")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "localapi_pipe_pool").as_deref(),
+            Some("16")
+        );
+
+        for bad in ["0", "17", "-1", "four", "4.0", "1e3"] {
+            assert!(
+                apply(&mut cfg, "localapi_pipe_pool", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert_eq!(
+                current_value(&cfg, "localapi_pipe_pool").as_deref(),
+                Some("16"),
+                "a rejected set is a no-op ({bad:?})"
+            );
+        }
+
+        apply(&mut cfg, "localapi_pipe_pool", None).unwrap();
+        assert_eq!(
+            current_value(&cfg, "localapi_pipe_pool"),
+            None,
+            "cleared = built-in default again"
+        );
+        apply(&mut cfg, "localapi_pipe_pool", Some("")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "localapi_pipe_pool"),
+            None,
+            "empty clears too"
+        );
     }
 }
