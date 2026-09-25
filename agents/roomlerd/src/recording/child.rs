@@ -120,49 +120,69 @@ pub fn parse_event_line(line: &str) -> Option<serde_json::Value> {
     serde_json::from_str(line.trim_end().strip_prefix(EVENT_PREFIX)?).ok()
 }
 
-/// The recording encoder for this run. Software is openh264's recording
-/// profile (it keeps its own GOP); anything else goes through the same H.264
-/// cascade as a live session — denylist included — with the recorder forcing
-/// a keyframe every GOP.
-fn encoder_factory(pref: &str, fps: u32, gop_seconds: u32) -> Result<(EncoderFactory, bool)> {
-    match pref {
-        "software" => {
-            #[cfg(feature = "openh264-encoder")]
-            {
-                let f: EncoderFactory = Box::new(move |w, h| {
-                    let e = crate::encode::openh264_backend::Openh264Encoder::new_recording(
-                        w,
-                        h,
-                        fps,
-                        fps * gop_seconds,
-                    )?;
-                    Ok(Box::new(e) as Box<dyn crate::encode::VideoEncoder>)
-                });
-                Ok((f, true))
-            }
-            #[cfg(not(feature = "openh264-encoder"))]
-            {
-                let _ = (fps, gop_seconds);
-                bail!("this build has no software H.264 encoder (openh264-encoder)");
-            }
-        }
-        "auto" | "hardware" => {
-            let p = if pref == "hardware" {
-                crate::encode::EncoderPreference::Hardware
-            } else {
-                crate::encode::EncoderPreference::Auto
-            };
-            let f: EncoderFactory = Box::new(move |w, h| {
-                let (e, codec) = crate::encode::open_for_codec("h264", w, h, p);
-                if codec != "h264" {
-                    bail!("the H.264 cascade returned {codec}");
-                }
-                Ok(e)
-            });
-            Ok((f, false))
-        }
-        other => bail!("unknown --encoder {other:?} (auto | hardware | software)"),
+/// openh264's recording profile — the software rung, and the whole ladder on a
+/// build without FFmpeg (Linux arm64).
+fn software_encoder(
+    w: u32,
+    h: u32,
+    fps: u32,
+    gop_frames: u32,
+) -> Result<Box<dyn crate::encode::VideoEncoder>> {
+    #[cfg(feature = "openh264-encoder")]
+    {
+        let e =
+            crate::encode::openh264_backend::Openh264Encoder::new_recording(w, h, fps, gop_frames)?;
+        Ok(Box::new(e))
     }
+    #[cfg(not(feature = "openh264-encoder"))]
+    {
+        let _ = (w, h, fps, gop_frames);
+        bail!("this build has no software H.264 encoder (openh264-encoder)");
+    }
+}
+
+/// The recording encoder for this run. Every rung keeps its own GOP (the
+/// recorder never has to force keyframes):
+///
+/// - `software`: openh264's recording profile;
+/// - `hardware`: the FFmpeg H.264 cascade in its RECORDING profile
+///   (`FfmpegEncoder::new_recording` — the device denylist honoured exactly as
+///   a session's), and nothing else: asked for hardware, a host without it
+///   refuses rather than quietly recording in software;
+/// - `auto`: hardware, then software.
+fn encoder_factory(pref: &str, fps: u32, gop_seconds: u32) -> Result<(EncoderFactory, bool)> {
+    let gop = fps * gop_seconds.max(1);
+    let prefer_hw = match pref {
+        "software" => {
+            let f: EncoderFactory = Box::new(move |w, h| software_encoder(w, h, fps, gop));
+            return Ok((f, true));
+        }
+        "hardware" => true,
+        "auto" => false,
+        other => bail!("unknown --encoder {other:?} (auto | hardware | software)"),
+    };
+    let f: EncoderFactory = Box::new(move |w, h| {
+        #[cfg(feature = "ffmpeg-encoder")]
+        match crate::encode::ffmpeg::FfmpegEncoder::new_recording(
+            roomler_ai_remote_control::models::VideoCodec::H264,
+            w,
+            h,
+            fps,
+            gop,
+        ) {
+            Ok(e) => return Ok(Box::new(e) as Box<dyn crate::encode::VideoEncoder>),
+            Err(e) if prefer_hw => bail!("no hardware H.264 encoder opened for recording: {e:#}"),
+            Err(e) => {
+                tracing::info!(%e, "recording: no hardware H.264 encoder — the software recording profile");
+            }
+        }
+        #[cfg(not(feature = "ffmpeg-encoder"))]
+        if prefer_hw {
+            bail!("this build has no hardware encoder backend (ffmpeg-encoder)");
+        }
+        software_encoder(w, h, fps, gop)
+    });
+    Ok((f, true))
 }
 
 /// Body of `roomlerd record`. Returns once the file is final.
