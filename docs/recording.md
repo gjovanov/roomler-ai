@@ -1,12 +1,13 @@
 # Screen recording
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
-> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core) and
-> P2a (the local verbs).** It sits behind the `recording` cargo feature and is in
-> no release build yet. It is driven by `roomlerd record`, and by the daemon for
-> the LocalAPI recording verbs and `roomler record` (§6). Still to come:
-> roomler-desktop's Recordings view and the tray in P2b, remote recording in P3,
-> and the editor (cut, speed up, background music) in P5.
+> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core),
+> P2a (the local verbs) and P2b (roomler-desktop's Recordings view and tray).**
+> It sits behind the `recording` cargo feature and is in no release build yet.
+> It is driven by `roomlerd record`, by the daemon for the LocalAPI recording
+> verbs and `roomler record` (§6), and by roomler-desktop (§7). Still to come:
+> delivery out of the recorder's data folder (P2c), remote recording (P3), and
+> the editor (cut, speed up, background music) in P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -273,7 +274,61 @@ sequenceDiagram
   (`agents/roomler-cli/src/cli.rs`) wraps these verbs one to one. `--json`
   prints the wire shape.
 
-## 7. The sidecar
+## 7. roomler-desktop — the Recordings view and the tray (P2b)
+
+The companion's sixth view (`#/recordings`, `src/front/recordings.js`) and a
+tray item. Both only ASK the daemon; every decision stays there (§6).
+
+```mermaid
+flowchart LR
+    subgraph companion["roomler-desktop (the person's session)"]
+      V["Recordings view<br/>recordings.js"]
+      T["tray item<br/>Start / Stop recording"]
+      P["native folder picker<br/>cmd_pick_record_dir"]
+    end
+    subgraph daemon["roomlerd (LocalAPI)"]
+      G{"console user?"}
+      M["RecordingManager"]
+      C["config surface<br/>record_dir (live)"]
+    end
+    V -- "cmd_recordings_view:<br/>status + list + record_dir,<br/>ONE connection" --> G
+    V -- "cmd_record_start / stop / delete" --> G
+    T -- "RecordStatus every 3 s,<br/>Start / Stop" --> G
+    P -- "a folder" --> V
+    V -- "cmd_config_set record_dir" --> G
+    G --> M
+    G --> C
+```
+
+| Part | What it does |
+|---|---|
+| **Record this screen** | Start / Stop, the frame rate (30 or 60) and the encoder (automatic, GPU only, software only), a blinking REC chip with the running time, size, encoder and resolution. The options lock while a recording runs. How the last one ended is one sentence (`describeLast`); every closed stop reason and refusal code has words. |
+| **Where recordings are saved** | The folder in use, whether it is the default or one the person chose, **Change folder…** (the native picker), **Use the default folder**, and **Open folder**. A fallback is named ("Not the usual folder: … is under OneDrive"). |
+| **Saved recordings** | Newest first, from the sidecars: when, how long, size, by whom (this device, or a remote controller by name), how it ended on hover. **Play** (the OS's default player), **Show** (selected in the file manager), **Delete** (two clicks, no modal: the first arms it for 4 s). |
+| **Tray** | **Start recording** / **Stop recording (m:ss)**, and the tooltip `Roomler — recording m:ss`, following the recorder whoever started it. A refusal opens the Recordings view with the sentence. |
+
+- **Start is greyed out, with the reason, wherever the service cannot record.**
+  `RecordingState` carries `available` and `unavailable_reason` (additive,
+  serde default `false`): false on a service built without the recorder, and
+  on a SYSTEM/root service until P1e. The tray disables its item the same way,
+  so neither offers a button that can only fail.
+- **One LocalAPI connection per refresh** (`cmd_recordings_view` reads status,
+  list and `record_dir` in turn), every second while a recording runs, every
+  5 s otherwise, and only while the view is visible. A failed refresh keeps
+  the last good data and says why (the FR-84 D1 rule). The rows are keyed and
+  patched in place, so a button never moves under the cursor.
+- ⚠️ **A daemon's answer on a `record_*` key is final.** `cmd_config_set`
+  falls back to writing the config file itself when the daemon fails. For the
+  recording keys it no longer does once the daemon has *answered*: the
+  listener refuses anyone but the console user, and a direct write behind that
+  refusal would report a success the daemon refused. (A daemon that is not
+  running still falls back: that is the person editing their own file.)
+- **Play / Show open a NAME, never a path from the page.** `cmd_recording_open`
+  joins the daemon's own folder with a bare `*.mp4` name, and opens it only if
+  it is a regular file. On Windows `/select,` needs the path quoted *inside*
+  the argument, which standard argument quoting breaks, so it is passed raw.
+
+## 8. The sidecar
 
 `<recording>.roomler.json`, beside the file: who started it (`local`, or
 `remote` with the controller's **user id**, because remote downloads are
@@ -282,7 +337,7 @@ codec and the backend that encoded it, colour, audio sources, frames,
 late ticks, events, the stop reason, and bytes. ⚠️ **Never content**: no
 window titles, and nothing typed.
 
-## 8. Tests
+## 9. Tests
 
 | Where | What | CI |
 |---|---|---|
@@ -292,6 +347,8 @@ window titles, and nothing typed.
 | `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`; `recording_dir` validation incl. a real Windows junction | same |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config` | same |
 | `agents/roomler-cli` | `record` verbs parse; lengths and endings read plainly | same |
+| `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
+| `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys are the daemon's to accept | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
 roomlerd test step is `--lib`, which is why `tests/file_dc.rs` has never run in
