@@ -1285,16 +1285,23 @@ fn is_daemon_owned_key(key: &str) -> bool {
 /// encoding, with the file and encoder named; rejects with the daemon's
 /// reason otherwise (not the console user, a SYSTEM/root service, no
 /// encoder, no disk).
+///
+/// FR-85 P1c — `system_audio` / `microphone` (JS `systemAudio` /
+/// `microphone`) are OFF unless the page passes `true`.
 #[tauri::command]
 pub async fn cmd_record_start(
     fps: Option<u32>,
     encoder: Option<String>,
+    system_audio: Option<bool>,
+    microphone: Option<bool>,
 ) -> Result<localapi::RecordingState, String> {
     let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
     client
         .record_start(localapi::RecordStartOpts {
             fps,
             encoder,
+            system_audio: system_audio.unwrap_or(false),
+            microphone: microphone.unwrap_or(false),
             ..Default::default()
         })
         .await

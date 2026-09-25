@@ -331,6 +331,12 @@ enum Command {
         /// (internal, P3) the controller's display name.
         #[arg(long, hide = true)]
         remote_user_name: Option<String>,
+        /// Also record what the computer plays (Windows, Linux).
+        #[arg(long)]
+        system_audio: bool,
+        /// Also record the microphone.
+        #[arg(long)]
+        microphone: bool,
     },
     CaptureSmoke {
         /// How many frames to pull before reporting.
@@ -1294,6 +1300,8 @@ async fn daemon_main() -> Result<()> {
             max_minutes,
             remote_user_id,
             remote_user_name,
+            system_audio,
+            microphone,
         } => {
             roomlerd::recording::child::run(
                 roomlerd::recording::child::RecordArgs {
@@ -1303,6 +1311,8 @@ async fn daemon_main() -> Result<()> {
                     max_minutes,
                     remote_user_id,
                     remote_user_name,
+                    system_audio,
+                    microphone,
                 },
                 &config_path,
             )

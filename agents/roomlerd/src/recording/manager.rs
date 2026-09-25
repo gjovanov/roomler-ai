@@ -145,14 +145,6 @@ impl RecordingManager {
                 message: SERVICE_IDENTITY_REFUSAL.into(),
             };
         }
-        if opts.system_audio || opts.microphone {
-            // P1c. Refusing beats silently recording without the audio the
-            // person asked for.
-            return Response::Error {
-                message: "recording audio is not available yet (FR-85 P1c) — start without it"
-                    .into(),
-            };
-        }
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
             && !*a.ended.borrow()
@@ -181,6 +173,15 @@ impl RecordingManager {
             .arg(&self.config_path);
         if let Some(dir) = self.configured_dir() {
             cmd.arg("--out").arg(dir);
+        }
+        // FR-85 P1c — both default OFF. The child refuses, by name, a source
+        // it cannot open (or a build without audio) rather than recording
+        // without the audio the person asked for.
+        if opts.system_audio {
+            cmd.arg("--system-audio");
+        }
+        if opts.microphone {
+            cmd.arg("--microphone");
         }
         // The config-backed knobs (the encoder denylist, pinned devices) are
         // process-local here; hand them to the child as real env, exactly as
@@ -454,6 +455,8 @@ fn apply_event(s: &mut RecordingState, ev: &serde_json::Value) -> bool {
             s.width = u64_of("width") as u32;
             s.height = u64_of("height") as u32;
             s.fps = u64_of("fps") as u32;
+            s.system_audio = ev["system_audio"].as_bool().unwrap_or(false);
+            s.microphone = ev["microphone"].as_bool().unwrap_or(false);
             s.started_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
             false
         }

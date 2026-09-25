@@ -99,6 +99,9 @@ pub enum RecorderEvent {
         height: u32,
         fps: u32,
         encoder: String,
+        /// FR-85 P1c — which audio is going in.
+        system_audio: bool,
+        microphone: bool,
     },
     Progress {
         duration_ms: u64,
@@ -127,6 +130,13 @@ pub enum StartRefusal {
     DiskLow,
     EncoderUnavailable,
     FolderUnwritable,
+    /// Audio was asked for and this build or platform cannot record it.
+    AudioUnavailable,
+    /// Computer audio was asked for and no loopback / monitor source opened.
+    SystemAudioUnavailable,
+    /// The microphone was asked for and did not open (none, or blocked by a
+    /// privacy setting).
+    MicUnavailable,
 }
 
 impl StartRefusal {
@@ -136,7 +146,28 @@ impl StartRefusal {
             Self::DiskLow => "disk_low",
             Self::EncoderUnavailable => "encoder_unavailable",
             Self::FolderUnwritable => "folder_unwritable",
+            Self::AudioUnavailable => "audio_unavailable",
+            Self::SystemAudioUnavailable => "system_audio_unavailable",
+            Self::MicUnavailable => "mic_unavailable",
         }
+    }
+}
+
+/// The audio a recording is made with (FR-85 P1c). Without the `audio`
+/// feature there is nothing to put in it: a recording is video-only.
+#[cfg(feature = "audio")]
+pub use super::audio::AudioSources;
+
+/// The audio a recording is made with — nothing, in a build without the
+/// `audio` feature.
+#[cfg(not(feature = "audio"))]
+#[derive(Default)]
+pub struct AudioSources;
+
+#[cfg(not(feature = "audio"))]
+impl AudioSources {
+    pub fn is_empty(&self) -> bool {
+        true
     }
 }
 
@@ -203,11 +234,32 @@ fn even(mut f: Frame) -> Frame {
 }
 
 /// Record until `stop` carries a reason (or a guard trips). Events stream to
-/// `events`; the summary is returned once the file is final.
+/// `events`; the summary is returned once the file is final. Video only —
+/// [`run_with_audio`] adds audio.
 pub async fn run(
+    opts: RecordOptions,
+    capturer: Box<dyn ScreenCapture>,
+    make_encoder: EncoderFactory,
+    stop: watch::Receiver<Option<StopReason>>,
+    events: mpsc::UnboundedSender<RecorderEvent>,
+) -> Result<RecordingSummary> {
+    run_with_audio(
+        opts,
+        capturer,
+        make_encoder,
+        AudioSources::default(),
+        stop,
+        events,
+    )
+    .await
+}
+
+/// [`run`], with the audio sources the recording was asked for (FR-85 P1c).
+pub async fn run_with_audio(
     opts: RecordOptions,
     mut capturer: Box<dyn ScreenCapture>,
     make_encoder: EncoderFactory,
+    audio: AudioSources,
     mut stop: watch::Receiver<Option<StopReason>>,
     events: mpsc::UnboundedSender<RecorderEvent>,
 ) -> Result<RecordingSummary> {
@@ -296,7 +348,38 @@ pub async fn run(
         fps: cadence.fps(),
         color: ColorInfo::BT601_LIMITED,
     };
-    let mut writer = FragmentedWriter::create(&partial, video, None)
+    // FR-85 P1c — the audio sources start pulling now; what they buffered
+    // before the clock starts is cut as a backlog.
+    #[cfg(feature = "audio")]
+    let mut audio_rt = if audio.is_empty() {
+        None
+    } else {
+        Some(
+            super::audio::RecordingAudio::start(audio)
+                .map_err(|e| refuse(StartRefusal::AudioUnavailable, format!("{e:#}")))?,
+        )
+    };
+    #[cfg(not(feature = "audio"))]
+    let _ = audio;
+    #[cfg(feature = "audio")]
+    let (audio_system, audio_microphone) = audio_rt
+        .as_ref()
+        .map(|a| (a.system, a.microphone))
+        .unwrap_or((false, false));
+    #[cfg(not(feature = "audio"))]
+    let (audio_system, audio_microphone) = (false, false);
+    #[cfg(feature = "audio")]
+    let audio_track = audio_rt.as_ref().map(|a| mp4::AudioTrack {
+        sample_rate: super::audio::RATE,
+        channels: super::audio::CHANNELS as u8,
+        codec: mp4::AudioCodec::Opus {
+            pre_skip: a.pre_skip(),
+        },
+    });
+    #[cfg(not(feature = "audio"))]
+    let audio_track: Option<mp4::AudioTrack> = None;
+
+    let mut writer = FragmentedWriter::create(&partial, video, audio_track)
         .map_err(|e| refuse(StartRefusal::FolderUnwritable, format!("{e:#}")))?;
     let started_at = chrono::Utc::now();
     let _ = events.send(RecorderEvent::Started {
@@ -306,6 +389,8 @@ pub async fn run(
         height,
         fps: cadence.fps(),
         encoder: encoder_name.clone(),
+        system_audio: audio_system,
+        microphone: audio_microphone,
     });
     tracing::info!(
         width, height, fps = cadence.fps(), encoder = %encoder_name,
@@ -371,6 +456,14 @@ pub async fn run(
     let mut last_progress = Instant::now();
     let mut last_disk_check = Instant::now();
     let mut events_log: Vec<Event> = Vec::new();
+    // FR-85 P1c — encoded audio waits here until the first video frame is
+    // written: that frame's time is audio time zero (`audio_origin`, in
+    // 48 kHz samples), and audio before it is dropped rather than shifted.
+    #[cfg(feature = "audio")]
+    let mut audio_queue: std::collections::VecDeque<(u64, Vec<u8>)> =
+        std::collections::VecDeque::new();
+    #[cfg(feature = "audio")]
+    let mut audio_origin: Option<u64> = None;
 
     let reason = loop {
         tokio::select! {
@@ -449,7 +542,15 @@ pub async fn run(
             let pts = cadence.pts(t);
             let r = tokio::task::block_in_place(|| writer.push_video(pts, &au, key));
             match r {
-                Ok(mp4::PushOutcome::Written) => frames += 1,
+                Ok(mp4::PushOutcome::Written) => {
+                    frames += 1;
+                    #[cfg(feature = "audio")]
+                    if audio_origin.is_none() {
+                        audio_origin = Some(
+                            pts * u64::from(super::audio::RATE) / u64::from(mp4::VIDEO_TIMESCALE),
+                        );
+                    }
+                }
                 Ok(mp4::PushOutcome::DroppedBeforeKeyframe) => {}
                 Err(e) => {
                     tracing::warn!(%e, "recording: writer refused an access unit");
@@ -460,6 +561,30 @@ pub async fn run(
         }
         if let Some(r) = failed {
             break r;
+        }
+
+        // FR-85 P1c — audio on the same clock, a mix lag behind it.
+        #[cfg(feature = "audio")]
+        {
+            let until = super::audio::samples_for(start.elapsed())
+                .saturating_sub(super::audio::samples_for(super::audio::MIX_LAG));
+            let failed = match audio_rt.as_mut() {
+                Some(a) => pump_audio(a, until, &mut audio_queue, audio_origin, &mut writer).err(),
+                None => None,
+            };
+            if let Some(e) = failed {
+                // The video goes on: a recording without its audio is still
+                // the recording, and the sidecar says what happened.
+                tracing::warn!(%e, "recording: audio failed — continuing without it");
+                events_log.push(Event {
+                    t_ms: start.elapsed().as_millis() as u64,
+                    kind: "audio_failed".into(),
+                    detail: Some(format!("{e:#}")),
+                });
+                if let Some(a) = audio_rt.take() {
+                    let _ = a.stop();
+                }
+            }
         }
 
         if last_progress.elapsed() >= Duration::from_secs(1) {
@@ -485,6 +610,31 @@ pub async fn run(
     // ── finalize ────────────────────────────────────────────────────────────
     let _ = cap_stop_tx.send(true);
     let _ = capture.await;
+    // The audio catches up to the video's end (no lag now: what is buffered
+    // is all there will be), then its sources stop.
+    #[cfg(feature = "audio")]
+    if let Some(mut a) = audio_rt.take() {
+        let until = super::audio::samples_for(start.elapsed());
+        if let Err(e) = pump_audio(&mut a, until, &mut audio_queue, audio_origin, &mut writer) {
+            tracing::warn!(%e, "recording: the last audio could not be written");
+        }
+        for s in a.stop() {
+            tracing::info!(
+                source = s.name,
+                padded_frames = s.padded_frames,
+                trimmed_frames = s.trimmed_frames,
+                lost = s.lost,
+                "recording: audio source summary"
+            );
+            if s.lost {
+                events_log.push(Event {
+                    t_ms: start.elapsed().as_millis() as u64,
+                    kind: "audio_source_lost".into(),
+                    detail: Some(s.name.to_string()),
+                });
+            }
+        }
+    }
     if late_ticks > 0 {
         events_log.push(Event {
             t_ms: start.elapsed().as_millis() as u64,
@@ -540,7 +690,11 @@ pub async fn run(
         codec: "h264".into(),
         encoder: encoder_name.clone(),
         color: ColorInfo::BT601_LIMITED,
-        audio: AudioInfo::default(),
+        audio: AudioInfo {
+            system: audio_system,
+            microphone: audio_microphone,
+            codec: (audio_system || audio_microphone).then(|| "opus".to_string()),
+        },
         frames,
         late_ticks,
         events: events_log,
@@ -565,6 +719,34 @@ pub async fn run(
         path,
         sidecar,
     })
+}
+
+/// FR-85 P1c — encode the audio up to `until` (48 kHz samples since the
+/// clock started) and write whatever is at or after `origin`, the first
+/// written video frame's time. Before the first frame nothing is written:
+/// the packets wait in `queue`, so audio time zero is video time zero.
+#[cfg(feature = "audio")]
+fn pump_audio(
+    a: &mut super::audio::RecordingAudio,
+    until: u64,
+    queue: &mut std::collections::VecDeque<(u64, Vec<u8>)>,
+    origin: Option<u64>,
+    writer: &mut FragmentedWriter,
+) -> Result<()> {
+    a.produce_until(until, &mut |start, packet| queue.push_back((start, packet)))?;
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    while let Some((start, packet)) = queue.pop_front() {
+        // Whole 20 ms frames only: a frame mostly before the origin is before
+        // the video began. The first one kept starts within ±10 ms of the
+        // first frame — never an audible offset.
+        if start + (super::audio::FRAME as u64) / 2 <= origin {
+            continue;
+        }
+        tokio::task::block_in_place(|| writer.push_audio(&packet, super::audio::FRAME as u32))?;
+    }
+    Ok(())
 }
 
 /// The liveness lock beside a partial, `<name>.partial.lock`: an OS file lock

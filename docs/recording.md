@@ -1,13 +1,15 @@
 # Screen recording
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
-> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core),
-> P2a (the local verbs) and P2b (roomler-desktop's Recordings view and tray).**
-> It sits behind the `recording` cargo feature and is in no release build yet.
-> It is driven by `roomlerd record`, by the daemon for the LocalAPI recording
-> verbs and `roomler record` (§6), and by roomler-desktop (§7). Still to come:
-> delivery out of the recorder's data folder (P2c), remote recording (P3), and
-> the editor (cut, speed up, background music) in P5.
+> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
+> and its audio on Windows and Linux), P2a (the local verbs) and P2b
+> (roomler-desktop's Recordings view and tray).** It sits behind the
+> `recording` cargo feature and is in no release build yet. It is driven by
+> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
+> `roomler record` (§6), and by roomler-desktop (§7). Still to come: the
+> microphone on macOS, delivery out of the recorder's data folder (P2c),
+> remote recording (P3), and the editor (cut, speed up, background music) in
+> P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -153,6 +155,7 @@ but the recorder skipped would only be a courtesy.
 
 ```
 roomlerd record [--out <dir>] [--fps 30] [--encoder auto|hardware|software] [--max-minutes 240]
+                [--system-audio] [--microphone]
 ```
 
 **stdout:** one JSON object per line, each prefixed `ROOMLER_REC_JSON:`. That
@@ -163,10 +166,10 @@ the first log line. Use `recording::child::parse_event_line`.
 | `ev` | When | Fields |
 |---|---|---|
 | `folder` | the default or configured folder was not used | `path`, `reason` |
-| `started` | the first frame is encoding | `partial`, `path`, `width`, `height`, `fps`, `encoder` |
+| `started` | the first frame is encoding | `partial`, `path`, `width`, `height`, `fps`, `encoder`, `system_audio`, `microphone` |
 | `progress` | every second | `duration_ms`, `bytes`, `frames`, `late_ticks` |
 | `stopped` | the file is final | `reason`, `path`, `bytes`, `duration_ms`, `frames`, `fragmented` |
-| `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` |
+| `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` · `audio_unavailable` · `system_audio_unavailable` · `mic_unavailable` |
 | `recovered` | a dead recorder's partial in this folder was finalized | `path` |
 
 **stdin:** `{"cmd":"stop"}`, optionally with a `"reason"`. **End of stdin
@@ -337,12 +340,54 @@ codec and the backend that encoded it, colour, audio sources, frames,
 late ticks, events, the stop reason, and bytes. ⚠️ **Never content**: no
 window titles, and nothing typed.
 
-## 9. Tests
+## 9. Audio (P1c)
+
+Computer audio and the microphone are both **OFF unless asked for**
+(`--system-audio`, `--microphone`; the checkboxes in §7; `RecordStartOpts`).
+The microphone is local-only: no remote path will ever set it (P3).
+
+```mermaid
+flowchart LR
+    S["computer audio<br/>WASAPI loopback / Pulse monitor<br/>(never a mic)"] --> RS["resampler<br/>linear, → 48 kHz stereo,<br/>rate trimmed by depth"]
+    M["microphone<br/>default input"] --> RM["resampler"]
+    RS --> BS["buffer ≈ 60 ms"]
+    RM --> BM["buffer ≈ 60 ms"]
+    C(("the recorder's clock<br/>(the video pacer's Instant)")) --> X
+    BS --> X["mixer: one 20 ms frame<br/>per 20 ms of clock,<br/>silence for what is missing,<br/>soft-clipped sum"]
+    BM --> X
+    X --> O["Opus 128 kb/s<br/>(its own encoder)"] --> Q["queue until the first<br/>video frame is written"] --> W["MP4 audio track"]
+```
+
+| Decision | Why |
+|---|---|
+| **The mixer PULLS on the recorder's clock** | WASAPI loopback delivers nothing while nothing plays, and every device clock drifts. A track timed by what the devices delivered would collapse during silence and walk away from the video. Pulling one frame per 20 ms of the video pacer's own `Instant` makes audio time video time by construction. |
+| **It runs 60 ms behind** (`MIX_LAG`) | Devices hand over ~10 ms bursts. A mixer level with the clock would pad silence into every frame. |
+| **Drift is corrected by RATE** | Each source's linear resampler is bent by at most ±0.5 % toward keeping its buffer at the lag. Padding alone would click: a device clock 0.1 % slow empties the buffer, and from then on every frame pads a sample. The hard trim (a buffer past 250 ms, cut back to 60 ms, newest kept) is only for backlogs such as the capture pre-roll at start. |
+| **Linear, not nearest-neighbour** | A 44.1 kHz laptop microphone is common, and the live path's nearest-neighbour aliases audibly on speech. The live path keeps its own resampler, untouched. |
+| **Audio waits for the first video frame** | The writer's audio decode time starts at the first packet pushed after its header. Encoded audio queues from the clock's start; when the first video frame is written, frames mostly before its time are dropped, so the tracks start within ±10 ms of each other. |
+| **Soft clip, not wrap** | Two loud sources sum past full scale. Up to ¾ of full scale the sum is untouched; above it, a `tanh` knee compresses toward full scale, settling at it only far past it (never beyond, never wrapping). |
+| **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch), `audio_unavailable` (a build without the `audio` feature; macOS today). A recording that silently lacked the audio the person asked for would be worse. |
+| **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
+
+⚠️ **Computer audio never falls back to a microphone.** The live
+remote-control path, on a Linux host without a PulseAudio monitor, falls back
+to the default INPUT device. The recorder opens
+`cpal_backend::Source::SystemOnly`, which refuses instead
+(`system_audio_unavailable`).
+
+⚠️ **Not yet on macOS.** Computer audio there needs ScreenCaptureKit (macOS 13+;
+the bundle targets 12). The microphone needs cpal on macOS, plus
+`NSMicrophoneUsageDescription` and the `audio-input` entitlement in the
+bundle. Both are refused by name until then.
+
+## 10. Tests
 
 | Where | What | CI |
 |---|---|---|
 | `recording::*` unit tests | Annex-B split and parameter sets; the fragmented writer (keyframe cuts, refusals, never overwriting); remux sample order with `moov` first; truncated recovery; audio interleave; the pacer's tick math and FIFO; folder probe, validation, names, OneDrive/UNC; sidecar round trip; the manager's event folding, delete-name rules and listing; the identity probe | `ci.yml` "Test the recorder (FR-85)" (`--lib recording::`) |
 | `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the SYSTEM/root refusal | same step, `--test recorder` |
+| `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
+| `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
 | `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`; `recording_dir` validation incl. a real Windows junction | same |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config` | same |
