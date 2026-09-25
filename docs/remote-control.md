@@ -742,6 +742,297 @@ Two practical observations:
 1. The single biggest WAN latency contributor is TURN relaying through a far-away region. Co-locate TURN with users; roomler already runs `coturn.roomler.live` — for a global rollout, deploy regional TURN endpoints and let the agent pick the lowest-RTT one at registration. **SHIPPED (multi-region relay PoPs, 2026-08)**: `ROOMLER__RELAY__REGIONS` declares regional coturn+DERP PoPs (`scripts/relay-pop/` provisions one per cheap VPS); agents advertising `supports_relay_regions` receive the region list (`rc:relay.regions`), time a STUN binding per PoP, and report (`rc:relay.probe_report`); the server derives a hysteresis-guarded `relay_home` per agent and issues every RC-session / overlay-pair / tunnel TURN grant from the nearest region (sticky per pair, same-worker pin preserved within a region). Regional DERP rides EdDSA admission tickets (`crates/derp-relay`, public-key-only PoPs) and is applied to force-DERP-pinned pairs; the ladder DERP tier stays central pending netmap self-home. Master gate `ROOMLER__RELAY__REGIONS_ENABLED` (default off = legacy single-region, byte-identical).
 2. The single biggest CPU/battery contributor is encoding *unchanged frames*. Dirty-rect skipping is non-negotiable.
 
+### 12.1 Time-to-first-frame — the connect timeline (FR-22)
+
+The budget above is glass-to-glass once a session is up. The first thing every
+session is judged on is the wait *before* that: operator, 2026-08-28 — *"in some
+occasions it can take up to over 10 or even 15 secs to see the remote screen."*
+FR-22 (#819) measured that wait, bounded it, put it in front of the operator,
+and — since part 4 — persists it.
+
+What the 10–15 s turned out to be, from ten consecutive agent-side sessions
+(request → first ICE candidate 127–253 ms, → `video-bytes` DC open 0.95–2.25 s,
+→ first pump heartbeat 2.5–4.7 s, no outliers): **not a slow connect.** One
+silently lost attempt, unnoticed for the full `RC_SIGNALING_TIMEOUT_MS` = 15 s,
+then a 250 ms ladder step and a normal ~3 s connect — ≈18 s. The 15 s was the
+*cost* of a stall, never its *cause*, and the cause is still the open question
+(the 2026-09-25 field read localized it, § below).
+
+#### 12.1.1 The eleven marks, and who can see each
+
+The viewer records one mark per wait, per attempt
+(`ui/src/composables/rcConnectTiming.ts:31`; #821 added eight, #824 the three
+pre-flight ones after a field repro showed the clock started too late). Each
+name says what is being **waited on**, because the diagnostic question is
+always *who didn't answer*.
+
+```mermaid
+flowchart LR
+    subgraph pre["pre-flight — browser only"]
+        ws[ws_ready] --> turn[turn_ready] --> probes[probes_ready]
+    end
+    probes --> req[request_sent]
+    req -->|"requesting · 4 s bound"| sc[session_created]
+    sc -->|"awaiting_consent · server-owned, never armed"| rdy[ready]
+    rdy --> off[offer_sent]
+    off -->|"negotiating · 15 s bound"| ans[answer]
+    ans --> pc
+    subgraph carrier["carrier — browser only, dominates a relayed connect"]
+        pc[pc_connected] --> dc[dc_open] --> ff["first_frame = TTFF"]
+    end
+    classDef srv fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
+    class sc,rdy,ans srv;
+```
+
+| mark | waits on | set at | server record | persisted (part 4) |
+|---|---|---|---|---|
+| `ws_ready` | the signalling socket — re-keyed and redialled when the device's org differs from the page's, up to `RC_PREFLIGHT_WS_WAIT_MS` (`useRemoteControl.ts:202`) | `connect()` pre-flight | — | ✅ |
+| `turn_ready` | `GET /turn/credentials` | pre-flight | — | ✅ |
+| `probes_ready` | the loopback-relay probe + the browser's decode-capability probes (cached since #861: 28 ms cold, 7 ms warm) | pre-flight | — | ✅ |
+| `request_sent` | nothing — the instant `rc:session.request` left | `connect()` | — | ✅ |
+| `session_created` | **one server hop**: the request reached a live hub | `rc:session.created` | `remote_audit` `consent_prompted` | ✅ |
+| `ready` | a human, on a Prompt-mode device | `rc:ready` | `remote_audit` `consent_granted` | ✅ |
+| `offer_sent` | the browser building its offer | after `setLocalDescription` | — | ✅ |
+| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1242`, `crates/remote_control/src/audit.rs:152`) | ✅ |
+| `pc_connected` | ICE + DTLS | `RTCPeerConnection` `connected` | — | ✅ |
+| `dc_open` | SCTP — the `video-bytes` DataChannel | DC `open` | — | ✅ |
+| `first_frame` | the decode worker's first output frame | worker `first-frame` | — | ✅ |
+
+Only the three blue marks have ever had a server record (`remote_audit`, 90 d),
+so the server can see the consent band and the offer→answer band and **nothing
+else**: not the pre-flight, not the requesting hop, and not the carrier phases
+that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
+`answer` +214 ms, then `pc_connected` +1.2 s, `dc_open` +0.3–0.8 s,
+`first_frame` +0.4 s of a 2.7 s TTFF).
+
+⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
+ladder would let the fast retry overwrite the lost attempt's marks and report an
+18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
+calls `beginAttempt()` (`useRemoteControl.ts:7390`) and gets a fresh recorder.
+
+⚠️ **An unreached mark is the finding.** The console line prints it as
+`<name>:—` and the record omits the key; the first missing mark
+(`firstMissingMark`, `rcConnectTiming.ts:87`) names the step that never
+completed, and the three candidate causes — a half-open agent control WS, a
+cross-pod split, a lost SDP frame on a reconnected WS — fail in **different
+phases**. A single total could not tell them apart.
+
+#### 12.1.2 The phase-aware bound (part 1)
+
+One timeout used to guard two different questions. `signalingTimeoutFor(phase)`
+(`useRemoteControl.ts:186`) is total over `RcPhase`, so a new phase must declare
+its own bound instead of inheriting the ICE-sized one:
+
+| phase | waits on | bound | why |
+|---|---|---|---|
+| `requesting` | one server hop, measured sub-second | **4 s** (`RC_REQUEST_TIMEOUT_MS`, `:164`) | guarding a sub-second hop with a 15 s timer is what made a lost request cost 18 s |
+| `awaiting_consent` | a human | **never armed** | the SERVER owns `consent_timeout`; a client number here would abandon a session someone is about to approve |
+| `negotiating` | ICE, which legitimately varies by network | 15 s (`RC_SIGNALING_TIMEOUT_MS`, `:163`, unchanged) | a corp-VPN host reaching a DERP relay is nothing like a LAN pair |
+| everything else | nothing | never armed | terminal, or already connected |
+
+A stall in `requesting` now recovers in 4 s + 250 ms (`RC_RECONNECT_LADDER_MS[0]`,
+`:78`) + a normal ~3 s connect — under the 8 s acceptance budget, locked by a
+unit test. ⚠️ **A stall in `negotiating` still costs 15 s by design**: that bound
+is guarding ICE. ⚠️ **Mitigation, not diagnosis** — the bound shortens the cost
+of the stall and explains nothing about it.
+
+#### 12.1.3 An undeliverable request fails in well under a second (part 2 — already there)
+
+The spec proposed making the server answer instead of the client guessing, on
+the assumption the fast-fail was missing. Measured against the tree, it was not
+— recorded rather than rebuilt:
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant P as API pod (rc hub)
+    participant R as Redis presence
+    participant O as Owner pod
+    V->>P: rc:session.request
+    P->>P: Hub::create_session (hub.rs:678)
+    alt the agent is registered on this pod
+        P-->>V: rc:session.created
+    else AgentOffline here
+        P->>R: agent_presence_foreign(agent) — 250 ms budget (controller.rs:139)
+        alt a foreign pod holds a fresh presence record
+            P->>O: relay the frame to the owner pod (PR-2)
+            O-->>V: rc:session.created, via the relay
+        else nobody holds it
+            P-->>V: rc:error agent_offline (error_code, controller.rs:508)
+            Note over V: isRetryableRcErrorCode → the ladder advances;<br/>no client timer was involved
+        end
+    end
+```
+
+The viewer surfaces the code (`rcErrorMessage`) and advances the ladder on it
+(`isRetryableRcErrorCode`, `useRemoteControl.ts:264`), so the undeliverable case
+never waits for any timer. ⚠️ **What the server genuinely cannot see** is the case
+actually observed in the field: a session that *reached* the agent, gathered
+candidates at +160 ms, and then went silent. A live agent that stops answering is
+not detectable by another server-side check — only the browser's marks can name
+the phase it died in, which is what parts 3 and 4 are for.
+
+#### 12.1.4 The verdict the operator sees (part 3b)
+
+The console line is invisible during exactly the sessions this exists to
+explain — nobody has devtools open when a connect takes 15 s — so
+`describeConnectTiming()` (`rcConnectTiming.ts:279`) turns one attempt's marks
+into a sentence in the app snackbar, naming which wait dominated in plain words,
+with the short mark name in the tail so a reported snackbar is traceable without
+devtools (`(stalled at answer)`).
+
+| rule | why |
+|---|---|
+| **Consent is never named as "what was slow"** (`HUMAN_PACED`, `:240`) | `ready` is human-paced by design; blaming the operator's own approval is true, useless, and points them at themselves. Locked by a test, because the failure mode is a *confidently wrong* message, not a missing one |
+| A normal connect says nothing (`CONNECT_SLOW_MS` = 7 s, `:247`) | above the measured healthy band, below the reported 10–15 s; a threshold inside the band trains people to dismiss the message |
+| A retry is always notable, even when the total looks fine | the operator waited through a lost attempt either way — and that is the FR-22 signature |
+| `afterDrop` changes the wording | `attempt > 1` has two causes that look identical in the counter: a request never answered, and a session that WORKED and then dropped. Field-found: the first wording named the wrong one |
+| Stall warnings throttle (20 s, `:253`); resolutions never | a flapping path would bury its own message, but showing "it is failing" and suppressing "it finally connected" leaves a warning with no ending |
+| Operator cancellation is silent | telling someone their own button press interrupted a connect is noise |
+
+⚠️ **#822's snackbar never fired in the field**, twice over: the clock started at
+the request while the operator waits from the click (fixed by the three
+pre-flight marks), and the snackbar teleported to `<body>` while the viewer was
+fullscreen, so it rendered outside the fullscreen element (fixed by `attach`).
+Every test had agreed with the bug, because every fixture was hand-written from
+the same wrong model of where the wait lives.
+
+#### 12.1.5 Persisted marks (part 4) — where a stall's phase outlives the tab
+
+Parts 1–3b left every mark in the browser. The 2026-09-25 field read found what
+that costs: every server-visible stall in 90 d of `remote_audit` had aged past
+the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
+leaves **no server row at all** (the request never reached a hub), and
+`agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
+(`crates/modules/fleet/src/agent_log.rs:170`, mounted at
+`crates/modules/fleet/src/lib.rs:325`) had existed since rc.58 without a caller.
+
+Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
+attempt ends — first paint, a phase bound firing, the operator cancelling, or
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:3717`)
+posts **one record**: the console line, persisted.
+
+```jsonc
+// POST /api/log/browser  →  agent_logs, one batch, one line
+{
+  "tenant_id": "<page org hex>",            // the row's scope; membership is checked
+  "source": "browser",
+  "session_id": "<session hex>",            // ABSENT on a `requesting` stall — that absence is the phase
+  "lines": [{
+    "ts": {"$date": {"$numberLong": "1758826800000"}},   // canonical extended JSON, the shape bson::DateTime accepts
+    "level": "INFO",                        // WARN for anything that did not paint
+    "target": "rc.connect",
+    "msg": "attempt 1 ttff 2736ms — ws_ready:+12 turn_ready:+64 … first_frame:+372",
+    "fields": {
+      "v": 1,
+      "outcome": "first_frame",             // first_frame | abandoned | closed | retried
+      "attempt": 1, "after_drop": false,
+      "hidden": false,                      // the tab was hidden at some point during the attempt
+      "stalled_at": null,                   // the first mark never reached, e.g. "answer"
+      "ttff_ms": 2736,
+      "agent_id": "<device hex>",
+      "agent_org_id": "<device org hex>",   // only when it differs from tenant_id (FR-52 cross-org)
+      "error_code": "agent_offline",        // only when an rc:error ended the attempt
+      "marks": { "ws_ready": 12, "turn_ready": 76, /* … */ "first_frame": 2736 }   // absolute ms; unreached = absent
+    }
+  }]
+}
+```
+
+| outcome | means | snackbar |
+|---|---|---|
+| `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3858`) | stall warning |
+| `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
+| `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
+
+⚠️ **`retried` closed a hole the console never had a line for.** Before part 4
+such an attempt's recorder was replaced by the next `beginAttempt()` with no
+trace, so "one record per attempt" was false for exactly the attempts the
+server refused — and a refusal and a silence stop at the same missing mark.
+`error_code` is what tells them apart.
+
+⚠️ **`hidden` is a validity flag, not a curiosity.** Standing rule (2026-09-07):
+viewer-paint timing from a hidden tab is invalid — `requestAnimationFrame` does
+not run there, `first_frame` measures when the decoder produced a frame nobody
+could see, and the media watchdog tears such a session down about every 30 s.
+The 2026-09-25 self-measurement was blocked by exactly such a tab (the
+automation browser, 0 rAF frames per second, window 0×0). **Filter
+`hidden: false` before any paint-inclusive distribution.**
+
+⚠️ **Best effort, by construction.** The POST is fire-and-forget with
+`keepalive` (so the `closed` record of a tab the operator shut still leaves),
+bypasses `api/client.ts` on purpose (its 401 handler would refresh-then-logout,
+its 429/5xx handlers raise a snackbar), never retries, and caps itself at
+`RC_CONNECT_UPLOAD_MAX_PER_MIN` = 12 per page under the API's 60 req/min per-IP
+governor — a flapping ladder drops records rather than throttling the API the
+session shares. A diagnostic must never become the incident.
+
+⚠️ **Timing metadata only, by shape.** Ids must be ObjectId hex or they are
+dropped; `error_code` must match the server's snake_case vocabulary or it is
+recorded as `other`; `msg` is mark names and millisecond deltas. No URL, token,
+message text or hostname can enter the record — locked by
+`rcConnectTimingUpload.spec.ts`, and the exact JSON is locked to parse on the
+route by `browser_connect_timing_record_parses` (`agent_log.rs:445`), because a
+422 is swallowed like every other failure and would look like nobody connecting.
+
+**Mining it** (`roomler2`, in the `mongodb-0` pod — credentials from the
+`mongodb-secret`, never on a transcript). Retention is the collection's **7 d
+TTL** (`lib.rs:475`, `crates/db/src/models/agent_log.rs:115`) — the same window
+as the agent's own logs and the pod log is shorter still, so a stall must be
+mined within the week; `remote_audit` keeps its three marks for 90 d.
+
+```js
+// Which step do stalls die in, and did the server refuse or stay silent? Foreground tabs only.
+db.agent_logs.aggregate([
+  { $match: { source: 'browser', 'lines.target': 'rc.connect' } },
+  { $unwind: '$lines' },
+  { $match: { 'lines.fields.outcome': { $ne: 'first_frame' }, 'lines.fields.hidden': false } },
+  { $group: { _id: { outcome: '$lines.fields.outcome', at: '$lines.fields.stalled_at',
+                     code: '$lines.fields.error_code' }, n: { $sum: 1 } } },
+  { $sort: { n: -1 } } ])
+
+// Paint-inclusive TTFF per device: first attempts, foreground, no drop (MongoDB ≥ 7 for $percentile).
+db.agent_logs.aggregate([
+  { $match: { source: 'browser', 'lines.target': 'rc.connect' } },
+  { $unwind: '$lines' },
+  { $match: { 'lines.fields.outcome': 'first_frame', 'lines.fields.hidden': false,
+              'lines.fields.attempt': 1, 'lines.fields.after_drop': false } },
+  { $group: { _id: '$lines.fields.agent_id', n: { $sum: 1 },
+              p: { $percentile: { input: '$lines.fields.ttff_ms', p: [0.5, 0.9], method: 'approximate' } } } } ])
+
+// One stall, both ends: the browser's record and the agent's own upload share the session hex.
+db.agent_logs.find({ session_id: '<hex>' }).sort({ created_at: 1 })
+```
+
+`session_id` is a **string** on both agent and browser batches; join it to
+`remote_sessions._id` / `remote_audit.session_id` with `ObjectId(...)`. A
+browser row with **no** `session_id` and `stalled_at: "session_created"` is the
+one class the server can never count: a request that reached no hub.
+
+#### 12.1.6 What the field read found (2026-09-25, prod `0.4.101`)
+
+From `remote_audit` (90 d), consent excluded (`consent_granted` → `session_started`):
+
+- **The healthy signalling band shows no slowdown attributable to #821** — p50
+  116 → 143 ms, p90 216 → 293 across the boundary (n 6503 / 1809), a real shift
+  that moves with which hosts connect in a window (last 7 d: p50 118, n 49) and
+  that #821 has no mechanism to cause: it arms a client-side timer that never
+  fires on a healthy connect.
+- **The server-visible stall is in `negotiating`** — 34 of 8312 started sessions
+  ≥ 3 s (0.41 %), ~17 ≥ 8 s, consent tiny on every one, clustered on the hosts
+  whose control WS runs through a TLS-inspecting corporate middlebox or a WSL NAT
+  (CORPLAP-1/2/3, NEO16, NEO16-WSL) while direct/LAN hosts stay p99 < 630 ms.
+  Because it sits **before** `pc_connected` it is not the media carrier and not
+  consent; it fits a **half-open agent control WS delaying offer delivery**
+  (the "GREEN but `agent_offline`" class; agents ≥ rc.293 self-heal in ≤ ~2 min).
+
+Both are localizations, not a traced mechanism: no single stall could be read
+through both ends' logs, because the explanatory logs had aged out while the
+audit row survived, and the browser marks that name the phase were not
+persisted. Part 4 exists so the next one is. The full read, with the per-host
+table, is in `docs/fr/FR-22-time-to-first-frame.md`.
+
 ## 13. Testing strategy
 
 Reuse the existing 114 Rust integration test conventions plus Playwright E2E specs. New harness pieces:

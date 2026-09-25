@@ -62,6 +62,7 @@ import {
   type RcConnectMark,
   type RcConnectRecorder,
 } from './rcConnectTiming'
+import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import { useSnackbar } from './useSnackbar'
 
 /**
@@ -3692,21 +3693,39 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  overwrite the first one's marks and make a two-attempt connect read
    *  as one fast one. */
   let connectTiming: RcConnectRecorder | null = null
+  /** FR-22 part 4 - the console line, persisted. One POST per finished
+   *  attempt into `agent_logs` (source `browser`, target `rc.connect`) so
+   *  a stall's phase outlives the tab. Best effort: it can never throw,
+   *  retry, or surface anything to the operator. */
+  const connectTimingUploader = createConnectTimingUploader()
+  /** FR-22 part 4 - the `rc:error` code that ended the live attempt, if
+   *  one did. In the marks a refusal and a silence stop at the same missing
+   *  step; this is what tells them apart in the record. Cleared per attempt. */
+  let attemptErrorCode: string | null = null
 
   /** Emit the current attempt's timing once, then release it. `reason`
    *  distinguishes the success line from the abandonment line, because
    *  an INCOMPLETE record is the diagnostically valuable one - the
-   *  missing mark names the step that never completed. */
-  function logConnectTiming(reason: 'first-frame' | 'abandoned' | 'closed') {
+   *  missing mark names the step that never completed.
+   *
+   *  `retried` (FR-22 part 4): the ladder advanced past a live attempt for
+   *  a reason other than a phase bound - a transient `rc:error` it rides,
+   *  an ICE failure, dead air before the first frame. Such an attempt used
+   *  to be replaced by the next `beginAttempt()` with no line and no
+   *  record; it is persisted like the others but, like `closed`, never
+   *  reaches the snackbar, whose verdict vocabulary is about stalls. */
+  function logConnectTiming(reason: 'first-frame' | 'abandoned' | 'closed' | 'retried') {
     const t = connectTiming
     if (!t) return
     // A successful attempt reports exactly once, at first paint. Later
     // teardown must not re-log it as if it were a second connect.
     if (reason !== 'first-frame' && t.done()) {
       connectTiming = null
+      disarmVisibilityTiming()
       return
     }
     connectTiming = null
+    disarmVisibilityTiming()
     const snap = t.snapshot()
     const line = formatConnectTiming(snap)
     if (reason === 'first-frame') {
@@ -3716,6 +3735,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else {
       console.warn('[rc] connect', reason, line)
     }
+    // FR-22 part 4 - persist what was just printed. Filed under the PAGE's
+    // org (membership is what let the operator open this page; the route
+    // refuses any other), with the device's org alongside when it differs
+    // (FR-52 cross-org). `sessionId` is still set here on every path that
+    // reaches this line - `scheduleReconnect` reports before it clears it,
+    // and `disconnect`/`failWith` clear `lastConnectArgs` only afterwards -
+    // and its ABSENCE is the record of a stall in `requesting`.
+    const outcome: RcConnectOutcome = reason === 'first-frame' ? 'first_frame' : reason
+    connectTimingUploader.send(snap, {
+      tenantId: expectedOrgTid(null, location.pathname) ?? lastConnectArgs?.orgId ?? null,
+      agentOrgId: lastConnectArgs?.orgId ?? null,
+      agentId: lastConnectArgs?.agentId ?? null,
+      sessionId: sessionId.value,
+      outcome,
+      errorCode: attemptErrorCode,
+    })
     // FR-22 - tell the OPERATOR, not just the console. A devtools line
     // is invisible during exactly the sessions this exists to explain,
     // and "it was slow again" is not a report anyone can act on. The
@@ -3726,8 +3761,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     //
     // Cancellation is excluded on purpose: the operator pressed the
     // button, so telling them their own action interrupted a connect is
-    // noise, not information.
-    if (reason === 'closed') return
+    // noise, not information. So is a ladder advance the operator was
+    // already told about by the error path that caused it.
+    if (reason === 'closed' || reason === 'retried') return
     const verdict = describeConnectTiming(snap)
     if (!verdict.notable) return
     // Throttle the STALL warnings only. A flapping path abandons an
@@ -3749,6 +3785,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  outside an attempt, so callers never have to guard. */
   function markConnect(name: RcConnectMark) {
     connectTiming?.mark(name)
+  }
+  /** FR-22 part 4 - a tab that goes hidden mid-attempt taints that
+   *  attempt's paint timing (standing rule: no rAF, no valid `first_frame`).
+   *  The recorder starts from the visibility at `beginAttempt` and this
+   *  listener catches a change during the attempt. Armed with the recorder,
+   *  released with it, and on unmount. */
+  function onVisibilityTiming() {
+    if (globalThis.document.visibilityState === 'hidden') connectTiming?.noteHidden()
+  }
+  let visibilityTimingArmed = false
+  function armVisibilityTiming() {
+    if (visibilityTimingArmed || typeof document === 'undefined') return
+    visibilityTimingArmed = true
+    document.addEventListener('visibilitychange', onVisibilityTiming)
+  }
+  function disarmVisibilityTiming() {
+    if (!visibilityTimingArmed) return
+    visibilityTimingArmed = false
+    document.removeEventListener('visibilitychange', onVisibilityTiming)
   }
   /** Consecutive sessions that connected but never delivered a frame —
    *  drives `deadAirDelayMs`. Cleared the moment media actually moves. */
@@ -6954,6 +7009,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // diagnostics stay in the console, never in the UI.
       if (msg.code === 'agent_on_other_pod') {
         if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+        attemptErrorCode = msg.code
         if (!lastConnectArgs) {
           failWith(friendlyRcError(msg.code, msg.message))
           return
@@ -7002,6 +7058,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
         return
       }
+      // FR-22 part 4 - from here on the error ACTS on the live attempt (it
+      // retries it or fails it), so its code belongs in that attempt's
+      // record. The ignored cases above never reach this line.
+      attemptErrorCode = typeof msg.code === 'string' ? msg.code : 'unknown'
       // (2026-08-05 winhost-a wedge) An un-scoped transient (no session_id -
       // e.g. agent_offline bounced by our own hangup for the PREVIOUS
       // session while the agent's WS flaps) passes the gate and used to
@@ -7088,6 +7148,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       failWith('peer connection failed')
       return
     }
+    // FR-22 part 4 - an attempt the ladder is advancing past without a
+    // phase bound firing (a transient rc:error it rides, an ICE failure,
+    // dead air before the first frame) had no record at all: its recorder
+    // was replaced by the next beginAttempt(). Report it FIRST, while the
+    // session id is still known. A recorder that already painted is a
+    // drop, reported at first paint; logConnectTiming just releases it.
+    if (connectTiming) logConnectTiming('retried')
     // Free the agent's session slot BEFORE retrying: the default
     // max_simultaneous_sessions is 1, and the agent only notices a
     // dead peer on its own timeout Ã¢ÂÂ without this hangup the fresh
@@ -7321,6 +7388,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // reported a small TTFF and was reported as healthy - which is
     // exactly the case that reproduced with no snackbar.
     connectTiming = beginAttempt(reconnectAttempt.value + 1, sessionEverPainted)
+    attemptErrorCode = null
+    armVisibilityTiming()
     // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
     // flowed" again, otherwise one good session would excuse every frameless
     // one that followed it.
@@ -8879,6 +8948,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   onBeforeUnmount(() => {
     disconnect()
+    // FR-22 part 4 - disconnect() released the recorder and its listener,
+    // but a view that unmounts with no attempt live never armed one; this
+    // is the belt for the DC-never-opened class below.
+    disarmVisibilityTiming()
     // Defensive Ã¢ÂÂ disconnect() closes the DC which stops the triggers
     // via onclose, but a DC that never opened has no onclose to fire.
     stopClipboardSyncTriggers()
