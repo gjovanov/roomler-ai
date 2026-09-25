@@ -1,7 +1,7 @@
 # FR-52: Cross-org remote access — an outsider, a device password, and a server that cannot use it
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
-**Status:** in progress — P1 · P2a–c · P3a–d shipped: an outsider can PROVE the password to a device through the server, from any pod, but **no session follows yet** (P4) ·
+**Status:** in progress — P1 · P2a–c · P3a–d · P4a–d built: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent. **No page yet** (P4e) and **in no release build** (P4f) ·
 **Owner:** remote-control (pillar 1) + control plane ·
 **Anchors verified against master `41425700`** (re-verified after FR-69)
 
@@ -148,6 +148,14 @@ additive and serde-defaulted, so older agents keep today's prompt text; a device
 that cannot say "outside your organization" must therefore not be gate-2 approvable,
 which the `RpcCap` check in §5 enforces.
 
+> **As built (P4).** The field is `Request.external: Option<ExternalGrant>`, and it
+> carries more than a scope: the `attempt_id` of the login the device must bind the
+> session to (§4c). An older agent would take it as an unknown field and serve the
+> outsider as an ordinary controller, so the server opens an external session only
+> on a device advertising a SECOND verb, `external-session` — `external-access` says
+> a build can LOG an outsider in, which is not the same promise
+> (`external_access_does_not_imply_external_session`).
+
 ## 4. The handshake
 
 The requirement is narrow: the party *brokering* the exchange must not be able to
@@ -251,6 +259,93 @@ refunds it. Two properties follow and must be kept:
 Locked by `a_wrong_password_is_decided_at_ke2_so_the_device_never_sees_a_failure`,
 which fails loudly if the protocol property it relies on ever stops holding.
 
+### 4c. The session: the login is bound to the transport, and the device decides (P4)
+
+A verified login is worth **one** session, and everything that makes that session
+safe is decided on the device, against a key the server never holds — P3b's
+`AppKey = HKDF-SHA512(OPAQUE session key, "roomler-extauth-v1 app-key" ‖ attempt ‖ principal)`,
+derived independently by the browser and the device.
+
+The binding is a MAC over each end's DTLS certificate fingerprint, one per direction:
+
+`extauth_mac = base64url(HMAC-SHA256(AppKey, "roomler-extauth-v1 transport" ‖ u16be ‖ role ‖ u16be ‖ fingerprint))`,
+`role ∈ {offer, answer}`, and `fingerprint` is the SDP's ONE distinct
+`a=fingerprint:` value as `lowercase(hash) ␠ UPPERCASE(hex)`. Zero or two distinct
+certificates is a refusal: the MAC could cover one while DTLS negotiated the other.
+Pinned by known-answer tests computed with Node's HMAC
+(`the_transport_mac_matches_an_independent_hmac`), and exercised end to end by an
+integration test that implements the browser's half — HKDF included — from this
+paragraph rather than from the device's code.
+
+```mermaid
+sequenceDiagram
+  participant B as Outsider's browser
+  participant S as Server (Hub)
+  participant D as Device (roomlerd)
+  Note over B,D: P3 — login VERIFIED. B and D each derive AppKey; S keeps a bookkeeping entry, not a credential.
+  B->>S: rc:extauth.session {connect_code, attempt_id, permissions}
+  S->>S: resolve the code · spend the verified login (principal + device) · gates 1–2 · external-session cap · clamp to the org ceiling
+  S->>D: rc:request {…, external: {attempt_id}}
+  D->>D: primary org · gate 3 + password (live) · own consent mode + ceiling · bind the session to the login (consumed LAST)
+  S-->>B: rc:session.created {agent_id: 000…0}
+  D->>D: consent by external_consent_mode — recorded BEFORE the grant leaves
+  D->>S: rc:consent {granted}
+  S-->>B: rc:ready
+  B->>S: rc:sdp.offer {sdp, extauth_mac = MAC(offer, fp_B)}
+  S->>D: forwarded verbatim — the server cannot check it and must not drop it
+  D->>D: consented? first offer? MAC over fp_B? — otherwise END the session
+  D->>S: rc:sdp.answer {sdp, extauth_mac = MAC(answer, fp_D)} — key dropped, id remembered
+  S-->>B: forwarded verbatim
+  B->>B: verify the MAC over fp_D BEFORE setRemoteDescription
+  Note over B,D: DTLS pins fp_B and fp_D — a relay, or the server, carries only ciphertext
+```
+
+Six refusal points, in the order a session meets them:
+
+| # | Where | Refuses | Why there |
+|---|---|---|---|
+| 1 | server — `extauth::handle_session` | an unknown code; a login not verified on this pod, or another principal's, or for another device, or already spent | one login, one session — checked where it is cheapest |
+| 2 | server — same | gates 1–2 closed; a quarantined device; an archived org; no `external-session` cap; nothing left after the org's ceiling | the org's gates, re-read at session time — a revocation between login and session holds |
+| 3 | device — `extauth::admit_session` | a secondary org's socket; gate 3 off or no password (read LIVE from the file); an unreadable consent mode or ceiling; a ceiling that leaves nothing; no verified login | the device's own terms, never the server's word. The login is consumed LAST, so a refusal on the device's terms leaves it unspent |
+| 4 | device — `grant_consent` | a binding that ended while the question stood | a grant for a session that is over is a refusal |
+| 5 | device — `check_offer`, ahead of FR-43 delegation | an offer before THIS device consented; a second offer; no MAC; a MAC that does not verify; zero or two certificates | gate 5 is the device's, and an offer is the only thing that builds a peer. Before delegation because the binding lives in the root daemon, not the GUI worker |
+| 6 | device — `seal_answer`, and `seal_outbound` for a GUI worker's answer | an answer to no admitted offer; an ended session | an external session's answer is never sent unsealed |
+
+> ⚠️⚠️ **"Not bound" means ORDINARY session, and is the one answer on which an offer
+> proceeds without a MAC** — so it must never be the answer for a session that WAS
+> external. An ended binding leaves its session id in a bounded memory (256, oldest
+> out), and a full table **refuses the newcomer rather than evicting** a live binding:
+> an evicted session would find no binding at its offer and be taken for an ordinary
+> one. Both locked (`an_ended_session_is_never_admitted_again`,
+> `a_full_table_refuses_the_newcomer_and_evicts_nobody`).
+
+> ⚠️ **The server's consent directive is not consulted.** `Request.consent_mode`
+> arrives as `Prompt` — which only sizes the Hub's wait to the attended window — and
+> an external session ignores it: `external_consent_mode` decides, floored by the
+> device's own `auto_grant_session` through `consent::strictest_of`. Email and push
+> never apply. The prompt's TITLE says "from OUTSIDE your organization", because the
+> controller's name is whatever they chose to call themselves.
+
+> ⚠️ **Two server-side widenings an outsider must not inherit.** The Hub's FILES
+> grandfather rule widens exactly `VIEW | INPUT | CLIPBOARD` to add `FILES`, and an
+> org ceiling of exactly that triple would have handed an outsider file transfer no
+> admin granted — it now skips external sessions. And system audio follows the opt-in
+> alone on an ordinary session; an external one needs `AUDIO` in its grant, checked
+> by the server and again by the device.
+
+**Why a separate frame** (`rc:extauth.session`) rather than fields on
+`rc:session.request`: it names the device by connect code — an outsider never learns
+the internal id, and `rc:session.created` answers them with a zero id — and it has no
+`local_relay` and no `override_reason`, which closes F4 by type. `ExternalGrant`
+reaches `Hub::create_session` from the extauth relay only; `Hub::dispatch` always
+passes `None`, so no frame a controller sends can make a session external, or an
+external one ordinary.
+
+**Across pods**, P3d's path extends as is: the session is created on the device's pod
+with the relay's proxy sender, the origin pod recorded the route when it forwarded
+the frame, and the sealed offer and answer cross the PR-2 relay unchanged — the MAC
+rides the raw frame (`an_outsider_on_the_other_pod_opens_a_sealed_session`).
+
 ## 5. Addressing: how an outsider names a device
 
 An outsider cannot browse the org's device list and must not be able to. They
@@ -330,7 +425,13 @@ CAS. P6 follows it rather than inventing one.
 | P3b | The device's login **state machine** (`external_logins.rs`): guesses debited when a KE2 leaves the device (§4b), check-and-debit in ONE critical section (a concurrent burst cannot outrun it), a success refunds only its own guess, 5 free then 30 s doubling to a 1 h cap over a 24 h window, bounded pending/verified tables with TTLs, and a verified login retained **single-use** as `AppKey = HKDF-SHA512(session key, label ‖ attempt ‖ principal)` — the principal is bound after the login because the browser library binds no OPAQUE `context`. Known-answer test against an independent HKDF. Open decisions 6 + 7. | same | **SHIPPED** |
 | P3c | The wire: `rc:extauth.*` frames (4 client, 4 server; the device's refusal decoded leniently — anything present is a refusal), the server as a blind relay (`crates/modules/remote/src/extauth.rs`: byte-identical `unavailable` for no-such-code / gate 1 / gate 2 / offline, reply before the audit write, park-before-push, only the starter finishes, gates re-checked at KE3), the device's answer in **every** build (`agents/roomlerd/src/extauth.rs`: gate 3 and the record read LIVE from the config file, primary org only), and a `login` audit action. **Proven on loopback against the real agent**: `crates/tests/src/extauth_tests.rs`, 4 tests. ⚠️ **Single-pod only** — see P3d. | P2's flag; no client surface ships | **SHIPPED** |
 | P3d | **Cross-pod.** An outsider has NO tenant, so tenant affinity cannot put their socket on the pod holding the device, and `/ws` refuses a `tid` they are not a member of — in a 2-replica deployment roughly half of them land on a pod that cannot reach it. The landing pod re-resolves the connect code and forwards the raw frame ONCE over the PR-2 rc relay (`Hop::Origin` → `Hop::Relayed`, never relayed twice); the owner pod's `rc.cmd` handler routes it to the extauth relay with the proxy sender, whose pump already routes replies back to the browser's connection. `finish` resolves the code BEFORE the attempt table, because an attempt started cross-pod lives on the other pod. Proven by `an_outsider_on_the_other_pod_still_logs_in` (device on pod 1, outsider on pod 2), falsified by disabling the forward. | same | **SHIPPED** |
-| P4 | Session establishment: the external branch in `resolve_session_authz`, transport binding at offer time, external consent path, public `/connect` page. Permission ceiling enforced **at the agent**, not merely offered by the server. | revert the authz branch; gates 1–3 still refuse | not started |
+| P4 | Session establishment — §4c. Designed as its own frame (`rc:extauth.session`) rather than a branch in `resolve_session_authz`: an outsider has no membership for that gate to judge, and the frame's TYPE is what keeps a connect code, not an agent id, on the wire and `local_relay` off it (F4). | per sub-phase, below | P4a–P4d **SHIPPED** on the branch; P4e–P4f not started |
+| P4a | **The wire and the binding primitive.** `rc:extauth.session`; `Request.external`; `extauth_mac` on the offer and the answer in both directions (relayed verbatim — the server holds no key to check it); `RpcCap::ExternalSession`; `external_logins`' binding — bind (consuming the login) → the device's consent → ONE offer → a sealed answer → the key dropped and the id remembered. KATs from an independent HMAC. | `external-access` feature, in no release build | **SHIPPED** |
+| P4b | **The server's session step** (`extauth::handle_session`): a verified login kept single-use for 150 s; gates 1–2, quarantine and archived re-checked; the `external-session` cap; the org's clamp; `Hub::create_session(external)` — the only caller that passes one; a `session` audit action joined to the login by `attempt_id` and to the session by `session_id`; the FILES grandfather rule skipped; a zero agent id to the outsider. | same | **SHIPPED** |
+| P4c | **The device's admission**: primary org only; gate 3 read live; its own consent mode and ceiling (now validated at `config set`); the login consumed last; the MAC checked ahead of FR-43 delegation; the answer sealed at both places an answer leaves the root daemon; audio behind `AUDIO`; the prompt titled "from OUTSIDE your organization"; a refusal ends the session as `agent_hangup`, never reported as a human's no. | same | **SHIPPED** |
+| P4d | **The proof, against the real agent**: a sealed session end to end with the browser's half written from the spec; three forged offers each ENDED by the device; one login, one session, one principal; and the same session across two pods with both MACs crossing the PR-2 relay intact. | same | **SHIPPED** |
+| P4e | The public `/connect` page: `@serenity-kit/opaque` login, WebCrypto AppKey and MACs, the answer's MAC checked BEFORE `setRemoteDescription`, a clear refusal on a missing one. | no route ships | not started |
+| P4f | Turn it on: `external-access` into the release feature sets; the first field run on an installed daemon with a real second account; `vs-teamviewer.md`. | gate 3 per device, default off | not started |
 | P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; relay bytes metered to the device's tenant (F3); a plan limit. | n/a — read-only surfaces | not started |
 | P6 | Ad-hoc attended support: host generates a short one-time code from tray/CLI. **Same wire** — the one-time secret takes the password's place. | separate `external_rc_mode` value; independent of unattended access | not started |
 
@@ -419,6 +520,43 @@ CAS. P6 follows it rather than inventing one.
    will. The cap (≈34 answered guesses a day against a ≥12-character password) is
    the trade. P5's owner notification on repeated failures is the complement: a
    human learns of a sustained attack, and rotating the connect code ends it.
+8. **The prompt names the outsider by a name they chose (P4).** The TITLE now says
+   the request is from outside the organization, and the detail line says what it
+   rests on — but "Alice from IT" is still whatever the account calls itself, and
+   the classic support scam is built on exactly that. Proposal: show the account's
+   email too, when (and only when) it is a PROVEN address (the security baseline's
+   rule for `users.email`), and say "unverified" otherwise. Needs a decision before
+   P4f puts the prompt in front of real people.
+9. **A device-side narrowing is enforced but not SHOWN (P4).** When the device's
+   own `external_max_permissions` is narrower than the org's, the device enforces
+   its grant (the input and clipboard channels refuse), but the viewer's toolbar
+   follows `rc:session.created`, which carries the server's clamp. Honest options:
+   the device reports its effective grant in `rc:consent` (additive), or the page
+   treats refusals as the signal. P4e should pick one; the safe property — the
+   device enforces its own ceiling — does not depend on it.
+10. **One login, one offer — so a reconnect costs a login (P4).** An external session
+    admits exactly one offer, because the device rebuilds its peer for each and
+    nothing about a second offer is covered by the consent the first got. A network
+    blip therefore sends the outsider back to the password. A reconnect ticket
+    derived from the AppKey (MAC'd, single-use, short-lived, and still subject to the
+    device's consent mode) would remove that without a server-side secret; deferred
+    until the page exists and the cost can be measured.
+11. **Who may turn `external-access` on in the release builds (P4f).** Every gate
+    is default-closed, so shipping the stack changes nothing on a device until its
+    owner opts in (gate 3) and sets a password — but it does put the OPAQUE stack
+    (+7 crates) into every agent. The alternative is a separate build flavour; the
+    proposal is to ship it in `full`, because a feature only some builds can serve is
+    one the fleet view has to explain device by device.
+12. **The page cannot run its OPAQUE client under today's CSP (found while planning
+    P4e).** `@serenity-kit/opaque` is opaque-ke compiled to WebAssembly, and the SPA's
+    policy (`files/nginx-pod.conf:62`) is `script-src 'self' https://purestat.ai` —
+    with no `'wasm-unsafe-eval'`, a browser refuses to compile any WebAssembly module,
+    so the login would fail before its first frame. The CSP is one per document, and
+    SPA navigation never re-fetches it, so the allowance cannot be scoped to
+    `/connect` alone. Proposal: add `'wasm-unsafe-eval'` — it permits compiling
+    WebAssembly and nothing else (not JS `eval`) — in the same change as the page,
+    exercising the remote-control page as the security baseline requires for any CSP
+    edit, and extending the `rc_local_turn.rs` test that already parses this header.
 
 ## 10. Out of scope
 
@@ -461,4 +599,7 @@ CAS. P6 follows it rather than inventing one.
 | 2026-09-24 | P3c | **Falsification of the two server properties**, one run, both mutations: a distinguishable gate refusal → the identical-refusals test RED (`other` ≠ `unavailable`); the server's starter check removed → the only-the-starter test RED (`rejected`, not `unknown_attempt`). Each mutation turned exactly its own test red. Note the second: with the server's check gone, the stranger's KE3 reached the device — and the **device's** principal check still refused it. Two independent layers, observed. | PASS |
 | 2026-09-24 | P3d | **Cross-pod, two pods over one bus** (`TestApp::spawn_pair`, a real Redis): the device homed on pod 1, the outsider's socket on pod 2. KE1 → relayed → the device → KE2 → back over the conn-addressed lane → KE3 → relayed → **VERIFIED** — including `finish`, whose attempt existed only on pod 1. **Falsified**: with the forward disabled, exactly this test fails (`unavailable` where the device's challenge was expected) and the four single-pod tests stay green, so it exercises the relay rather than a shared hub. The test announces `SKIPPED` without a bus instead of passing on nothing. | PASS |
 | 2026-09-24 | P3c prep | ⚠️ **Found while rebasing onto FR-83: no CI lane runs `roomler-ai-remote-control`'s unit tests.** Every "locked by test" guard in that crate — including `ssh_does_not_imply_ssh_consent` and this FR's own `DesiredConfig` prefix guard and `external_access_tests` — has only run locally; two FR-78 tests have been red there since Vulkan became a known backend. Separately, the ClientMsg owner-table test could not run on a Windows checkout at all (CRLF; fixed here). Reported, not fixed: adding the lane needs the FR-78 tests repaired first. | reported |
+| 2026-09-25 | branch `fr52-p4` | **P4 unit tests on the dev box.** roomlerd with `external-access` (the binding: KATs against Node's HMAC, normalisation and the one-certificate rule, the whole lifecycle, refuse-never-evict, the ended memory, the TTL, and a REAL login's key equal to the key the client derives from its own side) — 48 in the touched modules; `external-session` advertised exactly with the feature, checked both ways; Hub 150 (incl. the external session's zero id, its `Request.external` and the FILES rule it skips); relay 4; remote-control 215 (the 2 stale FR-78 tests skipped, as on master); node-core's `config set` validation. `fmt`; `clippy -D warnings` on roomlerd with and without the feature, the server crates `--all-targets`, `--workspace`, and CI's api+services+tests `--all-targets` lane; the tunnel-core feature check. Composition baseline **+2 / −0**: exactly `rc:extauth.session` and its owner, `remote`. | PASS |
+| 2026-09-25 | same | **The P4 proof against the real agent** — `extauth_tests.rs`, with the browser's half written from §4c rather than from the device's code (HKDF built from two HMACs). (1) A verified login opens a session; `rc:session.created` carries a zero id; the offer's MAC verifies; the answer comes back sealed over the DEVICE's certificate under the same key; the browser's peer accepts it; the org's log has a `session` row naming the session and the login. (2) Three forged offers — another key, no MAC, a genuine tag over a swapped certificate — each **ENDED by the device** (`agent_hangup`), never answered. (3) Another outsider holding the attempt id, a second ask on the same login, and a never-verified attempt: all `unknown_attempt`. (4) **Two pods**: device on pod 1, outsider on pod 2, both MACs across the PR-2 relay intact. 10/10 with the P3 tests and the composition gate, 61 s. | PASS |
+| 2026-09-25 | same | **Falsification, six guards, each RED on its own test only.** Against the real agent, one run: (M1) the device ignores the offer's MAC → `an_offer_the_login_did_not_seal_ends_the_session` RED — the forged offer was ANSWERED; (M2) the server drops the principal check → `a_login_opens_one_session_for_its_own_principal` RED — outsider B got `rc:session.created` on A's login; (M3) the device never seals → both sealed-session tests RED (one pod and two) — an answer with no MAC; the five P3 tests stayed green. Units, one run: (M4) the Hub's FILES rule without its external guard → the outsider got `VIEW \| INPUT \| CLIPBOARD \| FILES`; (M5) no cap on the binding table → a 33rd session admitted; (M6) the login consumed FIRST → caught. ⚠️ **M6 was caught only after the test was fixed**: the first version re-admitted the SAME session id to prove the login survived, and re-admission on the same login is deliberately idempotent (the Hub re-pushes a pending Request after a socket flap) — so it would have passed with the mutation in. Found by designing the mutation before running it; the survivor check now admits a fresh id. Also found while designing M1: removing only `check_offer` does NOT turn anything red, because the seal step refuses an answer to an offer that was never admitted — a second, independent layer. All reverted. | PASS |
 | — | — | **Still unrun: an INSTALLED daemon.** The login loop against a real agent is now proven in-process (P3c, above), and the `rc password` LocalAPI path live against the installed service (P2c). What no run has touched is both on one installed host: the LocalAPI pipe name is a compile-time constant and the singleton instance lock stops a second daemon coexisting with the service, so it needs `external-access` in a release build. That belongs with P4 — the first phase whose feature an operator could actually use — not before it. | — |
