@@ -31,6 +31,18 @@
 //! with the relay's proxy sender, whose replies route back to the browser's own
 //! connection. `finish` resolves the code BEFORE the attempt table for the same
 //! reason: an attempt started cross-pod lives on the other pod.
+//!
+//! # The session (P4)
+//!
+//! A VERIFIED login is kept here, single-use, for [`VERIFIED_TTL`], and
+//! `rc:extauth.session` spends it: the server proves the login was verified on
+//! THIS pod, for THIS principal and THIS device, re-checks gates 1 and 2, clamps
+//! the grant to the org's ceiling, and asks the Hub for a session whose
+//! `rc:request` names the login. It decides nothing else — the device binds the
+//! session to that login or refuses it, asks its own consent, applies its own
+//! ceiling, and checks the offer's MAC (`agents/roomlerd/src/extauth.rs`). What
+//! the server holds here is a bookkeeping entry, not a credential: without the
+//! device's key it can neither open the session nor impersonate either end.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,10 +52,12 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_remote_control::connect_code;
 use roomler_ai_remote_control::models::{
-    Agent, ExtauthRefusal, ExternalRcAuditAction, ExternalRcAuditEvent, RpcCap,
+    Agent, AgentStatus, ConsentMode, ExtauthRefusal, ExternalRcAuditAction, ExternalRcAuditEvent,
+    RpcCap,
 };
+use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::ClientTx;
-use roomler_ai_remote_control::signaling::ServerMsg;
+use roomler_ai_remote_control::signaling::{ExternalGrant, ServerMsg};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -61,6 +75,10 @@ pub const ATTEMPT_TTL: Duration = Duration::from_secs(90);
 /// limit (§4b). The device's budget is the one that protects the password;
 /// this one bounds relay traffic and audit rows per account.
 pub const STARTS_PER_MINUTE: u32 = 10;
+/// How long a VERIFIED login may wait here for its `rc:extauth.session`.
+/// Longer than the device's own hold on it (120 s): the device holds the key,
+/// so it should be the party that lets a login lapse.
+pub const VERIFIED_TTL: Duration = Duration::from_secs(150);
 
 /// What the device said about one login step.
 #[derive(Debug)]
@@ -83,11 +101,20 @@ struct Attempt {
     started: Instant,
 }
 
+/// P4 — a login the device VERIFIED, waiting for the session it earns.
+struct Verified {
+    agent_id: ObjectId,
+    principal: ObjectId,
+    verified: Instant,
+}
+
 /// Attempts in flight and the waiters for the device's answers. Pod-local.
 #[derive(Default)]
 pub struct ExtauthRelay {
     waiters: DashMap<String, Waiter>,
     attempts: DashMap<String, Attempt>,
+    /// P4 — attempt id → a verified login not yet spent on a session.
+    verified: DashMap<String, Verified>,
     /// principal → (window start, starts in it).
     starts: std::sync::Mutex<HashMap<ObjectId, (Instant, u32)>>,
 }
@@ -147,6 +174,26 @@ impl ExtauthRelay {
     fn prune(&self, now: Instant) {
         self.attempts
             .retain(|_, a| now.saturating_duration_since(a.started) <= ATTEMPT_TTL);
+        self.verified
+            .retain(|_, v| now.saturating_duration_since(v.verified) <= VERIFIED_TTL);
+    }
+
+    /// P4 — spend `attempt_id`'s verified login: once, by its own principal,
+    /// for its own device. Anyone else leaves it in place and is told it does
+    /// not exist.
+    fn take_verified(
+        &self,
+        attempt_id: &str,
+        principal: ObjectId,
+        device: ObjectId,
+        now: Instant,
+    ) -> bool {
+        self.prune(now);
+        self.verified
+            .remove_if(attempt_id, |_, v| {
+                v.principal == principal && v.agent_id == device
+            })
+            .is_some()
     }
 
     /// Attempts currently in flight. For tests and gauges.
@@ -265,15 +312,20 @@ fn unavailable(attempt_id: Option<String>) -> ServerMsg {
 /// Gates 1 and 2, plus "can this device do it at all". `Err` carries what the
 /// org's audit log records; the outsider sees only `unavailable`.
 async fn gates(state: &RemoteState, agent: &Agent) -> Result<(), &'static str> {
-    let org_on = state
-        .fleet
-        .tenants
-        .base
-        .find_by_id(agent.tenant_id)
-        .await
-        .map(|t| t.settings.external_rc_enabled)
-        .unwrap_or(false);
-    if !org_on {
+    // The two refusals the org's OWN session gate applies before anything
+    // else (`controller::resolve_session_authz`) — an outsider must not get
+    // into a device a colleague could not. A tenant that cannot be read is a
+    // refusal: this gate opens only on a row it has seen.
+    if agent.status == AgentStatus::Quarantined {
+        return Err("the device is quarantined");
+    }
+    let Ok(tenant) = state.fleet.tenants.base.find_by_id(agent.tenant_id).await else {
+        return Err("gate 1: the organization could not be read");
+    };
+    if tenant.is_archived {
+        return Err("the organization is archived");
+    }
+    if !tenant.settings.external_rc_enabled {
         return Err("gate 1: the organization has external access switched off");
     }
     let (gates, _) = agent.external_access_policy.clone().split();
@@ -319,7 +371,8 @@ async fn resolve(state: &RemoteState, typed: &str) -> Option<Agent> {
     found
 }
 
-/// Written AFTER the reply, so its latency is not part of the answer (§5).
+/// A `login` row. Written AFTER the reply, so its latency is not part of the
+/// answer (§5).
 #[allow(clippy::too_many_arguments)]
 fn audit(
     state: &RemoteState,
@@ -331,10 +384,65 @@ fn audit(
     refused: Option<ExtauthRefusal>,
     detail: Option<&str>,
 ) {
+    audit_row(
+        state,
+        ExternalRcAuditAction::Login,
+        agent,
+        agent_id,
+        principal,
+        actor,
+        attempt_id,
+        refused,
+        detail,
+        None,
+    );
+}
+
+/// P4 — a `session` row: a verified login admitted into `session_id`, or
+/// refused (`refused` / `detail`, and no session).
+#[allow(clippy::too_many_arguments)]
+fn audit_session(
+    state: &RemoteState,
+    agent: &Agent,
+    agent_id: ObjectId,
+    principal: ObjectId,
+    actor: &str,
+    attempt_id: String,
+    refused: Option<ExtauthRefusal>,
+    detail: Option<&str>,
+    session_id: Option<ObjectId>,
+) {
+    audit_row(
+        state,
+        ExternalRcAuditAction::Session,
+        agent,
+        agent_id,
+        principal,
+        actor,
+        Some(attempt_id),
+        refused,
+        detail,
+        session_id,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_row(
+    state: &RemoteState,
+    action: ExternalRcAuditAction,
+    agent: &Agent,
+    agent_id: ObjectId,
+    principal: ObjectId,
+    actor: &str,
+    attempt_id: Option<String>,
+    refused: Option<ExtauthRefusal>,
+    detail: Option<&str>,
+    session_id: Option<ObjectId>,
+) {
     let event = ExternalRcAuditEvent {
         id: None,
         tenant_id: agent.tenant_id,
-        action: ExternalRcAuditAction::Login,
+        action,
         agent_id,
         user_id: principal,
         actor: actor.to_string(),
@@ -346,6 +454,7 @@ fn audit(
         attempt_id,
         login_refused: refused,
         login_detail: detail.map(str::to_string),
+        session_id,
     };
     let dao = Arc::clone(&state.fleet.external_rc_audit);
     tokio::spawn(async move {
@@ -596,10 +705,20 @@ pub async fn handle_finish(
             refused,
             retry_after_secs,
         }) => {
-            let _ = tx.try_send(result(Some(attempt_id.clone()), refused, retry_after_secs));
             if refused.is_none() {
+                // P4 — kept for the session it earns, BEFORE the outsider is
+                // told: their `rc:extauth.session` can follow at once.
+                relay.verified.insert(
+                    attempt_id.clone(),
+                    Verified {
+                        agent_id,
+                        principal,
+                        verified: Instant::now(),
+                    },
+                );
                 info!(%principal, agent = %agent_id, %attempt_id, "extauth: login VERIFIED by the device");
             }
+            let _ = tx.try_send(result(Some(attempt_id.clone()), refused, retry_after_secs));
             audit(
                 state,
                 &agent,
@@ -637,6 +756,178 @@ pub async fn handle_finish(
                 Some(attempt_id),
                 Some(ExtauthRefusal::Unavailable),
                 Some("the device did not answer KE3 in time"),
+            );
+        }
+    }
+}
+
+/// P4 — what `rc:extauth.session` asks for.
+pub struct SessionAsk {
+    pub connect_code: String,
+    pub attempt_id: String,
+    pub permissions: Permissions,
+    pub browser_caps: Vec<String>,
+    pub preferred_transport: Option<String>,
+    pub chroma_pref: Option<String>,
+    pub chunk_framing: Option<bool>,
+    pub audio_enabled: bool,
+}
+
+/// `rc:extauth.session` — open the session a verified login earned.
+///
+/// Thin on purpose (module docs, "The session"). Every refusal before the Hub
+/// is one the outsider sees as `unknown_attempt` or `unavailable`, told apart
+/// only in the org's audit log; a refusal FROM the Hub (the device is busy, or
+/// went away) is relayed as what it is.
+pub async fn handle_session(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    ask: SessionAsk,
+    hop: Hop,
+) {
+    let relay = &state.extauth;
+    let attempt_id = ask.attempt_id;
+    let unknown =
+        |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
+    // The code FIRST, as in `finish`: a login verified cross-pod is held on the
+    // pod that holds the device, and a local lookup here would miss it.
+    let Some(agent) = resolve(state, &ask.connect_code).await else {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    };
+    let Some(device) = agent.id else {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    };
+    if !state.fleet.rc_hub.is_agent_online(device) {
+        if forward(state, &hop, device, principal, actor).await {
+            return;
+        }
+        let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
+        audit_session(
+            state,
+            &agent,
+            device,
+            principal,
+            actor,
+            attempt_id,
+            Some(ExtauthRefusal::Unavailable),
+            Some("the device is offline (no pod holds it)"),
+            None,
+        );
+        return;
+    }
+    // Spent, not read: one verified login opens one session, whatever happens
+    // below — a refusal here sends the outsider back to log in again, which is
+    // the cheap direction to be wrong in.
+    if !relay.take_verified(&attempt_id, principal, device, Instant::now()) {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    }
+    // Gates 1 and 2 again: an admin who revokes between the login and the
+    // session must not see the session open.
+    let refuse = |detail: &'static str, attempt_id: String| {
+        let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
+        info!(%principal, agent = %device, %attempt_id, detail, "extauth: session refused");
+        audit_session(
+            state,
+            &agent,
+            device,
+            principal,
+            actor,
+            attempt_id,
+            Some(ExtauthRefusal::Unavailable),
+            Some(detail),
+            None,
+        );
+    };
+    if let Err(detail) = gates(state, &agent).await {
+        refuse(detail, attempt_id);
+        return;
+    }
+    // ⚠️ A device that cannot bind a session to its login would take
+    // `Request.external` as an unknown field and serve the outsider as an
+    // ordinary controller. Its `external-access` says it can LOG ONE IN, which
+    // is not the same promise.
+    if !agent.capabilities.has_rpc(RpcCap::ExternalSession) {
+        refuse(
+            "the device's agent can verify an external login but is too old to admit the session",
+            attempt_id,
+        );
+        return;
+    }
+    // Gate 2's ceiling. The device applies its own on top; the grant only
+    // ever narrows.
+    let (_, spec) = agent.external_access_policy.clone().split();
+    let permissions = spec.clamp(ask.permissions);
+    if permissions.is_empty() {
+        refuse(
+            "nothing the outsider asked for is within the org's ceiling for this device",
+            attempt_id,
+        );
+        return;
+    }
+    let session = state.fleet.rc_hub.create_session(
+        device,
+        principal,
+        actor.to_string(),
+        tx.clone(),
+        permissions,
+        ask.browser_caps,
+        ask.preferred_transport,
+        ask.chroma_pref,
+        ask.chunk_framing,
+        // System audio leaves the host: only under a grant that says so.
+        ask.audio_enabled && permissions.contains(Permissions::AUDIO),
+        // The device ignores this for an external session and asks by its own
+        // `external_consent_mode`. `Prompt` gives the Hub the attended window
+        // to wait, which is the longest the device can take.
+        ConsentMode::Prompt,
+        // No break-glass from outside the org, and no relay descriptor (F4):
+        // the frame cannot carry either, and neither is invented here.
+        None,
+        None,
+        agent.access_policy.input_mode,
+        // The device labels an outsider itself; no org name to show.
+        None,
+        Some(ExternalGrant {
+            attempt_id: attempt_id.clone(),
+        }),
+    );
+    match session {
+        Ok(session_id) => {
+            info!(%principal, agent = %device, %attempt_id, %session_id, "extauth: session opened");
+            audit_session(
+                state,
+                &agent,
+                device,
+                principal,
+                actor,
+                attempt_id,
+                None,
+                None,
+                Some(session_id),
+            );
+        }
+        Err(e) => {
+            let refused = match e {
+                roomler_ai_remote_control::Error::AgentBusy => ExtauthRefusal::Busy,
+                _ => ExtauthRefusal::Unavailable,
+            };
+            let _ = tx.try_send(result(Some(attempt_id.clone()), Some(refused), None));
+            warn!(%principal, agent = %device, %attempt_id, %e, "extauth: the hub could not open the session");
+            audit_session(
+                state,
+                &agent,
+                device,
+                principal,
+                actor,
+                attempt_id,
+                Some(refused),
+                Some("the hub could not open the session"),
+                None,
             );
         }
     }
@@ -692,6 +983,7 @@ pub fn on_relayed(
         msg,
         ClientMsg::ExtauthStart { .. }
             | ClientMsg::ExtauthFinish { .. }
+            | ClientMsg::ExtauthSession { .. }
             | ClientMsg::ExtauthKe2 { .. }
             | ClientMsg::ExtauthOutcome { .. }
     ) {
@@ -734,6 +1026,31 @@ fn dispatch(
                     hop,
                 )
                 .await;
+            });
+            Some(true)
+        }
+        ClientMsg::ExtauthSession {
+            connect_code,
+            attempt_id,
+            permissions,
+            browser_caps,
+            preferred_transport,
+            chroma_pref,
+            chunk_framing,
+            audio_enabled,
+        } => {
+            let ask = SessionAsk {
+                connect_code,
+                attempt_id,
+                permissions,
+                browser_caps,
+                preferred_transport,
+                chroma_pref,
+                chunk_framing,
+                audio_enabled,
+            };
+            tokio::spawn(async move {
+                handle_session(&state, principal, &actor, &tx, ask, hop).await;
             });
             Some(true)
         }

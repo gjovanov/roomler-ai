@@ -80,6 +80,17 @@ pub struct RemoteConfigServices {
     external_logins: Arc<crate::external_logins::ExternalLogins>,
 }
 
+/// FR-52 P4 — the device's own terms for an external session, as stored.
+/// See [`RemoteConfigServices::external_session_live`].
+#[cfg(feature = "external-access")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalSessionConfig {
+    /// `external_consent_mode`, unparsed. `None` = `prompt`.
+    pub consent_mode: Option<String>,
+    /// `external_max_permissions`, unparsed. `None` = defer to the org.
+    pub max_permissions: Option<String>,
+}
+
 impl RemoteConfigServices {
     pub fn new(
         path: PathBuf,
@@ -138,6 +149,33 @@ impl RemoteConfigServices {
             Some(crate::external_access::Credential {
                 setup: cfg.external_access_setup?,
                 verifier: cfg.external_access_verifier?,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// FR-52 P4 — what an external SESSION is admitted under, read from the
+    /// FILE when its `Request` arrives: live for the reason
+    /// [`Self::external_access_live`] is, and one read so the session is
+    /// judged on one consistent config.
+    ///
+    /// `None` exactly where `external_access_live` would say `None` — gate 3
+    /// shut, no complete password record, or an unreadable file. The consent
+    /// mode and the ceiling come back RAW: parsing them is the caller's, so
+    /// that a value it cannot read is a refusal it can name.
+    #[cfg(feature = "external-access")]
+    pub async fn external_session_live(&self) -> Option<ExternalSessionConfig> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::load(&path).ok()?;
+            let password_set =
+                cfg.external_access_setup.is_some() && cfg.external_access_verifier.is_some();
+            (cfg.external_access_enabled && password_set).then_some(ExternalSessionConfig {
+                consent_mode: cfg.external_consent_mode,
+                max_permissions: cfg.external_max_permissions,
             })
         })
         .await

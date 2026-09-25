@@ -1079,8 +1079,48 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // be one push away from meaningless. See `docs/remote-config.md`.
         "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
         "external_access_enabled" => cfg.external_access_enabled = parse_bool_or(value, false)?,
-        "external_consent_mode" => cfg.external_consent_mode = value.map(str::to_string),
-        "external_max_permissions" => cfg.external_max_permissions = value.map(str::to_string),
+        // FR-52 P4 — both validated on the way IN, the FR-55 rule: the session
+        // path REFUSES a value it cannot read (never falls back — `auto` is the
+        // one value that skips a human, and a typo must not be what decides
+        // it), so a typo accepted here would surface weeks later as external
+        // access that silently never works. Blank clears, as elsewhere.
+        "external_consent_mode" => {
+            cfg.external_consent_mode = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v @ ("prompt" | "auto")) => Some(v.to_string()),
+                Some(v) => {
+                    return Err(format!(
+                        "external_consent_mode must be prompt | auto (got {v:?})"
+                    ));
+                }
+            }
+        }
+        "external_max_permissions" => {
+            cfg.external_max_permissions = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let parsed =
+                        roomler_ai_remote_control::permissions::Permissions::from_wire_names(v)
+                            .ok_or_else(|| {
+                                format!(
+                                    "external_max_permissions must be permission names joined by \
+                                 `|`, e.g. \"VIEW | INPUT\" (got {v:?})"
+                                )
+                            })?;
+                    // `"|"` parses to NO permission, which would be stored as
+                    // "" and read back as "unset: defer to the org" — the
+                    // opposite of what was typed.
+                    if parsed.is_empty() {
+                        return Err("external_max_permissions names no permission; clear it to \
+                                    defer to the org, or set external_access_enabled false"
+                            .to_string());
+                    }
+                    // Stored in the canonical spelling, so what `config get`
+                    // prints is what the session path will read.
+                    Some(parsed.wire_names())
+                }
+            }
+        }
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
@@ -2802,5 +2842,46 @@ mod external_access_surface_tests {
                 "`{key}` must be unsettable through `apply`, listed or not"
             );
         }
+    }
+
+    /// FR-52 P4 — the device's terms for an external session are validated
+    /// when they are SET: the session path refuses what it cannot read (never
+    /// falls back), so a typo accepted here would be external access that
+    /// silently never works, found weeks later on a device nobody is watching.
+    #[test]
+    fn the_external_session_terms_are_validated_when_set() {
+        let mut cfg = crate::config::test_fixture();
+
+        for good in ["prompt", "auto", " auto "] {
+            apply(&mut cfg, "external_consent_mode", Some(good)).unwrap();
+            assert_eq!(cfg.external_consent_mode.as_deref(), Some(good.trim()));
+        }
+        for bad in ["Auto", "always", "yes"] {
+            assert!(
+                apply(&mut cfg, "external_consent_mode", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        apply(&mut cfg, "external_consent_mode", Some("  ")).unwrap();
+        assert_eq!(cfg.external_consent_mode, None, "blank clears: prompt");
+
+        apply(&mut cfg, "external_max_permissions", Some("input|VIEW")).unwrap_err();
+        apply(&mut cfg, "external_max_permissions", Some("INPUT|VIEW")).unwrap();
+        assert_eq!(
+            cfg.external_max_permissions.as_deref(),
+            Some("VIEW | INPUT"),
+            "stored in the spelling the session path reads"
+        );
+        for bad in ["VIEW | TELEPORT", "|", " | "] {
+            assert!(
+                apply(&mut cfg, "external_max_permissions", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        apply(&mut cfg, "external_max_permissions", None).unwrap();
+        assert_eq!(
+            cfg.external_max_permissions, None,
+            "clears: defer to the org"
+        );
     }
 }

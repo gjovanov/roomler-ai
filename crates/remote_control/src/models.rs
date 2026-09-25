@@ -592,6 +592,21 @@ pub enum RpcCap {
     /// prefix with an existing verb today; if a shorter `external` is ever
     /// added, the `ssh` / `ssh-consent` trap applies and the test locks it.
     ExternalAccess,
+    /// FR-52 P4 — this build ENFORCES the external session binding: it opens an
+    /// external session only against a login it verified itself, refuses an SDP
+    /// offer whose DTLS fingerprint is not authenticated under that login's key,
+    /// and authenticates its own answer the same way.
+    ///
+    /// ⚠️ Deliberately NOT the same verb as [`Self::ExternalAccess`], which every
+    /// build advertises. `rc:request` carries the external grant in an optional
+    /// field, and an agent that predates the binding would IGNORE that field and
+    /// run an ordinary session — no binding, no local ceiling, no "outside your
+    /// organization" — failing OPEN. The server opens an external session only
+    /// on an agent advertising this, so an old agent is never asked.
+    ///
+    /// ⚠️ `external-access` and `external-session` share a prefix; neither is a
+    /// prefix of the other, and matching stays equality regardless.
+    ExternalSession,
 }
 
 impl RpcCap {
@@ -613,11 +628,12 @@ impl RpcCap {
             Self::KeyRotate => "key-rotate",
             Self::SshGrantAck => "ssh-grant-ack",
             Self::ExternalAccess => "external-access",
+            Self::ExternalSession => "external-session",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 10] = [
+    pub const ALL: [RpcCap; 11] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -628,6 +644,7 @@ impl RpcCap {
         Self::KeyRotate,
         Self::SshGrantAck,
         Self::ExternalAccess,
+        Self::ExternalSession,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -2642,6 +2659,12 @@ pub enum ExternalRcAuditAction {
     /// a device (an unresolvable code has no device and no tenant to attach a
     /// row to). `user_id` is the would-be controller, not an admin.
     Login,
+    /// FR-52 P4 — a verified login asked to open its session: admitted (with
+    /// the `session_id` it got) or refused. One row per ask, keyed to the
+    /// login by `attempt_id`, so "who got in, on which login, into which
+    /// session" is one join. What the DEVICE then decides — its own consent,
+    /// its own ceiling — is the session's own audit trail, not this row.
+    Session,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -2680,10 +2703,12 @@ pub struct ExternalRcAuditEvent {
     /// Refusal reason; `None` = the decision went through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<ExternalRcDenyReason>,
-    /// `login` — the attempt this row closes.
+    /// `login` / `session` — the attempt this row closes (`login`) or spends
+    /// (`session`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
-    /// `login` — why it was refused; `None` on a `login` row = VERIFIED.
+    /// `login` / `session` — why it was refused; `None` = VERIFIED (`login`)
+    /// or ADMITTED (`session`).
     ///
     /// ⚠️ This is the one place the refusal reasons are told apart. The
     /// would-be controller only ever sees `unavailable` for every configuration
@@ -2691,10 +2716,16 @@ pub struct ExternalRcAuditEvent {
     /// device is offline" must be distinguishable, or no admin could act on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_refused: Option<ExtauthRefusal>,
-    /// `login` — what the SERVER knows about a refusal the controller saw as
-    /// `unavailable`: which gate, or offline. `None` when the device refused.
+    /// `login` / `session` — what the SERVER knows about a refusal the
+    /// controller saw as `unavailable`: which gate, or offline. `None` when the
+    /// device refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_detail: Option<String>,
+    /// `session` — the session an admitted login opened. Joins this row to the
+    /// session's own audit (`remote_audit`), which records what the device
+    /// then decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ObjectId>,
 }
 
 impl ExternalRcAuditEvent {
@@ -2921,6 +2952,14 @@ mod external_access_tests {
             serde_json::to_string(&ExternalRcAuditAction::RotateCode).unwrap(),
             "\"rotate_code\""
         );
+        assert_eq!(
+            serde_json::to_string(&ExternalRcAuditAction::Login).unwrap(),
+            "\"login\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExternalRcAuditAction::Session).unwrap(),
+            "\"session\""
+        );
     }
 
     /// A refusal row must not carry grant-only fields — the reason the SSH
@@ -2943,6 +2982,7 @@ mod external_access_tests {
             attempt_id: None,
             login_refused: None,
             login_detail: None,
+            session_id: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());
@@ -4594,6 +4634,22 @@ mod tests {
         assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
         assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
         assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
+        assert_eq!(RpcCap::ExternalAccess.wire(), "external-access");
+        assert_eq!(RpcCap::ExternalSession.wire(), "external-session");
+    }
+
+    /// FR-52 P4 — a P3 agent advertises `external-access` (it can LOG IN an
+    /// outsider) but ignores `Request.external`, so it would serve one as an
+    /// ordinary controller: the password proven, the session bound to nothing.
+    /// The server opens external sessions on `external-session` alone.
+    #[test]
+    fn external_access_does_not_imply_external_session() {
+        let p3 = AgentCaps {
+            rpc: vec!["external-access".into()],
+            ..AgentCaps::default()
+        };
+        assert!(p3.has_rpc(RpcCap::ExternalAccess));
+        assert!(!p3.has_rpc(RpcCap::ExternalSession));
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.

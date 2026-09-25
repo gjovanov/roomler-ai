@@ -298,6 +298,9 @@ pub struct ExternalRcAuditView {
     pub login_refused: Option<roomler_ai_remote_control::models::ExtauthRefusal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_detail: Option<String>,
+    /// FR-52 P4 — `session` rows: the session an admitted login opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
@@ -319,6 +322,7 @@ impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
             attempt_id,
             login_refused,
             login_detail,
+            session_id,
         } = e;
         Self {
             id: id.map(|i| i.to_hex()),
@@ -334,6 +338,7 @@ impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
             attempt_id,
             login_refused,
             login_detail,
+            session_id: session_id.map(|s| s.to_hex()),
         }
     }
 }
@@ -478,6 +483,7 @@ pub async fn set_policy(
         attempt_id: None,
         login_refused: None,
         login_detail: None,
+        session_id: None,
     };
     if let Err(e) = state.external_rc_audit.record(event).await {
         // Best-effort, like the other decision logs: an audit insert must
@@ -564,6 +570,7 @@ pub async fn rotate_connect_code(
                     attempt_id: None,
                     login_refused: None,
                     login_detail: None,
+                    session_id: None,
                 };
                 if let Err(e) = state.external_rc_audit.record(event).await {
                     warn!(%e, "external access: audit write failed");
