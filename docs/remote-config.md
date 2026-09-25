@@ -144,9 +144,11 @@ and the UI must show "device too old" rather than a spinner.
 `main.rs` records that a non-elevated `config::save` fails ACCESS_DENIED — which
 is satisfied because the daemon is SYSTEM/root.
 
-**Restart, staggered 0–120 s.** `config_surface`'s own doc says every key is read
-at daemon startup, so the whole surface is `restart_required = true`. A
-fleet-wide push without jitter restarts every device at once. The jitter is
+**Restart, staggered 0–120 s.** `config_surface`'s own doc says every key but the
+two live gate-4 flags (§7b) is read at daemon startup, so the surface is
+`restart_required = true` for everything else — and since FR-84 D2 each
+`ConfigEntry` says which. A fleet-wide push without jitter restarts every device
+at once. The jitter is
 per-device and derived from the machine id, so it is stable across retries
 rather than re-rolled.
 
@@ -226,8 +228,8 @@ detail at the end of it. All verified at `09ada123`.
 takes an OWNED snapshot at startup and passes it down by reference;
 `exec_enabled` is read as `agent_cfg.exec_enabled` per request from that
 snapshot, never re-read from disk. So writing config.toml changes nothing about
-the running daemon. `config_surface`'s "the whole surface is
-`restart_required = true`" is exactly right.
+the running daemon. `config_surface`'s `restart_required = true` for every key
+but the two live flags is exactly right.
 
 **There is no self-restart primitive.** `restart-service` is Windows-only,
 external (an admin runs it), and does an SCM Stop+Start — which a process cannot
