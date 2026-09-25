@@ -265,18 +265,83 @@ fi
 # not a service: it holds no session and captures nothing, so a failure to
 # start it must never fail the install — but it IS the only place that tells
 # the user which macOS permission is missing, which the OS never does.
+#
+# ⚠️⚠️ The companion enforces a SINGLE INSTANCE (tauri-plugin-single-instance):
+# a second launch hands its arguments to the first and EXITS 0. So a companion
+# that outlives this script defeats the update: the freshly installed one
+# starts, defers to the old one and quits, launchd records a clean exit, and
+# `bootstrap` has already reported success.
+#
+# `bootout` cannot rule that out, because it only reaches launchd's instance of
+# `com.roomler.desktop`. An app a person opened from Finder, Spotlight or the
+# Dock runs under LaunchServices' own job (`application.<bundle-id>.<n>`),
+# which nothing here addresses. Field 2026-09-25: a 0.4.92 companion kept
+# running through NINE updates on a Mac whose install.log said "Roomler
+# menu-bar app started" after every one — `launchctl print` showed the job
+# `runs = 1, last exit code = 0, not running`, the process was executing an
+# unlinked inode, and the operator saw "v0.4.92" on a 0.4.101 host.
+# Reproduced deterministically: `open -a Roomler.app`, then this block's
+# previous form.
+#
+# So: stop EVERY instance of the console user's companion, however it was
+# started, before starting the new one — matched on the executable path's TAIL,
+# so a copy of the app outside /Applications cannot hold the lock either.
+# SIGTERM first (it exits in ~0.5 s, measured), SIGKILL only for stragglers.
+# Only the console user's: another logged-in user's companion has no plist of
+# ours to bring it back, and a stale menu-bar app beats an absent one.
+# ⚠️ Everything below runs under `set -euo pipefail` and must never fail the
+# install: `pkill` exits 1 when nothing matched, which is the common case.
+COMPANION_EXE_RE='/Roomler\.app/Contents/MacOS/roomler-desktop( |$)'
+
+stop_companions() {
+  pkill -TERM -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || return 0
+  n=0
+  while pgrep -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" >/dev/null 2>&1; do
+    n=$((n + 1))
+    if [ "$n" -ge 20 ]; then
+      pkill -KILL -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || true
+      sleep 1
+      break
+    fi
+    sleep 0.5
+  done
+}
+
+# Did the new companion come up AND STAY up? A single-instance loser also
+# starts — and reads as `running` for a moment — before it exits 0, so one look
+# proves nothing: require the same pid on two looks two seconds apart.
+companion_pid() {
+  launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
+    | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true
+}
+companion_running() {
+  first=$(companion_pid)
+  [ -n "$first" ] || return 1
+  sleep 2
+  second=$(companion_pid)
+  [ -n "$second" ] && [ "$second" = "$first" ]
+}
+
 DESKTOP_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.desktop.plist"
 DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
 if [ -f "$DESKTOP_PLIST_SOURCE" ] && [ -d /Applications/Roomler.app ]; then
   cp "$DESKTOP_PLIST_SOURCE" "$DESKTOP_PLIST_TARGET"
   chown "$CONSOLE_USER":staff "$DESKTOP_PLIST_TARGET"
   chmod 644 "$DESKTOP_PLIST_TARGET"
+  stop_companions
   # Same drain-aware replacement — the tray dies faster than the agent, but the
   # race is the same shape and the retry costs nothing when it isn't needed.
-  if replace_launchd_service "gui/$CONSOLE_UID" com.roomler.desktop "$DESKTOP_PLIST_TARGET"; then
+  if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.desktop "$DESKTOP_PLIST_TARGET"; then
+    echo "Roomler menu-bar app installed; it will start at the next login"
+  elif companion_running; then
     echo "Roomler menu-bar app started for $CONSOLE_USER"
   else
-    echo "Roomler menu-bar app installed; it will start at the next login"
+    # Say so: this line printed "started" through nine updates while nothing
+    # had restarted.
+    echo "WARNING: the Roomler menu-bar app was registered but did not stay running"
+    echo "  launchd: $(launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
+      | grep -E 'state =|last exit code =' | head -2 | tr -s '\t\n ' ' ' || true)"
+    echo "  still running elsewhere? pgrep -lf roomler-desktop"
   fi
   rm -f /tmp/roomler-bootstrap.err
 else
