@@ -158,6 +158,14 @@ pub fn cmd_launch_intent() -> LaunchIntent {
 pub struct DesktopStateView {
     pub first_run_done: bool,
     pub autostart_opt_out: bool,
+    /// `windows` | `linux` | `macos` — the tour words the private-network
+    /// step per platform.
+    pub platform: &'static str,
+    /// macOS: the privileged half (`com.roomler.daemon`, root) is installed.
+    /// On a Mac the MESH belongs to that half — its own enrollment — while
+    /// this app talks to the per-user capture half; offering to put THIS half
+    /// on the mesh too would make the Mac two nodes.
+    pub macos_privileged_half: bool,
 }
 
 #[tauri::command]
@@ -166,6 +174,16 @@ pub fn cmd_desktop_state() -> DesktopStateView {
     DesktopStateView {
         first_run_done: s.first_run_done,
         autostart_opt_out: s.autostart_opt_out,
+        platform: if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        },
+        // The plist is world-readable; `/etc/roomler` (0700) is not.
+        macos_privileged_half: cfg!(target_os = "macos")
+            && std::path::Path::new("/Library/LaunchDaemons/com.roomler.daemon.plist").exists(),
     }
 }
 
