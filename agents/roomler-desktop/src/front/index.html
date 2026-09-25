@@ -44,6 +44,13 @@
           </svg>
           Routes
         </a>
+        <a href="#/recordings" data-view="recordings">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"></circle>
+            <circle cx="12" cy="12" r="3.5" fill="currentColor"></circle>
+          </svg>
+          Recordings
+        </a>
         <a href="#/settings" data-view="settings">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
@@ -310,6 +317,85 @@
         </div>
       </section>
 
+      <!-- Recordings (FR-85) -->
+      <section id="view-recordings" class="view" hidden>
+        <div class="view-head"><h2>Recordings</h2></div>
+        <p class="view-sub">
+          Record this screen to a high-quality video file. Recordings stay on
+          this device, in the folder below.
+        </p>
+
+        <!-- Why the page cannot act: the service is down, has no recorder,
+             or a refresh failed (the last good data stays below). -->
+        <p id="rec-banner" class="banner banner-warn small" hidden></p>
+
+        <div class="card" id="rec-control">
+          <div class="card-title-row">
+            <h3>Record this screen</h3>
+            <span id="rec-live" class="chip chip-err" hidden>
+              <span class="dot rec-dot"></span> REC <span id="rec-live-time">0:00</span>
+            </span>
+          </div>
+          <p id="rec-status" class="muted small" style="margin: 0">Not recording.</p>
+          <p id="rec-unavailable" class="banner banner-warn small" hidden></p>
+          <div class="actions" id="rec-options">
+            <label>Frame rate
+              <select id="rec-fps">
+                <option value="30" selected>30 fps</option>
+                <option value="60">60 fps</option>
+              </select>
+            </label>
+            <label>Encoder
+              <select id="rec-encoder">
+                <option value="auto" selected>Automatic (GPU, else software)</option>
+                <option value="hardware">GPU only</option>
+                <option value="software">Software only</option>
+              </select>
+            </label>
+          </div>
+          <div class="actions">
+            <button type="button" id="rec-start" class="primary">Start recording</button>
+            <button type="button" id="rec-stop" class="danger" hidden>Stop recording</button>
+          </div>
+          <p id="rec-last" class="muted small" hidden></p>
+          <p id="rec-error" class="error small" hidden></p>
+        </div>
+
+        <div class="card">
+          <h3>Where recordings are saved</h3>
+          <p class="mono small" id="rec-folder" style="margin: 0">—</p>
+          <p id="rec-folder-note" class="muted small" hidden></p>
+          <p id="rec-folder-reason" class="banner banner-warn small" hidden></p>
+          <div class="actions">
+            <button type="button" id="rec-folder-change">Change folder…</button>
+            <button type="button" id="rec-folder-default" hidden>Use the default folder</button>
+            <button type="button" id="rec-folder-open">Open folder</button>
+          </div>
+          <p id="rec-folder-error" class="error small" hidden></p>
+        </div>
+
+        <div class="card">
+          <h3>Saved recordings</h3>
+          <p id="rec-empty" class="muted small" style="margin: 0" hidden>No recordings yet.</p>
+          <div class="tbl-wrap">
+            <table id="rec-table" class="tbl" hidden>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Recorded</th>
+                  <th>Length</th>
+                  <th>Size</th>
+                  <th>By</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="rec-body"></tbody>
+            </table>
+          </div>
+          <p id="rec-list-error" class="error small" hidden></p>
+        </div>
+      </section>
+
       <!-- Settings -->
       <section id="view-settings" class="view" hidden>
         <div class="view-head"><h2>Settings</h2></div>
@@ -531,6 +617,7 @@
     <script src="overview.js"></script>
     <script src="devices.js"></script>
     <script src="tunnels.js"></script>
+    <script src="recordings.js"></script>
     <script src="settings.js"></script>
     <script src="onboarding.js"></script>
     <script src="consent.js"></script>
