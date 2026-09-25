@@ -23,6 +23,24 @@ on:
       - 'crates/**'
       - 'agents/**'
       - 'ui/src/**'
+      # ⚠️ The trigger names EXTENSIONS, not directories. `apply-spdx.sh --check`
+      # grades every TRACKED file whose extension has a `comment_style` and whose
+      # path is outside `EXCLUDE_PATTERNS` — wherever it lives. A directory list
+      # cannot keep up with that: #1194 touched only `ui/public/`, this job never
+      # fired, its headerless `rc-vp9-444-harness.js` merged, and master went red
+      # on the next push — failing every unrelated PR after it. On 2026-09-25 the
+      # same gap still covered `ui/docs/` (the docs site), the `ui/` root and
+      # `docs/assets/`: 24 graded files no PR could trigger this job for.
+      # A gate that cannot see the files it grades is worse than no gate,
+      # because it reports success.
+      # ⚠️ An extension added to `comment_style` must be added here too.
+      - '**.rs'
+      - '**.ts'
+      - '**.mts'
+      - '**.cts'
+      - '**.js'
+      - '**.vue'
+      - '**.html'
       - 'LICENSE*'
       - 'LICENSING.md'
   push:
