@@ -1071,6 +1071,77 @@ pub(crate) mod win {
             assert_eq!(&parsed[1..], &cases[..]);
         }
 
+        /// The token this thread acts with right now — its impersonation
+        /// token when it has one — as text: user, integrity, every group
+        /// with its attribute bits, every enabled privilege. For a failure
+        /// that has to explain itself from a CI log.
+        fn effective_token() -> String {
+            use windows_sys::Win32::Security::{
+                LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, TOKEN_PRIVILEGES, TokenPrivileges,
+            };
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+            let mut t: HANDLE = std::ptr::null_mut();
+            // SAFETY: the pseudo-handle of this thread, a valid out-param.
+            let (tok, impersonating) =
+                if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut t) } != 0 {
+                    (Owned::new(t), true)
+                } else {
+                    (own_token(TOKEN_QUERY), false)
+                };
+            let Some(tok) = tok else {
+                return "no token".into();
+            };
+            let user = token_info(tok.raw(), TokenUser)
+                // SAFETY: a TOKEN_USER whose SID lives in the buffer.
+                .map(|b| sid_string(unsafe { (*(b.as_ptr() as *const TOKEN_USER)).User.Sid }));
+            let groups = token_info(tok.raw(), TokenGroups).map(|b| {
+                // SAFETY: a TOKEN_GROUPS whose array and SIDs live in `b`.
+                unsafe {
+                    let g = &*(b.as_ptr() as *const TOKEN_GROUPS);
+                    std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+                        .iter()
+                        .map(|x| format!("{}:{:#x}", sid_string(x.Sid), x.Attributes))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            });
+            let privileges = token_info(tok.raw(), TokenPrivileges).map(|b| {
+                // SAFETY: a TOKEN_PRIVILEGES whose array lives in `b`.
+                let list: &[LUID_AND_ATTRIBUTES] = unsafe {
+                    let p = &*(b.as_ptr() as *const TOKEN_PRIVILEGES);
+                    std::slice::from_raw_parts(p.Privileges.as_ptr(), p.PrivilegeCount as usize)
+                };
+                list.iter()
+                    .filter(|p| p.Attributes & 0x2 != 0) // SE_PRIVILEGE_ENABLED
+                    .map(|p| {
+                        let mut name = [0u16; 128];
+                        let mut len = name.len() as u32;
+                        // SAFETY: `name` holds `len` u16s.
+                        let ok = unsafe {
+                            LookupPrivilegeNameW(
+                                std::ptr::null(),
+                                &p.Luid,
+                                name.as_mut_ptr(),
+                                &mut len,
+                            )
+                        };
+                        if ok != 0 {
+                            String::from_utf16_lossy(&name[..len as usize])
+                        } else {
+                            format!("luid:{}", p.Luid.LowPart)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            format!(
+                "impersonating={impersonating} user={user:?} il={:?} groups=[{}] enabled_privileges=[{}]",
+                integrity_rid(tok.raw()),
+                groups.unwrap_or_default(),
+                privileges.unwrap_or_default(),
+            )
+        }
+
         /// The daemon's work in the person's folder gets only the person's
         /// rights: on an elevated run, a folder only Administrators may write
         /// to takes this process's write and refuses the same write made
@@ -1099,15 +1170,27 @@ pub(crate) mod win {
                 .unwrap();
             assert!(granted.status.success(), "{granted:?}");
 
+            let acl = std::process::Command::new("icacls")
+                .arg(&locked)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let outside_token = effective_token();
+
             std::fs::write(locked.join("as-the-daemon"), b"x")
                 .expect("the elevated daemon may write there: the control");
-            let (inside, write) = super::super::as_identity(Identity::RestrictedCopy, || {
-                (
-                    admin_group_enabled(),
-                    std::fs::write(locked.join("as-the-recorder"), b"x"),
-                )
-            })
-            .unwrap();
+            let (inside, inside_token, write) =
+                super::super::as_identity(Identity::RestrictedCopy, || {
+                    (
+                        admin_group_enabled(),
+                        effective_token(),
+                        std::fs::write(locked.join("as-the-recorder"), b"x"),
+                    )
+                })
+                .unwrap();
+            println!(
+                "the folder: {acl}\nthe daemon: {outside_token}\nas the recorder: {inside_token}"
+            );
             assert_eq!(
                 inside,
                 Some(false),
@@ -1115,7 +1198,8 @@ pub(crate) mod win {
             );
             assert!(
                 write.is_err(),
-                "work done as the recorder wrote into an Administrators-only folder"
+                "work done as the recorder wrote into an Administrators-only folder.\n\
+                 the folder: {acl}\nthe daemon: {outside_token}\nas the recorder: {inside_token}"
             );
             assert!(!locked.join("as-the-recorder").exists());
             assert_eq!(
