@@ -4,3 +4,8 @@
 // re-exported so every `crate::extractors::{auth, tenant}` path in this
 // crate reads as before.
 pub use roomler_core::extractors::{auth, tenant};
+
+// FR-84 D5a — the agent-JWT extractor for the host's `/api/agent/self/*`
+// routes: the fleet module's decision, plus "no fleet ⇒ 503".
+#[cfg(feature = "fleet")]
+pub mod auth_agent;

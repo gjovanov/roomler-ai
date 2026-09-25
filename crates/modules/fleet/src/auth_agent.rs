@@ -100,6 +100,72 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
+/// The decision itself, over the request headers — what the extractor below
+/// runs, callable by a router whose state cannot `FromRef` a `FleetState`.
+///
+/// FR-84 D5a split this out of the extractor for the HOST's `/api/agent/self/*`
+/// routes: their state is `AppState`, on which the fleet module is an
+/// `Option` (a switched-off module is unmounted, never a boot refusal), so
+/// the `FleetState: FromRef<S>` bound above can't be met there. The host
+/// wraps this in its own extractor and answers 503 for the `None`; the rules
+/// are these, once: bearer only, audience-checked, status-checked on every
+/// use, deletion wins over status, a lookup FAILURE is 500 not 401.
+pub async fn authenticate(
+    fleet: &FleetState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthAgent, ApiError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    // Audience-checked: `verify_agent_token` rejects a user JWT.
+    let claims = fleet
+        .auth
+        .verify_agent_token(token)
+        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+
+    let agent_id = ObjectId::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("invalid agent_id in claims".to_string()))?;
+    let tenant_id = ObjectId::parse_str(&claims.tenant_id)
+        .map_err(|_| ApiError::Unauthorized("invalid tenant_id in claims".to_string()))?;
+
+    // The row is the revocation list. A lookup FAILURE is a 500, not a
+    // 401: a Mongo blip must not tell a healthy fleet its credentials were
+    // revoked, which would turn a database wobble into an enrollment storm.
+    //
+    // `NotFound` is the one exception, and FR-51 is what made it real: a
+    // REAPED ephemeral row is hard-deleted, so "no row" is Mongo's
+    // AUTHORITATIVE answer, not a wobble — pre-FR-51 a gone device always
+    // still had a tombstone and took the 401 below. Mapping NotFound to
+    // 500 would have a reaped-but-still-running device retrying forever
+    // against what reads as server trouble, instead of hearing that its
+    // credential is dead (and the agent's self-unenroll deliberately
+    // treats 401 as "already gone").
+    let agent = fleet
+        .agents
+        .find_in_tenant(tenant_id, agent_id)
+        .await
+        .map_err(|e| match e {
+            roomler_ai_services::dao::base::DaoError::NotFound => {
+                tracing::info!(%agent_id, %tenant_id, "refusing agent-authed request: row gone");
+                ApiError::Unauthorized("no such device".to_string())
+            }
+            other => ApiError::Internal(format!("agent lookup: {other}")),
+        })?;
+
+    if let Some(reason) = refusal_reason(&agent) {
+        tracing::info!(%agent_id, %tenant_id, reason, "refusing agent-authed request");
+        // 401, not 403: the credential itself is no longer accepted, and
+        // that is what the device needs to hear.
+        return Err(ApiError::Unauthorized(reason.to_string()));
+    }
+
+    Ok(AuthAgent {
+        agent_id,
+        tenant_id,
+        agent,
+    })
+}
+
 impl<S> FromRequestParts<S> for AuthAgent
 where
     FleetState: FromRef<S>,
@@ -109,57 +175,7 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state = FleetState::from_ref(state);
-
-        let token = bearer_token(&parts.headers)
-            .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
-
-        // Audience-checked: `verify_agent_token` rejects a user JWT.
-        let claims = app_state
-            .auth
-            .verify_agent_token(token)
-            .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
-
-        let agent_id = ObjectId::parse_str(&claims.sub)
-            .map_err(|_| ApiError::Unauthorized("invalid agent_id in claims".to_string()))?;
-        let tenant_id = ObjectId::parse_str(&claims.tenant_id)
-            .map_err(|_| ApiError::Unauthorized("invalid tenant_id in claims".to_string()))?;
-
-        // The row is the revocation list. A lookup FAILURE is a 500, not a
-        // 401: a Mongo blip must not tell a healthy fleet its credentials were
-        // revoked, which would turn a database wobble into an enrollment storm.
-        //
-        // `NotFound` is the one exception, and FR-51 is what made it real: a
-        // REAPED ephemeral row is hard-deleted, so "no row" is Mongo's
-        // AUTHORITATIVE answer, not a wobble — pre-FR-51 a gone device always
-        // still had a tombstone and took the 401 below. Mapping NotFound to
-        // 500 would have a reaped-but-still-running device retrying forever
-        // against what reads as server trouble, instead of hearing that its
-        // credential is dead (and the agent's self-unenroll deliberately
-        // treats 401 as "already gone").
-        let agent = app_state
-            .agents
-            .find_in_tenant(tenant_id, agent_id)
-            .await
-            .map_err(|e| match e {
-                roomler_ai_services::dao::base::DaoError::NotFound => {
-                    tracing::info!(%agent_id, %tenant_id, "refusing agent-authed request: row gone");
-                    ApiError::Unauthorized("no such device".to_string())
-                }
-                other => ApiError::Internal(format!("agent lookup: {other}")),
-            })?;
-
-        if let Some(reason) = refusal_reason(&agent) {
-            tracing::info!(%agent_id, %tenant_id, reason, "refusing agent-authed request");
-            // 401, not 403: the credential itself is no longer accepted, and
-            // that is what the device needs to hear.
-            return Err(ApiError::Unauthorized(reason.to_string()));
-        }
-
-        Ok(AuthAgent {
-            agent_id,
-            tenant_id,
-            agent,
-        })
+        authenticate(&app_state, &parts.headers).await
     }
 }
 

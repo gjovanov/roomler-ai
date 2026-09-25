@@ -1785,6 +1785,190 @@ impl TunnelClient {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// A device's own view of its org (FR-84 D5a)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `GET /api/agent/self/devices` — what THIS device's overlay netmap already
+// carries, plus itself, for the desktop companion (which reaches only its
+// local daemon, and the daemon holds an AGENT token, never a user's). Shared
+// with the daemon, which proxies it to the companion, so every field is
+// additive: `#[serde(default)]` on the way in, skipped when empty on the way
+// out, and a newer server may add fields an older daemon ignores.
+//
+// ⚠️ Deliberately ABSENT, by shape rather than by policy: `machine_id`, the
+// owner / user ids, the WG public key and its epoch, the consent settings,
+// the codecs. A device sees its peers the way the netmap shows them to it —
+// an admin's label and an address — never the fleet record. Adding one of
+// those here is a security change, not a convenience.
+
+/// One device THIS device may see — itself, or a peer its netmap carries.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VisibleDeviceRow {
+    /// `agent` | `tunnel_client`.
+    #[serde(default)]
+    pub kind: String,
+    /// The agent / tunnel-client id (hex).
+    #[serde(default)]
+    pub id: String,
+    /// The machine-reported (or admin-renamed) technical name.
+    #[serde(default)]
+    pub name: String,
+    /// The admin's friendly label; the grid shows it over `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub os: OsKind,
+    /// agent_version / client_version, unified.
+    #[serde(default)]
+    pub version: String,
+    /// `online` | `stale` | `offline` — the control-plane presence.
+    #[serde(default)]
+    pub presence: String,
+    #[serde(default)]
+    pub is_online: bool,
+    /// RFC 3339.
+    #[serde(default)]
+    pub last_seen_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_node_id: Option<String>,
+    /// The node's MagicDNS label (bare, no domain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_dns_name: Option<String>,
+    /// `<label>.<tenant magic_dns_domain>`, when the tenant has a domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_dns_fqdn: Option<String>,
+    /// Admin labels — the same class of operator-authored label as
+    /// `display_name` (operator decision, FR-84).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The netmap's presence verdict for the peer's overlay node: may this
+    /// device dial it right now? `false` for a device with no overlay node.
+    #[serde(default)]
+    pub reachable: bool,
+    /// FR-51 — enrolled as temporary. Serialised only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
+    /// The caller itself.
+    #[serde(default)]
+    pub is_self: bool,
+}
+
+/// The page `GET /api/agent/self/devices` answers with.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VisibleDevicesPage {
+    #[serde(default)]
+    pub items: Vec<VisibleDeviceRow>,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub page: u64,
+    #[serde(default)]
+    pub per_page: u64,
+    #[serde(default)]
+    pub total_pages: u64,
+    /// Why the list is what it is: `ok` (the netmap shaping applied) ·
+    /// `no_node` (this device has no live overlay node — overlay off) ·
+    /// `no_network` (the org has no overlay network yet) · `unavailable`
+    /// (the server mounts no network module). Every value but `ok` lists
+    /// the caller alone.
+    #[serde(default)]
+    pub overlay: String,
+    /// The tenant's overlay ACL posture the shaping ran under: `off` | `warn`
+    /// | `enforce` (`unknown` when the network module is absent).
+    #[serde(default)]
+    pub acl_mode: String,
+    /// The caller's own overlay node id (hex), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_node_id: Option<String>,
+}
+
+#[cfg(test)]
+mod visible_device_tests {
+    use super::*;
+
+    fn row() -> VisibleDeviceRow {
+        VisibleDeviceRow {
+            kind: "agent".into(),
+            id: "0123456789abcdef01234567".into(),
+            name: "alpha-box".into(),
+            display_name: Some("Alpha".into()),
+            os: OsKind::Linux,
+            version: "0.4.103".into(),
+            presence: "online".into(),
+            is_online: true,
+            last_seen_at: "2026-09-25T00:00:00Z".into(),
+            overlay_ip: Some("100.64.0.7".into()),
+            overlay_node_id: Some("76543210fedcba9876543210".into()),
+            magic_dns_name: Some("alpha-box".into()),
+            magic_dns_fqdn: None,
+            tags: vec!["prod".into()],
+            reachable: true,
+            ephemeral: false,
+            is_self: false,
+        }
+    }
+
+    /// The fleet-record fields a device must never see have no slot on the
+    /// wire: the guarantee is the struct's shape, and this pins it so a
+    /// "helpful" addition fails a test before it reaches a review.
+    #[test]
+    fn a_visible_row_has_no_slot_for_the_fleet_record() {
+        let v = serde_json::to_value(row()).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        for forbidden in [
+            "machine_id",
+            "owner_user_id",
+            "enrolled_by",
+            "overlay_public_key",
+            "wg_public_key",
+            "overlay_key_epoch",
+            "key_epoch",
+            "access_policy",
+            "capabilities",
+            "codecs",
+            "status",
+            "created_at",
+        ] {
+            assert!(!keys.contains(&forbidden), "{forbidden} leaked: {keys:?}");
+        }
+        assert_eq!(v["display_name"], serde_json::json!("Alpha"));
+        assert_eq!(v["reachable"], serde_json::json!(true));
+        // `ephemeral: false` is omitted, like the admin row.
+        assert!(v.get("ephemeral").is_none());
+    }
+
+    /// Additive on the way in: a page from an older server (fewer fields)
+    /// still parses, and a round trip is lossless.
+    #[test]
+    fn page_round_trips_and_tolerates_missing_fields() {
+        let page = VisibleDevicesPage {
+            items: vec![row()],
+            total: 1,
+            page: 1,
+            per_page: 25,
+            total_pages: 1,
+            overlay: "ok".into(),
+            acl_mode: "enforce".into(),
+            self_node_id: Some("76543210fedcba9876543210".into()),
+        };
+        let text = serde_json::to_string(&page).unwrap();
+        let back: VisibleDevicesPage = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, page);
+
+        let older: VisibleDevicesPage = serde_json::from_str(
+            r#"{"items":[{"kind":"agent","id":"x","name":"n","os":"windows"}],"total":1}"#,
+        )
+        .unwrap();
+        assert_eq!(older.items[0].os, OsKind::Windows);
+        assert_eq!(older.items[0].presence, "");
+        assert!(!older.items[0].is_self);
+        assert_eq!(older.overlay, "");
+        assert!(older.self_node_id.is_none());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tunnel policy
 // ────────────────────────────────────────────────────────────────────────────
 //
