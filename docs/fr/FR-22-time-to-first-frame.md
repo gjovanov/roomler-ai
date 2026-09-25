@@ -1,9 +1,11 @@
 # FR-22: Time-to-first-frame — connecting sometimes takes 10–15 s
 
-Status: **parts 1 + 3 + 3b shipped; field-verified 2026-09-25 (prod `0.4.101`) — the healthy
-signalling band shows no slowdown attributable to #821 (AC4 `[~]`) and the stall is localized to the
-negotiating phase on flap-prone control-WS hosts (AC5 `[~]`); both criteria stay open pending
-a persisted-marks trace, so the FR does not close.** Tracking issue: `FR-22` (#819).
+Status: **parts 1 + 3 + 3b shipped; part 4 (persist the marks) BUILT 2026-09-25, awaiting a
+deploy and a field read; field-verified 2026-09-25 (prod `0.4.101`) — the healthy signalling band
+shows no slowdown attributable to #821 (AC4 `[~]`) and the stall is localized to the negotiating
+phase on flap-prone control-WS hosts (AC5 `[~]`); both criteria stay open pending a persisted-marks
+read, and the docs criterion (added retroactively) is unticked until its PR merges, so the FR does
+not close.** Tracking issue: `FR-22` (#819). Reader-facing doc: `docs/remote-control.md` §12.1.
 UX rather than picture quality — but it is the first thing every session is judged on,
 and the quality work is invisible to someone still looking at a blank stage.
 
@@ -99,7 +101,9 @@ here is an anecdote. Feeds FR-16 (#798) L3.
 
 `ui/src/composables/rcConnectTiming.ts` records eight marks — `request_sent`,
 `session_created`, `ready`, `offer_sent`, `answer`, `pc_connected`, `dc_open`,
-`first_frame` — and logs per-STEP deltas.
+`first_frame` — and logs per-STEP deltas. (#824 added three pre-flight marks —
+`ws_ready`, `turn_ready`, `probes_ready` — after a field repro showed the clock
+started at the request while the operator waits from the click; **eleven** in all.)
 
 ⚠️ **Marks are per ATTEMPT, not per connect.** A recorder shared across the ladder would
 let a fast retry overwrite the lost attempt's marks and report an 18 s connect as a 3 s
@@ -161,6 +165,16 @@ leaves a warning with no ending.
       never wired — so no pre-#821 TTFF distribution exists and none can be reconstructed;
       a current self-measurement was blocked by the automation tab being a hidden background
       tab (no `requestAnimationFrame` ⇒ viewer-paint timing invalid, standing rule).
+      **2026-09-25, part 4 built (§ Part 4):** the marks are now persisted per attempt, so a
+      paint-inclusive p50 becomes mineable once a build carrying it is deployed and used from a
+      foreground tab; the fail-first read on the current deploy (`hosted-20260925-3f17571`,
+      19:04 Z) is `agent_logs` browser = **0**, `rc.connect` = **0**. ⚠️ **The "unchanged" half is
+      structurally unmeasurable as written**: a *before* would have to predate #821, and
+      browser timing did not exist before #821 — no build ever recorded it. Part 4 can produce
+      the *current* distribution, never the comparison. What to accept as AC4's paint-inclusive
+      evidence (the signalling-band read on its mechanism argument, a re-worded "sits inside the
+      healthy band" criterion, or striking the paint half) is an **operator decision**, recorded
+      under Open decisions.
 - [~] The stall's ROOT CAUSE is identified from the new instrumentation and recorded here.
       **Phase and leading mechanism identified from recorded audit; a single-attempt
       end-to-end log trace is still owed.** Field-verified 2026-09-25 on prod `0.4.101`
@@ -176,7 +190,36 @@ leaves a warning with no ending.
       phase per-attempt are not persisted at all; (b) the **requesting**-phase stall is
       unquantifiable from records (a request that never reaches a hub leaves no row).
       Closing it needs the marks persisted (wire `/api/log/browser`) or a live catch —
-      proposed as **part 4** below. Remains open; not `[x]`.
+      proposed as **part 4** below. Remains open; not `[x]`. **2026-09-25, part 4 built**: each
+      attempt's marks, outcome, `stalled_at`, `error_code` and `hidden` flag now persist to
+      `agent_logs` within the agent-log window, so the next stall can be traced through both
+      ends (join on the session hex) and the `requesting`-phase class becomes countable (a
+      browser row with no `session_id`). Fail-first on the current deploy: **0** such rows.
+      The pass read — a stall with its phase named, and the agent's log for the same session —
+      is owed after the deploy, from real foreground use.
+- [ ] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+      [`docs/remote-control.md`](../remote-control.md) §12.1 *Time-to-first-frame — the connect
+      timeline*: the eleven marks and who can see each (flowchart), the phase-aware signalling
+      bound, the `agent_offline` fast-fail (sequence diagram), the operator's verdict rules, the
+      persisted per-attempt record with its collection, filter, 7 d retention, the `hidden`
+      validity flag and the mining recipes, and what the 2026-09-25 field read found; `file:line`
+      anchors verified against master; `docs/README.md`'s remote-control row names the section.
+      ⚠️ **Added retroactively (2026-09-25)**: FR-22 opened on 2026-08-28, before the
+      docs-before-close rule (#1401, 2026-09-05), and a close after that date binds it. Marked
+      rather than backdated, so the spec does not claim it always complied. Ticked when the PR
+      carrying the docs has merged, not before.
+
+## Open decisions
+
+- **AC4's paint-inclusive half (operator).** "p50 TTFF unchanged within noise" needs a
+  pre-#821 TTFF distribution, and none can exist: the browser marks *are* #821, and until part 4
+  nothing persisted them. Part 4 yields the current distribution only. Options: (a) accept the
+  server-side signalling-band before/after (§ Field-verification) as AC4's evidence, on the
+  mechanism argument that a client-side timer which never fires on a healthy connect cannot slow
+  one; (b) re-word the paint half to *"the foreground, first-attempt, paint-inclusive p50 sits
+  inside the healthy band the agent-side measurement predicts (≤ ~5 s)"* and tick it from part
+  4's data; (c) strike the paint half. Measuring the number is agent work; deciding which
+  number the criterion means is not.
 
 ## Out of scope
 
@@ -193,6 +236,7 @@ leaves a warning with no ending.
 | 2026-08-28 | — | 3b merged (#822): the verdict reaches the operator through the snackbar. Console-only reporting could not produce a root cause, because the console is closed during the sessions that stall. |
 | 2026-09-25 | prod `0.4.101` | **AC4 field read.** Server-observed signalling band (consent excluded) shows no slowdown attributable to #821, though the aggregate moved: p50 116 → 143 ms, p90 216 → 293 (n 6503/1809). Last 30 d p50 142, last 7 d p50 118 / p99 204 / max 252 (n 49) — no stalls in the recent window at all. AC4 → `[~]`: signalling half met; paint-inclusive TTFF has no recorded baseline (browser marks unpersisted) and could not be self-measured (hidden automation tab). |
 | 2026-09-25 | prod `0.4.101` | **AC5 field read.** The server-visible stall is the **negotiating** band; 34/8312 started sessions ≥ 3 s (0.41 %), ~17 ≥ 8 s, clustered on flap-prone control-WS hosts, consent excluded. Leading mechanism: a half-open agent control WS delaying offer delivery — not the carrier, not consent. AC5 → `[~]`: phase + mechanism localized; single-attempt end-to-end trace and requesting-phase quantification still owed (explanatory logs aged out; marks unpersisted). |
+| 2026-09-25 | `hosted-20260925-3f17571` (current deploy) | **Part 4 built; fail-first read.** Read-only count in prod `agent_logs` at 19:04 Z: **total 220 969 batches, `source: browser` = 0, `lines.target: rc.connect` = 0**; by source `agent` only; oldest row 2026-09-18 (the 7 d TTL, `expireAfterSeconds` 604 800); both pods on `hosted-20260925-3f17571` (started 18:33 Z, 0 restarts). This is the run the change must be shown to change: today no attempt leaves a record. The pass read is owed after the deploy, from foreground use. ⚠️ The build alone ticks nothing. |
 
 ## Field-verification — 2026-09-25 (prod `0.4.101`)
 
@@ -228,7 +272,7 @@ Only three marks have a server record, via `remote_audit` (`event.kind`, 90 d TT
 is **browser-only and unpersisted**:
 
 - ⚠️ **The `/api/log/browser` ingest route exists but is unwired** — no UI uploader ships to
-  it (`crates/modules/fleet/src/agent_log.rs:160`, and the route's own `// punted to rc.59`
+  it (`crates/modules/fleet/src/agent_log.rs:160` as of that read; part 4 rewrites the comment, and the route's own `// punted to rc.59`
   comment), and `agent_logs` holds **0** browser-source rows. So the TTFF number and the
   `stalled waiting for <mark>` verdict live only in the live browser (console + snackbar)
   and are gone the moment the tab closes.
@@ -325,13 +369,59 @@ mechanism observed end-to-end — see the gap below.
    so the requesting-vs-negotiating split the spec describes can only be quantified from the
    browser marks — again, unpersisted.
 
-### Proposed part 4 (not built this run) — persist the connect marks
+### Part 4 — persist the connect marks ✅ BUILT (2026-09-25; awaiting deploy + field read)
 
-Wire the RC viewer to POST each completed/abandoned attempt's marks to the existing
-`/api/log/browser` route, tagged with `session_id`, so a stall's phase (the missing mark) is
-mineable server-side **within the same retention window as the pod/agent logs**. This is the
-one change that lets AC5 close on recorded evidence instead of a rare live catch — the marks
-already exist (`ui/src/composables/rcConnectTiming.ts`); only the uploader is missing. It is
-a UI change whose payoff is a *future* stall, so it is not field-verifiable inside one run and
-is left for the operator to schedule. A live catch is the alternative, but at 0.2 % and zero
-in the last 7 d it needs hundreds of connects and a foreground browser tab.
+The RC viewer now POSTs **one record per finished attempt** to the existing
+`/api/log/browser` route (`crates/modules/fleet/src/agent_log.rs:170`), so a stall's phase — the
+missing mark — is mineable server-side **within the same 7 d window as the agent's own logs**.
+The marks already existed; only the uploader was missing
+(`ui/src/composables/rcConnectTimingUpload.ts`, wired from `logConnectTiming` in
+`useRemoteControl.ts`). Reader-facing detail, the record shape and the mining recipes:
+`docs/remote-control.md` §12.1.5.
+
+What one record carries: the attempt number, `after_drop`, the outcome (`first_frame` ·
+`abandoned` · `closed` · `retried`), `stalled_at` (the first mark never reached), `ttff_ms`,
+every mark reached (absolute ms; an unreached mark is *absent*, never zero), `agent_id`,
+`session_id` **when known**, the `rc:error` code when one ended the attempt, and `hidden`.
+It lands in `agent_logs` as `source: "browser"`, `lines.target: "rc.connect"`.
+
+Decisions worth recording, each of which a cheaper build would have got wrong:
+
+- **`retried` is a new outcome, and it closes a hole the console never had a line for.** An
+  attempt the ladder advanced past for a reason other than a phase bound — a transient
+  `rc:error` it rides (`agent_offline`, `agent_busy`, `agent_on_other_pod`), an ICE failure, dead
+  air before the first frame — had its recorder replaced by the next `beginAttempt()` with no
+  trace. "One record per attempt" was false for exactly the attempts the server *refused*, and a
+  refusal and a silence stop at the same missing mark. The record now carries `error_code`, and
+  `scheduleReconnect` reports the live recorder before it clears the session id.
+- **`hidden` is a validity flag.** Standing rule (2026-09-07): paint timing from a hidden tab is
+  invalid (no `requestAnimationFrame`; the watchdog tears the session down ~30 s in). The
+  recorder starts from the tab's visibility at `beginAttempt` and a `visibilitychange` listener
+  makes the flag sticky for the attempt. **Every paint-inclusive distribution filters
+  `hidden: false` first** — this run's own self-measurement was invalid for exactly this reason.
+- **Best effort, by construction.** A raw `fetch` with `keepalive`, deliberately *not*
+  `api/client.ts` (its 401 path would refresh-then-logout, its 429/5xx paths raise a snackbar);
+  every settlement swallowed; no retry; capped at 12 records/min per page under the 60 req/min
+  per-IP governor. A diagnostic must never become the incident.
+- **Timing metadata only, by shape, not by trust.** Ids must be ObjectId hex or are dropped;
+  `error_code` must match the server's snake_case code vocabulary or is recorded as `other` (the
+  Vitest that asserts "no URL, no token" found the pass-through — the server sends short codes,
+  but the record's promise cannot rest on that); `msg` is the console's mark/delta line. The row
+  is filed under the **page's** org (membership is what let the operator open the page; the
+  route refuses any other), with the device's org alongside when it differs (FR-52).
+- **The exact JSON is locked to parse on the route** (`browser_connect_timing_record_parses`,
+  `agent_log.rs:445`), including the canonical extended-JSON `ts` that `bson::DateTime`
+  accepts — because a 422 is swallowed like every other failure, and a shape drift would look
+  exactly like nobody connecting.
+
+**Fail-first read (2026-09-25 19:04 Z, prod, read-only):** `agent_logs` total 220 969,
+`source: browser` **0**, `rc.connect` **0**; oldest row 2026-09-18 (TTL 604 800 s); pods on
+`hosted-20260925-3f17571`. ⚠️ **Not field-verified**: the payoff is a *future* stall, the
+build carrying this is not deployed, and the automation browser is a hidden tab whose records
+would be `hidden: true` by design. The pass read — records from the operator's own foreground
+use, then one stall traced through both ends by its session hex — is owed after the deploy.
+
+**What it can and cannot give AC4/AC5.** AC5's trace becomes a query instead of a live catch,
+and the `requesting`-phase class (a browser row with no `session_id`) becomes countable. AC4
+gains a *current* paint-inclusive distribution, foreground and first-attempt filtered — but
+never the pre-#821 comparison the criterion's wording asks for (§ Open decisions).
