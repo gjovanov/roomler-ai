@@ -2114,6 +2114,29 @@ mod tests {
         assert!(should_record_supervisor_crash(1));
     }
 
+    /// FR-84 D3 — a worker that exits because a person asked it to restart
+    /// ("Apply now") must come straight back, like an auto-update's exit 0,
+    /// and must not bank a crash. Under the SCM the worker exits 0 for
+    /// exactly that reason; the sentinel (9, `RESTART_REQUESTED_EXIT_CODE`)
+    /// is mapped as well so a worker that emits it — a build that moves the
+    /// SCM flavour onto the sentinel, or a task-flavour binary re-spawned
+    /// under the service — is never put on the crash ladder for a restart it
+    /// was asked for. Written against the literal so it compiles on the
+    /// pre-D3 tree, where it is RED: 9 was an ordinary non-zero exit →
+    /// `Backoff(2 s)` plus a `SupervisorDetected` sidecar.
+    #[test]
+    fn restart_requested_exit_respawns_without_backoff() {
+        assert_eq!(decide_exit_reaction(9, 0), (ExitReaction::Respawn, 0));
+        assert_eq!(
+            decide_exit_reaction(9, 4),
+            (ExitReaction::Respawn, 0),
+            "a requested restart resets the ladder — nothing failed"
+        );
+        assert!(!should_record_supervisor_crash(9));
+        // Guard the guard, as above.
+        assert!(should_record_supervisor_crash(1));
+    }
+
     /// The sentinel is shared with the Linux units, which list it in
     /// `RestartPreventExitStatus` (asserted in `watchdog`'s tests). Nothing
     /// couples the three sites, so pin the value here as well — renumbering
