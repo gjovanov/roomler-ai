@@ -2003,6 +2003,12 @@ impl Hub {
     /// `extauth_mac` (FR-52 P4) is relayed verbatim: the server never holds the
     /// key to check it and must never drop it — the device refuses an external
     /// offer without one.
+    ///
+    /// ⚠️ Only after consent, and only once — see `LiveSession::admit_offer`.
+    /// The agent builds a peer from any offer that reaches it, so this is the
+    /// server's half of the consent gate for the media path; before it, an
+    /// offer sent straight after `rc:session.created` streamed the screen
+    /// while the host's prompt still stood.
     pub fn forward_offer(
         &self,
         session_id: ObjectId,
@@ -2013,9 +2019,9 @@ impl Hub {
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthOffer>,
     ) -> Result<()> {
         let (agent_id, local_relay, rc_overlay, region) = self.with_session(session_id, |s| {
-            // The negotiating reaper stands down once an offer exists — from
-            // here on the ICE layer owns liveness.
-            s.offer_seen = true;
+            // Also what stands the negotiating reaper down: once an offer
+            // exists, the ICE layer owns liveness.
+            s.admit_offer()?;
             Ok((
                 s.agent_id,
                 s.local_relay.clone(),
@@ -4622,6 +4628,122 @@ mod tests {
         assert_eq!(device_end_limit(Role::Agent, EndReason::Error, None), None);
     }
 
+    /// The media path's consent gate. The agent builds a peer from any offer
+    /// that reaches it, so the Hub must not forward one before consent — or
+    /// the controller that owns the session skips the host's prompt by
+    /// offering straight after `rc:session.created` — nor a second one, which
+    /// rebuilt the agent's peer under the default grant.
+    #[tokio::test]
+    async fn an_offer_reaches_the_agent_only_after_consent_and_only_once() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        let owner = ObjectId::new();
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                owner,
+                "Owner".into(),
+                ctl_tx.clone(),
+                Permissions::VIEW,
+                Vec::new(),
+                None,
+                None,
+                None, // chunk_framing
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let owner_ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(owner),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: false,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+        };
+        let offer = || ClientMsg::SdpOffer {
+            session_id: sid,
+            sdp: "v=0".into(),
+            extauth_mac: None,
+            peer_auth: None,
+        };
+        let offers_at_agent = |rx: &mut mpsc::Receiver<ServerMsg>| {
+            let mut n = 0;
+            while let Ok(m) = rx.try_recv() {
+                if matches!(m, ServerMsg::SdpOffer { .. }) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ServerMsg::SessionCreated { .. })
+        ));
+
+        // While the host is still being asked.
+        let early = hub.dispatch(&owner_ctx, offer());
+        assert!(
+            matches!(early, Err(Error::BadPhase(_, "awaiting_consent"))),
+            "an offer before consent must be refused, got {early:?}"
+        );
+        assert_eq!(
+            offers_at_agent(&mut agent_rx),
+            0,
+            "nothing reached the agent"
+        );
+
+        hub.deliver_consent(sid, true, None).unwrap();
+        assert!(matches!(ctl_rx.recv().await, Some(ServerMsg::Ready { .. })));
+        hub.dispatch(&owner_ctx, offer()).unwrap();
+        assert_eq!(
+            offers_at_agent(&mut agent_rx),
+            1,
+            "the one legitimate offer"
+        );
+
+        let again = hub.dispatch(&owner_ctx, offer());
+        assert!(
+            matches!(again, Err(Error::BadPhase(_, "offer_already_forwarded"))),
+            "a second offer must be refused, got {again:?}"
+        );
+        hub.forward_answer(sid, "v=0".into(), None, None, None)
+            .unwrap();
+        let live = hub.dispatch(&owner_ctx, offer());
+        assert!(
+            matches!(live, Err(Error::BadPhase(_, "active"))),
+            "a re-offer on a live session must be refused, got {live:?}"
+        );
+        assert_eq!(offers_at_agent(&mut agent_rx), 0, "and neither reached it");
+        assert!(
+            hub.session_snapshot(sid).is_some(),
+            "a refused offer does not end the session"
+        );
+    }
+
     /// P3 security — `dispatch` refuses session verbs from a connection
     /// that is not a party to the session (any authenticated user who
     /// learned a session id could previously Terminate it or inject
@@ -6230,7 +6352,7 @@ mod tests {
             false,
             false,
         );
-        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session_full(
                 agent_id,
@@ -6263,24 +6385,32 @@ mod tests {
             )
             .unwrap();
 
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
         hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
 
         let mut told = None;
-        let mut turn_urls: Vec<String> = Vec::new();
+        // `None` until the offer is seen: the callers' "no `turn:` URL"
+        // assertions must not be satisfied by an offer that never arrived.
+        let mut turn_urls: Option<Vec<String>> = None;
         while let Ok(msg) = agent_rx.try_recv() {
             match msg {
                 ServerMsg::Request { rc_overlay, .. } => told = Some(rc_overlay),
                 ServerMsg::SdpOffer { ice_servers, .. } => {
-                    turn_urls = ice_servers
-                        .iter()
-                        .flat_map(|s| s.urls.iter().cloned())
-                        .filter(|u| u.starts_with("turn:"))
-                        .collect();
+                    turn_urls = Some(
+                        ice_servers
+                            .iter()
+                            .flat_map(|s| s.urls.iter().cloned())
+                            .filter(|u| u.starts_with("turn:"))
+                            .collect(),
+                    );
                 }
                 _ => {}
             }
         }
-        (told.expect("the agent got its rc:request"), turn_urls)
+        (
+            told.expect("the agent got its rc:request"),
+            turn_urls.expect("the offer reached the agent"),
+        )
     }
 
     /// Loopback-TURN corp-relay (Phase 2): a session that forwarded a local
@@ -6329,6 +6459,23 @@ mod tests {
             turn_urls.is_empty(),
             "a non-overlay relay must be rejected, not forwarded to the agent's TURN client"
         );
+    }
+
+    /// Consent granted, and the controller told so: the one state in which
+    /// the Hub forwards an offer.
+    async fn grant_and_await_ready(
+        hub: &Hub,
+        sid: ObjectId,
+        ctl_rx: &mut mpsc::Receiver<ServerMsg>,
+    ) {
+        hub.deliver_consent(sid, true, None).unwrap();
+        loop {
+            match ctl_rx.recv().await {
+                Some(ServerMsg::Ready { .. }) => return,
+                Some(_) => continue,
+                None => panic!("the controller channel closed before rc:ready"),
+            }
+        }
     }
 
     #[test]
