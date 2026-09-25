@@ -1231,6 +1231,17 @@ fn fmt_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Which audio a recording carries, as a suffix: `""`, `", computer audio"`,
+/// `", microphone"` or `", computer audio + microphone"`.
+fn fmt_audio(system: bool, microphone: bool) -> &'static str {
+    match (system, microphone) {
+        (false, false) => "",
+        (true, false) => ", computer audio",
+        (false, true) => ", microphone",
+        (true, true) => ", computer audio + microphone",
+    }
+}
+
 /// How the last recording ended, in one line (`None` = nothing has ended).
 fn fmt_recording_end(last: &localapi::RecordingEnded) -> String {
     let what = match &last.path {
@@ -1258,6 +1269,8 @@ pub async fn record_start(
     fps: Option<u32>,
     encoder: Option<String>,
     max_minutes: Option<u32>,
+    system_audio: bool,
+    microphone: bool,
     json: bool,
 ) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
@@ -1266,7 +1279,8 @@ pub async fn record_start(
             fps,
             encoder,
             max_minutes,
-            ..Default::default()
+            system_audio,
+            microphone,
         })
         .await
         .map_err(daemon_err)?;
@@ -1276,11 +1290,12 @@ pub async fn record_start(
     }
     println!("recording to {}", st.path.as_deref().unwrap_or(DASH));
     println!(
-        "  {}x{} @ {} fps, {}",
+        "  {}x{} @ {} fps, {}{}",
         st.width,
         st.height,
         st.fps,
-        st.encoder.as_deref().unwrap_or(DASH)
+        st.encoder.as_deref().unwrap_or(DASH),
+        fmt_audio(st.system_audio, st.microphone)
     );
     if let Some(reason) = &st.folder_reason {
         println!("  folder: {reason}");
@@ -1315,11 +1330,12 @@ pub async fn record_status(json: bool) -> Result<()> {
     }
     if st.active {
         println!(
-            "recording — {}, {}, {} frames, {}",
+            "recording — {}, {}, {} frames, {}{}",
             fmt_duration_ms(st.duration_ms),
             human_bytes(st.bytes),
             st.frames,
-            st.encoder.as_deref().unwrap_or(DASH)
+            st.encoder.as_deref().unwrap_or(DASH),
+            fmt_audio(st.system_audio, st.microphone)
         );
         println!("  {}", st.path.as_deref().unwrap_or(DASH));
     } else {
@@ -2276,6 +2292,8 @@ mod tests {
 
     #[test]
     fn recording_lengths_and_endings_read_plainly() {
+        assert_eq!(fmt_audio(false, false), "");
+        assert_eq!(fmt_audio(true, true), ", computer audio + microphone");
         assert_eq!(fmt_duration_ms(0), "0:00");
         assert_eq!(fmt_duration_ms(61_999), "1:01");
         assert_eq!(fmt_duration_ms(3_600_000 + 62_000), "1:01:02");

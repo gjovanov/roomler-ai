@@ -51,6 +51,10 @@
     no_frame: 'no picture came from the screen',
     encoder_unavailable: 'no video encoder could be opened',
     folder_unwritable: 'the folder could not be written',
+    audio_unavailable: 'this device cannot record audio',
+    system_audio_unavailable: 'computer audio could not be opened',
+    mic_unavailable: 'the microphone could not be opened',
+    audio_failed: 'the audio failed, and the rest was recorded without it',
   };
 
   function describeEnding(reason) {
@@ -113,6 +117,15 @@
       show($('rec-live'));
       const parts = [fmtDuration(st.duration_ms), fmtBytes(st.bytes)];
       if (st.encoder) parts.push(st.encoder);
+      if (st.system_audio || st.microphone) {
+        parts.push(
+          st.system_audio && st.microphone
+            ? 'computer audio + microphone'
+            : st.system_audio
+              ? 'computer audio'
+              : 'microphone',
+        );
+      }
       if (st.width && st.height) parts.push(st.width + '×' + st.height + ' @ ' + st.fps + ' fps');
       setText('rec-status', 'Recording — ' + parts.join(', '));
     } else {
@@ -137,6 +150,8 @@
     // The options apply to the NEXT recording; locked while one runs.
     $('rec-fps').disabled = rec || busy || !can;
     $('rec-encoder').disabled = rec || busy || !can;
+    $('rec-system-audio').disabled = rec || busy || !can;
+    $('rec-microphone').disabled = rec || busy || !can;
     const lastEl = $('rec-last');
     if (!rec && st.last) {
       lastEl.textContent = describeLast(st.last);
@@ -316,6 +331,9 @@
       invoke('cmd_record_start', {
         fps: Number($('rec-fps').value) || 30,
         encoder: $('rec-encoder').value || 'auto',
+        // FR-85 P1c — both OFF unless ticked.
+        systemAudio: !!$('rec-system-audio').checked,
+        microphone: !!$('rec-microphone').checked,
       }),
     );
   }

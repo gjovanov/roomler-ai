@@ -57,11 +57,31 @@ pub struct CpalLoopbackCapture {
 // video pump treats its thread-affine encoder handles.
 unsafe impl Send for CpalLoopbackCapture {}
 
+/// Which device a capture opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The live remote-control path: the loopback / monitor source — and on
+    /// Linux, when no monitor exists, the default INPUT, as it always has.
+    LiveLoopback,
+    /// FR-85 recording's "computer audio": the loopback / monitor source
+    /// ONLY. ⚠️ Never the Linux fallback to the default input: that is a
+    /// microphone, which a recording captures only when the person asked
+    /// for the microphone.
+    SystemOnly,
+    /// FR-85 recording's microphone: the default input device.
+    Microphone,
+}
+
 impl CpalLoopbackCapture {
     /// Open the platform loopback source and start the RT→async bridge.
     pub fn open() -> Result<Self> {
+        Self::open_source(Source::LiveLoopback)
+    }
+
+    /// Open `source` and start the RT→async bridge.
+    pub fn open_source(source: Source) -> Result<Self> {
         let host = cpal::default_host();
-        let (device, is_loopback_output) = pick_device(&host)?;
+        let (device, is_loopback_output) = pick_device(&host, source)?;
         let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
 
         // Pick the capture format. On Windows loopback we must use the
@@ -223,7 +243,13 @@ fn push_drop_oldest(tx: &mpsc::Sender<AudioFrame>, frame: AudioFrame) {
 
 /// Select the capture device + whether it is an output device we're
 /// driving as loopback (Windows) vs a genuine input (Linux monitor).
-fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
+fn pick_device(host: &cpal::Host, source: Source) -> Result<(cpal::Device, bool)> {
+    if source == Source::Microphone {
+        let dev = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no microphone: this device has no default audio input"))?;
+        return Ok((dev, false));
+    }
     #[cfg(target_os = "windows")]
     {
         // WASAPI loopback: open the default OUTPUT device as an input.
@@ -259,6 +285,12 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
                     return Ok((dev, false));
                 }
             }
+        }
+        // A recording asked for computer audio, not a microphone.
+        if source == Source::SystemOnly {
+            return Err(anyhow!(
+                "no PulseAudio monitor source for computer audio (set ROOMLERD_AUDIO_SOURCE=<sink>.monitor)"
+            ));
         }
         // 3. Fallback: default input device (a mic, most likely — NOT
         //    desktop audio, but better than a hard failure). Warn loudly.

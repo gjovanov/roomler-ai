@@ -1392,6 +1392,11 @@ pub struct RecordingState {
     pub height: u32,
     #[serde(default)]
     pub fps: u32,
+    /// FR-85 P1c — which audio is going into the active recording.
+    #[serde(default)]
+    pub system_audio: bool,
+    #[serde(default)]
+    pub microphone: bool,
     /// Why the default or configured folder was not used, when it was not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_reason: Option<String>,
