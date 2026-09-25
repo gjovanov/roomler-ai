@@ -623,31 +623,40 @@ const PROBE_HEIGHT: u32 = 270;
 /// cached result.
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
-        .get_or_init(|| {
-            let mut caps = cached_or_probed();
-            // The RPC verbs are config-derived, not driver-probed: compute
-            // them HERE, where the config fallbacks are registered,
-            // whatever the child (or the cache) saw.
-            caps.rpc = rpc_caps();
-            // FR-56 AC10 (review of #1667) — the Remote Apps verbs likewise,
-            // and for a second reason: on a cache MISS `cached_or_probed` is
-            // the caps-probe CHILD's struct wholesale, and the child loads no
-            // config and must not run a privilege-dropped desktop walk. Until
-            // this line, `[virtual_desktop_apps] enabled = false` did not stop
-            // the hello advertising `list` on every release's first boot, or
-            // on any boot of a host with no hardware cell (never cached).
-            caps.apps = apps_caps();
-            // #1672 — the file-DC verbs too, for the same reason: `browse`
-            // follows `enable_remote_browse`, and the child's flag is the
-            // built-in default (`true`). Until this line, a device with
-            // browse disabled advertised it on every caps-cache-miss boot
-            // and the controller drew a Browse affordance that failed when
-            // used. Set once at startup and never live, so a boot-time
-            // snapshot here is exactly as fresh as the flag itself.
-            caps.files = files_caps();
-            caps
-        })
+        .get_or_init(|| with_config_lists(cached_or_probed()))
         .clone()
+}
+
+/// The config-derived lists, assigned by the DAEMON over whatever
+/// `cached_or_probed` answered — the caps-probe child's struct on a miss, the
+/// merged cache on a hit, the driver-free fallback when the child died. All
+/// three arrive here by this one line, and every list is OVERWRITTEN, never
+/// merged: the child loads no config, so anything it carried in these fields
+/// was computed against the built-in defaults.
+///
+/// - `rpc` — config-derived, not driver-probed (`relay_server_enabled` is an
+///   opt-in), so it is computed where the config fallbacks are registered.
+/// - `apps` — FR-56 AC10 (review of #1667): until it moved here,
+///   `[virtual_desktop_apps] enabled = false` did not stop the hello
+///   advertising `list` on every release's first boot, or on any boot of a
+///   host with no hardware cell (never cached). And the child must not run a
+///   privilege-dropped desktop walk.
+/// - `files` — #1672, the same hole: `browse` follows `enable_remote_browse`,
+///   and the child's flag is the built-in default (`true`). Set once at
+///   startup and never live, so a boot-time snapshot here is exactly as fresh
+///   as the flag itself.
+///
+/// A named seam rather than three lines inside the `OnceLock` closure so a
+/// test can lock EACH assignment (`the_daemon_assigns_every_config_list`):
+/// with the lines inline, deleting `caps.files = files_caps()` left every lib
+/// test green while every hello shipped an empty `files` and every browser
+/// fell back to upload-only — `detect()` itself cannot be called from a unit
+/// test without spawning the probe child.
+fn with_config_lists(mut caps: AgentCaps) -> AgentCaps {
+    caps.rpc = rpc_caps();
+    caps.apps = apps_caps();
+    caps.files = files_caps();
+    caps
 }
 
 /// FR-77 P3 — the probe cache in front of the child probe. A hit reuses the
@@ -1991,9 +2000,9 @@ mod tests {
         // rather than disabling it. File transfer is the clearest case, and
         // since #1672 it is not even IN the probe's answer: `detect()` assigns
         // `files` in the daemon after the probe has answered or failed, so no
-        // probe outcome can reach it — locked by
-        // `files_are_assigned_by_the_daemon_never_by_the_probe_child` and
-        // `files_caps_follow_the_config`.
+        // probe outcome can reach it. The "upload survives" assertion that
+        // used to sit here moved to `the_daemon_assigns_every_config_list`,
+        // which runs this same fallback struct through that assignment.
         assert!(caps.max_simultaneous_sessions > 0);
 
         // FR-77 — no hardware cell without a probe, and no probe time either
@@ -2202,6 +2211,60 @@ mod tests {
             on,
             vec!["upload", "download", "download-folder", "resume", "browse"],
             "browse enabled: the same four, plus `browse`"
+        );
+    }
+
+    /// #1672 (review of #1679) — the daemon's side of the split, locked. The
+    /// two `files_*` tests above prove the child carries nothing and the seam
+    /// follows the config; neither proves `detect()` ASSIGNS it. With the
+    /// three assignments inline in the `OnceLock` closure, deleting
+    /// `caps.files = files_caps()` left every lib test green while every hello
+    /// shipped an empty `files` and every browser fell back to upload-only —
+    /// and the same latent gap sat under `apps` (#1667) and `rpc`. `detect()`
+    /// cannot be called here (it spawns the probe child), so its closure is
+    /// the named seam `with_config_lists`, and this drives the exact struct
+    /// the driver-free fallback hands it, with the three lists poisoned so an
+    /// assignment that is skipped shows as `stale` surviving. Also the home of
+    /// the "file transfer survives a probe failure" assertion.
+    ///
+    /// ⚠️ On Linux `apps_caps()` performs the daemon's own read-only session
+    /// discovery (`loginctl`, then `wmctrl -m` per candidate display). The
+    /// assertion on `apps` does not depend on what it finds — `status` is a
+    /// property of the build — which is what makes calling the real seam,
+    /// rather than a copy with the sources injected, the honest choice here.
+    #[test]
+    fn the_daemon_assigns_every_config_list() {
+        let mut base = compute_caps(false, false);
+        base.rpc = vec!["stale".into()];
+        base.apps = vec!["stale".into()];
+        base.files = vec!["stale".into()];
+        let caps = with_config_lists(base);
+
+        assert_eq!(
+            caps.files,
+            files_caps(),
+            "`files` must be the daemon's list, assigned over whatever the probe path carried"
+        );
+        assert!(
+            caps.files.iter().any(|f| f == "upload") && caps.files.iter().any(|f| f == "resume"),
+            "file transfer must survive a probe failure — this IS the fallback struct: {:?}",
+            caps.files
+        );
+        assert_eq!(
+            caps.rpc,
+            rpc_caps(),
+            "`rpc` must be the daemon's list, assigned over whatever the probe path carried"
+        );
+        assert!(
+            !caps.apps.iter().any(|a| a == "stale"),
+            "`apps` must be overwritten by the daemon, never kept from the probe path: {:?}",
+            caps.apps
+        );
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        assert!(
+            caps.apps.iter().any(|a| a == "status"),
+            "a build with a Remote Apps backend advertises `status` whatever the host is doing: {:?}",
+            caps.apps
         );
     }
 

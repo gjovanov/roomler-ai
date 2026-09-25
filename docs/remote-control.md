@@ -1389,7 +1389,8 @@ to-activate, so the browser never sees a bait-and-switch.
   Gated by `AgentCaps.files` — `upload · download ·
   download-folder · resume` always, `browse` only while
   `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in
-  `encode::caps::detect()` (`files_caps`), never by the caps-probe child:
+  `encode::caps::detect()` (`with_config_lists` → `files_caps`), never by the
+  caps-probe child:
   the child loads no config, so a `browse` computed there rode the flag's
   default and a device with browse disabled advertised it on every
   cache-miss boot (#1672 — the same hole [`remote-apps.md`](remote-apps.md)
