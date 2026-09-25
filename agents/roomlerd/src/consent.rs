@@ -22,7 +22,11 @@
 //! ```
 //!
 //! 30 s timeout → auto-deny. Outcome propagates back through the
-//! [`ConsentBroker::request`] future the signaling layer awaits.
+//! [`ConsentBroker::request`] future the signaling layer awaits. A session
+//! that ends while its prompt still stands is withdrawn through
+//! [`ConsentBroker::cancel`] (#1632): the future resolves
+//! [`Decision::Cancelled`], the marker comes down, and nothing goes on the
+//! wire.
 //!
 //! The tray popup (Phase 3) now renders this prompt on attended
 //! sessions: the signaling layer calls [`ConsentBroker::write_pending`]
@@ -41,9 +45,12 @@
 //! types needed.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Default operator-decision timeout when an operator-consent prompt
 /// is required. 30 s matches the planner's spec; deliberately on the
@@ -70,12 +77,22 @@ pub enum Decision {
     /// denial on the wire (the hub's own audit pipeline records this
     /// distinctly from an explicit deny).
     Timeout,
+    /// #1632 — the question was WITHDRAWN before anyone answered it:
+    /// [`ConsentBroker::cancel`] ran because the session the prompt was
+    /// asking about ended (the controller closed its tab, switched device,
+    /// or the server timed the session out first). Not a verdict from the
+    /// person at the machine and not a timeout, so the RC path sends
+    /// **nothing** on the wire for it — the server has already forgotten
+    /// the session, and a `granted:false` would read as "the user denied
+    /// you" for a question nobody was asked to the end.
+    Cancelled,
 }
 
 impl Decision {
-    /// Map to the `granted` boolean on `ClientMsg::Consent`. Both
-    /// `Denied` and `Timeout` produce `false` — the hub's server-side
-    /// audit / heuristic distinguishes them via its own timer.
+    /// Map to the `granted` boolean on `ClientMsg::Consent`. Everything
+    /// but `Granted` produces `false` — the hub's server-side audit /
+    /// heuristic distinguishes `Denied` from `Timeout` via its own timer,
+    /// and `Cancelled` never reaches the wire at all.
     pub fn granted(self) -> bool {
         matches!(self, Decision::Granted)
     }
@@ -268,32 +285,122 @@ struct BrokerInner {
     /// The CLI subcommand creates these with a tiny "now()" payload
     /// that the broker's poll loop discovers.
     sentinel_dir: PathBuf,
-    /// Sessions currently awaiting a decision. Populated when
-    /// [`request`] is called, cleared when the sentinel arrives or
-    /// the timeout fires. A stale entry past timeout would simply
-    /// see its watcher exit naturally — there's no leaked task.
-    pending: Mutex<std::collections::HashSet<String>>,
+    /// Sessions currently awaiting a decision, each with the handle a
+    /// [`ConsentBroker::cancel`] fires. Populated the moment
+    /// [`ConsentBroker::request_with_mode`] is CALLED (before its future is
+    /// first polled — see there for why), cleared by the [`PendingGuard`]
+    /// when the sentinel arrives, the timeout fires, the prompt is
+    /// cancelled, or the future is dropped.
+    pending: Mutex<HashMap<String, Arc<Notify>>>,
+}
+
+impl BrokerInner {
+    fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> PathBuf {
+        self.sentinel_dir
+            .join(format!("{}.{}", session_hex, kind.suffix()))
+    }
 }
 
 /// Clears the `.pending` marker and the in-memory pending entry for one
 /// session on drop, so a prompt whose awaiting future is CANCELLED (the SSH /
 /// RC transport died before a decision) does not leak a phantom the CLI and
 /// tray keep showing. Straight-line cleanup ran only on a normal decision.
-struct PendingGuard<'a> {
-    inner: &'a BrokerInner,
-    session_hex: &'a str,
+///
+/// Owns its broker handle rather than borrowing it, so the prompt future it
+/// rides in is `'static` and can be created on one task and awaited on
+/// another (the RC path arms the prompt on the WS loop and awaits it in a
+/// spawned task).
+struct PendingGuard {
+    inner: Arc<BrokerInner>,
+    session_hex: String,
+    /// The cancel handle THIS prompt registered. The entry is removed only
+    /// while it still holds this exact handle, so a guard cannot evict a
+    /// later prompt that re-used the same session id.
+    cancel: Arc<Notify>,
 }
 
-impl Drop for PendingGuard<'_> {
+impl Drop for PendingGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(
             self.inner
                 .sentinel_dir
                 .join(format!("{}.pending", self.session_hex)),
         );
-        if let Ok(mut pending) = self.inner.pending.lock() {
-            pending.remove(self.session_hex);
+        if let Ok(mut pending) = self.inner.pending.lock()
+            && pending
+                .get(&self.session_hex)
+                .is_some_and(|n| Arc::ptr_eq(n, &self.cancel))
+        {
+            pending.remove(&self.session_hex);
         }
+    }
+}
+
+/// A prompt that is REGISTERED (its session is in the pending set, so a
+/// decision or a cancel can already reach it) but whose poll loop has not
+/// started. Produced synchronously by [`ConsentBroker::request_with_mode`],
+/// consumed by the future it returns.
+struct ArmedPrompt {
+    guard: PendingGuard,
+    timeout: Duration,
+}
+
+impl ArmedPrompt {
+    async fn run(self) -> Decision {
+        let ArmedPrompt { guard, timeout } = self;
+        let inner = &guard.inner;
+        let session_hex = guard.session_hex.as_str();
+        let cancel = &guard.cancel;
+        tracing::info!(
+            session = session_hex,
+            timeout_secs = timeout.as_secs(),
+            sentinel_dir = %inner.sentinel_dir.display(),
+            // RETIRED-NAME-ANCHOR: naming the retired binary is the POINT —
+            // this comment records which spelling was wrong and why.
+            // FR-21 retired `roomler-agent`; this line is the ONLY guidance a
+            // headless operator gets, and naming a binary that no longer
+            // exists makes it worse than silence. Field-caught on mars
+            // 2026-08-29, still printing the old name at 0.4.16.
+            "operator consent required — answer it with `roomlerd consent --session {} --approve|--deny` (`roomlerd consent --list` shows what is outstanding)",
+            session_hex
+        );
+
+        // The stale-sentinel purge happened in `arm()`, BEFORE this session
+        // was registered — a sentinel that exists now is an answer to this
+        // prompt. Purging here again would eat one recorded between arming
+        // and this first poll.
+        let approve = inner.sentinel_path(session_hex, SentinelKind::Approve);
+        let deny = inner.sentinel_path(session_hex, SentinelKind::Deny);
+        let deadline = Instant::now() + timeout;
+        let outcome = loop {
+            if approve.exists() {
+                break Decision::Granted;
+            }
+            if deny.exists() {
+                break Decision::Denied;
+            }
+            if Instant::now() >= deadline {
+                break Decision::Timeout;
+            }
+            // #1632 — a cancel lands within the poll interval, not at its
+            // end: `notify_one` stores a permit when nobody is waiting, so
+            // one fired between two iterations is consumed by the very next
+            // `notified()`, and one fired while the sleep is pending wakes
+            // it at once.
+            tokio::select! {
+                _ = cancel.notified() => break Decision::Cancelled,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        };
+
+        // Clear the decision sentinels so a future re-request of the same id
+        // doesn't see a stale one. The `.pending` marker and the in-memory
+        // entry are the guard's job (above) so they are cleared on cancellation
+        // too.
+        let _ = std::fs::remove_file(&approve);
+        let _ = std::fs::remove_file(&deny);
+        tracing::info!(session = session_hex, ?outcome, "operator consent decision");
+        outcome
     }
 }
 
@@ -333,7 +440,7 @@ impl ConsentBroker {
             inner: Arc::new(BrokerInner {
                 mode,
                 sentinel_dir,
-                pending: Mutex::new(std::collections::HashSet::new()),
+                pending: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -351,9 +458,7 @@ impl ConsentBroker {
     /// Path of the sentinel file for `(session_hex, decision)`.
     /// Public so the CLI subcommand can write to it.
     pub fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> PathBuf {
-        self.inner
-            .sentinel_dir
-            .join(format!("{}.{}", session_hex, kind.suffix()))
+        self.inner.sentinel_path(session_hex, kind)
     }
 
     /// Sentinel directory in use. Public so the CLI can list pending
@@ -377,8 +482,8 @@ impl ConsentBroker {
     /// with the same session id) are cleaned up — operators dropping
     /// stale `.approve` files won't accidentally pre-approve a
     /// future session.
-    pub async fn request(&self, session_hex: &str) -> Decision {
-        self.request_with_mode(session_hex, self.inner.mode).await
+    pub fn request(&self, session_hex: &str) -> impl Future<Output = Decision> + Send + use<> {
+        self.request_with_mode(session_hex, self.inner.mode)
     }
 
     /// Like [`request`], but drives the decision with an explicit per-session
@@ -388,82 +493,107 @@ impl ConsentBroker {
     /// than its local `auto_grant_session`. The sentinel dir + poll loop are
     /// shared state, so a broker built for `AutoGrant` can still prompt on
     /// demand when the server directs a `Prompt`.
-    pub async fn request_with_mode(&self, session_hex: &str, mode: Mode) -> Decision {
+    ///
+    /// #1632 — deliberately NOT an `async fn`: the session is registered as
+    /// pending HERE, synchronously, and only the poll loop lives in the
+    /// returned future. The RC path arms the prompt on the WS read loop and
+    /// awaits it in a spawned task, and the `Terminate` for that session can
+    /// be the very next frame the loop reads — with lazy registration the
+    /// task may not have been polled yet, `cancel()` would find nothing, and
+    /// the prompt would then stand for its full window. Eager registration
+    /// makes "a cancel issued after this call returns always reaches the
+    /// prompt" true without any ordering assumption about the runtime. The
+    /// future owns its broker handle (`use<>` captures no borrow), so it is
+    /// `'static` and spawnable; dropping it unpolled still runs the guard.
+    pub fn request_with_mode(
+        &self,
+        session_hex: &str,
+        mode: Mode,
+    ) -> impl Future<Output = Decision> + Send + use<> {
         // Reject anything that doesn't look like a hex session id.
         // Stops a stray empty-string request from scanning the
         // entire sentinel dir.
-        if session_hex.is_empty() || session_hex.len() > 64 {
+        let armed = if session_hex.is_empty() || session_hex.len() > 64 {
             tracing::warn!(session = session_hex, "consent request with implausible id");
-            return Decision::Denied;
-        }
-        match mode {
-            Mode::AutoGrant => Decision::Granted,
-            Mode::Prompt { timeout } => self.run_prompt(session_hex, timeout).await,
+            Err(Decision::Denied)
+        } else {
+            match mode {
+                Mode::AutoGrant => Err(Decision::Granted),
+                Mode::Prompt { timeout } => Ok(self.arm(session_hex, timeout)),
+            }
+        };
+        async move {
+            match armed {
+                Ok(prompt) => prompt.run().await,
+                Err(immediate) => immediate,
+            }
         }
     }
 
-    async fn run_prompt(&self, session_hex: &str, timeout: Duration) -> Decision {
-        // Stamp this session as pending; safe to clear unconditionally
-        // at exit because run_prompt fully owns its own decision flow.
-        {
-            let mut pending = self.inner.pending.lock().unwrap();
-            pending.insert(session_hex.to_string());
-        }
-        // FR-27 — clear the `.pending` marker and the in-memory entry on EVERY
-        // exit, including the future being DROPPED before a decision. Field
-        // 2026-08-29: an SSH dial from mars whose transport reset mid-prompt
-        // left `<id>.pending` behind, so `roomlerd consent --list` showed a
-        // phantom prompt that outlived its session (and a late `--approve`
-        // logged "no active prompt"). The old cleanup was straight-line code
-        // after the poll loop, so a cancelled `request_with_mode` skipped it.
-        let _guard = PendingGuard {
-            inner: &self.inner,
-            session_hex,
-        };
-        tracing::info!(
-            session = session_hex,
-            timeout_secs = timeout.as_secs(),
-            sentinel_dir = %self.inner.sentinel_dir.display(),
-            // RETIRED-NAME-ANCHOR: naming the retired binary is the POINT —
-            // this comment records which spelling was wrong and why.
-            // FR-21 retired `roomler-agent`; this line is the ONLY guidance a
-            // headless operator gets, and naming a binary that no longer
-            // exists makes it worse than silence. Field-caught on mars
-            // 2026-08-29, still printing the old name at 0.4.16.
-            "operator consent required — answer it with `roomlerd consent --session {} --approve|--deny` (`roomlerd consent --list` shows what is outstanding)",
-            session_hex
-        );
-
-        let approve = self.sentinel_path(session_hex, SentinelKind::Approve);
-        let deny = self.sentinel_path(session_hex, SentinelKind::Deny);
+    /// Stamp `session_hex` as pending and hand back the prompt to run. The
+    /// guard it carries clears the `.pending` marker and the in-memory entry
+    /// on EVERY exit, including the future being DROPPED before a decision.
+    /// Field 2026-08-29: an SSH dial from mars whose transport reset
+    /// mid-prompt left `<id>.pending` behind, so `roomlerd consent --list`
+    /// showed a phantom prompt that outlived its session (and a late
+    /// `--approve` logged "no active prompt"). The old cleanup was
+    /// straight-line code after the poll loop, so a cancelled
+    /// `request_with_mode` skipped it.
+    fn arm(&self, session_hex: &str, timeout: Duration) -> ArmedPrompt {
         // SECURITY (P2b): purge any pre-existing decision sentinel so ONLY a
         // decision that arrives AFTER this prompt starts can resolve it — a
         // sentinel written before the request (stale from a prior run, or a
         // pre-emptive approve) cannot pre-approve this session.
-        let _ = std::fs::remove_file(&approve);
-        let _ = std::fs::remove_file(&deny);
-        let deadline = Instant::now() + timeout;
-        let outcome = loop {
-            if approve.exists() {
-                break Decision::Granted;
-            }
-            if deny.exists() {
-                break Decision::Denied;
-            }
-            if Instant::now() >= deadline {
-                break Decision::Timeout;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        };
+        //
+        // BEFORE the registration below, never at the poll loop's first step
+        // (#1632): `record_decision` honours a decision from the moment the
+        // session is registered, and the loop's first poll can come later
+        // (the RC path arms on the WS loop and polls in a spawned task). A
+        // purge there ate an Approve recorded in between — the person who
+        // clicked watched the prompt time out.
+        let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Approve));
+        let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Deny));
+        let cancel = Arc::new(Notify::new());
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(session_hex.to_string(), cancel.clone());
+        ArmedPrompt {
+            guard: PendingGuard {
+                inner: self.inner.clone(),
+                session_hex: session_hex.to_string(),
+                cancel,
+            },
+            timeout,
+        }
+    }
 
-        // Clear the decision sentinels so a future re-request of the same id
-        // doesn't see a stale one. The `.pending` marker and the in-memory
-        // entry are the guard's job (above) so they are cleared on cancellation
-        // too.
-        let _ = std::fs::remove_file(&approve);
-        let _ = std::fs::remove_file(&deny);
-        tracing::info!(session = session_hex, ?outcome, "operator consent decision");
-        outcome
+    /// #1632 — withdraw the prompt standing for `session_hex`, if one is: its
+    /// future resolves [`Decision::Cancelled`] promptly (inside the poll
+    /// interval, not at the window's end) and its guard clears the `.pending`
+    /// marker the companion and `roomlerd consent --list` read. Returns
+    /// whether a prompt was running. A session that is not being prompted —
+    /// never was, or already resolved — is a no-op that returns `false`, and
+    /// nothing is remembered about it: a later prompt for the same id starts
+    /// clean, with its own handle.
+    ///
+    /// Called from the `ServerMsg::Terminate` path: the session the question
+    /// is about no longer exists, so the person at the machine must not be
+    /// left deciding on it, and no verdict is owed to the server.
+    pub fn cancel(&self, session_hex: &str) -> bool {
+        let handle = self.inner.pending.lock().unwrap().get(session_hex).cloned();
+        match handle {
+            Some(cancel) => {
+                tracing::info!(
+                    session = session_hex,
+                    "consent prompt cancelled — its session ended before an answer arrived"
+                );
+                cancel.notify_one();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drop a sentinel file for the given session. Used by the CLI
@@ -499,7 +629,7 @@ impl ConsentBroker {
     /// hex-validated by the caller (`DaemonState::consent_decide`) before it
     /// reaches this.
     pub fn record_decision(&self, session_hex: &str, allow: bool) -> bool {
-        if !self.inner.pending.lock().unwrap().contains(session_hex) {
+        if !self.inner.pending.lock().unwrap().contains_key(session_hex) {
             tracing::warn!(
                 session = session_hex,
                 "consent decision ignored — no active prompt for this session"
@@ -701,6 +831,7 @@ mod tests {
         assert!(Decision::Granted.granted());
         assert!(!Decision::Denied.granted());
         assert!(!Decision::Timeout.granted());
+        assert!(!Decision::Cancelled.granted());
     }
 
     #[test]
@@ -932,6 +1063,233 @@ mod tests {
         assert!(
             !broker.record_decision(session, true),
             "a cancelled prompt must clear the in-memory pending entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window every #1632 test prompts with: long enough that a broker
+    /// which only ever resolves at its deadline cannot pass by accident.
+    const LONG_WINDOW: Mode = Mode::Prompt {
+        timeout: Duration::from_secs(30),
+    };
+
+    /// How long a cancelled prompt may take to resolve before the test calls
+    /// it "waited for the window". The poll interval is 250 ms; 3 s is an
+    /// order of magnitude of slack for a loaded CI box.
+    const PROMPT_BOUND: Duration = Duration::from_secs(3);
+
+    /// Approve `session` through the LocalAPI path once its prompt is live.
+    async fn approve_once_pending(broker: &ConsentBroker, session: &str) {
+        for _ in 0..100 {
+            if broker.record_decision(session, true) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{session}: the prompt never became pending");
+    }
+
+    /// #1632 — a `Terminate` for a session whose prompt still stands takes
+    /// the prompt down with it: `cancel()` resolves the pending future
+    /// `Cancelled` inside the poll interval. Before this, nothing reached a
+    /// running prompt and the person at the machine was asked to decide on a
+    /// session that no longer existed, until the window elapsed.
+    #[tokio::test]
+    async fn cancel_resolves_a_pending_prompt_promptly() {
+        let dir = fixture_dir("cancel-prompt");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000aaaa";
+
+        let handle = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
+        // Let it enter the poll loop, so this exercises the sleeping branch
+        // of the select (the unpolled case has its own test below).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            broker.cancel(session),
+            "a running prompt reports that it was cancelled"
+        );
+        let decision = tokio::time::timeout(PROMPT_BOUND, handle)
+            .await
+            .expect("the prompt must resolve promptly after cancel, not at its 30 s window")
+            .unwrap();
+        assert_eq!(decision, Decision::Cancelled);
+        // The in-memory entry is gone: a late click finds no active prompt.
+        assert!(
+            !broker.record_decision(session, true),
+            "a cancelled prompt must clear the in-memory pending entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — the race the RC path actually has: the WS loop arms the
+    /// prompt, spawns the task that awaits it, and the very next frame it
+    /// reads is the `Terminate`. The spawned task may not have been polled
+    /// yet. Registration is therefore eager: a cancel issued after
+    /// `request_with_mode` RETURNS reaches the prompt even though its future
+    /// has never been polled.
+    #[tokio::test]
+    async fn a_cancel_before_the_first_poll_still_takes() {
+        let dir = fixture_dir("cancel-unpolled");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000bbbb";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(
+            broker.cancel(session),
+            "the session must be registered before its future is first polled"
+        );
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("a prompt cancelled before its first poll must still resolve promptly");
+        assert_eq!(decision, Decision::Cancelled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — registration is eager, so a decision can be recorded between
+    /// `request_with_mode` returning and its future's first poll. That
+    /// decision must be honoured: the stale-sentinel purge runs at arm time,
+    /// BEFORE the session is registered, never at the first poll (which ate
+    /// exactly this Approve while this fix was being written).
+    #[tokio::test]
+    async fn a_decision_recorded_before_the_first_poll_is_honoured() {
+        let dir = fixture_dir("armed-then-approved");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000a5a5";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(
+            broker.record_decision(session, true),
+            "the session is pending from the moment request_with_mode returns"
+        );
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("an approve recorded before the first poll must resolve the prompt");
+        assert_eq!(decision, Decision::Granted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — a cancel for a session nobody is prompting for is a no-op:
+    /// `false`, and nothing remembered — a prompt for that very id raised
+    /// afterwards runs to its own answer instead of inheriting the cancel.
+    #[tokio::test]
+    async fn cancel_of_an_unknown_session_is_a_no_op() {
+        let dir = fixture_dir("cancel-unknown");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000cccc";
+
+        assert!(!broker.cancel(session), "never prompted");
+        assert!(!broker.cancel(""), "not even an id");
+
+        let handle = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
+        approve_once_pending(&broker, session).await;
+        assert_eq!(
+            handle.await.unwrap(),
+            Decision::Granted,
+            "a cancel that found nothing must not be remembered against a later prompt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — a cancel that arrives AFTER the prompt resolved is inert: it
+    /// reports `false`, and neither a prompt for another session nor a
+    /// re-prompt of the same id sees it.
+    #[tokio::test]
+    async fn a_cancel_after_the_prompt_resolved_does_not_touch_the_next_prompt() {
+        let dir = fixture_dir("cancel-late");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let a = "16320000000000000000dddd";
+        let b = "16320000000000000000eeee";
+
+        let first = tokio::spawn(broker.request_with_mode(a, LONG_WINDOW));
+        approve_once_pending(&broker, a).await;
+        assert_eq!(first.await.unwrap(), Decision::Granted);
+
+        assert!(!broker.cancel(a), "the prompt is over; nothing to cancel");
+
+        for session in [b, a] {
+            let handle = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
+            approve_once_pending(&broker, session).await;
+            assert_eq!(
+                handle.await.unwrap(),
+                Decision::Granted,
+                "{session}: a late cancel must not bleed into the next prompt"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — the sharper form of the above: a cancel that DID reach a prompt
+    /// stores a permit on that prompt's handle. When the prompt then goes away
+    /// (here: dropped unpolled, the same path a dead transport takes) and the
+    /// SAME session id is prompted again, the new prompt must not consume the
+    /// old permit — each prompt registers its own handle.
+    #[tokio::test]
+    async fn a_stale_cancel_permit_does_not_leak_into_a_re_prompt() {
+        let dir = fixture_dir("cancel-stale-permit");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000ffff";
+
+        let doomed = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.cancel(session), "the permit is now stored");
+        drop(doomed); // the guard runs: entry + marker gone
+
+        let again = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
+        approve_once_pending(&broker, session).await;
+        assert_eq!(
+            again.await.unwrap(),
+            Decision::Granted,
+            "the re-prompt must answer on its own handle, not the cancelled one's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 — the marker the companion (and `roomlerd consent --list`) reads
+    /// is removed on cancel, so the companion's 750 ms poll finds nothing
+    /// pending and takes its own panel down (roomler-desktop
+    /// `consent_watch_loop`). The native panel is the caller's to hide.
+    #[tokio::test]
+    async fn cancel_removes_the_pending_marker() {
+        let dir = fixture_dir("cancel-marker");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "16320000000000000000abcd";
+        broker
+            .write_prompt(
+                session,
+                &PendingPrompt {
+                    kind: PromptKind::RemoteControl,
+                    asked_by: "tester",
+                    permissions: "view|control".into(),
+                    detail: String::new(),
+                    org: String::new(),
+                    timeout: Duration::from_secs(30),
+                    surface: PromptSurface::Companion,
+                },
+            )
+            .unwrap();
+        let marker = broker.pending_path(session);
+        assert!(marker.exists(), "precondition: the marker was written");
+
+        let handle = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(marker.exists(), "the marker stands while the prompt does");
+        assert!(broker.cancel(session));
+        assert_eq!(
+            tokio::time::timeout(PROMPT_BOUND, handle)
+                .await
+                .expect("resolves promptly")
+                .unwrap(),
+            Decision::Cancelled
+        );
+        assert!(
+            !marker.exists(),
+            "the .pending marker must be gone once the prompt is cancelled"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
