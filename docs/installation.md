@@ -348,12 +348,18 @@ The rules that matter (`agents/roomlerd/src/companion/launch_once.rs`, `decide`)
   stays quit across daemon restarts.
 - ⚠️ **An upgrade is not an install.** `last_known_good_version` is unset until a
   daemon has run healthily for five minutes, so a host upgrading into D6 is
-  *adopted* (marker written, nothing opened). Its person meets the tour at their
-  next login instead.
+  *adopted* (marker written, nothing opened by the launcher). Its people meet the
+  tour the next time their companion starts — at login, or straight after the
+  update where the service's version refresh restarts a running companion.
 - **Nobody signed in** (an RMM install, a headless box): no marker; the login start
   covers the first person to sign in.
 - **Pre-enrollment starts wait**: the wizard's MSI starts the service before it
   enrolls and places the companion, so the launcher re-checks for ten minutes.
+  The wizard also starts a **per-user** daemon right away now (its Scheduled
+  Task used to wait for the next logon), as `install.ps1` always has.
+- The marker records what happened (`launched`, `adopted`, `already_running`),
+  and the daemon log says it: `companion launch-once …`. The companion logs its
+  own `startup … action=Show("welcome")` in its `desktop.log`.
 
 **Opting out.** A person: the companion's **Start at login** toggle (Settings, or
 the tour) — per-user Windows deletes the `HKCU` value; per-machine Windows records
@@ -363,6 +369,10 @@ the choice and an `--autostart` launch exits at once; Linux writes
 **`companion_autostart = false`** (Settings → Device configuration, or `roomler
 config set companion_autostart false`) — no post-install launch, the Windows Run
 value removed at the next service start, and any `--autostart` launch leaves.
+⚠️ The machine-wide Run value starts a companion in **every** interactive session,
+RDP ones included: on a multi-user server, this switch is the one to turn off.
+The consent prompt does not depend on it — a prompt still starts the companion
+when one is needed (FR-27).
 
 ## Keeping it updated
 
