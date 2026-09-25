@@ -54,7 +54,7 @@ flowchart TB
         RCM["relay-cost-metering.md"]
     end
 
-    REF["api.md · permissions.md · data-model.md · testing.md"]
+    REF["api.md · permissions.md · data-model.md · testing.md · vmtest.md"]
 
     UC --> rd & net & collab
     ATA --> rd & net
@@ -131,6 +131,7 @@ same accounts and server.*
 | [multi-pod-scale-out.md](multi-pod-scale-out.md) | The settled multi-pod architecture: identity, tenant-affinity routing, mediasoup scale ladder |
 | [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md) | Operator checklist: verifying Windows SystemContext (pre-logon control) on a field host |
 | [testing.md](testing.md) | Test suites and harnesses: integration, unit, E2E, capture smoke, k8s E2E lane, the vmtest install matrix, and the [overlay stress lane](testing.md#the-overlay-stress-lane-fr-81) (FR-81 — latency distributions, SSH, transfer and carrier stability against the real fleet) |
+| [vmtest.md](vmtest.md) | The throwaway-OS install & verify matrix (FR-61): fresh Win11 / Ubuntu-Wayland / ARM / macOS VMs installing from the real served scripts and release assets, enrolling ephemeral against prod, proving remote desktop + overlay + `roomler-desktop`, then destroying the VM — the per-cell checks, the design rules, the regression-issue lifecycle (isolated re-run, one issue per condition, close on green) and the traps |
 | [business-model.md](business-model.md) | How the project earns: the three revenue mechanisms, what actually costs money (and what deliberately does not), the tier ladder and the measure-then-price sequence |
 | [relay-cost-metering.md](relay-cost-metering.md) | Attributing relay cost to the tenant that caused it (FR-20): the bill-only-what-we-measured rule and the provenance split it rests on, the idempotent `stats_usage` ledger, the three collection points (and why coturn attribution is deliberately not built), why the tenant surface shows units rather than money, and why "relayed fraction" counts connections and not bytes |
 | [newsletter.md](newsletter.md) | The subscriber list and the sending program (FR-39/FR-58): public subscribe/confirm/unsubscribe + RFC-8058 one-click, the platform-admin issue pipeline (claim-first ledger, preview = the sent bytes), and the ops prerequisites for a real campaign |
