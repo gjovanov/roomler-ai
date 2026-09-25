@@ -354,6 +354,17 @@ pub fn build_router(state: AppState) -> Router {
         Router::new().route("/", get(routes::device::list_devices)),
     );
 
+    // FR-84 D5a — a device's OWN view of its org, agent-token authenticated:
+    // the devices its overlay netmap already carries (plus itself) and the
+    // mesh graph over the same set, for the desktop companion. The same
+    // composition (fleet required, network optional) and the same owner as
+    // the listing above. Plain routes rather than a nest: the fleet module
+    // already serves `/agent/self/unenroll` under its own `/agent` nest.
+    #[cfg(feature = "fleet")]
+    let api = api
+        .route("/agent/self/devices", get(routes::agent_self::devices))
+        .route("/agent/self/mesh", get(routes::agent_self::mesh));
+
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
     // startup probes — must NOT flap on dependency blips or k8s restarts the
     // pod during a Redis outage); `/health/ready` checks the dependencies
