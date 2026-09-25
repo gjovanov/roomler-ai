@@ -655,26 +655,17 @@ async fn place_desktop_companion(
     }
 }
 
-/// FR-84 D6 — `schtasks /Run /TN Roomler`, best-effort: the per-user daemon
-/// starts now instead of at the next logon. The task name is the one
-/// `roomlerd service install` registers (and `install.ps1` runs).
+/// FR-84 D6 — start the per-user daemon now instead of at the next logon,
+/// best-effort, through the same `roomlerd service start` FR-84 D3's Apply
+/// now uses (the Scheduled Task, legacy name included).
 #[cfg(target_os = "windows")]
 fn start_user_task() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    match std::process::Command::new("schtasks")
-        .args(["/Run", "/TN", "Roomler"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
-        Ok(out) if out.status.success() => tracing::info!("started the per-user Roomler task"),
-        Ok(out) => tracing::warn!(
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+    match roomlerd::service::start() {
+        Ok(()) => tracing::info!("started the per-user Roomler task"),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
             "could not start the per-user Roomler task; it starts at the next logon"
         ),
-        Err(e) => {
-            tracing::warn!(error = %e, "could not run schtasks; the daemon starts at the next logon")
-        }
     }
 }
 
