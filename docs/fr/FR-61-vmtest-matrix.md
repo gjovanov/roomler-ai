@@ -184,8 +184,15 @@ COW-clone golden image → boot → SSH in
 - [x] AC8 — teardown leaves the org at baseline (graceful self-unenroll + reaper backstop
   observed; `count ≤ baseline` accepts the reaper cleaning older leftovers); k8s untouched
   (`kubectl get nodes` + prod `/health` green across every run).
-- [ ] AC9 — the regression-issue mechanism (isolated re-run + `gh issue create`) is coded; not
-  yet observed firing (no green-then-red regression occurred).
+- [x] AC9 — the regression-issue mechanism files **one issue per condition**
+  (`lane/method/type#check`), only after an **isolated re-run** confirms the failure; a repeat
+  comments on the open issue; the first green run closes it — and drains the legacy per-run
+  issues once every condition they list is green. Field-verified 2026-09-25 on
+  `ubuntu/script/system@zeus` with an induced enroll refusal, fail-first: master filed #1618
+  and, eight minutes later, its duplicate #1620 (one per run, no re-run, nothing closing
+  either); the fix (`roomler-ai-deploy` #12) filed **#1623** once (run A, after the re-run),
+  commented on it (run B), and the green run C retired #1623, #1620 and #1618 with a comment
+  naming the run. Runs and rows in the field log.
 - [~] AC10 — fail-first evidence per cell class (P7), each shown failing before its fix or
   expectation, with the run id and the issue the mechanism filed (the table in the field log,
   2026-09-25). **Met** for perMachine SystemContext (`win11/script/system` — three PowerShell
@@ -203,7 +210,7 @@ COW-clone golden image → boot → SSH in
   --type`, `--keep`); the `vmtest` skill documents it.
 - [x] AC12 — docs: [`docs/vmtest.md`](../vmtest.md) in the house style (mermaid, tables,
   callouts, `file:line` anchors), a row in `docs/README.md`'s index, and `testing.md` pointing
-  at it. Landed with the 2026-09-25 spec PR (ap1199-pr).
+  at it. Landed with the 2026-09-25 spec PR, #1648.
 
 ## Open decisions
 
@@ -321,9 +328,9 @@ orchestrator checkout:
 |---|---|---|---|
 | `20260925-110253` | master (`623fe58`) | `FAIL pass=4 fail=5 na=1` — enroll rc=1, overlay + wayland "no verdict", bare cell | **#1618** created at once, no re-run |
 | `20260925-111117` | master | same | **#1620** created — a duplicate of #1618 eight minutes later; one issue per run, nothing closes either |
-| ap1199-runA | PR #12 | ap1199-runA-result | ap1199-runA-action |
-| ap1199-runB | PR #12 | ap1199-runB-result | ap1199-runB-action |
-| ap1199-runC | PR #12, valid key | ap1199-runC-result | ap1199-runC-action |
+| `20260925-111956` (A) | PR #12 (`e5b744d`) | main `FAIL pass=4 fail=2 na=3`: enroll rc=1, overlay + wayland **NA "not reached"**, no bare row; isolated re-run (11:28→11:36) identical ⇒ `unexpected='…#enroll' flaky=''` | **#1623** `vmtest: unexpected failure in ubuntu/script/system#enroll` created — ONE issue for one root cause; #1618/#1620 left open ("RED in this run") |
+| `20260925-113642` (B) | PR #12 | identical to A (main + isolated re-run) | a **comment** on #1623, no new issue; open vmtest issues still exactly three (#1618, #1620, #1623) |
+| `20260925-115327` (C) | PR #12, valid key | `PASS pass=8 fail=0 na=0` — enroll, overlay (`self=100.65.20.1`, anchor 2 ms), wayland, **RD** (frames decoded, advancing), desktop (5 views); org back at baseline 1; no VM left on zeus | close-on-green retired **#1623**, then **#1620 and #1618** (every condition each lists went green), each with a comment naming the run; zero open `vmtest:` issues afterwards |
 
 Dry `triage` runs before the field test (copied run dirs, `VMTEST_FILE_ISSUES=0`): the
 2026-09-02 ARM failure run → six "would create" (its archived rows still carry the cascade
