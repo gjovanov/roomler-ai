@@ -1120,10 +1120,34 @@ pub struct ConfigEntry {
     /// Editor hint: `bool` | `tribool` (unset/on/off) | `string` |
     /// `enum:<a|b|c>` | `list` (comma-separated) | `json`.
     pub kind: String,
-    /// The change only takes effect after a daemon restart.
+    /// The change only takes effect after a daemon restart. `false` = the
+    /// daemon puts the new value into force at once (FR-84 D2: the surface
+    /// says so per key instead of a client keeping its own list).
     pub restart_required: bool,
     /// One-line operator help.
     pub description: String,
+    /// FR-84 D2 — the Settings group this key belongs to, as a stable wire
+    /// id (`access` | `network` | `network_carriers` | `network_routing` |
+    /// `tunnels` | `ssh` | `remote_desktop` | `capture_input` |
+    /// `video_encoding` | `video_rate` | `files` | `device`). Empty from a
+    /// daemon older than D2 — the client's cue to render the flat list.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Human label for `group` (e.g. `Private network`), so a client never
+    /// needs its own id → label table.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_label: String,
+    /// `essential` | `standard` | `advanced`. Essentials are the handful a
+    /// person is expected to touch; the rest start collapsed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tier: String,
+    /// The built-in default, rendered exactly as `value` would be for a
+    /// config that never set this key. `None` = the key is unset by
+    /// default (the `tribool` / optional-number keys), which is also what
+    /// an older daemon sends — so "modified" is `value != default` only
+    /// once `group` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -3002,7 +3026,14 @@ mod tests {
             kind: "tribool".into(),
             restart_required: true,
             description: "d".into(),
+            group: String::new(),
+            group_label: String::new(),
+            tier: String::new(),
+            default: None,
         };
+        // The pre-D2 shape: the four FR-84 D2 fields are omitted while
+        // empty, so an entry a D2 daemon has not classified is byte-for-byte
+        // what it always was.
         assert_eq!(
             serde_json::to_string(&Response::ConfigUpdated {
                 entry: entry.clone()
@@ -3026,6 +3057,60 @@ mod tests {
             handle(&Request::ConfigGet, &s),
             Response::Error { .. }
         ));
+    }
+
+    /// FR-84 D2 — the Settings metadata on a `ConfigEntry` is ADDITIVE in
+    /// both directions: an entry a pre-D2 daemon sends (no `group`,
+    /// `group_label`, `tier`, `default`) still parses, with the fields empty
+    /// — which is exactly the cue the desktop uses to fall back to the flat
+    /// list — and a classified entry round-trips with every field intact.
+    #[test]
+    fn config_entry_settings_metadata_is_additive() {
+        // An OLD daemon's entry, exactly as it was serialised before D2.
+        let old: ConfigEntry = serde_json::from_str(
+            r#"{"key":"overlay_quic","kind":"tribool","restart_required":true,"description":"d"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.group, "");
+        assert_eq!(old.group_label, "");
+        assert_eq!(old.tier, "");
+        assert_eq!(old.default, None);
+        assert!(old.restart_required);
+
+        // A NEW daemon's entry: every field survives a round-trip, and the
+        // wire spellings of the metadata are plain strings a client can
+        // switch on without a table of its own.
+        let full = ConfigEntry {
+            key: "exec_enabled".into(),
+            value: Some("false".into()),
+            kind: "bool".into(),
+            restart_required: false,
+            description: "d".into(),
+            group: "access".into(),
+            group_label: "Access & consent".into(),
+            tier: "essential".into(),
+            default: Some("false".into()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            json,
+            r#"{"key":"exec_enabled","value":"false","kind":"bool","restart_required":false,"description":"d","group":"access","group_label":"Access & consent","tier":"essential","default":"false"}"#
+        );
+        let back: ConfigEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, full);
+
+        // A classified key whose built-in default is UNSET (a tribool) omits
+        // `default` rather than sending `null`, so "unset by default" and
+        // "an old daemon" look the same on that one field — `group` is the
+        // discriminator, never `default`.
+        let unset = ConfigEntry {
+            default: None,
+            group: "network_carriers".into(),
+            ..full.clone()
+        };
+        let json = serde_json::to_string(&unset).unwrap();
+        assert!(!json.contains("\"default\""), "{json}");
+        assert!(json.contains("\"group\":\"network_carriers\""), "{json}");
     }
 
     #[tokio::test]
