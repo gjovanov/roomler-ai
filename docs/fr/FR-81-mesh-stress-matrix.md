@@ -110,6 +110,14 @@ is minutes not hours.
       relay arm. Same VM image, same target, one config key.*
 - [x] **AC8** the whole sweep runs from one command and is documented in a skill.
       *`vmtest.sh run --lane stress --host zeus`; the `meshstress` skill carries eleven traps.*
+- [ ] **AC9** docs in the house style, linked from `docs/README.md` (the docs-before-close rule,
+      #1401): the stress lane in `docs/testing.md`'s "CI & special lanes" — the matrix, the two
+      arms and the one config key that forces relay (AC7), what each measurement means and why
+      none asserts which carrier won (AC2), and round 2's two product fixes (#1559, #1565).
+      AC8's `meshstress` skill does not satisfy this: it is gitignored, so nothing public
+      documents the lane (nor the vmtest harness under it — that one is FR-61's to write).
+      ⚠️ No fleet addresses in the doc: they are WHY the skill is gitignored, and they belong
+      in the private docs repo.
 ## Out of scope
 
 Tuning anything. This measures; it does not fix. Also: no carrier pinning on any host but the
