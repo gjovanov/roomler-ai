@@ -211,8 +211,11 @@ the server proxies the downloads and gets a cache-bust ping
 |---|---|---|
 | `release-agent.yml` | `agent-v*` | Windows MSIs (perUser + perMachine) + `roomler-desktop` companion; Linux `.deb`/tarball (x86_64 **and** aarch64); macOS `.pkg` (arm64) |
 | `release-tunnel.yml` | `tunnel-v*` | `roomler` CLI: Windows zip, Linux tarball + `.deb`, macOS universal tarball |
-| `release-setup.yml` | `setup-v*` | The install wizard: Linux/macOS tarballs, signed Windows EXE zip |
+| `release-setup.yml` | `setup-v*` — cut **automatically at every `agent-v*` commit** by `release-agent.yml`'s `dispatch-setup-release` job (FR-84 S1; repo variable `SETUP_LOCKSTEP=false` disables it) | The install wizard: Linux/macOS tarballs, signed Windows EXE zip — all three or none |
 
 All assets carry `.sha256`, GPG `.asc`, and SLSA provenance; releases are
 published non-prerelease so `/releases/latest` stays resolvable for the fleet's
-auto-updaters.
+auto-updaters. `/api/setup/{windows,linux,macos}` serve the newest `setup-v*`,
+so the wizard a new install downloads is only as current as the last lockstep
+roll — verify one with `gh release view setup-v<V> --json assets,targetCommitish`
+(the recipe, and the re-run after a failure, are in the `ship-it` skill §6).
