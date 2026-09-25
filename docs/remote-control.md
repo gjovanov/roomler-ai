@@ -601,6 +601,39 @@ something. The floor defeats `auto` only; `email`/`push` do not auto-grant, so a
 device that merely refuses to auto-grant has no standing to force a second
 prompt onto the host.
 
+How one session's consent is resolved, end to end — the server picks a
+directive, the device takes the stricter of that and its own setting, and the
+reason for a "no" survives to the controller:
+
+```mermaid
+flowchart LR
+  subgraph server["server — hub"]
+    A["resolve_session_authz<br/>owner → auto (unless prompt_owner)<br/>else the device policy"] --> D["rc:request<br/>consent_mode + windows"]
+  end
+  subgraph device["device — roomlerd"]
+    L["auto_grant_session<br/>(config.toml — never remote)"] --> S
+    D --> S{"strictest_of(directive, local)"}
+    S -- "auto, local true" --> G["grant, ~1 ms"]
+    S -- "auto, local false → Prompt over the server's window" --> P
+    S -- "prompt" --> P["prompt surface chain<br/>native → companion → CLI → none"]
+    P -- "Approve" --> G
+    P -- "Deny" --> N["granted=false"]
+    P -- "window expires, a surface existed" --> T["granted=false, reason=timeout"]
+    P -- "window expires, no surface" --> X["granted=false, reason=no_prompt_surface"]
+  end
+  G --> H1["session runs"]
+  N --> H2["UserDenied"]
+  T --> H3["ConsentTimeout"]
+  X --> H4["NoPromptSurface"]
+```
+
+Field-verified 2026-09-25 on the WSL node (agent 0.4.102, API 0.4.101): with
+`auto_grant_session = false`, the owner's own session — a server `auto` — ran as
+a prompt for the full 300 s server window, found no surface and ended
+`NoPromptSurface`, the controller told that nobody could be asked; with the
+setting at its default the same request auto-granted in 1.5 ms. The run, both
+halves, is in `docs/fr/FR-27-consent-surfaces-and-desktop-companion.md`'s log.
+
 ⚠️ **This surprises operators** (field, 2026-08-30): a device whose *server*
 policy reads `consent_mode = auto` — including one you own — can still prompt on
 every session, and nothing server-side fixes it. The reason is that
