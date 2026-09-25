@@ -601,6 +601,26 @@ function scan() {
       );
     }
 
+    // A worker parks its card at `pr_open` with its PR in `run.pr` and `started_at` still
+    // set, and the reviewer merges later, when no worker is left to update the card. That
+    // was the one-way door again, on the worker side: on 2026-09-25 five cards (FR-22, 27,
+    // 45, 61, 79) sat in "PR open" citing MERGED PRs. `started_at` also exempts a card from
+    // `place()`, so they could never re-derive. Once the worker's PR is merged or closed,
+    // the run is over: clear the claim and let the column derive like any other card's.
+    // ⚠️ `run.pr` is not always a number. FR-45's worker recorded the full URL.
+    const workerPr = Number(String(card.run.pr ?? '').match(/(\d+)\s*$/)?.[1] || 0);
+    if (workerPr && card.run.started_at) {
+      let state = null;
+      try {
+        state = gh(['pr', 'view', String(workerPr), '--repo', 'gjovanov/roomler-ai', '--json', 'state', '-q', '.state']).trim();
+      } catch { /* unreadable: leave the claim alone rather than guess */ }
+      if (state === 'MERGED' || state === 'CLOSED') {
+        card.run.notes.push(`worker PR #${workerPr} ${state.toLowerCase()}: run ended, column re-derived`);
+        card.run.started_at = null;
+        if (card.column === 'pr_open' || card.column === 'in_progress') card.column = 'admitted';
+      }
+    }
+
     // Trace, never take over. A card with work in flight is reported and left alone.
     // ⚠️ Both directions. This only ever moved a card IN, so "In progress" was a one-way
     // door: when the traced work ended (its PR merged, its branch went stale), the card
