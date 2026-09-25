@@ -244,7 +244,56 @@ sequenceDiagram
 
 ## 7. Apply now — restarting the service from the companion
 
-*Placeholder — FR-84 D3.*
+Most settings are read once at startup, so saving one is not the same as applying it. The
+Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
+`roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
+(`crates/localapi/src/lib.rs:1209`), and **the daemon decides**.
+
+It restarts only when it can prove that something will start it again — exiting an
+unsupervised `roomlerd run` would take the device offline for good:
+
+| How the daemon runs | How it knows (`agents/roomlerd/src/supervision.rs:193`) | Leaves with | Who starts it again |
+|---|---|---|---|
+| Windows service (SCM host) | the host passes `run --supervisor scm` | `0` — the host respawns 0 at once | the service host |
+| Windows Scheduled Task (per-user) | the task passes `run --supervisor task` | `9` | **the caller**: the task's `IgnoreNew` policy drops a start while the old process is still exiting, so the companion / CLI runs `roomlerd service start` every 3 s until a new process answers |
+| systemd | `INVOCATION_ID` **and** `/proc/self/cgroup` puts the process inside one of our units, **and** `systemctl show` says this process is the unit's main PID and its restart policy restarts exit `9` | `9` | systemd |
+| launchd | `XPC_SERVICE_NAME` starts with `com.roomler.` | `9` — `KeepAlive{SuccessfulExit:false}` relaunches only a non-zero exit | launchd |
+| the macOS supervisor (FR-43) | the worker's `--supervised` flag | `9` | the supervisor |
+| anything else | — | **refused** | — |
+
+`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:172`); it is outside
+systemd's `RestartPreventExitStatus=7 8`, and the SCM host maps it to *respawn* as well.
+
+```mermaid
+sequenceDiagram
+    participant C as companion / roomler restart
+    participant D as roomlerd (old process)
+    participant S as supervisor
+    participant N as roomlerd (new process)
+    C->>D: RestartDaemon {reason}
+    D->>D: decide: supervised? enabled? recording? < 30 s since the last?
+    D-->>C: DaemonRestarting {supervisor, restart_by, exit_code, pid, started_at_ms}
+    Note over D: shutdown starts only after the answer is written
+    D->>D: the auto-updater's graceful path (clean shutdown recorded, exit routes purged)
+    D->>S: exit(code)
+    S->>N: start
+    C->>N: Status until a DIFFERENT pid + start time answers
+```
+
+- **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
+  uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
+  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1480`).
+- **Refusals are named and shown verbatim:** no supervisor it can prove,
+  `local_restart_enabled = false` (read on every request, so turning it off applies to the
+  very next one), a screen recording in progress (FR-85), a previous restart less than 30 s
+  ago (`RESTART_MIN_INTERVAL`, persisted next to the config, so it also bounds a loop across
+  processes), and on the macOS supervisor a worker younger than 30 s.
+- **"Back" means a new process.** The companion waits for a different pid **and** start time
+  (`cmd_restart_wait`, `src/commands.rs:943`) — the leaving process keeps answering for a
+  moment, and Windows can hand the relaunched daemon the old pid.
+- ⚠️ **This is local only.** Remote configuration never restarts a daemon: a server push is
+  persisted and reported as *applied-pending-restart*, and there is no server message that
+  restarts anything (`docs/remote-config.md` §7b).
 
 ## 8. What this device can encode
 
