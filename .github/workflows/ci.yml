@@ -495,10 +495,16 @@ jobs:
         # loopback PeerConnection pair, the production handler, the real
         # recorder child (the owner's gates, the host prompt with a fresh id,
         # the indicator before the first frame, every way a recording ends).
+        #
+        # FR-85 P5a — `export`: a recording whose every frame paints its own
+        # index, exported through keep / cut / 4× / keep, decoded back frame
+        # for frame (the oracle is proven against the unedited source), plus
+        # the real `roomlerd media probe|export` process.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
 

@@ -1180,6 +1180,18 @@ fn progressive_moov(
 
 // ── reading progressive files (tests; the P5 export engine) ─────────────────
 
+/// FR-85 P5 — a recording's video, as an export sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoFormat {
+    pub width: u32,
+    pub height: u32,
+    /// `avcC`'s profile: 66 Baseline (what openh264 writes), 77 Main, 100
+    /// High (what the hardware encoders write).
+    pub profile: u8,
+    /// The track's media timescale ([`VIDEO_TIMESCALE`] for a recording).
+    pub timescale: u32,
+}
+
 /// One sample of a progressive file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressiveSample {
@@ -1297,9 +1309,8 @@ impl ProgressiveFile {
         Ok(out)
     }
 
-    /// The `avcC` parameter sets of the video track, as Annex-B, ready to be
-    /// prepended to the first keyframe for a start-code decoder.
-    pub fn avc_parameter_sets_annexb(&self) -> Result<Vec<u8>> {
+    /// The video track's `avc1` sample entry and its media timescale.
+    fn video_avc1(&self) -> Result<(&Avc1, u32)> {
         let trak = self
             .moov
             .trak
@@ -1317,6 +1328,27 @@ impl ProgressiveFile {
         let Codec::Avc1(avc1) = codec else {
             bail!("mp4: video track is not avc1");
         };
+        Ok((avc1, trak.mdia.mdhd.timescale))
+    }
+
+    /// FR-85 P5 — what an export needs to know before it decodes a sample.
+    pub fn video_format(&self) -> Result<VideoFormat> {
+        let (avc1, timescale) = self.video_avc1()?;
+        if timescale == 0 {
+            bail!("mp4: the video track has no timescale");
+        }
+        Ok(VideoFormat {
+            width: u32::from(avc1.visual.width),
+            height: u32::from(avc1.visual.height),
+            profile: avc1.avcc.avc_profile_indication,
+            timescale,
+        })
+    }
+
+    /// The `avcC` parameter sets of the video track, as Annex-B, ready to be
+    /// prepended to the first keyframe for a start-code decoder.
+    pub fn avc_parameter_sets_annexb(&self) -> Result<Vec<u8>> {
+        let (avc1, _) = self.video_avc1()?;
         let mut out = Vec::new();
         for ps in avc1
             .avcc
