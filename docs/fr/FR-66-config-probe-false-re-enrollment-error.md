@@ -132,6 +132,7 @@ expected input to a boolean question.
 | P1 | `config::read_if_present` + `netd_enabled()` uses it; the no-ERROR property unit-locked and mutation-checked | revert (one function) | **shipped** |
 | P2 | audit all 37 `config::load` call sites — is the failure normal for that caller? | per-call-site | **shipped** — 1 more fixed, 6 correct as-is |
 | P3 | field-verify on the host that produced the evidence: a service restart logs no ERROR, and an induced unreadable config still does | — | **✅ FIELD-VERIFIED** — last ERROR on 0.4.53 (the final build without the fix); 21 starts across 0.4.55→0.4.73 since, zero |
+| P4 | docs, in the house style (the docs-before-close rule, #1401): `docs/installation.md` § "The host must be re-enrolled — when to believe it" — the two readers, a flowchart of which to pick and what each logs, and why a false re-enroll is a destructive remedy rather than noise | — (docs) | **done 2026-09-25**, after the close — the verification-debt guard (#1598) found FR-66 closed with no docs criterion |
 
 ### P2 audit — all 37 call sites
 
@@ -172,6 +173,13 @@ enrollment, whereas the supervisor's fires on every start forever.
 - [x] Field-verified on the originating host across a real service restart —
       and shown FAILING on the build immediately before, which is what makes the
       pass mean anything.
+- [x] Docs, in the house style and linked from `docs/README.md` (the
+      docs-before-close rule, #1401) — P4: `docs/installation.md` § "The host
+      must be re-enrolled — when to believe it" carries both readers with their
+      anchors, a flowchart of which to pick and what each logs (including the
+      `.prev` RECOVERED path, which needs no action), and why the false alarm
+      mattered: the remedy it prescribes is destructive.
+      *Added 2026-09-25, after the close.*
 
 ## Open decisions
 
@@ -202,6 +210,7 @@ enrollment, whereas the supervisor's fires on every start forever.
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-09-25 | docs | **Docs written after the close.** FR-66 closed on 2026-09-06, the day after the docs-before-close rule reached master, with no docs criterion; the verification-debt guard (#1598) flagged it. The section sits in `docs/installation.md` beside the enrollment path this FR also fixed, and leads with the reason a false alarm here is not cosmetic — re-enrollment is final and costs the device its overlay address. Anchors re-checked against master: `config.rs:2487` / `:2523` / `:2553`, `supervisor.rs:961` (the spec's `:2349` / `:958` had drifted) |
 | 2026-09-06 | 0.4.53 → 0.4.73, neo16 | **P3 field-verified, with the failing run alongside it.** The last `the host must be re-enrolled` on this host is `2026-09-03T02:50:47Z`, on a service start running **0.4.53** — the final release *without* the fix. The very next start, `10:11:20Z` the same morning on **0.4.55**, the first fixed build it ran, logged nothing; **21 service starts** across 0.4.55 → 0.4.73 since, **zero** occurrences. The precondition still holds throughout — the machine-global config is still absent, so the trigger never went away, only the false alarm did. ⚠️ The line-for-line comparison is the strongest part: in both builds the sequence runs *service started → M3 A1 auto-swap → desktop companion refreshing → **[slot]** → peer-presence transition → spawned worker*, and only the ERROR occupying that slot is gone. Nothing else moved |
 | 2026-09-06 | ⚠️ method | **I called this "not verified" first, and the reason is worth more than the verdict.** `git tag --contains <the master SHA>` reported the fix's first release as **0.4.72**, which put it *after* every build whose logs were clean and made the pass look like a coincidence that had already happened for some other reason. It is wrong because **release tags here are cut from a lineage separate from master**: the same change exists on that lineage under a different SHA, and asking whether the *master* commit is an ancestor of a *tag* answers "have the two lineages converged", not "does this release contain this change". The first question resolves 18 releases too late. ⇒ to date a fix against releases, find the SHA **on the tag lineage** (`git log <tag-a>..<tag-b> -- <path>`) and test ancestry with that. 🔑 The generalisable form: an ancestry query answers a question about **one graph**, and a repo with two publishing lineages has two |
 | 2026-09-03 | CI | **FR-46's guard caught this FR's own spec, on the first push.** The out-of-scope paragraph originally spelled the peer-presence marker path out in full, which is an unclassified retired-name occurrence; `Retired-name audit (FR-21)` failed the PR with `unclassified rose 0 -> 1` and named the file and line. Reworded to point at `peer_presence::marker_path()` instead — a new document is exactly where the old spelling should stop spreading, and there is no "current name" to substitute because the path is a deliberately frozen anchor. ⚠️ Recorded rather than silently fixed: this is the first time that guard has fired on a document nobody was thinking about it in, which is the only kind of evidence that it works |

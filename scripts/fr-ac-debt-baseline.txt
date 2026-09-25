@@ -44,7 +44,6 @@ FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addre
 # Each of these has a Result / field-verified comment. The likeliest reading is
 # that the work was verified and nobody walked back to the checkboxes — but see
 # the warning above: the comment does not attest to THESE boxes.
-FR-7=1    # C.1  #778 Apple Developer ID + notarisation. Code signing has since gone live on all three platforms (team 4TG7586MY5) — almost certainly tickable from that evidence today.
 FR-12=5   # C.2  #788 P1 and P2 spotlight tours both shipped (#797, #1117); no criterion was ticked for either.
 FR-32=7   # C.3  #898 14 comments and a field-verified Result; 0 of 7 ticked.
 FR-34=3   # C.4  #917 Result present; 3 of 6 remain, incl. "the controller is TOLD the host is locked".
@@ -66,17 +65,19 @@ FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — an
 # the debt pins above cannot see their docs at all — there is no box to be
 # unticked. Each line is removed the day its spec gains the criterion.
 #
-# Four were found when the check was written. FR-74 and FR-81, both still
-# OPEN, were given the criterion in the same PR (#1598), so the debt pins can
-# now see their docs. The two below are CLOSED, and they cannot be fixed the
-# same way: an unticked criterion on a closed FR only moves it from this list
-# to the debt list above, and a ticked one without the docs would be a false
-# record. The honest fix for each is to write the docs, then add the criterion
-# ticked, with a link to them.
+# Four were found when the check was written; none remain. FR-74 and FR-81,
+# both OPEN, were given the criterion in #1598, so the debt pins can see their
+# docs. FR-7 and FR-66, both CLOSED, could not be fixed that way — an unticked
+# criterion on a closed FR only moves it to the debt list, and a ticked one
+# without the docs would be a false record — so their docs were WRITTEN first
+# (2026-09-25: docs/code-signing.md, docs/installation.md) and each criterion
+# added ticked in the same PR. Writing FR-7's also paid its one debt pin: the
+# Apple criterion had been field-verified on 2026-09-08 and never ticked.
+#
+# So this section is empty on purpose. A line appearing here means an FR bound
+# by the rule was written, or closed, without the criterion.
 #
 # ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
 #    reader-facing docs — the close the operator made the rule ABOUT — and its
 #    owed docs landed in #1401 itself. It is the reason the boundary is a
 #    timestamp and not a date.
-nodocs FR-7    # closed 2026-09-08, three days after the rule. docs/code-signing.md exists and has a docs/README.md row, but carries NO mermaid diagram (the rule requires them) and the spec never recorded a docs criterion.
-nodocs FR-66   # closed 2026-09-06, the day after the rule. A severity fix (a missing machine-global config logged ERROR). No doc mentions the change; whether it warranted docs was never written down.
