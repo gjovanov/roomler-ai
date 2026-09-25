@@ -139,6 +139,13 @@ same accounts and server.*
 | [security-baseline.md](security-baseline.md) | The server and web security controls and **why each is shaped the way it is**: identity and session handling, the email-ownership invariant that closes the nOAuth class, object-level tenant scoping (`is_member` is not an authorization check), the device plane, SSRF/CORS/CSP and the loopback origins the remote-desktop viewer needs, content sniffing and the message-HTML allowlist, the four-layer publishing-identity allowlist, and the open gaps |
 | [data-model.md](data-model.md) | Every MongoDB collection with ER diagrams, indexes, TTLs |
 
+## ⚖️ Licensing
+
+| Doc | What it covers |
+|---|---|
+| [licensing.md](licensing.md) | How the AGPL / MPL / CC-BY split is classified (`scripts/licence-classes.sh` is the one source), the four CI checks that stop it rotting and how each is shaped (including why the manifest check walks the workspace members rather than a glob), and the FFmpeg LGPL obligations: per-platform linkage, the corresponding-source bundle with every patch our builds apply, and the release gate that keeps it complete. Practical questions: [`LICENSING.md`](../LICENSING.md) |
+| [lgpl-relink.md](lgpl-relink.md) | Exercising the LGPL-2.1 §6 relink right on the statically linked Windows agent, step by step, and how to verify the result |
+
 ## 📐 Design records
 
 Point-in-time design documents for features that are in flight or deliberately

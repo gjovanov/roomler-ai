@@ -46,7 +46,20 @@ jobs:
           set -euo pipefail
           source scripts/licence-classes.sh
           fail=0
-          for f in crates/*/Cargo.toml agents/*/Cargo.toml; do
+          # The WORKSPACE decides what is a member, not a glob. This step used to
+          # iterate `crates/*/Cargo.toml agents/*/Cargo.toml`, one level deep, so
+          # when FR-69 put six crates under `crates/modules/` it checked 18 of 24
+          # members and still printed OK. The six happened to declare AGPL
+          # correctly; nothing here would have noticed if they had not.
+          members=$(awk '/^members *= *\[/{p=1; next} p && /^\]/{exit} p' Cargo.toml \
+            | sed -E 's/#.*//' | grep -oE '"[^"]+"' | tr -d '"')
+          n=$(printf '%s\n' "$members" | grep -c . || true)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::parsed no workspace members from Cargo.toml — refusing to report a clean split"
+            exit 1
+          fi
+          for m in $members; do
+            f="$m/Cargo.toml"
             pkg=$(grep -m1 '^name = ' "$f" | sed 's/name = //;s/"//g')
             # Only the [package] section counts — [package.metadata.wix] also
             # has a `license` key, and it means something entirely different.
@@ -60,7 +73,7 @@ jobs:
               fail=1
             fi
           done
-          [ "$fail" = 0 ] && echo "OK: all workspace members declare the expected licence."
+          [ "$fail" = 0 ] && echo "OK: all $n workspace members declare the expected licence."
           exit $fail
 
       - name: Every first-party source file carries the right SPDX header
