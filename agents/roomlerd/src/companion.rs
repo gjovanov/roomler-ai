@@ -32,6 +32,10 @@
 // platform, where before this module was Windows-only.
 use anyhow::{Context, Result};
 
+/// FR-84 D6 — the one-shot post-install launch: its decision table and the
+/// marker that makes it one-shot.
+mod launch_once;
+
 /// Who is calling the refresh — decides how a running desktop gets
 /// respawned after the swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

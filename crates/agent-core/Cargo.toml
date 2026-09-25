@@ -50,6 +50,16 @@ tokio = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# FR-84 D6 — the companion's `…\Run\Roomler Desktop` value, written by the
+# daemon (HKLM from the elevated service install, HKCU from the per-user one)
+# and by the companion (its own HKCU toggle). The 0.59 line the daemon and the
+# companion already resolve; Registry is the only feature this crate adds.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
 [features]
 # Exposes `config::test_fixture` to DOWNSTREAM test builds (a foreign crate's
 # `cargo test` compiles this crate in normal mode, so `#[cfg(test)]` alone

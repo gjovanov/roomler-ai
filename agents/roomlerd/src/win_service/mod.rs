@@ -32,6 +32,9 @@
 
 #[cfg(feature = "wgc-capture")]
 pub mod capture_smoke;
+/// FR-84 D6 — start the companion from a user-context daemon without
+/// handing it our handles (#1035).
+pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod supervisor;
