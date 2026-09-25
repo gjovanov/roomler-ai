@@ -3352,6 +3352,46 @@ mod tests {
         assert!(apply(&mut cfg, "exec_enabled", Some("perhaps")).is_err());
     }
 
+    /// FR-84 D3 — the switch that keeps "Apply now" off a shared machine.
+    /// Default ON (a personal device wants it); clearing returns to ON, the
+    /// built-in default — unlike the root-granting gates, OFF is not the
+    /// fail-safe direction here, it only removes a convenience. LIVE: the
+    /// restart verb re-reads the file on every request, so an administrator's
+    /// edit is in force at once and the desktop must not ask for a restart to
+    /// apply it. Written against strings so it compiles on the pre-D3 tree,
+    /// where it is RED: the key was unknown to the surface.
+    #[test]
+    fn local_restart_enabled_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "local_restart_enabled").as_deref(),
+            Some("true"),
+            "a fresh device lets the person at it restart the service"
+        );
+        apply(&mut cfg, "local_restart_enabled", Some("false")).unwrap();
+        assert_eq!(
+            entry_for(&cfg, "local_restart_enabled")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "local_restart_enabled", None).unwrap();
+        assert_eq!(
+            current_value(&cfg, "local_restart_enabled").as_deref(),
+            Some("true"),
+            "clearing restores the built-in default"
+        );
+        assert!(apply(&mut cfg, "local_restart_enabled", Some("perhaps")).is_err());
+        let e = entry_for(&cfg, "local_restart_enabled").unwrap();
+        assert_eq!(e.group, "access");
+        assert_eq!(e.tier, "standard");
+        assert!(
+            !e.restart_required,
+            "the restart verb reads the file per request — the key is live"
+        );
+    }
+
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
     /// compromised control plane (`docs/remote-config.md`). Locked here
     /// because the DEFAULT is the security property: a device that has not

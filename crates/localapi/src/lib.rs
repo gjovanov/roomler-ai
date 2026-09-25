@@ -3767,6 +3767,26 @@ mod tests {
         ));
     }
 
+    /// FR-84 D3 — the restart verb's wire shape, locked as JSON TEXT so the
+    /// test also compiles against a daemon that predates the verb and is RED
+    /// there: its serde answers `unknown variant`, which is the exact phrase
+    /// a newer client turns into "this service predates Apply now" — so the
+    /// phrase is pinned here too, on a spelling no build will ever accept.
+    #[test]
+    fn restart_daemon_verb_is_on_the_wire() {
+        let req: Result<Request, _> =
+            serde_json::from_str(r#"{"t":"restart_daemon","d":{"reason":"settings"}}"#);
+        assert!(req.is_ok(), "restart_daemon must parse: {req:?}");
+        let resp: Result<Response, _> = serde_json::from_str(
+            r#"{"t":"daemon_restarting","d":{"supervisor":"scm","restart_by":"supervisor","exit_code":0}}"#,
+        );
+        assert!(resp.is_ok(), "daemon_restarting must parse: {resp:?}");
+        let old = serde_json::from_str::<Request>(r#"{"t":"restart_daemon_v0"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(old.contains("unknown variant"), "{old}");
+    }
+
     #[tokio::test]
     async fn config_verbs_wire_shape_and_default_unsupported() {
         // Wire lock: adjacently tagged, snake_case; unset `value` is

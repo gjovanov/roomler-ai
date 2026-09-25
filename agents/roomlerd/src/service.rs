@@ -501,6 +501,22 @@ mod windows {
             assert!(!xml.contains("Joe & Sons"));
         }
 
+        /// FR-84 D3 — the worker learns it is task-supervised from its own
+        /// argv, so `RestartDaemon` knows the relaunch is the CALLER's job
+        /// (the task's `<RestartOnFailure>` is a minute away and `IgnoreNew`
+        /// would drop a second instance anyway). Written against the literal
+        /// so it compiles on the pre-D3 tree, where it is RED: the action was
+        /// a bare `run`, which `supervision::detect` reads as an orphan and
+        /// refuses to restart.
+        #[test]
+        fn xml_template_marks_the_worker_as_task_supervised() {
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user");
+            assert!(
+                xml.contains("<Arguments>run --supervisor task</Arguments>"),
+                "the task action must carry the supervisor flag: {xml}"
+            );
+        }
+
         #[test]
         fn write_temp_xml_uses_utf16_le_bom() {
             let path = write_temp_xml("<?xml?>").unwrap();
