@@ -238,6 +238,21 @@ Windows service host the WORKER (console session) runs the probe and owns the
 cache file. Measured: a hit answers 0.5 s after `agent starting` where the probe
 took 3.6 s.
 
+⚠️ **The knob half of the key makes every `ROOMLERD_*` variable a probe
+trigger, including ones that have nothing to do with encoding.** Flipping a
+capture flag (`ROOMLERD_PORTAL_CAPTURE`, `ROOMLERD_VIRTUAL_DESKTOP`, …) misses
+the single-entry cache (`a ROOMLERD_* knob changed`) and the next start runs
+the full probe — and restoring the old value is a *second* miss. Measured on
+the WSL2 dev host (2026-09-25, FR-45 AC2): a fresh NVENC probe **hung** while a
+software-rendering compositor rig loaded the box — `caps probe: the probe child
+hung` after the 60 s bound, `env -i roomlerd caps` reproducing a 75 s stall
+where the same command from a login shell took ~5 s — and the pumps then
+missed the watchdog's 90 s window, so the daemon forced `exit(2)` and systemd
+restarted it into the same probe. With the load stopped the identical probe
+took 4.6 s. So: change knobs on an **unloaded** host, wait for `rc:agent.hello
+sent`, and only then load it; tear the load down before restoring them. The
+sequence is written out in [`linux-capture.md` §7](linux-capture.md#7-configuration).
+
 Implementation notes that keep the child honest:
 
 - The child sets `ROOMLERD_CAPS_CHILD=1`; `detect()` seeing it computes
@@ -479,9 +494,17 @@ Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**
 (service worker on Windows — adapter-bound DXGI that picks the adapter *owning the
 primary output*, fixing Optimus hybrid GPUs, with a GDI `BitBlt` fallback after
 three consecutive hard errors) → **Windows.Graphics.Capture** (hardware cursor,
-dirty regions on Win11) → **scrap** (DXGI duplication / X11 XShm / CoreGraphics)
-→ noop. A `DownscalePolicy` box-filters very large desktops (>~3.5 Mpx) before
-encode. Cursor shapes ride a dedicated channel and render viewer-side.
+dirty regions on Win11) → **DRM/KMS** (Linux, opt-in `ROOMLERD_DRM_CAPTURE=1` —
+the scanout plane below the compositor, FR-36) → **the desktop portal** (Linux,
+opt-in `ROOMLERD_PORTAL_CAPTURE=1` — a privilege-dropped `portal-helper` in the
+user's session feeding PipeWire frames over a pipe, FR-45; with
+`ROOMLERD_MUTTER_CAPTURE=1` the same helper takes them from
+`org.gnome.Mutter.ScreenCast` instead, unattended) → **scrap** (DXGI duplication
+/ X11 XShm + XDamage / CoreGraphics) → noop carrying the reason (FR-80). The
+Linux arms, their selection order and the **attended-only** rule of the portal
+are [`linux-capture.md`](linux-capture.md). A `DownscalePolicy` box-filters very
+large desktops (>~3.5 Mpx) before encode. Cursor shapes ride a dedicated channel
+and render viewer-side.
 
 With multiple concurrent viewers of one host, DC sessions with an identical
 profile (transport × codec × chroma) **share one capture + one encoder**
