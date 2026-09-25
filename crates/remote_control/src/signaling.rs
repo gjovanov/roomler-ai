@@ -1479,7 +1479,11 @@ mod namespace_tests {
     /// source — so the table below is checked against what serde actually
     /// emits, not against a second hand-written list.
     fn client_renames() -> Vec<String> {
-        let src = include_str!("signaling.rs");
+        // Normalised first: a Windows checkout with `core.autocrlf` has CRLF
+        // line ends, `"\n}\n"` below then never matches, and this test fails
+        // there on a table that is perfectly correct (found on the dev box).
+        let src = include_str!("signaling.rs").replace("\r\n", "\n");
+        let src = src.as_str();
         let start = src
             .find("pub enum ClientMsg {")
             .expect("the enum is in this file");
