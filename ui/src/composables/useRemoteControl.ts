@@ -163,6 +163,16 @@ export const RC_SIGNALING_TIMEOUT_MS = 15000
 export const RC_REQUEST_TIMEOUT_MS = 4000
 
 /**
+ * #1631 - how long a request that went out and was then abandoned (the view
+ * unmounted or the operator hung up while it was unanswered) keeps a
+ * terminator armed for its late `rc:session.created`
+ * (`createAbandonedRequestRegistry`). Twice the request timeout: a create
+ * later than that would have been abandoned by the ladder anyway, and the
+ * next request to the same agent reaps it on the hub.
+ */
+export const RC_LATE_CREATE_WINDOW_MS = 2 * RC_REQUEST_TIMEOUT_MS
+
+/**
  * FR-22 - how long an attempt may sit in `phase` before the ladder
  * abandons it. `null` means "do not arm": `awaiting_consent` is
  * human-paced and server-owned, and the terminal phases have nothing
@@ -268,6 +278,137 @@ export function sessionGateAllows(
   if (typeof msgSessionId !== 'string' || msgSessionId.length === 0) return true
   return currentSessionId !== null && msgSessionId === currentSessionId
 }
+
+/** #1631 - what the `rc:session.created` handler does with a create. */
+export type SessionCreatedAction = 'adopt' | 'ignore' | 'terminate'
+
+/**
+ * #1631 - decide what an inbound `rc:session.created` means to THIS
+ * composable.
+ *
+ * Outside `requesting` nothing is expected. A create naming the session we
+ * already track is the #1045 coalesce echo (the server re-affirming our live
+ * session after a duplicate request on this socket) and is ignored; any
+ * other is a ghost the server would otherwise hold pinned to the agent until
+ * the consent timeout, so it is released (`terminate`).
+ *
+ * Inside `requesting` the create is ours ONLY if it names the agent we asked
+ * for. The server always sends `agent_id`
+ * (`crates/remote_control/src/signaling.rs` `ServerMsg::SessionCreated`), and
+ * a create for a different agent while we wait is exactly the device-switch
+ * race: A's late create landing while B's request is in flight. The old
+ * inline logic adopted it, and B's viewer then drove A. A create without an
+ * `agent_id`, or one arriving while the requested agent is not known, is
+ * adopted as before: the guard refuses only what it can prove foreign, so a
+ * server that omitted the field could never brick Connect.
+ */
+export function sessionCreatedAction(
+  phase: RcPhase,
+  msg: { session_id?: unknown; agent_id?: unknown },
+  trackedSessionId: string | null,
+  requestedAgentId: string | null,
+): SessionCreatedAction {
+  if (phase !== 'requesting') {
+    if (typeof msg.session_id === 'string' && msg.session_id === trackedSessionId) {
+      return 'ignore'
+    }
+    return 'terminate'
+  }
+  if (
+    typeof msg.agent_id === 'string'
+    && msg.agent_id !== ''
+    && requestedAgentId !== null
+    && msg.agent_id !== requestedAgentId
+  ) {
+    return 'terminate'
+  }
+  return 'adopt'
+}
+
+/** The slice of the WS store the late-create terminator needs. */
+export interface AbandonedRequestIo {
+  onRcMessage(t: string, handler: (msg: any) => void): () => void
+  sendRaw(msg: unknown): void
+}
+
+export interface AbandonedRequestRegistry {
+  /** Watch for the late create of a request to `agentId` that no composable
+   *  will answer for any more, and release it when it lands. Re-arming
+   *  replaces the previous entry and restarts its window. */
+  arm(agentId: string): void
+  /** Stop watching: the caller is about to request `agentId` again and wants
+   *  the session the hub coalesces onto, not a terminate under its feet. */
+  disarm(agentId: string): void
+  /** Entries currently armed (tests). */
+  readonly size: number
+}
+
+type AbandonedRequestEntry = { unsub: () => void; timer: ReturnType<typeof setTimeout> }
+
+/**
+ * #1631 - a bounded terminator for `rc:session.created`s that answer a
+ * request whose composable is gone.
+ *
+ * `disconnect()` removes this composable's handlers, so a create landing
+ * after the view unmounted mid-request (the operator picked another device in
+ * the nav, or hung up before the server answered) had nobody to release it:
+ * the hub kept the session pinned to the agent until the consent timeout, and
+ * the next Connect on that agent bounced off `agent_busy`.
+ *
+ * The entries live at MODULE scope (`ABANDONED_REQUESTS`), shared by every
+ * composable instance, because the instance that armed one is gone by the
+ * time the create arrives. `connect()` disarms its agent right before it
+ * sends, so A -> B -> A keeps the session the hub coalesces onto instead of
+ * terminating it under the new viewer (coalescing is same-socket +
+ * same-agent: `crates/modules/fleet/src/hub.rs`, `request_session`). Terminate
+ * is idempotent on the hub, so this and a still-mounted sibling composable
+ * both releasing one ghost is harmless. An entry disarms itself after
+ * `windowMs`.
+ */
+export function createAbandonedRequestRegistry(
+  io: AbandonedRequestIo,
+  windowMs: number = RC_LATE_CREATE_WINDOW_MS,
+  entries: Map<string, AbandonedRequestEntry> = new Map(),
+): AbandonedRequestRegistry {
+  function disarm(agentId: string) {
+    const entry = entries.get(agentId)
+    if (!entry) return
+    entries.delete(agentId)
+    clearTimeout(entry.timer)
+    entry.unsub()
+  }
+  function arm(agentId: string) {
+    disarm(agentId)
+    const unsub = io.onRcMessage('rc:session.created', (msg) => {
+      if (!msg || msg.agent_id !== agentId) return
+      if (typeof msg.session_id === 'string' && msg.session_id) {
+        console.warn(
+          '[rc] late rc:session.created for an abandoned request to',
+          agentId,
+          '- releasing the session',
+        )
+        io.sendRaw({
+          t: 'rc:terminate',
+          session_id: msg.session_id,
+          reason: 'controller_hangup',
+        })
+      }
+      disarm(agentId)
+    })
+    const timer = setTimeout(() => disarm(agentId), windowMs)
+    entries.set(agentId, { unsub, timer })
+  }
+  return {
+    arm,
+    disarm,
+    get size() {
+      return entries.size
+    },
+  }
+}
+
+/** #1631 - module-level registry state; see `createAbandonedRequestRegistry`. */
+const ABANDONED_REQUESTS = new Map<string, AbandonedRequestEntry>()
 
 /** Stall decision table Ã¢ÂÂ see the constants docblock above. */
 export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconnect' {
@@ -3507,6 +3648,26 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * scheduleReconnect / cancelReconnect.
    */
   let lastConnectArgs: { agentId: string; permissions: string; orgId?: string } | null = null
+  /** #1631 - the late-create terminator over the module-level entries, bound
+   *  to this store's socket (see `createAbandonedRequestRegistry`). */
+  const abandonedRequests = createAbandonedRequestRegistry(
+    ws,
+    RC_LATE_CREATE_WINDOW_MS,
+    ABANDONED_REQUESTS,
+  )
+  /** #1631 - the generation of the `connect()` in flight. Every teardown
+   *  bumps it, so a pre-flight that resumes after its composable was torn
+   *  down (disconnect(), failWith(), a scoped rc:terminate, the ladder)
+   *  finds `gen !== connectGen` and stops before it creates a peer or sends
+   *  a request on behalf of a state that no longer exists. */
+  let connectGen = 0
+  /** #1631 - an `rc:session.request` went out and nothing has answered it
+   *  yet: neither a create (adopted -> false) nor a failing rc:error
+   *  (failWith -> false). Deliberately NOT cleared by teardown(): the
+   *  ladder's teardown after a request timeout does not answer the request,
+   *  and its late create is exactly what `abandonedRequests` exists to
+   *  release. Consumed by disconnect(). */
+  let requestSent = false
   const reconnectAttempt = ref(0)
   /** FR-22 - ms from `rc:session.request` to the first painted frame on
    *  the attempt that succeeded. Null until one does. Exposed so the
@@ -6607,18 +6768,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // the server holds a live session pinned to the agent until someone
       // terminates it (previously it survived until the next request's
       // orphan reap or the consent timeout).
-      if (phase.value !== 'requesting') {
-        // #1045 — a create for the session we're ALREADY tracking is not a
-        // ghost: it's the server re-affirming our live session (the coalesce
-        // echo, where a duplicate request on this same socket is answered with
-        // our existing id). Terminating on it would kill the session we're in.
-        if (typeof msg.session_id === 'string' && msg.session_id === sessionId.value) {
-          return
-        }
+      // #1045 — a create for the session we're ALREADY tracking is not a
+      // ghost: it's the server re-affirming our live session (the coalesce
+      // echo, where a duplicate request on this same socket is answered with
+      // our existing id). Terminating on it would kill the session we're in.
+      // #1631 — and while `requesting`, a create for ANOTHER agent is not
+      // ours either (A's late create landing while B's request is in
+      // flight). The decision table is `sessionCreatedAction`.
+      const action = sessionCreatedAction(
+        phase.value,
+        msg,
+        sessionId.value,
+        lastConnectArgs?.agentId ?? null,
+      )
+      if (action === 'ignore') return
+      if (action === 'terminate') {
         console.warn(
-          '[rc] rc:session.created outside an active request (phase',
-          phase.value,
-          ') - releasing the ghost session',
+          '[rc] rc:session.created',
+          phase.value === 'requesting'
+            ? `for agent ${String(msg.agent_id)} while requesting ${lastConnectArgs?.agentId}`
+            : `outside an active request (phase ${phase.value})`,
+          '- releasing the ghost session',
         )
         if (typeof msg.session_id === 'string' && msg.session_id) {
           ws.sendRaw({
@@ -6629,6 +6799,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         }
         return
       }
+      requestSent = false
       sessionId.value = msg.session_id
       // Multi-user P3: the server reports the EFFECTIVE grant, which the
       // single-INPUT-holder rule may have narrowed (another live session
@@ -6867,6 +7038,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     cancelReconnect()
     logConnectTiming('closed')
     lastConnectArgs = null
+    // #1631 - a request answered by a failing rc:error (or an attempt that
+    // died before one went out) leaves nothing for the late-create
+    // terminator to release. teardown() bumps `connectGen`, so a connect()
+    // still in its pre-flight stops at its next check.
+    requestSent = false
     teardown()
   }
 
@@ -7032,6 +7208,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   )
 
   function teardown() {
+    // #1631 - invalidate any connect() still in its pre-flight (see
+    // `connectGen`): the peer it would build belongs to a state that just
+    // ended. Every teardown path - disconnect(), failWith(), a scoped
+    // rc:terminate, the ladder - comes through here.
+    connectGen += 1
     stopStatsPoll()
     stopMediaWatchdog()
     clearPcDisconnectedTimer()
@@ -7113,6 +7294,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     ) {
       return // already active
     }
+    // #1631 - this attempt's generation, re-checked after every suspension
+    // below. Taken AFTER the guard: a call rejected above must not touch it,
+    // the attempt it would have displaced is still the live one.
+    const gen = ++connectGen
     // Capture the original call so a later 'failed' can replay it.
     // Don't clobber on an isReconnect call Ã¢ÂÂ that path already has
     // the right args from the original user click.
@@ -7170,6 +7355,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.warn('[rc] pre-flight: signalling socket not ready; proceeding (ladder will retry)')
       }
     }
+    // #1631 - torn down while we waited for the socket (the operator picked
+    // another device, or hung up). Nothing below may run for a dead attempt.
+    if (gen !== connectGen) return
     markConnect('ws_ready')
 
     // Restore the per-agent resolution preference. This has to live
@@ -7239,6 +7427,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Fall back to a public STUN if the server has none configured.
       iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }]
     }
+    if (gen !== connectGen) return // #1631 - torn down during the TURN fetch
     markConnect('turn_ready')
 
     // loopback-TURN corp-relay (Phase 2): if opted-in AND this host runs a
@@ -7257,6 +7446,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       }
     }
+    // #1631 - the last suspension before the peer exists. A disconnect()
+    // during any wait above must never leave a peer that nothing will close
+    // (its ICE sockets outlive the composable - see the socket-leak note in
+    // docs/tunnels.md), nor send a request on behalf of a torn-down state.
+    if (gen !== connectGen) return
 
     pc = new RTCPeerConnection({
       iceServers: iceServers as RTCIceServer[],
@@ -8499,6 +8693,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
 
+    // #1631 - the decode probes above suspend too. Nothing else does between
+    // here and the request send, so this one check guards both the DC/worker
+    // start (which would otherwise open a channel on a NEWER attempt's peer,
+    // `pc` being shared) and the `rc:session.request` itself.
+    if (gen !== connectGen) return
+
     // FR-17 — per-chunk framing is negotiated, never assumed: only when
     // the agent advertised `chunk-framing` AND this session actually uses
     // a DataChannel transport (the RTP track has no chunks to frame).
@@ -8625,7 +8825,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (overrideReason.value.trim()) {
       requestPayload.override_reason = overrideReason.value.trim()
     }
+    // #1631 - a request we abandoned to this same agent may still be
+    // answered, and that answer is now OURS: the hub coalesces a same-socket,
+    // same-agent request onto the live session. Stop the terminator first.
+    abandonedRequests.disarm(agentId)
     ws.sendRaw(requestPayload)
+    requestSent = true
     markConnect('request_sent')
     overrideReason.value = ''
     // Abandon-and-retry if the server never answers the request (WS
@@ -8634,6 +8839,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   function disconnect() {
+    // #1631 - read BEFORE the resets below. A request that went out and was
+    // never answered (still `requesting`, or `reconnecting` after its
+    // timeout) will be answered by a create this composable no longer sees
+    // once removeRcHandlers() runs; the module-level registry releases it.
+    const abandonedAgentId =
+      (phase.value === 'requesting' || phase.value === 'reconnecting')
+      && requestSent
+      && !sessionId.value
+        ? (lastConnectArgs?.agentId ?? null)
+        : null
+    requestSent = false
     // Operator-initiated teardown must override any pending
     // reconnect timer; otherwise a reconnect could fire after the
     // user already dismissed the viewer, racing the WS rc:terminate
@@ -8655,6 +8871,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         reason: 'controller_hangup',
       })
     }
+    if (abandonedAgentId !== null) abandonedRequests.arm(abandonedAgentId)
     phase.value = 'closed'
     teardown()
     removeRcHandlers()
