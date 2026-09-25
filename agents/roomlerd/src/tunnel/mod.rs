@@ -34,5 +34,7 @@ pub mod client_mgr;
 pub mod dialer;
 pub(crate) mod netwatch;
 pub mod peer;
+/// FR-84 D6 / #1035 — name who holds a port a declared route cannot bind.
+pub mod port_holder;
 pub mod quic_peer;
 pub mod route_reconciler;

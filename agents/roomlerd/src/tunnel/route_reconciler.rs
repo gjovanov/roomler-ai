@@ -307,9 +307,30 @@ impl RouteReconciler {
                     match result {
                         Ok(flow_id) => {
                             info!(route = %route.id, flow = %flow_id, "route reconciled into a live flow");
+                            super::port_holder::note_ok(&route.id);
                             runtime.insert(route.id.clone(), RouteRuntime::Live { flow_id });
                         }
                         Err(message) => {
+                            // FR-84 D6 / #1035 — refused its port for two
+                            // minutes: say WHO holds it (off the reconcile
+                            // pass; the lookup reads tables and /proc).
+                            if super::port_holder::note_failure(&route.id, &message) {
+                                let (route_id, port) = (route.id.clone(), route.local);
+                                tokio::spawn(async move {
+                                    if let Ok(holder) = tokio::task::spawn_blocking(move || {
+                                        super::port_holder::lookup(port)
+                                    })
+                                    .await
+                                    {
+                                        warn!(
+                                            route = %route_id,
+                                            port,
+                                            holder = %super::port_holder::describe(&holder),
+                                            "route still cannot bind its local port"
+                                        );
+                                    }
+                                });
+                            }
                             let failures = match runtime.get(&route.id) {
                                 Some(RouteRuntime::Pending {
                                     consecutive_failures,
