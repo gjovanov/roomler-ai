@@ -108,7 +108,7 @@ jobs:
           # grows no import and the agent no load-time need. av1_d3d12va
           # additionally needs the SDK's AV1 encode structs
           # (`d3d12va_av1_headers`, SDK 10.0.26100 — the runner's).
-          $inject = 'string(APPEND OPTIONS " --disable-everything --disable-network --disable-protocols --disable-devices --disable-filters --disable-bsfs --disable-parsers --disable-demuxers --disable-muxers --disable-decoders --disable-encoders --disable-hwaccels --enable-encoder=h264_nvenc --enable-encoder=hevc_nvenc --enable-encoder=av1_nvenc --enable-encoder=h264_qsv --enable-encoder=hevc_qsv --enable-encoder=av1_qsv --enable-encoder=vp9_qsv --enable-encoder=h264_amf --enable-encoder=hevc_amf --enable-encoder=av1_amf --enable-encoder=h264_d3d12va --enable-encoder=hevc_d3d12va --enable-encoder=av1_d3d12va --enable-encoder=h264_vulkan --enable-encoder=hevc_vulkan --enable-encoder=av1_vulkan --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va --enable-d3d12va --enable-vulkan")' + "`n" + $anchor
+          $inject = 'string(APPEND OPTIONS " --disable-everything --disable-network --disable-protocols --disable-devices --disable-filters --disable-bsfs --disable-parsers --disable-demuxers --disable-muxers --disable-decoders --disable-encoders --disable-hwaccels --enable-encoder=h264_nvenc --enable-encoder=hevc_nvenc --enable-encoder=av1_nvenc --enable-encoder=h264_qsv --enable-encoder=hevc_qsv --enable-encoder=av1_qsv --enable-encoder=vp9_qsv --enable-encoder=h264_amf --enable-encoder=hevc_amf --enable-encoder=av1_amf --enable-encoder=h264_d3d12va --enable-encoder=hevc_d3d12va --enable-encoder=av1_d3d12va --enable-encoder=h264_vulkan --enable-encoder=hevc_vulkan --enable-encoder=av1_vulkan --enable-decoder=h264 --enable-decoder=hevc --enable-encoder=aac --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va --enable-d3d12va --enable-vulkan")' + "`n" + $anchor
           $content = $content.Replace($anchor, $inject)
 
           # ── FR-62 A2: apply the roomler FFmpeg source patches via the port's
@@ -187,9 +187,15 @@ jobs:
           foreach ($dll in @('vulkan-1.lib','d3d12.lib')) {
             if ($imports -match [regex]::Escape($dll)) { Write-Host "::error::avutil.lib carries a link directive for $dll — the backend must stay dlopen'd"; exit 1 }
           }
-          foreach ($dead in @('ff_prores_decoder','ff_h264_decoder','ff_mov_muxer')) {
+          # FR-84 P0 (measurement branch, never merged): the three components
+          # the recording editor adds must be present; the rest of the trim holds.
+          foreach ($want in @('ff_h264_decoder','ff_hevc_decoder','ff_aac_encoder')) {
+            if ($syms -notmatch [regex]::Escape($want)) { Write-Host "::error::FR-84 P0: expected symbol missing: $want"; exit 1 }
+          }
+          foreach ($dead in @('ff_prores_decoder','ff_mov_muxer')) {
             if ($syms -match [regex]::Escape($dead)) { Write-Host "::error::component that should be trimmed is present: $dead"; exit 1 }
           }
+          Get-ChildItem $lib -Filter '*.lib' | Sort-Object Name | ForEach-Object { Write-Host ("FR84-P0-SIZE {0} {1}" -f $_.Name, $_.Length) }
           $mb = [math]::Round((Get-Item "$lib\avcodec.lib").Length / 1MB, 1)
           Write-Host "avcodec.lib = $mb MB (full build was 139.3)"
           if ($mb -gt 60) { Write-Host "::error::avcodec.lib is $mb MB — the trim did not take"; exit 1 }
@@ -208,7 +214,7 @@ jobs:
           # zip (kept on the release untouched). FR-78 P0 added the
           # `-d3d12-vulkan` suffix (six more encoders, no new import):
           # rollback = drop that suffix.
-          $zip = "$env:RUNNER_TEMP\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-fr84-p0.zip"
           # FR-62 A2 — carry the patch manifest inside the asset so
           # release-agent can prove the vendored libs match the committed
           # patches (see the build step). Present iff the build applied patches.
@@ -222,8 +228,16 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
           Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB  sha256=$hash"
-          gh release upload vendored-ffmpeg-9.0.1 $zip "$zip.sha256" --repo "${{ github.repository }}" --clobber
-          Write-Host "uploaded $(Split-Path $zip -Leaf) to vendored-ffmpeg-9.0.1"
+          # FR-84 P0: NEVER the release — an Actions artifact only, so the
+          # production asset release-agent.yml downloads cannot be touched.
+          Write-Host "FR84-P0-SIZE zip $((Get-Item $zip).Length)"
+
+      - name: FR-84 P0 — upload the measurement tree as an artifact (not the release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fr84-p0-ffmpeg-win64
+          path: ${{ runner.temp }}/ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-fr84-p0.zip
+          retention-days: 14
 
   # ────────────────────────────────────────────────────────────────────────
   # P3e: the Linux twin of the minimal build. The old linux64 asset was a
@@ -358,6 +372,7 @@ jobs:
             --enable-nvenc --enable-ffnvcodec --enable-cuda --enable-libvpl --enable-amf --enable-vaapi --enable-vulkan \
             --extra-cflags=-I/opt/ffout/include \
             --enable-parser=h264,hevc,av1 \
+            --enable-decoder=h264,hevc --enable-encoder=aac \
             || { echo "=== configure failed; last errors in config.log ==="; grep -n -B 25 "^ERROR:" ffbuild/config.log | tail -80; grep -nE "error:" ffbuild/config.log | tail -10; exit 1; }
           make -j"$(nproc)"
           sudo make install
@@ -379,9 +394,14 @@ jobs:
             for (unsigned i = 0; i < sizeof(want)/sizeof(*want); i++) {
               if (!avcodec_find_encoder_by_name(want[i])) { fprintf(stderr, "MISSING encoder %s\n", want[i]); return 1; }
             }
-            if (avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1; }
+            /* FR-84 P0 (measurement branch, never merged): the recording
+               editor's three components are present; the rest stays trimmed. */
+            if (!avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "FR-84 P0: h264 decoder missing\n"); return 1; }
+            if (!avcodec_find_decoder_by_name("hevc")) { fprintf(stderr, "FR-84 P0: hevc decoder missing\n"); return 1; }
+            if (!avcodec_find_encoder_by_name("aac")) { fprintf(stderr, "FR-84 P0: aac encoder missing\n"); return 1; }
+            if (avcodec_find_decoder_by_name("prores")) { fprintf(stderr, "prores DECODER present — trim did not take\n"); return 1; }
             if (avcodec_find_encoder_by_name("libkvazaar")) { fprintf(stderr, "libkvazaar present — trim did not take\n"); return 1; }
-            printf("probe OK: 17 encoders present, registry trimmed\n");
+            printf("probe OK: 17 encoders + FR-84 P0 components present, registry trimmed\n");
             return 0;
           }
           EOC
@@ -407,6 +427,7 @@ jobs:
             ldd "$l" | grep -q "libvulkan" && { echo "::error::$(basename "$l") links libvulkan — the backend must stay dlopen'd"; exit 1; } || true
           done
           du -sh /opt/ffout/lib | cut -f1
+          for l in /opt/ffout/lib/*.so.*; do [ -L "$l" ] || echo "FR84-P0-SIZE $(basename "$l") $(stat -c %s "$l")"; done
 
       - name: Package + upload the minimal shared tree
         env:
@@ -441,9 +462,15 @@ jobs:
           cp /tmp/ROOMLER-PATCHES.txt "$staging/ROOMLER-PATCHES.txt"
           # FR-78 P0: `-vulkan` suffix (three more encoders, no new DT_NEEDED);
           # rollback = drop it.
-          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz -C /tmp/stage ffmpeg-minimal
-          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz | tee /tmp/min.sha256
-          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz
-          gh release upload vendored-ffmpeg-9.0.1 \
-            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
-            --repo "${{ github.repository }}" --clobber
+          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-fr84-p0.tar.xz -C /tmp/stage ffmpeg-minimal
+          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-fr84-p0.tar.xz | tee /tmp/min.sha256
+          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-fr84-p0.tar.xz
+          echo "FR84-P0-SIZE tar.xz $(stat -c %s /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-fr84-p0.tar.xz)"
+          # FR-84 P0: NEVER the release — an Actions artifact only.
+
+      - name: FR-84 P0 — upload the measurement tree as an artifact (not the release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fr84-p0-ffmpeg-linux64
+          path: /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-fr84-p0.tar.xz
+          retention-days: 14

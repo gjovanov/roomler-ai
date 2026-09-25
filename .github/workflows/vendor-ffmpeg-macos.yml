@@ -94,6 +94,7 @@ jobs:
             --enable-videotoolbox \
             --enable-encoder=h264_videotoolbox,hevc_videotoolbox,av1_videotoolbox \
             --enable-parser=h264,hevc,av1 \
+            --enable-decoder=h264,hevc --enable-encoder=aac \
             --install-name-dir=@rpath \
             --enable-pic \
             || { echo "=== configure failed; last errors in config.log ==="; \
@@ -172,8 +173,14 @@ jobs:
             /* And the trim must actually have taken — if a general decoder or
                an unrelated encoder survived, --disable-everything did not
                apply and this is the fat tree again. */
-            if (avcodec_find_decoder_by_name("h264")) {
-              fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1;
+            /* FR-84 P0 (measurement branch, never merged): the recording
+               editor's three components are present; the rest stays trimmed. */
+            if (!avcodec_find_decoder_by_name("h264") || !avcodec_find_decoder_by_name("hevc")
+                || !avcodec_find_encoder_by_name("aac")) {
+              fprintf(stderr, "FR-84 P0: h264/hevc decoder or aac encoder missing\n"); return 1;
+            }
+            if (avcodec_find_decoder_by_name("prores")) {
+              fprintf(stderr, "prores DECODER present — trim did not take\n"); return 1;
             }
             if (avcodec_find_encoder_by_name("mpeg4")) {
               fprintf(stderr, "mpeg4 encoder present — trim did not take\n"); return 1;
@@ -190,24 +197,24 @@ jobs:
           echo "=== dylib set + size (untrimmed was ~20 MB; libavcodec 12.85 MB) ==="
           ls -1 "$OUT/lib"/*.dylib | sed 's|.*/|    |'
           du -sh "$OUT/lib" | cut -f1
+          for l in "$OUT"/lib/*.dylib; do [ -L "$l" ] || echo "FR84-P0-SIZE $(basename "$l") $(stat -f %z "$l")"; done
 
       - name: Package tarball
         run: |
           set -euo pipefail
           cd "$OUT"
-          TAR="ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz"
+          TAR="ffmpeg-9.0.1-macos-arm64-lgpl-shared-fr84-p0.tar.xz"
           tar cJf "$RUNNER_TEMP/$TAR" lib include
           cd "$RUNNER_TEMP"
           shasum -a 256 "$TAR" | tee "$TAR.sha256"
           echo "TAR=$RUNNER_TEMP/$TAR" >> "$GITHUB_ENV"
           echo "size: $(du -h "$TAR" | cut -f1)"
 
-      - name: Upload to the vendored-ffmpeg-9.0.1 release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload vendored-ffmpeg-9.0.1 \
-            "$TAR" "$TAR.sha256" \
-            --repo "${{ github.repository }}" --clobber
-          echo "uploaded $(basename "$TAR") to vendored-ffmpeg-9.0.1"
+      # FR-84 P0: NEVER the release — an Actions artifact only, so the
+      # production asset release-agent.yml downloads cannot be touched.
+      - name: FR-84 P0 — upload the measurement tree as an artifact (not the release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fr84-p0-ffmpeg-macos-arm64
+          path: ${{ env.TAR }}
+          retention-days: 14
