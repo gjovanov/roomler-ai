@@ -786,7 +786,10 @@ impl Handler {
             Some(m) => match m.folder().await {
                 Some(dir) => {
                     let who = self.ctx.controller_user_id;
-                    tokio::task::spawn_blocking(move || owned_recordings(&dir, &who))
+                    // P1e — read as the recorder's identity: the folder is
+                    // the person's, and so is whatever it has been made to
+                    // point at.
+                    m.as_user(move || owned_recordings(&dir, &who))
                         .await
                         .unwrap_or_default()
                 }
@@ -830,16 +833,33 @@ impl Handler {
             return;
         };
         let who = self.ctx.controller_user_id;
-        let (dir_c, name_c) = (dir.clone(), name.clone());
-        let mine = tokio::task::spawn_blocking(move || owned_by(&dir_c, &name_c, &who))
+        let name_c = name.clone();
+        // P1e — the ownership check and the open run as the recorder's
+        // identity, so a link or a junction in the person's folder reaches
+        // only what the person could read themselves.
+        let opened = m
+            .as_user(move || {
+                if !owned_by(&dir, &name_c, &who) {
+                    return None;
+                }
+                Some(open_no_follow(&dir.join(&name_c)))
+            })
             .await
-            .unwrap_or(false);
+            .flatten();
         // ⚠️ Someone else's recording and no recording look alike: a
         // controller learns nothing about files that are not theirs.
-        if !mine {
-            self.transfer_error(&id, "not_found", None).await;
-            return;
-        }
+        let file = match opened {
+            Some(Ok(f)) => f,
+            Some(Err(e)) => {
+                self.transfer_error(&id, "not_found", Some(e.to_string()))
+                    .await;
+                return;
+            }
+            None => {
+                self.transfer_error(&id, "not_found", None).await;
+                return;
+            }
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         // The slot is claimed in ONE expression, so the (non-`Send`) guard is
         // gone before anything awaits.
@@ -855,9 +875,7 @@ impl Handler {
             self.transfer_error(&id, "transfer_in_progress", None).await;
             return;
         }
-        let outcome = self
-            .pump(&id, &dir.join(&name), &name, offset, &cancel)
-            .await;
+        let outcome = self.pump(&id, file, &name, offset, &cancel).await;
         if let Ok(mut t) = self.transfer.lock() {
             *t = None;
         }
@@ -876,10 +894,12 @@ impl Handler {
         }
     }
 
+    /// `std_file` was opened as the recorder's identity (P1e); reading an
+    /// open handle needs no identity at all.
     async fn pump(
         &self,
         id: &str,
-        path: &Path,
+        std_file: std::fs::File,
         name: &str,
         offset: u64,
         cancel: &AtomicBool,
@@ -888,7 +908,6 @@ impl Handler {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
         let read_failed = |e: std::io::Error| ("read_failed", Some(e.to_string()));
-        let std_file = open_no_follow(path).map_err(|e| ("not_found", Some(e.to_string())))?;
         let size = std_file.metadata().map_err(read_failed)?.len();
         if offset > size {
             return Err((
