@@ -241,8 +241,8 @@ impl Unavailable {
                  ({detail}). They are never run as root on a user's session instead."
             ),
             Self::ToolMissing { tool, install } => format!(
-                "`{tool}` is not installed on the agent host ({install}); listing and \
-                 focusing windows need it."
+                "`{tool}` is not installed on the agent host ({install}); this backend \
+                 needs it to find and manage the desktop."
             ),
             Self::Platform => "Remote apps have no backend on this platform — they exist for \
                                Linux desktops (X11, or Wayland through Xwayland) and Windows."
@@ -304,13 +304,22 @@ pub fn apps_config() -> VirtualDesktopAppsConfig {
 /// compositor runs Xwayland). Windows: the agent always drives the active
 /// user's desktop.
 ///
-/// The hello advertises `list`/`focus`/`launch` on `Ok`; the `rc:apps.list`
-/// reply carries the `Err` as `unavailable`. Both go through this one
-/// function, so the two can disagree only by TIME — the hello is a boot-time
-/// snapshot (`encode::caps::detect` memoizes it), the reply is live — never by
-/// logic.
+/// The hello advertises `list`/`focus`/`launch` on `Ok` (`encode::caps::detect`
+/// assigns them from [`availability_for`] with the installed config, in the
+/// daemon — never in the caps-probe child, which loads no config); the
+/// `rc:apps.list` reply carries the `Err` as `unavailable`. Both go through
+/// [`availability_for`], so the two can disagree only by TIME — the hello is
+/// a boot-time snapshot (`detect` memoizes it), the reply is live — never by
+/// logic, and never by which process asked.
 pub fn availability() -> Result<(), Unavailable> {
-    if !apps_config().enabled {
+    availability_for(&apps_config())
+}
+
+/// [`availability`] against an explicit config — the seam the hello builder
+/// uses (so its answer is testable without installing a process-global
+/// config) and the one the reply path shares.
+pub fn availability_for(cfg: &VirtualDesktopAppsConfig) -> Result<(), Unavailable> {
+    if !cfg.enabled {
         return Err(Unavailable::Disabled);
     }
     #[cfg(target_os = "linux")]

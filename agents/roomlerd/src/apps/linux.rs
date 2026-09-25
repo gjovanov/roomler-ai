@@ -52,6 +52,7 @@ const LAUNCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(250)
 /// encoded a second assumption: that the DAEMON owns the X server. That is
 /// true in virtual-desktop mode and false everywhere else, and it is why
 /// Remote Apps never engaged on a Wayland host — see [`discover`].
+#[derive(Debug)]
 pub enum Target {
     /// Virtual-desktop mode: the daemon started Xvfb and owns it, so commands
     /// run as the daemon with nothing but `DISPLAY`. Byte-for-byte the
@@ -482,18 +483,28 @@ pub fn discover() -> Result<Target, Unavailable> {
         // the daemon started that Xvfb and owns it.
         return Ok(Target::Daemon { display });
     }
+    discover_with(
+        crate::companion::graphical_session().map_err(|e| format!("{e:#}")),
+        probe,
+    )
+}
 
-    let sess = match crate::companion::graphical_session() {
+/// The session arm of [`discover`] with its two inputs injected — what
+/// `loginctl` said (or why it said nothing), and what `wmctrl -m` answers per
+/// candidate. The unit-test seam: the refusal arms below are decisions, and a
+/// decision that can only be exercised on a host with a real login session is
+/// one nobody re-checks.
+fn discover_with(
+    sess: Result<crate::companion::GraphicalSession, String>,
+    probe: impl Fn(&Target) -> Probe,
+) -> Result<Target, Unavailable> {
+    let sess = match sess {
         Ok(s) => s,
         // This used to be `.ok()?`, which discarded the sentence
         // `graphical_session` composes ("no active graphical session — nobody
         // is at this machine's screen") and left the hello silent with nothing
         // anywhere saying why.
-        Err(e) => {
-            return refused(Unavailable::NoSession {
-                detail: format!("{e:#}"),
-            });
-        }
+        Err(detail) => return refused(Unavailable::NoSession { detail }),
     };
     let xauthority = find_xauthority(sess.uid);
     // loginctl reports `Display=` for X11 sessions and often not for Wayland
@@ -821,5 +832,145 @@ mod tests {
         assert!(!is_safe_session("a b"));
         assert!(!is_safe_session("a;rm -rf"));
         assert!(!is_safe_session(&"x".repeat(65)));
+    }
+
+    // ── FR-56 AC10 (review of #1667) — the refusal arms of `discover`, driven
+    // through the `discover_with` seam with a scripted `wmctrl -m`. Each test
+    // is red with its arm reverted to the pre-P6 behaviour (recorded in the
+    // PR): ToolMissing → `Ok(target)`, CannotRun → `continue`, NoSession →
+    // an empty detail.
+
+    use std::cell::RefCell;
+
+    /// A login session as `loginctl` would report it. The uid is one no host
+    /// has, so `find_xauthority` finds no runtime dir and carries no cookie.
+    fn session(display: Option<&str>, wayland: bool) -> crate::companion::GraphicalSession {
+        crate::companion::GraphicalSession {
+            uid: u32::MAX - 7,
+            name: "someone".to_string(),
+            display: display.map(str::to_string),
+            wayland_display: wayland.then(|| "wayland-0".to_string()),
+        }
+    }
+
+    fn display_of(t: &Target) -> String {
+        match t {
+            Target::Daemon { display } | Target::Session { display, .. } => display.clone(),
+        }
+    }
+
+    #[test]
+    fn no_session_keeps_the_sentence_and_never_probes() {
+        let probes = RefCell::new(0u32);
+        let sentence = "no active graphical session — nobody is at this machine's screen";
+        let out = discover_with(Err(sentence.to_string()), |_| {
+            *probes.borrow_mut() += 1;
+            Probe::Answered
+        });
+        match out {
+            Err(Unavailable::NoSession { detail }) => {
+                assert!(
+                    detail.contains("nobody is at this machine's screen"),
+                    "{detail}"
+                );
+                assert!(
+                    Unavailable::NoSession { detail }
+                        .reason()
+                        .contains("nobody is at"),
+                    "the sentence must survive into the wire reason"
+                );
+            }
+            other => panic!("expected NoSession, got {other:?}"),
+        }
+        assert_eq!(*probes.borrow(), 0, "nothing to probe without a session");
+    }
+
+    #[test]
+    fn wmctrl_missing_on_the_first_candidate_refuses_at_once() {
+        let probes = RefCell::new(0u32);
+        let out = discover_with(Ok(session(Some(":5"), true)), |_| {
+            *probes.borrow_mut() += 1;
+            Probe::ToolMissing
+        });
+        match out {
+            Err(Unavailable::ToolMissing { tool, install }) => {
+                assert_eq!(tool, "wmctrl");
+                assert!(install.contains("install"), "{install}");
+            }
+            other => panic!("expected ToolMissing, got {other:?}"),
+        }
+        // A missing binary says nothing about a display, and the next display
+        // cannot install it: one probe, then the refusal.
+        assert_eq!(*probes.borrow(), 1);
+    }
+
+    #[test]
+    fn a_failed_privilege_drop_stops_at_the_first_candidate() {
+        let tried: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let out = discover_with(Ok(session(None, false)), |t| {
+            tried.borrow_mut().push(display_of(t));
+            Probe::CannotRun("setuid refused".to_string())
+        });
+        match out {
+            Err(Unavailable::CannotRunAs { user, detail }) => {
+                assert_eq!(user, "someone");
+                assert_eq!(detail, "setuid refused");
+            }
+            other => panic!("expected CannotRunAs, got {other:?}"),
+        }
+        // Pre-P6 this was folded into NoDisplay: `:1` was tried next and the
+        // answer came back as "no Xwayland". The account has not changed
+        // between displays, so the walk must stop here.
+        assert_eq!(*tried.borrow(), vec![":0".to_string()]);
+    }
+
+    #[test]
+    fn no_x_display_walks_every_candidate_then_names_them() {
+        let tried: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let out = discover_with(Ok(session(Some(":7"), true)), |t| {
+            tried.borrow_mut().push(display_of(t));
+            Probe::NoDisplay
+        });
+        let want = vec![":7".to_string(), ":0".to_string(), ":1".to_string()];
+        assert_eq!(
+            *tried.borrow(),
+            want,
+            "loginctl's Display= first, then the guesses"
+        );
+        match out {
+            Err(Unavailable::NoXDisplay { user, tried }) => {
+                assert_eq!(user, "someone");
+                assert_eq!(tried, want, "the reply names what was tried");
+            }
+            other => panic!("expected NoXDisplay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_first_answering_candidate_wins_as_the_session_owner() {
+        let out = discover_with(Ok(session(None, true)), |t| {
+            if display_of(t) == ":1" {
+                Probe::Answered
+            } else {
+                Probe::NoDisplay
+            }
+        });
+        match out {
+            Ok(Target::Session {
+                display,
+                wayland,
+                user,
+                xauthority,
+            }) => {
+                assert_eq!(display, ":1");
+                assert!(wayland, "a Wayland session is reported as one (P2)");
+                assert_eq!(
+                    user, "someone",
+                    "commands run as the session's owner, never root"
+                );
+                assert!(xauthority.is_none(), "no runtime dir for a uid nobody has");
+            }
+            other => panic!("expected a Session target on :1, got {other:?}"),
+        }
     }
 }

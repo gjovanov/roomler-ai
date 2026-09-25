@@ -553,6 +553,14 @@ pub fn detect() -> AgentCaps {
             // them HERE, where the config fallbacks are registered,
             // whatever the child (or the cache) saw.
             caps.rpc = rpc_caps();
+            // FR-56 AC10 (review of #1667) — the Remote Apps verbs likewise,
+            // and for a second reason: on a cache MISS `cached_or_probed` is
+            // the caps-probe CHILD's struct wholesale, and the child loads no
+            // config and must not run a privilege-dropped desktop walk. Until
+            // this line, `[virtual_desktop_apps] enabled = false` did not stop
+            // the hello advertising `list` on every release's first boot, or
+            // on any boot of a host with no hardware cell (never cached).
+            caps.apps = apps_caps();
             caps
         })
         .clone()
@@ -1258,28 +1266,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         audio.push("opus".into());
     }
 
-    // Remote app selection & launch. `list`/`focus`/`launch` are advertised
-    // only when this process can actually manage a desktop (a Linux virtual
-    // desktop or a logged-in X11/Xwayland session, or Windows) AND the
-    // operator hasn't disabled it; the browser gates its Apps menu on this
-    // list. Older agents omit the field → menu hidden.
-    //
-    // FR-56 AC10 — `status` says "this build has a Remote Apps backend and
-    // answers `rc:apps.list` honestly": with the list when there is a desktop,
-    // with `unavailable: {code, reason}` when there is not. It is what lets the
-    // viewer show WHY instead of hiding the button — and it matters because
-    // this whole struct is a boot-time snapshot (`detect()` memoizes it), so
-    // `list` being absent here can simply mean nobody had logged in yet when
-    // the daemon started. The reply is live; the hello is not.
-    let mut apps: Vec<String> = Vec::new();
-    if crate::apps::has_backend() {
-        apps.push("status".into());
-    }
-    if crate::apps::apps_supported() {
-        apps.push("list".into());
-        apps.push("focus".into());
-        apps.push("launch".into());
-    }
+    // Remote Apps verbs: deliberately NOT computed here. `detect()` assigns
+    // them from `apps_caps()` in the daemon — see that function for why the
+    // caps-probe child must never be the one to answer.
 
     // Clipboard protocol-v2 flags. Advertised purely on feature
     // presence (like `supports_clipboard`): the handlers for ack /
@@ -1360,7 +1349,9 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         vp9_chroma,
         hevc_chroma,
         audio,
-        apps,
+        // Empty in the child's struct BY DESIGN; `detect()` fills it in the
+        // daemon (`apps_caps`). A test locks this.
+        apps: Vec::new(),
         clipboard,
         layout,
         video_cells,
@@ -1389,6 +1380,48 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // `Permissions::RECORD` from every grant to this agent.
         record: Vec::new(),
     }
+}
+
+/// FR-56 — the Remote Apps verbs, assigned by [`detect`] in the DAEMON and
+/// never computed inside `compute_caps`.
+///
+/// Two reasons, one measured in the review of #1667. On a caps-cache MISS the
+/// hello takes the caps-probe child's struct wholesale, and the child loads
+/// no config — so an apps block inside `compute_caps` advertised `list` on a
+/// device whose owner had set `[virtual_desktop_apps] enabled = false`, on
+/// every release's first boot and on every boot of a host with no hardware
+/// cell (a no-hardware answer is never cached). And the child exists to
+/// contain untrusted driver code; a privilege-dropped `loginctl`/`wmctrl`
+/// walk of somebody's login session has no business in it.
+///
+/// `list` / `focus` / `launch` are advertised only when this process can
+/// manage a desktop right now (a Linux virtual desktop or a logged-in
+/// X11/Xwayland session, or Windows) AND the operator hasn't disabled it; the
+/// browser gates its Apps menu on this list, and older agents omit the field.
+/// `status` (AC10) says "this build has a Remote Apps backend and answers
+/// `rc:apps.list` honestly": with the list when there is a desktop, with
+/// `unavailable: {code, reason}` when there is not. It is what lets the viewer
+/// show WHY instead of hiding the button — and it matters because this struct
+/// is a boot-time snapshot (`detect` memoizes it), so `list` absent here can
+/// simply mean nobody had logged in yet when the daemon started. The reply is
+/// live; the hello is not.
+fn apps_caps() -> Vec<String> {
+    apps_caps_for(&crate::apps::apps_config())
+}
+
+/// [`apps_caps`] against an explicit config — testable without installing the
+/// process-global one, and the same seam the reply path answers through.
+fn apps_caps_for(cfg: &crate::apps::VirtualDesktopAppsConfig) -> Vec<String> {
+    let mut apps: Vec<String> = Vec::new();
+    if crate::apps::has_backend() {
+        apps.push("status".into());
+    }
+    if crate::apps::availability_for(cfg).is_ok() {
+        apps.push("list".into());
+        apps.push("focus".into());
+        apps.push("launch".into());
+    }
+    apps
 }
 
 /// Fleet-RPC + roomler-SSH verb capabilities.
@@ -1913,6 +1946,65 @@ mod tests {
             "rc.19 caps.files must include \"resume\"; got {:?}",
             caps.files
         );
+    }
+
+    /// FR-56 AC10 (review of #1667) — `apps` is the DAEMON's to assign, in
+    /// `detect()`, never the caps-probe child's to compute. On a cache miss
+    /// `cached_or_probed` returns the child's struct wholesale, and the child
+    /// loads no config: with the apps block inside `compute_caps`, a device
+    /// with `[virtual_desktop_apps] enabled = false` still advertised `list`
+    /// on every release's first boot and on every boot of a host with no
+    /// hardware cell. So what the child runs must leave the field empty — a
+    /// re-added block here is exactly the regression, and this is red on it.
+    #[test]
+    fn apps_are_assigned_by_the_daemon_never_by_the_probe_child() {
+        let caps = compute_caps(false, false);
+        assert!(
+            caps.apps.is_empty(),
+            "compute_caps is what the caps-probe child runs; it must leave `apps` to \
+             detect(), which reads the installed config in the daemon — got {:?}",
+            caps.apps
+        );
+    }
+
+    /// FR-56 AC10 — `status` is locked on every build with a backend and absent
+    /// elsewhere, and the three verbs follow the CONFIG the daemon installed,
+    /// not the built-in default. Driven through `apps_caps_for` so no
+    /// process-global config is installed and no login session is looked for.
+    #[test]
+    fn apps_caps_lock_status_and_follow_the_config() {
+        use crate::apps::VirtualDesktopAppsConfig;
+        let off = VirtualDesktopAppsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let apps = apps_caps_for(&off);
+        let apps: Vec<&str> = apps.iter().map(String::as_str).collect();
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            assert_eq!(
+                apps,
+                vec!["status"],
+                "disabled: `status` alone — the entry shows, and the reply says `disabled`"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            assert!(
+                apps.is_empty(),
+                "no backend on this platform, nothing to advertise: {apps:?}"
+            );
+        }
+        // Windows always drives the active desktop, so with the feature on the
+        // three verbs follow. On Linux the answer depends on a login session,
+        // which a unit test must not go looking for.
+        #[cfg(target_os = "windows")]
+        {
+            let on = VirtualDesktopAppsConfig::default();
+            let apps = apps_caps_for(&on);
+            let apps: Vec<&str> = apps.iter().map(String::as_str).collect();
+            assert_eq!(apps, vec!["status", "list", "focus", "launch"]);
+        }
     }
 
     /// The child's output has to survive the round trip, or the parent falls
