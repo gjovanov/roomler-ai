@@ -10,10 +10,16 @@
  * reachable from the tray's "Welcome tour" and from Settings.
  *
  * Every choice is saved the moment it is made (cmd_config_set), so quitting
- * half-way loses nothing. Keys the daemon applies only at a restart are
- * collected in `pending` and applied together by ONE service restart: the
+ * half-way loses nothing. Keys the daemon applies only at a restart join the
+ * app's ONE pending set (Settings' restart bar shows the same keys) and are
+ * applied together by ONE service restart — through the ONE restart flow,
+ * `window.Roomler.restartDaemon` (settings.js, FR-84 D3): the
  * private-network step restarts at once (it has to, to show the address it
  * gets), and anything chosen after that is applied from the last step.
+ *
+ * Received files use FR-84 D4's own commands (`cmd_files_dir_view`,
+ * `cmd_pick_files_dir`, `cmd_open_files_dir`, `cmd_files_dir_default`), and
+ * the service's refusals are shown verbatim.
  *
  * All dynamic text goes in through textContent.
  */
@@ -30,8 +36,32 @@
 
   let step = 0;
   let busy = false;
-  // Config keys saved during the tour that wait for a service restart.
-  const pending = new Set();
+  // Keys waiting for a service restart: the app's one set, Settings' restart
+  // bar included (settings.js). A local stand-in only if that is absent.
+  const localPending = new Set();
+  const pending = {
+    add(key) {
+      const shared = window.Roomler.settingsPendingRestart;
+      if (shared) shared.add(key);
+      else localPending.add(key);
+    },
+    size() {
+      const shared = window.Roomler.settingsPendingRestart;
+      return shared ? shared.keys().length : localPending.size;
+    },
+    keys() {
+      const shared = window.Roomler.settingsPendingRestart;
+      return shared ? shared.keys() : [...localPending];
+    },
+    has(key) {
+      return this.keys().includes(key);
+    },
+    clear() {
+      const shared = window.Roomler.settingsPendingRestart;
+      if (shared) shared.clear();
+      localPending.clear();
+    },
+  };
   // Last config entries read, keyed by key.
   let entries = new Map();
   // What the tour did, for the summary.
@@ -88,11 +118,11 @@
     return 'unknown';
   }
 
-  /* ── service restart (FR-84 D3 when present) ─────────────────────── */
+  /* ── service restart: the app's one flow (settings.js, FR-84 D3) ──── */
 
-  /* Resolves {ok:true} once the service is back, {ok:false, message} when it
-   * refused or did not come back, {manual:true} when this build cannot
-   * restart it (a service that predates "Apply now"). */
+  /* {ok:true} once a NEW daemon answers; {ok:false, message} when it refused
+   * (the service's own words) or did not come back; {manual:true} when the
+   * service predates "Apply now" — or this page has no restart flow at all. */
   async function restartService(reason, progress) {
     const R = window.Roomler;
     if (typeof R.restartDaemon === 'function') {
@@ -222,14 +252,87 @@
     }
   }
 
+  /* Received files — FR-84 D4's `cmd_files_dir_view`: where the next file
+   * lands (`effective`), what is configured, and whether this service knows
+   * the setting at all. */
+  let filesView = null;
+  let filesBusy = false;
+
+  async function refreshFiles() {
+    try {
+      filesView = await invoke('cmd_files_dir_view');
+    } catch (e) {
+      filesView = { available: false, reason: String(e) };
+    }
+    paintFiles();
+  }
+
   function paintFiles() {
-    // FR-84 D4 reports the effective folder as NodeStatus.files_dir; a service
-    // without it keeps the long-standing default (the Downloads folder).
-    const dv = get('deviceView');
-    const dir = dv && dv.status && dv.status.files_dir;
-    setText('wl-files-path', dir || 'your Downloads folder');
+    const v = filesView;
     const actions = el('wl-files-actions');
-    if (actions) actions.hidden = !dir;
+    const useDefault = el('wl-btn-files-default');
+    if (!v) {
+      setText('wl-files-path', '…');
+      actions.hidden = true;
+      return;
+    }
+    if (!v.available) {
+      setText('wl-files-path', '—');
+      setText(
+        'wl-files-note',
+        v.reason === 'daemon_unreachable'
+          ? 'The Roomler service is not running, so the folder cannot be shown or changed right now.'
+          : 'Could not read the setting: ' + (v.reason || 'unknown error'),
+      );
+      actions.hidden = true;
+      return;
+    }
+    setText('wl-files-path', v.effective || 'your Downloads folder');
+    if (!v.supported) {
+      setText(
+        'wl-files-note',
+        'This version of the Roomler service always uses your Downloads folder; updating it lets you choose.',
+      );
+      actions.hidden = true;
+      return;
+    }
+    actions.hidden = false;
+    useDefault.hidden = !v.configured;
+    setText(
+      'wl-files-note',
+      v.configured
+        ? 'Your choice: ' + v.configured +
+            (v.configured.startsWith('~') ? ' (inside the profile of whoever is signed in)' : '') +
+            '. The Overview shows the same folder.'
+        : "The default: the signed-in user's Downloads folder. You can pick another folder here or later on the Overview.",
+    );
+  }
+
+  async function filesAction(run) {
+    if (filesBusy) return;
+    filesBusy = true;
+    say('wl-files-result', '');
+    try {
+      const text = await run();
+      if (text) say('wl-files-result', text, 'ok');
+    } catch (e) {
+      // The service's own words: a refusal names the rule it applied.
+      say('wl-files-result', String(e), 'error');
+    } finally {
+      filesBusy = false;
+      await refreshFiles();
+    }
+  }
+
+  function filesSavedText(entry, value) {
+    const where = value || (entry && entry.value) || 'the default folder';
+    return (
+      'Saved: ' +
+      where +
+      (entry && entry.restart_required
+        ? ' — takes effect after the service restarts.'
+        : ' — in effect now, for the next file.')
+    );
   }
 
   async function paintLogin() {
@@ -249,7 +352,7 @@
       'wl-sum-login',
       outcome.login || (loginBox && loginBox.checked ? 'On' : 'Off'),
     );
-    const n = pending.size;
+    const n = pending.size();
     el('wl-pending').hidden = n === 0;
     if (n > 0) {
       setText(
@@ -267,7 +370,7 @@
     if (name === 'device') paintDevice();
     else if (name === 'network') paintNetwork();
     else if (name === 'consent') paintConsent();
-    else if (name === 'files') paintFiles();
+    else if (name === 'files') await refreshFiles();
     else if (name === 'login') await paintLogin();
     else if (name === 'done') paintDone();
   }
@@ -350,15 +453,16 @@
       }
       await setKey('overlay_enabled', 'true');
 
-      say('wl-net-result', 'Restarting the Roomler service…');
       const r = await restartService('welcome: private network', (text) => say('wl-net-result', text));
       if (r.manual) {
         outcome.network = 'On after the service restarts';
-        say('wl-net-result', manualRestartHint());
+        say('wl-net-result', r.message ? 'Saved. ' + r.message : manualRestartHint());
         return;
       }
       if (!r.ok) {
-        say('wl-net-result', 'Not restarted: ' + (r.message || 'unknown reason'), 'error');
+        // The flow's own words: a refusal verbatim, or why it did not come back.
+        outcome.network = 'On after the service restarts';
+        say('wl-net-result', r.message || 'The service was not restarted.', 'error');
         return;
       }
       pending.clear();
@@ -447,20 +551,19 @@
   async function applyPending() {
     const btn = el('wl-btn-apply');
     btn.disabled = true;
-    say('wl-pending-result', 'Restarting the Roomler service…');
     const r = await restartService(
-      'welcome: ' + [...pending].join(', '),
+      'welcome: ' + pending.keys().join(', '),
       (text) => say('wl-pending-result', text),
     );
     if (r.manual) {
-      say('wl-pending-result', manualRestartHint());
+      say('wl-pending-result', r.message ? 'Saved. ' + r.message : manualRestartHint());
     } else if (r.ok) {
       pending.clear();
       say('wl-pending-result', 'Done — your choices are in effect.', 'ok');
       await loadEntries();
       paintDone();
     } else {
-      say('wl-pending-result', 'Not restarted: ' + (r.message || 'unknown reason'), 'error');
+      say('wl-pending-result', r.message || 'The service was not restarted.', 'error');
     }
     btn.disabled = false;
   }
@@ -522,11 +625,24 @@
       if (STEPS[step] === 'device') paintDevice();
       if (STEPS[step] === 'network' && !busy) paintNetwork();
     });
-    on('deviceView', () => {
+    on('deviceView', (dv) => {
       if (window.Roomler.currentView() !== 'welcome') return;
       if (STEPS[step] === 'device') paintDevice();
       if (STEPS[step] === 'network' && !busy) setText('wl-net-state', networkState());
-      if (STEPS[step] === 'files') paintFiles();
+      // The daemon's effective folder moved (a change made elsewhere, a
+      // refusal at use time): read the view again, as the Overview does.
+      const st = dv && dv.available && dv.status;
+      if (
+        STEPS[step] === 'files' &&
+        !filesBusy &&
+        st &&
+        st.files_dir &&
+        filesView &&
+        filesView.available &&
+        st.files_dir !== filesView.effective
+      ) {
+        void refreshFiles();
+      }
     });
 
     el('wl-btn-next').addEventListener('click', () => void go(1));
@@ -540,24 +656,27 @@
       void setAutostart(ev.target.checked, 'wl-login-result', 'wl-login-toggle', 'wl-login-note', 'wl-login-label'),
     );
 
-    // FR-84 D4's folder commands, when this build has them.
-    el('wl-btn-files-open').addEventListener('click', async () => {
-      try {
+    // FR-84 D4's folder commands; the service's refusals shown verbatim.
+    el('wl-btn-files-open').addEventListener('click', () =>
+      filesAction(async () => {
         await invoke('cmd_open_files_dir');
-      } catch (e) {
-        say('wl-files-result', 'Could not open it: ' + e, 'error');
-      }
-    });
-    el('wl-btn-files-change').addEventListener('click', async () => {
-      try {
-        const picked = await invoke('cmd_pick_files_dir');
-        if (picked) say('wl-files-result', 'Saved.', 'ok');
-        await window.Roomler.refreshDeviceView();
-        paintFiles();
-      } catch (e) {
-        say('wl-files-result', String(e), 'error');
-      }
-    });
+        return '';
+      }),
+    );
+    el('wl-btn-files-change').addEventListener('click', () =>
+      filesAction(async () => {
+        const r = await invoke('cmd_pick_files_dir');
+        return r.cancelled ? '' : filesSavedText(r.entry, r.value);
+      }),
+    );
+    el('wl-btn-files-default').addEventListener('click', () =>
+      filesAction(async () => {
+        const entry = await invoke('cmd_files_dir_default');
+        return entry.restart_required
+          ? 'Back to the default folder after the service restarts.'
+          : 'Back to the default folder — in effect now.';
+      }),
+    );
 
     // The Settings card.
     const stToggle = el('st-autostart-toggle');
