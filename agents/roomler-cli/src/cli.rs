@@ -306,6 +306,28 @@ enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// Restart the local daemon through the service manager that runs it —
+    /// the companion's "Apply now" (FR-84), for changes `config ls` marks as
+    /// needing a restart.
+    ///
+    /// The daemon decides, and this exits non-zero when it refuses: it
+    /// restarts only under a supervisor it can prove (a Windows service or
+    /// scheduled task, systemd, launchd) — a hand-started `roomlerd run` is
+    /// never taken offline — at most once every 30 s, and never while
+    /// `local_restart_enabled` is off or a recording is running. Then waits
+    /// (up to 60 s) until the NEW daemon answers, starting the scheduled task
+    /// itself where that is how the daemon comes back.
+    ///
+    ///   roomler restart --reason "applied overlay settings"
+    Restart {
+        /// Why — written to the daemon's log and its restart record.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Return as soon as the daemon has accepted, without waiting for the
+        /// new one (the relaunch is then the supervisor's alone).
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
@@ -608,6 +630,32 @@ pub enum Origin {
     EmbeddedInDaemon,
 }
 
+/// FR-84 D3 — the `roomlerd` binary `roomler restart` runs `service start`
+/// with, when bringing the daemon back is the caller's job (the Windows
+/// Scheduled Task). Embedded in the daemon — `roomlerd cli`, which is what the
+/// installed `roomler` shim re-execs — that is this very executable;
+/// standalone, a sibling, else whatever `roomlerd` PATH finds.
+fn daemon_exe(origin: Origin) -> Option<PathBuf> {
+    let me = std::env::current_exe().ok();
+    if origin == Origin::EmbeddedInDaemon {
+        return me;
+    }
+    let name = if cfg!(windows) {
+        "roomlerd.exe"
+    } else {
+        "roomlerd"
+    };
+    if let Some(sibling) = me
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join(name))
+        .filter(|p| p.is_file())
+    {
+        return Some(sibling);
+    }
+    Some(PathBuf::from(name))
+}
+
 /// Entry point for the standalone `roomler` binary — parses the process's
 /// own argv.
 pub async fn run() -> Result<()> {
@@ -824,6 +872,9 @@ where
             RecordAction::Ls { fmt } => localclient::recordings_ls(fmt.json).await,
             RecordAction::Rm { name } => localclient::recording_rm(&name).await,
         },
+        Command::Restart { reason, no_wait } => {
+            localclient::restart(&reason, no_wait, daemon_exe(origin)).await
+        }
         Command::Ping {
             target,
             timeout_ms,
