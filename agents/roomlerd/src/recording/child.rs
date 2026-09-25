@@ -30,7 +30,9 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 
 use super::folder;
-use super::recorder::{self, EncoderFactory, RecordOptions, RecorderEvent, StartError};
+use super::recorder::{
+    self, AudioSources, EncoderFactory, RecordOptions, RecorderEvent, StartError, StartRefusal,
+};
 use super::sidecar::{Initiator, StopReason};
 
 /// Command-line options of `roomlerd record`.
@@ -45,6 +47,107 @@ pub struct RecordArgs {
     /// A remote recording's controller (P3 passes it); `None` = local.
     pub remote_user_id: Option<String>,
     pub remote_user_name: Option<String>,
+    /// FR-85 P1c — record what the computer plays.
+    pub system_audio: bool,
+    /// FR-85 P1c — record the microphone. Local only: no remote path ever
+    /// sets it.
+    pub microphone: bool,
+}
+
+/// Open the audio sources the recording was asked for. Each failure is
+/// named — a recording that silently lacks the audio the person asked for is
+/// worse than a refusal that says which source did not open.
+fn open_audio(
+    system: bool,
+    microphone: bool,
+) -> std::result::Result<AudioSources, (StartRefusal, String)> {
+    #[cfg(feature = "audio")]
+    {
+        let mut sources = AudioSources::default();
+        if system {
+            sources.system = Some(
+                open_system_audio()
+                    .map_err(|e| (StartRefusal::SystemAudioUnavailable, format!("{e:#}")))?,
+            );
+        }
+        if microphone {
+            sources.microphone = Some(
+                open_microphone().map_err(|e| (StartRefusal::MicUnavailable, mic_detail(&e)))?,
+            );
+        }
+        Ok(sources)
+    }
+    #[cfg(not(feature = "audio"))]
+    {
+        if system || microphone {
+            return Err((
+                StartRefusal::AudioUnavailable,
+                "this build of roomlerd has no audio capture".into(),
+            ));
+        }
+        Ok(AudioSources::default())
+    }
+}
+
+/// Computer audio: the loopback / monitor source only — never a microphone.
+#[cfg(feature = "audio")]
+fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
+    #[cfg(feature = "synthetic-frame-source")]
+    if std::env::var_os("ROOMLERD_SYNTHETIC_AUDIO").is_some() {
+        // A 440 Hz tone at 44.1 kHz mono: the shape of a real device,
+        // including a rate that is not 48 kHz.
+        return Ok(Box::new(super::audio::SineCapture::new(
+            440.0, 44_100, 1, 8_000.0,
+        )));
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let cap = crate::audio::cpal_backend::CpalLoopbackCapture::open_source(
+            crate::audio::cpal_backend::Source::SystemOnly,
+        )?;
+        Ok(Box::new(cap))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        bail!("computer audio cannot be recorded on this platform (macOS needs ScreenCaptureKit)")
+    }
+}
+
+/// The microphone: the default input device.
+#[cfg(feature = "audio")]
+fn open_microphone() -> Result<Box<dyn crate::audio::AudioCapture>> {
+    #[cfg(feature = "synthetic-frame-source")]
+    if std::env::var_os("ROOMLERD_SYNTHETIC_AUDIO").is_some() {
+        return Ok(Box::new(crate::audio::NoopAudioCapture));
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let cap = crate::audio::cpal_backend::CpalLoopbackCapture::open_source(
+            crate::audio::cpal_backend::Source::Microphone,
+        )?;
+        Ok(Box::new(cap))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        bail!("recording the microphone on this platform arrives with FR-85 P1c (macOS)")
+    }
+}
+
+/// What to say when the microphone did not open: on Windows, the one
+/// setting that most often blocks it without any other sign.
+#[cfg(feature = "audio")]
+fn mic_detail(e: &anyhow::Error) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!(
+            "{e:#} — if a microphone is connected, check Settings › Privacy & security › \
+             Microphone › “Let desktop apps access your microphone”"
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("{e:#}")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +353,16 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
     };
     opts.encoder_keeps_gop = keeps_gop;
 
+    // FR-85 P1c — audio, both sources default OFF; a source asked for and not
+    // opened refuses the whole start, by name.
+    let audio = match open_audio(args.system_audio, args.microphone) {
+        Ok(a) => a,
+        Err((refusal, detail)) => {
+            emit(&serde_json::json!({"ev": "refused", "code": refusal.as_str(), "detail": detail}));
+            bail!("{detail}");
+        }
+    };
+
     // The recorder's own capturer, at native resolution — never the live
     // pump's capped rung.
     let capturer = crate::capture::open_default(opts.fps, crate::capture::DownscalePolicy::Never);
@@ -307,7 +420,7 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
         }
     });
 
-    let result = recorder::run(opts, capturer, factory, stop_rx, ev_tx).await;
+    let result = recorder::run_with_audio(opts, capturer, factory, audio, stop_rx, ev_tx).await;
     let _ = printer.await;
     // Never exit mid-remux: a killed remux is safe (it writes a temp and
     // renames), but it is work the next recorder would only have to redo.

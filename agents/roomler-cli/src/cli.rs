@@ -456,6 +456,12 @@ enum RecordAction {
         /// Stop by itself after this many minutes. Default: 240.
         #[arg(long)]
         max_minutes: Option<u32>,
+        /// Also record what the computer plays (Windows, Linux).
+        #[arg(long)]
+        system_audio: bool,
+        /// Also record the microphone.
+        #[arg(long)]
+        microphone: bool,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -745,8 +751,20 @@ where
                 fps,
                 encoder,
                 max_minutes,
+                system_audio,
+                microphone,
                 fmt,
-            } => localclient::record_start(fps, encoder, max_minutes, fmt.json).await,
+            } => {
+                localclient::record_start(
+                    fps,
+                    encoder,
+                    max_minutes,
+                    system_audio,
+                    microphone,
+                    fmt.json,
+                )
+                .await
+            }
             RecordAction::Stop { fmt } => localclient::record_stop(fmt.json).await,
             RecordAction::Status { fmt } => localclient::record_status(fmt.json).await,
             RecordAction::Ls { fmt } => localclient::recordings_ls(fmt.json).await,
@@ -1118,16 +1136,40 @@ mod tests {
                         fps,
                         encoder,
                         max_minutes,
+                        system_audio,
+                        microphone,
                         fmt,
                     },
             } => {
                 assert_eq!(fps, Some(60));
                 assert_eq!(encoder.as_deref(), Some("software"));
                 assert_eq!(max_minutes, None, "absent = the daemon's default");
+                assert!(
+                    !system_audio && !microphone,
+                    "audio is OFF unless asked for"
+                );
                 assert!(fmt.json);
             }
             other => panic!("expected record start, got {other:?}"),
         }
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "record",
+            "start",
+            "--system-audio",
+            "--microphone",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Record {
+                action: RecordAction::Start {
+                    system_audio: true,
+                    microphone: true,
+                    ..
+                }
+            }
+        ));
         let cli = Cli::try_parse_from(["roomler", "record", "rm", "a.mp4"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -1139,8 +1181,8 @@ mod tests {
             let cli = Cli::try_parse_from(["roomler", "record", verb]).unwrap();
             assert!(matches!(cli.command, Command::Record { .. }), "{verb}");
         }
-        // There is no microphone flag until audio lands (P1c).
-        assert!(Cli::try_parse_from(["roomler", "record", "start", "--microphone"]).is_err());
+        // Audio flags belong to `start` alone.
+        assert!(Cli::try_parse_from(["roomler", "record", "stop", "--microphone"]).is_err());
     }
 
     #[test]
