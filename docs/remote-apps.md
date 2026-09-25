@@ -137,8 +137,9 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1408`,
-`:548`) — in the daemon, never in the caps-probe child (§4.3).
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1487`,
+`:624` via `with_config_lists` `:655`) — in the daemon, never in the
+caps-probe child (§4.3).
 
 | Tier / path | Hello `apps` on 0.4.102 | `rc:apps.list.reply` on 0.4.102 | Reason reached the screen? | After P6 |
 |---|---|---|---|---|
@@ -231,10 +232,11 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 
 ### 4.3 The hello is a boot-time snapshot; the reply is live
 
-`detect()` assigns `caps.apps = apps_caps()` once, beside `caps.rpc`, and
-memoizes the whole `AgentCaps` behind a `OnceLock`
-(`agents/roomlerd/src/encode/caps.rs:37`, `:548`); both the hello and the
-FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:4231`, `:1601`)
+`detect()` assigns `caps.apps = apps_caps()` once, beside `caps.rpc` and
+`caps.files` (the `with_config_lists` seam), and memoizes the whole
+`AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:37`,
+`:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
+(`agents/roomlerd/src/signaling.rs:4286`, `:1602`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -259,12 +261,14 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:277`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:1408`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:1487`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
-  entry rode the same default the same way — and is assigned on the next
-  line of `detect()` (`files_caps`).
+  entry rode the same default the same way — and is assigned by the same
+  seam (`with_config_lists`, `caps.rs:655`; `files_caps` `:1532`), which a
+  test locks assignment by assignment: `detect()` itself cannot run in a
+  unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
   `useRemoteControl.ts:890`) rather than papering over it — inventing a reason
@@ -401,7 +405,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:127`, `MissingTool` `:151`, `Unavailable` `:176` with `code` `:209` and `reason` `:221`), the `WindowManager` trait (`:259`), `availability` (`:314`) and `availability_for` (`:321`), `has_backend` (`:357`), `backend` (`:367`), `handle_control_message` (`:390`) and the pure `dispatch` seam (`:410`), the three reply builders (`:433`, `:471`, `:489`), `unavailable_reply` (`:521`), `resolve_app` (`:536`), the `wmctrl`/tmux parsers and `classify_title` (`:650`) |
 | `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
-| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1408`, `:1414`), assigned in `detect` (`:548`) beside `rpc`; `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:574`) — why the child's struct must carry no `apps` |
+| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1487`, `:1493`), assigned by `with_config_lists` (`:655`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1532`, `:1539`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:667`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8452`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:457`) |
 | `agents/roomlerd/src/main.rs` | `apps-probe` (`:4696`) — reads the device config through `read_if_present`, never `load` |
