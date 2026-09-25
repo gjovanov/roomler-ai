@@ -336,9 +336,17 @@ fn running_probe_enabled() -> bool {
 async fn running_state_inner() -> Option<CompanionRunning> {
     // Nothing installed ⇒ not measured; see `running_state`.
     let installed = installed_companion_exe()?;
+    probe_running(&installed, COMPANION_PROCESS).await
+}
+
+/// The measurement itself, with the file and the process name passed in so a
+/// test can run it for real against a binary it controls — the pure verdict
+/// and parser tests cannot tell whether `pgrep` and `/proc` behave as assumed.
+#[cfg(unix)]
+async fn probe_running(installed: &std::path::Path, process: &str) -> Option<CompanionRunning> {
     let installed = FileId::of(&std::fs::metadata(installed).ok()?);
-    let pids = pgrep_pids(COMPANION_PROCESS).await?;
-    let running = running_images(&pids).await;
+    let pids = pgrep_pids(process).await?;
+    let running = running_images(&pids, process).await;
     running_verdict(installed, &running)
 }
 
@@ -457,7 +465,7 @@ async fn bounded_output(mut cmd: tokio::process::Command) -> Option<std::process
 /// per-user daemon reads its own user's). `/usr/sbin/lsof` by absolute path:
 /// `sbin` is on launchd's default `PATH` but not on every user's.
 #[cfg(target_os = "macos")]
-async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
+async fn running_images(pids: &[u32], process: &str) -> Vec<Option<FileId>> {
     if pids.is_empty() {
         return Vec::new();
     }
@@ -474,7 +482,7 @@ async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
     // the pids has gone, while still printing the rest.
     let found = bounded_output(cmd)
         .await
-        .map(|o| parse_lsof_images(&String::from_utf8_lossy(&o.stdout), COMPANION_PROCESS))
+        .map(|o| parse_lsof_images(&String::from_utf8_lossy(&o.stdout), process))
         .unwrap_or_default();
     pids.iter().map(|p| found.get(p).copied()).collect()
 }
@@ -483,8 +491,10 @@ async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
 /// even after the file was replaced or deleted. A pid that has gone, or that
 /// is not ours to read (a per-user daemon looking at another user's companion),
 /// is unknown — not current.
+/// (`_process` is the macOS arm's: `lsof` needs the name to pick the executable
+/// out of the image list, and `/proc/<pid>/exe` IS the executable.)
 #[cfg(all(unix, not(target_os = "macos")))]
-async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
+async fn running_images(pids: &[u32], _process: &str) -> Vec<Option<FileId>> {
     pids.iter()
         .map(|pid| {
             std::fs::metadata(format!("/proc/{pid}/exe"))
@@ -676,6 +686,66 @@ mod running_tests {
         assert_eq!(parse_pids("56489\n"), vec![56489]);
         assert_eq!(parse_pids("12\n34\n"), vec![12, 34]);
         assert!(parse_pids("").is_empty());
+    }
+
+    /// The probe for REAL, on Linux — `pgrep`, `/proc/<pid>/exe`, the verdict —
+    /// with a copy of `/bin/sleep` under a unique name standing in for the
+    /// companion. The same sequence as the WSL measurement the phase rests on:
+    /// `none` before it starts, `current` while it runs the file on disk,
+    /// `stale` once that file is replaced underneath it, `none` once it exits.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn probe_follows_a_real_process_through_a_replace() {
+        use super::probe_running;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Unique per test binary, because `pgrep` matches NAMES; and inside
+        // `comm`'s 15-character limit, or the name would never match at all.
+        let name = format!("rcr{}", std::process::id() % 1_000_000);
+        let exe = dir.path().join(&name);
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+
+        let before = probe_running(&exe, &name).await;
+
+        // ⚠️ ETXTBSY is the known race with executing a freshly written file
+        // from a multi-threaded process: a sibling test that forks while the
+        // copy's fd is open holds it until its own exec. It clears; retry.
+        let mut tries = 0;
+        let mut child = loop {
+            match std::process::Command::new(&exe).arg("30").spawn() {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("spawning the stand-in companion: {e}"),
+            }
+        };
+        // `spawn` returns only after the exec, so `comm` already reads `name`.
+        let running = probe_running(&exe, &name).await;
+
+        // Replace it the way a package manager does: write aside, rename over.
+        let staged = dir.path().join("staged");
+        std::fs::copy(&exe, &staged).unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+        let replaced = probe_running(&exe, &name).await;
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let exited = probe_running(&exe, &name).await;
+
+        assert_eq!(before, Some(CompanionRunning::None), "nothing running yet");
+        assert_eq!(
+            running,
+            Some(CompanionRunning::Current),
+            "running the file on disk"
+        );
+        assert_eq!(
+            replaced,
+            Some(CompanionRunning::Stale),
+            "the file was replaced under it"
+        );
+        assert_eq!(exited, Some(CompanionRunning::None), "it has exited");
     }
 }
 
