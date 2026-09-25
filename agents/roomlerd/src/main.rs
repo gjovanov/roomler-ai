@@ -4701,8 +4701,14 @@ fn apps_probe_cmd(config_path: &std::path::Path) -> anyhow::Result<()> {
     // default (apps enabled) and could print `supported: true` on a device
     // whose owner had turned them off — a gap of exactly the kind the probe
     // exists to remove.
-    match config::load(&config_path.to_path_buf()) {
-        Ok(cfg) => {
+    //
+    // ⚠️ `read_if_present`, not `load`: this is a PROBE of a config the process
+    // does not run on. `load` self-heals — on an unreadable live file it logs
+    // "the host must be re-enrolled" at ERROR and can promote the `.prev` copy
+    // back over it — and a diagnostic command must never write the device's
+    // config as a side effect of being run (FR-66's rule).
+    match config::read_if_present(&config_path.to_path_buf()) {
+        Some(cfg) => {
             println!(
                 "config: {} ([virtual_desktop_apps] enabled = {}, {} allowlisted)",
                 config_path.display(),
@@ -4711,8 +4717,8 @@ fn apps_probe_cmd(config_path: &std::path::Path) -> anyhow::Result<()> {
             );
             apps::set_apps_config(cfg.virtual_desktop_apps.clone());
         }
-        Err(e) => println!(
-            "config: {} not loaded ({e:#}) — probing with the built-in default (apps enabled)",
+        None => println!(
+            "config: {} absent or unreadable — probing with the built-in default (apps enabled)",
             config_path.display()
         ),
     }
