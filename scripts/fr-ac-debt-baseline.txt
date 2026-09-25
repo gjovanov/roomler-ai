@@ -47,15 +47,22 @@ FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addre
 FR-12=5   # C.2  #788 P1 and P2 spotlight tours both shipped (#797, #1117); no criterion was ticked for either.
 FR-32=7   # C.3  #898 14 comments and a field-verified Result; 0 of 7 ticked.
 FR-34=3   # C.4  #917 Result present; 3 of 6 remain, incl. "the controller is TOLD the host is locked".
-FR-39=2   # C.5  #951 Result present; the self-host compose criterion overlaps FR-42's.
+FR-39=6   # C.5  #951 Result present; the self-host compose criterion overlaps FR-42's. +4 half-met `[~]` (visible since 2026-09-25): the social-preview upload and the README demo are operator steps (GitHub has no API for the preview); subscribe/unsubscribe say "asserted, not yet run", a note that predates CI running crates/tests.
 FR-41=7   # C.6  #965 the 90-second demo. Result present; 0 of 7 ticked.
-FR-42=1   # C.7  #967 Result present; the remaining one is `docker compose down -v` leaving the machine clean.
+FR-42=2   # C.7  #967 Result present; the remaining one is `docker compose down -v` leaving the machine clean. +1 half-met `[~]` (visible since 2026-09-25): enrolment via the doc's one-liner proven, "online" not (the test host already ran a daemon, and one machine serves one).
 FR-49=8   # C.8  #1084 Result present; 0 of 8 ticked (per-org overlay mode across `org ls` / `status` / `peers`).
 FR-50=6   # C.9  #1083 Result present; 0 of 6 ticked (the served installer naming its own server).
 FR-53=5   # C.10 #1123 Result present; 0 of 5 ticked (rollback sentinel lifecycle).
 FR-54=4   # C.11 #1130 Result present; 0 of 4 ticked (orphaned-network reporting).
 FR-57=6   # C.12 #1161 Result present; 0 of 6 ticked (multi-arch manifest).
 FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — and "docs before close" is a standing operator rule (2026-09-05). The only breach of it in the tree, and nothing could see it.
+# ── D. half-met `- [~]`, invisible to this guard until it counted them ───────
+# Added 2026-09-25 with the fix that made `ac_scan` count a `[~]` as OPEN. It had
+# matched only `[ ]` / `[x]`, so a half-met criterion on a closed FR was neither
+# ticked nor debt, and a `[~]` line even ended the criterion before it. FR-39's
+# and FR-42's half-met ones are folded into their C lines above; an FR whose
+# ONLY debt is half-met lives here.
+FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fps only via the production `Auto` downscale path (24.0 ms of 33); undownscaled 4K is 43.8 ms (~23 fps). The spec records it honestly; owed: tick with a stated waiver, or a child FR for native 4K.
 
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
