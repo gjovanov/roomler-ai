@@ -490,9 +490,15 @@ jobs:
         # with the synthetic tone) and WITHOUT it (an audio request is refused
         # by name, never recorded silently without). Each half has tests the
         # other cannot compile.
+        #
+        # FR-85 P3b — `control_dc_record`: the `record` DataChannel over a
+        # loopback PeerConnection pair, the production handler, the real
+        # recorder child (the owner's gates, the host prompt with a fresh id,
+        # the indicator before the first frame, every way a recording ends).
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
 

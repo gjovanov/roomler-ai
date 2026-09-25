@@ -368,3 +368,85 @@ describe('companion Recordings view (FR-85 P2b)', () => {
     expect(($('rec-start') as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+describe('companion Recordings view — remote recording (FR-85 P3b)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
+  const box = (id: string) => $(id) as HTMLInputElement
+
+  it('offers no toggle against a service that predates the gates', () => {
+    const api = mount(vi.fn())
+    api.render(view())
+    expect($('rec-remote').hidden).toBe(true)
+  })
+
+  it('shows the gates, and computer audio only once remote recording is allowed', () => {
+    const api = mount(vi.fn())
+    api.render(view({ remote: { enabled: false, audio: false } }))
+    expect($('rec-remote').hidden).toBe(false)
+    expect(box('rec-remote-enabled').checked).toBe(false)
+    expect(box('rec-remote-audio').disabled).toBe(true)
+
+    api.render(view({ remote: { enabled: true, audio: true } }))
+    expect(box('rec-remote-enabled').checked).toBe(true)
+    expect(box('rec-remote-audio').checked).toBe(true)
+    expect(box('rec-remote-audio').disabled).toBe(false)
+  })
+
+  it('saves each toggle through the config surface, as the daemon must accept it', async () => {
+    const invoke = vi.fn(async (name: string) =>
+      name === 'cmd_recordings_view' ? view({ remote: { enabled: true, audio: false } }) : {},
+    )
+    const api = mount(invoke)
+    api.render(view({ remote: { enabled: false, audio: false } }))
+    box('rec-remote-enabled').click()
+    await settle()
+    expect(invoke).toHaveBeenCalledWith('cmd_config_set', {
+      key: 'record_remote_enabled',
+      value: 'true',
+    })
+    box('rec-remote-audio').click()
+    await settle()
+    expect(invoke).toHaveBeenCalledWith('cmd_config_set', {
+      key: 'record_remote_audio',
+      value: 'true',
+    })
+  })
+
+  it('says a refused toggle, and keeps what the service reports', async () => {
+    const invoke = vi.fn(async (name: string) => {
+      if (name === 'cmd_config_set') throw 'only the person at this computer can change that'
+      return view({ remote: { enabled: false, audio: false } })
+    })
+    const api = mount(invoke)
+    api.render(view({ remote: { enabled: false, audio: false } }))
+    box('rec-remote-enabled').click()
+    await settle()
+    expect($('rec-remote-error').hidden).toBe(false)
+    expect($('rec-remote-error').textContent).toContain('person at this computer')
+    expect(box('rec-remote-enabled').checked).toBe(false)
+  })
+
+  it('names who a remote recording is for', () => {
+    const api = mount(vi.fn())
+    api.render(
+      view({
+        state: {
+          available: true,
+          active: true,
+          duration_ms: 5_000,
+          bytes: 1024,
+          frames: 150,
+          remote_controller: 'Alice',
+        },
+      }),
+    )
+    expect($('rec-status').textContent).toContain('Recording for Alice (remote)')
+  })
+})

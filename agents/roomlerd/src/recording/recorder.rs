@@ -236,6 +236,9 @@ fn even(mut f: Frame) -> Frame {
 /// Record until `stop` carries a reason (or a guard trips). Events stream to
 /// `events`; the summary is returned once the file is final. Video only —
 /// [`run_with_audio`] adds audio.
+// `AudioSources` is a unit struct without `audio` and a struct with fields
+// with it; `default()` is the one spelling that builds both.
+#[allow(clippy::default_constructed_unit_structs)]
 pub async fn run(
     opts: RecordOptions,
     capturer: Box<dyn ScreenCapture>,

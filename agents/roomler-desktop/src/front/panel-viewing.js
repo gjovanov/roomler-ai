@@ -30,13 +30,20 @@
     if (sessions.length === 0) {
       $('v-who').textContent = 'Being viewed'
       $('v-sub').textContent = ''
+      $('v-rec-stop').hidden = true
       return
     }
-    const first = sessions[0]
+    // FR-85 P3b — a controller RECORDING outranks one merely watching: it is
+    // the first thing said, and the only way to stop it without ending the
+    // session sits right here.
+    const recorder = sessions.find((s) => s.recording)
+    const first = recorder || sessions[0]
     const extra = sessions.length - 1
+    const who = first.controller_name || 'a remote operator'
     $('v-who').textContent =
-      `Being viewed by ${first.controller_name || 'a remote operator'}` +
+      (recorder ? `Recording your screen for ${who}` : `Being viewed by ${who}`) +
       (extra > 0 ? ` +${extra}` : '')
+    $('v-rec-stop').hidden = !recorder
 
     // The GRANT matters as much as the name: "watching" and "typing on this
     // machine" are different things to be told about.
@@ -62,6 +69,25 @@
     }
     paint()
   }
+
+  // FR-85 P3b — stop the RECORDING, keep the session: the file is kept, and
+  // the controller is told the host stopped it (`host_stopped`).
+  $('v-rec-stop').addEventListener('click', async () => {
+    if (busy) return
+    busy = true
+    const btn = $('v-rec-stop')
+    btn.disabled = true
+    btn.textContent = 'Stopping…'
+    try {
+      await invoke('cmd_record_stop')
+    } catch (e) {
+      $('v-sub').textContent = 'Failed: ' + e
+    } finally {
+      busy = false
+      btn.disabled = false
+      btn.textContent = 'Stop recording'
+    }
+  })
 
   $('v-stop').addEventListener('click', async () => {
     if (busy || sessions.length === 0) return

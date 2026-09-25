@@ -85,7 +85,7 @@ fn open_audio(
                 "this build of roomlerd has no audio capture".into(),
             ));
         }
-        Ok(AudioSources::default())
+        Ok(AudioSources)
     }
 }
 

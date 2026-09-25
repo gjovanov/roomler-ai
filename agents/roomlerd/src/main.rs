@@ -3532,14 +3532,24 @@ async fn run_cmd(
     // leave `/proc/self/exe` pointing at a deleted inode).
     #[cfg(feature = "recording")]
     let daemon_state = match std::env::current_exe() {
-        Ok(exe) => daemon_state.with_recorder(std::sync::Arc::new(
-            roomlerd::recording::manager::RecordingManager::new(exe, config_path.clone()),
-        )),
+        Ok(exe) => {
+            let recorder = std::sync::Arc::new(
+                roomlerd::recording::manager::RecordingManager::new(exe, config_path.clone()),
+            );
+            // FR-85 P3b — the SAME recorder serves a remote controller, so a
+            // local and a remote recording can never run at once.
+            roomlerd::recording::remote::install(recorder.clone());
+            daemon_state.with_recorder(recorder)
+        }
         Err(e) => {
             tracing::warn!(%e, "recording: cannot resolve our own path — the recording verbs are off");
             daemon_state
         }
     };
+    // FR-85 P3b — the owner's remote-recording gates, live from here on (a
+    // local `ConfigSet` re-seeds them; the server cannot reach them).
+    #[cfg(feature = "recording")]
+    roomlerd::recording::remote::adopt(&cfg);
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(daemon_state);
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
