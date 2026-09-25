@@ -3364,10 +3364,16 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     #[cfg(not(unix))]
     let _ = supervised;
 
+    // FR-84 D1 — the named-pipe listener pool. `localapi_pipe_pool = 1` is
+    // the pre-FR-84 single instance (the kill switch); unset = 4.
+    let localapi_pipe_pool = tunnel_core::localapi::effective_pipe_pool(cfg.localapi_pipe_pool);
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
         async move {
-            if let Err(e) = tunnel_core::localapi::serve(localapi_state, shutdown).await {
+            if let Err(e) =
+                tunnel_core::localapi::serve_with_pool(localapi_state, shutdown, localapi_pipe_pool)
+                    .await
+            {
                 tracing::warn!(error = %e, "localapi: listener exited with error");
             }
         }

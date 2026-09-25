@@ -89,6 +89,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ephemeral: body.ephemeral,
         encoder_preference: crate::config::EncoderPreferenceChoice::default(),
         update_check_interval_h: None,
+        localapi_pipe_pool: None,
         enable_remote_browse: true,
         auto_grant_session: true,
         // Fleet RPC stays OFF on a freshly enrolled device: enabling it is a
