@@ -41,12 +41,15 @@ use axum::{
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_text, index_ttl, index_unique};
+use roomler_ai_db::indexes::{
+    IndexSet, index, index_text, index_ttl, index_unique, index_unique_partial,
+};
 use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
     enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao,
+    external_rc_audit::ExternalRcAuditDao,
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
 use tokio::sync::mpsc;
@@ -62,6 +65,7 @@ pub mod consent;
 pub mod consent_consumer;
 pub mod ctrl;
 pub mod enroll_key;
+pub mod external_access;
 pub mod hub;
 pub mod nudge;
 pub mod presence;
@@ -88,6 +92,10 @@ pub struct FleetState {
     pub consent_requests: Arc<ConsentRequestDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
+    /// FR-52 — cross-org access decisions: who opened a device to
+    /// outsiders, and every refusal. The server's own record, never the
+    /// session's.
+    pub external_rc_audit: Arc<ExternalRcAuditDao>,
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
@@ -192,6 +200,7 @@ impl Module for FleetState {
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
             exec_audit: Arc::new(ExecAuditDao::new(db)),
+            external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
@@ -303,6 +312,19 @@ impl Module for FleetState {
                 post(agent_exec::cancel),
             )
             .route("/{agent_id}/exec-policy", put(agent_exec::set_policy))
+            // FR-52 gate 2 — approve a device for control by someone OUTSIDE
+            // the org. MANAGE_AGENTS + REMOTE_CONTROL to grant, MANAGE_AGENTS
+            // alone to clear (external_access.rs says why); audited both arms.
+            .route(
+                "/{agent_id}/external-access-policy",
+                put(external_access::set_policy),
+            )
+            // FR-52 §5 — mint or rotate the connect code an outsider names
+            // this device by. Rotation IS the revocation story for a leak.
+            .route(
+                "/{agent_id}/connect-code",
+                post(external_access::rotate_connect_code),
+            )
             // Remote config — records an INTENT for the device to reconcile.
             .route(
                 "/{agent_id}/desired-config",
@@ -313,6 +335,14 @@ impl Module for FleetState {
         // joins agents with tunnel clients and overlay nodes — a cross-pillar
         // view the host keeps until `network` exists.
         let exec_audit = Router::new().route("/", get(agent_exec::audit));
+        // FR-52 — the org switch (gate 1) + the approved-device list, and
+        // the decision log. Approval itself is on the agent router, since
+        // gate 2 is per device.
+        let external_access = Router::new().route(
+            "/",
+            get(external_access::get_settings).put(external_access::set_enabled),
+        );
+        let external_rc_audit = Router::new().route("/", get(external_access::audit));
         let exec_settings = Router::new().route(
             "/",
             get(agent_exec::get_org_settings).put(agent_exec::set_org_settings),
@@ -377,6 +407,8 @@ impl Module for FleetState {
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
+            .nest("/tenant/{tenant_id}/external-access", external_access)
+            .nest("/tenant/{tenant_id}/external-rc-audit", external_rc_audit)
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
             .nest(
                 "/tenant/{tenant_id}/ephemeral-key-settings",
@@ -413,6 +445,19 @@ impl Module for FleetState {
                     index(bson::doc! { "owner_user_id": 1 }),
                     // FR-51 — the reaper's candidate scan (ESR).
                     index(bson::doc! { "ephemeral": 1, "deleted_at": 1, "last_seen_at": 1 }),
+                    // FR-52 — the connect code an outsider names a device by.
+                    // Unique GLOBALLY, not per tenant: a stranger types a code
+                    // with no org context, so it has to resolve on its own.
+                    //
+                    // ⚠️ Deliberately NOT scoped to live rows. A tombstone keeps
+                    // its code reserved forever, so a code can never be recycled
+                    // onto a new device and point someone holding the old note at
+                    // a DIFFERENT machine. The cost is one reserved string per
+                    // removed device, which is the cheap side of that trade.
+                    index_unique_partial(
+                        bson::doc! { "connect_code": 1 },
+                        bson::doc! { "connect_code": { "$exists": true } },
+                    ),
                 ],
             },
             IndexSet {
@@ -439,6 +484,19 @@ impl Module for FleetState {
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "key_id": 1, "created_at": -1 }),
                     index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-52 — the server's own record of every external-access
+            // decision, granted or refused. Same 90-day TTL and the same
+            // reason as exec_audit: the REFUSED rows are the point.
+            IndexSet {
+                collection: "external_rc_audit",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "agent_id": 1, "at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+                    index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },
             IndexSet {

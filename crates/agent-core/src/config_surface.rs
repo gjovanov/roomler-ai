@@ -108,6 +108,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
     ),
     (
+        "external_access_enabled",
+        "bool",
+        "Let someone OUTSIDE this device's organization control it (FR-52 gate 3). NEVER settable by the server — the whole `external_*` surface is absent from remote config, because a server able to set this could admit a stranger to a machine whose owner never agreed. Opens nothing on its own: an org admin must also approve this device, the outsider must prove the password held HERE, and whoever is at the machine is still asked. Default: OFF.",
+    ),
+    (
         "ssh_enabled",
         "bool",
         "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
@@ -862,6 +867,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
             cfg.power_policy.clone()
         }),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
+        "external_access_enabled" => Some(fmt_bool(cfg.external_access_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -1060,6 +1066,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // explicitly; if the server could set it, every other gate here would
         // be one push away from meaningless. See `docs/remote-config.md`.
         "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
+        "external_access_enabled" => cfg.external_access_enabled = parse_bool_or(value, false)?,
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
