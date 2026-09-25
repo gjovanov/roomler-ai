@@ -297,11 +297,56 @@ sequenceDiagram
 
 ## 8. What this device can encode
 
-*Placeholder — FR-84 D4 (the encoder-capabilities card).*
+The Overview's **Hardware video encoding** card is a codec × backend matrix — H.264, HEVC,
+AV1 and VP9 against NVENC, QSV, AMF, VideoToolbox, VAAPI, D3D12, Vulkan, Media Foundation and
+the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), denied cells
+struck through, and how long the probe took.
+
+- It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:48`). The capability probe runs in
+  child processes (vendor driver code) at the first server hello; a control-surface poll
+  must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
+- Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the
+  card polls every 5 s while the Overview is visible, then stops), `unsupported` (a build
+  with no video encoder). An older service gets a one-line "update the service" instead.
+- `denied` is the effective `encoder_cells_deny` list (env, config or built-in), shown
+  because a denied cell is never opened by the probe or a session, so it could not appear in
+  the matrix otherwise. The resolved `encoder_preference` is shown under it.
+- It is the same data `roomlerd caps` prints and the server's `AgentCaps` carries; see
+  [encoders.md](encoders.md) for what a cell means and why a probe proves an open, not a
+  session.
 
 ## 9. Where files dropped from a remote viewer land
 
-*Placeholder — FR-84 D4 (`files_dir` and its SYSTEM rule).*
+The Overview's **Incoming files** card shows where a file a controller drops onto this
+screen will land **right now**, with **Open folder**, **Change…** (the native folder picker,
+which can create a folder) and **Use default**. The setting is `files_dir`; unset, the ladder
+is the active user's Downloads, then the service's own fallback. It is **live**: every
+transfer reads the current value, so a change needs no restart.
+
+⚠️ `files_dir` is a security control, because the daemon writing the file can be SYSTEM or
+root and the LocalAPI admits any interactive user. The rules
+(`crates/agent-core/src/files_dir.rs`):
+
+| Rule | Why |
+|---|---|
+| Absolute, or `~\…` — expanded against the **active** user's profile when a file arrives | one machine-wide setting stays right for whoever is signed in |
+| No device / kernel-namespace paths (`\\?\GLOBALROOT`, `\\.\…`), no admin or device shares, no `..` | none of those is a folder a person meant |
+| No name Windows silently rewrites (a trailing dot or space, `:stream`) | `C:\Windows.\Temp` would otherwise pass the system-folder check |
+| Not under the system folders (`%WINDIR%`, `%ProgramFiles%`, `/etc`, `/usr`, `/bin`, `/System`, …) | remote-supplied files must never land where the OS executes from |
+| **When the writer is SYSTEM or root, inside the active user's profile — and refused when no profile is known** | otherwise a non-admin user could make SYSTEM write remote-supplied files anywhere |
+| Links resolved and re-checked; an unresolvable link is refused for a privileged writer | a junction must not carry the path outside the rules |
+| Creatable and writable | a folder that cannot take the file is a failed drop later |
+
+- Checked **when set** (the daemon refuses the `ConfigSet` with the reason, which the card
+  shows verbatim) **and when used** (`download_dir()` re-validates per transfer and falls back
+  to the default ladder with a warning — the check that holds even if `config.toml` was
+  edited by hand).
+- Only the **console user** may change it through the LocalAPI: an RDP user on the same
+  machine must not choose where the console user's incoming files land. A SYSTEM shell
+  (`roomler exec`, SSH) can still edit the config file; the use-time check applies.
+- The Status the companion shows is refreshed off the request path, so a Downloads folder
+  redirected to an offline share cannot stall the 2 s poll.
 
 ## 10. Starting after install, and the Welcome flow
 
