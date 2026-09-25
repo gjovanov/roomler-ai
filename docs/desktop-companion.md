@@ -1,9 +1,8 @@
 # roomler-desktop — the companion app
 
-**Status:** FR-84 ([#1633](https://github.com/gjovanov/roomler-ai/issues/1633)) in progress —
-Routes, the LocalAPI listener pool, grouped Settings and the device-scoped server
-endpoints are shipped; Apply now, the Overview cards, the Devices grid/mesh and the
-first-run flow are being built (§7–§10 are placeholders until they land).
+**Status:** FR-84 ([#1633](https://github.com/gjovanov/roomler-ai/issues/1633)) — every
+phase merged; field verification rides `agent-v0.4.103` (the FR's field-verification log
+records each result).
 
 `roomler-desktop` is the tray + window app a person uses on an enrolled machine. It is a
 **thin client of the local daemon**: every number it shows and every change it makes goes
@@ -59,6 +58,7 @@ Hash routes in `src/front/app.js`; one `<section id="view-*">` per page. The ins
 | Routes | `#/tunnels` | declared routes (`[[tunnel_routes]]`) and live forwards, with add / edit / enable / disable / remove | `RouteList` + `Flows` on **one** connection; `RouteAdd` / `RouteUpdate` / `RouteSetEnabled` / `RouteRemove` | 2 s while visible |
 | Settings | `#/settings` | the config surface, grouped (§5); device name; service; the log | `ConfigGet` / `ConfigSet`, `SetDeviceName`, `TailLog` | on entry |
 | Onboarding | `#/onboarding` | enrol (server, name, token) or re-enrol | in-process enrolment | — |
+| Welcome | `#/welcome` | the first-run tour — see §10 | `Status`, `ConfigSet`, `RestartDaemon`, the files commands | while a step waits |
 
 ## 3. The LocalAPI, and why the Routes page used to blink
 
@@ -350,7 +350,53 @@ root and the LocalAPI admits any interactive user. The rules
 
 ## 10. Starting after install, and the Welcome flow
 
-*Placeholder — FR-84 D6.*
+Every install path ends with the daemon starting, so the **daemon** opens the companion —
+once per install, into the signed-in user's session, with `--first-run`
+(`agents/roomlerd/src/companion/launch_once.rs`). Who does it on each platform, the login
+start, the marker that makes it one-shot, and why an upgrade is *adopted* rather than
+launched into are in [installation.md](installation.md) §"After install: the companion
+opens". The rules that matter here:
+
+- ⚠️ **No inherited handles.** A companion the daemon starts gets none of the daemon's
+  handles: `CreateProcessW` with `bInheritHandles = FALSE`, detached, and outside the
+  daemon's job object where that is allowed
+  (`agents/roomlerd/src/win_service/companion_spawn.rs:98`). Before this, a companion
+  spawned by a daemon worker could outlive it holding the worker's handles — the #1035
+  signature, tunnel ports held by a process whose parent was already gone. A route that
+  cannot bind its port for two minutes now logs who holds it.
+- **Per-machine Windows launches from the service host, with the console user's own,
+  non-elevated token** — never from a worker that may run elevated.
+- **The companion decides what to show** (`agents/roomler-desktop/src/first_run.rs:63`):
+  it reads its own arguments on the first launch too (`--first-run`, `--autostart`,
+  `--view=<name>`) and a per-user `desktop-state.json` (`first_run_done`, the start-at-login
+  opt-out; `crates/agent-core/src/desktop_state.rs`). A missing or unreadable file is a
+  first run. Until the tour is finished or skipped it shows at every start; afterwards a
+  login start stays in the tray.
+
+**The Welcome** (`front/welcome.js`) is six steps — this device · the private network ·
+who may view this screen · files you receive · start at login · done:
+
+```mermaid
+flowchart LR
+    A["This device<br/>(enrolled as … on …)"] --> B["Private network<br/>what it is · what it changes · Enable"]
+    B --> C["Who may view this screen<br/>ask me before someone connects"]
+    C --> D["Files you receive<br/>§9"]
+    D --> E["Start at login"]
+    E --> F["Done → Overview"]
+```
+
+- **Enable** on the private network writes `overlay_enabled`, then uses the same restart
+  flow as Settings' Apply now (`window.Roomler.restartDaemon`, `front/settings.js`) and
+  waits up to a minute for the overlay address. A per-user install cannot create the
+  WireGuard adapter, so it is offered **userspace mode** instead: `netstack_socks_port` on a
+  free port (never a hard-coded one a declared route may already hold), explained as "apps
+  reach the mesh through SOCKS5 on 127.0.0.1:<port>; remote desktop needs nothing".
+- Every refusal from the daemon — Apply now's, `files_dir`'s — is shown verbatim, and a
+  service too old for a step says so and points at the manual way instead.
+- The tour can be reopened from the tray and from Settings.
+- The whole device can opt out: `companion_autostart = false` stops the post-install launch
+  and removes the Windows login start. On a multi-user server that is the switch to use —
+  the machine-wide login start opens a companion in every interactive session.
 
 ## 11. Testing it
 
