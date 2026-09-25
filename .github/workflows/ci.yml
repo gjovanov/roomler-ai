@@ -643,6 +643,12 @@ jobs:
       # job exists for. `full` itself, as the release builds it (less the
       # vendored FFmpeg and libvpx), so what is checked is what ships.
       - name: cargo check agent with the release feature set (FR-85 — `full`, recording included)
+        # `full` carries `audio`, and audiopus_sys builds its bundled libopus
+        # with CMake, whose CMakeLists declares a minimum below 3.5 that
+        # current CMake refuses. The release builds set the same variable on
+        # every platform; the first run of this step failed on exactly that.
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo check -p roomlerd --lib --bins --features full
 
       # The desktop companion ships on macOS from rc.455 and owns the
