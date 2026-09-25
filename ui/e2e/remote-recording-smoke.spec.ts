@@ -5,11 +5,13 @@
  * a VISIBLE outcome: the REC chip, or a refusal said in words. Never silence.
  *
  * Runs only against an agent whose caps advertise `record` (an image built
- * with the `recording` feature, its owner's `record_remote_enabled` on).
- * The harness agents are headless: with nothing on screen to show a
- * recording, the device's own gate refuses it (`no_indicator_surface`), which
- * this spec accepts as a correct, visible outcome — a real recording is
- * proven on real hosts in the field matrix (FR-85 P6).
+ * with the `recording` feature, its owner's `record_remote_enabled` on, and
+ * someone to record as). The harness agents run as root with nobody at a
+ * console, which the identity rule refuses (FR-85 P1e), so today none
+ * advertises `record` and this spec skips; it becomes live with the
+ * unattended exception (P1f). A refusal said in words is accepted as a
+ * correct, visible outcome — a real recording is proven on real hosts in the
+ * field matrix (FR-85 P6).
  */
 import { test, expect } from '@playwright/test'
 
