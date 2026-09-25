@@ -842,3 +842,140 @@ fn urlencode(s: &str) -> String {
         .replace('/', "%2F")
         .replace('=', "%3D")
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #1630: the session audit trail must read back through the real route
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `GET /api/tenant/{tid}/session/{sid}/audit` 500'd on every session in prod
+/// (0.4.101): the audit sink writes rows through the driver's typed
+/// `insert_many`, whose raw serializer stores `Permissions` as `Int32` bits,
+/// and the route reads them back through the typed cursor — where serde's
+/// tagged-enum buffering reports the field as human-readable, so the `rc:*`
+/// wire rule refused the number. A `to_document`/`from_document` round trip
+/// cannot see this (#1166 learned that the hard way), so this test uses the
+/// production writer (`AuditSink`) and the production reader (the HTTP route)
+/// against a real MongoDB. RED before the `deserialize_stored` opt-ins, with
+/// exactly the prod message in the 500 body.
+#[tokio::test]
+async fn session_audit_reads_back_rows_the_audit_sink_wrote() {
+    use bson::oid::ObjectId;
+    use roomler_ai_remote_control::audit::AuditSink;
+    use roomler_ai_remote_control::models::{AuditKind, EndReason, RemoteAuditEvent};
+    use roomler_ai_remote_control::permissions::Permissions;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("audit1630").await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let uid = ObjectId::parse_str(&seeded.admin.id).unwrap();
+    let sid = ObjectId::new();
+    let aid = ObjectId::new();
+
+    // The production writer — the sink the Hub records through. Its
+    // `SessionRequested` projection also creates the `remote_sessions` row
+    // the route's tenant check reads, exactly as in prod.
+    let (sink, flusher) = AuditSink::spawn(app.db.clone());
+    sink.record(
+        sid,
+        aid,
+        tid,
+        AuditKind::SessionRequested {
+            controller_user_id: uid,
+            controller_name: "audit1630 Admin".into(),
+            permissions: Permissions::VIEW | Permissions::INPUT | Permissions::CLIPBOARD,
+        },
+    );
+    sink.record(
+        sid,
+        aid,
+        tid,
+        AuditKind::PermissionsChanged {
+            permissions: Permissions::VIEW,
+        },
+    );
+    sink.record(
+        sid,
+        aid,
+        tid,
+        AuditKind::SessionEnded {
+            reason: EndReason::ControllerHangup,
+        },
+    );
+    // Closing the channel makes the flusher drain and exit: every write
+    // above has landed once it joins.
+    drop(sink);
+    flusher.await.expect("audit flusher");
+
+    // Pin what is actually on disk: the driver's typed insert stores the
+    // bits (every `remote_audit` row in prod holds an Int32), while the
+    // `to_document` projection stores the names. Both must read, forever.
+    let audit_raw = app
+        .db
+        .collection::<bson::Document>(RemoteAuditEvent::COLLECTION)
+        .find_one(bson::doc! { "session_id": sid, "event.kind": "session_requested" })
+        .await
+        .unwrap()
+        .expect("audit row present");
+    let stored = audit_raw.get_document("event").unwrap().get("permissions");
+    assert_eq!(stored, Some(&bson::Bson::Int32(7)), "audit rows hold bits");
+    let session_raw = app
+        .db
+        .collection::<bson::Document>("remote_sessions")
+        .find_one(bson::doc! { "_id": sid })
+        .await
+        .unwrap()
+        .expect("session row projected");
+    assert_eq!(
+        session_raw.get_str("permissions").ok(),
+        Some("VIEW"),
+        "session rows hold names (the PermissionsChanged $set landed)"
+    );
+
+    // The production reader.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/session/{}/audit", seeded.tenant_id, sid),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "the audit route must read bits-shaped rows: {body}"
+    );
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3, "{body}");
+    let by_kind = |kind: &str| -> &Value {
+        items
+            .iter()
+            .find(|i| i["event"]["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} in {body}"))
+    };
+    // The API keeps the name form the browser expects.
+    assert_eq!(
+        by_kind("session_requested")["event"]["permissions"],
+        "VIEW | INPUT | CLIPBOARD"
+    );
+    assert_eq!(
+        by_kind("permissions_changed")["event"]["permissions"],
+        "VIEW"
+    );
+    let _ = by_kind("session_ended");
+
+    // Positive control for the #1166 half: the name-shaped session row the
+    // same flush projected (and then `$set` to "VIEW") still reads.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/session/{}", seeded.tenant_id, sid),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let session: Value = resp.json().await.unwrap();
+    assert_eq!(session["permissions"], "VIEW");
+}
