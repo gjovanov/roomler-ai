@@ -1245,12 +1245,22 @@
             >
               Browse remote files
             </v-btn>
+            <!-- FR-56 AC10 — never disabled: a host that cannot serve the
+                 feature says WHY in the dialog (`unavailable.reason`), and a
+                 greyed button with no tooltip was the one place that reason
+                 could not reach. The entry shows for `list` (a desktop was
+                 there at hello time) and for `status` (the agent will answer
+                 honestly either way). -->
             <v-btn
               v-if="agentSupportsApps"
               block
               variant="tonal"
               prepend-icon="mdi-apps"
-              :disabled="rc.appsSupported.value === false"
+              :title="
+                agentAppsCaps.includes('list')
+                  ? 'List, focus or launch apps on the controlled host'
+                  : 'Remote apps were not available when this agent announced itself — open to see why'
+              "
               class="mb-2"
               @click="openAppsDialog(); settingsOpen = false"
             >
@@ -1329,8 +1339,15 @@
               </v-chip>
             </template>
           </v-list-item>
+          <!-- FR-56 AC10 — not when the agent REFUSED: "No windows reported"
+               under a refusal reads as a quiet desktop, and the alert above
+               already carries the reason. -->
           <v-list-item
-            v-if="rc.remoteWindows.value.length === 0 && !rc.appsLoading.value"
+            v-if="
+              rc.remoteWindows.value.length === 0 &&
+              !rc.appsLoading.value &&
+              rc.appsSupported.value !== false
+            "
             class="text-medium-emphasis"
             title="No windows reported"
           />
@@ -3582,10 +3599,17 @@ function transferProgressPct(t: { bytes: number; total: number | null }): number
 // unanswered request.
 const agentFilesCaps = computed<string[]>(() => agent.value?.capabilities?.files ?? [])
 const agentSupportsBrowse = computed(() => agentFilesCaps.value.includes('browse'))
-// rc.NEXT — remote app selection & launch. Advertised only by
-// virtual-desktop-mode agents; drives the Apps toolbar entry's v-if.
+// Remote app selection & launch (FR-56). `list` = the agent could manage a
+// desktop when it announced itself; `status` (AC10) = the agent has a Remote
+// Apps backend and answers rc:apps.list honestly — with the list, or with
+// `unavailable: {code, reason}`. The entry shows for either and the DIALOG
+// carries the truth, because the hello is a boot-time snapshot: `list`
+// missing from it can mean nobody had logged in yet when the daemon started,
+// and only the live reply can say.
 const agentAppsCaps = computed<string[]>(() => agent.value?.capabilities?.apps ?? [])
-const agentSupportsApps = computed(() => agentAppsCaps.value.includes('list'))
+const agentSupportsApps = computed(
+  () => agentAppsCaps.value.includes('list') || agentAppsCaps.value.includes('status'),
+)
 const agentSupportsDownload = computed(() =>
   agentFilesCaps.value.includes('download') || agentFilesCaps.value.includes('download-folder')
 )

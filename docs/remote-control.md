@@ -1372,6 +1372,14 @@ to-activate, so the browser never sees a bait-and-switch.
   `files:end` → agent writes into the controlled host's Downloads
   folder. Filename sanitization + collision-safe rename + 2 GiB
   per-transfer cap.
+- **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
+  `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
+  id-correlated like `rc:logs-fetch`, handled off-thread in
+  `apps::handle_control_message`. Gated by `AgentCaps.apps` — `list · focus ·
+  launch` when the agent could manage a desktop at hello time, `status` when
+  it has a backend and will say honestly why not. The reply carries the
+  honesty: `coverage` (`sources`, `unlisted`, `missing_tools`) on a host where
+  the feature works, `unavailable: {code, reason}` where it does not.
 
 ### 18.3 Hotkey + viewer indicator (0.1.33)
 
