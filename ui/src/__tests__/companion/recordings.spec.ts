@@ -206,7 +206,41 @@ describe('companion Recordings view (FR-85 P2b)', () => {
     ;($('rec-encoder') as HTMLSelectElement).value = 'software'
     $('rec-start').click()
     await settle()
-    expect(invoke).toHaveBeenCalledWith('cmd_record_start', { fps: 60, encoder: 'software' })
+    // FR-85 P1c — audio is OFF unless ticked.
+    expect(invoke).toHaveBeenCalledWith('cmd_record_start', {
+      fps: 60,
+      encoder: 'software',
+      systemAudio: false,
+      microphone: false,
+    })
+  })
+
+  it('asks for the audio the person ticked, and shows it while recording', async () => {
+    const invoke = vi.fn(async (name: string) => (name === 'cmd_recordings_view' ? view() : {}))
+    const api = mount(invoke)
+    api.render(view())
+    ;($('rec-system-audio') as HTMLInputElement).checked = true
+    ;($('rec-microphone') as HTMLInputElement).checked = true
+    $('rec-start').click()
+    await settle()
+    expect(invoke).toHaveBeenCalledWith(
+      'cmd_record_start',
+      expect.objectContaining({ systemAudio: true, microphone: true }),
+    )
+    api.render(
+      view({
+        state: {
+          available: true,
+          active: true,
+          duration_ms: 1000,
+          bytes: 1,
+          system_audio: true,
+          microphone: true,
+        },
+      }),
+    )
+    expect($('rec-status').textContent).toContain('computer audio + microphone')
+    expect(($('rec-microphone') as HTMLInputElement).disabled).toBe(true)
   })
 
   it('says why a start was refused', async () => {

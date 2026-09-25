@@ -353,6 +353,11 @@
               </select>
             </label>
           </div>
+          <!-- FR-85 P1c — both OFF unless the person ticks them. -->
+          <div class="actions" id="rec-audio">
+            <label><input type="checkbox" id="rec-system-audio" /> Computer audio</label>
+            <label><input type="checkbox" id="rec-microphone" /> Microphone</label>
+          </div>
           <div class="actions">
             <button type="button" id="rec-start" class="primary">Start recording</button>
             <button type="button" id="rec-stop" class="danger" hidden>Stop recording</button>

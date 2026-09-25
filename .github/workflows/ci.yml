@@ -484,9 +484,17 @@ jobs:
         # `synthetic-frame-source` lets the `roomlerd record` process tests
         # capture on a runner with no display; openh264 is both the encoder and
         # the decoder the oracle reads frames back through.
+        #
+        # FR-85 P1c — and twice over: WITH `audio` (the mixer on the
+        # recorder's clock, the Opus track decoded back at 440 Hz, the process
+        # with the synthetic tone) and WITHOUT it (an audio request is refused
+        # by name, never recorded silently without). Each half has tests the
+        # other cannot compile.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
