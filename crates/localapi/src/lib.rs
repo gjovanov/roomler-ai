@@ -23,6 +23,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+// FR-84 D5b — the device's own view of its org (the Devices page's grid and
+// mesh), in its own file so the verbs' types don't sprawl through this one.
+mod devices;
+pub use devices::{
+    DeviceRowLite, DevicesPage, DevicesQuery, DirectoryError, MeshAgentLite, MeshCenter,
+    MeshEdgeEndLite, MeshEdgeLite, MeshNodeLite, MeshView,
+};
+
 /// How this node currently reaches a peer — the Tailscale-style connection
 /// type shown per device in the UI. `Tunnel` is the userspace SOCKS/forward
 /// path (used when a corp full-tunnel VPN captures the overlay's routes);
@@ -1137,6 +1145,40 @@ pub enum Request {
     /// FR-85 — delete one recording (and its sidecar) from the folder, by file
     /// name. Console user only. Returns [`Response::RecordingDeleted`].
     RecordingDelete { name: String },
+    /// FR-84 D5b — one page of the devices THIS device may see (itself
+    /// included): `GET /api/agent/self/devices` on the org's server, asked by
+    /// the daemon with that org's agent token. The server searches, sorts and
+    /// pages (`q` / `sort` / `dir` / `page` / `per_page`, its own grid
+    /// contract). `org` is an enrollment label; empty or `primary` = the
+    /// primary enrollment.
+    ///
+    /// Read-only, and the token never crosses the pipe: the answer is the
+    /// server's list, nothing of the daemon's credentials. Returns
+    /// [`Response::Devices`] or a [`Response::Upstream`] naming why not. A
+    /// daemon older than the verb answers "unknown variant", which a client
+    /// renders as "this service predates the device list".
+    Devices {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        org: String,
+        #[serde(default)]
+        page: u64,
+        #[serde(default)]
+        per_page: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        q: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+    },
+    /// FR-84 D5b — the org mesh graph restricted to the same set
+    /// (`GET /api/agent/self/mesh`). Returns [`Response::Mesh`] (whose
+    /// `enabled: false` means the server has statistics off — data, not an
+    /// error) or a [`Response::Upstream`].
+    Mesh {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        org: String,
+    },
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -1335,6 +1377,28 @@ pub enum Response {
     },
     Error {
         message: String,
+    },
+    /// FR-84 D5b — one page of the device list ([`Request::Devices`]).
+    /// Boxed for the same reason as `Status`: the envelope is the largest
+    /// payload on the enum, and every other response would pay for it.
+    Devices(Box<DevicesPage>),
+    /// FR-84 D5b — the mesh graph ([`Request::Mesh`]).
+    Mesh(Box<MeshView>),
+    /// FR-84 D5b — the daemon answered FOR THE SERVER and the server did not
+    /// give it the list. `code` names the cause so a client can choose what
+    /// to show without reading prose: `server_unreachable` (connect / TLS /
+    /// timeout) · `unauthorized` (401 — the device's credentials were
+    /// refused) · `unsupported_server` (404 — a server older than the route)
+    /// · `module_unmounted` (the server's own 503) · `rate_limited` (429) ·
+    /// `server_error` (any other failure status) · `bad_request` (400 — e.g.
+    /// an unknown sort key) · `bad_response` (a 2xx the daemon could not
+    /// read) · `unknown_org` · `org_disabled` · `unsupported` (this node has
+    /// no server to ask). `status` is the HTTP status when there was one.
+    Upstream {
+        code: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
 }
 
@@ -1803,6 +1867,29 @@ pub trait LocalApiState: Send + Sync {
             message: "screen recording is not available in this build".into(),
         }
     }
+
+    /// FR-84 D5b — one page of the devices this device may see, fetched from
+    /// `org`'s server (async — an HTTP round-trip). Default: this node has no
+    /// server to ask, which is an [`Response::Upstream`] with code
+    /// `unsupported` rather than a bare error, so a client falls back the
+    /// same way it does for every other upstream failure.
+    async fn devices(&self, _org: &str, _query: &DevicesQuery) -> Response {
+        Response::Upstream {
+            code: "unsupported".into(),
+            message: "this node has no server connection to list devices from".into(),
+            status: None,
+        }
+    }
+
+    /// FR-84 D5b — the mesh graph for `org`'s visible set (async). Default:
+    /// unsupported, as for [`Self::devices`].
+    async fn mesh(&self, _org: &str) -> Response {
+        Response::Upstream {
+            code: "unsupported".into(),
+            message: "this node has no server connection to read the mesh from".into(),
+            status: None,
+        }
+    }
 }
 
 /// FR-85 — the refusal a non-console caller gets for a recording verb.
@@ -1855,7 +1942,9 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordStop
         | Request::RecordStatus
         | Request::RecordingsList
-        | Request::RecordingDelete { .. } => Response::Error {
+        | Request::RecordingDelete { .. }
+        | Request::Devices { .. }
+        | Request::Mesh { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -1955,6 +2044,25 @@ where
             Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
             Ok(Request::RecordStop) => state.record_stop().await,
             Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
+            // FR-84 D5b — read-only, open to every local client like `Peers`.
+            Ok(Request::Devices {
+                org,
+                page,
+                per_page,
+                q,
+                sort,
+                dir,
+            }) => {
+                let query = DevicesQuery {
+                    page,
+                    per_page,
+                    q,
+                    sort,
+                    dir,
+                };
+                state.devices(&org, &query).await
+            }
+            Ok(Request::Mesh { org }) => state.mesh(&org).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -3019,6 +3127,60 @@ impl Client {
             )),
             other => Err(unexpected_response(other)),
         }
+    }
+
+    /// FR-84 D5b — `Request::Devices` → one page of the devices this device
+    /// may see. The error says WHY not, by cause ([`DirectoryError`]): the
+    /// server's refusal as the daemon relayed it, a daemon too old to know
+    /// the verb, or the pipe itself — each has a different fallback.
+    pub async fn devices(
+        &mut self,
+        org: &str,
+        query: &DevicesQuery,
+    ) -> Result<DevicesPage, DirectoryError> {
+        let req = Request::Devices {
+            org: org.to_string(),
+            page: query.page,
+            per_page: query.per_page,
+            q: query.q.clone(),
+            sort: query.sort.clone(),
+            dir: query.dir.clone(),
+        };
+        match self.request(&req).await? {
+            Response::Devices(page) => Ok(*page),
+            other => Err(directory_error(other)),
+        }
+    }
+
+    /// FR-84 D5b — `Request::Mesh` → the mesh graph for the same set.
+    /// `Ok` with `enabled: false` is the server's statistics being off.
+    pub async fn mesh(&mut self, org: &str) -> Result<MeshView, DirectoryError> {
+        let req = Request::Mesh {
+            org: org.to_string(),
+        };
+        match self.request(&req).await? {
+            Response::Mesh(view) => Ok(*view),
+            other => Err(directory_error(other)),
+        }
+    }
+}
+
+/// FR-84 D5b — a non-answer to `Devices` / `Mesh`, classified by cause.
+fn directory_error(resp: Response) -> DirectoryError {
+    match resp {
+        Response::Upstream {
+            code,
+            message,
+            status,
+        } => DirectoryError::Upstream {
+            code,
+            message,
+            status,
+        },
+        Response::Error { message } => DirectoryError::from_daemon_error(message),
+        other => DirectoryError::Io(std::io::Error::other(format!(
+            "localapi: unexpected response: {other:?}"
+        ))),
     }
 }
 
