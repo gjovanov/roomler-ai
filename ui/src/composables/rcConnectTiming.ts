@@ -71,6 +71,23 @@ const MARK_ORDER: RcConnectMark[] = [
   'first_frame',
 ]
 
+/** The marks in wait order, for anything that renders or persists them.
+ *  Read-only: the ORDER is the timeline, and a consumer that sorted the
+ *  keys alphabetically would report `answer` before `ws_ready`. */
+export const RC_CONNECT_MARKS: readonly RcConnectMark[] = MARK_ORDER
+
+/**
+ * The first wait that never completed — `null` when the attempt painted.
+ *
+ * This is THE finding of an incomplete attempt (the console line, the
+ * snackbar and the persisted record all lead with it), so it is computed in
+ * exactly one place: three consumers each walking the list would be three
+ * chances to disagree about which step stalled.
+ */
+export function firstMissingMark(t: RcConnectTiming): RcConnectMark | null {
+  return MARK_ORDER.find((m) => t.marks[m] === undefined) ?? null
+}
+
 export interface RcConnectTiming {
   /** 1-based attempt number within one user-initiated connect. */
   attempt: number
@@ -88,12 +105,24 @@ export interface RcConnectTiming {
   afterDrop: boolean
   /** ms since the attempt began, per mark. Missing = never reached. */
   marks: Partial<Record<RcConnectMark, number>>
+  /** True when the tab was hidden at ANY point during the attempt.
+   *
+   *  ⚠️ Standing rule (2026-09-07): viewer-paint timing from a hidden tab is
+   *  invalid — `requestAnimationFrame` does not run, so `first_frame` there
+   *  measures when the decoder produced a frame nobody could see, and the
+   *  media watchdog tears such a session down about every 30 s. A record
+   *  that could not say this would poison every distribution it entered
+   *  (the 2026-09-25 field read was blocked by exactly such a tab). Optional
+   *  only so hand-written fixtures stay terse; the recorder always sets it. */
+  hidden?: boolean
 }
 
 export interface RcConnectRecorder {
   attempt: number
   afterDrop: boolean
   mark(name: RcConnectMark): void
+  /** The tab went hidden while this attempt was live. Sticky. */
+  noteHidden(): void
   /** Elapsed ms since the attempt began. */
   elapsed(): number
   snapshot(): RcConnectTiming
@@ -106,9 +135,20 @@ function now(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now()
 }
 
-export function beginAttempt(attempt: number, afterDrop = false): RcConnectRecorder {
+/** Is the document hidden right now? `false` wherever there is no DOM. */
+export function documentHidden(): boolean {
+  const d = (globalThis as { document?: { visibilityState?: string } }).document
+  return d?.visibilityState === 'hidden'
+}
+
+export function beginAttempt(
+  attempt: number,
+  afterDrop = false,
+  hiddenAtStart: boolean = documentHidden(),
+): RcConnectRecorder {
   const t0 = now()
   const marks: Partial<Record<RcConnectMark, number>> = {}
+  let hidden = hiddenAtStart
   return {
     attempt,
     afterDrop,
@@ -117,11 +157,14 @@ export function beginAttempt(attempt: number, afterDrop = false): RcConnectRecor
       // not restate a wait that already completed.
       if (marks[name] === undefined) marks[name] = Math.round(now() - t0)
     },
+    noteHidden() {
+      hidden = true
+    },
     elapsed() {
       return Math.round(now() - t0)
     },
     snapshot() {
-      return { attempt, afterDrop, marks: { ...marks } }
+      return { attempt, afterDrop, marks: { ...marks }, hidden }
     },
     done() {
       return marks.first_frame !== undefined
@@ -239,7 +282,7 @@ export function describeConnectTiming(t: RcConnectTiming): RcConnectVerdict {
   // Incomplete: the attempt was abandoned or cancelled. The step that
   // never completed IS the finding, so lead with it.
   if (total === undefined) {
-    const stalled = MARK_ORDER.find((m) => t.marks[m] === undefined)
+    const stalled = firstMissingMark(t)
     const what = stalled ? WAIT_LABEL[stalled] : 'connecting'
     return {
       text: `Reconnecting - the session stalled while waiting for ${what}. `
