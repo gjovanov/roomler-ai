@@ -224,6 +224,21 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
     opts.fps = args.fps;
     opts.max_duration = Duration::from_secs(u64::from(args.max_minutes.max(1)) * 60);
 
+    // A recorder that died (a crash, a killed parent, an update's Restart
+    // Manager) left its partial behind: finalize it now, as the identity that
+    // owns this folder. Beside this recording, not before it — a multi-GB
+    // remux must not hold up `started` (the daemon waits 20 s for it) — and
+    // safe beside it: this recording's partial is locked from its creation.
+    let reconcile = {
+        let staging = opts.staging();
+        let dest = opts.dest_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            for p in recorder::reconcile_partials(&staging, &dest) {
+                emit(&serde_json::json!({"ev": "recovered", "path": p}));
+            }
+        })
+    };
+
     let (factory, keeps_gop) = match encoder_factory(&args.encoder, opts.fps, opts.gop_seconds) {
         Ok(v) => v,
         Err(e) => {
@@ -294,6 +309,9 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
 
     let result = recorder::run(opts, capturer, factory, stop_rx, ev_tx).await;
     let _ = printer.await;
+    // Never exit mid-remux: a killed remux is safe (it writes a temp and
+    // renames), but it is work the next recorder would only have to redo.
+    let _ = reconcile.await;
     match result {
         Ok(summary) => {
             tracing::info!(reason = summary.reason.as_str(), path = ?summary.path, "recording: finished");

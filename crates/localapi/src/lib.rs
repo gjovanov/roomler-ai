@@ -1117,6 +1117,26 @@ pub enum Request {
         #[serde(default)]
         session_secs: u64,
     },
+    /// FR-85 — start a LOCAL screen recording (the daemon spawns
+    /// `roomlerd record`). Mutating, and the endpoint ACL is NOT the whole
+    /// boundary: the caller must be the console user
+    /// ([`ClientPeer::is_console_user`]) — an RDP guest must not record the
+    /// console user's desktop. Returns [`Response::Recording`].
+    RecordStart {
+        #[serde(default)]
+        opts: RecordStartOpts,
+    },
+    /// FR-85 — stop the active recording; answers once the file is final.
+    /// Console user only. Returns [`Response::Recording`].
+    RecordStop,
+    /// FR-85 — the recorder's state. Read-only. Returns [`Response::Recording`].
+    RecordStatus,
+    /// FR-85 — the recordings folder and what is in it. Read-only. Returns
+    /// [`Response::Recordings`].
+    RecordingsList,
+    /// FR-85 — delete one recording (and its sidecar) from the folder, by file
+    /// name. Console user only. Returns [`Response::RecordingDeleted`].
+    RecordingDelete { name: String },
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -1302,9 +1322,222 @@ pub enum Response {
         error: Option<String>,
     },
     /// The verb couldn't be served (bad request, state unavailable).
+    /// FR-85 — the recorder's state, answering [`Request::RecordStart`],
+    /// [`Request::RecordStop`] and [`Request::RecordStatus`].
+    Recording(RecordingState),
+    /// FR-85 — the recordings folder and what is in it.
+    Recordings(RecordingsListing),
+    /// FR-85 — the result of [`Request::RecordingDelete`].
+    RecordingDeleted {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Error {
         message: String,
     },
+}
+
+/// FR-85 — options for a LOCAL recording. The microphone and system audio are
+/// OFF unless asked for, and only a local caller can ask: this verb is served
+/// on the device's own LocalAPI, which no remote controller reaches.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordStartOpts {
+    /// 1–60; `None` ⇒ 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// `auto` | `hardware` | `software`; `None` ⇒ `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    /// Stop cleanly after this many minutes; `None` ⇒ 240.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
+    /// Record what the computer plays.
+    #[serde(default)]
+    pub system_audio: bool,
+    /// Record the microphone. Local only, by construction.
+    #[serde(default)]
+    pub microphone: bool,
+}
+
+/// FR-85 — what the recorder is doing now, and how the last recording ended.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingState {
+    pub active: bool,
+    /// The file being written (its final path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Unix milliseconds the recording started; 0 when idle.
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub frames: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub fps: u32,
+    /// Why the default or configured folder was not used, when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_reason: Option<String>,
+    /// How the previous recording ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<RecordingEnded>,
+}
+
+/// FR-85 — how a recording ended.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingEnded {
+    /// The closed stop-reason set (`requested`, `disk_low`, …), or a refusal
+    /// code (`encoder_unavailable`, `no_frame`, …) when it never started.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// FR-85 — one finished recording in the folder.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingItem {
+    /// File name (no path — it lives in [`RecordingsListing::dir`]).
+    pub name: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// RFC 3339, from the sidecar; empty when the sidecar is missing.
+    #[serde(default)]
+    pub started_at: String,
+    /// `local` | `remote`.
+    #[serde(default)]
+    pub origin: String,
+    /// A remote recording's controller, as the sidecar names them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
+/// FR-85 — the recordings folder, why it is that one, and its recordings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingsListing {
+    pub dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_reason: Option<String>,
+    pub items: Vec<RecordingItem>,
+}
+
+/// FR-85 — who is on the other end of a LocalAPI connection, captured by the
+/// listener at accept time from the OS (never from anything the client says).
+///
+/// The pipe ACL admits every Interactive User — RDP sessions included — and
+/// the unix socket every process of its uid. That is the right boundary for
+/// reading status, and the wrong one for starting a screen recording: a guest
+/// in an RDP session must not be able to record the CONSOLE user's desktop.
+/// The recording verbs, and a `ConfigSet` of any `record_*` key, therefore
+/// require [`ClientPeer::is_console_user`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientPeer {
+    /// Windows: the client process's session id.
+    pub session_id: Option<u32>,
+    /// Unix: the client's uid.
+    pub uid: Option<u32>,
+}
+
+impl ClientPeer {
+    /// A peer nothing is known about (tests, and any transport that cannot
+    /// say). Fails every console check — the gate is fail-closed.
+    pub const UNKNOWN: ClientPeer = ClientPeer {
+        session_id: None,
+        uid: None,
+    };
+
+    /// Is this peer the person at the console? Windows: its session is the
+    /// active CONSOLE session. Unix: it is this daemon's own uid (a per-user
+    /// daemon, whose socket is 0600 anyway), or root.
+    pub fn is_console_user(&self) -> bool {
+        peer_is_console_user(self, console_session_id(), own_uid())
+    }
+}
+
+/// The pure decision behind [`ClientPeer::is_console_user`], testable
+/// without an OS.
+pub fn peer_is_console_user(
+    peer: &ClientPeer,
+    console_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
+        return p == c;
+    }
+    match (peer.uid, own_uid) {
+        (Some(p), Some(o)) => p == o || p == 0,
+        _ => false,
+    }
+}
+
+/// The active console session (Windows), `None` when there is none or on
+/// other platforms.
+fn console_session_id() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        // SAFETY: no arguments, no preconditions.
+        let s =
+            unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
+        (s != u32::MAX).then_some(s)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// This process's effective uid (unix), `None` elsewhere.
+fn own_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid never fails.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The session id of the client on the far end of a server pipe handle.
+#[cfg(windows)]
+fn pipe_client_session(handle: std::os::windows::io::RawHandle) -> Option<u32> {
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut pid = 0u32;
+    // SAFETY: `handle` is a live server-end pipe handle owned by the caller for
+    // the duration of this call; both out-params are valid u32s.
+    unsafe {
+        if GetNamedPipeClientProcessId(handle as _, &mut pid) == 0 {
+            return None;
+        }
+        let mut session = 0u32;
+        if ProcessIdToSessionId(pid, &mut session) == 0 {
+            return None;
+        }
+        Some(session)
+    }
 }
 
 /// The overlay runtime's live view of the mesh, republished on a
@@ -1513,6 +1746,45 @@ pub trait LocalApiState: Send + Sync {
             message: "this node cannot originate SSH sessions (no server connection)".into(),
         }
     }
+    /// FR-85 — start a local recording. The console-user check has already
+    /// passed when this is called ([`serve_connection_as`] enforces it).
+    /// Default: this build has no recorder.
+    async fn record_start(&self, _opts: RecordStartOpts) -> Response {
+        Response::Error {
+            message: "screen recording is not available in this build".into(),
+        }
+    }
+    /// FR-85 — stop the active recording (console user, checked by the caller).
+    async fn record_stop(&self) -> Response {
+        Response::Error {
+            message: "screen recording is not available in this build".into(),
+        }
+    }
+    /// FR-85 — the recorder's state.
+    async fn record_status(&self) -> Response {
+        Response::Recording(RecordingState::default())
+    }
+    /// FR-85 — the recordings folder and its recordings.
+    async fn recordings_list(&self) -> Response {
+        Response::Error {
+            message: "screen recording is not available in this build".into(),
+        }
+    }
+    /// FR-85 — delete a recording by name (console user, checked by the caller).
+    async fn recording_delete(&self, _name: &str) -> Response {
+        Response::Error {
+            message: "screen recording is not available in this build".into(),
+        }
+    }
+}
+
+/// FR-85 — the refusal a non-console caller gets for a recording verb.
+fn not_the_console_user() -> Response {
+    Response::Error {
+        message: "only the person at this device's console can start, stop or delete a \
+                  recording, or change where recordings are saved"
+            .into(),
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -1551,7 +1823,12 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::ConfigSet { .. }
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
-        | Request::SshSession { .. } => Response::Error {
+        | Request::SshSession { .. }
+        | Request::RecordStart { .. }
+        | Request::RecordStop
+        | Request::RecordStatus
+        | Request::RecordingsList
+        | Request::RecordingDelete { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -1567,6 +1844,20 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
 /// accept a connection and hand the accepted stream here. The daemon
 /// spawns one task per connection: `serve_connection(stream, state.as_ref())`.
 pub async fn serve_connection<S>(stream: S, state: &dyn LocalApiState) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    serve_connection_as(stream, state, ClientPeer::UNKNOWN).await
+}
+
+/// [`serve_connection`] with the peer the listener identified at accept time.
+/// FR-85: the recording verbs and a `ConfigSet` of any `record_*` key require
+/// [`ClientPeer::is_console_user`]; an unknown peer fails that check.
+pub async fn serve_connection_as<S>(
+    stream: S,
+    state: &dyn LocalApiState,
+    peer: ClientPeer,
+) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1608,6 +1899,12 @@ where
             Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
             Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
             Ok(Request::ConfigGet) => state.config_entries().await,
+            // FR-85 — where recordings are written is the console user's call.
+            Ok(Request::ConfigSet { key, .. })
+                if key.starts_with("record_") && !peer.is_console_user() =>
+            {
+                not_the_console_user()
+            }
             Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
             Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
             Ok(Request::ExecRemote {
@@ -1621,6 +1918,16 @@ where
                 public_key,
                 session_secs,
             }) => state.ssh_session(&node, &public_key, session_secs).await,
+            // FR-85 — recording. Reading state is open to every local client;
+            // starting, stopping and deleting are the console user's alone.
+            Ok(Request::RecordStatus) => state.record_status().await,
+            Ok(Request::RecordingsList) => state.recordings_list().await,
+            Ok(
+                Request::RecordStart { .. } | Request::RecordStop | Request::RecordingDelete { .. },
+            ) if !peer.is_console_user() => not_the_console_user(),
+            Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
+            Ok(Request::RecordStop) => state.record_stop().await,
+            Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -2000,8 +2307,16 @@ async fn accept_pipe(
                         }
                     }
                     let st = state.clone();
+                    // FR-85 — who connected, from the OS, before a byte is read.
+                    let peer = {
+                        use std::os::windows::io::AsRawHandle;
+                        ClientPeer {
+                            session_id: pipe_client_session(connected.as_raw_handle()),
+                            uid: None,
+                        }
+                    };
                     tokio::spawn(async move {
-                        if let Err(e) = serve_connection(connected, &*st).await {
+                        if let Err(e) = serve_connection_as(connected, &*st, peer).await {
                             tracing::debug!(error = %e, "localapi: pipe client ended");
                         }
                     });
@@ -2169,8 +2484,13 @@ async fn accept_unix(
             accept = listener.accept() => match accept {
                 Ok((stream, _addr)) => {
                     let st = state.clone();
+                    // FR-85 — who connected, from the kernel (SO_PEERCRED).
+                    let peer = ClientPeer {
+                        session_id: None,
+                        uid: stream.peer_cred().ok().map(|c| c.uid()),
+                    };
                     tokio::spawn(async move {
-                        if let Err(e) = serve_connection(stream, &*st).await {
+                        if let Err(e) = serve_connection_as(stream, &*st, peer).await {
                             tracing::debug!(error = %e, "localapi: unix client ended");
                         }
                     });
@@ -2618,6 +2938,58 @@ impl Client {
                 size,
                 content,
             } => Ok((path, size, content)),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-85 — start a recording of this device's screen. Answers once the
+    /// recorder has begun encoding (the state names the file and encoder) or
+    /// refused (an `Err` naming why). Console user only.
+    pub async fn record_start(&mut self, opts: RecordStartOpts) -> std::io::Result<RecordingState> {
+        match self.request(&Request::RecordStart { opts }).await? {
+            Response::Recording(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-85 — stop the active recording. Answers once the file is final
+    /// (`last` says how it ended). Console user only.
+    pub async fn record_stop(&mut self) -> std::io::Result<RecordingState> {
+        match self.request(&Request::RecordStop).await? {
+            Response::Recording(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-85 — what the recorder is doing, and how the last recording ended.
+    pub async fn record_status(&mut self) -> std::io::Result<RecordingState> {
+        match self.request(&Request::RecordStatus).await? {
+            Response::Recording(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-85 — the recordings folder, why it is that one, and its recordings.
+    pub async fn recordings_list(&mut self) -> std::io::Result<RecordingsListing> {
+        match self.request(&Request::RecordingsList).await? {
+            Response::Recordings(l) => Ok(l),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-85 — delete one recording (and its sidecar) by file name. Console
+    /// user only.
+    pub async fn recording_delete(&mut self, name: &str) -> std::io::Result<()> {
+        match self
+            .request(&Request::RecordingDelete {
+                name: name.to_string(),
+            })
+            .await?
+        {
+            Response::RecordingDeleted { ok: true, .. } => Ok(()),
+            Response::RecordingDeleted { message, .. } => Err(std::io::Error::other(
+                message.unwrap_or_else(|| "the recording was not deleted".into()),
+            )),
             other => Err(unexpected_response(other)),
         }
     }
@@ -3590,6 +3962,144 @@ mod tests {
         drop(cwr);
         drop(clines);
         srv.await.unwrap().unwrap();
+    }
+
+    // ── FR-85 — the recording verbs and the console-user gate ───────────────
+
+    #[test]
+    fn the_console_user_decision_table() {
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            uid: None,
+        };
+        let unix = |u| ClientPeer {
+            session_id: None,
+            uid: Some(u),
+        };
+        // Windows: the peer's session must be the active console session.
+        assert!(peer_is_console_user(&win(1), Some(1), None));
+        assert!(
+            !peer_is_console_user(&win(2), Some(1), None),
+            "an RDP session"
+        );
+        assert!(
+            !peer_is_console_user(&win(1), None, None),
+            "no console session at all"
+        );
+        // Unix: the daemon's own uid, or root.
+        assert!(peer_is_console_user(&unix(1000), None, Some(1000)));
+        assert!(peer_is_console_user(&unix(0), None, Some(1000)));
+        assert!(!peer_is_console_user(&unix(1001), None, Some(1000)));
+        // Fail-closed on anything unknown.
+        assert!(!peer_is_console_user(
+            &ClientPeer::UNKNOWN,
+            Some(1),
+            Some(1000)
+        ));
+        assert!(!ClientPeer::UNKNOWN.is_console_user());
+    }
+
+    #[test]
+    fn the_recording_verbs_round_trip() {
+        for req in [
+            Request::RecordStart {
+                opts: RecordStartOpts {
+                    fps: Some(60),
+                    encoder: Some("software".into()),
+                    max_minutes: Some(5),
+                    system_audio: true,
+                    microphone: false,
+                },
+            },
+            Request::RecordStop,
+            Request::RecordStatus,
+            Request::RecordingsList,
+            Request::RecordingDelete {
+                name: "Roomler Recording 2026-09-25 14-30-12.mp4".into(),
+            },
+        ] {
+            let j = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&j).unwrap(), req, "{j}");
+        }
+        // An older client's bare start (no opts) still parses, with audio off.
+        let bare: Request = serde_json::from_str(r#"{"t":"record_start","d":{}}"#).unwrap();
+        assert_eq!(
+            bare,
+            Request::RecordStart {
+                opts: RecordStartOpts::default()
+            }
+        );
+        let resp = Response::Recording(RecordingState {
+            active: true,
+            path: Some("C:\\x\\r.mp4".into()),
+            fps: 30,
+            ..Default::default()
+        });
+        let j = serde_json::to_string(&resp).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&j).unwrap(), resp);
+    }
+
+    async fn ask(peer: ClientPeer, line: &str) -> Response {
+        let (client, server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            let state = Mock;
+            serve_connection_as(server, &state, peer).await
+        });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut clines = tokio::io::BufReader::new(crd).lines();
+        cwr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        let r = clines.next_line().await.unwrap().unwrap();
+        drop(cwr);
+        drop(clines);
+        srv.await.unwrap().unwrap();
+        serde_json::from_str(&r).unwrap()
+    }
+
+    fn is_console_refusal(r: &Response) -> bool {
+        matches!(r, Response::Error { message } if message.contains("console"))
+    }
+
+    #[tokio::test]
+    async fn an_unidentified_peer_cannot_start_stop_delete_or_move_recordings() {
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
+            r#"{"t":"config_set","d":{"key":"record_dir","value":"C:\\elsewhere"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(is_console_refusal(&r), "{line} → {r:?}");
+        }
+        // Reading state is open to every local client.
+        assert!(matches!(
+            ask(ClientPeer::UNKNOWN, r#"{"t":"record_status"}"#).await,
+            Response::Recording(_)
+        ));
+        // And a ConfigSet of any OTHER key is not the recorder's business.
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"exec_enabled","value":"true"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn the_console_user_passes_the_gate() {
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+        };
+        if !me.is_console_user() {
+            // A Windows host with no active console session (some CI runners):
+            // the refusal half above is the part that must hold everywhere.
+            return;
+        }
+        // The gate lets the console user through to the state, which in this
+        // mock has no recorder — a DIFFERENT error, proving the gate passed.
+        let r = ask(me, r#"{"t":"record_start","d":{}}"#).await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        assert!(matches!(r, Response::Error { message } if message.contains("not available")));
     }
 
     #[cfg(windows)]

@@ -398,6 +398,7 @@ async fn no_frame_refuses_the_start() {
 #[cfg(feature = "synthetic-frame-source")]
 mod process {
     use super::*;
+    use roomlerd::recording::recorder::PartialLock;
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::process::{Child, ChildStdin, Command, Stdio};
@@ -540,8 +541,12 @@ mod process {
         r.child.kill().unwrap(); // SIGKILL / TerminateProcess: no finalize ran
         let _ = r.child.wait();
         let staging = dir.path().join(PARTIAL_DIR);
-        let partials: Vec<_> = std::fs::read_dir(&staging).unwrap().flatten().collect();
+        let partials = partials_in(&staging);
         assert_eq!(partials.len(), 1, "the dead recorder left its partial");
+        assert!(
+            PartialLock::path_for(&partials[0]).exists(),
+            "…and its lock file, which the kernel unlocked when it died"
+        );
 
         let done = recorder::reconcile_partials(&staging, dir.path());
         assert_eq!(done.len(), 1);
@@ -559,7 +564,203 @@ mod process {
         assert_eq!(
             std::fs::read_dir(&staging).unwrap().count(),
             0,
-            "the partial is gone"
+            "the partial and its lock are gone"
         );
+    }
+
+    fn partials_in(staging: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(staging)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(PARTIAL_SUFFIX))
+            .collect()
+    }
+
+    /// The reconciler runs at every recorder start, beside whatever else is
+    /// recording into the same folder. A partial that is still being
+    /// written is not interrupted: finalizing it would remux a file under its
+    /// writer — or, before its first fragment, delete it as unrecoverable.
+    #[test]
+    fn a_live_partial_is_left_alone_by_the_reconciler() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(2500)); // a fragment on disk
+        let staging = dir.path().join(PARTIAL_DIR);
+        assert_eq!(partials_in(&staging).len(), 1);
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert!(done.is_empty(), "a live partial was finalized: {done:?}");
+        assert_eq!(partials_in(&staging).len(), 1, "…and it is still there");
+
+        // The live recording is unharmed: it stops and finalizes normally.
+        writeln!(r.stdin.as_mut().unwrap(), r#"{{"cmd":"stop"}}"#).unwrap();
+        let stopped = r.wait_for("stopped", Duration::from_secs(30));
+        assert_eq!(stopped["reason"], "requested");
+        assert_eq!(stopped["fragmented"], false);
+        assert!(r.wait_exit(Duration::from_secs(30)).success());
+        let p = r.only_recording();
+        assert_eq!(sidecar_of(&p).stop_reason, Some(StopReason::Requested));
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "the finished recording took its partial and lock with it"
+        );
+    }
+
+    /// P2a — the daemon's side, end to end: the manager launches the real
+    /// `roomlerd record` into the configured `record_dir`, answers `start`
+    /// once encoding began, refuses a second one, answers `stop` once the
+    /// file is final, lists it from its sidecar, and deletes it by name only.
+    /// The manager tests share the process-wide "a recording is running" mark
+    /// the updater reads; run them one at a time so each reads only its own.
+    static MANAGER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_manager_drives_a_recording_end_to_end() {
+        use roomlerd::recording::manager::{RecordingManager, is_recording};
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+
+        let _serial = MANAGER_TESTS.lock().await;
+        let dir = scratch();
+        let out = dir.path().join("Recordings");
+        let cfg_path = dir.path().join("config.toml");
+        let mut cfg = roomler_node_core::config::test_fixture();
+        cfg.record_dir = Some(out.to_string_lossy().into_owned());
+        roomler_node_core::config::save(&cfg_path, &cfg).unwrap();
+
+        let m = RecordingManager::new(PathBuf::from(env!("CARGO_BIN_EXE_roomlerd")), cfg_path)
+            .with_service_identity(false)
+            .with_child_env([("ROOMLERD_SYNTHETIC_FRAMES", "1")]);
+        let software = || RecordStartOpts {
+            encoder: Some("software".into()),
+            ..Default::default()
+        };
+
+        let st = match m.start(software()).await {
+            Response::Recording(s) => s,
+            other => panic!("start: {other:?}"),
+        };
+        assert!(st.active, "{st:?}");
+        assert_eq!(st.encoder.as_deref(), Some("openh264"));
+        assert!(
+            st.path
+                .as_deref()
+                .is_some_and(|p| Path::new(p).starts_with(&out))
+        );
+        assert!(is_recording(), "the updater's defer gate sees it");
+        assert!(
+            matches!(m.start(software()).await, Response::Error { .. }),
+            "one recording at a time"
+        );
+
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let st = match m.stop().await {
+            Response::Recording(s) => s,
+            other => panic!("stop: {other:?}"),
+        };
+        assert!(!st.active && !is_recording());
+        let last = st.last.expect("how it ended");
+        assert_eq!(last.reason, "requested");
+        assert!(last.duration_ms >= 1000, "{last:?}");
+        let file = PathBuf::from(last.path.expect("the finished file"));
+        assert!(file.starts_with(&out) && file.is_file());
+
+        let listing = match m.list().await {
+            Response::Recordings(l) => l,
+            other => panic!("list: {other:?}"),
+        };
+        assert_eq!(Path::new(&listing.dir), out.as_path());
+        assert_eq!(listing.items.len(), 1, "{listing:?}");
+        let item = &listing.items[0];
+        assert_eq!(item.origin, "local");
+        assert_eq!(item.stop_reason.as_deref(), Some("requested"));
+        assert!(item.width >= 16 && item.duration_ms >= 1000, "{item:?}");
+
+        for bad in ["../escape.mp4", "a/b.mp4", "notes.txt"] {
+            assert!(
+                matches!(
+                    m.delete(bad).await,
+                    Response::RecordingDeleted { ok: false, .. }
+                ),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            m.delete(&item.name).await,
+            Response::RecordingDeleted { ok: true, .. }
+        ));
+        assert!(!file.exists() && !Sidecar::path_for(&file).exists());
+    }
+
+    /// A recorder that misses the start deadline is STOPPED, not left behind:
+    /// its caller was told "did not start", and one that began a second later
+    /// would be recording unseen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorder_that_misses_the_start_deadline_is_stopped_not_left_recording() {
+        use roomlerd::recording::manager::RecordingManager;
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+
+        let _serial = MANAGER_TESTS.lock().await;
+        let dir = scratch();
+        let out = dir.path().join("Recordings");
+        let cfg_path = dir.path().join("config.toml");
+        let mut cfg = roomler_node_core::config::test_fixture();
+        cfg.record_dir = Some(out.to_string_lossy().into_owned());
+        roomler_node_core::config::save(&cfg_path, &cfg).unwrap();
+        let m = RecordingManager::new(PathBuf::from(env!("CARGO_BIN_EXE_roomlerd")), cfg_path)
+            .with_service_identity(false)
+            .with_child_env([("ROOMLERD_SYNTHETIC_FRAMES", "1")])
+            // Far shorter than a process spawn: the deadline always wins.
+            .with_start_timeout(Duration::from_millis(1));
+        let opts = RecordStartOpts {
+            encoder: Some("software".into()),
+            ..Default::default()
+        };
+        match m.start(opts).await {
+            Response::Error { message } => {
+                assert!(message.contains("did not start"), "{message}")
+            }
+            other => panic!("a missed deadline must be an error: {other:?}"),
+        }
+        // Long enough for a surviving child to have opened its encoder and
+        // reported `started` (the healthy path takes well under a second).
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let st = match m.status() {
+            Response::Recording(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert!(!st.active, "a killed recorder started anyway: {st:?}");
+        assert!(st.path.is_none(), "it reported `started` after all: {st:?}");
+        assert_eq!(st.last.map(|l| l.reason).as_deref(), Some("start_timeout"));
+        // (A killed child may not even have created the folder.)
+        let written = std::fs::read_dir(&out)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "mp4"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(written, 0, "no recording was written");
+    }
+
+    /// A SYSTEM/root daemon refuses a local recording (until P1e launches
+    /// the recorder as the console user) — and says why, before spawning
+    /// anything.
+    #[tokio::test]
+    async fn a_service_identity_daemon_refuses_a_local_recording() {
+        use roomlerd::recording::manager::RecordingManager;
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+        let dir = scratch();
+        let m = RecordingManager::new(
+            PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+            dir.path().join("config.toml"),
+        )
+        .with_service_identity(true);
+        match m.start(RecordStartOpts::default()).await {
+            Response::Error { message } => assert!(message.contains("SYSTEM/root"), "{message}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

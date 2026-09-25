@@ -1152,6 +1152,14 @@ pub struct AgentConfig {
     /// Unset = the loader's default device.
     #[serde(default)]
     pub vulkan_device: Option<String>,
+    /// FR-85 — where screen recordings go. Unset = the per-user default
+    /// (`Videos\Roomler` on Windows when local and writable, `~/Movies/Roomler`,
+    /// the XDG videos dir + `Roomler`). Validated by
+    /// [`crate::recording_dir::validate_record_dir`]. ⚠️ Device-owned: a
+    /// server-pushed path would pick where the recorder writes, so it is
+    /// structurally absent from `DesiredConfig` (the `record_` prefix test).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_dir: Option<String>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2152,6 +2160,7 @@ pub fn test_fixture() -> AgentConfig {
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
+        record_dir: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

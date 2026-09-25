@@ -31,6 +31,7 @@ pub mod logging;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
+pub mod recording_dir;
 /// macOS privacy-permission probes. Here rather than in `roomlerd`
 /// because the desktop companion needs them too and deliberately does NOT
 /// depend on the agent (P3e lever E) — the whole point of that split is that
