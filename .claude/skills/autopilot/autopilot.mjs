@@ -185,6 +185,40 @@ function parseAcs(text) {
   return acs;
 }
 
+// Does the spec carry THE docs criterion that docs-before-close requires? This mirrors
+// `ac_scan` in `scripts/fr-verification-debt.sh`, the guard that fails master when an FR
+// closes without one. A criterion counts when ANY of its three rules holds:
+//   1. its SUBJECT opens with the word "docs" (not a `docs/` path, which is a feature
+//      criterion asserting some doc's content);
+//   2. it commits to the `docs/README.md` index row;
+//   3. it names the rule ("docs-before-close" / "close requires docs").
+// ⚠️ Keep the two in step. If the guard's rules change, change this too: a board that
+// disagrees with the guard parks a card as Ready to close that the close then turns red.
+// That happened to FR-22 on 2026-09-25, and FR-24 was sitting in the same state.
+// The one intended difference: a `- [~]` line starts a criterion here (#1614).
+function hasDocsCriterion(text) {
+  let inAc = false, cur = null, docs = false;
+  const chk = (t) => {
+    if (/docs\/readme\.md|docs[- ]before[- ]close|close[- ]requires[- ]docs/i.test(t)) docs = true;
+  };
+  const subject = (l) => {
+    const s = l.replace(/^\s*-\s*\[.\]\s*/, '').replace(/\*/g, '')
+      .replace(/^(AC|P)[0-9]+[a-z]?[^A-Za-z`]*/, '');
+    if (/^docs?([^a-z/]|$)/i.test(s)) docs = true;
+  };
+  for (const l of text.split(/\r?\n/)) {
+    if (/^## .*[Aa]cceptance [Cc]riteria/.test(l)) { inAc = true; continue; }
+    if (/^## /.test(l)) { if (cur) chk(cur); cur = null; inAc = false; continue; }
+    if (!inAc) continue;
+    if (/^\s*-\s*\[.\]/.test(l)) { if (cur) chk(cur); cur = l; subject(l); continue; }
+    if (/^\s+\S/.test(l) && cur) { cur += ' ' + l; continue; }
+    if (cur) chk(cur);
+    cur = null;
+  }
+  if (cur) chk(cur);
+  return docs;
+}
+
 // Phases are BEST EFFORT and nothing depends on them: only 41 of 79 specs have the heading,
 // the tables under it have 15+ distinct header shapes, and FR-70 has prose instead of a
 // table. Match header cells by NAME, never by position; a spec we cannot parse gets [].
@@ -519,6 +553,8 @@ function scan() {
       priority: prev?.priority ?? null,
       acs,
       phases,
+      // null = the spec could not be read, which says nothing either way.
+      docs_criterion: text ? hasDocsCriterion(text) : null,
       ledger_status: row.ledgerStatus,
       issue_updated_at: issue.updatedAt,
       labels: issue.labels.map((l) => l.name),
@@ -639,7 +675,21 @@ function rank(cards) {
 const fraction = (c) => (c.acs.length ? c.acs.filter((a) => a.done).length / c.acs.length : 0);
 const remaining = (c) => c.acs.filter((a) => !a.done);
 const operatorOnly = (c) => remaining(c).filter((a) => a.verify === 'operator');
-const agentLeft = (c) => remaining(c).filter((a) => a.verify !== 'operator');
+// A spec with no docs criterion owes one: closing the FR binds it to docs-before-close,
+// and the verification-debt guard then fails master. Writing the doc and adding the
+// criterion (marked as added retroactively) is agent work, so it counts here even though
+// no checkbox exists yet.
+const docsOwed = (c) => c.docs_criterion === false;
+const DOCS_OWED = {
+  id: 'DOCS',
+  text: 'no docs criterion: closing would fail the FR verification-debt guard. Write the doc, add the criterion marked as added retroactively',
+  done: false,
+  verify: 'agent',
+};
+const agentLeft = (c) => [
+  ...remaining(c).filter((a) => a.verify !== 'operator'),
+  ...(docsOwed(c) ? [DOCS_OWED] : []),
+];
 
 function bar(f) {
   const n = Math.round(f * 10);
@@ -708,7 +758,7 @@ function board() {
       const half = c.acs.filter((a) => !a.done && a.mark === '~').length;
       const op = operatorOnly(c).length;
       const title = `**[${c.id}](https://github.com/gjovanov/roomler-ai/issues/${c.issue})** ${trunc(c.title, 60)}`;
-      const marks = [half ? `${half} ◐` : '', op ? `${op} 👤` : ''].filter(Boolean);
+      const marks = [half ? `${half} ◐` : '', op ? `${op} 👤` : '', docsOwed(c) ? '📘' : ''].filter(Boolean);
       const acCell = `${done}/${c.acs.length}${marks.length ? ` (${marks.join(', ')})` : ''}`;
       const next = c.run.hands_off ? `🔒 ${c.run.hands_off_reason}`
         : (c.run.last_action || nextPhase(c) || '—');
@@ -720,7 +770,8 @@ function board() {
   L.push('---');
   L.push('');
   L.push('**Legend** — `👤` an open criterion only the operator can settle · `◐` one the spec');
-  L.push('marks half met (`- [~]`), counted as open until it reads `[x]` · `🚧` blocked ·');
+  L.push('marks half met (`- [~]`), counted as open until it reads `[x]` · `📘` the spec has no');
+  L.push('docs criterion, so closing it would fail the verification-debt guard · `🚧` blocked ·');
   L.push('`🔒` work already in flight — **traced, never picked up**. A branch counts as live for');
   L.push(`${FRESH_DAYS} days after its last commit (\`--fresh-days\`); clear a card by hand if its`);
   L.push('branch is actually dead. ·');
@@ -821,13 +872,16 @@ function classify() {
 // A card whose remaining criteria are ALL operator-only has no agent work left in it —
 // that is `ready`, and saying so is the point of the board. Derived, never sticky: it
 // re-derives on every scan, and a card a worker has claimed is left alone.
+// ⚠️ …unless it owes the docs criterion. "Every box ticked" is not closable when no box
+// for the docs exists. The close would turn master's verification-debt guard red, as
+// FR-22's did on 2026-09-25. So such a card is agent work, not the operator's to close.
 function place() {
   let moved = 0;
   for (const card of allCards()) {
     if (card.run.started_at || card.run.hands_off || card.column === 'judgement') continue;
     const rem = remaining(card);
-    const should = rem.length === 0 ? 'ready'
-      : rem.every((a) => a.verify === 'operator') ? 'ready'
+    const closable = rem.every((a) => a.verify === 'operator') && !docsOwed(card);
+    const should = closable ? 'ready'
       : card.column === 'ready' ? 'admitted'
       : card.column;
     if (should !== card.column) { card.column = should; saveCard(card); moved++; }

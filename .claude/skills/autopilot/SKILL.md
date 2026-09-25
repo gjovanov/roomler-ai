@@ -79,6 +79,14 @@ never edits a spec, never touches an issue.
 ## Safety rails (do not violate)
 
 1. **Never close an issue. Never merge a PR.** The card parks at `ready`; the operator closes.
+   ⚠️ A merge can close an issue without anyone deciding to. GitHub acts on
+   `close`/`fix`/`resolve #<n>` in a PR body or a commit message the moment the PR merges.
+   On 2026-09-25 a worker's "close #819" closed FR-22 with criteria still `[~]`, and
+   master's verification-debt guard went red. Workers write `Refs #<n>`. Whoever merges a
+   worker's PR checks its body AND its commit messages for closing keywords first.
+   ⚠️ `ready` also requires a **docs criterion** in the spec. An FR closed without one
+   fails the guard (docs-before-close binds every FR that closes after #1401), so a card
+   owing one stays agent work, marked `📘`, even when every box it has is ticked.
 2. **Never tick an acceptance criterion on CI evidence.** A green lane is not a field read.
    If the only evidence is CI, the AC stays open and the card says so.
 3. **Never claim an FR number.** Write the proposal on the card and in the issue; the
