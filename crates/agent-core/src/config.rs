@@ -1191,6 +1191,21 @@ pub struct AgentConfig {
     /// structurally absent from `DesiredConfig` (the `record_` prefix test).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_dir: Option<String>,
+    /// FR-85 P3 — let a remote controller record this screen. Default OFF.
+    /// The recording is made and kept on this device; the controller
+    /// downloads it over the session. The agent advertises the `record`
+    /// capability only while this is on, so the server never grants
+    /// `Permissions::RECORD` to a controller of a device whose owner did not
+    /// opt in. Read live: OFF also stops a remote recording in progress.
+    /// ⚠️ Device-owned: structurally absent from `DesiredConfig` (the
+    /// `record_` prefix test), like `record_dir`.
+    #[serde(default)]
+    pub record_remote_enabled: bool,
+    /// FR-85 P3 — let a remote recording include what the computer plays.
+    /// Default OFF, and meaningless without `record_remote_enabled`. The
+    /// microphone is never a remote option.
+    #[serde(default)]
+    pub record_remote_audio: bool,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2194,6 +2209,8 @@ pub fn test_fixture() -> AgentConfig {
         d3d12_adapter: None,
         vulkan_device: None,
         record_dir: None,
+        record_remote_enabled: false,
+        record_remote_audio: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

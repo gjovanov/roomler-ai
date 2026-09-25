@@ -72,6 +72,18 @@ pub struct PromptView {
     pub expires_at: std::time::Instant,
 }
 
+/// FR-85 P3 — where a recording in progress is shown on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingShown {
+    /// The daemon's own badge draws it (Windows, capture-excluded, pinned
+    /// open while recording).
+    pub native: bool,
+    /// The session registry carries it, so the desktop companion's banner
+    /// can show it — if the companion is running, which is the caller's to
+    /// ensure (`companion::ensure_running`).
+    pub listed: bool,
+}
+
 /// A handle to the viewer-indicator worker. Cheap to clone; multiple
 /// sessions sharing one handle is the common case (one worker, many
 /// concurrent sessions → one combined label).
@@ -188,6 +200,21 @@ impl ViewerIndicator {
     /// somewhere else (the CLI, the companion, an emailed link). Idempotent.
     pub fn hide_prompt(&self, session_hex: &str) {
         self.inner.dismiss(session_hex);
+    }
+
+    /// FR-85 P3 — mark `session_id` as recording (or not) on every surface
+    /// this daemon has, and say which of them can SHOW it. A remote
+    /// recording starts only behind one of them: the person at the device
+    /// must be told before the first frame is written.
+    pub fn set_recording(
+        &self,
+        session_id: bson::oid::ObjectId,
+        recording: bool,
+    ) -> RecordingShown {
+        RecordingShown {
+            native: self.inner.set_recording(&session_id.to_hex(), recording),
+            listed: self.registry.set_recording(&session_id, recording),
+        }
     }
 
     /// Announce that a session has ended. When the last session drops,
@@ -314,6 +341,10 @@ impl Inner {
     }
     fn show(&self, _session_id: String, _controller_name: String) {}
     fn hide(&self, _session_id: String) {}
+    /// No native banner outside Windows: the companion's is the surface.
+    fn set_recording(&self, _session_id: &str, _recording: bool) -> bool {
+        false
+    }
     /// `false` here is what routes the caller to the companion — never a
     /// swallowed prompt.
     fn prompt(&self, view: PromptView) -> bool {
