@@ -104,6 +104,47 @@ const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 /// experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
+/// What the agent puts on the wire for a resolved host consent prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsentReply {
+    pub granted: bool,
+    /// FR-27 — WHY, when the answer is no. A bare `false` reaches the
+    /// controller as "the user denied your request", which is a lie whenever
+    /// the truth is that the prompt stood unanswered, or that nothing could
+    /// raise one.
+    pub reason: Option<roomler_ai_remote_control::consent::ConsentDenyReason>,
+}
+
+/// Map a prompt's [`crate::consent::Decision`] to the `rc:consent` the agent
+/// sends — or to `None`, meaning **send nothing**.
+///
+/// `have_surface` is whether a human could have been asked at all: a timeout
+/// with no surface is `no_prompt_surface`, not `timeout`.
+///
+/// #1632 — `Cancelled` is the one decision with no reply. The prompt was
+/// withdrawn because the session it asked about was terminated (the
+/// controller closed its tab, switched device, or the server timed the
+/// session out first), so the server has already forgotten the session and
+/// no verdict is owed; a `granted:false` would only be audited against
+/// nothing, or read as a refusal nobody made.
+pub(crate) fn consent_reply(
+    decision: crate::consent::Decision,
+    have_surface: bool,
+) -> Option<ConsentReply> {
+    use crate::consent::Decision;
+    use roomler_ai_remote_control::consent::ConsentDenyReason;
+    let reason = match decision {
+        Decision::Granted | Decision::Denied => None,
+        Decision::Timeout if !have_surface => Some(ConsentDenyReason::NoPromptSurface),
+        Decision::Timeout => Some(ConsentDenyReason::HostTimeout),
+        Decision::Cancelled => return None,
+    };
+    Some(ConsentReply {
+        granted: decision.granted(),
+        reason,
+    })
+}
+
 /// Pong-RTT degradation bound for the control WS. Field winhost-a 2026-08-15
 /// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
 /// with application round-trips over 60 s — every send completed into the
@@ -2133,6 +2174,26 @@ async fn handle_server_msg(
     // channel and not on our own control WS. `None` is every ordinary session.
     delegated: Option<&mpsc::Sender<ClientMsg>>,
 ) -> Result<(), ConnectError> {
+    // #1632 — a Terminate takes any consent prompt still standing for its
+    // session down with it, and does so AHEAD of the delegation gate below:
+    // the prompt is this daemon's (`Request` is never delegated — consent is
+    // the enrolled identity's decision), so on a host whose session media was
+    // handed to the GUI worker the local `Terminate` arm never runs here, and
+    // the prompt would stand for its full window. Not in the arm, then.
+    //
+    // The broker resolves the prompt task `Cancelled` (which sends no
+    // `rc:consent` — the server has already forgotten the session) and its
+    // guard removes the `.pending` marker the companion polls. The native
+    // panel is hidden here directly rather than waiting for that task to be
+    // scheduled; both calls are idempotent and the task hides again anyway.
+    if let ServerMsg::Terminate { session_id, .. } = &msg {
+        let session_hex = session_id.to_hex();
+        if consent_broker.cancel(&session_hex) {
+            info!(%session_id, "consent prompt withdrawn — the session was terminated while awaiting consent");
+        }
+        indicator.hide_prompt(&session_hex);
+    }
+
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
     // one. This sits ahead of the whole dispatch rather than inside each of
     // the five handlers: one place to read, one place to audit, and no way for
@@ -2499,47 +2560,50 @@ async fn handle_server_msg(
                     "owner-side consent (email/push) — agent waits for the server to resolve"
                 );
             } else {
-                let broker = consent_broker.clone();
                 let outbound = outbound_tx.clone();
                 let ind = indicator.clone();
+                // #1632 — armed HERE, on the WS loop, not inside the task:
+                // `request_with_mode` registers the session as pending
+                // synchronously, so a `Terminate` that is the very next frame
+                // this loop reads finds the prompt whether or not the task
+                // below has been polled yet. (A spawned task has no ordering
+                // guarantee against the loop that spawned it.)
+                let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
                 tokio::spawn(async move {
-                    let decision = broker.request_with_mode(&session_hex, effective_mode).await;
+                    let decision = prompt.await;
                     // FR-27 — take the native panel down however the question
-                    // was answered: the click here, the CLI, the companion, or
-                    // the window simply expiring. This is the ONE place every
-                    // one of those paths converges, so it is the only place
-                    // that cannot miss one — a panel still on screen for a
-                    // resolved session is its own bug, and a stale Approve
-                    // button is a dangerous one.
+                    // was answered: the click here, the CLI, the companion,
+                    // the window simply expiring, or the session ending first.
+                    // This is the ONE place every one of those paths
+                    // converges, so it is the only place that cannot miss one
+                    // — a panel still on screen for a resolved session is its
+                    // own bug, and a stale Approve button is a dangerous one.
                     ind.hide_prompt(&session_hex);
-                    let granted = decision.granted();
-                    // FR-27 — say WHY, when the answer is no. A bare `false`
-                    // reaches the controller as "the user denied your request",
-                    // which is a lie whenever the truth is that the prompt
-                    // stood unanswered, or that nothing could raise one.
-                    let reason = match decision {
-                        crate::consent::Decision::Granted => None,
-                        crate::consent::Decision::Denied => None,
-                        crate::consent::Decision::Timeout if !have_surface => Some(
-                            roomler_ai_remote_control::consent::ConsentDenyReason::NoPromptSurface,
-                        ),
-                        crate::consent::Decision::Timeout => {
-                            Some(roomler_ai_remote_control::consent::ConsentDenyReason::HostTimeout)
-                        }
+                    let Some(reply) = consent_reply(decision, have_surface) else {
+                        // #1632 — the session was terminated while the
+                        // question stood. The server forgot it when it sent
+                        // the Terminate; there is nobody to answer to.
+                        tracing::info!(
+                            session = %session_hex,
+                            ?decision,
+                            ?effective_mode,
+                            "consent prompt withdrawn — the session ended before an answer; no rc:consent sent"
+                        );
+                        return;
                     };
                     tracing::info!(
                         session = %session_hex,
                         ?decision,
                         ?effective_mode,
-                        granted,
-                        reason = reason.map(|r| r.wire()),
+                        granted = reply.granted,
+                        reason = reply.reason.map(|r| r.wire()),
                         "consent decision → sending rc:consent"
                     );
                     if let Err(e) = outbound
                         .send(ClientMsg::Consent {
                             session_id,
-                            granted,
-                            reason: reason.map(|r| r.wire().to_string()),
+                            granted: reply.granted,
+                            reason: reply.reason.map(|r| r.wire().to_string()),
                         })
                         .await
                     {
@@ -2732,6 +2796,10 @@ async fn handle_server_msg(
         // Distinguish by what follows: a teardown line, or nothing.
         ServerMsg::Terminate { session_id, reason } => {
             info!(%session_id, ?reason, "session terminated by server");
+            // A consent prompt still standing for this session was already
+            // withdrawn above, ahead of the delegation gate (#1632) — this arm
+            // does not run on a delegated session, and the prompt is ours
+            // either way.
             if let Some(peer) = peers.remove(&session_id) {
                 let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
             }
@@ -4186,6 +4254,56 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:
+    /// the session was terminated while the prompt stood, so no verdict is
+    /// owed. Every other decision still answers, and the FR-27 shape holds —
+    /// a timeout is never a bare `granted:false` (that reads as "the user
+    /// denied you"); it carries `timeout`, or `no_prompt_surface` when nobody
+    /// could have been asked.
+    #[test]
+    fn a_cancelled_prompt_sends_no_consent_and_the_others_keep_their_reason() {
+        use crate::consent::Decision;
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+
+        for have_surface in [true, false] {
+            assert_eq!(
+                consent_reply(Decision::Cancelled, have_surface),
+                None,
+                "cancelled (surface={have_surface}): nothing is sent"
+            );
+            assert_eq!(
+                consent_reply(Decision::Granted, have_surface),
+                Some(ConsentReply {
+                    granted: true,
+                    reason: None
+                })
+            );
+            assert_eq!(
+                consent_reply(Decision::Denied, have_surface),
+                Some(ConsentReply {
+                    granted: false,
+                    reason: None
+                })
+            );
+        }
+        assert_eq!(
+            consent_reply(Decision::Timeout, true),
+            Some(ConsentReply {
+                granted: false,
+                reason: Some(ConsentDenyReason::HostTimeout)
+            }),
+            "an unanswered prompt says so"
+        );
+        assert_eq!(
+            consent_reply(Decision::Timeout, false),
+            Some(ConsentReply {
+                granted: false,
+                reason: Some(ConsentDenyReason::NoPromptSurface)
+            }),
+            "a prompt nobody could see says THAT, not timeout"
+        );
+    }
 
     /// Slowness-cycle treadmill (field winhost-a 2026-08-17): cycling on RTT
     /// degradation is allowed twice; a THIRD young-connection conviction
