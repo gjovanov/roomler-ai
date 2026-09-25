@@ -138,6 +138,11 @@ fn every_way_it_ends_is_named() -> Result<()> {
     rt().block_on(every_way_it_ends_is_named_cell())
 }
 
+#[test]
+fn a_controller_downloads_only_its_own_recordings_and_can_resume() -> Result<()> {
+    rt().block_on(a_controller_downloads_only_its_own_recordings_and_can_resume_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -184,6 +189,8 @@ impl Default for Opts {
 struct Rig {
     dc: Arc<RTCDataChannel>,
     strings: mpsc::UnboundedReceiver<String>,
+    /// Binary messages: a download's chunks.
+    bytes: mpsc::UnboundedReceiver<Vec<u8>>,
     activity: mpsc::Receiver<ClientMsg>,
     registry: RcSessionRegistry,
     broker: ConsentBroker,
@@ -242,6 +249,62 @@ impl Rig {
             }
         }
         out
+    }
+
+    /// The next message of type `t`, skipping anything else (a recording's
+    /// progress, say), within `within`.
+    async fn next_of(&mut self, t: &str, within: Duration) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let s = tokio::time::timeout(left, self.strings.recv())
+                .await
+                .map_err(|_| anyhow!("no {t} within {within:?}"))?
+                .ok_or_else(|| anyhow!("the channel closed"))?;
+            let v: Value = serde_json::from_str(&s)?;
+            if v["t"] == t {
+                return Ok(v);
+            }
+        }
+    }
+
+    /// Fetch `name` from `offset`: `Ok((header, bytes, done))`, or the
+    /// refusal's reason as `Err`.
+    async fn download(
+        &mut self,
+        name: &str,
+        offset: u64,
+    ) -> Result<std::result::Result<(Value, Vec<u8>, Value), String>> {
+        let id = format!("dl-{offset}");
+        self.send(json!({"t": "rc:record.get", "id": id, "name": name, "offset": offset}))
+            .await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut header = Value::Null;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let s = tokio::time::timeout(left, self.strings.recv())
+                .await
+                .map_err(|_| anyhow!("the download of {name} did not finish"))?
+                .ok_or_else(|| anyhow!("the channel closed"))?;
+            let v: Value = serde_json::from_str(&s)?;
+            if v["id"] != id.as_str() {
+                continue;
+            }
+            match v["t"].as_str() {
+                Some("rc:record.error") => {
+                    return Ok(Err(v["reason"].as_str().unwrap_or_default().to_string()));
+                }
+                Some("rc:record.file") => header = v,
+                Some("rc:record.done") => {
+                    let mut got = Vec::new();
+                    while let Ok(chunk) = self.bytes.try_recv() {
+                        got.extend_from_slice(&chunk);
+                    }
+                    return Ok(Ok((header, got, v)));
+                }
+                _ => {}
+            }
+        }
     }
 
     fn banner_says_recording(&self) -> bool {
@@ -303,12 +366,16 @@ async fn rig(opts: Opts) -> Result<Rig> {
         })
     }));
     let (strings_tx, strings_rx) = mpsc::unbounded_channel::<String>();
+    let (bytes_tx, bytes_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // One callback, in channel order: when a `done` reaches `strings`, every
+    // chunk sent before it is already in `bytes`.
     browser_dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let tx = strings_tx.clone();
+        let btx = bytes_tx.clone();
         Box::pin(async move {
-            if msg.is_string
-                && let Ok(s) = std::str::from_utf8(&msg.data)
-            {
+            if !msg.is_string {
+                let _ = btx.send(msg.data.to_vec());
+            } else if let Ok(s) = std::str::from_utf8(&msg.data) {
                 let _ = tx.send(s.to_string());
             }
         })
@@ -344,6 +411,7 @@ async fn rig(opts: Opts) -> Result<Rig> {
     Ok(Rig {
         dc: browser_dc,
         strings: strings_rx,
+        bytes: bytes_rx,
         activity: activity_rx,
         registry,
         broker,
@@ -743,6 +811,111 @@ async fn every_way_it_ends_is_named_cell() -> Result<()> {
         Some("session_ended")
     );
     let file = s.out.join(&name);
+    let _ = std::fs::remove_file(Sidecar::path_for(&file));
+    let _ = std::fs::remove_file(&file);
+    Ok(())
+}
+
+/// P3b-2 — the download. A controller lists and fetches its OWN recordings,
+/// whole or resumed from an offset, and the device's SHA-256 is of the whole
+/// file either way. A second controller of the same device sees nothing and
+/// cannot fetch it by name; a name that could leave the folder and an offset
+/// past the end are refused by name; each finished transfer is reported.
+async fn a_controller_downloads_only_its_own_recordings_and_can_resume_cell() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+
+    let mut a = rig(Opts::default()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "d1"})).await?;
+    let v = a.state(START).await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    let name = v["name"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    a.send(json!({"t": "rc:record.stop", "id": "d1"})).await?;
+    let v = a.until_not_recording(STOP).await?;
+    assert_eq!(v["state"], "stopped", "{v}");
+    let file = s.out.join(&name);
+    let on_disk = std::fs::read(&file)?;
+    let size = on_disk.len() as u64;
+    let whole = hex::encode(Sha256::digest(&on_disk));
+    let _ = a.reports();
+
+    // Listed for its controller.
+    a.send(json!({"t": "rc:record.list", "id": "l1"})).await?;
+    let v = a.next_of("rc:record.list", START).await?;
+    let names: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    assert!(names.contains(&name.as_str()), "{v}");
+
+    // Whole.
+    let (header, got, done) = a.download(&name, 0).await?.expect("the download");
+    assert_eq!(
+        (header["offset"].as_u64(), header["size"].as_u64()),
+        (Some(0), Some(size))
+    );
+    assert!(
+        got == on_disk,
+        "the bytes differ from the file ({} of {size})",
+        got.len()
+    );
+    assert_eq!(done["sha256"].as_str(), Some(whole.as_str()));
+    assert_eq!(done["bytes"].as_u64(), Some(size));
+
+    // Resumed from the middle: only the rest is sent, the hash is still the
+    // whole file's.
+    let half = size / 2;
+    let (header, got, done) = a
+        .download(&name, half)
+        .await?
+        .expect("the resumed download");
+    assert_eq!(header["offset"].as_u64(), Some(half));
+    assert!(
+        got[..] == on_disk[half as usize..],
+        "the resumed bytes differ"
+    );
+    assert_eq!(done["sha256"].as_str(), Some(whole.as_str()));
+    assert_eq!(done["bytes"].as_u64(), Some(size - half));
+
+    // Refusals, by name.
+    assert_eq!(
+        a.download("../escape.mp4", 0).await?.err().as_deref(),
+        Some("bad_name")
+    );
+    assert_eq!(
+        a.download(&name, size + 1).await?.err().as_deref(),
+        Some("bad_offset")
+    );
+    assert_eq!(
+        a.download("no such.mp4", 0).await?.err().as_deref(),
+        Some("not_found")
+    );
+
+    let downloaded: Vec<_> = a
+        .reports()
+        .into_iter()
+        .filter(|(k, _, _)| *k == RecordingActivityKind::Downloaded)
+        .map(|(_, _, bytes)| bytes)
+        .collect();
+    assert_eq!(downloaded, vec![Some(size), Some(size - half)]);
+
+    // ⚠️ Another controller of the SAME device: nothing listed, and the name
+    // alone does not fetch it — indistinguishable from a file that is not there.
+    let mut b = rig(Opts::default()).await?;
+    b.send(json!({"t": "rc:record.list", "id": "l2"})).await?;
+    let v = b.next_of("rc:record.list", START).await?;
+    assert_eq!(v["items"].as_array().map(|i| i.len()), Some(0), "{v}");
+    assert_eq!(
+        b.download(&name, 0).await?.err().as_deref(),
+        Some("not_found")
+    );
+
     let _ = std::fs::remove_file(Sidecar::path_for(&file));
     let _ = std::fs::remove_file(&file);
     Ok(())

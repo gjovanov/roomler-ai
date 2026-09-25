@@ -30,6 +30,7 @@
 //! The microphone is not a remote option: [`RecordingManager::start_remote`]
 //! has no parameter for it.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -152,6 +153,28 @@ pub enum Incoming {
     /// Say where things stand (a viewer that reconnected its channel).
     #[serde(rename = "rc:record.status")]
     Status,
+    /// P3b-2 — this controller's finished recordings on this device.
+    #[serde(rename = "rc:record.list")]
+    List {
+        #[serde(default)]
+        id: String,
+    },
+    /// P3b-2 — send one of them from byte `offset` (a resumed transfer asks
+    /// for where the last one broke off).
+    #[serde(rename = "rc:record.get")]
+    Get {
+        #[serde(default)]
+        id: String,
+        name: String,
+        #[serde(default)]
+        offset: u64,
+    },
+    /// P3b-2 — abandon the transfer in progress.
+    #[serde(rename = "rc:record.cancel")]
+    Cancel {
+        #[serde(default)]
+        id: String,
+    },
 }
 
 /// Device → controller: one `rc:record.state`.
@@ -276,6 +299,9 @@ struct Handler {
     prompt: StdMutex<Option<String>>,
     /// The controller's id for the recording in progress.
     current: StdMutex<Option<String>>,
+    /// P3b-2 — the transfer in progress (`id`, its cancel flag): one at a
+    /// time per session.
+    transfer: StdMutex<Option<(String, Arc<AtomicBool>)>>,
 }
 
 /// Serve `rc:record.*` on `dc` for the session in `ctx`. Installed only when
@@ -289,6 +315,7 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
         last_deny: StdMutex::new(None),
         prompt: StdMutex::new(None),
         current: StdMutex::new(None),
+        transfer: StdMutex::new(None),
     });
     let on_close = h.clone();
     dc.on_close(Box::new(move || {
@@ -314,6 +341,13 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
                 }
                 Ok(Incoming::Stop { id }) => h.stop(id).await,
                 Ok(Incoming::Status) => h.status().await,
+                Ok(Incoming::List { id }) => h.list(id).await,
+                // A transfer runs for as long as the file takes: off the
+                // message loop, so a Cancel can get through.
+                Ok(Incoming::Get { id, name, offset }) => {
+                    tokio::spawn(h.get(id, name, offset));
+                }
+                Ok(Incoming::Cancel { id }) => h.cancel(&id),
                 Err(e) => warn!(session = %h.ctx.session_id, %e, "record DC: unparseable message"),
             }
         })
@@ -346,11 +380,117 @@ pub fn attach_refusing(dc: Arc<RTCDataChannel>, session_id: ObjectId, reason: &'
 }
 
 async fn send(dc: &RTCDataChannel, s: &StateMsg) {
-    if let Ok(text) = serde_json::to_string(s)
+    send_json(dc, s).await
+}
+
+async fn send_json<T: Serialize>(dc: &RTCDataChannel, v: &T) {
+    if let Ok(text) = serde_json::to_string(v)
         && let Err(e) = dc.send_text(text).await
     {
         tracing::debug!(%e, "record DC: send failed (channel closing)");
     }
+}
+
+// ── P3b-2: downloading a remote recording ──────────────────────────────────
+
+/// A transfer's chunk: the files channel's size, so the two pumps behave
+/// alike under the same SCTP limits.
+const CHUNK: usize = 64 * 1024;
+/// Stop queuing chunks past this much buffered on the channel (the files
+/// channel's number): a multi-GB file must not become a multi-GB queue.
+const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+
+/// One of this controller's recordings, as the list says it.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct ListedRecording {
+    pub name: String,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    /// RFC 3339.
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Does `name`'s sidecar say `controller` started it remotely? The only
+/// thing that makes a recording theirs to list or fetch — a recording the
+/// person at the device made, or another controller's, is not.
+///
+/// ⚠️ By USER, never by session: the reconnect ladder mints new session ids,
+/// and a controller whose connection flapped must still reach their file.
+pub fn owned_by(dir: &Path, name: &str, controller: &ObjectId) -> bool {
+    let path = dir.join(name);
+    let Ok(json) = std::fs::read_to_string(super::sidecar::Sidecar::path_for(&path)) else {
+        return false;
+    };
+    let Ok(sc) = serde_json::from_str::<super::sidecar::Sidecar>(&json) else {
+        return false;
+    };
+    matches!(
+        sc.initiator,
+        super::sidecar::Initiator::Remote { ref controller_user_id, .. }
+            if *controller_user_id == controller.to_hex()
+    )
+}
+
+/// `controller`'s finished recordings in `dir`, newest first.
+pub fn owned_recordings(dir: &Path, controller: &ObjectId) -> Vec<ListedRecording> {
+    super::manager::list_recordings(dir)
+        .into_iter()
+        .filter(|it| owned_by(dir, &it.name, controller))
+        .map(|it| ListedRecording {
+            name: it.name,
+            bytes: it.bytes,
+            duration_ms: it.duration_ms,
+            started_at: it.started_at,
+            stop_reason: it.stop_reason,
+            width: it.width,
+            height: it.height,
+        })
+        .collect()
+}
+
+/// Open a recording to send it: never through a link. The name has already
+/// passed `check_recording_name` (a bare `*.mp4`, no separator, no `..`);
+/// this refuses a symlink or junction at that name, and anything that is not
+/// a regular file once open.
+///
+/// ⚠️ Two layers, and each refuses a link on its own, so the unit test stays
+/// green with either one deleted. Keep both: the pre-check also keeps a FIFO
+/// from blocking `open`, and the no-follow open closes the swap between the
+/// check and the open.
+pub fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the link itself, never its target.
+        opts.custom_flags(0x0020_0000);
+    }
+    let file = opts.open(path)?;
+    // Swapped between the check and the open? The handle says what was opened.
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 impl Handler {
@@ -640,6 +780,192 @@ impl Handler {
         send(&self.dc, &s).await;
     }
 
+    /// P3b-2 — this controller's finished recordings.
+    async fn list(&self, id: String) {
+        let items = match manager() {
+            Some(m) => match m.folder().await {
+                Some(dir) => {
+                    let who = self.ctx.controller_user_id;
+                    tokio::task::spawn_blocking(move || owned_recordings(&dir, &who))
+                        .await
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        send_json(
+            &self.dc,
+            &serde_json::json!({ "t": "rc:record.list", "id": id, "items": items }),
+        )
+        .await;
+    }
+
+    async fn transfer_error(&self, id: &str, reason: &str, detail: Option<String>) {
+        info!(session = %self.ctx.session_id, %reason, ?detail, "record: transfer refused");
+        send_json(
+            &self.dc,
+            &serde_json::json!({ "t": "rc:record.error", "id": id, "reason": reason, "detail": detail }),
+        )
+        .await;
+    }
+
+    /// P3b-2 — send one of this controller's recordings from `offset`.
+    ///
+    /// `rc:record.file {id, name, offset, size}`, then the bytes as binary
+    /// messages, then `rc:record.done {id, name, bytes, sha256}`: `sha256`
+    /// is of the WHOLE file, so a transfer resumed from an offset (the prefix
+    /// read from disk, not sent) is checked end to end like any other.
+    async fn get(self: Arc<Self>, id: String, name: String, offset: u64) {
+        if let Err(detail) = super::manager::check_recording_name(&name) {
+            self.transfer_error(&id, "bad_name", Some(detail)).await;
+            return;
+        }
+        let Some(m) = manager() else {
+            self.transfer_error(&id, "unavailable", None).await;
+            return;
+        };
+        let Some(dir) = m.folder().await else {
+            self.transfer_error(&id, "unavailable", None).await;
+            return;
+        };
+        let who = self.ctx.controller_user_id;
+        let (dir_c, name_c) = (dir.clone(), name.clone());
+        let mine = tokio::task::spawn_blocking(move || owned_by(&dir_c, &name_c, &who))
+            .await
+            .unwrap_or(false);
+        // ⚠️ Someone else's recording and no recording look alike: a
+        // controller learns nothing about files that are not theirs.
+        if !mine {
+            self.transfer_error(&id, "not_found", None).await;
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The slot is claimed in ONE expression, so the (non-`Send`) guard is
+        // gone before anything awaits.
+        let claimed = match self.transfer.lock() {
+            Ok(mut t) if t.is_none() => {
+                *t = Some((id.clone(), cancel.clone()));
+                true
+            }
+            Ok(_) => false,
+            Err(_) => return,
+        };
+        if !claimed {
+            self.transfer_error(&id, "transfer_in_progress", None).await;
+            return;
+        }
+        let outcome = self
+            .pump(&id, &dir.join(&name), &name, offset, &cancel)
+            .await;
+        if let Ok(mut t) = self.transfer.lock() {
+            *t = None;
+        }
+        match outcome {
+            Ok(sent) => {
+                info!(session = %self.ctx.session_id, %name, offset, sent, "record: download sent");
+                self.report(
+                    RecordingActivityKind::Downloaded,
+                    Some(name),
+                    Some(sent),
+                    None,
+                    None,
+                );
+            }
+            Err((reason, detail)) => self.transfer_error(&id, reason, detail).await,
+        }
+    }
+
+    async fn pump(
+        &self,
+        id: &str,
+        path: &Path,
+        name: &str,
+        offset: u64,
+        cancel: &AtomicBool,
+    ) -> Result<u64, (&'static str, Option<String>)> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let read_failed = |e: std::io::Error| ("read_failed", Some(e.to_string()));
+        let std_file = open_no_follow(path).map_err(|e| ("not_found", Some(e.to_string())))?;
+        let size = std_file.metadata().map_err(read_failed)?.len();
+        if offset > size {
+            return Err((
+                "bad_offset",
+                Some(format!("{offset} is past the end ({size})")),
+            ));
+        }
+        let mut file = tokio::fs::File::from_std(std_file);
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; CHUNK];
+        // The part the controller already has: hashed, not sent.
+        let mut left = offset;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = file.read(&mut buf[..want]).await.map_err(read_failed)?;
+            if n == 0 {
+                return Err(("read_failed", Some("the file shrank".into())));
+            }
+            hasher.update(&buf[..n]);
+            left -= n as u64;
+        }
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(read_failed)?;
+        send_json(
+            &self.dc,
+            &serde_json::json!({ "t": "rc:record.file", "id": id, "name": name, "offset": offset, "size": size }),
+        )
+        .await;
+        let mut sent: u64 = 0;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(("cancelled", None));
+            }
+            if self.dc.ready_state() == RTCDataChannelState::Closed {
+                return Err(("session_ended", None));
+            }
+            while self.dc.buffered_amount().await > BACKPRESSURE_HIGH {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if cancel.load(Ordering::Acquire) {
+                    return Err(("cancelled", None));
+                }
+                if self.dc.ready_state() == RTCDataChannelState::Closed {
+                    return Err(("session_ended", None));
+                }
+            }
+            let n = file.read(&mut buf).await.map_err(read_failed)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            self.dc
+                .send(&bytes::Bytes::copy_from_slice(&buf[..n]))
+                .await
+                .map_err(|e| ("send_failed", Some(e.to_string())))?;
+            sent += n as u64;
+        }
+        send_json(
+            &self.dc,
+            &serde_json::json!({
+                "t": "rc:record.done", "id": id, "name": name, "bytes": sent,
+                "size": size, "sha256": hex::encode(hasher.finalize()),
+            }),
+        )
+        .await;
+        Ok(sent)
+    }
+
+    fn cancel(&self, id: &str) {
+        if let Ok(t) = self.transfer.lock()
+            && let Some((tid, flag)) = t.as_ref()
+            && (id.is_empty() || tid == id)
+        {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
     /// The channel closed: the session is over. A prompt standing for it is
     /// withdrawn, and a recording it started ends `session_ended`.
     async fn session_gone(&self) {
@@ -647,6 +973,9 @@ impl Handler {
         if let Some(p) = prompt {
             self.ctx.consent.cancel(&p);
         }
+        // A transfer has nowhere left to go (the controller resumes it from
+        // its offset on the next session).
+        self.cancel("");
         if self.owns_active() {
             info!(session = %self.ctx.session_id, "session ended — stopping its remote recording");
             tokio::spawn(async move {
@@ -857,6 +1186,109 @@ mod tests {
             Some("Roomler Recording 2026-09-25 14-30-12.mp4")
         );
         assert_eq!(file_name(None), None);
+    }
+
+    /// A recording and its sidecar, in `dir`.
+    fn made(dir: &Path, name: &str, initiator: Option<super::super::sidecar::Initiator>) {
+        use super::super::mp4::ColorInfo;
+        use super::super::sidecar::{AudioInfo, SIDECAR_VERSION, Sidecar};
+        let path = dir.join(name);
+        std::fs::write(&path, b"not really an mp4").unwrap();
+        if let Some(initiator) = initiator {
+            let sc = Sidecar {
+                version: SIDECAR_VERSION,
+                file: name.into(),
+                initiator,
+                started_at: "2026-09-25T12:30:12Z".into(),
+                ended_at: None,
+                duration_ms: 1000,
+                width: 320,
+                height: 240,
+                fps: 30,
+                codec: "h264".into(),
+                encoder: "openh264".into(),
+                color: ColorInfo::BT601_LIMITED,
+                audio: AudioInfo::default(),
+                frames: 30,
+                late_ticks: 0,
+                events: Vec::new(),
+                stop_reason: None,
+                bytes: 17,
+            };
+            std::fs::write(Sidecar::path_for(&path), sc.to_json()).unwrap();
+        }
+    }
+
+    /// P3b-2 — a recording is a controller's to list or fetch only when its
+    /// sidecar says THAT user started it remotely: not the person at the
+    /// device's own, not another controller's, not one with no sidecar or a
+    /// broken one.
+    #[test]
+    fn only_the_controller_who_started_it_owns_a_recording() {
+        use super::super::sidecar::Initiator;
+        let dir = tempfile::tempdir().unwrap();
+        let me = ObjectId::new();
+        let other = ObjectId::new();
+        let remote = |who: &ObjectId| Initiator::Remote {
+            controller_user_id: who.to_hex(),
+            controller_name: Some("x".into()),
+        };
+        made(dir.path(), "mine.mp4", Some(remote(&me)));
+        made(dir.path(), "theirs.mp4", Some(remote(&other)));
+        made(
+            dir.path(),
+            "local.mp4",
+            Some(Initiator::Local { user: None }),
+        );
+        made(dir.path(), "bare.mp4", None);
+        made(dir.path(), "broken.mp4", None);
+        std::fs::write(dir.path().join("broken.mp4.roomler.json"), b"{nope").unwrap();
+
+        assert!(owned_by(dir.path(), "mine.mp4", &me));
+        for name in [
+            "theirs.mp4",
+            "local.mp4",
+            "bare.mp4",
+            "broken.mp4",
+            "absent.mp4",
+        ] {
+            assert!(!owned_by(dir.path(), name, &me), "{name}");
+        }
+        let listed: Vec<String> = owned_recordings(dir.path(), &me)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(listed, vec!["mine.mp4"]);
+        assert!(owned_recordings(dir.path(), &ObjectId::new()).is_empty());
+    }
+
+    /// P3b-2 — a download never follows a link out of the folder.
+    #[test]
+    fn a_link_at_a_recordings_name_is_never_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let real = dir.path().join("real.mp4");
+        std::fs::write(&real, b"a recording").unwrap();
+        assert!(open_no_follow(&real).is_ok(), "the positive control");
+        assert!(
+            open_no_follow(dir.path()).is_err(),
+            "a directory is not a recording"
+        );
+
+        let link = dir.path().join("link.mp4");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        // Creating a symlink on Windows needs a privilege (or developer
+        // mode): where it is refused, the case cannot be staged here.
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&outside, &link).is_ok();
+        if made {
+            assert!(
+                open_no_follow(&link).is_err(),
+                "followed a link out of the folder"
+            );
+        }
     }
 
     #[test]
