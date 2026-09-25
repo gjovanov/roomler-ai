@@ -657,6 +657,63 @@ pub struct FfmpegEncoder {
     /// counter: it cost this investigation a wrong conclusion.
     swaps: u32,
     idr_count: u64,
+    /// FR-85 P1b — a RECORDING encoder's GOP (frames between keyframes).
+    /// `None` for every live encoder, whose keyframes are on demand only
+    /// (`KEYFRAME_INTERVAL`); kept so a rebuild reproduces it.
+    gop_override: Option<i32>,
+    /// FR-85 P1b — PTS from this encoder's own frame counter instead of
+    /// `Frame.monotonic_us`. A recording repeats the last frame on a still
+    /// screen (constant frame rate), and a repeated frame must not repeat a
+    /// timestamp. `false` for every live encoder.
+    counter_pts: bool,
+}
+
+/// FR-85 P1b — what turns an FFmpeg open into a RECORDING encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordingOpen {
+    /// Frames between keyframes.
+    gop: i32,
+    /// The constant-quality target before any bias.
+    cq: u32,
+}
+
+/// FR-85 P1b — the recording's quality target: sharper than the live
+/// default (22), because a file has no link to fit. `ROOMLERD_RECORD_CQ`
+/// overrides; clamped to the same [10, 40] as the live knob.
+fn recording_cq() -> u32 {
+    node_env("RECORD_CQ")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|c| c.clamp(10, 40))
+        .unwrap_or(19)
+}
+
+/// FR-85 P1b — a recording encoder's ceiling. The live option sets are reused
+/// as they are (every one of them is field-proven on the fleet), so what
+/// `maxrate` MEANS differs per backend, and so does the number:
+///
+/// - NVENC runs constant-quality VBR with `bit_rate=0`: `maxrate` is only a
+///   burst ceiling, so it is generous (~0.3 bpp·s, 10–80 Mbps);
+/// - QSV / AMF / VAAPI / D3D12 / Vulkan / VideoToolbox anchor their rate
+///   control ON `maxrate` (QSV opens as CBR when `b:v == maxrate`), so the
+///   ceiling IS the bitrate: ~0.12 bpp·s, 6–40 Mbps — 1080p30 ≈ 7.5 Mbps,
+///   4K30 ≈ 30 Mbps, ample for screen content.
+///
+/// True per-backend constant-quality modes (ICQ, CQP) are a follow-up that
+/// needs field measurement on each vendor's hardware first.
+pub(crate) fn recording_maxrate_bps(name: &str, width: u32, height: u32, fps: u32) -> usize {
+    let px_per_s = u64::from(width) * u64::from(height) * u64::from(fps.max(1));
+    let (bpp_milli, lo, hi) = if name.contains("nvenc") {
+        (300u64, 10_000_000u64, 80_000_000u64)
+    } else {
+        (120u64, 6_000_000u64, 40_000_000u64)
+    };
+    (px_per_s * bpp_milli / 1000).clamp(lo, hi) as usize
+}
+
+/// FR-85 P1b — the millisecond PTS of frame `n` at `fps`. Strictly
+/// increasing for any fps ≤ 1000, which is what a counter-timed encoder needs.
+fn recording_pts_ms(n: u64, fps: i32) -> i64 {
+    (n * 1000 / u64::from(fps.max(1) as u32)) as i64
 }
 
 /// FR-62 A1 — how `set_bitrate` applies a rate move on a given backend.
@@ -1173,7 +1230,7 @@ impl FfmpegEncoder {
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
         let cq = ffmpeg_cq();
         let (encoder, hw) = Self::build_encoder(
-            "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false,
+            "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false, None,
         )?;
         let plane_pixels = (width as usize) * (height as usize);
         Ok(Self {
@@ -1201,6 +1258,8 @@ impl FfmpegEncoder {
             rebuilds: 0,
             swaps: 0,
             idr_count: 0,
+            gop_override: None,
+            counter_pts: false,
         })
     }
 
@@ -1312,6 +1371,70 @@ impl FfmpegEncoder {
         chroma444: bool,
         constrained: bool,
     ) -> Result<Self> {
+        Self::new_with_dispatch_opts(
+            names,
+            width,
+            height,
+            fps,
+            maxrate_bps,
+            cq_bias,
+            chroma444,
+            constrained,
+            None,
+        )
+    }
+
+    /// FR-85 P1b — a RECORDING encoder: the codec's 4:2:0 cascade (the device
+    /// denylist honoured, exactly as a session's — `cells::names_420`), the
+    /// live option sets (field-proven on every backend the fleet runs) with a
+    /// sharper quality target and a recording-sized ceiling instead of the
+    /// network's, a real GOP, and PTS from its own frame counter. The rate
+    /// governor never touches it: nothing calls `set_bitrate` on a recording.
+    pub fn new_recording(
+        codec: roomler_ai_remote_control::models::VideoCodec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        gop_frames: u32,
+    ) -> Result<Self> {
+        let fps = fps.clamp(1, 60);
+        let open = RecordingOpen {
+            gop: gop_frames.max(1) as i32,
+            cq: recording_cq(),
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        // One name at a time: the ceiling depends on the backend.
+        for name in crate::encode::cells::names_420(codec) {
+            match Self::new_with_dispatch_opts(
+                &[name],
+                width,
+                height,
+                fps as i32,
+                recording_maxrate_bps(name, width, height, fps),
+                0,
+                false,
+                false,
+                Some(open),
+            ) {
+                Ok(e) => return Ok(e),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no {codec:?} encoder is allowed on this device")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_dispatch_opts(
+        names: &[&'static str],
+        width: u32,
+        height: u32,
+        fps: i32,
+        maxrate_bps: usize,
+        cq_bias: i32,
+        chroma444: bool,
+        constrained: bool,
+        recording: Option<RecordingOpen>,
+    ) -> Result<Self> {
         // `ffmpeg_next::init()` is idempotent + cheap to call; safe to
         // run on each new encoder. Sets up codec registration.
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
@@ -1329,7 +1452,8 @@ impl FfmpegEncoder {
         // rebuilt on every dims change, so build-time application is exact,
         // and `self.cq` stores the biased value — the QSV/AMF set_bitrate
         // rebuild path reuses it verbatim (dims never change there).
-        let cq = crate::encode::rate_profile::apply_cq_bias(ffmpeg_cq(), cq_bias);
+        let base_cq = recording.map(|r| r.cq).unwrap_or_else(ffmpeg_cq);
+        let cq = crate::encode::rate_profile::apply_cq_bias(base_cq, cq_bias);
         // P4 — vp9_qsv GOP/low_power from the cached startup IDR-probe
         // verdict (containment defaults when unprobed); ignored by every
         // other candidate name.
@@ -1348,6 +1472,7 @@ impl FfmpegEncoder {
                 qsv_gop,
                 chroma444,
                 constrained,
+                recording.map(|r| r.gop),
             ) {
                 Ok((encoder, hw)) => {
                     tracing::info!(
@@ -1359,6 +1484,7 @@ impl FfmpegEncoder {
                         cq_bias,
                         maxrate_bps,
                         chroma444,
+                        recording = recording.is_some(),
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
                     let plane_pixels = (width as usize) * (height as usize);
@@ -1399,6 +1525,8 @@ impl FfmpegEncoder {
                         rebuilds: 0,
                         swaps: 0,
                         idr_count: 0,
+                        gop_override: recording.map(|r| r.gop),
+                        counter_pts: recording.is_some(),
                     });
                 }
                 Err(e) => {
@@ -1430,6 +1558,7 @@ impl FfmpegEncoder {
         qsv_gop: i32,
         chroma444: bool,
         constrained: bool,
+        gop_override: Option<i32>,
     ) -> Result<(codec::encoder::Video, Option<hwframes::Frames>)> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
@@ -1507,7 +1636,12 @@ impl FfmpegEncoder {
             // threads the PROBED per-host value (`vp9_qsv_runtime_config`):
             // hosts whose vp9_qsv measurably honours runtime forced IDRs
             // get KEYFRAME_INTERVAL (on-demand-only keys) instead.
-            let gop = if name == "vp9_qsv" {
+            // FR-85 P1b — a recording keeps a real GOP: every fragment of its
+            // MP4 starts on a keyframe, and an editor cut decodes at most one
+            // GOP. `None` (every live open) is exactly the old rule.
+            let gop = if let Some(g) = gop_override {
+                g
+            } else if name == "vp9_qsv" {
                 qsv_gop
             } else {
                 KEYFRAME_INTERVAL
@@ -1836,7 +1970,15 @@ impl FfmpegEncoder {
         };
         let mut av = frame::Video::new(format, self.width, self.height);
 
-        let pts = (monotonic_us / 1000) as i64;
+        // FR-85 P1b — a recording encoder times frames by its own counter: it
+        // is fed the same frame again on a still screen, and a repeated frame
+        // must not repeat a timestamp. Every live encoder keeps the capture
+        // clock, exactly as before.
+        let pts = if self.counter_pts {
+            recording_pts_ms(self.frame_count, self.fps)
+        } else {
+            (monotonic_us / 1000) as i64
+        };
         av.set_pts(Some(pts));
 
         if self.force_keyframe || self.frame_count == 0 {
@@ -2095,6 +2237,9 @@ impl FfmpegEncoder {
             qsv_gop,
             spec.chroma444,
             spec.constrained,
+            // The background swap serves the live pump only; a recording
+            // encoder is never rebuilt this way.
+            None,
         )?;
         Ok(RebuiltEncoder { spec, inner, hw })
     }
@@ -2301,6 +2446,7 @@ impl VideoEncoder for FfmpegEncoder {
                     qsv_gop,
                     self.chroma444,
                     self.constrained,
+                    self.gop_override,
                 ) {
                     Ok((enc, hw)) => {
                         self.encoder = enc;
@@ -2427,6 +2573,55 @@ fn copy_plane_into_av(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FR-85 P1b — the recording profile ───────────────────────────────
+
+    #[test]
+    fn a_recording_encoder_never_repeats_a_timestamp() {
+        for fps in [1, 15, 24, 25, 30, 50, 60] {
+            let pts: Vec<i64> = (0..10_000u64).map(|n| recording_pts_ms(n, fps)).collect();
+            assert!(pts.windows(2).all(|w| w[1] > w[0]), "{fps} fps");
+            assert_eq!(
+                recording_pts_ms(u64::from(fps as u32), fps),
+                1000,
+                "{fps} fps"
+            );
+        }
+        assert_eq!(recording_pts_ms(7, 0), 7000, "fps 0 is treated as 1");
+    }
+
+    #[test]
+    fn the_recording_ceiling_is_generous_for_cq_nvenc_and_is_the_bitrate_elsewhere() {
+        // NVENC: a burst ceiling over constant quality — generous.
+        let nv = recording_maxrate_bps("h264_nvenc", 1920, 1080, 30);
+        assert_eq!(nv, 18_662_400);
+        // Everything that anchors rate control ON maxrate: ~0.12 bpp·s.
+        let qsv = recording_maxrate_bps("h264_qsv", 1920, 1080, 30);
+        assert_eq!(qsv, 7_464_960);
+        assert!(nv > qsv);
+        // Floors and caps.
+        assert_eq!(recording_maxrate_bps("h264_vaapi", 320, 240, 30), 6_000_000);
+        assert_eq!(
+            recording_maxrate_bps("hevc_qsv", 7680, 4320, 60),
+            40_000_000
+        );
+        assert_eq!(
+            recording_maxrate_bps("hevc_nvenc", 320, 240, 30),
+            10_000_000
+        );
+        // And far above the live ceiling, which clamps at 12 Mbps.
+        assert!(qsv < 12_000_000 && nv > 12_000_000);
+        assert!(recording_maxrate_bps("h264_qsv", 3840, 2160, 30) > 12_000_000);
+    }
+
+    #[test]
+    fn the_recording_quality_target_is_sharper_than_the_live_one() {
+        // Default only (no env set in this test binary for RECORD_CQ).
+        if tunnel_core::env::node_env("RECORD_CQ").is_none() {
+            assert_eq!(recording_cq(), 19);
+            assert!(recording_cq() < 22, "the live default is 22");
+        }
+    }
 
     // FR-62 A1 — the apply path is resolved from the backend name + the flag.
     #[test]

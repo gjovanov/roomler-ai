@@ -83,7 +83,32 @@ flowchart TB
 | Preference | Encoder | GOP | Rate |
 |---|---|---|---|
 | `software` | openh264, **recording profile** (`Openh264Encoder::new_recording`) | its own, `fps × 2` | quality mode, QP 10–30, ~0.2 bpp target (4–40 Mbps), no frame skipping, screen-content tuning |
-| `auto` / `hardware` | the same H.264 cascade as a live session (MF / FFmpeg HW / openh264) | forced by the recorder every 2 s | the live profile (P1b adds a dedicated constant-quality profile per backend) |
+| `hardware` | the FFmpeg H.264 cascade in its **recording profile** (`FfmpegEncoder::new_recording`); refuses rather than fall back to software | its own, `fps × 2` | see below |
+| `auto` | `hardware`, then `software` | | |
+
+**The hardware recording profile** reuses the live option sets: every one of
+them is field-proven on the fleet's GPUs, and a new private-option dict would
+be a new way for a driver to refuse an open. Three things change:
+
+- **Quality target:** `cq` 19 instead of the live 22 (`ROOMLERD_RECORD_CQ` overrides).
+- **Ceiling** (`recording_maxrate_bps`):
+  - on NVENC, which runs constant quality with `bit_rate=0`, it is only a burst ceiling, so it is generous (~0.3 bpp·s, 10–80 Mbps);
+  - QSV, AMF, VAAPI, D3D12, Vulkan and VideoToolbox anchor their rate control *on* `maxrate` (QSV opens as CBR when `b:v == maxrate`), so there the ceiling is the bitrate (~0.12 bpp·s, 6–40 Mbps: 1080p30 ≈ 7.5 Mbps, 4K30 ≈ 30 Mbps).
+- **GOP and timing:** a real GOP replaces the on-demand-only `KEYFRAME_INTERVAL`, and PTS come from the encoder's own frame counter, because a recording feeds the same frame again on a still screen.
+
+Every live open passes `gop_override: None` and keeps the capture clock, so
+the live path is unchanged. True per-backend constant-quality modes (QSV ICQ,
+AMF/VAAPI CQP) are a follow-up that needs field measurement on each vendor's
+hardware first.
+
+Verified locally with the synthetic source, by `ffprobe`:
+
+| Encoder | Profile | Colour | GOP |
+|---|---|---|---|
+| `h264_nvenc` | High | `smpte170m`/`tv` | keyframes at 0 and 60 |
+| openh264 | Constrained Baseline | `smpte170m`/`tv` | keyframes at 0 and 60 |
+
+Both are 30 fps constant, decode with zero errors, and are laid out `ftyp → moov → mdat`.
 
 ⚠️ **The encoder denylist applies here too.** The FFmpeg constructors read
 `ENCODER_CELLS_DENY` through `node_env`. A child the daemon spawns inherits it
