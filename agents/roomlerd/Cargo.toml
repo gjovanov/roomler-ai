@@ -180,6 +180,13 @@ russh = { version = "0.62", default-features = false, features = ["ring"], optio
 # `Bitrate::BitsPerSecond` API this module targets.
 audiopus = { version = "0.3.0-rc.0", optional = true }
 
+# FR-85 — MP4 box encode/decode for screen recordings (`recording`
+# feature). Box-level only: we write fragmented MP4 while recording (a crash
+# loses at most one ~2 s fragment) and remux to a progressive, moov-first
+# file on stop — no FFmpeg muxer, so it works on the arm64 build that has no
+# FFmpeg at all. MIT OR Apache-2.0.
+mp4-atom = { version = "0.16", optional = true }
+
 # Option B HEVC plan (rc.65+). `ffmpeg-next` is the safe Rust wrapper
 # over FFmpeg's libav*. We use it to dispatch HEVC + H.264 + VP9 to
 # vendor HW encoders (NVENC, Intel QSV / oneVPL, AMD AMF) WITHOUT going
@@ -513,6 +520,11 @@ viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundatio
 # back to a silent Noop capture). Independent of `ffmpeg-encoder`. See
 # `src/audio/`.
 audio = ["dep:audiopus", "dep:cpal"]
+# FR-85 — HQ screen recording: the `roomlerd record` child (own capturer, CFR
+# pacer, recording encoder profile, fragmented MP4 + remux on stop). Kept OUT
+# of `full` until the local surfaces land (P2), so no release build carries it
+# yet; CI enables it explicitly for the `recorder` test binary.
+recording = ["dep:mp4-atom"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
 # Full media pipeline including the MF hardware encoder. Production

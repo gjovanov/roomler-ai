@@ -33,6 +33,7 @@ flowchart TB
     subgraph rd["🖥️ 1 · Remote desktop"]
         RC["remote-control.md"]
         ENC["encoders.md"]
+        REC["recording.md"]
     end
 
     subgraph net["🔐 2 · Private network & tunnels"]
@@ -83,6 +84,7 @@ side, consent-gated, end-to-end encrypted.*
 | Doc | What it covers |
 |---|---|
 | [remote-control.md](remote-control.md) | Full design: topology, agent internals, `rc:*` signalling, consent/security model, latency budget |
+| [recording.md](recording.md) | FR-85 screen recording: the recorder's own pipeline (capture → constant-rate pacer → recording encoder → fragmented MP4, remuxed moov-first on stop), crash recovery, where files go (the default-folder probe, `record_dir` rules, staging), the `roomlerd record` protocol and stop reasons, the sidecar |
 | [encoders.md](encoders.md) | The cell matrix a host advertises (codec × backend × chroma) and how the viewer resolves it into a session; the probe lifecycle (child processes, the cache, the denylist); the hardware-encoder cascade per platform (NVENC · QSV · AMF · VideoToolbox · VAAPI · D3D12 · Vulkan, with libva bundled on Linux); rate control, capture backends, viewer decode paths |
 | [rate-control.md](rate-control.md) | How a session spends its bits: the FR-79 **validity gate** every estimator reads first (one verdict per window, V5's one exception, the pair memory's write-back and seed, the V3b belief still in shadow), the Priority dial, the per-session control loops, why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
 
