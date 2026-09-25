@@ -460,8 +460,9 @@ pub async fn cmd_config_set(
             // listener refuses a `record_*` change from anyone but the
             // console user. When it answered, its answer stands; writing the
             // file behind its back would report a success it refused.
+            // FR-84 D4 — the same for `files_dir` (see `is_daemon_owned_key`).
             Err(e) if is_daemon_owned_key(&key) => {
-                return Err(explain_recording_error(&e.to_string()));
+                return Err(explain_daemon_owned_error(&key, &e.to_string()));
             }
             Err(e) => daemon_err = Some(e.to_string()),
         }
@@ -490,6 +491,348 @@ fn config_set_blocking(
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     roomler_node_core::config_surface::entry_for(&cfg, &key)
         .ok_or_else(|| format!("unknown config key {key:?}"))
+}
+
+/// The LocalAPI client wraps a daemon's own `Error { message }` as
+/// `localapi error: <message>`; the person reads the daemon's words.
+fn daemon_message(message: &str) -> String {
+    message
+        .strip_prefix("localapi error: ")
+        .unwrap_or(message)
+        .to_string()
+}
+
+// ─── FR-84 D4 — the Overview: encoder matrix, incoming-files folder ────
+
+/// What the "Hardware video encoding" card renders. Never rejects: a
+/// failure is a state the card words (`reason`).
+#[derive(Debug, Serialize)]
+pub struct EncoderCapsView {
+    /// The daemon answered the verb.
+    pub available: bool,
+    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb), or
+    /// the failing stage and error.
+    pub reason: Option<String>,
+    /// The daemon's answer, verbatim (`state`, `cells`, `denied`, …).
+    pub caps: Option<localapi::EncoderCapsSummary>,
+    /// The `denied` entries this app can place in the matrix.
+    pub denied_cells: Vec<DeniedCell>,
+}
+
+/// One `encoder_cells_deny` entry, in the matrix's vocabulary.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DeniedCell {
+    /// `h264` · `hevc` · `av1` · `vp9` — the cell codec wire names.
+    pub codec: String,
+    /// A `VideoBackend` wire name (`d3d12`, not FFmpeg's `d3d12va`).
+    pub backend: String,
+    /// `yuv420` | `yuv444`.
+    pub chroma: String,
+    /// The entry as the denylist spells it (`hevc_qsv:yuv444`).
+    pub entry: String,
+}
+
+/// Place a denylist entry (`<ffmpeg name>:<chroma>`) in the matrix — the
+/// same split `VideoBackend::from_ffmpeg_name` makes in the daemon
+/// (crates/remote_control/src/models.rs): codec before the first `_`, the
+/// FFmpeg backend suffix after it, `d3d12va` meaning the `d3d12` column.
+/// `None` for anything else (a backend newer than this app, a typo in
+/// the key) — the card still lists those, verbatim, under the matrix.
+fn place_denied(entry: &str) -> Option<DeniedCell> {
+    let (name, chroma) = entry.trim().split_once(':')?;
+    let (codec, suffix) = name.split_once('_')?;
+    if !matches!(codec, "h264" | "hevc" | "av1" | "vp9") || !matches!(chroma, "yuv420" | "yuv444") {
+        return None;
+    }
+    let backend = match suffix {
+        "nvenc" | "qsv" | "amf" | "videotoolbox" | "vaapi" | "vulkan" => suffix,
+        "d3d12va" => "d3d12",
+        _ => return None,
+    };
+    Some(DeniedCell {
+        codec: codec.to_string(),
+        backend: backend.to_string(),
+        chroma: chroma.to_string(),
+        entry: entry.trim().to_string(),
+    })
+}
+
+impl EncoderCapsView {
+    fn unavailable(reason: String) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason),
+            caps: None,
+            denied_cells: Vec::new(),
+        }
+    }
+
+    fn from_summary(caps: localapi::EncoderCapsSummary) -> Self {
+        let denied_cells = caps.denied.iter().filter_map(|d| place_denied(d)).collect();
+        Self {
+            available: true,
+            reason: None,
+            caps: Some(caps),
+            denied_cells,
+        }
+    }
+}
+
+/// FR-84 D4 — what this device can encode, from the daemon's CACHED probe
+/// (the verb never starts one). The card polls this only while the answer
+/// is `not_probed`, and re-reads it when the daemon comes back or changes.
+#[tauri::command]
+pub async fn cmd_encoder_caps() -> EncoderCapsView {
+    const SURFACE: &str = "encoder_caps";
+    let mut client = match localapi::connect().await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return EncoderCapsView::unavailable("daemon_unreachable".into());
+        }
+        Err(e) => {
+            return EncoderCapsView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("connect", &e),
+            ));
+        }
+    };
+    match client.encoder_caps().await {
+        Ok(caps) => {
+            refresh_ok(SURFACE);
+            EncoderCapsView::from_summary(caps)
+        }
+        // A daemon older than the verb: not a failure, a version.
+        Err(e) if e.to_string().contains("unknown variant") => {
+            EncoderCapsView::unavailable("old_daemon".into())
+        }
+        Err(e) => {
+            EncoderCapsView::unavailable(refresh_failed(SURFACE, describe_io("encoder_caps", &e)))
+        }
+    }
+}
+
+/// What the "Incoming files" card renders.
+#[derive(Debug, Serialize)]
+pub struct FilesDirView {
+    /// The daemon answered.
+    pub available: bool,
+    /// Why not (`daemon_unreachable`, or the failing stage and error).
+    pub reason: Option<String>,
+    /// The daemon knows `files_dir` (its config surface lists the key). An
+    /// older one does not: the card says "update the service" and offers
+    /// no controls.
+    pub supported: bool,
+    /// Where a drop would land right now, as the daemon reports it.
+    pub effective: Option<String>,
+    /// The configured value, as stored (`~\Drops`, `D:\In`), or `None` for
+    /// the default.
+    pub configured: Option<String>,
+    /// `configured` resolved for THIS user (`~` expanded), so the card can
+    /// tell "in use" from "set, but refused right now".
+    pub configured_resolved: Option<String>,
+}
+
+impl FilesDirView {
+    fn unavailable(reason: String) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason),
+            supported: false,
+            effective: None,
+            configured: None,
+            configured_resolved: None,
+        }
+    }
+}
+
+/// This app's own user's home — the profile a machine-wide daemon treats
+/// as "active" while this person is the one signed in.
+fn own_home() -> Option<String> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var(var).ok().filter(|h| !h.trim().is_empty())
+}
+
+/// FR-84 D4 — the card's data: the daemon's effective folder (status) and
+/// the configured value (its config surface), on ONE connection.
+#[tauri::command]
+pub async fn cmd_files_dir_view() -> FilesDirView {
+    const SURFACE: &str = "files_dir";
+    let mut client = match localapi::connect().await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return FilesDirView::unavailable("daemon_unreachable".into());
+        }
+        Err(e) => {
+            return FilesDirView::unavailable(refresh_failed(SURFACE, describe_io("connect", &e)));
+        }
+    };
+    let status = match client.status().await {
+        Ok(s) => s,
+        Err(e) => {
+            return FilesDirView::unavailable(refresh_failed(SURFACE, describe_io("status", &e)));
+        }
+    };
+    let entries = match client.config_entries().await {
+        Ok(e) => e,
+        Err(e) => {
+            return FilesDirView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("config_entries", &e),
+            ));
+        }
+    };
+    refresh_ok(SURFACE);
+    let entry = entries.into_iter().find(|e| e.key == "files_dir");
+    let configured = entry.as_ref().and_then(|e| e.value.clone());
+    let configured_resolved = configured.as_deref().and_then(|raw| {
+        use roomler_node_core::files_dir::{Rules, Writer, resolve};
+        resolve(raw, &Writer::unprivileged(own_home()), &Rules::from_env())
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    FilesDirView {
+        available: true,
+        reason: None,
+        supported: entry.is_some(),
+        effective: status.files_dir,
+        configured,
+        configured_resolved,
+    }
+}
+
+/// The result of "Change…".
+#[derive(Debug, Serialize)]
+pub struct FilesDirChange {
+    /// The picker was closed without choosing — nothing was sent.
+    pub cancelled: bool,
+    /// What was sent: a folder inside this user's own profile goes as
+    /// `~\…` (see [`files_dir_value_for`]).
+    pub value: Option<String>,
+    /// The daemon's echo of the saved key.
+    pub entry: Option<localapi::ConfigEntry>,
+}
+
+/// The config value for a picked folder: `~`-relative when it sits inside
+/// `home` (by the daemon's own component rules), else the path as picked.
+/// On a machine-wide install the config is one file for every user, and
+/// an absolute folder inside one user's profile is refused for every other
+/// user by the SYSTEM rule; `~` lands each of them in their own.
+fn files_dir_value_for(picked: &Path, home: Option<&str>) -> String {
+    let spelled = picked.to_string_lossy().into_owned();
+    home.and_then(|h| {
+        roomler_node_core::files_dir::tilde_form(
+            &spelled,
+            h,
+            &roomler_node_core::files_dir::Rules::from_env(),
+        )
+    })
+    .unwrap_or(spelled)
+}
+
+/// `files_dir` through the DAEMON only. It is the one that knows who will
+/// write, as whom, into which profile; its refusal is the answer, shown in
+/// its own words — never a cue to write the file directly.
+async fn set_files_dir_via_daemon(value: Option<&str>) -> Result<localapi::ConfigEntry, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .config_set("files_dir", value)
+        .await
+        .map_err(|e| explain_files_dir_error(&e.to_string()))
+}
+
+fn explain_files_dir_error(message: &str) -> String {
+    if message.contains("unknown or non-editable config key") || message.contains("unknown variant")
+    {
+        "The device service predates this setting — update it, then try again.".to_string()
+    } else {
+        daemon_message(message)
+    }
+}
+
+/// FR-84 D4 — "Change…": the native folder picker (it can create a new
+/// folder), then `ConfigSet files_dir` through the daemon.
+///
+/// The picker is driven from Rust: the dialog plugin is initialised but the
+/// app grants the webview no plugin capabilities, so the JS dialog API is
+/// not reachable — and should not need to be for one folder choice.
+/// `blocking_pick_folder` runs the dialog on the main thread and blocks the
+/// CALLER until it closes, so it is called on a blocking-pool thread.
+#[tauri::command]
+pub async fn cmd_pick_files_dir(app: tauri::AppHandle) -> Result<FilesDirChange, String> {
+    // Start where drops land now — best effort; the picker opens anyway.
+    let start = match localapi::connect().await {
+        Ok(mut c) => c.status().await.ok().and_then(|s| s.files_dir),
+        Err(_) => None,
+    };
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        use tauri_plugin_dialog::DialogExt;
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Where should files dropped onto this device land?")
+            .set_can_create_directories(true);
+        if let Some(dir) = start.filter(|d| Path::new(d).is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+        dialog.blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("folder picker: {e}"))?;
+    let Some(picked) = picked else {
+        return Ok(FilesDirChange {
+            cancelled: true,
+            value: None,
+            entry: None,
+        });
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("folder picker: {e}"))?;
+    let value = files_dir_value_for(&path, own_home().as_deref());
+    let entry = set_files_dir_via_daemon(Some(&value)).await?;
+    Ok(FilesDirChange {
+        cancelled: false,
+        value: Some(value),
+        entry: Some(entry),
+    })
+}
+
+/// FR-84 D4 — "Use default": clear `files_dir` (the active user's
+/// Downloads), through the daemon like every change to this key.
+#[tauri::command]
+pub async fn cmd_files_dir_default() -> Result<localapi::ConfigEntry, String> {
+    set_files_dir_via_daemon(None).await
+}
+
+/// FR-84 D4 — "Open folder": the folder the DAEMON says drops land in, or —
+/// before the first drop has created it — its nearest existing parent.
+/// Takes no path from the page, and opens only a DIRECTORY: `explorer
+/// <file>` / `open <file>` would launch a file rather than show it.
+#[tauri::command]
+pub async fn cmd_open_files_dir() -> Result<(), String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let status = client
+        .status()
+        .await
+        .map_err(|e| daemon_message(&e.to_string()))?;
+    let dir = status.files_dir.ok_or_else(|| {
+        "The device service does not report where files land — update it, then try again."
+            .to_string()
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let target = Path::new(&dir)
+            .ancestors()
+            .find(|a| a.is_dir())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("{dir} does not exist, nor does any folder above it"))?;
+        open_path_in_explorer(&target)
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
 }
 
 /// S7 — the embedded web window's label. The main tray window keeps its
@@ -1518,8 +1861,25 @@ pub async fn cmd_recordings_view() -> RecordingsView {
 
 /// Keys whose change the daemon must accept itself: a refusal it ANSWERED
 /// is final, never retried as a direct file write (`cmd_config_set`).
+///
+/// FR-84 D4 — `files_dir` too, matched EXACTLY: the daemon checks it against
+/// what this app cannot see (the identity it writes as — SYSTEM on a machine
+/// install — the console user, its own disk), while the direct-file path can
+/// check only the shape. Falling back after a refusal would save, wherever
+/// the user can write the config, exactly the value the daemon refused and
+/// hide why; and a daemon too old to know the key would ignore the file and
+/// be reported "in effect now".
 fn is_daemon_owned_key(key: &str) -> bool {
-    key.starts_with("record_")
+    key.starts_with("record_") || key == "files_dir"
+}
+
+/// The words for a daemon-owned key's refusal.
+fn explain_daemon_owned_error(key: &str, message: &str) -> String {
+    if key == "files_dir" {
+        explain_files_dir_error(message)
+    } else {
+        explain_recording_error(message)
+    }
 }
 
 /// Start recording this device's screen. Resolves once the recorder is
@@ -2155,7 +2515,10 @@ mod tests {
     fn recording_keys_are_the_daemons_to_accept() {
         assert!(is_daemon_owned_key("record_dir"));
         assert!(!is_daemon_owned_key("exec_enabled"));
-        assert!(!is_daemon_owned_key("files_dir"));
+        assert!(!is_daemon_owned_key("enable_remote_browse"));
+        // FR-84 D4 made `files_dir` daemon-owned as well (see
+        // `a_daemon_refusal_of_files_dir_is_final`).
+        assert!(is_daemon_owned_key("files_dir"));
     }
 
     /// The split-brain lock: machine-global is read ONLY under an SCM
@@ -2402,5 +2765,122 @@ mod tests {
             v["message"],
             "device service not running (no LocalAPI endpoint)"
         );
+    }
+
+    /// FR-84 D4 — `files_dir` is DAEMON-OWNED: once a daemon answered, its
+    /// refusal is final. It checks the folder against the identity it writes
+    /// as (SYSTEM on a machine install), the console user and its own disk;
+    /// the direct-file fallback checks only the shape, so running it after a
+    /// refusal would save the refused value wherever the user can write the
+    /// config and swallow the reason — and for a daemon too old to know the
+    /// key, save a value it ignores and call it "in effect now". Matched
+    /// exactly; FR-85's `record_*` keys are unchanged; other keys still fall
+    /// back.
+    #[test]
+    fn a_daemon_refusal_of_files_dir_is_final() {
+        assert!(is_daemon_owned_key("files_dir"));
+        assert!(
+            !is_daemon_owned_key("files_dir_x"),
+            "equality, not a prefix"
+        );
+        assert!(!is_daemon_owned_key("overlay_quic"));
+        assert!(is_daemon_owned_key("record_dir"), "FR-85's rule, unchanged");
+
+        let refused = "localapi error: the service runs as SYSTEM/root, so files_dir must be inside the active user's profile (C:\\Users\\alice); D:\\Drops is outside it";
+        // What the person reads is the daemon's own sentence.
+        assert_eq!(
+            explain_daemon_owned_error("files_dir", refused),
+            "the service runs as SYSTEM/root, so files_dir must be inside the active user's profile (C:\\Users\\alice); D:\\Drops is outside it"
+        );
+        let console = "localapi error: only the person at this device's console can change where incoming files land";
+        assert_eq!(
+            explain_daemon_owned_error("files_dir", console),
+            "only the person at this device's console can change where incoming files land"
+        );
+        // An older daemon (key or verb unknown): a plain "update", not the
+        // raw parse error — and still no direct write.
+        for old in [
+            "localapi error: unknown or non-editable config key \"files_dir\"",
+            "localapi error: bad request: unknown variant `config_set`",
+        ] {
+            assert!(
+                explain_daemon_owned_error("files_dir", old).contains("predates this setting"),
+                "{old}"
+            );
+        }
+        assert_eq!(daemon_message("no prefix here"), "no prefix here");
+    }
+
+    /// FR-84 D4 — denylist entries land in the matrix by the daemon's own
+    /// split (`VideoBackend::from_ffmpeg_name`): codec before the first `_`,
+    /// FFmpeg's `d3d12va` is the `d3d12` column; anything else is not
+    /// placed (and is still listed verbatim by the card).
+    #[test]
+    fn denied_entries_are_placed_like_the_daemon_splits_them() {
+        let p = place_denied("hevc_qsv:yuv444").unwrap();
+        assert_eq!(
+            (p.codec.as_str(), p.backend.as_str(), p.chroma.as_str()),
+            ("hevc", "qsv", "yuv444")
+        );
+        assert_eq!(p.entry, "hevc_qsv:yuv444");
+        assert_eq!(place_denied("av1_d3d12va:yuv420").unwrap().backend, "d3d12");
+        assert_eq!(
+            place_denied(" av1_vulkan:yuv420 ").unwrap().backend,
+            "vulkan"
+        );
+        for unplaceable in [
+            "hevc_qsv",             // no chroma
+            "hevc_qsv:yuv422",      // no such chroma
+            "mpeg2_qsv:yuv420",     // no such codec
+            "hevc_newthing:yuv420", // a backend newer than this app
+            "none",
+            "",
+        ] {
+            assert_eq!(place_denied(unplaceable), None, "{unplaceable:?}");
+        }
+        let view = EncoderCapsView::from_summary(localapi::EncoderCapsSummary {
+            state: "ready".into(),
+            denied: vec!["hevc_qsv:yuv444".into(), "bogus".into()],
+            ..Default::default()
+        });
+        assert!(view.available);
+        assert_eq!(view.denied_cells.len(), 1);
+        assert_eq!(
+            view.caps.as_ref().unwrap().denied.len(),
+            2,
+            "the verbatim list travels whole"
+        );
+    }
+
+    /// FR-84 D4 — a picked folder inside the picker's own profile is stored
+    /// `~`-relative (the daemon expands it per user at drop time); anything
+    /// else as picked.
+    #[test]
+    fn a_picked_folder_inside_home_is_stored_relative_to_it() {
+        if cfg!(windows) {
+            let home = Some(r"C:\Users\alice");
+            assert_eq!(
+                files_dir_value_for(Path::new(r"C:\Users\alice\Desktop\In"), home),
+                r"~\Desktop\In"
+            );
+            assert_eq!(files_dir_value_for(Path::new(r"C:\Users\alice"), home), "~");
+            assert_eq!(
+                files_dir_value_for(Path::new(r"D:\Drops"), home),
+                r"D:\Drops"
+            );
+            assert_eq!(
+                files_dir_value_for(Path::new(r"C:\Users\alice2\x"), home),
+                r"C:\Users\alice2\x"
+            );
+            assert_eq!(
+                files_dir_value_for(Path::new(r"C:\Users\alice\x"), None),
+                r"C:\Users\alice\x",
+                "no known home: as picked"
+            );
+        } else {
+            let home = Some("/home/bob");
+            assert_eq!(files_dir_value_for(Path::new("/home/bob/in"), home), "~/in");
+            assert_eq!(files_dir_value_for(Path::new("/srv/in"), home), "/srv/in");
+        }
     }
 }

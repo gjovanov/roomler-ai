@@ -175,6 +175,67 @@
           </dl>
         </div>
 
+        <!-- FR-84 D4: what the capability probe found — the same cells the
+             service advertises to viewers (`roomler caps` prints them too).
+             The service probes at its first server connection; this card
+             never starts a probe. -->
+        <div class="card" id="ov-enc-card">
+          <div class="card-title-row">
+            <h3>Hardware video encoding</h3>
+            <span id="ov-enc-chip" class="chip chip-muted">…</span>
+          </div>
+          <p id="ov-enc-note" class="muted small" hidden></p>
+          <div id="ov-enc-matrix" class="tbl-wrap" hidden>
+            <table class="tbl enc-matrix">
+              <thead><tr id="ov-enc-head"></tr></thead>
+              <tbody id="ov-enc-rows"></tbody>
+            </table>
+            <p class="muted small enc-legend">
+              <span class="enc-cell enc-hw">4:2:0</span> hardware
+              <span class="enc-cell enc-sw">4:2:0</span> software
+              <span class="enc-cell enc-denied">4:4:4</span> denied by
+              <span class="mono">encoder_cells_deny</span>
+            </p>
+          </div>
+          <p id="ov-enc-foot" class="muted small" hidden></p>
+          <p id="ov-enc-denied" class="muted small" hidden></p>
+          <details id="ov-enc-raw" class="small" hidden>
+            <summary class="muted">As advertised to viewers</summary>
+            <dl class="kv" style="margin-top: 6px">
+              <dt>Encoders</dt>
+              <dd id="ov-enc-hw" class="mono small">—</dd>
+              <dt>Codecs</dt>
+              <dd id="ov-enc-codecs" class="mono small">—</dd>
+            </dl>
+          </details>
+        </div>
+
+        <!-- FR-84 D4: where files dropped onto this device land (`files_dir`).
+             Every change goes through the service, which checks the folder
+             for the identity it writes as; its refusals show verbatim. -->
+        <div class="card" id="ov-files-card">
+          <div class="card-title-row">
+            <h3>Incoming files</h3>
+            <span id="ov-files-chip" class="chip chip-muted">…</span>
+          </div>
+          <p class="muted small" style="margin: 0 0 8px">
+            Where files dropped onto this device during a remote session land.
+          </p>
+          <dl class="kv">
+            <dt>Folder</dt>
+            <dd id="ov-files-path" class="mono">—</dd>
+            <dt>Setting</dt>
+            <dd id="ov-files-setting">—</dd>
+          </dl>
+          <p id="ov-files-note" class="muted small" hidden></p>
+          <div class="actions" id="ov-files-actions">
+            <button type="button" id="ov-files-open">Open folder</button>
+            <button type="button" id="ov-files-change" class="primary">Change…</button>
+            <button type="button" id="ov-files-default">Use default</button>
+          </div>
+          <p id="ov-files-msg" class="small" hidden style="white-space: pre-wrap"></p>
+        </div>
+
         <div class="card">
           <h3>Updates</h3>
           <div class="actions" style="margin-top: 0">

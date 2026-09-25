@@ -27,6 +27,10 @@ pub mod config;
 pub mod config_surface;
 pub mod crash_recorder;
 pub mod enrollment;
+/// FR-84 D4 — the `files_dir` validator: shape (shared with the config
+/// surface), placement (the SYSTEM/root-inside-the-active-profile rule) and
+/// writability, run by the daemon at set time and at every drop.
+pub mod files_dir;
 pub mod logging;
 pub mod logs_upload;
 pub mod machine;

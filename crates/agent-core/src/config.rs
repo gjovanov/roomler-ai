@@ -93,6 +93,19 @@ pub struct AgentConfig {
     #[serde(default = "default_enable_remote_browse")]
     pub enable_remote_browse: bool,
 
+    /// FR-84 D4 — where files dropped onto a remote-control session land.
+    /// Absolute, or `~/…` for the ACTIVE user's profile (expanded at use
+    /// time, so one machine-global config is right for whoever is logged
+    /// in). `None` = the default ladder in `files::download_dir` (the
+    /// active user's Downloads). Validated by [`crate::files_dir`]: shape
+    /// in `config_surface::apply`, placement + writability in the daemon,
+    /// at set time AND at every drop — when the daemon runs as SYSTEM/root
+    /// the folder must be inside the active user's profile, or a non-admin
+    /// at the LocalAPI could make SYSTEM write remote-supplied files
+    /// anywhere. Live: the daemon re-reads it per transfer, no restart.
+    #[serde(default)]
+    pub files_dir: Option<String>,
+
     /// Whether incoming `rc:session.request` messages are
     /// auto-granted without operator interaction. Default `true` to
     /// match historical self-host behaviour (`docs/remote-control.md`
@@ -2044,6 +2057,7 @@ pub fn test_fixture() -> AgentConfig {
         update_check_interval_h: None,
         localapi_pipe_pool: None,
         enable_remote_browse: true,
+        files_dir: None,
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,

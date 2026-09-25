@@ -14,7 +14,8 @@
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
-    appdirs, config, config_surface, crash_recorder, enrollment, logging, logs_upload, machine,
+    appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
+    machine,
 };
 
 pub mod apps;
@@ -125,6 +126,11 @@ pub mod virtual_desktop;
 pub mod watchdog;
 #[cfg(target_os = "windows")]
 pub mod win32_monitors;
+/// FR-84 D4 — "is this process LocalSystem, and whose profile is its
+/// session's?", on every Windows build: the `files_dir` placement rule must
+/// not depend on the `system-context` feature.
+#[cfg(target_os = "windows")]
+pub mod win_identity;
 #[cfg(target_os = "windows")]
 pub mod win_service;
 #[cfg(target_os = "windows")]
