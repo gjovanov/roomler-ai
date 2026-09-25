@@ -122,6 +122,44 @@ capability URLs, webhook signatures).
 | POST | `/api/notification/read-all` | Mark all read |
 | GET/PUT | `/api/user/newsletter` | FR-58: the signed-in newsletter toggle — a door into the same `subscribers` store the public form writes; subscribing pre-confirms only on a verified account email |
 
+### Device-scoped — `/api/agent/self/*` (agent JWT, no tenant prefix)
+
+The device's own view of its org, for the desktop companion (FR-84 D5a). The
+companion reaches only its local daemon, and the daemon holds an **agent** token,
+so the admin grid and the org mesh above are out of its reach; these answer the
+same questions **for one device**. Authentication is the agent's bearer token,
+audience- and status-checked on every call (a user JWT, a quarantined or a deleted
+device are each a 401); without the fleet module the answer is 503.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/agent/self/devices` | The devices this device may see, itself included — searched, sorted and paged on the server (`page`, `per_page`, `q`, `sort`, `dir`, `kind`, the admin grid's own contract; an unknown `sort` is a 400) |
+| GET | `/api/agent/self/mesh` | The org mesh graph restricted to the same set, with a server-computed `label` per node and the caller's `self_node_id`; `{"enabled": false}` when stats are off |
+
+**The visibility rule.** `visible = self ∪ what this device's overlay netmap
+already carries`. The set is computed by the join path's own shaping
+(`overlay::shape_full_netmap`, the function that builds the `rc:overlay.netmap` a
+node receives), never by a second rule: under ACL `off` and `warn` every live node
+is listed, under `enforce` exactly the peers the netmap would ship. A device
+without a live overlay node lists itself alone (`overlay: "no_node"`; `"no_network"`
+when the org has no mesh yet, `"unavailable"` without the network module), and the
+GET never creates a network row. Rows carry `display_name`, `name`, `os`, `version`,
+`presence`, `overlay_ip`, MagicDNS, `tags`, `reachable` and `is_self` — never
+`machine_id`, owner ids, keys, consent settings or codecs; those fields are blanked
+before the search runs, so `q` cannot probe them.
+
+```json
+{
+  "items": [{ "kind": "agent", "id": "…", "name": "bravo-box", "display_name": "Kilo",
+              "os": "linux", "version": "0.4.103", "presence": "online", "is_online": true,
+              "last_seen_at": "2026-09-25T09:00:00Z", "overlay_ip": "100.64.0.3",
+              "overlay_node_id": "…", "magic_dns_name": "bravo-box", "reachable": true,
+              "is_self": false }],
+  "total": 2, "page": 1, "per_page": 25, "total_pages": 1,
+  "overlay": "ok", "acl_mode": "enforce", "self_node_id": "…"
+}
+```
+
 ### Public newsletter list (FR-39/FR-58 — no auth; see [newsletter.md](newsletter.md))
 
 | Method | Path | Purpose |
