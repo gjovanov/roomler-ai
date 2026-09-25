@@ -1764,7 +1764,9 @@ jobs:
   #     a bare windows-latest. The MSIs never contained this EXE (it ships
   #     standalone), so the split changes wall-clock only. (P4c-2 retired
   #     the legacy roomler-installer wizard EXE this job also used to build
-  #     — the unified roomler-setup wizard ships via release-setup.yml.)
+  #     — the unified roomler-setup wizard ships via release-setup.yml,
+  #     which the `dispatch-setup-release` job at the end of this file runs
+  #     in LOCKSTEP with every agent release: FR-84 S1.)
   # ---------------------------------------------------------------------------
   build-windows-companions:
     name: Build desktop companion EXE (Windows x86_64)
@@ -3222,4 +3224,91 @@ jobs:
               *) ;;
             esac
           done
+
+  # ---------------------------------------------------------------------------
+  # 8. FR-84 S1 — the setup wizard releases in LOCKSTEP with the agent.
+  #
+  #    `/api/setup/{windows,linux,macos}` serve the newest `setup-v*` release
+  #    (setup_release.rs::pick_release_for). Nothing cut one between
+  #    setup-v0.4.48 (2026-09-02) and agent-v0.4.102: the landing page's
+  #    download button served a wizard 54 agent releases old, with no macOS
+  #    asset at all, and nothing said so. A release lane a human has to
+  #    remember is a release lane that drifts — so every agent release tags
+  #    `setup-v<V>` at the SAME commit and runs release-setup.yml on it.
+  #
+  #    Two GitHub rules shape the mechanics:
+  #      - a tag pushed with GITHUB_TOKEN triggers NO workflow (by design,
+  #        against recursion) — the tag push alone would publish nothing;
+  #      - `workflow_dispatch` is the documented exception — so the job
+  #        dispatches release-setup.yml explicitly, ON THE TAG REF, which is
+  #        also how that lane's validate-version sees ref_type == tag and can
+  #        assert the ref matches the version it was handed.
+  #    The tag is created idempotently: present at the same commit → reused
+  #    (a re-run after a transient dispatch failure must not trip over its
+  #    own earlier success); present at a DIFFERENT commit → refuse loudly.
+  #    A wizard is never re-cut under a number that already shipped: the
+  #    resolver serves by number, so the bytes behind one download URL would
+  #    change underneath everyone who already fetched them.
+  #
+  #    Ordered AFTER `release`, so the wizard can never block or poison the
+  #    agent release. A failure here goes red with the manual recovery in
+  #    the log, and release-setup.yml's own failure alert opens an issue if
+  #    the dispatched run fails. Kill switch: repo variable
+  #    SETUP_LOCKSTEP=false skips the job.
+  # ---------------------------------------------------------------------------
+  dispatch-setup-release:
+    name: Release the setup wizard in lockstep
+    if: needs.validate-version.outputs.is_release == 'true' && vars.SETUP_LOCKSTEP != 'false'
+    needs: [validate-version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # push the setup-v<V> tag
+      actions: write    # dispatch release-setup.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag setup-v<V> at the released commit and dispatch release-setup.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          AGENT_TAG: ${{ needs.validate-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          setup_tag="setup-v${VERSION}"
+          # The commit the agent release was BUILT from, read from the
+          # checkout rather than GITHUB_SHA: on an ANNOTATED tag push
+          # GITHUB_SHA is the tag object, not the commit (agent-v0.4.102 was
+          # annotated, 0.4.101 was not — both must produce a commit here).
+          commit=$(git rev-parse 'HEAD^{commit}')
+          echo "agent release ${AGENT_TAG} built from ${commit} (GITHUB_SHA=${GITHUB_SHA})"
+
+          refused=0
+          recover() {
+            if [ "$refused" -eq 1 ]; then return; fi
+            echo "::error::${setup_tag} was NOT released in lockstep with ${AGENT_TAG} — /api/setup serves the previous wizard until one of these runs:"
+            echo "::error::  gh workflow run release-setup.yml --ref ${setup_tag} -f version=${VERSION} -f publish_release=true    # once ${setup_tag} exists at ${commit}"
+            echo "::error::  git push origin ${commit}:refs/tags/${setup_tag}    # a tag pushed with a HUMAN token triggers release-setup.yml by itself"
+          }
+          trap 'rc=$?; [ "$rc" -eq 0 ] || recover' EXIT
+
+          # Idempotent tag: reuse it at the same commit, refuse it at another.
+          if git fetch --quiet origin "refs/tags/${setup_tag}:refs/tags/${setup_tag}" 2>/dev/null; then
+            at=$(git rev-parse "${setup_tag}^{commit}")
+            if [ "$at" != "$commit" ]; then
+              refused=1
+              echo "::error::${setup_tag} already exists at ${at}, not at ${commit} — a wizard release is never re-cut under a number that already shipped; bump the version and release again"
+              exit 1
+            fi
+            echo "${setup_tag} already exists at ${commit} — reusing it"
+          else
+            git tag "${setup_tag}" "${commit}"
+            git push origin "refs/tags/${setup_tag}"
+            echo "pushed ${setup_tag} at ${commit} (a GITHUB_TOKEN tag push triggers no workflow — dispatching explicitly)"
+          fi
+
+          gh workflow run release-setup.yml --ref "${setup_tag}" \
+            -f version="${VERSION}" -f publish_release=true
+          echo "dispatched release-setup.yml on ${setup_tag}: it builds all three platforms, publishes the release pinned to ${commit}, refreshes the roomler.ai cache, and opens an issue if it fails"
+          echo "verify: gh release view ${setup_tag} --json assets,targetCommitish ; curl -sI https://roomler.ai/api/setup/windows | grep -i content-disposition"
 # RETIRED-NAME-ANCHOR-END

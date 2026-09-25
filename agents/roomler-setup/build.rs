@@ -5,10 +5,12 @@
 // depend on what this emits.
 //
 // Also drops placeholder icons (`icons/icon.ico`, `icons/icon.png`)
-// at build time so a fresh `cargo build` works without committing
-// binary blobs. The CI release pipeline (`release-setup.yml`) can
-// overwrite these with real branded icons before invoking
-// `cargo build --release`.
+// when they are MISSING, so a stripped-down checkout still builds.
+// The real icons are committed (FR-84 S2: `scripts/gen-tray-icons.py
+// --target setup`, a white R on green) and CI asserts they are real,
+// so on any normal checkout these never fire — they existed for the
+// wizard's whole life before that, which is why it shipped with a
+// blank icon in Explorer and the taskbar.
 //
 // Byte arrays are the smallest valid 1×1 black .ico and 1×1 .png
 // (inherited verbatim from the retired legacy wizards' build.rs).
