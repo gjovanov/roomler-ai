@@ -3597,11 +3597,35 @@ const agentSupportsFolderDownload = computed(() =>
 // hint when the operator opens the drawer.
 const isLegacyFileDc = computed(() => agentFilesCaps.value.length === 0)
 
+// #1631 — the device this view is for, wherever it lives: the cached page
+// (the nav's live view over the store) first, else the single-device GET,
+// which is the only way to reach a device beyond the 100-row page or a deep
+// link opened before any listing ran. Throws on any error; the callers
+// decide what to do with the snapshot they already hold.
+async function resolveAgent(): Promise<Agent> {
+  const cached = agentStore.agents.find((a) => a.id === agentId.value)
+  if (cached) return cached
+  return agentStore.fetchAgent(tenantId.value, agentId.value)
+}
+
+/** A server answer that says the device is not there for this caller
+ *  (deleted, or another org's id): the honest state is "no device", not
+ *  yesterday's snapshot. Anything else is transient and keeps the snapshot. */
+function saysNoSuchDevice(e: unknown): boolean {
+  const status = (e as { status?: unknown })?.status
+  return status === 404 || status === 403
+}
+
 async function loadAgent() {
   if (!agentStore.agents.length) {
     await agentStore.fetchAgents(tenantId.value)
   }
-  agent.value = agentStore.agents.find((a) => a.id === agentId.value) || null
+  try {
+    agent.value = await resolveAgent()
+  } catch (e) {
+    if (saysNoSuchDevice(e)) agent.value = null
+    /* else transient — keep the previous snapshot (null on a first load) */
+  }
 }
 
 // S3 — keep the toolbar online-dot honest; P4 relaxed the cadence from
@@ -3613,10 +3637,16 @@ const AGENT_STATUS_POLL_MS = 300_000
 let agentStatusTimer: ReturnType<typeof setInterval> | null = null
 async function refreshAgentStatus() {
   try {
+    // `fetchAgents` swallows its own errors into an EMPTY list, so the old
+    // `find(...) || null` here nulled the device on every transient blip and
+    // on every device beyond the cached page — the toolbar name vanished and
+    // Connect went dead mid-session. Resolve through the single-device GET
+    // instead and only replace the snapshot with an answer.
     await agentStore.fetchAgents(tenantId.value)
-    agent.value = agentStore.agents.find((a) => a.id === agentId.value) || null
-  } catch {
-    /* transient — keep the previous snapshot */
+    agent.value = await resolveAgent()
+  } catch (e) {
+    if (saysNoSuchDevice(e)) agent.value = null
+    /* else transient — keep the previous snapshot */
   }
 }
 watch(
