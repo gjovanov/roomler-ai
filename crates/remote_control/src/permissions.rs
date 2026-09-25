@@ -24,64 +24,115 @@ bitflags::bitflags! {
 
 /// Hand-written so a `Permissions` stored in Mongo can be read back.
 ///
-/// **The bug this fixes.** bitflags 2.x's serde impl branches on
-/// `Serializer::is_human_readable()`: pipe-separated names when true, raw bits
-/// when false. bson 2.x's **Serializer defaults `human_readable = true` while
-/// its Deserializer defaults to `false`** — so the same type wrote
-/// `"VIEW | INPUT | CLIPBOARD | FILES"` into Mongo and then demanded a `u16`
-/// reading it back. Every read of a stored `RemoteSession` 500'd with
-/// `invalid type: string "VIEW | INPUT …", expected u16`, while routes that
-/// only touch live hub state kept working. Issue #1166.
+/// **What is actually on disk — measured per entry point, not assumed
+/// (#1166, #1630).** bitflags 2.x's serde impl branches on
+/// `is_human_readable()`: pipe-separated names when true, raw bits when false.
+/// bson 2.15 answers that question differently for each of its entry points,
+/// and the mongodb driver's typed API sits on the *raw* ones:
 ///
-/// **Why only the read side changed.** The write is *already correct*: every
-/// reader in the field expects the name form, and every row ever stored holds
-/// it (the Serializer has always defaulted human-readable). "Symmetrising" this
-/// to `u16` on both ends would break currently-working paths in order to repair
-/// a broken one, and would strand 100 % of existing rows. Do not do it.
+/// | entry point (bson 2.15.0 / mongodb 3.7.0) | `is_human_readable()` | a `Permissions` is |
+/// |---|---|---|
+/// | `to_bson` / `to_document` — `$set` values, the `remote_sessions` projection in `audit.rs` | `true` | `"VIEW \| INPUT"` |
+/// | `to_vec` / `to_raw_document_buf` — the driver's typed `insert_one` / `insert_many` | **`false`** | `Int32(3)` |
+/// | `from_bson` / `from_document` | `true` | — |
+/// | `from_slice` — the driver's typed cursor, a plain struct field | **`false`** | — |
+/// | `from_slice` — a field under `#[serde(tag)]` / `untagged` / `flatten` | **`true`** (see below) | — |
 ///
-/// **Why the numeric form is gated on `!is_human_readable()`.** The `rc:*` JSON
-/// wire is deliberately name-only — `deserialise_numeric_is_rejected` locks
-/// that, and the agent plus the TS store depend on it. Accepting bits
+/// So `remote_sessions.permissions` (written with `bson::to_document`) holds
+/// NAMES, while `remote_audit.event.permissions` (written by the driver's
+/// `insert_many` in the same file) has held BITS since the field appeared in
+/// multi-user P3. Both shapes are in production and both stay: an older binary
+/// keeps writing whatever it writes, so every reader must accept either,
+/// permanently.
+///
+/// **Why the numeric form is gated on `!is_human_readable()` here.** The
+/// `rc:*` JSON wire is deliberately name-only — `deserialise_numeric_is_rejected`
+/// locks that, and the agent plus the TS store depend on it. Accepting bits
 /// unconditionally would loosen that wire contract as a side effect of a
-/// storage fix. Gating on the same flag bitflags itself branches on keeps JSON
-/// strictly name-only while letting the non-human-readable (bson) path accept
-/// either shape — which it must, permanently: an older binary in the field
-/// keeps writing names, so the old shape never stops arriving.
+/// storage fix, so this impl stays the WIRE rule: names always, bits only when
+/// the format itself says it is binary.
+///
+/// **Why that gate cannot carry storage on its own (#1630).** serde reads an
+/// internally-tagged enum such as `AuditKind` by buffering the whole value into
+/// its private `Content` and re-deserialising each variant field from a
+/// `ContentDeserializer`, which does not forward the outer format's flag and
+/// answers the trait default, `true`. The `Int32` the driver had written under
+/// `RemoteAuditEvent.event` therefore reached this visitor as "human-readable"
+/// and was refused, and `GET …/session/{id}/audit` 500'd on every session
+/// (0.4.101). The same buffering happens under `#[serde(untagged)]`,
+/// `#[serde(tag, content)]` and `#[serde(flatten)]`. Where a field sits in the
+/// document is not something this impl can see, so every PERSISTED field opts
+/// in explicitly with [`deserialize_stored`] — do that for any new stored
+/// `Permissions`, top-level or nested, and leave this impl as the wire rule.
+///
+/// **Why only the read side changed, both times.** Every reader in the field
+/// expects the name form on the wire, and both shapes already exist on disk.
+/// "Symmetrising" the writer to `u16` would strand every name-shaped row and
+/// break the wire for older agents; switching the driver path to names would
+/// not remove the bits already stored. Do neither.
 impl<'de> Deserialize<'de> for Permissions {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V {
-            /// Mirrors the deserializer's own flag; see the type docs.
-            human_readable: bool,
+        // Mirrors the deserializer's own flag; see the type docs.
+        let accept_bits = !d.is_human_readable();
+        d.deserialize_any(NamesOrBits { accept_bits })
+    }
+}
+
+/// Read a `Permissions` that came out of STORAGE: names or bits, whatever the
+/// deserializer claims about itself.
+///
+/// Put `#[serde(deserialize_with = "crate::permissions::deserialize_stored")]`
+/// on every persisted `Permissions` field. The blanket impl keys its tolerance
+/// on `is_human_readable()`, and that flag does not survive serde's `Content`
+/// buffering (tagged / untagged enums, `flatten`): `AuditKind`'s two fields
+/// read as human-readable under the raw driver cursor and refused the `Int32`
+/// the raw driver insert had written (#1630). A field-level opt-in is the one
+/// signal independent of where in the document the field sits. Unknown bits
+/// are truncated — the fail-safe direction; an unknown NAME is still an error,
+/// exactly as on the wire.
+///
+/// ⚠️ Only for types that never arrive over the `rc:*` JSON wire: a struct
+/// carrying this attribute accepts `"permissions": 3` from JSON too.
+/// `RemoteSession` and `RemoteAuditEvent` are read from Mongo and only ever
+/// serialised towards the browser, so nothing loosens there.
+pub fn deserialize_stored<'de, D>(d: D) -> Result<Permissions, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    d.deserialize_any(NamesOrBits { accept_bits: true })
+}
+
+/// The one visitor behind both entry points; `accept_bits` is the whole
+/// difference between the wire rule and the storage rule.
+struct NamesOrBits {
+    accept_bits: bool,
+}
+
+impl serde::de::Visitor<'_> for NamesOrBits {
+    type Value = Permissions;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.accept_bits {
+            f.write_str("a pipe-separated permission name list or a u16 bitfield")
+        } else {
+            f.write_str("a pipe-separated permission name list, e.g. \"VIEW | INPUT\"")
         }
-        impl serde::de::Visitor<'_> for V {
-            type Value = Permissions;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                if self.human_readable {
-                    f.write_str("a pipe-separated permission name list, e.g. \"VIEW | INPUT\"")
-                } else {
-                    f.write_str("a pipe-separated permission name list or a u16 bitfield")
-                }
-            }
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Permissions, E> {
-                parse_wire_names(s).ok_or_else(|| E::custom(format!("unknown permission in {s:?}")))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Permissions, E> {
-                if self.human_readable {
-                    // Keep the rc:* wire name-only.
-                    return Err(E::custom("numeric permissions are not accepted here"));
-                }
-                // Truncating is the fail-SAFE direction: an unknown bit from a
-                // newer writer drops the permission rather than granting it.
-                Ok(Permissions::from_bits_truncate(v as u16))
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Permissions, E> {
-                // bson stores integers as i32/i64, so this arm is the one a
-                // bits-shaped stored row actually lands on.
-                self.visit_u64(v.max(0) as u64)
-            }
+    }
+    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Permissions, E> {
+        parse_wire_names(s).ok_or_else(|| E::custom(format!("unknown permission in {s:?}")))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Permissions, E> {
+        if !self.accept_bits {
+            // Keep the rc:* wire name-only.
+            return Err(E::custom("numeric permissions are not accepted here"));
         }
-        let human_readable = d.is_human_readable();
-        d.deserialize_any(V { human_readable })
+        // Truncating is the fail-SAFE direction: an unknown bit from a
+        // newer writer drops the permission rather than granting it.
+        Ok(Permissions::from_bits_truncate(v as u16))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Permissions, E> {
+        // bson stores integers as i32/i64, so this arm is the one a
+        // bits-shaped stored row actually lands on.
+        self.visit_u64(v.max(0) as u64)
     }
 }
 
@@ -195,14 +246,17 @@ mod tests {
         assert!(r.is_err(), "numeric form must not be accepted");
     }
 
-    // ── #1166: the bson path ────────────────────────────────────────────────
+    // ── #1166 / #1630: the bson paths ───────────────────────────────────────
     //
     // These are deliberately bson, not JSON. The JSON tests above pass even
     // when storage is completely broken, because serde_json is human-readable
     // in BOTH directions — so bitflags takes the same branch on the way in and
-    // out. bson does not: its Serializer defaults human_readable = true and its
-    // Deserializer defaults to false. A JSON-only suite cannot catch that class
-    // by construction, which is exactly why this shipped.
+    // out. bson does not, and it is not even one answer: the VALUE API
+    // (`to_bson`/`to_document`/`from_bson`/`from_document`) says true, the RAW
+    // API the mongodb driver uses (`to_vec`/`to_raw_document_buf`/`from_slice`)
+    // says false — except under serde's `Content` buffering, where the flag is
+    // lost and reads as true again. A JSON-only suite cannot catch any of that
+    // by construction, which is exactly why both bugs shipped.
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
     struct StoredPerms {
@@ -236,9 +290,14 @@ mod tests {
         }
     }
 
-    /// Pin the STORED shape. Every row in prod holds the name form, so if the
-    /// write side ever flips to bits this fails loudly — that change would
-    /// strand every existing row and break readers still in the field.
+    /// Pin the shape the VALUE API stores (`to_bson` / `to_document` — every
+    /// `remote_sessions` row): the name form. If this ever flips to bits it
+    /// fails loudly, because readers in the field still expect names on the
+    /// wire. ⚠️ It is one of TWO writers: the driver's typed insert goes
+    /// through the raw serializer and stores bits — see
+    /// `the_raw_serializer_the_driver_uses_stores_bits`. #1166's version of
+    /// this comment said "every row in prod holds the name form"; measured on
+    /// 2026-09-25, every `remote_audit` row held an `Int32`.
     #[test]
     fn bson_stores_the_name_form() {
         let p = Permissions::VIEW | Permissions::INPUT;
@@ -284,5 +343,132 @@ mod tests {
         assert!(serde_json::from_str::<Permissions>("\"VIEW | NOPE\"").is_err());
         let bytes = bson::to_vec(&bson::doc! { "permissions": "VIEW | NOPE" }).unwrap();
         assert!(bson::from_slice::<StoredPerms>(&bytes).is_err());
+    }
+
+    // ── #1630: the gate is blind under serde's Content buffering ───────────
+    //
+    // `AuditKind` is `#[serde(tag = "kind")]`. Under `from_slice` the OUTER
+    // deserializer says `false`, but serde re-reads the variant fields from a
+    // buffered `Content` whose deserializer says `true` — so the raw driver
+    // cursor refused the `Int32` the raw driver insert had written. Nothing
+    // here touches a database; the pair below is byte-for-byte the driver's.
+
+    /// The stored shape, read by the blanket impl (the wire rule).
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum TaggedWire {
+        Requested { permissions: Permissions },
+    }
+
+    /// The same shape with the storage opt-in.
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum TaggedStored {
+        Requested {
+            #[serde(deserialize_with = "deserialize_stored")]
+            permissions: Permissions,
+        },
+    }
+
+    #[derive(serde::Deserialize, Debug)]
+    struct Row<E> {
+        event: E,
+    }
+
+    fn tagged_row(permissions: bson::Bson) -> Vec<u8> {
+        bson::to_vec(&bson::doc! { "event": { "kind": "requested", "permissions": permissions } })
+            .unwrap()
+    }
+
+    /// The driver's typed insert writes BITS — pin it. #1166's comment said
+    /// every stored row held names because "the Serializer has always
+    /// defaulted human-readable"; the RAW serializer never has, and every
+    /// `remote_audit` row in prod held an `Int32` when measured (2026-09-25).
+    #[test]
+    fn the_raw_serializer_the_driver_uses_stores_bits() {
+        let p = Permissions::VIEW | Permissions::INPUT;
+        let raw = bson::to_raw_document_buf(&StoredPerms { permissions: p }).unwrap();
+        let elem = raw.get("permissions").unwrap().expect("present");
+        assert_eq!(
+            elem.element_type(),
+            bson::spec::ElementType::Int32,
+            "{elem:?}"
+        );
+        assert_eq!(elem.as_i32(), Some(3));
+    }
+
+    /// The canary behind the type docs: serde's `ContentDeserializer` reports
+    /// human-readable whatever the format, so the blanket impl refuses bits
+    /// under a tagged enum EVEN on the raw path. If this ever starts passing,
+    /// serde began forwarding the flag — the opt-ins stay (both shapes are on
+    /// disk), but the docs can be simplified.
+    #[test]
+    fn under_a_tagged_enum_the_raw_path_reads_as_human_readable() {
+        let err = bson::from_slice::<Row<TaggedWire>>(&tagged_row(bson::Bson::Int32(3)))
+            .expect_err("the flag does not survive Content buffering");
+        assert!(
+            err.to_string()
+                .contains("numeric permissions are not accepted here"),
+            "{err}"
+        );
+    }
+
+    /// The fix: the opt-in reads bits regardless of what the deserializer
+    /// claims — through the driver's raw path AND the value API.
+    #[test]
+    fn deserialize_stored_reads_bits_under_a_tagged_enum() {
+        let row: Row<TaggedStored> =
+            bson::from_slice(&tagged_row(bson::Bson::Int32(3))).expect("raw path");
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(permissions, Permissions::VIEW | Permissions::INPUT);
+
+        let row: Row<TaggedStored> = bson::from_document(
+            bson::doc! { "event": { "kind": "requested", "permissions": bson::Bson::Int64(1) } },
+        )
+        .expect("value API");
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(permissions, Permissions::VIEW);
+    }
+
+    /// The other shape keeps reading: names are what `to_bson` writes and what
+    /// an operator would hand-edit.
+    #[test]
+    fn deserialize_stored_reads_names_too() {
+        let row: Row<TaggedStored> =
+            bson::from_slice(&tagged_row("VIEW | INPUT".into())).expect("names");
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(permissions, Permissions::VIEW | Permissions::INPUT);
+    }
+
+    /// Same strictness as the wire on names, fail-safe on bits.
+    #[test]
+    fn deserialize_stored_truncates_unknown_bits_and_refuses_unknown_names() {
+        let row: Row<TaggedStored> =
+            bson::from_slice(&tagged_row(bson::Bson::Int32(0x4001))).unwrap();
+        let TaggedStored::Requested { permissions } = row.event;
+        assert_eq!(
+            permissions,
+            Permissions::VIEW,
+            "an unknown bit is dropped, never granted"
+        );
+        assert!(bson::from_slice::<Row<TaggedStored>>(&tagged_row("VIEW | NOPE".into())).is_err());
+    }
+
+    /// And the wire rule is untouched by any of it: names read, numbers do
+    /// not, including through a tagged enum.
+    #[test]
+    fn the_json_wire_still_refuses_numbers_after_1630() {
+        assert!(serde_json::from_str::<Permissions>("3").is_err());
+        assert!(
+            serde_json::from_str::<Row<TaggedWire>>(
+                r#"{"event":{"kind":"requested","permissions":3}}"#
+            )
+            .is_err()
+        );
+        let row: Row<TaggedWire> =
+            serde_json::from_str(r#"{"event":{"kind":"requested","permissions":"VIEW | INPUT"}}"#)
+                .expect("names on the wire");
+        let TaggedWire::Requested { permissions } = row.event;
+        assert_eq!(permissions, Permissions::VIEW | Permissions::INPUT);
     }
 }
