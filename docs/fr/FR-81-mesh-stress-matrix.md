@@ -1,7 +1,10 @@
 # FR-81: Overlay stress matrix — latency, throughput and carrier stability from a throwaway VM
 
 **Issue:** [#1546](https://github.com/gjovanov/roomler-ai/issues/1546) ·
-**Status:** proposed 2026-09-08
+**Status:** **closed 2026-09-25** — all nine criteria met. Reference run `20260924-155559` (every
+target on agent 0.4.101): PASS 26/0, SSH 30/30, 0 transitions over 189 **measured** samples on
+every pair. Docs: [`testing.md` → the overlay stress lane](../testing.md#the-overlay-stress-lane-fr-81).
+⚠️ AC6's round-one evidence was 0 over *zero* samples and is withdrawn — see round three.
 
 ## Goal
 
@@ -79,8 +82,10 @@ left alone — which is also why `scp` works there at all (the sftp subsystem sp
 a `console_user` host would refuse).
 
 ⚠️ **These are someone's working machines.** Transfer size, sample counts and session counts are
-bounded and configurable, files land in the platform temp dir and are deleted, and the whole sweep
-is minutes not hours.
+bounded and configurable, and files land in the platform temp dir and are deleted. *(As built,
+the sweep is not "minutes": both arms take about 2 h 50 min — mostly VM bring-up, 40 pings and a
+VM-sender-limited 32 MiB transfer per target. The load on each target stays one SSH session or one
+transfer at a time.)*
 
 ## Acceptance criteria
 
@@ -98,19 +103,25 @@ is minutes not hours.
       throughput number per arm.
       *32 MiB round trip, sha256 verified, on CORPLAP-1 and CORPLAP-2 in both arms
       (0.36–0.41 MiB/s). CORPLAP-3 reports `target-has-no-sftp-server`; zeus and mars serve no
-      SSH at all — each named, none silent.*
+      SSH at all — each named, none silent.* *Round three (SSH since enabled on the servers,
+      operator-approved; `scp` is the transport): 8/8 possible round trips sha256-verified in
+      `20260924-155559`; throughput is VM-sender-limited (~1 MiB/s on any carrier).*
 - [x] **AC5** SSH session establishment is exercised repeatedly and reported as a success rate.
       *3/3 on all three corporate laptops in both arms — including CORPLAP-3, which had never
       produced a successful session in this lane before #1565.*
 - [x] **AC6** carrier transitions are counted over the run — the stability claim gets a number.
-      *`carrier_transitions=0` on all ten (target × arm) pairs across ~3 ¼ hours.*
+      ~~*`carrier_transitions=0` on all ten (target × arm) pairs across ~3 ¼ hours.*~~
+      **Withdrawn:** that zero — and rounds one and two's — was counted over **zero samples**; the
+      sampler's output was never collected (round three). *Measured since the fix: the first real
+      count, `20260923-182640`, caught a genuine ~70 s demotion (mars direct: 2 transitions / 177
+      samples); `20260924-155559`: 0 / 189 on every pair, no stalled or unrecognised state.*
 - [x] **AC7** the relay arm is *forced*, not hoped for, and the direct arm proves the forcing knob
       changed something.
       *mars: `carrier=direct` p50 0 ms in the direct arm → `carrier=relay:derp/tcp` p50 2 ms in the
       relay arm. Same VM image, same target, one config key.*
 - [x] **AC8** the whole sweep runs from one command and is documented in a skill.
-      *`vmtest.sh run --lane stress --host zeus`; the `meshstress` skill carries eleven traps.*
-- [ ] **AC9** docs in the house style, linked from `docs/README.md` (the docs-before-close rule,
+      *`vmtest.sh run --lane stress --host zeus`; the `meshstress` skill carries sixteen traps.*
+- [x] **AC9** docs in the house style, linked from `docs/README.md` (the docs-before-close rule,
       #1401): the stress lane in `docs/testing.md`'s "CI & special lanes" — the matrix, the two
       arms and the one config key that forces relay (AC7), what each measurement means and why
       none asserts which carrier won (AC2), and round 2's two product fixes (#1559, #1565).
@@ -118,6 +129,13 @@ is minutes not hours.
       documents the lane (nor the vmtest harness under it — that one is FR-61's to write).
       ⚠️ No fleet addresses in the doc: they are WHY the skill is gitignored, and they belong
       in the private docs repo.
+      *[`testing.md` → "The overlay stress lane (FR-81)"](../testing.md#the-overlay-stress-lane-fr-81):
+      the lane in the lanes table, a flow diagram, the two arms with `overlay_direct = false`
+      anchored, every measurement and why the carrier is reported not asserted, the allow-list
+      and sample-count rules for stability, all four product fixes the lane found (#1559,
+      #1565, FR-83/#1597, #1573) with anchors, the reference run and the rails; indexed from
+      `docs/README.md`'s `testing.md` row. No addresses, no real machine names.*
+
 ## Out of scope
 
 Tuning anything. This measures; it does not fix. Also: no carrier pinning on any host but the
@@ -311,3 +329,68 @@ inside the VM can look** (sftp cannot start, and a `roomler ssh` grant session i
 denied on `C:\Windows\Temp`), so it correctly reported `UNVERIFIED` and was checked from mars with
 `roomler exec`, which runs as the daemon: **0 files** matching `roomler-stress*`. zeus and mars: 0.
 Fleet org back to 21 devices, zero ghosts, no VM on zeus, k8s untouched.
+
+### 2026-09-23 → 09-24 — round three: stability had never been measured, and an SSH race
+
+#### 🚨 Rounds one and two counted stability over ZERO samples
+
+*(Found 2026-09-10; fixed in the lane on 09-23; merged with #11 on 09-24.)*
+`carrier_transitions=0` was printed for every pair across three runs (rounds one and two), and
+every one of them was 0 over **zero** samples. The collection was one remote command —
+`pkill -f 'roomler peers'; sudo cat /tmp/carrier.log` — and `pkill -f` matched the invoking shell's
+own command line, which contained that exact pattern: it killed the shell it ran in, so the `cat`
+never ran, the collected log was empty, and the counter found no transitions in nothing. The
+sampler itself had worked all along. AC6's round-one evidence is withdrawn above.
+Fixed in `roomler-ai-deploy` #11: collect first, kill second; the sampler's verdict is judged at
+collection time on the lines captured; every result prints `transitions=<n>/<k>samples`.
+
+Once real samples arrived, the counter called healthy peers flapping: the `CONN` column of
+`roomler peers` carries **states** as well as carriers (`upgrading` is a make-before-break probe on
+a relayed peer, plus `stalled` and `offline`). Transitions are now counted only between carrier
+shapes on an allow-list (`direct`, `lan`, `relay:*`); states are tallied separately and anything
+unrecognised is reported, never counted.
+
+#### The first measured stability — `20260923-182640`, 26 PASS / 0 FAIL
+
+0 transitions on every pair over 177–189 samples, except **mars direct: 2 / 177** —
+`162× direct → 7× relay:derp → 8× direct`, a genuine ~70 s demotion and recovery (never-ratchet
+doing its job). CORPLAP-3's relay arm logged 2 `stalled` and 36 `offline` samples as it left the
+mesh for ~6 min at the end of its sweep, after its own measurements were taken.
+
+#### Product bug 3 — a grant-issued SSH session could beat its own grant (#1597 → FR-83)
+
+CORPLAP-2's direct arm: SSH **0/3**. The laptop's own log showed `rejected — no live grant`
+3.3–4.4 s **before** `grant recorded`: the caller (the VM, on a fleet host close to the server)
+dialled before the grant had crossed the laptop's slower control connection. FR-83 (#1601) makes
+the server answer only after the device acknowledges the grant — shipped in 0.4.101, verified
+below.
+
+#### Product bug 4 — `roomler proxy`'s own `--help` recipe could not work (#1573)
+
+Found while enabling SSH on the fleet servers for this lane: `Host *.roomler` hands the proxy
+`<name>.roomler`, which it looked up verbatim. Fixed in 0.4.101.
+
+#### ⚠️ One run's relay-arm SSH column was invalidated by a probe — `20260924-113449`
+
+The confirming run for #11 (PASS 26/0; direct arm clean — SSH 15/15, `scp` 4/4 possible
+sha-equal, 0/194 transitions) lost its relay-arm SSH to an FR-83 verification probe that PUT a
+partial `ssh-policy` onto the live relay VM. The route is a full replace, and the lane grants the
+VM `can_originate` through the same object: every relay-arm SSH attempt then answered *"not
+permitted to originate"* (0/15, `scp` skipped) while the verdict stayed green, because the lane
+reports a policy refusal as a measurement. Carrier, latency, loss and stability were unaffected.
+The rail is now written down (`testing.md`, and trap 16 of the local skill).
+
+#### Result — reference run `20260924-155559`, every target on agent 0.4.101 — PASS 26/0
+
+| target | carrier (direct · relay) | loss | p50 / p95 ms (direct · relay) | SSH (dir · rel) | `scp` 32 MiB | transitions (dir · rel) |
+|---|---|---|---|---|---|---|
+| CORPLAP-1 | relay:derp · relay:derp | 0 % | 43/70 · 44/61 | 3/3 · 3/3 | ✅ sha256, both arms | 0/189 · 0/189 |
+| CORPLAP-2 | relay:derp · relay:derp | 0 % | 56/79 · 57/94 | **3/3 · 3/3** | ✅ sha256, both arms | 0/189 · 0/189 |
+| CORPLAP-3 | relay:derp · relay:derp | 0 % | 47/90 · 47/91 | 3/3 · 3/3 | ⛔ no `sftp-server` on the target | 0/189 · 0/189 |
+| zeus | relay:derp · relay:derp | 0 % | 2/3 · 2/7 | 3/3 · 3/3 | ✅ sha256, both arms | 0/189 · 0/189 |
+| mars | **direct** · relay:derp | 0 % | 0/0 · 2/8 | 3/3 · 3/3 | ✅ sha256, both arms | 0/189 · 0/189 |
+
+From the five targets' own logs: **40/40 grant-issued sessions were recorded before they opened**
+(leads 92–173 ms on the laptops, 7–28 ms on the servers), **0 rejected** — FR-83 in the field.
+Sampler: 3591 lines per arm; no `stalled`, `offline` or unrecognised value on any pair. Fleet org
+back to 21 devices after each arm.
