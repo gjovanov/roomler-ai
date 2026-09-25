@@ -9,9 +9,11 @@ the way it is, and the exact sequence to (re)establish the credentials.
 
 Publisher of record: **G ROX LTD** (Plovdivska 110, 4400 Pazardzhik, Bulgaria
 — UIC/EIK `205174895`, VAT `BG205174895`). The Windows "Verified publisher"
-string, the macOS Developer ID team name, the MSI `Manufacturer`, the `.deb`
-maintainer and the EXE `CompanyName` all carry this name; if any of them
-drifts, sweep them back together (see [Identity alignment](#identity-alignment)).
+string, the MSI `Manufacturer`, the `.deb` maintainer and the EXE
+`CompanyName` all carry this name; if any of them drifts, sweep them back
+together (see [Identity alignment](#identity-alignment)). ⚠️ The one exception
+is the **macOS Developer ID team name, `G ROX EOOD`** — the same company under
+its Bulgarian legal form, and not something a sweep can change (§9).
 
 ---
 
@@ -56,7 +58,7 @@ SmartScreen reputation organically from download volume. What signing buys
   EU *individuals* are not (US/Canada only), which is why signing runs under
   the company identity.
 
-## 2b. Live status (2026-08-22) — the Azure half is DONE
+## 2b. Live status — all three platforms sign (Azure 2026-08-22, Apple 2026-09-08)
 
 - Identity validation **Completed** for G ROX LTD (id
   `2390bcea-a3d5-4919-a624-cb209c875bf7`, valid to 2028-11-21).
@@ -80,10 +82,31 @@ SmartScreen reputation organically from download volume. What signing buys
   `roomler-release-pubkey.asc`: ed25519 primary `[C]` certify-only
   `D654B016256FD92A81634A0E2AD1E9F025973A7F` + ed25519 `[S]` subkey
   `5DB8221F546288DE780C10D3A2C53E5FE6FA485A`, both to 2028-08-22. Signatures
-  verify; a flipped byte gives `BAD signature`. The agent does not check them
-  yet — see §7b.
-- Still pending: Apple D-U-N-S → `60-apple-setup.sh` (which is what blocks
-  `pkgutil --check-signature` in the updater).
+  verify; a flipped byte gives `BAD signature`. **The agent checks them too**
+  (this line said "does not check them yet" long after that stopped being
+  true): a `.deb`/`.pkg` update is refused unless its `.asc` verifies against
+  the signing subkey pinned in the binary — see §7b.
+- **Apple is LIVE and field-verified** (2026-09-08; this line said "still
+  pending" for two weeks after that and was stale — FR-7, #778). Enrolment
+  `5XS5WN8R99` completed for **G ROX EOOD**, team `4TG7586MY5` — the same
+  company as G ROX LTD, under the name its D-U-N-S record holds (§9). Developer ID
+  **Application** and **Installer** certificates are issued on the **G2**
+  Sub-CA, valid to 2031-09-09; the notarytool key is an App Store Connect team
+  key. `60-apple-setup.sh` produced the six `APPLE_*` secrets.
+- The first run with real credentials was refused: notarisation returned
+  `Invalid` for a self-signed bundle inside a signed `.pkg` (#1521, fixed).
+  Nothing before real credentials could have exercised that path.
+- Field proof, on a real Mac, of the **published** `.pkg` with quarantine set —
+  the path an end user's download actually takes:
+  `spctl -a -vvv -t install` → `source=Notarized Developer ID`,
+  `origin=Developer ID Installer: G ROX EOOD (4TG7586MY5)`
+  ([result](https://github.com/gjovanov/roomler-ai/issues/778#issuecomment-5589571740),
+  [on the published artifact](https://github.com/gjovanov/roomler-ai/issues/778#issuecomment-5589756486)).
+  That line is the only check that tells *signed* from *signed AND notarised*.
+- ⚠️ What a *release* carries and what the *machine installing an update*
+  checks are different questions — §7b. The agent's own check of a `.pkg`
+  update is the GPG `.asc` against its pinned key, not the Apple signature, and
+  a `.pkg` is not yet bound to the release it claims to be.
 
 ## 3. Credential setup — `scripts/signing/`
 
@@ -130,6 +153,39 @@ work). GPG (`70-gpg-release-key.sh create|export`): ed25519 signing subkey →
 offline.
 
 ## 4. What gets signed, where
+
+```mermaid
+graph LR
+    TAG["a release tag<br/>agent-v* · setup-v* · tunnel-v*"]
+
+    subgraph WIN["Windows — sign-windows · Azure Artifact Signing over OIDC"]
+        W1["the payload first<br/>roomlerd.exe · roomler.exe"]
+        W2["wintun.dll staged<br/>NEVER re-signed —<br/>WireGuard LLC's signature survives"]
+        W3["then the MSIs<br/>harvested, then signed"]
+        W1 -->|"no cargo build after this —<br/>a relink strips the signature"| W2 --> W3
+    end
+
+    subgraph MAC["macOS — Developer ID · team 4TG7586MY5"]
+        M1["codesign<br/>+ productbuild for the .pkg"] --> M2["notarytool"]
+        M2 --> M3["staple<br/>.pkg · Setup.app<br/>a loose binary cannot be stapled"]
+        M3 --> M4["verify<br/>stapler validate · spctl"]
+    end
+
+    TAG --> W1
+    TAG --> M1
+    W3 --> PUB
+    M4 --> PUB
+    PUB["publish jobs<br/>+ GPG .asc per asset<br/>+ SLSA provenance attestation"] --> REL["GitHub release"]
+
+    REL --> HUMAN["§7 — a person verifying<br/>Get-AuthenticodeSignature · spctl → Notarized Developer ID<br/>gh attestation verify · gpg --verify"]
+    REL --> AGENT["§7b — the agent, before an update<br/>.msi → Authenticode publisher + embedded version<br/>.pkg · .deb → .asc vs the pinned key; version NOT bound"]
+```
+
+The diagram is the chain; the table is every artifact on it. The setup,
+desktop and tunnel executables go through the same `sign-windows` step as the
+MSI payload. Note the asymmetry at the right edge: every update is
+authenticated by the machine installing it, but only the Windows **MSI** is
+also bound to the release it claims to be (§7b).
 
 | Artifact | Workflow | Mechanism |
 |---|---|---|
@@ -249,15 +305,16 @@ gpg --verify <asset>.asc <asset>
 
 ## 7b. What the AGENT verifies before installing an update
 
-§7 is a human checking a release. This is the machine refusing one. Both gates
-live in `updater::download_asset`, both fail closed, and both failures are the
-same benign outcome: the file is discarded and the agent keeps the version it
-is already running.
+§7 is a human checking a release. This is the machine refusing one. The gates
+live in `updater::download_asset`, each fails closed where it applies, and
+every failure is the same benign outcome: the file is discarded and the agent
+keeps the version it is already running.
 
 | Gate | Module | Answers | Enforced on |
 |---|---|---|---|
 | Authenticode + publisher name | `code_signature::verify_publisher` | *Whose* bytes are these? | Windows |
-| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | Windows (`.msi`) |
+| Detached `.asc` vs the signing subkey **pinned in the binary** | `pgp_verify::verify_release_artifact` | *Whose* bytes are these? | Linux, macOS (`.deb`, `.pkg`) — the `.asc` is **required** |
+| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | Windows (`.msi`) only |
 
 **Neither is sufficient alone, and the second is the less obvious one.**
 `is_newer` decides to upgrade by reading the **manifest's** tag, while the
@@ -273,28 +330,48 @@ envelope** — editing it invalidates the Authenticode signature the first gate
 already enforces. Equally, the signature is what makes the embedded version
 unforgeable. Neither gate means much without the other.
 
-⚠️ **`.deb` and `.pkg` report `Unsupported`, not a refusal.** The *agent* has
-authenticated nothing about them, so a version check there would compare a
-claim against a claim while reading like a control.
+**On Linux and macOS the bytes are authenticated, but the release is not
+bound.** A `.deb` or `.pkg` update is refused unless its detached `.asc`
+verifies against the signing key **pinned in the binary** — a key fetched from
+the release alongside the artifact would be the same-channel trust failure as
+the SHA256. The sidecar is *required*: it is fetched from `<asset-url>.asc`
+over the same channel as the artifact, which is sound precisely because of the
+pin — a channel can withhold a signature but cannot mint one, and withholding
+is a refusal. Live-proven on the rc.481 and rc.482 macOS updates, which logged
+`installer .asc verified against the pinned release signing key` (FR-7).
 
-Note the gap precisely — **the release pipeline is ahead of the agent here.**
-Every published artifact already carries a detached `.asc`, and
-`roomler-release-pubkey.asc` ships in the release. Verified 2026-08-24 against
-`agent-v0.3.0-rc.458`: the key is an ed25519 primary `[C]` (certify-only,
-offline, `D654B016256FD92A81634A0E2AD1E9F025973A7F`) with an ed25519 `[S]`
-signing subkey (`5DB8221F546288DE780C10D3A2C53E5FE6FA485A`), both valid to
-2028-08-22; the `.deb` sidecar verifies, and flipping one byte yields
-`BAD signature`. **What is missing is the client half.** Verifying in-process
-needs the release public key *pinned in the binary* — a key fetched from the
-release alongside the artifact is the same-channel trust failure as the SHA256.
+What these formats still lack is the version gate. `verify_artifact_version`
+has no reader for a version embedded in a `.pkg` or `.deb`, so it reports
+`Unsupported` and the update proceeds (logged at INFO, the expected steady
+state there). ⚠️ So the downgrade the MSI binding closes is **still open on
+Linux and macOS**: a genuinely-signed *older* package offered under a newer
+manifest claim verifies — the signature really is ours. It is the same gap as
+the unsigned manifest in `CLAUDE.md`'s Known Issues. (The comment on that
+`Unsupported` arm in `updater.rs` still says the format "carries no signature
+for a version to be anchored to"; since the `.asc` gate landed it does — what
+is missing is a reader, not a signature.)
 
-That makes the remaining Linux work a size question, not a key-custody one:
-both a pinned-raw-ed25519 scheme and in-process OpenPGP put a *signing* key in
-CI, and the primitive is ed25519 either way. The difference is **revocability**
-— pinning the offline primary lets a compromised subkey be revoked and replaced
-without touching the fleet, whereas a pinned raw key can only be rotated by a
-fleet-wide update signed with the very key being rotated. Measure the linked
-size of a minimal OpenPGP verify path before committing.
+The key, verified 2026-08-24 against `agent-v0.3.0-rc.458`: an ed25519 primary
+`[C]` (certify-only, offline, `D654B016256FD92A81634A0E2AD1E9F025973A7F`)
+with an ed25519 `[S]` signing subkey
+(`5DB8221F546288DE780C10D3A2C53E5FE6FA485A`), both valid to 2028-08-22; a
+flipped byte yields `BAD signature`.
+
+⚠️ **What is pinned is the SUBKEY's raw ed25519 point**
+(`pgp_verify::PINNED_RELEASE_SIGNING_KEY`), not the offline primary. This
+section once weighed exactly that choice on **revocability**: pinning the
+primary would let a compromised subkey be revoked and replaced without touching
+the fleet, whereas a pinned raw key can only be rotated by a fleet-wide update
+signed with the very key being rotated. The raw pin is what shipped, so a new
+signing subkey reaches the fleet only inside an update signed by the one it
+replaces. Keep the primary offline and treat the subkey as the fleet's root of
+update trust on these platforms.
+
+⚠️ **A release without its `.asc` freezes Linux and macOS updates.** The
+release workflow skips GPG signing gracefully when its secret is absent; with
+the sidecar required, that grace becomes a refusal on every Linux and macOS
+agent — loud (a refusal plus the sentinel), which is intended, but a freeze
+all the same.
 
 ⚠️ **The `MAJOR.MINOR.RC` mapping has two copies.** Windows Installer's version
 is three numeric fields, so `0.3.0-rc.458` cannot be stored literally;
@@ -342,6 +419,14 @@ name in the UAC prompt and another in Add/Remove Programs. Current sweep
 The `AZURE_SIGNING_EXPECT_SUBJECT` variable enforces the cert side: if the
 issued subject ever stops containing the expected CN, every signing call fails
 verification instead of quietly shipping a different publisher.
+
+⚠️ **macOS is the exception, and no sweep here can fix it.** The Developer ID
+team is **`G ROX EOOD`** (`4TG7586MY5`). Apple enrols against the company's
+D-U-N-S record, and D&B holds it under the Latin form of the registered
+Bulgarian name — EOOD is the Bulgarian legal form, LTD its English rendering:
+one company, UIC `205174895`. So Gatekeeper and the macOS installer name
+`G ROX EOOD` while every Windows and Linux surface names `G ROX LTD`. Aligning
+them means changing the D&B record, not a file in this repository.
 
 `LICENSE` deliberately still names Goran Jovanov — transferring the MIT
 copyright grant to the company is a legal decision, not a packaging one.
