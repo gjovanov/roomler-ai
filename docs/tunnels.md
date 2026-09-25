@@ -233,9 +233,19 @@ to a running `roomlerd` without any token:
 | `Status` · `Peers` · `Flows` | Node status, mesh peers (carrier, RTT, upgrade state), live flows |
 | `Ping {target, timeout_ms, prefer_v6}` | Overlay reachability probe |
 | `CreateForward` · `CreateSocks5` · `KillFlow` | Imperative flow control |
-| `RouteList` · `RouteAdd` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk) |
+| `RouteList` · `RouteAdd` · `RouteUpdate` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk). `RouteUpdate` replaces a route in one save; an invalid replacement leaves the old route running |
 | `ConsentPending` · `ConsentDecide` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service) |
 | `SetDeviceName` | Rename the node |
+| `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
+| `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
+| `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
+
+⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
+default 4; `1` is the pre-FR-84 single instance). With one instance, a client that
+opened the pipe while another was being served got `ERROR_PIPE_BUSY` at once — the
+companion's three simultaneous polls lost 60 of 60 bursts on the reporting host, and
+its Routes page blanked. Clients retry a busy pipe on a bounded backoff (≤ 315 ms).
+The companion's side of this is [desktop-companion.md](desktop-companion.md) §3.
 
 ## CLI
 
@@ -249,8 +259,10 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 |---|---|
 | `enroll --server --token --name` | Enroll this machine as a tunnel client |
 | `forward` / `socks5` | Open flows (above); `--transport auto\|quic\|webrtc`; `--daemon` hands ownership to `roomlerd` |
-| `route add/rm/ls/enable/disable` | Declared routes |
+| `route add/rm/ls/enable/disable/edit` | Declared routes |
 | `status` / `peers` / `flows` / `ping` (`--json`) | Live node state via LocalAPI |
+| `devices` | The devices this node's mesh can see, with display names, from the server (FR-84) |
+| `restart` | Restart the daemon through its supervisor — refused when it has none it can prove (FR-84) |
 | `kill <flow-id>` · `rename <name>` · `logs` · `config ls/set/clear` | Node management |
 | `exec` | Run a command on a fleet device — four default-deny gates, full audit ([fleet-rpc.md](fleet-rpc.md)) |
 | `diag host` / `diag pair` | Diagnostic evidence bundles (CLI-side, so new probes don't need a fleet rollout) |

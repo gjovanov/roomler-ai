@@ -707,8 +707,10 @@ screen, and each has a different fix. **Compare revisions, not just outcomes.**
 ⚠️ **Local edits are live too** (`adopt_local`) — making a server push live while
 the owner's own edit waited for a restart inverts the very property gate 4 exists
 for.
-⚠️ There is deliberately **no self-restart**: nothing can tell whether the daemon is
-supervised, and exiting an orphan `roomlerd run` host takes it permanently offline.
+⚠️ **Remote configuration never restarts a daemon** — exiting an orphan `roomlerd
+run` host takes it permanently offline. The one restart path is LOCAL (LocalAPI
+`RestartDaemon`: "Apply now", `roomler restart`, FR-84 D3), and it refuses unless it
+can PROVE a supervisor (`agents/roomlerd/src/supervision.rs`).
 
 **Linux root daemons resolve `/etc/roomler/config.toml`** (rc.435,
 `docs/installation.md`). ⚠️ `systemctl is-active` reads **inactive while such a host
