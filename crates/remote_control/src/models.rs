@@ -1370,6 +1370,13 @@ pub enum SshAccountMode {
 /// list is an allowlist, so leaving it out is sufficient; the trap is a later
 /// change that adds "the rest of the ssh_* surface" for symmetry.
 ///
+/// ⚠️ `local_restart_enabled` (FR-84 D3) is ABSENT, and so is any notion of
+/// "restart after applying". The daemon restarts itself only when a LOCAL
+/// client asks over the LocalAPI; a server that could trigger it would hold
+/// every device's uptime on a button, and a push that restarted daemons would
+/// take down exactly the orphan `roomlerd run` hosts that cannot come back
+/// (docs/remote-config.md §7b).
+///
 /// ⚠️ **The whole `relay_*` surface (FR-19) is ABSENT**, and unlike the two
 /// above this is enforced by a test that matches on the PREFIX rather than on
 /// a name. `relay_server_enabled` is gate 4 — the refusal that survives a
@@ -5095,13 +5102,24 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        for forbidden in ["remote_config_enabled", "ssh_max_privilege"] {
+        // FR-84 D3 — nor may the server switch the LOCAL restart on, or ask
+        // for a restart at all: the daemon restarts itself only when a local
+        // client asks over the LocalAPI.
+        for forbidden in [
+            "remote_config_enabled",
+            "ssh_max_privilege",
+            "local_restart_enabled",
+        ] {
             assert!(
                 !keys.contains(&forbidden),
                 "{forbidden} must never be pushable by the server — it is the device's own \
                  refusal, and a server that can set it can set everything. Got keys: {keys:?}"
             );
         }
+        assert!(
+            !keys.iter().any(|k| k.contains("restart")),
+            "remote configuration never restarts a daemon (docs/remote-config.md §7b): {keys:?}"
+        );
 
         // And the receiving side ignores it rather than erroring, which is the
         // safe direction: a server asserting it gets no effect, not a refused
@@ -5110,6 +5128,7 @@ mod tests {
             "ssh_enabled": true,
             "ssh_max_privilege": "daemon",
             "remote_config_enabled": true,
+            "local_restart_enabled": true,
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));

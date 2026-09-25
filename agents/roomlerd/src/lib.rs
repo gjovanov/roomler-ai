@@ -106,6 +106,10 @@ pub mod ssh;
 /// plain control WS and must be deliverable in every build.
 pub mod ssh_origin;
 pub mod subnet_detect;
+/// FR-84 D3 — which supervisor will relaunch this process, decided from
+/// evidence the supervisor left; the only gate on `RestartDaemon`. Pure and
+/// ungated so its table is a unit test on every platform.
+pub mod supervision;
 #[cfg(feature = "system-context")]
 pub mod system_context;
 /// Re-export, not a module: the TCC probes live in `agent-core` so the desktop

@@ -3,8 +3,10 @@
 **Status: steps 1–6 SHIPPED** (#626, #630, #640, #645, #668). Step 4 took
 option **C** from the fork in §7b — `exec_enabled` is live, `ssh_*` are
 persisted and honestly reported as needing a restart. Option **A**
-(supervisor-detected exit-to-restart) is deliberately still unbuilt; §7b is the
-record of why, not a to-do that was forgotten.
+(supervisor-detected exit-to-restart) now exists **for the LOCAL path only**
+(FR-84 D3: the LocalAPI's `RestartDaemon`, the companion's "Apply now",
+`roomler restart`); remote configuration still never restarts a daemon, and
+§7b records why both halves of that are deliberate.
 
 This documents a design and the reasoning that constrains it. Claims about
 behaviour were checked against the code at `5b60dacc` unless noted; the file
@@ -289,14 +291,64 @@ step 4 needed it. But this is a real decision with real trade-offs, not a
 detail to settle by momentum — hence written down here rather than chosen
 silently.
 
+### A, built — for the local path only (FR-84 D3, 2026-09-25)
+
+Option A now exists, as the LocalAPI verb `RestartDaemon`: the desktop
+companion's **Apply now** and `roomler restart` ask the daemon to exit so its
+supervisor relaunches it. Every objection above got an answer rather than a
+waiver, and one did not — which is why remote configuration still does not use
+it.
+
+```mermaid
+flowchart TD
+    Ask["RestartDaemon over the LocalAPI<br/>(companion Apply now · roomler restart)"] --> Sup{"supervisor PROVEN<br/>at startup?"}
+    Sup -- "none (orphan roomlerd run)" --> R1["refuse — exiting would take<br/>the device offline"]
+    Sup -- "scm · task · systemd · launchd · FR-43" --> On{"local_restart_enabled<br/>(read from the file)"}
+    On -- off --> R2[refuse]
+    On -- on --> Rate{"last accepted restart<br/>≥ 30 s ago? (record on disk)"}
+    Rate -- no --> R3["refuse, naming the wait"]
+    Rate -- yes --> Sd{"systemd: does the unit's<br/>EFFECTIVE policy restart<br/>this pid on exit 9?"}
+    Sd -- no --> R4[refuse]
+    Sd -- "yes / not systemd" --> Rec["write the record (fsync + rename)<br/>— a restart that cannot be recorded does not happen"]
+    Rec --> Ans["answer DaemonRestarting"]
+    Ans --> Commit["answer written → internal shutdown<br/>(the auto-updater's graceful path:<br/>mark_clean_shutdown, no crash counted)"]
+    Commit --> Exit["exit 0 under the SCM, 9 elsewhere"]
+```
+
+| objection (§7b, above) | answer in D3 |
+|---|---|
+| **The daemon cannot tell whether it is supervised.** | `supervision::detect` decides once at startup, from evidence only a supervisor leaves: the SCM host and the Scheduled Task pass a hidden `run --supervisor scm\|task`; the FR-43 root daemon passes `--supervised`; launchd sets `XPC_SERVICE_NAME` to one of our `com.roomler.*` labels; systemd sets `INVOCATION_ID` **and** the process sits in one of our units' cgroups (the id alone is inherited by every shell under GNOME Terminal). Never the config file. Anything else is `none`. |
+| **Orphan `roomlerd run` processes exist.** | `none` always refuses. A pre-rc.435 root daemon, a hand-run process, a container's PID 1 — none of them is ever asked to exit. |
+| **systemd: what if the unit does not restart?** | Before accepting, the daemon asks systemd itself (`systemctl show`: `MainPID`, `Restart`, `RestartPreventExitStatus`, `RestartForceExitStatus`, `SuccessExitStatus`) and mirrors `service_shall_restart`: this pid must be the unit's main process, and the effective policy — drop-ins included — must restart exit status 9. Any failure to get that answer is a refusal. |
+| **The Windows respawn has zero backoff** (`decide_exit_reaction` maps 0 to `Respawn`). | Exactly what ONE deliberate restart wants, so an SCM worker exits **0**. A loop is impossible because the verb refuses a second request within 30 s of the last *accepted* one, and that record lives on disk beside the config — it binds the relaunched process too. At most one restart per 30 s, whatever a client does. |
+| **A restart must not look like a crash.** | It rides the internal-shutdown path the auto-updater already uses: `mark_clean_shutdown`, the runtime torn down as for an update, then the exit code. The SCM supervisor also maps the sentinel 9 to `Respawn` and records no crash for it. |
+| **launchd relaunches only a non-zero exit.** | Everything but the SCM exits `RESTART_REQUESTED_EXIT_CODE = 9` — outside the Linux units' `RestartPreventExitStatus=7 8`, and nothing else in the tree exits 9. Tests assert both packaged units and both packaged plists. |
+
+**Why the remote path still does not restart anything.** The objection that
+survives is the fleet. A config push lands on every device an admin selects,
+and the ones that cannot come back are precisely the ones D3 refuses — the
+orphans — so a push would either restart the healthy majority and silently skip
+the rest (the dashboard then shows "applied" beside devices still running the
+old value), or need its own reporting for a state that has no local person to
+read it. And a server able to restart daemons holds every device's uptime on a
+button, which is the same compromise this document exists to refuse for
+`exec_enabled`. So a pushed key stays `applied-pending-restart` until someone at
+the device applies it — or an operator runs `roomler exec … -- roomler restart`,
+which needs every one of exec's four gates, the device's own `exec_enabled`
+included (exec already runs anything as root, so it grants nothing new), and
+which the daemon still refuses on the same terms as a local request.
+`DesiredConfig` carries no restart and no `local_restart_enabled`, and
+`the_device_owned_refusals_are_not_pushable` fails the build if either appears.
+
 ## 8. Order
 
 1. `remote_config_enabled` key + config-surface entry, default OFF. Inert alone.
 2. `desired_config` on `agents` + the authz rule in §5 + audit collection.
 3. Hello capability flag + the `ServerMsg` variant + reconcile-on-connect.
 4. Apply + persist on the agent, primary-only. ⚠️ The restart half is NOT
-   settled — see §7b. A persisted change is inert until the daemon restarts,
-   and no safe self-restart exists yet.
+   settled — see §7b. A persisted change is inert until the daemon restarts;
+   the safe self-restart that now exists (FR-84 D3) is deliberately LOCAL, so
+   a pushed restart-required key still waits for a person at the device.
 4b. `rc:agent.config_status` — the device reports what it did, behind its own
    `config-report` verb, resolved server-side into `RemoteConfigState`. Found
    while starting step 5, which cannot render "secondary org" at all without
@@ -335,10 +387,13 @@ silently.
 
 ## 9. Not built, on purpose
 
-- **Option A**, supervisor-detected exit-to-restart (§7b). The `ssh_*` keys are
-  therefore still restart-required, reported as such rather than pretended
-  into effect.
-- **A restart verb.** Same reason: nothing can tell whether the daemon is
-  supervised, and orphan `roomlerd run` hosts exist.
+- **Option A on the remote path** (§7b). Supervisor-detected exit-to-restart
+  exists since FR-84 D3, but only behind the LocalAPI; a push never restarts a
+  daemon. The `ssh_*` keys are therefore still restart-required after a push,
+  reported as such rather than pretended into effect.
+- **A server-side restart verb.** A server able to restart daemons would hold
+  every device's uptime on a button, and the devices that could not come back
+  (orphan `roomlerd run` hosts) are exactly the ones it could not see. The
+  local verb refuses those; there is nothing for a server to send.
 - **Secondary-org control** (§4). A borrowed device is not yours to
   reconfigure; the UI says so instead of showing a switch that does nothing.

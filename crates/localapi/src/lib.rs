@@ -304,6 +304,19 @@ pub struct NodeStatus {
     /// upgrade rewrites, and machine-wide registry values in no runbook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_env_present: Option<Vec<String>>,
+    /// FR-84 D3 — the process that answered. A client waiting out a restart
+    /// ([`Request::RestartDaemon`]) must know the relaunched daemon from the
+    /// one that accepted: the old process keeps answering for a moment after
+    /// it says yes, and "reachable" alone would read that as "back". `None`
+    /// from a daemon that predates the field. See [`DaemonInstance`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// FR-84 D3 — when this daemon process started (unix ms). With `pid` it
+    /// names the PROCESS, not just a number: Windows can hand a PID freed a
+    /// moment ago to the very next process — which, after a restart, is the
+    /// relaunched daemon itself. `None` from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -1179,6 +1192,25 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         org: String,
     },
+    /// FR-84 D3 — restart this daemon through the service manager that
+    /// supervises it ("Apply now" in the companion, `roomler restart`).
+    ///
+    /// Mutating; the endpoint ACL is the trust boundary, as for
+    /// [`Self::ConfigSet`], and the daemon refuses on its own terms: no
+    /// supervisor it can prove (an orphan `roomlerd run` would go offline, not
+    /// restart), `local_restart_enabled = false`, a recording in progress, or
+    /// a previous restart less than 30 s ago. Never sent by a server — remote
+    /// configuration does not restart daemons (`docs/remote-config.md` §7b).
+    ///
+    /// Returns [`Response::DaemonRestarting`] — after which the daemon exits,
+    /// once that answer is written — or an `Error` carrying the refusal. A
+    /// daemon older than the verb answers `Error("bad request: unknown
+    /// variant ...")` ([`RestartAnswer::Unsupported`]).
+    RestartDaemon {
+        /// Why — logged by the daemon and kept in its restart record.
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -1363,7 +1395,6 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// The verb couldn't be served (bad request, state unavailable).
     /// FR-85 — the recorder's state, answering [`Request::RecordStart`],
     /// [`Request::RecordStop`] and [`Request::RecordStatus`].
     Recording(RecordingState),
@@ -1375,6 +1406,26 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// FR-84 D3 — the restart was accepted ([`Request::RestartDaemon`]). The
+    /// daemon exits once this answer is written, with `exit_code`, and
+    /// `restart_by` names who brings it back: `"supervisor"`, or `"caller"` —
+    /// the Windows Scheduled Task, whose own restart is a minute away at best,
+    /// so the caller runs `roomlerd service start` until a NEW daemon (a
+    /// different [`DaemonInstance`]) answers.
+    DaemonRestarting {
+        /// `scm` | `task` | `systemd` | `launchd` | `macos-supervisor`.
+        supervisor: String,
+        /// `supervisor` | `caller`.
+        restart_by: String,
+        exit_code: i32,
+        /// The process that is about to exit ([`NodeStatus::pid`]).
+        #[serde(default)]
+        pid: u32,
+        /// When it started ([`NodeStatus::started_at_ms`]).
+        #[serde(default)]
+        started_at_ms: u64,
+    },
+    /// The verb couldn't be served (bad request, state unavailable).
     Error {
         message: String,
     },
@@ -1890,6 +1941,22 @@ pub trait LocalApiState: Send + Sync {
             status: None,
         }
     }
+
+    /// FR-84 D3 — decide a restart request: [`Response::DaemonRestarting`]
+    /// when accepted (the implementation arms it, it does NOT exit yet), or
+    /// an `Error` with the refusal. Default: this node cannot restart itself.
+    async fn restart_daemon(&self, _reason: &str) -> Response {
+        Response::Error {
+            message: "restarting is not supported on this node".into(),
+        }
+    }
+    /// FR-84 D3 — called by the connection loop right after an accepted
+    /// [`Response::DaemonRestarting`] has been written (or its write failed —
+    /// the restart was accepted and recorded either way). This is the ONLY
+    /// point where the shutdown may begin, so a client never sees its
+    /// connection die before it learns the restart was accepted. Default:
+    /// no-op.
+    fn restart_commit(&self) {}
 }
 
 /// FR-85 — the refusal a non-console caller gets for a recording verb.
@@ -1944,7 +2011,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingsList
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
-        | Request::Mesh { .. } => Response::Error {
+        | Request::Mesh { .. }
+        | Request::RestartDaemon { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -2063,11 +2131,15 @@ where
                 state.devices(&org, &query).await
             }
             Ok(Request::Mesh { org }) => state.mesh(&org).await,
+            // FR-84 D3 — the daemon decides (and records) here; it leaves only
+            // after the answer below is on the wire.
+            Ok(Request::RestartDaemon { reason }) => state.restart_daemon(&reason).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
         };
+        let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
         // A Response always serialises; fall back to an Error line if a
         // custom serializer ever failed, so we never break the frame.
         let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
@@ -2077,8 +2149,18 @@ where
             .expect("Error response always serialises")
         });
         out.push(b'\n');
-        wr.write_all(&out).await?;
-        wr.flush().await?;
+        let written = async {
+            wr.write_all(&out).await?;
+            wr.flush().await
+        }
+        .await;
+        if restart_accepted {
+            // FR-84 D3 — the answer is out (or the caller is gone; the
+            // restart was accepted and recorded either way): only NOW may the
+            // shutdown begin.
+            state.restart_commit();
+        }
+        written?;
     }
     Ok(())
 }
@@ -3163,6 +3245,66 @@ impl Client {
             other => Err(directory_error(other)),
         }
     }
+
+    /// FR-84 D3 — ask the daemon to restart itself through its supervisor.
+    /// `Err` only when the exchange itself failed; the daemon's decision —
+    /// accepted, refused, or "I predate the verb" — is the [`RestartAnswer`].
+    /// After `Accepted` the daemon exits: this connection is spent.
+    pub async fn restart_daemon(&mut self, reason: &str) -> std::io::Result<RestartAnswer> {
+        let resp = self
+            .request(&Request::RestartDaemon {
+                reason: reason.to_string(),
+            })
+            .await?;
+        Ok(RestartAnswer::from_response(resp))
+    }
+}
+
+/// FR-84 D3 — what a daemon said to [`Request::RestartDaemon`], classified
+/// once here so the CLI and the companion cannot disagree about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartAnswer {
+    /// Accepted: the daemon `leaving` exits with `exit_code`; `restart_by`
+    /// says who relaunches it (see [`Response::DaemonRestarting`]).
+    Accepted {
+        supervisor: String,
+        restart_by: String,
+        exit_code: i32,
+        leaving: DaemonInstance,
+    },
+    /// Refused, with the daemon's own reason (shown verbatim).
+    Refused(String),
+    /// The daemon predates the verb — it cannot parse the request at all.
+    Unsupported(String),
+}
+
+/// FR-84 D3 — one daemon PROCESS: its pid and when it started. Two answers
+/// come from the same process only if both match — a pid alone does not
+/// say it, because Windows can give a just-freed PID to the very next
+/// process, and after a restart that is the relaunched daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonInstance {
+    pub pid: Option<u32>,
+    pub started_at_ms: Option<u64>,
+}
+
+impl DaemonInstance {
+    /// The process a `Status` answer came from.
+    pub fn of(status: &NodeStatus) -> Self {
+        Self {
+            pid: status.pid,
+            started_at_ms: status.started_at_ms,
+        }
+    }
+
+    /// The process a `DaemonRestarting` answer came from (`0` = not
+    /// reported).
+    pub fn leaving(pid: u32, started_at_ms: u64) -> Self {
+        Self {
+            pid: (pid != 0).then_some(pid),
+            started_at_ms: (started_at_ms != 0).then_some(started_at_ms),
+        }
+    }
 }
 
 /// FR-84 D5b — a non-answer to `Devices` / `Mesh`, classified by cause.
@@ -3181,6 +3323,154 @@ fn directory_error(resp: Response) -> DirectoryError {
         other => DirectoryError::Io(std::io::Error::other(format!(
             "localapi: unexpected response: {other:?}"
         ))),
+    }
+}
+
+impl RestartAnswer {
+    pub fn from_response(resp: Response) -> Self {
+        match resp {
+            Response::DaemonRestarting {
+                supervisor,
+                restart_by,
+                exit_code,
+                pid,
+                started_at_ms,
+            } => RestartAnswer::Accepted {
+                supervisor,
+                restart_by,
+                exit_code,
+                leaving: DaemonInstance::leaving(pid, started_at_ms),
+            },
+            Response::Error { message } if is_unknown_verb(&message) => {
+                RestartAnswer::Unsupported(message)
+            }
+            Response::Error { message } => RestartAnswer::Refused(message),
+            other => RestartAnswer::Refused(format!("unexpected answer: {other:?}")),
+        }
+    }
+}
+
+/// The one reply a daemon gives to a verb it has never heard of: its serde
+/// rejects the tag with "unknown variant". Every "this service predates …"
+/// message in a client keys on this, and only this.
+pub fn is_unknown_verb(message: &str) -> bool {
+    message.contains("unknown variant")
+}
+
+/// FR-84 D3 — how often a caller waiting out a restart polls `Status`.
+pub const RESTART_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// FR-84 D3 — the least time between two "start the service" attempts by a
+/// caller that owns the relaunch (`restart_by: "caller"`).
+pub const RESTART_START_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// FR-84 D3 — one poll of a restart in progress, as the waiting caller sees
+/// the endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartProbe {
+    /// A daemon answered `Status` — this process.
+    Up(DaemonInstance),
+    /// No daemon at all: the pipe does not exist / nothing listens on the
+    /// socket.
+    Gone,
+    /// The endpoint exists but did not answer — busy, or mid-shutdown.
+    Busy,
+}
+
+/// FR-84 D3 — what a waiting caller does after one probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStep {
+    /// A NEW daemon answered (its pid, when it reports one).
+    Back(Option<u32>),
+    /// Keep polling.
+    Wait,
+    /// Nothing is running and the relaunch is ours: start the service, then
+    /// keep polling.
+    StartThenWait,
+}
+
+/// The waiting caller's decision, pure. The daemon that accepted the restart
+/// keeps answering for a moment after it said yes, so "reachable" is not
+/// "back" — only a different PROCESS is ([`DaemonInstance`]: pid AND start
+/// time, because the relaunched daemon may well get the old one's pid). And a
+/// caller that owns the relaunch starts the service whenever NOTHING answers
+/// (never while the old process still does), again every
+/// [`RESTART_START_EVERY`] until something does: under the Scheduled Task a
+/// start that lands while the old instance is still exiting is dropped by its
+/// `IgnoreNew` policy, so one attempt is not enough, and every extra one is
+/// harmless.
+pub fn restart_step(
+    probe: RestartProbe,
+    leaving: DaemonInstance,
+    caller_starts: bool,
+    start_due: bool,
+) -> RestartStep {
+    match probe {
+        RestartProbe::Up(answered) if answered == leaving => RestartStep::Wait,
+        RestartProbe::Up(answered) => RestartStep::Back(answered.pid),
+        RestartProbe::Gone if caller_starts && start_due => RestartStep::StartThenWait,
+        RestartProbe::Gone | RestartProbe::Busy => RestartStep::Wait,
+    }
+}
+
+/// Probe the LocalAPI endpoint once for [`restart_step`].
+pub async fn probe_restart() -> RestartProbe {
+    match connect().await {
+        Ok(mut client) => match client.status().await {
+            Ok(status) => RestartProbe::Up(DaemonInstance::of(&status)),
+            Err(_) => RestartProbe::Busy,
+        },
+        // No pipe (Windows), no socket file or nothing listening on it (unix,
+        // where an exited daemon can leave the file behind).
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            RestartProbe::Gone
+        }
+        Err(_) => RestartProbe::Busy,
+    }
+}
+
+/// FR-84 D3 — the caller's half of a restart the daemon accepted: poll until
+/// a daemon process other than `leaving` answers, running `start` along the
+/// way when the relaunch is the caller's (`caller_starts`, i.e. `restart_by:
+/// "caller"`). `Ok` carries the new daemon's pid; `Err` says what was seen by
+/// the deadline (and the last start failure, if any), worded for a person.
+pub async fn wait_for_restart<F, Fut>(
+    leaving: DaemonInstance,
+    caller_starts: bool,
+    mut start: F,
+    within: std::time::Duration,
+) -> Result<Option<u32>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let begun = tokio::time::Instant::now();
+    let mut last_start: Option<tokio::time::Instant> = None;
+    let mut start_error: Option<String> = None;
+    loop {
+        let due = last_start.is_none_or(|t| t.elapsed() >= RESTART_START_EVERY);
+        match restart_step(probe_restart().await, leaving, caller_starts, due) {
+            RestartStep::Back(pid) => return Ok(pid),
+            RestartStep::StartThenWait => {
+                last_start = Some(tokio::time::Instant::now());
+                start_error = start().await.err();
+            }
+            RestartStep::Wait => {}
+        }
+        if begun.elapsed() >= within {
+            return Err(match start_error {
+                Some(e) => format!(
+                    "no new daemon answered within {} s; the last attempt to start it failed: {e}",
+                    within.as_secs()
+                ),
+                None => format!("no new daemon answered within {} s", within.as_secs()),
+            });
+        }
+        tokio::time::sleep(RESTART_POLL).await;
     }
 }
 
@@ -3348,6 +3638,8 @@ mod tests {
                 retired_env_present: Some(Vec::new()),
                 derp_inbound_drops: None,
                 netcheck: None,
+                pid: None,
+                started_at_ms: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -3785,6 +4077,278 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(old.contains("unknown variant"), "{old}");
+    }
+
+    /// FR-84 D3 — the rest of the wire: a bare request (no reason) parses,
+    /// the answer carries the pid the caller waits out, an answer from a
+    /// build before `pid` still parses, and a node that cannot restart says
+    /// so on both dispatch paths.
+    #[tokio::test]
+    async fn restart_verbs_round_trip_and_default_refuses() {
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"t":"restart_daemon","d":{}}"#).unwrap(),
+            Request::RestartDaemon {
+                reason: String::new()
+            }
+        );
+        let req = Request::RestartDaemon {
+            reason: "settings: overlay_enabled".into(),
+        };
+        let wire = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"t":"restart_daemon","d":{"reason":"settings: overlay_enabled"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), req);
+
+        let resp = Response::DaemonRestarting {
+            supervisor: "systemd".into(),
+            restart_by: "supervisor".into(),
+            exit_code: 9,
+            pid: 4242,
+            started_at_ms: 1_700_000_000_000,
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"t":"daemon_restarting","d":{"supervisor":"systemd","restart_by":"supervisor","exit_code":9,"pid":4242,"started_at_ms":1700000000000}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), resp);
+        assert!(matches!(
+            serde_json::from_str::<Response>(
+                r#"{"t":"daemon_restarting","d":{"supervisor":"scm","restart_by":"supervisor","exit_code":0}}"#
+            )
+            .unwrap(),
+            Response::DaemonRestarting {
+                pid: 0,
+                started_at_ms: 0,
+                ..
+            }
+        ));
+        // `NodeStatus::{pid, started_at_ms}` are additive: absent from an
+        // older daemon.
+        let s = Mock.status();
+        let old_wire = serde_json::to_string(&s).unwrap();
+        assert!(!old_wire.contains("\"pid\"") && !old_wire.contains("started_at_ms"));
+        let with_instance = NodeStatus {
+            pid: Some(7),
+            started_at_ms: Some(1_700_000_000_000),
+            ..s
+        };
+        let back: NodeStatus =
+            serde_json::from_str(&serde_json::to_string(&with_instance).unwrap()).unwrap();
+        assert_eq!(
+            DaemonInstance::of(&back),
+            DaemonInstance::leaving(7, 1_700_000_000_000)
+        );
+
+        assert!(matches!(
+            Mock.restart_daemon("x").await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            handle(&Request::RestartDaemon { reason: "x".into() }, &Mock),
+            Response::Error { .. }
+        ));
+    }
+
+    /// One classification for every client: accepted, refused (verbatim),
+    /// and the exact reply an OLD daemon gives to a verb it cannot parse.
+    #[test]
+    fn restart_answer_classifies_accept_refuse_and_old_daemon() {
+        assert_eq!(
+            RestartAnswer::from_response(Response::DaemonRestarting {
+                supervisor: "task".into(),
+                restart_by: "caller".into(),
+                exit_code: 9,
+                pid: 11,
+                started_at_ms: 22,
+            }),
+            RestartAnswer::Accepted {
+                supervisor: "task".into(),
+                restart_by: "caller".into(),
+                exit_code: 9,
+                leaving: DaemonInstance {
+                    pid: Some(11),
+                    started_at_ms: Some(22),
+                },
+            }
+        );
+        let refusal = "restarting from this device is turned off (local_restart_enabled = false)";
+        assert_eq!(
+            RestartAnswer::from_response(Response::Error {
+                message: refusal.into()
+            }),
+            RestartAnswer::Refused(refusal.into())
+        );
+        // What `serve_connection_as` sends for a line it cannot parse — the
+        // real serde error, not a hand-typed imitation of it.
+        let e = serde_json::from_str::<Request>(r#"{"t":"restart_daemon_v0","d":{}}"#).unwrap_err();
+        let old = format!("bad request: {e}");
+        assert!(matches!(
+            RestartAnswer::from_response(Response::Error { message: old }),
+            RestartAnswer::Unsupported(_)
+        ));
+    }
+
+    /// FR-84 D3 — the waiting caller: reachable is not "back" (the old
+    /// process answers for a moment after it said yes), only another PROCESS
+    /// is — and a relaunched daemon that got the old one's pid (Windows
+    /// reuses a just-freed PID) is still another process; and only a caller
+    /// that owns the relaunch ever starts anything, only when NOTHING answers,
+    /// and only when a start is due.
+    #[test]
+    fn restart_wait_steps() {
+        use RestartProbe::*;
+        use RestartStep::*;
+        let old = DaemonInstance::leaving(100, 1_000);
+        // The old process, still answering: wait — whoever relaunches.
+        for caller in [true, false] {
+            assert_eq!(restart_step(Up(old), old, caller, true), Wait);
+        }
+        // A new pid: back.
+        let new = DaemonInstance::leaving(101, 5_000);
+        assert_eq!(restart_step(Up(new), old, true, true), Back(Some(101)));
+        assert_eq!(restart_step(Up(new), old, false, false), Back(Some(101)));
+        // The SAME pid, started later: the relaunched daemon, not the old
+        // one — pid alone would wait here until the deadline.
+        let reused = DaemonInstance::leaving(100, 5_000);
+        assert_eq!(restart_step(Up(reused), old, true, true), Back(Some(100)));
+        // A daemon that reports neither is not the one that accepted (that one
+        // always reports both): back.
+        let older_build = DaemonInstance {
+            pid: None,
+            started_at_ms: None,
+        };
+        assert_eq!(restart_step(Up(older_build), old, false, true), Back(None));
+        // Nothing at all: the caller that owns the relaunch starts it — when
+        // due — and a supervisor-owned relaunch is only ever waited for.
+        assert_eq!(restart_step(Gone, old, true, true), StartThenWait);
+        assert_eq!(restart_step(Gone, old, true, false), Wait);
+        assert_eq!(restart_step(Gone, old, false, true), Wait);
+        // Busy / mid-shutdown: the old process may still hold the task
+        // instance, so a start now would be dropped — wait.
+        assert_eq!(restart_step(Busy, old, true, true), Wait);
+        // The cadence the caller re-asks at is bounded, never a hot loop.
+        assert!(RESTART_START_EVERY >= RESTART_POLL * 2);
+    }
+
+    /// A stream whose reads come from a script and whose writes land in a
+    /// buffer the state can inspect — so a test can ask what the client had
+    /// been SENT at the moment something happened.
+    struct Scripted {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = std::io::Read::read(&mut self.input, buf.initialize_unfilled())?;
+            buf.advance(n);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Scripted {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.output.lock().unwrap().extend_from_slice(data);
+            std::task::Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Accepts or refuses every restart, and records what the client had
+    /// been sent each time the loop committed one.
+    struct RestartMock {
+        accept: bool,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+        commits: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LocalApiState for RestartMock {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn restart_daemon(&self, _reason: &str) -> Response {
+            if self.accept {
+                Response::DaemonRestarting {
+                    supervisor: "scm".into(),
+                    restart_by: "supervisor".into(),
+                    exit_code: 0,
+                    pid: 1,
+                    started_at_ms: 2,
+                }
+            } else {
+                Response::Error {
+                    message: "refused".into(),
+                }
+            }
+        }
+        fn restart_commit(&self) {
+            let sent = String::from_utf8_lossy(&self.output.lock().unwrap()).to_string();
+            self.commits.lock().unwrap().push(sent);
+        }
+    }
+
+    /// FR-84 D3 — the shutdown may start only once the client has its
+    /// answer: `restart_commit` runs after the `daemon_restarting` line is
+    /// written, exactly once, and never for a refusal or any other verb.
+    #[tokio::test]
+    async fn restart_commit_runs_only_after_the_answer_is_written() {
+        for accept in [true, false] {
+            let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let state = RestartMock {
+                accept,
+                output: output.clone(),
+                commits: std::sync::Mutex::new(Vec::new()),
+            };
+            let script =
+                b"{\"t\":\"status\"}\n{\"t\":\"restart_daemon\",\"d\":{\"reason\":\"x\"}}\n";
+            let stream = Scripted {
+                input: std::io::Cursor::new(script.to_vec()),
+                output: output.clone(),
+            };
+            serve_connection_as(stream, &state, ClientPeer::UNKNOWN)
+                .await
+                .unwrap();
+            let commits = state.commits.lock().unwrap().clone();
+            if accept {
+                assert_eq!(commits.len(), 1, "exactly one commit: {commits:?}");
+                assert!(
+                    commits[0].contains(r#""t":"daemon_restarting""#),
+                    "the answer must already be on the wire when the shutdown starts: {:?}",
+                    commits[0]
+                );
+            } else {
+                assert!(commits.is_empty(), "a refusal never starts a shutdown");
+            }
+        }
     }
 
     #[tokio::test]

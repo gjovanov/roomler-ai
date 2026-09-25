@@ -129,6 +129,93 @@
     actionsSlot: () => $('cfg-restart-actions'),
   };
 
+  /* ── FR-84 D3: Apply now — the daemon restarts itself under its supervisor
+   *
+   * `cmd_restart_daemon` asks; the DAEMON decides. It refuses when it cannot
+   * prove a supervisor (an orphan `roomlerd run` would go offline rather
+   * than restart), when `local_restart_enabled` is off, while a recording
+   * runs, or within 30 s of its last restart — and every refusal is shown
+   * verbatim. Accepted, the old process keeps answering for a moment, so
+   * `cmd_restart_wait` waits for a DIFFERENT process rather than for
+   * "reachable", and when the answer says `restart_by: 'caller'` (the Windows Scheduled
+   * Task) it runs `roomlerd service start` itself whenever nothing answers.
+   * Once the new daemon is up, the pending set clears and the entries reload
+   * from the file the new process read. */
+  let applying = false;
+
+  function restartRefusalText(r) {
+    if (r.predates) {
+      return 'This service predates Apply now — restart it from Background service.';
+    }
+    return 'Not restarted — ' + r.refusal;
+  }
+
+  /* Wait for the relaunched daemon (≤ 60 s, Rust side): its pid, or throws.
+   * "Relaunched" = another PROCESS (pid + start time — Windows may hand the
+   * new daemon the old pid), never merely "reachable". */
+  async function waitForDaemon(r) {
+    return invoke('cmd_restart_wait', {
+      oldPid: r.pid,
+      oldStartedAtMs: r.started_at_ms,
+      restartBy: r.restart_by,
+    });
+  }
+
+  async function applyNow(btn) {
+    if (applying) return;
+    applying = true;
+    const keys = window.Roomler.settingsPendingRestart.keys();
+    btn.disabled = true;
+    setText('cfg-restart-text', 'Asking the service to restart…');
+    try {
+      let r;
+      try {
+        r = await invoke('cmd_restart_daemon', {
+          reason: keys.length ? 'settings: ' + keys.join(', ') : 'settings',
+        });
+      } catch (e) {
+        setText('cfg-restart-text', 'Could not ask the service to restart: ' + e);
+        return;
+      }
+      if (!r.started) {
+        setText('cfg-restart-text', restartRefusalText(r));
+        return;
+      }
+      setText(
+        'cfg-restart-text',
+        r.restart_by === 'caller'
+          ? 'Restarting the service — starting it again…'
+          : 'Restarting the service (' + r.supervisor + ')…',
+      );
+      try {
+        await waitForDaemon(r);
+      } catch (e) {
+        setText('cfg-restart-text', 'The service has not come back: ' + e + ' — check Background service.');
+        void refreshStatus();
+        return;
+      }
+      window.Roomler.settingsPendingRestart.clear();
+      await loadCfg(true);
+      showResult('Service restarted — your changes are in effect.', false);
+      void refreshStatus();
+    } finally {
+      applying = false;
+      btn.disabled = false;
+    }
+  }
+
+  function mountApplyNow() {
+    const slot = window.Roomler.settingsPendingRestart.actionsSlot();
+    if (!slot || $('btn-apply-now')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'btn-apply-now';
+    btn.textContent = 'Apply now';
+    btn.title = 'Restart the device service so the saved changes take effect';
+    btn.addEventListener('click', () => void applyNow(btn));
+    slot.appendChild(btn);
+  }
+
   function cfgRowStatus(row) {
     return row.querySelector('.cfg-row-status');
   }
@@ -586,6 +673,10 @@
         showResult('Could not open the config folder: ' + e, true);
       }
     });
+
+    // FR-84 D3 — "Apply now" lives in the restart bar, which shows itself
+    // only while a saved change waits for a restart.
+    mountApplyNow();
 
     // FR-84 D2 — the configuration search box (shown once a daemon with
     // grouped entries has answered).

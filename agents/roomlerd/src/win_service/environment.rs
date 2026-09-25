@@ -318,6 +318,34 @@ pub fn restart_service(timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+/// FR-84 D3 — start the service if it is not running, and wait for `RUNNING`.
+/// The `--as-service` half of `roomlerd service start`; needs `SERVICE_START`
+/// on the service, i.e. elevation on a stock install. A service already
+/// running (or start-pending) is left alone and reported as success — the
+/// SCM supervisor respawns its own worker, so this is only ever needed when
+/// the whole service is down.
+pub fn start_service(timeout: Duration) -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("ServiceManager::local_computer(CONNECT)")?;
+    let service = manager
+        .open_service(
+            resolved_service_name(),
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+        )
+        .with_context(|| format!("open_service({})", resolved_service_name()))?;
+    let status = service
+        .query_status()
+        .context("query_status before start")?;
+    if status.current_state == ServiceState::Running {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StartPending {
+        service.start::<&str>(&[]).context("service.start()")?;
+    }
+    wait_for_state(&service, ServiceState::Running, timeout).context("waiting for RUNNING")?;
+    Ok(())
+}
+
 fn wait_for_state(
     service: &windows_service::service::Service,
     target: ServiceState,

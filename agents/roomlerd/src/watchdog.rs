@@ -132,6 +132,45 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 /// in `win_service::supervisor` asserts the Windows half.
 pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 
+/// FR-84 D3: sentinel for "a person asked this daemon to restart itself
+/// (`Request::RestartDaemon`, the companion's *Apply now*) — relaunch me,
+/// this was not a failure."
+///
+/// Why not 0: launchd's `KeepAlive{SuccessfulExit:false}` relaunches only
+/// an UNsuccessful exit, and the per-user Scheduled Task's
+/// `<RestartOnFailure>`, where it acts at all, acts only on a non-zero
+/// code — a 0 under launchd leaves the device down. Why not any of the
+/// codes above: each already means something to a supervisor (2 must come
+/// back, 7 and 8 must NOT — they are `RestartPreventExitStatus=7 8` in the
+/// Linux units), so this one must be OUTSIDE that list on both units, which
+/// the test below asserts, and must not shadow the Windows supervisor's
+/// arms. Nothing else in the tree exits 9.
+///
+/// Per supervisor (`supervision::Supervision::restart_exit_code`):
+///
+///   * **systemd** `Restart=always` restarts it after `RestartSec` — and the
+///     daemon reads the unit's effective policy back from systemd before
+///     it accepts (`supervision::systemd_restarts`).
+///   * **launchd** relaunches it (non-zero), throttled by
+///     `ThrottleInterval`.
+///   * **the FR-43 macOS supervisor** respawns any exit after ≥ 1 s.
+///   * **the Windows Scheduled Task**: the caller runs `roomlerd service
+///     start` once the old process is gone (`restart_by: caller`); the
+///     task's own `<RestartOnFailure>` is at most a floor a minute later.
+///   * **the Windows SCM supervisor** does NOT see it: an SCM worker exits
+///     **0**, which `decide_exit_reaction` already maps to an immediate
+///     `Respawn` (and which an SCM host older than D3 respawns too). The
+///     supervisor still maps this code to `Respawn` and excludes it from
+///     crash recording, so a worker that emits it is never put on the crash
+///     ladder for a restart it was asked for.
+///
+/// Emitted by `main` once `run_cmd` has completed the graceful
+/// internal-shutdown path (`mark_clean_shutdown`, so nothing counts a
+/// crash and the rollback detector never sees it) and the runtime has been
+/// torn down exactly as an auto-update's exit tears it down. At most once
+/// per `supervision::RESTART_MIN_INTERVAL`, across process lifetimes.
+pub const RESTART_REQUESTED_EXIT_CODE: i32 = 9;
+
 /// Process-wide singleton. Set by `install`; read by the free
 /// functions and the `run` task.
 static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
@@ -779,6 +818,7 @@ mod tests {
             STALL_EXIT_CODE,
             AGENT_DELETED_EXIT_CODE,
             ALREADY_RUNNING_EXIT_CODE,
+            RESTART_REQUESTED_EXIT_CODE,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -790,6 +830,50 @@ mod tests {
         assert_eq!(STALL_EXIT_CODE, 2);
         assert_eq!(AGENT_DELETED_EXIT_CODE, 7);
         assert_eq!(ALREADY_RUNNING_EXIT_CODE, 8);
+        assert_eq!(RESTART_REQUESTED_EXIT_CODE, 9);
+        // 0 and 1 are the ordinary exits; a sentinel on either would be
+        // ambiguous with "done" / "an error" to every supervisor.
+        for code in all {
+            assert!(code > 1, "sentinel {code} collides with an ordinary exit");
+        }
+    }
+
+    /// FR-84 D3 — the inverse of the test above for the restart sentinel: a
+    /// requested restart MUST come back, so neither unit may list it in
+    /// `RestartPreventExitStatus`. A unit that did would turn "Apply now" into
+    /// "go offline" on every Linux host at once, with `systemctl is-active`
+    /// reading `inactive` and nothing logging why.
+    #[test]
+    fn shipped_linux_units_restart_the_restart_requested_sentinel() {
+        for (name, unit) in [
+            (
+                "roomlerd.service",
+                include_str!("../packaging/linux/roomlerd.service"),
+            ),
+            (
+                "roomler.service",
+                include_str!("../packaging/linux/roomler.service"),
+            ),
+        ] {
+            let codes: Vec<i32> = unit
+                .lines()
+                .find(|l| l.starts_with("RestartPreventExitStatus="))
+                .unwrap_or_else(|| panic!("{name}: no RestartPreventExitStatus= line"))
+                .trim_start_matches("RestartPreventExitStatus=")
+                .split_whitespace()
+                .map(|c| c.parse().expect("numeric exit code"))
+                .collect();
+            assert!(
+                !codes.contains(&RESTART_REQUESTED_EXIT_CODE),
+                "{name} must NOT list RESTART_REQUESTED_EXIT_CODE ({RESTART_REQUESTED_EXIT_CODE}); \
+                 got {codes:?}"
+            );
+            // And the policy must be one that restarts a non-zero exit at all.
+            assert!(
+                unit.lines().any(|l| l.trim() == "Restart=always"),
+                "{name}: the restart sentinel relies on Restart=always"
+            );
+        }
     }
 
     #[test]
