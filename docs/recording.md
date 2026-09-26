@@ -6,26 +6,25 @@
 > the person at the device, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
-> P3c (the viewer's Record and Download, §10) and P5a (the export engine: cut
-> and speed up, §11).** It is in **no release build**: `recording` joined
-> `full` for a day (#1677) and was taken back out before any release carried
-> it (the operator, 2026-09-26). It rejoins once canary hosts prove it in the
-> field: an EDR-managed corporate laptop first, because on Windows the daemon
-> launches a restricted-token child (§6) as soon as someone opens the
-> Recordings view, the pattern EDR watches for; then macOS TCC for that
-> child. Where it is compiled in, every gate is closed: a local recording
-> starts only when the person at the device presses Record, a remote one
-> only once the device's owner allows it, and `ROOMLERD_RECORDING=0` in the
-> service's environment switches recording off, local and remote. It is
-> driven by
+> P3c (the viewer's Record and Download, §10), P5a (the export engine: cut
+> and speed up, §11) and P5b (the export's sound and background music).**
+> It is in **no release build**: `recording` joined `full` for a day (#1677)
+> and was taken back out before any release carried it (the operator,
+> 2026-09-26). It rejoins once canary hosts prove it in the field: an
+> EDR-managed corporate laptop first, because on Windows the daemon launches
+> a restricted-token child (§6) as soon as someone opens the Recordings
+> view, the pattern EDR watches for; then macOS TCC for that child. Where it
+> is compiled in, every gate is closed: a local recording starts only when
+> the person at the device presses Record, a remote one only once the
+> device's owner allows it, and `ROOMLERD_RECORDING=0` in the service's
+> environment switches recording off, local and remote. It is driven by
 > `roomlerd record`, by the daemon for the LocalAPI recording verbs and
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
 > person hands it. Still to come: the microphone on macOS, delivery out of
 > the recorder's data folder (P2c), re-attaching after a dropped session
-> (P3b-3), and the rest of the editor: audio through an export and
-> background music (P5b), the Edit view (P5c).
+> (P3b-3), and the editor's Edit view in roomler-desktop (P5c).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -718,6 +717,8 @@ flowchart LR
 | `version` | `1`; any other is refused by name |
 | `source` | the recording's file name, bare, in the list's own folder |
 | `segments[]` | `{start_ms, end_ms, action}`, contiguous from 0: `keep`, `cut`, or `speed` with `"speed": 1.25 … 16` in quarter steps. Whatever follows the last segment is kept, so "cut the first ten seconds" is one segment; segments past the recording's end are clipped |
+| `original_volume` | P5b: the recording's own audio, 0 to 1; absent = as recorded |
+| `music` | P5b: `{path, volume (0–1, default 0.5), start_ms, fade_in_ms, fade_out_ms, loop (default true)}`. `path` is absolute or relative to the list's folder; the export runs as the person, so it reaches only what they can read |
 
 - ⚠️ **The time map is exact integer arithmetic** on the 90 kHz clock.
   Output frame `n` shows the source frame presented at `Plan::source_time(n)`;
@@ -740,9 +741,6 @@ flowchart LR
 - The export's partial holds the same liveness lock as a recording's, so a
   recorder starting beside a running export never reconciles it. A failed or
   cancelled export leaves nothing behind.
-- **Video only in P5a.** The export carries no audio yet, and says so
-  (`"audio": "not_carried"`), so a caller never presents a silent file as the
-  whole export.
 
 **`roomlerd media`** is the engine as a process of its own, launched by
 roomler-desktop **as the person** (never by the daemon), speaking the
@@ -751,14 +749,51 @@ recorder's JSON-line protocol:
 | Command | Answers |
 |---|---|
 | `media probe <file>` | one `probe`: `duration_ms`, `width`, `height`, `frames`, `profile`, `audio`, `editable`, and the reason when it is not |
-| `media export --edl <file> [--encoder auto\|hardware\|software]` | `started`, `progress {frames, total}`, then `done {path, frames, duration_ms, bytes, encoder, audio}` or `refused {code, detail}`: `bad_edit_list`, `source_unreadable`, `decoder_unavailable`, `encoder_unavailable`, `decode_failed`, `write_failed`, `cancelled` |
+| `media export --edl <file> [--encoder auto\|hardware\|software]` | `started`, `progress {frames, total}`, then `done {path, frames, duration_ms, bytes, encoder, audio}` or `refused {code, detail}`: `bad_edit_list`, `source_unreadable`, `decoder_unavailable`, `encoder_unavailable`, `decode_failed`, `write_failed`, `music_unreadable`, `audio_unavailable`, `cancelled` |
 
 `{"cmd":"cancel"}` on stdin stops an export. End of stdin does not: a
 finished file is harmless, and an export started with stdin closed must run.
 
-Not yet: the original audio through cuts and speed-ups, and background music
-(P5b); the Edit view in roomler-desktop (P5c); FFmpeg's decoder for hardware
-recordings (P4).
+### The export's sound (P5b)
+
+`recording/export_audio.rs` makes one Opus track at the recorder's profile
+(48 kHz stereo, 20 ms frames), produced in step with the video so the file
+interleaves as a recording does.
+
+| Part of the export | The recording's audio | The music |
+|---|---|---|
+| a kept stretch | plays from the same moment, times `original_volume` | plays |
+| a speed-up | ⚠️ **muted** | plays |
+| a cut | gone, with the picture | — (it follows the export, not the recording) |
+| before `start_ms` | as above | silent |
+| the first `fade_in_ms` of the music, the last `fade_out_ms` of the export | as above | ramps linearly |
+
+- **Sped-up sound is muted on purpose.** Played faster it is noise, and a
+  recording's audio is mostly speech. The music plays on under it.
+- **The music is decoded by symphonia**: pure Rust, because a file the person
+  picks is untrusted input. MP3, AAC/M4A, FLAC, Ogg Vorbis and WAV are read.
+  It is streamed, never held whole, and resampled by the recorder's own
+  resampler. A short piece loops by default; one under 100 ms plays once,
+  since looping a few samples would reopen the file thousands of times per
+  second of export.
+- ⚠️ **A malformed music file is refused `music_unreadable`, never a crash.**
+  A fuzz pass over 1,800 malformed files found one that crashes symphonia
+  0.5.5: a WAV declaring 0 Hz panics its probe. So every call into it is
+  guarded, and a rate outside 1–768 kHz is refused (symphonia accepts 1 Hz,
+  and at 1 Hz every packet would grow 48 000-fold on its way to 48 kHz). The
+  rate is checked at open when the header declares one and again on every
+  decoded buffer; the second check is the gate, since a container can
+  declare one rate and its codec produce another.
+- Both are summed through the recorder's soft clip, so music under loud speech
+  bends instead of wrapping into a crack.
+- The `done` event says what the file's sound is: `none`, `original`, `music`,
+  `original_and_music`, or `not_carried` (the recording had audio and this
+  build has no audio encoder). A caller never presents a silent file as the
+  whole export. An unreadable music file is refused `music_unreadable`, and
+  music on a build without audio `audio_unavailable`.
+
+Not yet: the Edit view in roomler-desktop (P5c); FFmpeg's decoder for
+hardware recordings, and AAC for the sound (P4).
 
 ## 12. Tests
 
@@ -770,7 +805,9 @@ recordings (P4).
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
 | `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
 | `recording::edit` unit tests (P5a) | the keep / cut / 4× / keep list maps every output frame to exactly the frame the oracle expects; keeping everything is the identity (the control); an hour at 1.5× lands on the frame integer arithmetic says, no drift; what follows the last segment is kept and a long list is clipped; a bad list is refused by name (version, no segments, not from 0, a gap, an empty segment, nothing kept); speeds are 1.25–16 in quarter steps (NaN, infinity, 1×, 17× refused); the file reads as written | "Test the recorder (FR-85)" (`--lib recording::`) |
-| `tests/export.rs` (P5a) | a recording whose every frame paints its own index, exported keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s, decodes to exactly `0..59, 120, 124 … 236, 240..299` (150 frames, 5 s, moov first, the recording byte-identical); the same comparison against the unedited source fails (the oracle discriminates); keeping everything reproduces the recording frame for frame; a cancelled export and one that keeps nothing leave no file and nothing staged; the real `roomlerd media probe` / `export` process (a cut plus 2× shows frames 30, 32 … 58, the `done` event says `audio: not_carried`), and a list naming `../elsewhere.mp4` is refused `bad_edit_list`. Red, each on its own cell: the map ignoring speed, the frame choice off by one, the cancel check removed, the name check removed | same step, `--test export` |
+| `tests/export.rs` (P5a) | a recording whose every frame paints its own index, exported keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s, decodes to exactly `0..59, 120, 124 … 236, 240..299` (150 frames, 5 s, moov first, the recording byte-identical); the same comparison against the unedited source fails (the oracle discriminates); keeping everything reproduces the recording frame for frame; a cancelled export and one that keeps nothing leave no file and nothing staged; the real `roomlerd media probe` / `export` process (a cut plus 2× shows frames 30, 32 … 58, the `done` event says `audio: none`, the recording being silent), and a list naming `../elsewhere.mp4` is refused `bad_edit_list`. Red, each on its own cell: the map ignoring speed, the frame choice off by one, the cancel check removed, the name check removed | same step, `--test export` |
+| `recording::edit` and `recording::export_audio` unit tests (P5b) | the sound of keep / cut / 4× / keep: the kept stretches play from their own source sample, the speed-up is muted, the cut is gone, and the sound is exactly as long as the picture; a volume is 0 to 1 (1.5, NaN and −0.1 refused by name; 0 is a volume, the recording muted), and music needs a file; music defaults to half volume and looping, and an absent `original_volume` means as recorded; the music's gain is silent before its start, ramps in from it, and ramps out to the export's end; a music time too large to count in samples saturates instead of wrapping to an early start | "Test the recorder (FR-85)" (`--lib recording::`; `export_audio`'s in the `audio` run) |
+| `tests/export.rs`, `mod sound` (P5b) | a recording whose sound is a STEPPED tone, second k playing 300 + 100·k Hz, so every second of an export names the second of the recording it came from (the oracle reads the recording's own second 3 as 600 Hz first). Keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s: the export's seconds 0, 1, 3 and 4 play 300, 400, 1100 and 1200 Hz at full level, second 2 (the speed-up) is muted, and the sound lasts as long as the picture. Music (a 2 s WAV at 44.1 kHz, so it is resampled) under a keep and a 4× speed-up: at its volume and pitch, still playing after its own 2 s (it looped), quieter while it fades in. Both together: under the speed-up only the music is heard. `original_volume` 0 with no music gives a file with no audio track (`audio: none`). A file that is not music, a WAV declaring 0 Hz (which panics symphonia 0.5.5's probe) and one declaring 1 Hz are refused `music_unreadable`, with nothing left staged; a 50 ms blip plays once. Red, each on its own cell: a speed-up not muted, the sound ignoring the cut, the music never looping, the fade-in ignored, the music's volume ignored, the panic guard removed, the rate range widened, the loop minimum removed (and, in the unit test, the saturation removed). ⚠️ The 1 Hz cell stays green with EITHER rate check deleted (at open, per buffer): each refuses that WAV on its own, so it is red only with the range widened | same step, the `audio` run of `--test export` |
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |

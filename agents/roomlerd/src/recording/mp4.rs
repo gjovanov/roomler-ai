@@ -1192,6 +1192,15 @@ pub struct VideoFormat {
     pub timescale: u32,
 }
 
+/// FR-85 P5b — a recording's audio, as an export sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub channels: u16,
+    /// Samples (48 kHz) an Opus decoder drops from the start.
+    pub pre_skip: u16,
+    pub timescale: u32,
+}
+
 /// One sample of a progressive file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressiveSample {
@@ -1329,6 +1338,29 @@ impl ProgressiveFile {
             bail!("mp4: video track is not avc1");
         };
         Ok((avc1, trak.mdia.mdhd.timescale))
+    }
+
+    /// FR-85 P5b — the audio track, when the recording has one: its channel
+    /// count and the Opus `pre_skip` a decoder must drop from the start.
+    /// `None` = no audio track (recordings are silent unless asked).
+    pub fn audio_format(&self) -> Result<Option<AudioFormat>> {
+        let Some(trak) = self
+            .moov
+            .trak
+            .iter()
+            .find(|t| t.tkhd.track_id == AUDIO_TRACK_ID)
+        else {
+            return Ok(None);
+        };
+        match trak.mdia.minf.stbl.stsd.codecs.first() {
+            Some(Codec::Opus(opus)) => Ok(Some(AudioFormat {
+                channels: opus.audio.channel_count,
+                pre_skip: opus.dops.pre_skip,
+                timescale: trak.mdia.mdhd.timescale,
+            })),
+            Some(_) => bail!("mp4: the audio track is not Opus"),
+            None => bail!("mp4: the audio track has an empty stsd"),
+        }
     }
 
     /// FR-85 P5 — what an export needs to know before it decodes a sample.

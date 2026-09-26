@@ -78,7 +78,7 @@ impl AudioSources {
 ///
 /// Linear, not the live path's nearest-neighbour: a 44.1 kHz laptop
 /// microphone is common, and nearest-neighbour aliases audibly on speech.
-struct Resampler {
+pub(crate) struct Resampler {
     in_rate: u32,
     /// The last input frame of the previous buffer (`s[-1]`).
     prev: [f32; 2],
@@ -89,7 +89,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(in_rate: u32) -> Self {
+    pub(crate) fn new(in_rate: u32) -> Self {
         Self {
             in_rate: in_rate.max(1),
             prev: [0.0; 2],
@@ -100,7 +100,7 @@ impl Resampler {
 
     /// Resample `f` into `out` (interleaved stereo). `adjust` bends the rate:
     /// positive consumes input faster (fewer output frames per input frame).
-    fn push(&mut self, f: &AudioFrame, adjust: f64, out: &mut VecDeque<i16>) {
+    pub(crate) fn push(&mut self, f: &AudioFrame, adjust: f64, out: &mut VecDeque<i16>) {
         let ch = usize::from(f.channels.max(1));
         let n = f.samples.len() / ch;
         if n == 0 {
@@ -268,14 +268,14 @@ impl Mixer {
 
 /// Opus for a recording: 48 kHz stereo, 20 ms frames, 128 kb/s, full
 /// complexity. Its own encoder — the live path's stays untouched.
-struct RecordingOpus {
+pub(crate) struct RecordingOpus {
     enc: OpusCoder,
     out: Vec<u8>,
-    pre_skip: u16,
+    pub(crate) pre_skip: u16,
 }
 
 impl RecordingOpus {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let mut enc = OpusCoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)
             .context("recording: create the Opus encoder")?;
         enc.set_bitrate(Bitrate::BitsPerSecond(BITRATE_BPS))
@@ -291,7 +291,7 @@ impl RecordingOpus {
         })
     }
 
-    fn encode(&mut self, frame: &[i16]) -> Result<Vec<u8>> {
+    pub(crate) fn encode(&mut self, frame: &[i16]) -> Result<Vec<u8>> {
         let n = self
             .enc
             .encode(frame, &mut self.out)

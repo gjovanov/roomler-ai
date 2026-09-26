@@ -39,6 +39,45 @@ pub struct EditList {
     /// The recording's file name, bare, in the same folder as this list.
     pub source: String,
     pub segments: Vec<Segment>,
+    /// FR-85 P5b — the recording's own audio, 0.0 (muted) to 1.0 (as
+    /// recorded, the default). Always muted inside a speed-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_volume: Option<f32>,
+    /// FR-85 P5b — background music under the export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music: Option<Music>,
+}
+
+/// Background music for an export.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Music {
+    /// The music file: absolute, or relative to the edit list's folder. The
+    /// export runs as the person, so it reaches only what they can read.
+    pub path: String,
+    /// 0.0 to 1.0.
+    #[serde(default = "Music::default_volume")]
+    pub volume: f32,
+    /// Where in the EXPORT the music begins.
+    #[serde(default)]
+    pub start_ms: u64,
+    #[serde(default)]
+    pub fade_in_ms: u64,
+    /// Over the last stretch of the music's time in the export.
+    #[serde(default)]
+    pub fade_out_ms: u64,
+    /// Start again from the top when it ends (a short piece under a long
+    /// export); otherwise silence after it.
+    #[serde(default = "Music::default_loop", rename = "loop")]
+    pub looped: bool,
+}
+
+impl Music {
+    fn default_volume() -> f32 {
+        0.5
+    }
+    fn default_loop() -> bool {
+        true
+    }
 }
 
 /// A stretch of the recording and what happens to it.
@@ -102,6 +141,36 @@ impl Plan {
     pub fn out_ms(&self) -> u64 {
         self.out_ticks * 1000 / u64::from(VIDEO_TIMESCALE)
     }
+
+    /// FR-85 P5b — the output's audio timeline in samples at `rate`: each
+    /// stretch either plays the source from `src_start` (kept) or is muted
+    /// (a speed-up: sped-up sound is noise, and a recording's audio is mostly
+    /// speech). Cuts are gone, as in the video.
+    pub fn audio_spans(&self, rate: u32) -> Vec<AudioSpan> {
+        let at = |ticks: u64| ticks * u64::from(rate) / u64::from(VIDEO_TIMESCALE);
+        self.pieces
+            .iter()
+            .map(|p| AudioSpan {
+                out_start: at(p.out_start),
+                out_end: at(p.out_start + p.out_len),
+                src_start: (p.quarters == QUARTERS_PER_X).then(|| at(p.src_start)),
+            })
+            .collect()
+    }
+
+    /// The output's length in samples at `rate`.
+    pub fn out_samples(&self, rate: u32) -> u64 {
+        self.out_ticks * u64::from(rate) / u64::from(VIDEO_TIMESCALE)
+    }
+}
+
+/// One stretch of an export's audio timeline, in samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSpan {
+    pub out_start: u64,
+    pub out_end: u64,
+    /// Where the source's audio for this stretch starts; `None` = muted.
+    pub src_start: Option<u64>,
 }
 
 /// Why an edit list cannot be exported. Each is said to the person as it is.
@@ -110,10 +179,24 @@ pub enum Invalid {
     Version(u32),
     NoSegments,
     DoesNotStartAtZero(u64),
-    Gap { after_ms: u64, next_ms: u64 },
-    Empty { start_ms: u64 },
-    Speed { start_ms: u64, speed: String },
+    Gap {
+        after_ms: u64,
+        next_ms: u64,
+    },
+    Empty {
+        start_ms: u64,
+    },
+    Speed {
+        start_ms: u64,
+        speed: String,
+    },
     NothingKept,
+    /// A volume outside 0.0–1.0 (or not a number).
+    Volume {
+        what: &'static str,
+        value: String,
+    },
+    NoMusicFile,
 }
 
 impl std::fmt::Display for Invalid {
@@ -134,8 +217,17 @@ impl std::fmt::Display for Invalid {
                 "the segment at {start_ms} ms has speed {speed}: speeds go from 1.25 to 16 in quarter steps"
             ),
             Self::NothingKept => write!(f, "every part of the recording is cut: nothing to export"),
+            Self::Volume { what, value } => {
+                write!(f, "the {what} volume is {value}: volumes go from 0 to 1")
+            }
+            Self::NoMusicFile => write!(f, "the music has no file"),
         }
     }
+}
+
+/// A volume is a number from 0 to 1.
+fn volume_ok(v: f32) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
 impl EditList {
@@ -158,6 +250,25 @@ impl EditList {
     pub fn plan(&self, duration_ms: u64) -> Result<Plan, Invalid> {
         if self.version != VERSION {
             return Err(Invalid::Version(self.version));
+        }
+        if let Some(v) = self.original_volume
+            && !volume_ok(v)
+        {
+            return Err(Invalid::Volume {
+                what: "recording's",
+                value: format!("{v}"),
+            });
+        }
+        if let Some(m) = &self.music {
+            if m.path.trim().is_empty() {
+                return Err(Invalid::NoMusicFile);
+            }
+            if !volume_ok(m.volume) {
+                return Err(Invalid::Volume {
+                    what: "music",
+                    value: format!("{}", m.volume),
+                });
+            }
         }
         let Some(first) = self.segments.first() else {
             return Err(Invalid::NoSegments);
@@ -251,6 +362,8 @@ mod tests {
             version: VERSION,
             source: "Roomler Recording.mp4".into(),
             segments,
+            original_volume: None,
+            music: None,
         }
     }
 
@@ -376,6 +489,81 @@ mod tests {
             .plan(10_000)
             .unwrap_err();
         assert!(err.to_string().contains("quarter steps"), "{err}");
+    }
+
+    /// P5b — the audio timeline follows the video's: a kept stretch plays the
+    /// source from the same moment (48 samples a millisecond), a speed-up is
+    /// muted, a cut is gone.
+    #[test]
+    fn the_audio_timeline_keeps_mutes_and_cuts_as_the_picture_does() {
+        let plan = list(vec![
+            seg(0, 2000, Action::Keep),
+            seg(2000, 4000, Action::Cut),
+            seg(4000, 8000, Action::Speed { speed: 4.0 }),
+            seg(8000, 10_000, Action::Keep),
+        ])
+        .plan(10_000)
+        .unwrap();
+        assert_eq!(plan.out_samples(48_000), 240_000);
+        assert_eq!(
+            plan.audio_spans(48_000),
+            vec![
+                AudioSpan {
+                    out_start: 0,
+                    out_end: 96_000,
+                    src_start: Some(0)
+                },
+                AudioSpan {
+                    out_start: 96_000,
+                    out_end: 144_000,
+                    src_start: None
+                },
+                AudioSpan {
+                    out_start: 144_000,
+                    out_end: 240_000,
+                    src_start: Some(384_000)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_volume_is_zero_to_one_and_music_needs_a_file() {
+        let mut l = list(vec![seg(0, 1000, Action::Keep)]);
+        l.original_volume = Some(1.5);
+        assert!(matches!(l.plan(1000), Err(Invalid::Volume { .. })));
+        l.original_volume = Some(f32::NAN);
+        assert!(matches!(l.plan(1000), Err(Invalid::Volume { .. })));
+        l.original_volume = Some(0.0);
+        assert!(l.plan(1000).is_ok(), "0 is a volume: the recording muted");
+        l.music = Some(Music {
+            path: " ".into(),
+            volume: 0.5,
+            start_ms: 0,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            looped: true,
+        });
+        assert_eq!(l.plan(1000), Err(Invalid::NoMusicFile));
+        l.music.as_mut().unwrap().path = "song.mp3".into();
+        l.music.as_mut().unwrap().volume = -0.1;
+        assert!(matches!(
+            l.plan(1000),
+            Err(Invalid::Volume { what: "music", .. })
+        ));
+    }
+
+    /// Music fields default as the Edit view expects: half volume, looping.
+    #[test]
+    fn music_defaults_to_half_volume_and_looping() {
+        let l: EditList = serde_json::from_str(
+            r#"{"version":1,"source":"a.mp4","segments":[{"start_ms":0,"end_ms":1000,"action":"keep"}],
+                "music":{"path":"song.mp3"}}"#,
+        )
+        .unwrap();
+        let m = l.music.unwrap();
+        assert_eq!((m.volume, m.looped, m.start_ms), (0.5, true, 0));
+        assert_eq!(l.original_volume, None, "absent = as recorded");
     }
 
     /// The saved shape is the one roomler-desktop writes.

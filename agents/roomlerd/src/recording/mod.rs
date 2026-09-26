@@ -29,6 +29,10 @@ pub mod edit;
 /// the software encoder's feature).
 #[cfg(feature = "openh264-encoder")]
 pub mod export;
+/// FR-85 P5b — an export's sound: the recording's audio through the edit
+/// list, and background music (Opus, like a recording's).
+#[cfg(feature = "audio")]
+pub mod export_audio;
 pub mod folder;
 /// FR-85 P1e — who the recorder runs as (the person signed in at the
 /// device, at normal integrity), and launching it as that.
