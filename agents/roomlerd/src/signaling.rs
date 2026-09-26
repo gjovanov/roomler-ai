@@ -1736,6 +1736,11 @@ async fn connect_once(
                 // the browser and echoes ServerMsg::Terminate back; that
                 // handler is idempotent, so the echo re-running is safe.
                 info!(session_id = %sid, "viewee requested disconnect via overlay badge");
+                // FR-85 P3b-3 — the person at the device sent the controller
+                // away: a recording of this session STOPS now, rather than
+                // wait for the controller to come back (a drop does wait).
+                #[cfg(feature = "recording")]
+                crate::recording::remote::host_ended(sid);
                 if let Some(peer) = peers.remove(&sid) {
                     let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
                 }
@@ -2860,6 +2865,13 @@ async fn handle_server_msg(
             // withdrawn above, ahead of the delegation gate (#1632) — this arm
             // does not run on a delegated session, and the prompt is ours
             // either way.
+            //
+            // FR-85 P3b-3 — said BEFORE the close: a close that overruns its
+            // budget never reaches the `record` channel, which would then
+            // stay open and its recording undetached for good. (A delegated
+            // session never records.)
+            #[cfg(feature = "recording")]
+            crate::recording::remote::session_ended(session_id);
             if let Some(peer) = peers.remove(&session_id) {
                 let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
             }
@@ -4033,6 +4045,10 @@ async fn close_all_peers(
     }
     let count = peers.len();
     for (session_id, peer) in peers.drain() {
+        // FR-85 P3b-3 — the session is over whether or not its close
+        // finishes (see the `Terminate` arm).
+        #[cfg(feature = "recording")]
+        crate::recording::remote::session_ended(session_id);
         indicator.hide_session(session_id.to_hex());
         // Bounded ([`PEER_CLOSE_BUDGET`]): `pc.close()` hangs on webrtc
         // internals when the network was captured mid-session — the

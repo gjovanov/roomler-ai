@@ -622,7 +622,7 @@
         color="error"
         variant="flat"
         prepend-icon="mdi-stop"
-        @click="rc.disconnect()"
+        @click="leave()"
       >
         Disconnect
       </v-btn>
@@ -779,7 +779,7 @@
           The device currently reports offline — retries continue until it
           returns.
         </p>
-        <v-btn variant="tonal" size="small" class="mt-3" @click="rc.disconnect()">
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
           Cancel
         </v-btn>
       </div>
@@ -1873,6 +1873,13 @@ const clipboardBusy = ref(false)
 const rec = rc.recording
 const recAudio = ref(false)
 const recRunning = computed(() => rec.state.value === 'recording')
+// FR-85 P3b-3 — a deliberate Disconnect ends a recording first: to the device
+// a hang-up and the reconnect ladder's retry look the same, and a retry is
+// what it keeps a recording running for.
+async function leave() {
+  await rec.stopBeforeLeaving()
+  rc.disconnect()
+}
 function fmtClock(ms: number): string {
   const s = Math.floor(Math.max(0, ms) / 1000)
   const h = Math.floor(s / 3600)
@@ -4116,6 +4123,9 @@ onBeforeUnmount(() => {
   // Exit fullscreen on unmount so navigating away doesn't leave the
   // browser in a weird fullscreen state.
   if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
+  // Leaving the page is a deliberate end too; an unmount cannot wait for the
+  // answer, so the Stop goes out first and the device's grace covers a loss.
+  if (rec.state.value === 'recording') rec.stop()
   rc.disconnect()
 })
 </script>
