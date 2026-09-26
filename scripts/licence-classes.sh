@@ -56,6 +56,16 @@ CLIENT_PATHS=(
   crates/tcp-turn-conn
 )
 
+# CLIENT files inside a SERVER path: a single FILE compiled into both the web
+# app and a shipped client takes the CLIENT licence, by the same rule as the
+# shared crates above. Exact paths, checked before SERVER_PATHS — a directory
+# never goes here.
+CLIENT_FILES=(
+  # Bundled into the desktop companion as
+  # agents/roomler-desktop/src/front/mesh-util.js (FR-84 D5c).
+  ui/src/utils/mesh.ts
+)
+
 # Never touched: upstream code keeps upstream headers, and generated files are
 # regenerated. Matched as substrings of the path.
 EXCLUDE_PATTERNS=(
@@ -125,6 +135,10 @@ licence_for() {
 
   for p in "${EXCLUDE_PATTERNS[@]}"; do
     case "$path" in *"$p"*) return 1 ;; esac
+  done
+
+  for p in "${CLIENT_FILES[@]}"; do
+    [ "$path" = "$p" ] && { printf '%s' "$CLIENT_LICENCE"; return 0; }
   done
 
   for p in "${SERVER_PATHS[@]}"; do
