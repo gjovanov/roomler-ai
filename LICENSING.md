@@ -117,6 +117,11 @@ direction is fine: MPL-2.0 §3.3 expressly allows MPL-covered files to be
 distributed as part of a Larger Work under a secondary licence such as the
 (A)GPL, with the MPL files remaining under the MPL.
 
+The same rule applies to a single file: `ui/src/utils/mesh.ts` (the mesh graph's
+edge rules) is bundled into the desktop companion as
+`agents/roomler-desktop/src/front/mesh-util.js`, so it is MPL-2.0 inside the
+otherwise AGPL web app (`CLIENT_FILES` in `scripts/licence-classes.sh`).
+
 We would rather state this plainly than let someone discover it by reading the
 dependency graph: **the AGPL here protects the control plane against commercial
 re-hosting. It is not a claim to have locked up the transport or encoding code.**
