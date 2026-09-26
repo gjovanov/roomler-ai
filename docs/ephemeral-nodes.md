@@ -19,11 +19,15 @@ roomlerd enroll --server … --token <key> --name runner-1 --ephemeral
         ▼
 roomlerd run          … the device works like any other …
         │
-        ├── clean stop (SIGTERM/SIGINT, e.g. `docker stop`)
+        ├── clean stop
+        │     • Unix: SIGTERM / SIGINT (e.g. `docker stop`, `systemctl stop`)
+        │     • Windows SCM service: SCM Stop / Preshutdown — the service host
+        │       signals the worker's stop event and waits (#1683)
         │       → the daemon calls POST /api/agent/self/unenroll
         │       → removed within seconds
         │
-        └── unclean stop (SIGKILL, power loss, network partition)
+        └── unclean stop (SIGKILL, power loss, network partition, or a Windows
+            worker that did not exit inside the host's graceful-stop budget)
                 → the server-side reaper removes it once it has been
                   silent past its TTL (default 15 min, 60 s floor)
 ```
@@ -106,6 +110,16 @@ exec roomlerd run
 - `docker stop` sends SIGTERM → the daemon de-enrolls within seconds. The
   auto-updater's internal restart does **not** de-enroll (that would delete
   the device on every update).
+- **On the Windows SCM service** the stop arrives as SCM Stop / Preshutdown, not
+  a signal, and the service host stops its worker with `TerminateProcess` — a
+  hard kill the worker never sees. So the host first **signals a named stop
+  event** and waits a bounded time (`WORKER_GRACEFUL_STOP_BUDGET`, 8 s) for the
+  worker to self-unenroll and mark a clean shutdown, and only then falls back to
+  `TerminateProcess`. The event's DACL lets **only SYSTEM signal** it, so an
+  unprivileged local user cannot stop (or unenroll) a SYSTEM worker. Before
+  #1683 the hard kill was the only path and a Windows-service ephemeral device
+  always waited out the reaper's TTL. Mechanism: `docs/remote-control.md`
+  (service host) and `agents/roomlerd/src/win_service/stop_event.rs`.
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
