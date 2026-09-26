@@ -272,7 +272,14 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
                 (pending, live.unwrap_or_default())
             }
             // Daemon down / pipe absent ⇒ nothing pending, nothing live.
-            Err(_) => (HashSet::new(), Vec::new()),
+            Err(e) => {
+                // FR-85 — for the tray, no service at all is an answer:
+                // nothing records without it (a busy pipe is not).
+                if tray::no_service(&e) {
+                    tray::sessions_answered(&app, Some(&[]));
+                }
+                (HashSet::new(), Vec::new())
+            }
         };
 
         // FR-27 — a newly-appeared prompt opens the small always-on-top CONSENT
