@@ -199,6 +199,46 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     expect(again.sent.at(-1)).toEqual({ t: 'rc:record.stop', id: 'device-side-id' })
   })
 
+  it('a deliberate Disconnect stops the recording first, and waits for the answer (P3b-3)', async () => {
+    const r = useRemoteRecording()
+    const { ch, sent } = fakeChannel()
+    r.attach(ch)
+    ch.deliver({ t: 'rc:record.state', id: 'a', state: 'recording' })
+    let left = false
+    const leaving = r.stopBeforeLeaving(2000).then(() => {
+      left = true
+    })
+    expect(sent.at(-1)).toEqual({ t: 'rc:record.stop', id: 'a' })
+    await new Promise((res) => setTimeout(res, 120))
+    expect(left, 'it left before the device said the recording stopped').toBe(false)
+    ch.deliver({ t: 'rc:record.state', id: 'a', state: 'stopped', reason: 'requested' })
+    await leaving
+    expect(left).toBe(true)
+
+    // No answer: the Disconnect goes ahead anyway, after the wait.
+    const q = useRemoteRecording()
+    const silent = fakeChannel()
+    q.attach(silent.ch)
+    silent.ch.deliver({ t: 'rc:record.state', id: 'b', state: 'recording' })
+    const t0 = Date.now()
+    await q.stopBeforeLeaving(150)
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(140)
+
+    // Nothing recording (or its channel already gone): nothing to stop.
+    const idle = useRemoteRecording()
+    const nothing = fakeChannel()
+    idle.attach(nothing.ch)
+    await idle.stopBeforeLeaving(5000)
+    expect(nothing.sent.some((m) => m.t === 'rc:record.stop')).toBe(false)
+    const gone = useRemoteRecording()
+    const dropped = fakeChannel()
+    gone.attach(dropped.ch)
+    dropped.ch.deliver({ t: 'rc:record.state', id: 'c', state: 'recording' })
+    dropped.ch.close()
+    await gone.stopBeforeLeaving(5000)
+    expect(dropped.sent.some((m) => m.t === 'rc:record.stop')).toBe(false)
+  })
+
   it('back after a drop with nothing recording: it ended while this session was away (P3b-3)', () => {
     const r = useRemoteRecording()
     const first = fakeChannel()

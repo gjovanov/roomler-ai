@@ -410,6 +410,27 @@ export function useRemoteRecording(
     send({ t: 'rc:record.stop', id: currentId })
   }
 
+  /** P3b-3 — a DELIBERATE Disconnect ends the recording first. The device
+   *  cannot tell a hang-up from the reconnect ladder's retry (both are
+   *  `controller_hangup`), and a retry is exactly what the re-attach grace
+   *  keeps a recording running for: left alone, the device would record a
+   *  minute more for a controller who has gone. Resolves once the device
+   *  says it stopped, or after `timeoutMs` (the Disconnect goes ahead either
+   *  way). A recording whose channel is already gone (`reconnecting`) cannot
+   *  be asked; the device's grace ends it. */
+  function stopBeforeLeaving(timeoutMs = 3000): Promise<void> {
+    if (state.value !== 'recording') return Promise.resolve()
+    stop()
+    return new Promise<void>((resolve) => {
+      const started = Date.now()
+      const look = () => {
+        if (state.value !== 'recording' || Date.now() - started >= timeoutMs) resolve()
+        else setTimeout(look, 50)
+      }
+      look()
+    })
+  }
+
   function list() {
     send({ t: 'rc:record.list', id: newId('list') })
   }
@@ -459,6 +480,7 @@ export function useRemoteRecording(
     detach,
     start,
     stop,
+    stopBeforeLeaving,
     list,
     downloadRecording,
     cancelDownload,
