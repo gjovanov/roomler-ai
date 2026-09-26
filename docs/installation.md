@@ -146,6 +146,15 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 - Installs the `.deb` (x86_64 **and** arm64) or tarball, verifies SHA-256,
   enrolls, and enables a **systemd user unit** (`roomler.service` →
   `systemctl --user enable --now`).
+- ⚠️ The user unit is **sandboxed** (`ProtectSystem=strict`,
+  `ProtectHome=read-only`): the daemon can write only its own config and data
+  folders and `~/Videos` (screen recordings, FR-85 P2c). Every
+  `ReadWritePaths=` entry that may be missing carries systemd's `-` prefix.
+  Without it a missing path fails the whole unit with `226/NAMESPACE`, and
+  until P2c the pre-rename folders listed there without it kept the unit from
+  starting on any host that never ran the pre-rename agent. CI starts a unit
+  with these sandbox lines on a fresh runner (`ci.yml`, "The Linux user
+  unit's sandbox").
 - `--role tunnel` installs just the CLI (tarball or `.deb`).
 - Useful flags: `--download-only`, `--no-enroll`.
 - Headless servers: the daemon's virtual-desktop mode gives the machine a
