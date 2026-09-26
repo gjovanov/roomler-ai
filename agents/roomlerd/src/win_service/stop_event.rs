@@ -13,13 +13,27 @@
 //! #1040 wall, on Windows). FR-51 promised a clean stop self-unenrolls in
 //! seconds; that worked on Linux (SIGTERM) only.
 //!
-//! The fix is a named Win32 **manual-reset** event that the host
-//! creates BEFORE it spawns each worker and signals on SCM stop / preshutdown:
-//! the host asks the worker to leave gracefully, waits a bounded time
+//! The fix is a named Win32 **manual-reset** event that the host creates BEFORE
+//! it spawns each worker and signals on SCM stop / preshutdown: the host asks
+//! the worker to leave gracefully, waits a bounded time
 //! ([`super::supervisor::WORKER_GRACEFUL_STOP_BUDGET`]), and only then falls
 //! back to `TerminateProcess`. The worker's Windows `terminate_signal()` waits
 //! on the same event and, when it fires, takes the exact `os_initiated_stop`
 //! arm a Unix SIGTERM takes.
+//!
+//! ## The worker POLLS — it never parks a blocking task on the event
+//!
+//! [`wait_for_stop_event`] probes the event with `WaitForSingleObject(h, 0)`
+//! every [`STOP_EVENT_POLL`] between plain tokio sleeps. That shape is
+//! load-bearing. The worker's shutdown `select!` has other arms — an update's
+//! internal shutdown, FR-84 D3's requested restart — and they win by DROPPING
+//! this future. `main()` then drops the runtime at the end of its `block_on`,
+//! and a runtime drop waits for every `spawn_blocking` task to *return*. A
+//! blocking wait that could only return on the host's signal would therefore
+//! have held process exit hostage: the worker never left on an auto-update, and
+//! a requested restart never landed. Here the handle lives inside the future
+//! and closes on drop, so nothing outlives a lost select; the ≤ 250 ms of
+//! latency is invisible against the host's 8 s budget.
 //!
 //! ## Security — why the DACL is load-bearing
 //!
@@ -31,10 +45,11 @@
 //!
 //! * **SYSTEM** (the host) gets `EVENT_ALL_ACCESS` — it created the event and is
 //!   the only principal that may `SetEvent` it.
-//! * **Interactive users** get `SYNCHRONIZE` only — enough to *wait*
-//!   ([`wait_for_stop_event`]), never enough to signal. `SYNCHRONIZE` (`0x100000`)
-//!   does not include `EVENT_MODIFY_STATE` (`0x2`), so a second interactive user
-//!   (fast-user-switch), or the worker itself, can wait but cannot stop anyone.
+//! * **Interactive users** get `SYNCHRONIZE` only — enough to *probe*
+//!   ([`WorkerStopEvent::is_signaled`]), never enough to signal. `SYNCHRONIZE`
+//!   (`0x100000`) does not include `EVENT_MODIFY_STATE` (`0x2`), so a second
+//!   interactive user (fast-user-switch), or the worker itself, can wait but
+//!   cannot stop anyone.
 //!
 //! The name is unique per spawn (host PID + a monotonic counter), so a restart
 //! never opens a stale, possibly-already-signaled handle. The host cannot use
@@ -44,16 +59,21 @@
 //!
 //! Everything degrades safely: if the event cannot be created the worker spawns
 //! anyway (the shutdown path just hard-terminates, exactly as before this
-//! change), and if the worker cannot open/​wait the event it falls through to
+//! change), and if the worker cannot open/probe the event it falls through to
 //! `std::future::pending()` (today's behaviour), so the host's bounded wait
 //! simply times out into the `TerminateProcess` fallback. The server-side
 //! reaper remains the backstop for every exit that never reaches self-unenroll.
+//!
+//! Whether a stop that DID arrive may unenroll the device is a separate, pure
+//! decision — `crate::updater::should_self_unenroll` — because the MSI's own
+//! service stop during an update must never read as the device leaving.
 
 #![cfg(target_os = "windows")]
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -61,7 +81,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, OpenEventW, SetEvent, WaitForSingleObject,
 };
 
 /// The security descriptor, in SDDL, applied to the stop event. **This is a
@@ -82,9 +102,8 @@ const STOP_EVENT_SDDL: &str = "D:P(A;;0x1f0003;;;SY)(A;;0x100000;;;IU)";
 /// `SDDL_REVISION_1` — the only defined SDDL revision.
 const SDDL_REVISION_1: u32 = 1;
 
-/// `SYNCHRONIZE` — the sole access the worker asks for when it opens the event
-/// to wait. Deliberately NOT `EVENT_MODIFY_STATE`: the worker waits, it never
-/// signals.
+/// `SYNCHRONIZE` — the sole access the worker asks for when it opens the event.
+/// Deliberately NOT `EVENT_MODIFY_STATE`: the worker probes, it never signals.
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// The kernel-object name prefix. `Global\` so the worker (which may be in a
@@ -92,6 +111,14 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 /// session 0. The host is SYSTEM and holds `SeCreateGlobalPrivilege`; opening a
 /// `Global\` object needs no privilege.
 const STOP_EVENT_NAME_PREFIX: &str = "Global\\roomler-worker-stop-";
+
+/// How often the worker probes the event. Each probe is a non-blocking
+/// `WaitForSingleObject(h, 0)`, and the sleep between probes is a plain tokio
+/// timer, so the wait is cancelled — and the handle closed — the instant the
+/// future is dropped (see the module docs for why that must hold). 250 ms is
+/// invisible against the host's 8 s budget; a manual-reset event stays
+/// signaled, so a probe can never miss a signal that landed between two probes.
+pub const STOP_EVENT_POLL: Duration = Duration::from_millis(250);
 
 /// Monotonic per-process counter that makes each spawn's event name unique.
 static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -121,7 +148,7 @@ struct EventHandle(HANDLE);
 // SAFETY: a Win32 `HANDLE` is a process-wide reference to a kernel object with
 // no thread affinity; `SetEvent` / `WaitForSingleObject` / `CloseHandle` are
 // all thread-safe. Send so a `HostStopEvent` may live on the supervisor's
-// `ActiveWorker` and be handed between the supervisor's own frames.
+// `ActiveWorker`, and so the worker's wait future (which holds one) is Send.
 unsafe impl Send for EventHandle {}
 
 impl Drop for EventHandle {
@@ -179,6 +206,7 @@ impl HostStopEvent {
         let handle = unsafe { CreateEventW(&sa, 1, 0, name_w.as_ptr()) };
         // Capture the create error BEFORE freeing the SD (LocalFree could reset
         // the thread-local error).
+        // SAFETY: GetLastError is a thread-local read.
         let create_err = unsafe { GetLastError() };
         // SAFETY: `psd` came from ConvertStringSecurityDescriptor…W (LocalAlloc);
         // the event has copied it, so LocalFree of our copy is the documented
@@ -228,44 +256,63 @@ impl HostStopEvent {
     }
 }
 
-/// Open the named stop event and wait, with a bounded timeout in ms. Returns
-/// `Ok(true)` if it was signaled, `Ok(false)` on timeout, `Err` if it could not
-/// be opened (e.g. the host never created it). Opens with `SYNCHRONIZE` only.
-fn wait_impl(name: &str, timeout_ms: u32) -> io::Result<bool> {
-    let name_w = to_wide(name);
-    // SAFETY: `name_w` is NUL-terminated; we ask for SYNCHRONIZE (wait) only,
-    // not inheritable. A null return means the open failed (GetLastError).
-    let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name_w.as_ptr()) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
+/// The worker side: the host's stop event, opened for `SYNCHRONIZE` only —
+/// enough to probe, never enough to signal.
+pub struct WorkerStopEvent {
+    handle: EventHandle,
+}
+
+impl WorkerStopEvent {
+    /// Open the named event with `SYNCHRONIZE`. `Err` when it does not exist or
+    /// the DACL denies us — the caller must then treat the channel as absent,
+    /// never as a stop.
+    pub fn open(name: &str) -> io::Result<Self> {
+        let name_w = to_wide(name);
+        // SAFETY: `name_w` is NUL-terminated; we ask for SYNCHRONIZE (probe)
+        // only, not inheritable. A null return means the open failed.
+        let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name_w.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: EventHandle(handle),
+        })
     }
-    let guard = EventHandle(handle);
-    // SAFETY: `guard.0` is a valid handle opened for SYNCHRONIZE.
-    let r = unsafe { WaitForSingleObject(guard.0, timeout_ms) };
-    drop(guard);
-    match r {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        other => Err(io::Error::other(format!(
-            "WaitForSingleObject on the stop event returned 0x{other:x}"
-        ))),
+
+    /// Non-blocking probe: has the host signaled? `WaitForSingleObject` with a
+    /// zero timeout returns at once. Because the event is manual-reset it stays
+    /// signaled, so a probe never misses a signal that arrived between probes.
+    pub fn is_signaled(&self) -> io::Result<bool> {
+        // SAFETY: a valid handle opened for SYNCHRONIZE; a 0 ms wait never blocks.
+        let r = unsafe { WaitForSingleObject(self.handle.0, 0) };
+        match r {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            other => Err(io::Error::other(format!(
+                "WaitForSingleObject on the stop event returned 0x{other:x}"
+            ))),
+        }
     }
 }
 
-/// Worker side: block until the SCM host signals the stop event named `name`.
-/// Called from the worker's `terminate_signal()` (on a blocking task, since the
-/// wait is blocking). Returns `Ok(())` when the host asked for a graceful stop;
-/// `Err` if the event could not be opened/​waited — in which case the caller
-/// must NOT treat it as a stop request (it awaits `pending()` instead), so a
-/// missing or inaccessible event never fabricates a shutdown.
-pub fn wait_for_stop_event(name: &str) -> io::Result<()> {
-    match wait_impl(name, INFINITE)? {
-        true => Ok(()),
-        // INFINITE cannot time out; a non-signalled return is anomalous and must
-        // not read as "stop".
-        false => Err(io::Error::other(
-            "stop-event wait returned without a signal",
-        )),
+/// Worker side: resolve when the SCM host signals the stop event named `name`.
+/// One arm of the worker's shutdown `select!` (`terminate_signal` in main.rs).
+///
+/// It POLLS ([`STOP_EVENT_POLL`]) instead of parking a blocking task on the
+/// event — see the module docs: a blocking wait that lost the `select!` would
+/// have kept the runtime's drop, and so process exit, waiting for a signal that
+/// never comes. Here the handle lives in this future and is closed on drop.
+///
+/// `Err` when the event cannot be opened or probed — the caller must NOT treat
+/// that as a stop (it awaits `pending()` instead), so a missing or inaccessible
+/// event never fabricates a shutdown or a self-unenroll.
+pub async fn wait_for_stop_event(name: &str) -> io::Result<()> {
+    let ev = WorkerStopEvent::open(name)?;
+    loop {
+        if ev.is_signaled()? {
+            return Ok(());
+        }
+        tokio::time::sleep(STOP_EVENT_POLL).await;
     }
 }
 
@@ -273,10 +320,134 @@ pub fn wait_for_stop_event(name: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn current_thread_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// The worker's `select!` has three arms. When ANOTHER arm wins (an
+    /// auto-update's internal shutdown, FR-84 D3 "Apply now"), this future is
+    /// dropped — and then `main()` drops the runtime, which waits for every
+    /// spawned blocking task to RETURN. A wait that can only return when the
+    /// host signals the event therefore hangs process exit: the worker never
+    /// leaves on an update, and a requested restart never lands. This test is
+    /// that exit: drive the wait on an unsignaled event, lose the select, drop
+    /// the runtime, and demand it comes back promptly. (RED against the
+    /// `spawn_blocking(INFINITE)` shape; the poll shape passes.)
+    #[test]
+    fn dropping_the_wait_future_never_hangs_runtime_shutdown() {
+        let ev = HostStopEvent::create().expect("create");
+        let name = ev.name().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = current_thread_rt();
+            rt.block_on(async {
+                tokio::select! {
+                    r = wait_for_stop_event(&name) => {
+                        panic!("the event is never signaled; the wait must not resolve: {r:?}")
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                }
+            });
+            // What `main()` does at the end of its `block_on` statement.
+            drop(rt);
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            done.is_ok(),
+            "dropping the runtime must not wait on a stop-event wait that lost its select! \
+             — the worker would never exit on an auto-update or a requested restart"
+        );
+        drop(ev);
+    }
+
+    /// The mechanism end to end, in one process: a "worker" runtime awaits the
+    /// wait on a helper thread, the host signals from here, the wait resolves.
+    /// Before this module the worker's Windows `terminate_signal()` was
+    /// `pending()` forever, so this round-trip did not exist.
+    #[test]
+    fn host_signal_resolves_the_worker_wait() {
+        let ev = HostStopEvent::create().expect("create");
+        let name = ev.name().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = current_thread_rt();
+            // The timeout's timer must be built INSIDE the runtime context.
+            let r = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), wait_for_stop_event(&name)).await
+            });
+            let _ = tx.send(r);
+        });
+        // Let the waiter open the event and start probing, then signal.
+        std::thread::sleep(Duration::from_millis(200));
+        ev.signal();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiter must report a result");
+        assert!(
+            matches!(got, Ok(Ok(()))),
+            "the worker's wait must resolve on the host's signal: {got:?}"
+        );
+    }
+
+    /// Proves the wait actually blocks on the event: an early resolve would, in
+    /// `terminate_signal`, fabricate a stop — and for an ephemeral device an
+    /// erroneous self-unenroll.
+    #[test]
+    fn an_unsignaled_event_does_not_resolve() {
+        let ev = HostStopEvent::create().expect("create");
+        let rt = current_thread_rt();
+        // The timeout's timer must be built INSIDE the runtime context.
+        let r = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(700), wait_for_stop_event(ev.name())).await
+        });
+        assert!(r.is_err(), "an unsignaled event must not resolve: {r:?}");
+    }
+
+    #[test]
+    fn is_signaled_flips_when_the_host_signals() {
+        let ev = HostStopEvent::create().expect("create");
+        let w = WorkerStopEvent::open(ev.name()).expect("open with SYNCHRONIZE");
+        assert!(
+            !w.is_signaled().expect("probe"),
+            "fresh event is unsignaled"
+        );
+        ev.signal();
+        assert!(
+            w.is_signaled().expect("probe"),
+            "manual-reset: once signaled it stays signaled for the next probe"
+        );
+    }
+
+    /// The safe-degradation path: no event ⇒ Err ⇒ the worker awaits
+    /// `pending()` instead of treating it as a stop.
+    #[test]
+    fn waiting_on_a_missing_event_errs() {
+        let rt = current_thread_rt();
+        let r = rt.block_on(wait_for_stop_event(
+            "Global\\roomler-worker-stop-nonexistent-1683",
+        ));
+        assert!(
+            r.is_err(),
+            "opening an absent event must error so the worker degrades to terminate"
+        );
+    }
+
+    /// The host waits `WORKER_GRACEFUL_STOP_BUDGET` after signaling; the worker
+    /// must notice long before that — many probes per budget, not one.
+    #[test]
+    fn the_poll_interval_is_well_inside_the_hosts_budget() {
+        assert_eq!(STOP_EVENT_POLL, Duration::from_millis(250));
+        assert!(STOP_EVENT_POLL * 8 < super::super::supervisor::WORKER_GRACEFUL_STOP_BUDGET);
+    }
+
     #[test]
     fn sddl_is_the_locked_security_contract() {
         // Only SYSTEM may SIGNAL (EVENT_MODIFY_STATE ⊂ 0x1f0003); an interactive
-        // user gets 0x100000 = SYNCHRONIZE = WAIT ONLY. That is the whole
+        // user gets 0x100000 = SYNCHRONIZE = PROBE ONLY. That is the whole
         // security property (#1683): no unprivileged local user can stop a
         // SYSTEM worker. Changing this string is changing that decision.
         assert_eq!(STOP_EVENT_SDDL, "D:P(A;;0x1f0003;;;SY)(A;;0x100000;;;IU)");
@@ -299,57 +470,6 @@ mod tests {
             a.name().starts_with(STOP_EVENT_NAME_PREFIX),
             "name must be in the Global namespace: {}",
             a.name()
-        );
-    }
-
-    #[test]
-    fn host_signal_is_observed_by_the_worker_wait() {
-        // The end-to-end mechanism, in one process: the host creates + signals,
-        // a "worker" opens the same name and waits. Before this module, the
-        // worker's Windows terminate_signal() was pending() forever, so this
-        // round-trip did not exist.
-        let ev = HostStopEvent::create().expect("create");
-        let name = ev.name().to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            // Generous bound so a slow CI box never flakes; the signal arrives
-            // in milliseconds in practice.
-            let _ = tx.send(wait_impl(&name, 5_000));
-        });
-        // Let the waiter reach WaitForSingleObject, then signal.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        ev.signal();
-        let got = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the waiter must return a result");
-        assert!(
-            matches!(got, Ok(true)),
-            "the worker's wait must observe the host's signal: {got:?}"
-        );
-        let _ = waiter.join();
-    }
-
-    #[test]
-    fn an_unsignaled_event_times_out_rather_than_resolving() {
-        // Proves the wait actually blocks on the event — it must not resolve
-        // early (which, in terminate_signal, would fabricate a stop and, for an
-        // ephemeral device, an erroneous self-unenroll).
-        let ev = HostStopEvent::create().expect("create");
-        let r = wait_impl(ev.name(), 200);
-        assert!(
-            matches!(r, Ok(false)),
-            "an unsignaled event must time out, not resolve: {r:?}"
-        );
-    }
-
-    #[test]
-    fn waiting_on_a_missing_event_errs() {
-        // The safe-degradation path: no event ⇒ Err ⇒ the worker awaits
-        // pending() instead of treating it as a stop.
-        let r = wait_impl("Global\\roomler-worker-stop-nonexistent-1683", 100);
-        assert!(
-            r.is_err(),
-            "opening an absent event must error so the worker degrades to terminate"
         );
     }
 }
