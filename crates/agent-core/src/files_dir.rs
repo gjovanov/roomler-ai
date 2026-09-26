@@ -599,7 +599,7 @@ fn canonical_form(path: &Path) -> Canonical {
 
 /// `\\?\C:\x` → `C:\x`, `\\?\UNC\host\share` → `\\host\share`. A no-op for
 /// anything else, including every Unix path.
-fn strip_verbatim(p: PathBuf) -> PathBuf {
+pub fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
