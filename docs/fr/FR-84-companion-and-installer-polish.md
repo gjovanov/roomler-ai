@@ -1,6 +1,6 @@
 # FR-84: The companion and the installer, finished — it starts after install, explains itself, and its pages hold still
 
-**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **shipped in 0.4.103; field verification in progress (2026-09-26)** — AC1–AC11, AC13, AC14 verified; AC12 (perMachine) waits on 0.4.104 (#1682) ·
+**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **closed 2026-09-26 — all 14 criteria field-verified** — shipped in 0.4.103; field fixes #1682 + #1688 in 0.4.104 and #1703 in 0.4.105 ·
 **Related:** [#1631](https://github.com/gjovanov/roomler-ai/issues/1631) (web: RC view stuck on the previous device) ·
 [#1632](https://github.com/gjovanov/roomler-ai/issues/1632) (a terminated session leaves the consent prompt up) ·
 [#1035](https://github.com/gjovanov/roomler-ai/issues/1035) (a route port held by a companion the daemon spawned) ·
@@ -278,8 +278,8 @@ keep today's behaviour for the part the older side lacks.
 | D5 | `/api/agent/self/*`, daemon verbs + `roomler devices`, grid + mesh | any error → the legacy peers table | merged #1646 (server), #1660 (daemon + desktop) |
 | D6 | launch once after install, autostart, Welcome, no-inherit spawn | `companion_autostart = false` | merged #1670 |
 | D7 | docs, vmtest check, field log | — | docs merged #1675; vmtest checks in the deploy repo; field log below |
-| — | release | — | `agent-v0.4.103` (`521598f83`) carries D1–D6 |
-| — | field fixes | revert | #1682 (#1681: the Welcome's Enable read the service probes' log noise — perMachine got the userspace path); #1688 (#1686: the old companion survived an update) — both ride 0.4.104 |
+| — | release | — | `agent-v0.4.103` (`521598f83`) carries D1–D6; `agent-v0.4.104` (`5e7bfc077`) and `agent-v0.4.105` (`f975c753a`) carry the field fixes |
+| — | field fixes | revert | #1682 (#1681: the Welcome's Enable read the service probes' log noise — perMachine got the userspace path); #1688 (#1686: the old companion survived an update) — both ride 0.4.104; #1703 (#1701: an enrolled SystemContext device read as not enrolled — the companion could not read the machine config W4(c) restricts to SYSTEM + Administrators, so it now asks the daemon) — rides 0.4.105 |
 
 New keys (`files_dir`, `local_restart_enabled`, `companion_autostart`, `localapi_pipe_pool`)
 are registered in the config surface like every other key.
@@ -317,7 +317,7 @@ are registered in the config surface like every other key.
       Ubuntu (`install.sh`) and macOS (`.pkg`), the Welcome view is up within 10 s of the
       daemon starting; a companion the user quit is not relaunched by a daemon restart;
       later logins start it in the tray.
-- [ ] **AC12** — "Enable" in the Welcome view ends with an overlay IP shown (perMachine) or
+- [x] **AC12** — "Enable" in the Welcome view ends with an overlay IP shown (perMachine) or
       userspace mode on a free port with an explanation (perUser).
 - [x] **AC13** — A companion the daemon launched holds no handle of the daemon's process
       (handle listing after a daemon restart).
@@ -370,3 +370,6 @@ are registered in the config surface like every other key.
 | 2026-09-26 | agent 0.4.103 (the released `.deb`, a container on a Linux host) | **AC8 (never probes)**: `server_url` pointed at a refusing port, so no hello can happen: 8 `encoder_caps` queries over 40 s → `state=not_probed` every time, no `caps-probe` child, no `caps probe:` log line. Control, the real server: the hello's probe ran (`child reported elapsed_ms=50 … cells=2`) and the same query then read `state=ready probe_ms=50 cells=2` |
 | 2026-09-26 | a signalling-only build of master `b61a337` (`cargo build -p roomlerd --release`, no features; a container on a Linux host) | **AC8 (unsupported)**: enrolled and running, `encoder_caps` → `state=unsupported cells=0` at start and again after its `rc:agent.hello`; no `caps-probe` child |
 | 2026-09-26 | agent 0.4.103 (vmtest win11 MSI SystemContext; drops from the production web viewer) | **AC9**: the person at the console set `~\DropsA` → "in effect now — no restart needed" (`applies="live"`) → a 256 KiB drop landed in `C:\Users\vmtest\DropsA`, SHA-256 identical; they set `~\DropsB`, no restart → the next drop landed in `C:\Users\vmtest\DropsB`, identical. Use time: `C:\RoomlerDrops` written into the config behind the daemon's back + a restart → the drop logged `files: configured files_dir refused - this transfer lands in the default folder … must be inside the active user's profile (C:\Users\vmtest)` and landed in `C:\Users\vmtest\Downloads`, identical; `C:\RoomlerDrops` was never created. Set time: refused through the companion (the cell's probe), and a set from anyone but the person at the console is refused outright ("only the person at this device's console can change where incoming files land") |
+| 2026-09-26 | `agent-v0.4.104` (`5e7bfc077`; vmtest win11 MSI attended + SystemContext) | **AC12 (perMachine, attended) ✅**: the Welcome's network step now offers "Turn on the private network" (the TUN path; 0.4.103 offered userspace) and ends "Connected. This computer is 100.65.20.4 on your private network." — #1682 in the field. **AC12 (SystemContext) ❌**: the label was right but Enable was disabled; step 1 read "Not enrolled yet" next to "● Connected". A second, independent cause, **#1701**: the companion read the machine-global config, which W4(c) restricts to SYSTEM + Administrators (as the console user `Get-Content` → *Access is denied*, while `roomler status` over the LocalAPI → enrolled). Fix #1703: the companion asks the daemon when it cannot read the file. A side-load of #1703 on the same guest turned `welcome-enable` FAIL → PASS. **#1686 after-run ✅**: 0.4.103 → 0.4.104 through the daemon's own updater — one refresher (the service host), the old companion stopped by PID, one companion running from the live image |
+| 2026-09-26 | `agent-v0.4.104` (fresh vmtest win11 MSI SystemContext) | **AC12 negative control, the same day as the fix shipped**: `welcome-enable` FAIL on a fresh 0.4.104 SystemContext cell (#1701) |
+| 2026-09-26 | `agent-v0.4.105` (`f975c753a`; fresh vmtest win11 MSI SystemContext + attended, the shipped MSI) | **AC12 (SystemContext) ✅**: overlay off → Apply now → the Welcome's network step state "Off", "Turn on the private network" → "Connected. This computer is 100.65.20.4 on your private network." **AC12 (attended) ✅** again on the shipped build ("… 100.65.20.3 …"). Every other cell check passed on both — install, enroll, overlay, companion autostart, restart-supervised 6.6–6.9 s with `crash_count` unchanged, RC frames, the six desktop views, settings groups + live save (SystemContext refused `C:\RoomlerDrops`, saved `~\Drops` live), caps card = `roomlerd caps`, devices grid / mesh / columns |
