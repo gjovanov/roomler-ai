@@ -93,4 +93,26 @@ describe('companion viewing banner (FR-27, FR-85 P3b)', () => {
     expect($('v-rec-stop').hidden).toBe(true)
     expect($('v-who').textContent).toBe('Being viewed by Alice')
   })
+
+  it('keeps saying a dropped session’s recording goes on, with its Stop and no Disconnect (P3b-3)', async () => {
+    mount(vi.fn(async () => [session({ recording: true, reconnecting: true })]))
+    await settle()
+    expect($('v-who').textContent).toBe('Recording your screen for Alice')
+    expect($('v-sub').textContent).toContain('reconnecting')
+    expect($('v-rec-stop').hidden).toBe(false)
+    // No session is left to disconnect.
+    expect($('v-stop').hidden).toBe(true)
+  })
+
+  it('offers Disconnect again while another session is live beside it (P3b-3)', async () => {
+    mount(
+      vi.fn(async () => [
+        session({ session_id: 'a', recording: true, reconnecting: true }),
+        session({ session_id: 'b', controller_name: 'Bob' }),
+      ]),
+    )
+    await settle()
+    expect($('v-rec-stop').hidden).toBe(false)
+    expect($('v-stop').hidden).toBe(false)
+  })
 })

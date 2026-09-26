@@ -101,6 +101,12 @@ pub struct ViewerIndicator {
     /// The channel a registry-driven Disconnect fires through — the same one
     /// the native overlay's own button uses, so both take one teardown path.
     kill_tx: Option<KillSender>,
+    /// FR-85 P3b-3 — the sessions whose recording is running, and whether
+    /// each one's SESSION has already ended (`true`: the banner is kept only
+    /// for the recording's re-attach grace). Kept here, not read back from
+    /// the registry or the native badge, because either may lack the entry.
+    recordings:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<bson::oid::ObjectId, bool>>>,
 }
 
 impl ViewerIndicator {
@@ -120,6 +126,7 @@ impl ViewerIndicator {
             inner: Inner::new(kill_tx.clone(), consent_tx)?,
             registry,
             kill_tx: Some(kill_tx),
+            recordings: Default::default(),
         })
     }
 
@@ -135,6 +142,7 @@ impl ViewerIndicator {
             // registry there would be the bug, not the safe default.
             registry: crate::rc_sessions::RcSessionRegistry::new(),
             kill_tx: None,
+            recordings: Default::default(),
         }
     }
 
@@ -211,6 +219,13 @@ impl ViewerIndicator {
         session_id: bson::oid::ObjectId,
         recording: bool,
     ) -> RecordingShown {
+        if let Ok(mut r) = self.recordings.lock() {
+            if recording {
+                r.insert(session_id, false);
+            } else {
+                r.remove(&session_id);
+            }
+        }
         RecordingShown {
             native: self.inner.set_recording(&session_id.to_hex(), recording),
             listed: self.registry.set_recording(&session_id, recording),
@@ -219,11 +234,45 @@ impl ViewerIndicator {
 
     /// Announce that a session has ended. When the last session drops,
     /// the overlay is hidden.
+    ///
+    /// ⚠️ FR-85 P3b-3 — NOT while the session is recording. Its recording
+    /// outlives it for the re-attach grace, and nothing may stop saying
+    /// "recording" while a recording runs: the banner (native and listed)
+    /// stays, marked reconnecting, until [`Self::end_recording`].
     pub fn hide_session(&self, session_id: String) {
         if let Ok(oid) = bson::oid::ObjectId::parse_str(&session_id) {
+            let recording = self
+                .recordings
+                .lock()
+                .ok()
+                .and_then(|mut r| r.get_mut(&oid).map(|detached| *detached = true))
+                .is_some();
+            if recording {
+                self.registry.session_ended(&oid);
+                return;
+            }
             self.registry.remove(&oid);
         }
         self.inner.hide(session_id);
+    }
+
+    /// FR-85 P3b-3 — the recording of `session_id` ended, or moved to its
+    /// controller's next session. Nothing says "recording" for it any more,
+    /// and a banner that was kept only for the recording (its session
+    /// already gone) comes down. On a live session this is exactly
+    /// `set_recording(session_id, false)`.
+    pub fn end_recording(&self, session_id: bson::oid::ObjectId) {
+        let detached = self
+            .recordings
+            .lock()
+            .ok()
+            .and_then(|mut r| r.remove(&session_id))
+            .unwrap_or(false);
+        self.inner.set_recording(&session_id.to_hex(), false);
+        self.registry.recording_ended(&session_id);
+        if detached {
+            self.inner.hide(session_id.to_hex());
+        }
     }
 }
 
@@ -459,5 +508,61 @@ mod tests {
     fn initials_empty_is_placeholder() {
         assert_eq!(initials_of(""), "?");
         assert_eq!(initials_of("   "), "?");
+    }
+
+    fn with_banner() -> (
+        super::ViewerIndicator,
+        crate::rc_sessions::RcSessionRegistry,
+    ) {
+        let registry = crate::rc_sessions::RcSessionRegistry::new();
+        let (kill, _rx) = tokio::sync::mpsc::channel(4);
+        let ind = super::ViewerIndicator::disabled().with_registry(kill, registry.clone());
+        (ind, registry)
+    }
+
+    /// FR-85 P3b-3 — the signalling loop hides a session the moment it ends,
+    /// but a session that is RECORDING keeps its banner (reconnecting) for as
+    /// long as its recording lasts: a recording is never unseen. The banner
+    /// comes down with the recording.
+    #[test]
+    fn a_recording_sessions_banner_outlives_the_session_until_the_recording_ends() {
+        let (ind, reg) = with_banner();
+        let (a, b) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        ind.show_session_full(a, "Rec".into(), "VIEW | RECORD".into(), String::new());
+        ind.show_session_full(b, "Watch".into(), "VIEW".into(), String::new());
+        assert!(ind.set_recording(a, true).listed);
+
+        ind.hide_session(b.to_hex());
+        ind.hide_session(a.to_hex());
+        let listed = reg.list();
+        assert_eq!(
+            listed.len(),
+            1,
+            "the watcher went, the recording stayed: {listed:?}"
+        );
+        assert_eq!(listed[0].session_id, a.to_hex());
+        assert!(listed[0].recording && listed[0].reconnecting);
+
+        ind.end_recording(a);
+        assert!(
+            reg.list().is_empty(),
+            "the kept banner outlived its recording"
+        );
+    }
+
+    /// The same end on a LIVE session only clears "recording"; the session's
+    /// banner stays for as long as the session does, and then goes as usual.
+    #[test]
+    fn a_recording_that_ends_on_a_live_session_keeps_the_session_on_screen() {
+        let (ind, reg) = with_banner();
+        let a = bson::oid::ObjectId::new();
+        ind.show_session_full(a, "Rec".into(), "VIEW | RECORD".into(), String::new());
+        ind.set_recording(a, true);
+        ind.end_recording(a);
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].recording && !listed[0].reconnecting);
+        ind.hide_session(a.to_hex());
+        assert!(reg.list().is_empty());
     }
 }

@@ -19,6 +19,10 @@ export type RecordState =
   | 'idle'
   | 'pending_consent'
   | 'recording'
+  /** P3b-3 — the session dropped mid-recording. The device goes on recording
+   *  for up to a minute for this controller's next session, which picks it
+   *  up when its `record` channel asks for the status. */
+  | 'reconnecting'
   | 'stopped'
   | 'refused'
   | 'failed'
@@ -233,9 +237,19 @@ export function useRemoteRecording(
   }
 
   function applyState(m: Record<string, unknown>) {
-    const s = String(m.state ?? 'idle') as RecordState
+    let s = String(m.state ?? 'idle') as RecordState
+    // P3b-3 — the device picked the recording up for this session: its id is
+    // the one Stop must name, even if this page never started it (a reload).
+    if (s === 'recording' && typeof m.id === 'string' && m.id) currentId = m.id
+    // Back after a drop, and nothing is recording any more: it ended while
+    // this session was away (the grace ran out, or the device stopped it).
+    let away = false
+    if (s === 'idle' && state.value === 'reconnecting') {
+      s = 'stopped'
+      away = true
+    }
     state.value = s
-    reason.value = typeof m.reason === 'string' ? m.reason : null
+    reason.value = away ? 'session_ended' : typeof m.reason === 'string' ? m.reason : null
     detail.value = typeof m.detail === 'string' ? m.detail : null
     if (typeof m.name === 'string') name.value = m.name
     bytes.value = Number(m.bytes ?? 0)
@@ -357,9 +371,14 @@ export function useRemoteRecording(
     ch.onclose = () => {
       if (channel === ch) channel = null
       pause('session_ended')
-      // The device stops a recording its session left (`session_ended`);
-      // this channel will not be there to say so.
-      if (state.value === 'recording' || state.value === 'pending_consent') {
+      // P3b-3 — the device does not stop a recording its session left: it
+      // waits up to a minute for this controller's next session, whose
+      // channel asks for the status as it opens and picks it up.
+      if (state.value === 'recording') {
+        state.value = 'reconnecting'
+        reason.value = null
+      } else if (state.value === 'pending_consent') {
+        // A question the host was asked dies with the session.
         state.value = 'stopped'
         reason.value = 'session_ended'
       }
@@ -389,6 +408,27 @@ export function useRemoteRecording(
 
   function stop() {
     send({ t: 'rc:record.stop', id: currentId })
+  }
+
+  /** P3b-3 — a DELIBERATE Disconnect ends the recording first. The device
+   *  cannot tell a hang-up from the reconnect ladder's retry (both are
+   *  `controller_hangup`), and a retry is exactly what the re-attach grace
+   *  keeps a recording running for: left alone, the device would record a
+   *  minute more for a controller who has gone. Resolves once the device
+   *  says it stopped, or after `timeoutMs` (the Disconnect goes ahead either
+   *  way). A recording whose channel is already gone (`reconnecting`) cannot
+   *  be asked; the device's grace ends it. */
+  function stopBeforeLeaving(timeoutMs = 3000): Promise<void> {
+    if (state.value !== 'recording') return Promise.resolve()
+    stop()
+    return new Promise<void>((resolve) => {
+      const started = Date.now()
+      const look = () => {
+        if (state.value !== 'recording' || Date.now() - started >= timeoutMs) resolve()
+        else setTimeout(look, 50)
+      }
+      look()
+    })
   }
 
   function list() {
@@ -440,6 +480,7 @@ export function useRemoteRecording(
     detach,
     start,
     stop,
+    stopBeforeLeaving,
     list,
     downloadRecording,
     cancelDownload,

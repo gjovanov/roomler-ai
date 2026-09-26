@@ -1028,6 +1028,12 @@ pub struct RcSessionInfo {
     /// records remotely).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recording: bool,
+    /// FR-85 P3b-3 — the SESSION is gone, and its recording goes on for up to
+    /// a minute while its controller reconnects. The banner keeps saying so,
+    /// with its Stop: a recording is never unseen. There is no session left
+    /// to disconnect. Additive, like `recording`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reconnecting: bool,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
