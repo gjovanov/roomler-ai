@@ -4611,7 +4611,21 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             // P5/A2 — this process::exit bypasses RAII; drop any exit-node
             // split-default so the update window can't blackhole egress (the new
             // binary's boot reconciler heals it too, but close the gap now).
-            roomlerd::purge_exit_routes();
+            // #1690 — only when no daemon owns them: this is a second process,
+            // and a running daemon's routes and DNS steer are its own.
+            let daemon_running = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tunnel_core::localapi::connect()
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if !roomlerd::purge_exit_routes_unless_owned(daemon_running) {
+                tracing::info!(
+                    "self-update: a running daemon owns the overlay's routes and DNS steer — leaving them to it"
+                );
+            }
             std::process::exit(0);
         }
         updater::CheckOutcome::Skipped(reason) => {
