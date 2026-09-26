@@ -349,13 +349,7 @@ pub fn decide_restart(i: &RestartInputs) -> Result<RestartPlan, String> {
 /// in the same cgroup with the same environment, and exiting it would restart
 /// nothing.
 pub fn systemd_restarts(show: &str, my_pid: u32, exit_code: i32) -> Result<(), String> {
-    let prop = |key: &str| -> Option<&str> {
-        show.lines().find_map(|l| {
-            l.strip_prefix(key)
-                .and_then(|rest| rest.strip_prefix('='))
-                .map(str::trim)
-        })
-    };
+    let prop = |key: &str| -> Option<&str> { systemd_prop(show, key) };
     let lists = |key: &str| -> bool {
         let code = exit_code.to_string();
         prop(key).is_some_and(|v| v.split_whitespace().any(|t| t == code))
@@ -398,19 +392,102 @@ pub fn systemd_restarts(show: &str, my_pid: u32, exit_code: i32) -> Result<(), S
     }
 }
 
-/// The properties [`systemd_restarts`] reads.
-pub const SYSTEMD_SHOW_PROPERTIES: [&str; 5] = [
+/// The properties [`systemd_restarts`] and [`systemd_restart_within_secs`] read.
+pub const SYSTEMD_SHOW_PROPERTIES: [&str; 7] = [
     "MainPID",
     "Restart",
     "RestartPreventExitStatus",
     "RestartForceExitStatus",
     "SuccessExitStatus",
+    // FR-84 D3 / #1684 — how long a stop+restart of this unit can take, so the
+    // caller's wait can follow the SUPERVISOR instead of a fixed guess: systemd
+    // waits up to `TimeoutStopSec` for the cgroup to empty, then `RestartSec`
+    // before relaunching.
+    "TimeoutStopUSec",
+    "RestartUSec",
 ];
+
+/// One `systemctl show` property value (`Key=value`), trimmed, or `None`.
+fn systemd_prop<'a>(show: &'a str, key: &str) -> Option<&'a str> {
+    show.lines().find_map(|l| {
+        l.strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::trim)
+    })
+}
+
+/// Parse a systemd `*USec=` property VALUE into whole seconds (rounded up), or
+/// `None` if it is absent, `infinity`, or unparseable.
+///
+/// `systemctl show` prints these either as an integer count of MICROSECONDS
+/// (older systemd) or as a human span like `1min 30s` / `500ms` / `2s` (newer)
+/// — both forms are handled. `infinity` and anything we cannot read map to
+/// `None`, so the caller falls back to its own default rather than trusting a
+/// misread. Deliberately permissive-then-safe: the cost of `None` is "wait the
+/// old fixed amount", never a wrong number.
+pub fn parse_usec_secs(value: &str) -> Option<u64> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    // Integer microseconds (the machine form): all ASCII digits.
+    if v.bytes().all(|b| b.is_ascii_digit()) {
+        let us: u128 = v.parse().ok()?;
+        return Some(us.div_ceil(1_000_000).min(u64::MAX as u128) as u64);
+    }
+    // Human form: whitespace-separated `<number><unit>` tokens, summed in
+    // milliseconds. Any token we don't recognise fails the whole parse (safe).
+    let mut total_ms: u128 = 0;
+    for tok in v.split_whitespace() {
+        let split = tok.find(|c: char| !c.is_ascii_digit())?;
+        if split == 0 {
+            return None; // no leading number
+        }
+        let (num, unit) = tok.split_at(split);
+        let n: u128 = num.parse().ok()?;
+        let ms = match unit {
+            "us" | "usec" => n.div_ceil(1000),
+            "ms" | "msec" => n,
+            "s" | "sec" | "seconds" | "second" => n.checked_mul(1_000)?,
+            "min" | "m" => n.checked_mul(60_000)?,
+            "h" | "hr" | "hour" | "hours" => n.checked_mul(3_600_000)?,
+            "d" | "day" | "days" => n.checked_mul(86_400_000)?,
+            "w" | "week" | "weeks" => n.checked_mul(604_800_000)?,
+            _ => return None,
+        };
+        total_ms = total_ms.checked_add(ms)?;
+    }
+    if total_ms == 0 {
+        return None;
+    }
+    Some((total_ms.div_ceil(1_000)).min(u64::MAX as u128) as u64)
+}
+
+/// The upper bound, in seconds, on how long a stop + relaunch of this unit can
+/// take: `TimeoutStopSec` (waiting for the cgroup to empty) + `RestartSec`.
+/// Pure, from `systemctl show` output. `None` when neither is known — the
+/// caller then keeps its own default wait. A known-but-`infinity` timeout also
+/// yields `None` on that term (we cannot wait forever), leaving whatever the
+/// other term contributes.
+pub fn systemd_restart_within_secs(show: &str) -> Option<u64> {
+    let stop = systemd_prop(show, "TimeoutStopUSec").and_then(parse_usec_secs);
+    let restart = systemd_prop(show, "RestartUSec").and_then(parse_usec_secs);
+    match (stop, restart) {
+        (None, None) => None,
+        _ => Some(stop.unwrap_or(0).saturating_add(restart.unwrap_or(0))),
+    }
+}
 
 /// Ask systemd — the manager itself, not the unit file — whether it will
 /// restart this process after `exit_code`. Bounded (5 s); any failure to get
 /// an answer is a refusal, because "probably" is not a restart.
-pub async fn confirm_systemd(unit: SystemdUnit, exit_code: i32) -> Result<(), String> {
+///
+/// On success returns the unit's [`systemd_restart_within_secs`] hint (`None`
+/// when systemd did not report the timers), read from the SAME `systemctl show`
+/// so the restart verb can tell the caller how long the relaunch may take
+/// (#1684) — a SIGTERM-deaf process in the cgroup can push a stop out to
+/// `TimeoutStopSec + RestartSec`, well past a fixed 60 s wait.
+pub async fn confirm_systemd(unit: SystemdUnit, exit_code: i32) -> Result<Option<u64>, String> {
     let mut cmd = tokio::process::Command::new("systemctl");
     if unit.user {
         cmd.arg("--user");
@@ -447,12 +524,10 @@ pub async fn confirm_systemd(unit: SystemdUnit, exit_code: i32) -> Result<(), St
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    systemd_restarts(
-        &String::from_utf8_lossy(&out.stdout),
-        std::process::id(),
-        exit_code,
-    )
-    .map_err(|why| format!("systemd would not restart {}: {why}", unit.name))
+    let show = String::from_utf8_lossy(&out.stdout);
+    systemd_restarts(&show, std::process::id(), exit_code)
+        .map_err(|why| format!("systemd would not restart {}: {why}", unit.name))?;
+    Ok(systemd_restart_within_secs(&show))
 }
 
 /// Where the last accepted restart is recorded: beside the config file the
@@ -1051,6 +1126,61 @@ mod tests {
         assert!(systemd_restarts("Restart=always\n", 4242, 9).is_err());
         assert!(systemd_restarts("MainPID=4242\n", 4242, 9).is_err());
         assert!(systemd_restarts("", 4242, 9).is_err());
+    }
+
+    /// FR-84 D3 / #1684 — the restart-within hint, from both `systemctl show`
+    /// forms. Anything we cannot read is `None`, so the caller keeps its own
+    /// fixed wait rather than trusting a misread number.
+    #[test]
+    fn parse_usec_covers_both_forms_and_fails_safe() {
+        // Integer microseconds (older systemd's machine form).
+        assert_eq!(parse_usec_secs("90000000"), Some(90));
+        assert_eq!(parse_usec_secs("5000000"), Some(5));
+        assert_eq!(parse_usec_secs("500000"), Some(1)); // 0.5 s rounds up
+        assert_eq!(parse_usec_secs("0"), Some(0));
+        // Human spans (newer systemd).
+        assert_eq!(parse_usec_secs("1min 30s"), Some(90));
+        assert_eq!(parse_usec_secs("2s"), Some(2));
+        assert_eq!(parse_usec_secs("500ms"), Some(1));
+        assert_eq!(parse_usec_secs("1h"), Some(3600));
+        assert_eq!(parse_usec_secs("1min 30s 500ms"), Some(91)); // 90.5 s -> 91
+        // Unreadable / infinite / empty -> None.
+        assert_eq!(parse_usec_secs("infinity"), None);
+        assert_eq!(parse_usec_secs(""), None);
+        assert_eq!(parse_usec_secs("nonsense"), None);
+        assert_eq!(parse_usec_secs("30x"), None);
+        assert_eq!(parse_usec_secs("s"), None);
+    }
+
+    #[test]
+    fn restart_within_sums_stop_and_restart() {
+        // The shipped system unit: TimeoutStopSec=90s (systemd default),
+        // RestartSec=5s.
+        assert_eq!(
+            systemd_restart_within_secs("TimeoutStopUSec=1min 30s\nRestartUSec=5s\n"),
+            Some(95)
+        );
+        // Integer-microsecond form, same answer.
+        assert_eq!(
+            systemd_restart_within_secs("TimeoutStopUSec=90000000\nRestartUSec=5000000\n"),
+            Some(95)
+        );
+        // Only one term known.
+        assert_eq!(systemd_restart_within_secs("RestartUSec=5s\n"), Some(5));
+        assert_eq!(
+            systemd_restart_within_secs("TimeoutStopUSec=90000000\n"),
+            Some(90)
+        );
+        // infinity stop + 5 s restart -> just the term we can bound.
+        assert_eq!(
+            systemd_restart_within_secs("TimeoutStopUSec=infinity\nRestartUSec=5s\n"),
+            Some(5)
+        );
+        // Neither reported -> None (the caller keeps its own wait).
+        assert_eq!(
+            systemd_restart_within_secs("MainPID=1\nRestart=always\n"),
+            None
+        );
     }
 
     #[test]

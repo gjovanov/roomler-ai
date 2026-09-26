@@ -1265,10 +1265,17 @@ impl LocalApiState for DaemonState {
             Ok(plan) => plan,
             Err(why) => return refused(why),
         };
-        if let sup::Supervision::Systemd(unit) = inner.supervision
-            && let Err(why) = sup::confirm_systemd(unit, plan.exit_code).await
-        {
-            return refused(why);
+        // #1684 — a systemd unit also tells us how long a stop+relaunch may
+        // take (`TimeoutStopSec + RestartSec`), so the caller can wait that
+        // long instead of a fixed guess. `None` for every other supervisor and
+        // when systemd did not report the timers — the caller keeps its
+        // default. Additive on the wire.
+        let mut restart_within_s: Option<u64> = None;
+        if let sup::Supervision::Systemd(unit) = inner.supervision {
+            match sup::confirm_systemd(unit, plan.exit_code).await {
+                Ok(within) => restart_within_s = within,
+                Err(why) => return refused(why),
+            }
         }
         let record = sup::RestartRecord {
             at_ms: now_ms,
@@ -1309,6 +1316,7 @@ impl LocalApiState for DaemonState {
             exit_code: plan.exit_code,
             pid: std::process::id(),
             started_at_ms: self.started_at_ms,
+            restart_within_s,
         }
     }
 
@@ -2329,10 +2337,14 @@ mod tests {
                 exit_code,
                 pid,
                 started_at_ms,
+                restart_within_s,
             } => {
                 assert_eq!(supervisor, "scm");
                 assert_eq!(restart_by, "supervisor");
                 assert_eq!(exit_code, 0, "decide_exit_reaction(0) is Respawn");
+                // #1684 — the SCM supervisor reports no stop+relaunch bound;
+                // only systemd does. The caller keeps its fixed wait.
+                assert_eq!(restart_within_s, None);
                 // The same process identity `status` reports, so a waiting
                 // caller can recognise the one that is leaving.
                 let status = st.status();
