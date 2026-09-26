@@ -230,7 +230,7 @@ Get-NetFirewallRule -Direction Inbound | Where-Object {
   ($_ | Get-NetFirewallApplicationFilter).Program -ieq "$env:ProgramFiles\Roomler\roomlerd.exe"
 } | Select-Object Name, DisplayName, Action, Enabled, Profile
 # 3. Order: the host's line is logged before the worker's first bind.
-Select-String -Path "$env:ProgramData\roomler\service-logs\*" `
+Select-String -Path "$env:ProgramData\roomler\roomler\service-logs\roomlerd-service.log.*" `
   -Pattern 'installed for the worker BEFORE its first bind'
 ```
 
