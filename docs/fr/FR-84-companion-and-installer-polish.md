@@ -1,6 +1,6 @@
 # FR-84: The companion and the installer, finished — it starts after install, explains itself, and its pages hold still
 
-**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **shipped in 0.4.103; field verification in progress (2026-09-26)** — AC1–AC6, AC10, AC13, AC14 verified; AC7 (launchd), AC8, AC9, AC11, AC12 open ·
+**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **shipped in 0.4.103; field verification in progress (2026-09-26)** — AC1–AC11, AC13, AC14 verified; AC12 (perMachine) waits on 0.4.104 (#1682) ·
 **Related:** [#1631](https://github.com/gjovanov/roomler-ai/issues/1631) (web: RC view stuck on the previous device) ·
 [#1632](https://github.com/gjovanov/roomler-ai/issues/1632) (a terminated session leaves the consent prompt up) ·
 [#1035](https://github.com/gjovanov/roomler-ai/issues/1035) (a route port held by a companion the daemon spawned) ·
@@ -299,13 +299,13 @@ are registered in the config surface like every other key.
       edit leaves the old route running.
 - [x] **AC6** — Settings shows grouped, collapsible keys with Essentials open; search finds a
       key inside a collapsed group; a live key saves without a restart prompt.
-- [ ] **AC7** — Apply now on a supervised Windows service returns the worker in < 10 s with
+- [x] **AC7** — Apply now on a supervised Windows service returns the worker in < 10 s with
       `crash_count` unchanged; an unsupervised `roomlerd run` refuses; systemd and launchd
       hosts verified via `roomler exec`.
-- [ ] **AC8** — The Overview caps card matches `roomlerd caps` on a Windows NVENC/QSV host and
+- [x] **AC8** — The Overview caps card matches `roomlerd caps` on a Windows NVENC/QSV host and
       a Linux VAAPI host; a signalling-only build says "unsupported"; querying it never
       starts a probe.
-- [ ] **AC9** — The Overview shows where dropped files land; changing it makes the next drop
+- [x] **AC9** — The Overview shows where dropped files land; changing it makes the next drop
       land there without a restart; a SYSTEM-context worker refuses a folder outside the
       active user's profile at set time and at use time.
 - [x] **AC10** — The desktop grid lists exactly this device's netmap set plus itself
@@ -313,7 +313,7 @@ are registered in the config surface like every other key.
       pages / sorts / searches on the server, keeps column order and visibility across
       restarts, draws the mesh for the same set, and no row carries `machine_id`, owner ids
       or keys.
-- [ ] **AC11** — After install on Win11 (served script and wizard, perMachine and perUser),
+- [x] **AC11** — After install on Win11 (served script and wizard, perMachine and perUser),
       Ubuntu (`install.sh`) and macOS (`.pkg`), the Welcome view is up within 10 s of the
       daemon starting; a companion the user quit is not relaunched by a daemon restart;
       later logins start it in the tray.
@@ -365,3 +365,8 @@ are registered in the config surface like every other key.
 | 2026-09-26 | agent 0.4.102 → 0.4.103 (vmtest win11 MSI attended, the daemon's own updater) | **#1686 before-run**: host `refreshing` 01:08:41.6 → `respawned=true` 01:08:43.9; worker `refreshing` 01:08:42.3 → `respawned=true` 01:08:44.9 — two refreshers, the companion closed and reopened twice in 3 s. This interleaving was benign (the worker checked after the host's respawn); the reporting host's was the other one. A hand-run `roomlerd self-update` over SSH is not a substitute: MSI 1601 twice. Side findings: #1689 (`rc:agent.update` on `auto_update = false` is swallowed silently), #1690 (the `self-update` CLI purges the running service's routes and DNS steer) |
 | 2026-09-26 | agent 0.4.103 (container on a Linux host, `roomlerd run` as PID 1, no supervisor) | **AC7 (orphan)**: `roomler restart` → rc 1, "the daemon refused to restart: this service is not running under a service manager it can identify … exiting would stop it for good rather than restart it"; still running, pid 1 → 1 |
 | 2026-09-26 | agent 0.4.103 (vmtest win11 MSI attended) | **AC13**: the companion the worker respawned in the post-update refresh (its parent has exited), after three daemon restarts: 302 handles — no socket (`\Device\Afd`), no daemon log or config, no `ProgramData\roomler` path, no roomler pipe, no process handle to a `roomlerd`; its files are the WebView2 runtime's, its own `desktop.log` and system resources; no listener owned by a dead pid. The listing's sanity check (the companion's known WebView2 process handles present) guards against an empty read |
+| 2026-09-26 | agent 0.4.103 (vmtest win11 MSI attended, reboots with autologon) | **AC11 (later logins)**: the tour marked done — the state a finished or skipped tour leaves — then a reboot: the HKLM `Run` login start (`--autostart`, parent `explorer.exe`) logged `action=Tray first_run_done=true`, and no `Roomler` window was on screen (a window list taken inside the console session). Control, no tour state: the same start logged `action=Show("welcome")` and the window was up. With `companion_autostart = false` both starts leave at once (`login start on a device whose companion_autostart is off — leaving`) — the kill switch, which the vmtest settings probe had flipped (it now puts it back) |
+| 2026-09-26 | agent 0.4.103 (a macOS host, the root launchd daemon, via `roomler exec`) | **AC7 (launchd)**: `roomler restart` → "pid 20382 exits with code 9; launchd relaunches it — back: pid 97139 after 1.0 s"; `launchctl print`: runs 1 → 2, last exit code 9; `crash_count` 0 → 0; both orgs reconnected; the running companion untouched. **AC11 (macOS `.pkg`)**: the 0.4.102 → 0.4.103 upgrade through the root update helper — `installer -pkg` 08:13:17 → the companion the postinstall started, 08:13:18.7, `action=Show("welcome") first_run_done=false` → the daemon up at 08:13:21.9: the Welcome was up before the daemon. An upgrade, not a fresh install; the postinstall that launches the companion is the same |
+| 2026-09-26 | agent 0.4.103 (the released `.deb`, a container on a Linux host) | **AC8 (never probes)**: `server_url` pointed at a refusing port, so no hello can happen: 8 `encoder_caps` queries over 40 s → `state=not_probed` every time, no `caps-probe` child, no `caps probe:` log line. Control, the real server: the hello's probe ran (`child reported elapsed_ms=50 … cells=2`) and the same query then read `state=ready probe_ms=50 cells=2` |
+| 2026-09-26 | a signalling-only build of master `b61a337` (`cargo build -p roomlerd --release`, no features; a container on a Linux host) | **AC8 (unsupported)**: enrolled and running, `encoder_caps` → `state=unsupported cells=0` at start and again after its `rc:agent.hello`; no `caps-probe` child |
+| 2026-09-26 | agent 0.4.103 (vmtest win11 MSI SystemContext; drops from the production web viewer) | **AC9**: the person at the console set `~\DropsA` → "in effect now — no restart needed" (`applies="live"`) → a 256 KiB drop landed in `C:\Users\vmtest\DropsA`, SHA-256 identical; they set `~\DropsB`, no restart → the next drop landed in `C:\Users\vmtest\DropsB`, identical. Use time: `C:\RoomlerDrops` written into the config behind the daemon's back + a restart → the drop logged `files: configured files_dir refused - this transfer lands in the default folder … must be inside the active user's profile (C:\Users\vmtest)` and landed in `C:\Users\vmtest\Downloads`, identical; `C:\RoomlerDrops` was never created. Set time: refused through the companion (the cell's probe), and a set from anyone but the person at the console is refused outright ("only the person at this device's console can change where incoming files land") |
