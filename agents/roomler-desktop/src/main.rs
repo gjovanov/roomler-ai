@@ -36,6 +36,7 @@
 
 mod commands;
 mod desktop_log;
+mod editor;
 mod first_run;
 mod panels;
 mod tray;
@@ -162,6 +163,16 @@ fn main() {
             commands::cmd_recording_delete,
             commands::cmd_recording_open,
             commands::cmd_pick_record_dir,
+            // FR-85 P5c — the Edit view.
+            editor::cmd_media_available,
+            editor::cmd_media_probe,
+            editor::cmd_edit_load,
+            editor::cmd_edit_save,
+            editor::cmd_export_start,
+            editor::cmd_export_status,
+            editor::cmd_export_cancel,
+            editor::cmd_pick_music,
+            editor::cmd_preview_src,
             // FR-84 D5c — the Devices page's grid and mesh.
             commands::cmd_devices,
             commands::cmd_mesh,
