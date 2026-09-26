@@ -22,10 +22,22 @@
 //! | 6 | a session consented ON THE HOST asks the host again (a fresh prompt id, never the session's); a deny is final for [`DENY_COOLDOWN`] | `consent_denied`, `consent_timeout`, `no_prompt_surface`, `rate_limited` |
 //! | 7 | something ON SCREEN says "recording" before the first frame: the daemon's badge (Windows) or the companion's banner | `no_indicator_surface` |
 //!
-//! ⚠️ Gate 7 has no unattended exception yet. A host with nobody at it could
-//! record without a banner, but a recorder there runs as SYSTEM/root, which
-//! the manager refuses until P1e; until then every remote recording is behind
-//! a banner.
+//! P1f — **the unattended exception to gate 7.** A service with nobody signed
+//! in (SYSTEM or root, no console user) records a remote session with no
+//! banner, because there is nobody to show one to: the owner's gate 1 is
+//! what allows it, the controller is told (`unattended: true` on the state),
+//! and the recorder is the daemon itself writing into the daemon's own folder,
+//! locked to the service side, never a person's. Someone who signs in is
+//! never recorded without a banner:
+//! - the identity is decided ONCE, before the indicator is skipped, and the
+//!   manager refuses the launch if it no longer holds;
+//! - an unattended recording already running is stopped `session_changed` the
+//!   moment someone signs in ([`Handler::follow`], every tick).
+//!
+//! All three read who is signed in FRESH: a cached "nobody" read twice within
+//! milliseconds is one observation, and review found the launch re-check a
+//! no-op on the cache before this was so. A LOCAL recording still needs
+//! someone at the device.
 //!
 //! The microphone is not a remote option: [`RecordingManager::start_remote`]
 //! has no parameter for it.
@@ -44,6 +56,7 @@ use tracing::{info, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
+use super::launch::Identity;
 use super::manager::{RecordingManager, RemoteInitiator, StartError};
 
 /// After a host says no, the same session may not ask again for this long:
@@ -105,11 +118,23 @@ fn manager() -> Option<&'static Arc<RecordingManager>> {
     MANAGER.get()
 }
 
+/// P1f — [`RecordingManager::identity_remote_fresh`] off the async runtime:
+/// asking afresh who is signed in runs `loginctl` on Linux. An answer that
+/// cannot be had reads as "nobody to record as" at a start (refused) and as
+/// "someone" in the watch (stopped): closed both ways.
+async fn fresh_remote_identity(
+    m: &'static Arc<RecordingManager>,
+) -> Result<Identity, super::launch::Refusal> {
+    tokio::task::spawn_blocking(move || m.identity_remote_fresh())
+        .await
+        .unwrap_or(Err(super::launch::Refusal::NoConsoleUser))
+}
+
 /// What this device advertises in `AgentCaps.record` right now.
 pub fn advertised() -> Vec<String> {
     advertise(
         gates(),
-        manager().is_some_and(|m| m.available()),
+        manager().is_some_and(|m| m.available_remote()),
         cfg!(feature = "audio"),
     )
 }
@@ -196,6 +221,11 @@ pub struct StateMsg {
     pub bytes: u64,
     pub duration_ms: u64,
     pub audio: bool,
+    /// FR-85 P1f — recording with nobody signed in at the device, so nothing
+    /// on its screen says so. Absent (false) otherwise; a viewer that does
+    /// not know the field reads nothing different.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unattended: bool,
 }
 
 impl StateMsg {
@@ -546,7 +576,7 @@ impl Handler {
         };
         if let Err(code) = precheck(
             gates(),
-            m.available(),
+            m.available_remote(),
             audio,
             cfg!(feature = "audio"),
             m.state().active,
@@ -630,19 +660,34 @@ impl Handler {
             }
         }
 
-        // ⚠️ Something on screen says "recording" BEFORE the first frame.
-        let shown = self.ctx.indicator.set_recording(sid, true);
-        let companion = shown.listed && self.ctx.companion.up().await;
-        if !(shown.native || companion) {
-            self.ctx.indicator.set_recording(sid, false);
-            return Some((
-                "no_indicator_surface",
-                Some(
-                    "nothing on this device can show that it is being recorded (no banner, and \
-                     the Roomler desktop app is not running)"
-                        .into(),
-                ),
-            ));
+        // P1f — decided ONCE, here, and asked FRESH (never a cached "nobody"):
+        // the manager re-checks it, fresh again, before the recorder launches,
+        // and `follow` stops an unattended recording the moment someone signs
+        // in.
+        let identity = match fresh_remote_identity(m).await {
+            Ok(i) => i,
+            Err(r) => return Some(("unavailable", Some(r.message().into()))),
+        };
+        let unattended = identity == Identity::Unattended;
+
+        // ⚠️ Something on screen says "recording" BEFORE the first frame —
+        // wherever there is someone to see it. An unattended host (a service
+        // with nobody signed in) has no one: the owner's gate is what allowed
+        // it, and the controller is told it records unattended.
+        if !unattended {
+            let shown = self.ctx.indicator.set_recording(sid, true);
+            let companion = shown.listed && self.ctx.companion.up().await;
+            if !(shown.native || companion) {
+                self.ctx.indicator.set_recording(sid, false);
+                return Some((
+                    "no_indicator_surface",
+                    Some(
+                        "nothing on this device can show that it is being recorded (no banner, \
+                         and the Roomler desktop app is not running)"
+                            .into(),
+                    ),
+                ));
+            }
         }
 
         let initiator = RemoteInitiator {
@@ -650,7 +695,7 @@ impl Handler {
             controller_user_id: self.ctx.controller_user_id,
             controller_name: self.ctx.controller_name.clone(),
         };
-        match m.start_remote(initiator, audio).await {
+        match m.start_remote(initiator, audio, identity).await {
             Ok(state) => {
                 let name = file_name(state.path.as_deref());
                 info!(session = %sid, ?name, audio, "remote recording started");
@@ -660,9 +705,10 @@ impl Handler {
                 let mut s = StateMsg::new(id, "recording");
                 s.name = name.clone();
                 s.audio = state.system_audio;
+                s.unattended = unattended;
                 send(&self.dc, &s).await;
                 self.report(RecordingActivityKind::Started, name, None, None, None);
-                tokio::spawn(self.clone().follow(id.to_string()));
+                tokio::spawn(self.clone().follow(id.to_string(), unattended));
                 None
             }
             Err(e) => {
@@ -782,21 +828,25 @@ impl Handler {
 
     /// P3b-2 — this controller's finished recordings.
     async fn list(&self, id: String) {
-        let items = match manager() {
-            Some(m) => match m.folder().await {
-                Some(dir) => {
-                    let who = self.ctx.controller_user_id;
-                    // P1e — read as the recorder's identity: the folder is
-                    // the person's, and so is whatever it has been made to
-                    // point at.
-                    m.as_user(move || owned_recordings(&dir, &who))
-                        .await
-                        .unwrap_or_default()
+        let mut items = Vec::new();
+        if let Some(m) = manager() {
+            // P1e — each place read as its own identity: the person's folder
+            // as the person (so whatever it has been made to point at is read
+            // with their rights), the unattended folder (P1f) as the daemon.
+            // The first place wins a name, as `get` does.
+            for (dir, identity) in m.remote_places().await {
+                let who = self.ctx.controller_user_id;
+                let found = m
+                    .as_identity(identity, move || owned_recordings(&dir, &who))
+                    .await
+                    .unwrap_or_default();
+                for item in found {
+                    if !items.iter().any(|i: &ListedRecording| i.name == item.name) {
+                        items.push(item);
+                    }
                 }
-                None => Vec::new(),
-            },
-            None => Vec::new(),
-        };
+            }
+        }
         send_json(
             &self.dc,
             &serde_json::json!({ "t": "rc:record.list", "id": id, "items": items }),
@@ -828,24 +878,33 @@ impl Handler {
             self.transfer_error(&id, "unavailable", None).await;
             return;
         };
-        let Some(dir) = m.folder().await else {
+        let places = m.remote_places().await;
+        if places.is_empty() {
             self.transfer_error(&id, "unavailable", None).await;
             return;
-        };
+        }
         let who = self.ctx.controller_user_id;
-        let name_c = name.clone();
-        // P1e — the ownership check and the open run as the recorder's
+        // P1e — the ownership check and the open run as each place's
         // identity, so a link or a junction in the person's folder reaches
-        // only what the person could read themselves.
-        let opened = m
-            .as_user(move || {
-                if !owned_by(&dir, &name_c, &who) {
-                    return None;
-                }
-                Some(open_no_follow(&dir.join(&name_c)))
-            })
-            .await
-            .flatten();
+        // only what the person could read themselves. The first place that
+        // holds this controller's recording by that name answers (P1f: the
+        // person's folder, then the unattended one), as the list does.
+        let mut opened = None;
+        for (dir, identity) in places {
+            let name_c = name.clone();
+            opened = m
+                .as_identity(identity, move || {
+                    if !owned_by(&dir, &name_c, &who) {
+                        return None;
+                    }
+                    Some(open_no_follow(&dir.join(&name_c)))
+                })
+                .await
+                .flatten();
+            if opened.is_some() {
+                break;
+            }
+        }
         // ⚠️ Someone else's recording and no recording look alike: a
         // controller learns nothing about files that are not theirs.
         let file = match opened {
@@ -1008,7 +1067,7 @@ impl Handler {
     /// Follow a recording this session started until its file is final:
     /// progress once a second, a stop when the owner switches remote
     /// recording off or the session is gone, then how it ended.
-    async fn follow(self: Arc<Self>, id: String) {
+    async fn follow(self: Arc<Self>, id: String, unattended: bool) {
         let Some(m) = manager() else { return };
         let sid = self.ctx.session_id;
         let mut gates_rx = gates_tx().subscribe();
@@ -1027,9 +1086,22 @@ impl Handler {
             if st.active && self.owns_active() {
                 let off = !gates().enabled;
                 let gone = self.dc.ready_state() == RTCDataChannelState::Closed;
-                if !stopping && (off || gone) {
+                // P1f — an UNATTENDED recording ends the moment someone signs
+                // in: they never saw it start, and nothing on their screen
+                // says it runs. Asked fresh every tick, never from a cache;
+                // an answer that cannot be had counts as "someone" (closed).
+                let signed_in = unattended
+                    && !stopping
+                    && fresh_remote_identity(m).await != Ok(Identity::Unattended);
+                if !stopping && (off || gone || signed_in) {
                     stopping = true;
-                    let reason = if off { "gate_revoked" } else { "session_ended" };
+                    let reason = if off {
+                        "gate_revoked"
+                    } else if signed_in {
+                        "session_changed"
+                    } else {
+                        "session_ended"
+                    };
                     info!(session = %sid, reason, "stopping a remote recording");
                     tokio::spawn(async move {
                         if let Some(m) = manager() {
@@ -1042,6 +1114,7 @@ impl Handler {
                 s.bytes = st.bytes;
                 s.duration_ms = st.duration_ms;
                 s.audio = st.system_audio;
+                s.unattended = unattended;
                 send(&self.dc, &s).await;
                 continue;
             }
