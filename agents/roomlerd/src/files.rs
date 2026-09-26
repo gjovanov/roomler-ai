@@ -2603,6 +2603,35 @@ mod tests {
         base.join(format!("roomler-files-dir-{tag}-{}", std::process::id()))
     }
 
+    /// Where an upload with no `dest_path` lands for the length of a test:
+    /// a scratch drop folder, set as the process-wide `files_dir` (the
+    /// production override `download_dir()` answers first), and put back to
+    /// unset when the guard drops, a failed assertion included. Hold
+    /// `FILES_DIR_TEST_LOCK` while it lives.
+    ///
+    /// ⚠️ Never a HOME/USERPROFILE redirect: on Windows the default ladder
+    /// resolves the Downloads known folder and ignores both, so those tests
+    /// wrote into the developer's REAL Downloads (452 `upload (N).txt` had
+    /// piled up there by 2026-09-26), and rewriting USERPROFILE mid-run
+    /// raced `win_identity`'s test, which reads it.
+    struct ScratchDrops(PathBuf);
+
+    impl ScratchDrops {
+        fn new(tag: &str) -> Self {
+            let dir = scratch_drop_dir(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            set_files_dir(Some(dir.to_string_lossy().into_owned()));
+            Self(dir)
+        }
+    }
+
+    impl Drop for ScratchDrops {
+        fn drop(&mut self) {
+            set_files_dir(None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// FR-84 D4 — the USE-time gate. A configured folder that passes is where
     /// the drop lands (created on first use); one the validator refuses —
     /// here a system root, the case a hand-edited config or the desktop's
@@ -3108,6 +3137,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_with_dest_path_lands_in_dest() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
         let _env = HOME_ENV_LOCK.lock().await;
         // End-to-end: a `begin` call with dest_path should produce a
         // path under the dest dir, not under Downloads.
@@ -3120,15 +3150,9 @@ mod tests {
         ));
         let dest = base.join("dest");
         tokio::fs::create_dir_all(&dest).await.unwrap();
-        // Point HOME / USERPROFILE at base so the Downloads fallback
-        // doesn't pollute the dev's actual Downloads dir if dest_path
-        // resolution somehow fell through.
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        unsafe {
-            std::env::set_var("HOME", &base);
-            std::env::set_var("USERPROFILE", &base);
-        }
+        // Should dest_path resolution ever fall through, the default folder
+        // is a scratch one, never the developer's real Downloads.
+        let _drops = ScratchDrops::new("dest-e2e");
 
         let h = FilesHandler::new();
         let path = h
@@ -3150,18 +3174,6 @@ mod tests {
 
         // Cleanup.
         h.abort().await;
-        unsafe {
-            if let Some(v) = prev_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(v) = prev_userprofile {
-                std::env::set_var("USERPROFILE", v);
-            } else {
-                std::env::remove_var("USERPROFILE");
-            }
-        }
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
@@ -3604,6 +3616,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_upload_and_download_do_not_contend() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
         let _env = HOME_ENV_LOCK.lock().await;
         // Critique #2 in the plan said an in-flight upload should
         // not block a concurrent download (and vice versa). Locks
@@ -3622,18 +3635,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Point HOME/USERPROFILE at base so begin() picks a Downloads
-        // dir we control. Otherwise begin() would land on the dev's
-        // real Downloads.
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        unsafe {
-            std::env::set_var("HOME", &base);
-            std::env::set_var("USERPROFILE", &base);
-        }
-        tokio::fs::create_dir_all(base.join("Downloads"))
-            .await
-            .unwrap();
+        // The upload lands in a scratch drop folder, never the dev's
+        // real Downloads (see `ScratchDrops`).
+        let _drops = ScratchDrops::new("concurrent");
 
         let h = FilesHandler::new();
         // Start an upload — populates `incoming`.
@@ -3659,25 +3663,24 @@ mod tests {
         let (final_path, bytes) = h.end("u1").await.expect("end");
         assert_eq!(final_path, upload_path);
         assert_eq!(bytes, 5);
+        // The whole point of the scratch folder: nothing a test uploads
+        // ever lands in the real Downloads (red with a HOME/USERPROFILE
+        // redirect on Windows, which the known folder ignores).
+        if let Some(real) =
+            directories::UserDirs::new().and_then(|u| u.download_dir().map(PathBuf::from))
+        {
+            assert!(
+                !final_path.starts_with(&real),
+                "a test upload landed in the real Downloads: {}",
+                final_path.display()
+            );
+        }
 
         // The download is still active.
         let cancelled = h.cancel_outgoing("d1").await;
         assert!(cancelled);
         h.finish_outgoing("d1").await;
 
-        // Restore env + cleanup.
-        unsafe {
-            if let Some(v) = prev_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(v) = prev_userprofile {
-                std::env::set_var("USERPROFILE", v);
-            } else {
-                std::env::remove_var("USERPROFILE");
-            }
-        }
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
@@ -3774,19 +3777,12 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_begin_chunk_end() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
         let _env = HOME_ENV_LOCK.lock().await;
+        // `begin` with no dest_path uses the drop folder: a scratch one
+        // here, never the dev's real Downloads (see `ScratchDrops`).
+        let _drops = ScratchDrops::new("round-trip");
         let h = FilesHandler::new();
-        let tmp = tempdir_or_skip().await;
-        // Override the download-dir resolver by ensuring the sanitized
-        // file lands somewhere writable. Easiest: test against the
-        // OS temp dir. `begin` uses Downloads, so we point
-        // HOME/USERPROFILE at tmp for the test.
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-            std::env::set_var("USERPROFILE", &tmp);
-        }
 
         let path = h
             .begin("t1".into(), "hello.txt".into(), 5, None, None)
@@ -3798,52 +3794,19 @@ mod tests {
         assert_eq!(bytes, 5);
         let got = tokio::fs::read(&final_path).await.unwrap();
         assert_eq!(got, b"hello");
-
-        // Restore env.
-        unsafe {
-            if let Some(v) = prev_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(v) = prev_userprofile {
-                std::env::set_var("USERPROFILE", v);
-            } else {
-                std::env::remove_var("USERPROFILE");
-            }
-        }
-        // Best-effort cleanup.
-        let _ = tokio::fs::remove_file(&final_path).await;
-    }
-
-    async fn tempdir_or_skip() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "roomlerd-files-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        tokio::fs::create_dir_all(&base).await.unwrap();
-        // Some test environments don't have a Downloads dir config —
-        // create one under HOME so directories::UserDirs can find it.
-        let dl = base.join("Downloads");
-        tokio::fs::create_dir_all(&dl).await.unwrap();
-        base
     }
 
     // ---- rc.19 P1 — staging dir + meta.json + sweep + sync_data ----
     //
     // These tests use `dest_path` to override the upload's target
     // directory because Windows `download_dir()` resolves via
-    // `KNOWNFOLDERID_Downloads`, NOT via HOME/USERPROFILE — so the
-    // existing HOME-redirect pattern other tests use only works on
-    // Linux. `dest_path` is the same operator-chosen-target path
-    // the browser sends when dropping into the drawer's current dir.
+    // `KNOWNFOLDERID_Downloads`, NOT via HOME/USERPROFILE (a test with no
+    // `dest_path` uses `ScratchDrops` instead). `dest_path` is the same
+    // operator-chosen-target path the browser sends when dropping into
+    // the drawer's current dir.
 
-    /// Create an isolated `dest_path`-style tempdir for staging tests.
-    /// Use this rather than `tempdir_or_skip` for rc.19 tests so the
-    /// staging dir is fully under our control on every platform.
+    /// Create an isolated `dest_path`-style tempdir for staging tests, so
+    /// the staging dir is fully under our control on every platform.
     async fn stage_tmpdir() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "roomler-rc19-stage-{}-{}",
