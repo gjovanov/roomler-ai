@@ -5,13 +5,14 @@
  * a VISIBLE outcome: the REC chip, or a refusal said in words. Never silence.
  *
  * Runs only against an agent whose caps advertise `record` (an image built
- * with the `recording` feature, its owner's `record_remote_enabled` on, and
- * someone to record as). The harness agents run as root with nobody at a
- * console, which the identity rule refuses (FR-85 P1e), so today none
- * advertises `record` and this spec skips; it becomes live with the
- * unattended exception (P1f). A refusal said in words is accepted as a
- * correct, visible outcome — a real recording is proven on real hosts in the
- * field matrix (FR-85 P6).
+ * with the `recording` feature, and its owner's `record_remote_enabled` on).
+ * The harness agents run as root with nobody at a console, so a recording
+ * there is UNATTENDED (FR-85 P1f): made by the daemon into its own folder,
+ * with no banner because there is nobody to show one to. `Dockerfile.agent-e2e`
+ * carries `recording` from P1f on; a harness image built before it
+ * advertises nothing and this spec skips. A refusal said in words is accepted
+ * as a correct, visible outcome — a real recording is proven on real hosts in
+ * the field matrix (FR-85 P6).
  */
 import { test, expect } from '@playwright/test'
 

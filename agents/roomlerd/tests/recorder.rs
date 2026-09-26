@@ -982,6 +982,33 @@ mod process {
         }
     }
 
+    /// FR-85 P1f — a REMOTE start decided under one identity is refused when
+    /// another holds as the recorder launches. An unattended start skipped
+    /// the banner because nobody was signed in, and must not then record a
+    /// person who signed in meanwhile, with nothing on their screen.
+    #[tokio::test]
+    async fn a_remote_start_refuses_if_who_is_signed_in_changed() {
+        use roomlerd::recording::launch::Identity;
+        use roomlerd::recording::manager::{RecordingManager, RemoteInitiator, StartError};
+        let dir = scratch();
+        let m = RecordingManager::new(
+            PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+            dir.path().join("config.toml"),
+        )
+        .with_identity(Ok(Identity::Inherit));
+        let initiator = RemoteInitiator {
+            session_id: bson::oid::ObjectId::new(),
+            controller_user_id: bson::oid::ObjectId::new(),
+            controller_name: "Tester".into(),
+        };
+        match m.start_remote(initiator, false, Identity::Unattended).await {
+            Err(StartError::Failed(message)) => {
+                assert!(message.contains("changed"), "{message}")
+            }
+            other => panic!("the start went ahead: {other:?}"),
+        }
+    }
+
     /// `ROOMLERD_RECORDING=0` closes every path at once, and says so: the
     /// state a client greys Start out with, a start, what the device
     /// advertises (`available`), the listing and the folder a download is
