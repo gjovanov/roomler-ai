@@ -59,3 +59,8 @@ pub mod socks5;
 pub mod transport;
 /// SOCKS5 UDP ASSOCIATE relay for the tunnel client's userspace mode.
 pub mod udp;
+/// Windows Defender Firewall rules for THIS binary — the inbound-UDP allow
+/// rule (one definition for the overlay's self-heal AND the SCM service
+/// host, #1698) and the cleanup of prompt-written Block rules. Pure parts
+/// build everywhere; the effectful parts are `#[cfg(windows)]`.
+pub mod winfw;

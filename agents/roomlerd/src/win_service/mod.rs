@@ -40,6 +40,7 @@ pub mod companion_procs;
 pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
+pub mod firewall;
 /// #1683 — the graceful-stop event the SCM host signals so a worker (an
 /// ephemeral device especially) self-unenrolls before it is TerminateProcess'd.
 pub mod stop_event;
@@ -49,7 +50,7 @@ pub mod system_context_probe;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -404,18 +405,24 @@ fn service_main_inner() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         service = NEW_SERVICE_NAME,
         worker_exe = %worker_exe.display(),
-        "service started; spawning worker supervisor"
+        "service started; preparing the firewall, then spawning the worker supervisor"
     );
 
-    // The supervisor blocks the calling thread, so we hand it to a
-    // dedicated OS thread and wait on the join handle. Returning the
-    // dispatcher thread to the SCM is the responsibility of the
-    // caller; we only need to keep this thread alive long enough to
-    // observe the supervisor's exit.
-    let sup_handle = thread::Builder::new()
-        .name("roomler-svc-supervisor".into())
-        .spawn(move || supervisor::run(worker_exe, worker_args, sup_rx))
-        .context("spawning supervisor thread")?;
+    // The once-per-start sequence (#1698): the firewall rule for the
+    // worker's path FIRST, then the supervisor — which is what spawns the
+    // process that binds. `run_startup_sequence` is the seam the ordering
+    // test drives with a recorder; this is its one production driver. The
+    // supervisor blocks its thread, so `HostSteps` gives it its own and this
+    // dispatcher thread waits on the handle to observe its exit.
+    let mut steps = HostSteps {
+        sup_rx: Some(sup_rx),
+        handle: None,
+    };
+    run_startup_sequence(&mut steps, worker_exe, worker_args)?;
+    let sup_handle = steps
+        .handle
+        .take()
+        .context("supervisor thread handle missing after spawn")?;
 
     match sup_handle.join() {
         Ok(Ok(())) => tracing::info!("supervisor exited cleanly"),
@@ -444,6 +451,61 @@ pub fn worker_args() -> Vec<String> {
         "--supervisor".to_string(),
         "scm".to_string(),
     ]
+}
+
+/// The service host's once-per-start steps between `Running` and the worker
+/// supervisor. A trait so the ORDER can be asserted with a recorder: the
+/// firewall rule for the worker's path must exist before anything of ours
+/// binds (#1698), and the supervisor is what spawns the thing that binds.
+pub(crate) trait StartupSteps {
+    /// Best-effort, bounded; its outcome is logged and never gates the spawn.
+    fn firewall_prep(&mut self, worker_exe: &Path) -> firewall::FirewallPrep;
+    /// Start the worker supervisor for `worker_exe worker_args…`.
+    fn spawn_supervisor(&mut self, worker_exe: PathBuf, worker_args: Vec<String>) -> Result<()>;
+}
+
+/// Run the host's once-per-start sequence, in order. The firewall prep's
+/// result is informational: a refused or timed-out `netsh` must never keep
+/// the daemon off the box — that would trade a firewall prompt for no
+/// remote access at all.
+pub(crate) fn run_startup_sequence<S: StartupSteps>(
+    steps: &mut S,
+    worker_exe: PathBuf,
+    worker_args: Vec<String>,
+) -> Result<()> {
+    let prep = steps.firewall_prep(&worker_exe);
+    tracing::debug!(
+        ?prep,
+        "service: firewall prep finished; starting the worker supervisor"
+    );
+    steps.spawn_supervisor(worker_exe, worker_args)
+}
+
+/// The production [`StartupSteps`]: the real firewall prep, and the
+/// supervisor on its own OS thread (it blocks the calling thread; the
+/// dispatcher thread waits on the handle to observe the supervisor's exit).
+struct HostSteps {
+    sup_rx: Option<mpsc::Receiver<supervisor::SupervisorEvent>>,
+    handle: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl StartupSteps for HostSteps {
+    fn firewall_prep(&mut self, worker_exe: &Path) -> firewall::FirewallPrep {
+        firewall::prepare_before_first_spawn(worker_exe)
+    }
+
+    fn spawn_supervisor(&mut self, worker_exe: PathBuf, worker_args: Vec<String>) -> Result<()> {
+        let sup_rx = self
+            .sup_rx
+            .take()
+            .context("supervisor already spawned once this start")?;
+        let handle = thread::Builder::new()
+            .name("roomler-svc-supervisor".into())
+            .spawn(move || supervisor::run(worker_exe, worker_args, sup_rx))
+            .context("spawning supervisor thread")?;
+        self.handle = Some(handle);
+        Ok(())
+    }
 }
 
 fn running_status() -> ServiceStatus {
@@ -511,6 +573,73 @@ mod tests {
             s.contains("roomler") && s.contains("service-logs"),
             "log dir layout drifted: {s}"
         );
+    }
+
+    /// A [`StartupSteps`] that records the order it was driven in.
+    struct Recorder {
+        calls: Vec<&'static str>,
+        prep: firewall::FirewallPrep,
+    }
+
+    impl StartupSteps for Recorder {
+        fn firewall_prep(&mut self, worker_exe: &Path) -> firewall::FirewallPrep {
+            assert_eq!(
+                worker_exe,
+                Path::new(r"C:\Program Files\Roomler\roomlerd.exe")
+            );
+            self.calls.push("firewall_prep");
+            self.prep.clone()
+        }
+
+        fn spawn_supervisor(&mut self, _exe: PathBuf, args: Vec<String>) -> Result<()> {
+            assert_eq!(args, ["run"]);
+            self.calls.push("spawn_supervisor");
+            Ok(())
+        }
+    }
+
+    fn drive(prep: firewall::FirewallPrep) -> Recorder {
+        let mut rec = Recorder {
+            calls: Vec::new(),
+            prep,
+        };
+        run_startup_sequence(
+            &mut rec,
+            PathBuf::from(r"C:\Program Files\Roomler\roomlerd.exe"),
+            vec!["run".to_string()],
+        )
+        .expect("sequence succeeds");
+        rec
+    }
+
+    /// #1698 — the fix IS the order: the rule for the worker's path is
+    /// written before the supervisor exists, so nothing of ours can bind
+    /// first and raise the prompt.
+    #[test]
+    fn startup_sequence_preps_the_firewall_before_the_supervisor_spawns() {
+        let rec = drive(firewall::FirewallPrep {
+            skipped: false,
+            rule_installed: true,
+            blocks_removed: 2,
+        });
+        assert_eq!(rec.calls, ["firewall_prep", "spawn_supervisor"]);
+    }
+
+    /// The prep is best-effort: a refused/timed-out netsh, or the kill
+    /// switch, must never keep the worker from starting — that would trade
+    /// a firewall prompt for no remote access at all.
+    #[test]
+    fn startup_sequence_spawns_the_supervisor_whatever_the_firewall_prep_reports() {
+        for prep in [
+            firewall::FirewallPrep::default(), // nothing installed, nothing removed
+            firewall::FirewallPrep {
+                skipped: true,
+                ..firewall::FirewallPrep::default()
+            },
+        ] {
+            let rec = drive(prep);
+            assert_eq!(rec.calls.last(), Some(&"spawn_supervisor"));
+        }
     }
 
     #[test]

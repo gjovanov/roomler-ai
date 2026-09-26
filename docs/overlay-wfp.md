@@ -106,3 +106,127 @@ overrides a GPO firewall block is exactly the pattern some EDRs flag as
 
 Implementation: `crates/tunnel-core/src/overlay/wfp.rs` (raw `windows-sys`
 0.61 FFI, gated `#[cfg(all(feature = "overlay-l3", windows))]`).
+
+## The other Windows firewall rule: the daemon's own inbound UDP (#1698)
+
+WFP above covers the **`roomler` adapter**. The daemon's WireGuard, disco/STUN
+and WebRTC sockets bind on the **physical** adapters too, and for those the
+ordinary Defender rule set applies: with no rule for `roomlerd.exe`, an
+unsolicited inbound UDP packet (a LAN-direct dial, a srflx punch) dies at the
+Public profile's default-deny. Since P9 (field-hit 2026-07-28) the daemon
+writes itself an allow rule at every TUN bring-up:
+
+| | |
+|---|---|
+| Name | `Roomler UDP-In (roomlerd)` — the exe stem, so the `roomler` tunnel client gets its own (`Roomler UDP-In (roomler)`) |
+| Shape | `dir=in action=allow protocol=udp program=<full path of roomlerd.exe>`, all profiles, every port |
+| Definition | `crates/tunnel-core/src/winfw.rs` — `UdpInAllowRule` is the ONE definition; both writers build their `netsh` calls from it |
+| Kill switch | `ROOMLERD_TUN_HYGIENE=0` — skips both writers (and the adapter's Private-profile set) |
+
+### Who writes it, and when — the attended-install prompt
+
+P9's premise was that a Windows *service* never sees the interactive
+"Allow access?" prompt. True for a SYSTEM worker; false for the **attended**
+perMachine flavour, whose worker the SCM host spawns in the signed-in user's
+session. Measured on a 0.4.104 vmtest guest (#1698): the worker bound its UDP
+sockets before the detached hygiene thread had added the rule, Windows raised
+the prompt (`PickerHost.exe`, "Windows Security", over the companion's
+Welcome), and the prompt wrote two `Roomler Daemon` **Block** rules (TCP + UDP,
+profile Public) for the exe. In Defender an explicit Block beats an Allow, so
+on every Public-profile network — home, hotel — unsolicited inbound UDP to the
+daemon stayed blocked until someone clicked Allow. Cancel, the cautious click,
+was the harmful one.
+
+```mermaid
+sequenceDiagram
+    participant SCM
+    participant Host as roomlerd service-run (SYSTEM)
+    participant FW as Defender Firewall
+    participant Worker as roomlerd run --supervisor scm (user session)
+    SCM->>Host: start
+    Host->>SCM: Running
+    Host->>FW: netsh delete + add "Roomler UDP-In (roomlerd)" (≤ 10 s per call)
+    Host->>FW: read the rule store; Remove-NetFirewallRule for inbound Block rules whose program == roomlerd.exe (≤ 30 s, only if any)
+    Host->>Worker: CreateProcessAsUserW
+    Worker->>FW: bind 0.0.0.0:<udp> — a rule exists for this path
+    Note over FW,Worker: no prompt, so no Block rules
+    Worker->>FW: TUN bring-up self-heal — store already holds exactly our rule, nothing to do
+```
+
+Since #1698 the **service host** writes the rule **before its first worker
+spawn** — `agents/roomlerd/src/win_service/firewall.rs`
+(`prepare_before_first_spawn`), driven by the `run_startup_sequence` seam in
+`win_service/mod.rs`, whose recorder test locks the order. Synchronous,
+bounded, best-effort: a refused or timed-out `netsh` is logged at WARN and the
+worker spawns anyway. The same run removes, once, the Block rules an earlier
+install's prompt left behind.
+
+| Flavour | Who writes the rule first | Prompt? |
+|---|---|---|
+| perMachine, SystemContext (worker = SYSTEM) | service host, before the spawn | never (SYSTEM was never prompted) |
+| perMachine, attended (worker = signed-in user) | service host, before the spawn | **no longer** — yes before #1698 |
+| perUser (Scheduled Task, cannot elevate) | the worker's own hygiene pass, only if the user is an admin | unchanged — may still prompt |
+| `roomler` tunnel client | its own hygiene pass (`Roomler UDP-In (roomler)`), only if elevated | unchanged |
+
+### The cleanup's predicate — exact, and never by name
+
+A rule is removed iff **direction inbound ∧ action Block ∧ program path equal
+to our `roomlerd.exe`** (case-insensitive, `%VAR%` expanded, `/`→`\`, `\\?\`
+stripped). `inbound_block_rules_for_program` in `winfw.rs` is the whole
+decision; its table test holds every neighbour it must not touch.
+
+- ⚠️ **Never by display name.** The prompt names its rules after the exe's
+  FileDescription (`Roomler Daemon`); any program can carry that name, and a
+  same-named `roomlerd.exe` in another directory is a different program.
+- ⚠️ **Allow rules are never touched** — not the prompt's own `Roomler Daemon`
+  Allow pair (someone clicked Allow), not ours. That is why the removal goes
+  through PowerShell (`Remove-NetFirewallRule -Name <store id>`) and not
+  `netsh delete`: netsh selects by name + dir + program and cannot filter on
+  action, so it would take an Allow of the same name along with the Blocks.
+- Rules are **read** from the local persistent store
+  (`HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules`,
+  the `v2.NN|Key=Value|…` grammar [MS-FASP] documents) and **removed by their
+  store id** — the value name, PowerShell's `Name`, distinct from
+  `DisplayName`. Reading costs a registry walk; PowerShell is spawned only when
+  there is something to remove, so the steady state spawns nothing. The store
+  is never written: the firewall service owns writes.
+- GPO-delivered rules live under `SOFTWARE\Policies\…` and are neither read
+  nor removable. A deliberate *local* inbound Block for `roomlerd.exe` is
+  removed too — the place for a policy block is GPO, and the daemon-side
+  switch is `ROOMLERD_TUN_HYGIENE=0`.
+
+### The self-heal, without the gap
+
+The per-bring-up pass in `overlay/tun.rs` (`spawn_windows_net_hygiene`) stays:
+it is what refreshes a stale program path after a moved install. It now heals
+only when the store does not already hold exactly our rule
+(`winfw::rule_is_current`: present once, Allow, In, UDP, our path, Active, all
+profiles, no clause netsh did not write). netsh's delete+add is not atomic, and
+in the gap between the two a session worker's next off-loopback bind has no
+rule for its path — the prompt again. Anything unexpected reads as "not
+current" and heals, so a wrong guess costs a netsh spawn, never a rule.
+
+### GPO-locked hosts
+
+Where `AllowLocalFirewallRules=False`, `netsh add` still returns success and
+the rule is inert; the host logs it as installed and moves on. Nothing on this
+path fails loudly, and nothing here replaces the WFP permit above for the
+adapter.
+
+### Field verification (attended Win11 guest)
+
+```powershell
+# 1. No prompt: no "Windows Security" window in the console session.
+Get-Process PickerHost -ErrorAction SilentlyContinue | Select-Object Id, MainWindowTitle
+# 2. Our Allow rule exists, and no Block rule names our exe.
+Get-NetFirewallRule -Direction Inbound | Where-Object {
+  ($_ | Get-NetFirewallApplicationFilter).Program -ieq "$env:ProgramFiles\Roomler\roomlerd.exe"
+} | Select-Object Name, DisplayName, Action, Enabled, Profile
+# 3. Order: the host's line is logged before the worker's first bind.
+Select-String -Path "$env:ProgramData\roomler\service-logs\*" `
+  -Pattern 'installed for the worker BEFORE its first bind'
+```
+
+On an upgrade over a guest that already holds the `Roomler Daemon` Block pair,
+the service log carries `removed inbound Block rules for this binary` once and
+step 2 then lists only the Allow rule.
