@@ -478,6 +478,11 @@ Release, signing and promotion mechanics: the **`ship-it` skill**.
   and the playbook **flushes and rebuilds** those chains — never hand-fix a host
   without also fixing the vars. App-side tell: `media transport has no DTLS 15s
   after connect_transport` in the pod log.
+  ⚠️ The same DNAT swallows the **host's own mesh node**. The overlay's default
+  port band (43648–44415) sits inside the range. So a serving host's `roomlerd` pins
+  `overlay_direct_port = 21640`, backed by a HOST_FW allow and
+  `ip_local_reserved_ports=40000-49999`. Without the pin, a peer's first packet lands
+  in the VM and the host rides DERP after every roll (#1665, `docs/deployment.md`).
 - ⚠️ **Tenant affinity pins long-lived sockets.** The front proxy hashes on the
   tenant key so a tenant's users, agents, tunnel clients, DERP sockets and
   mediasoup rooms land on ONE pod (the rc-hub / tunnel-hub / DERP relay / room

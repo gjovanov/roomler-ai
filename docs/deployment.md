@@ -201,6 +201,43 @@ The multi-pod design is settled and documented in
   tickets. One small VM per region is enough; it forwards WireGuard ciphertext it
   cannot read.
 
+## Cluster hosts: the media DNAT and the host's own mesh node
+
+A mediasoup-serving host (zeus and jupiter, `host_firewall_mediasoup_rtc: true` in
+`k8s-cluster-multi`) answers for two unrelated things on **one public IP**:
+- the RTC range 40000–49999, which `COTURN_DNAT` rewrites into the worker VM, where the pod's media ports are;
+- its own `roomlerd` mesh node.
+
+nat PREROUTING runs before any filter rule, so a port inside the RTC range can never
+belong to the host itself. A peer's first packet to it lands in the VM.
+
+```mermaid
+flowchart LR
+  P["peer's first packet<br/>to host-pub:port"] --> Q{"port inside<br/>40000–49999?"}
+  Q -- yes --> VM["COTURN_DNAT → worker VM<br/>(mediasoup) — the host never sees it"]
+  Q -- no --> IN["INPUT → HOST_FW_INPUT<br/>udp 21640:22415 ACCEPT"] --> R["roomlerd overlay socket"]
+```
+
+| Layer | Setting | Where it lives |
+|---|---|---|
+| Overlay port | `overlay_direct_port = 21640`. Its footprint is 21640–22415: the base, the +256 public-dial twin and the +512 fallback band | `/etc/roomler/config.toml` on the host |
+| Host firewall | `udp 21640:22415 ACCEPT` in `HOST_FW_INPUT`. jupiter has the chain; zeus has none | `k8s-cluster-multi` host_vars, plus `rules.v4` on the host |
+| Kernel | `net.ipv4.ip_local_reserved_ports = 40000-49999`. No ephemeral socket can land in the range: not the pin's fallback bind, not an RC or tunnel session socket | host-hardening sysctl, gated on `host_firewall_mediasoup_rtc` |
+| Drift guard | `mediasoup-rtc-forwarding.sh check` fails when `roomlerd` listens on the public IP inside the range | `roomler-ai-deploy`, run by the weekly audit |
+
+⚠️ **The overlay's default port band (43648–44415, derived per machine) sits inside
+the RTC range.** A new serving host needs the pin, or it holds a direct path only while
+it happened to open the flow itself. That was
+[#1665](https://github.com/gjovanov/roomler-ai/issues/1665): after a roll, both hosts sat
+on DERP. The tells:
+- `roomler why <host>` shows the direct candidate at 100 % loss;
+- on the host, `conntrack -L -p udp --orig-port-dst <port>` shows `[UNREPLIED]` entries
+  whose reply comes from the VM (`src=10.10.x.11`).
+
+⚠️ **Never "fix" this by carving ports out of the DNAT.** mediasoup allocates from the
+whole range, so a carve-out silently breaks every media transport that lands on a
+carved port. That is the zero-media failure class above, one port at a time.
+
 ## Release pipelines (native fleet)
 
 Tag-triggered GitHub workflows build, sign, and publish the native artifacts;
