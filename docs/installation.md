@@ -127,6 +127,14 @@ Details worth knowing:
   (prompts for role/token; flags mirror the sh script).
 - Binaries are Authenticode-signed; the MSI's payload EXEs are signed before
   packaging.
+- On a perMachine install the SCM host writes the Defender rule
+  `Roomler UDP-In (roomlerd)` **before** it spawns the worker, so an attended
+  install never sees the "Allow access?" prompt — and removes, once, the
+  `Roomler Daemon` Block rules an earlier install's prompt left behind (only
+  rules whose id carries the prompt's own signature; a Block an administrator
+  placed deliberately is left alone — #1698,
+  [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
+  and is unchanged.
 
 ## Linux
 
