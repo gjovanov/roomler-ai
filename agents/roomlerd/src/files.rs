@@ -968,6 +968,11 @@ pub(crate) struct OutgoingTransfer {
 pub struct FilesHandler {
     incoming: Arc<Mutex<Option<IncomingTransfer>>>,
     outgoing: Arc<Mutex<Option<OutgoingTransfer>>>,
+    /// Set by [`Self::end_session`]: nothing new begins on a session that
+    /// is over. A message already in flight when the session ended would
+    /// otherwise start a download after the teardown, whose pump outlives
+    /// it (found in review; the clipboard's `stopped` is the same guard).
+    ended: Arc<AtomicBool>,
 }
 
 impl Default for FilesHandler {
@@ -981,6 +986,7 @@ impl FilesHandler {
         Self {
             incoming: Arc::new(Mutex::new(None)),
             outgoing: Arc::new(Mutex::new(None)),
+            ended: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1014,6 +1020,9 @@ impl FilesHandler {
         rel_path: Option<&str>,
         dest_path: Option<&str>,
     ) -> Result<PathBuf> {
+        // Before anything lands on disk (a message straddling the session's
+        // end); an upload that got past this is dropped by `end_session`.
+        self.refuse_if_ended()?;
         if expected > MAX_TRANSFER_BYTES {
             return Err(anyhow!(
                 "transfer size {expected} exceeds the {} B cap",
@@ -1304,6 +1313,30 @@ impl FilesHandler {
         *guard = None;
     }
 
+    /// The session is over: drop an upload's state (its file closes; the
+    /// partial stays for a resume, as [`Self::abort`]) and stop a download
+    /// at its pump's next check. A download over a link slower than disk
+    /// waits on the channel's send buffer, and after a network drop that
+    /// buffer never drains: only its cancel flag (or the channel's state)
+    /// ends the pump, which otherwise ran on holding the file, the channel
+    /// and the transfer guard the updater defers for (found in review).
+    pub async fn end_session(&self) {
+        // First, so a begin that takes its lock after this refuses, and one
+        // that took it before is caught below.
+        self.ended.store(true, Ordering::Release);
+        self.abort().await;
+        if let Some(state) = self.outgoing.lock().await.as_ref() {
+            state.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn refuse_if_ended(&self) -> Result<()> {
+        if self.ended.load(Ordering::Acquire) {
+            return Err(anyhow!("the session is over"));
+        }
+        Ok(())
+    }
+
     /// rc.19: cancel an in-flight incoming upload. Removes the per-id
     /// staging dir + registry entry. Called from the
     /// `FilesIncoming::Cancel` arm in peer.rs (P2 wiring) when the
@@ -1543,6 +1576,8 @@ impl FilesHandler {
         let cancel = Arc::new(AtomicBool::new(false));
 
         let mut guard = self.outgoing.lock().await;
+        // Under the lock: `end_session` flags first, then takes it.
+        self.refuse_if_ended()?;
         if guard.is_some() {
             return Err(anyhow!(
                 "another outgoing transfer is already active; cancel it first"
@@ -2091,6 +2126,8 @@ impl FilesHandler {
         let cancel = Arc::new(AtomicBool::new(false));
 
         let mut guard = self.outgoing.lock().await;
+        // Under the lock: `end_session` flags first, then takes it.
+        self.refuse_if_ended()?;
         if guard.is_some() {
             return Err(anyhow!(
                 "another outgoing transfer is already active; cancel it first"
@@ -3642,6 +3679,66 @@ mod tests {
             }
         }
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// The session is over: a download's pump is told to stop (and an
+    /// upload's state goes, as [`FilesHandler::abort`]). Red without the
+    /// download half: after a drop its pump waits on a send buffer that
+    /// never drains, holding the file, the channel and the transfer guard
+    /// the updater defers for.
+    #[tokio::test]
+    async fn a_session_end_stops_the_download() {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-session-end-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let file_path = base.join("x.bin");
+        tokio::fs::write(&file_path, b"xx").await.unwrap();
+
+        let h = FilesHandler::new();
+        let offer = h
+            .begin_outgoing("session-end-d1".into(), &file_path.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        assert!(!offer.cancel.load(Ordering::Acquire));
+        h.end_session().await;
+        let told = offer.cancel.load(Ordering::Acquire);
+        // Twice is fine (the channel's own close may come after), and with
+        // no upload in flight there is none left.
+        h.end_session().await;
+        let upload_left = h.current_id().await;
+        // A message still in flight when the session ended begins nothing.
+        // (The upload names this test's own folder, never the real
+        // Downloads, should the refusal ever go.)
+        h.finish_outgoing("session-end-d1").await;
+        let late_download = h
+            .begin_outgoing("session-end-d2".into(), &file_path.to_string_lossy())
+            .await;
+        let late_upload = h
+            .begin(
+                "session-end-u2".into(),
+                "late.txt".into(),
+                1,
+                None,
+                Some(&base.to_string_lossy()),
+            )
+            .await;
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        assert!(told, "the download's pump was not told to stop");
+        assert_eq!(upload_left, None);
+        assert!(
+            late_download.is_err(),
+            "a download began after the session ended"
+        );
+        assert!(
+            late_upload.is_err(),
+            "an upload began after the session ended"
+        );
     }
 
     #[tokio::test]
