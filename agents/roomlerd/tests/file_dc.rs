@@ -251,7 +251,11 @@ async fn open_files_dc() -> Result<DcSide> {
         .map_err(|_| anyhow!("agent on_data_channel timed out"))?
         .map_err(|e| anyhow!("agent_dc_rx: {e}"))?;
     let session_id = bson::oid::ObjectId::new();
-    roomlerd::peer::attach_files_handler(agent_dc, session_id);
+    roomlerd::peer::attach_files_handler(
+        agent_dc,
+        session_id,
+        &tokio_util::sync::CancellationToken::new(),
+    );
 
     // Wait for the browser-side DC to reach `Open`. webrtc-rs reports
     // this via `on_open`. Poll-via-callback to a oneshot.
