@@ -63,16 +63,33 @@ impl UdpInAllowRule {
     /// The rule for `exe`. A path with no stem (never the case for a real
     /// binary) falls back to the `roomler` stem rather than an empty one.
     pub fn for_exe(exe: &Path) -> Self {
-        let stem = exe
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "roomler".into());
+        let text = exe.to_string_lossy();
+        let stem = windows_file_stem(&text).unwrap_or("roomler");
         Self {
             name: format!("{RULE_NAME_PREFIX} ({stem})"),
-            program: exe.to_string_lossy().to_string(),
+            program: text.into_owned(),
         }
     }
+}
 
+/// The file stem of a Windows path, from the text rather than
+/// `Path::file_stem`: on a non-Windows host `Path` treats `\` as an ordinary
+/// character, and the pure half of this module runs — and is tested — on the
+/// Linux CI lane. The rule's name must come out the same everywhere. Either
+/// separator is accepted; a leading dot is part of the name, not an extension.
+fn windows_file_stem(path: &str) -> Option<&str> {
+    let file = path.rsplit(['\\', '/']).next()?.trim();
+    if file.is_empty() {
+        return None;
+    }
+    let stem = match file.rfind('.') {
+        Some(0) | None => file,
+        Some(i) => &file[..i],
+    };
+    (!stem.is_empty()).then_some(stem)
+}
+
+impl UdpInAllowRule {
     /// The rule for the running binary; `None` only if the OS cannot say
     /// what that is.
     pub fn for_current_exe() -> Option<Self> {
@@ -770,6 +787,29 @@ mod tests {
         // The tunnel client gets its own rule — the two never fight.
         let c = UdpInAllowRule::for_exe(Path::new(r"C:\Tools\roomler.exe"));
         assert_eq!(c.name, "Roomler UDP-In (roomler)");
+    }
+
+    /// The rule's stem comes from the text of the path, so the Ubuntu CI lane
+    /// — where `Path::file_stem` would read `C:\…\roomlerd` as one component
+    /// — names the rule exactly as a Windows host does. (The first CI run of
+    /// #1712 caught precisely that.)
+    #[test]
+    fn rule_stem_is_derived_from_the_text_so_a_windows_path_reads_the_same_everywhere() {
+        assert_eq!(
+            windows_file_stem(r"C:\Program Files\Roomler\roomlerd.exe"),
+            Some("roomlerd")
+        );
+        assert_eq!(windows_file_stem("C:/Tools/roomler.exe"), Some("roomler"));
+        assert_eq!(windows_file_stem("roomlerd.exe"), Some("roomlerd"));
+        assert_eq!(windows_file_stem(r"C:\x\noext"), Some("noext"));
+        assert_eq!(windows_file_stem(r"C:\x\.hidden"), Some(".hidden"));
+        assert_eq!(windows_file_stem(r"C:\x\a.b.exe"), Some("a.b"));
+        assert_eq!(windows_file_stem(r"C:\x\"), None);
+        assert_eq!(windows_file_stem(""), None);
+        assert_eq!(
+            UdpInAllowRule::for_exe(Path::new(r"C:\x\")).name,
+            "Roomler UDP-In (roomler)"
+        );
     }
 
     /// The exact netsh argument lists `overlay::tun` has shipped since P9 —
