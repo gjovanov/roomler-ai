@@ -37,7 +37,7 @@ use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 use tunnel_core::localapi::{FlowKind, RouteDescriptor, RouteInfo, RouteState};
 
-use super::client_mgr::TunnelClientHub;
+use super::client_mgr::{FlowReport, TunnelClientHub};
 
 /// Steady-state reconcile cadence. Every pass is cheap (in-memory diff +
 /// a few hub map reads); creates only happen when something is out of
@@ -362,6 +362,12 @@ impl RouteReconciler {
     // ---- LocalAPI verb backs ---------------------------------------------
 
     /// The `RouteList` rows: declared descriptors joined with runtime state.
+    ///
+    /// #1685 — a `Live` runtime entry means the hub HAS a flow for the route,
+    /// not that the route serves; the state a reader gets comes from the
+    /// flow's own report ([`route_state_for_flow`]). Before this, `Live` was
+    /// mapped straight to `Active`, and a route to an offline node read
+    /// `active` with nothing listening on its port.
     pub fn list(&self) -> Vec<RouteInfo> {
         let routes = self.inner.routes.lock().unwrap().clone();
         let runtime = self.inner.runtime.lock().unwrap();
@@ -372,21 +378,28 @@ impl RouteReconciler {
                     RouteState::Disabled
                 } else {
                     match runtime.get(&route.id) {
-                        Some(RouteRuntime::Live { flow_id }) => RouteState::Active {
-                            flow_id: flow_id.clone(),
-                        },
+                        Some(RouteRuntime::Live { flow_id }) => {
+                            match self.inner.hub.flow_report(flow_id) {
+                                Some(report) => route_state_for_flow(flow_id, &report),
+                                // Killed by hand; the next pass recreates it.
+                                None => RouteState::Pending { flow_id: None },
+                            }
+                        }
                         Some(RouteRuntime::Failed { reason }) => RouteState::Failed {
                             reason: reason.clone(),
                         },
                         Some(RouteRuntime::Pending {
+                            consecutive_failures,
                             next_retry: Some(t),
                             last_error: Some(e),
-                            ..
                         }) if *t > Instant::now() => RouteState::Backoff {
                             next_retry_secs: t.saturating_duration_since(Instant::now()).as_secs(),
                             last_error: e.clone(),
+                            // No flow: creating one is what keeps failing.
+                            flow_id: None,
+                            attempts: *consecutive_failures,
                         },
-                        _ => RouteState::Pending,
+                        _ => RouteState::Pending { flow_id: None },
                     }
                 };
                 RouteInfo { route, state }
@@ -586,6 +599,37 @@ impl RouteReconciler {
     }
 }
 
+/// #1685 — the state a declared route reports for the flow the hub holds for
+/// it. `active` is the bound listener and nothing less. A flow whose session
+/// failed reads `backoff` WITH its flow id (the tunnel session, not flow
+/// creation, is what is being retried), carrying the last error, the
+/// consecutive failures and the countdown to the next attempt; a flow still
+/// on its first attempt — or between a healthy session's end and its
+/// re-open — reads `pending` with its flow id ("connecting").
+fn route_state_for_flow(flow_id: &str, report: &FlowReport) -> RouteState {
+    if let Some(reason) = &report.fatal {
+        return RouteState::Failed {
+            reason: reason.clone(),
+        };
+    }
+    if report.listening {
+        return RouteState::Active {
+            flow_id: flow_id.to_string(),
+        };
+    }
+    if report.failures > 0 || report.last_error.is_some() {
+        return RouteState::Backoff {
+            next_retry_secs: report.next_retry_in.map(|d| d.as_secs()).unwrap_or(0),
+            last_error: report.last_error.clone().unwrap_or_default(),
+            flow_id: Some(flow_id.to_string()),
+            attempts: report.failures,
+        };
+    }
+    RouteState::Pending {
+        flow_id: Some(flow_id.to_string()),
+    }
+}
+
 /// The shape checks shared by `add` and `replace`. They mirror what the hub
 /// enforces at create time, so a bad route fails HERE (once, with a clear
 /// message) instead of silently backing off forever.
@@ -689,7 +733,7 @@ mod tests {
         let rows = r.list();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].route.id, "a");
-        assert_eq!(rows[0].state, RouteState::Pending);
+        assert_eq!(rows[0].state, RouteState::Pending { flow_id: None });
         assert_eq!(rows[1].state, RouteState::Disabled);
     }
 
@@ -745,7 +789,7 @@ mod tests {
         assert_eq!(r.list()[0].state, RouteState::Disabled);
 
         assert!(r.set_enabled("a", true).await.unwrap());
-        assert_eq!(r.list()[0].state, RouteState::Pending);
+        assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
 
         assert!(!r.set_enabled("ghost", true).await.unwrap());
 
@@ -773,26 +817,34 @@ mod tests {
         ports.try_into().unwrap()
     }
 
-    /// The flow id behind an `Active` route, or a panic naming its state.
-    fn active_flow(r: &RouteReconciler, id: &str) -> String {
+    /// The flow id behind a route that HAS one, or a panic naming its state.
+    /// These tests run without an agent WS, so a route's flow never comes
+    /// up: it reads `pending` WITH its flow id ("connecting", #1685), never
+    /// `active` — that word is reserved for a bound listener.
+    fn route_flow(r: &RouteReconciler, id: &str) -> String {
         let rows = r.list();
         let row = rows.iter().find(|i| i.route.id == id).unwrap();
-        match &row.state {
-            RouteState::Active { flow_id } => flow_id.clone(),
-            other => panic!("route {id} is not active: {other:?}"),
+        assert!(
+            !matches!(row.state, RouteState::Active { .. }),
+            "no listener can be bound without a WS: {:?}",
+            row.state
+        );
+        match row.state.flow_id() {
+            Some(flow_id) => flow_id.to_string(),
+            None => panic!("route {id} has no flow: {:?}", row.state),
         }
     }
 
     /// FR-84 D1 — editing a live route's port: the old flow is gone the
     /// moment the replacement is persisted, the replacement is ONE config
-    /// write, and the next pass brings the route back `active` on the new
-    /// port with exactly one flow in the hub.
+    /// write, and the next pass brings the route back on a flow toward the
+    /// new port with exactly one flow in the hub.
     #[tokio::test]
     async fn replace_while_live_moves_the_flow_to_the_new_port() {
         let [p1, p2] = free_ports();
         let (r, _dir) = reconciler(vec![desc("a", p1, true)]);
         r.reconcile_pass().await;
-        let f1 = active_flow(&r, "a");
+        let f1 = route_flow(&r, "a");
         assert!(r.inner.hub.has_flow(&f1));
         assert_eq!(
             r.inner.hub.flows_snapshot()[0].local_addr,
@@ -817,10 +869,10 @@ mod tests {
             on_disk[0].local, p2,
             "the replacement is what got persisted"
         );
-        assert_eq!(r.list()[0].state, RouteState::Pending);
+        assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
 
         r.reconcile_pass().await;
-        let f2 = active_flow(&r, "a");
+        let f2 = route_flow(&r, "a");
         assert_ne!(f1, f2, "a new flow, not the old one revived");
         let flows = r.inner.hub.flows_snapshot();
         assert_eq!(
@@ -839,7 +891,7 @@ mod tests {
         let [p1, p2, p3] = free_ports();
         let (r, _dir) = reconciler(vec![desc("a", p1, true), desc("b", p2, true)]);
         r.reconcile_pass().await;
-        let f1 = active_flow(&r, "a");
+        let f1 = route_flow(&r, "a");
 
         let mut bad_node = desc("a", p3, true);
         bad_node.node = "nope".into();
@@ -860,7 +912,7 @@ mod tests {
             let err = r.replace(bad).await.expect_err(what);
             assert!(!err.is_empty(), "{what}: the refusal names a reason");
             assert_eq!(
-                active_flow(&r, "a"),
+                route_flow(&r, "a"),
                 f1,
                 "{what}: the old flow must keep running"
             );
@@ -921,6 +973,153 @@ mod tests {
         assert_eq!(rows[0].route.local, 1001);
     }
 
+    /// #1685 — a route whose flow is REGISTERED but whose tunnel session is
+    /// not up must not read `active`: nothing listens on its port. In this
+    /// test there is no agent WS, so the flow's supervisor parks waiting for
+    /// one — the same "flow exists, no listener" shape as a route to an
+    /// offline node whose session keeps failing. Before the fix `Live` was
+    /// mapped straight to `Active` and the port refused every connection.
+    #[tokio::test]
+    async fn a_route_whose_session_is_not_up_does_not_read_active() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let flow_id = {
+            let flows = r.inner.hub.flows_snapshot();
+            assert_eq!(flows.len(), 1, "the flow was created: {flows:?}");
+            flows[0].id.clone()
+        };
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", p)).is_err(),
+            "nothing listens on the route's port in this test"
+        );
+        let state = r.list()[0].state.clone();
+        assert!(
+            !matches!(state, RouteState::Active { .. }),
+            "a route with no listener must not read active (flow {flow_id}): {state:?}"
+        );
+        // The reader still sees WHICH flow is dialing: "connecting (fl-N)".
+        assert_eq!(
+            state,
+            RouteState::Pending {
+                flow_id: Some(flow_id)
+            }
+        );
+    }
+
+    /// #1685 — the field shape: a route to an OFFLINE node. Its flow exists,
+    /// every session attempt fails (`agent_unavailable`) and the supervisor
+    /// backs off; the route reads `backoff` WITH the flow, the attempt count
+    /// and the last error — never `active`. When the node comes back the
+    /// driver binds the listener, and only then does the route read `active`.
+    #[tokio::test]
+    async fn a_retrying_session_reads_backoff_with_its_error_then_active_once_bound() {
+        let [p] = free_ports();
+        let mut route = desc("corp-socks", p, true);
+        route.kind = FlowKind::Socks5;
+        route.remote = None;
+        let (r, _dir) = reconciler(vec![route]);
+        r.reconcile_pass().await;
+        let flow_id = route_flow(&r, "corp-socks");
+        let live = r.inner.hub.flow_live_for_test(&flow_id).unwrap();
+
+        // Two doomed cycles; the supervisor is now sleeping 8 s.
+        let offline = "server error during tunnel.open: agent_unavailable: agent is offline";
+        live.note_failure("waiting for DC pool to open: deadline has elapsed".into());
+        live.note_failure(offline.into());
+        live.note_backoff(Duration::from_secs(8));
+        let state = r.list()[0].state.clone();
+        match &state {
+            RouteState::Backoff {
+                next_retry_secs,
+                last_error,
+                flow_id: Some(f),
+                attempts,
+            } => {
+                assert_eq!(f, &flow_id, "the reader can join the Flows table");
+                assert_eq!(*attempts, 2);
+                assert_eq!(last_error, offline, "the LAST error, not the first");
+                assert!(
+                    (6..=8).contains(next_retry_secs),
+                    "countdown: {next_retry_secs}"
+                );
+            }
+            other => panic!("expected backoff with the flow: {other:?}"),
+        }
+        // A pre-#1685 reader sees `backoff` too — a true statement — because
+        // the tag set did not change; only fields were added.
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["state"], "backoff");
+        assert_eq!(wire["flow_id"], flow_id);
+        assert_eq!(wire["attempts"], 2);
+
+        // The node came online: the driver bound the listener.
+        live.mark_listening();
+        assert_eq!(r.list()[0].state, RouteState::Active { flow_id });
+    }
+
+    /// #1685 — the pure mapping, every branch: fatal wins, then listening,
+    /// then a recorded failure, else connecting.
+    #[test]
+    fn route_state_for_flow_orders_fatal_listening_failure_connecting() {
+        let base = FlowReport {
+            listening: false,
+            fatal: None,
+            failures: 0,
+            last_error: None,
+            next_retry_in: None,
+        };
+        assert_eq!(
+            route_state_for_flow("fl-1", &base),
+            RouteState::Pending {
+                flow_id: Some("fl-1".into())
+            }
+        );
+        assert_eq!(
+            route_state_for_flow(
+                "fl-1",
+                &FlowReport {
+                    listening: true,
+                    ..base.clone()
+                }
+            ),
+            RouteState::Active {
+                flow_id: "fl-1".into()
+            }
+        );
+        // In flight after a failure: no countdown ⇒ 0, still not active.
+        assert_eq!(
+            route_state_for_flow(
+                "fl-1",
+                &FlowReport {
+                    failures: 3,
+                    last_error: Some("x".into()),
+                    ..base.clone()
+                }
+            ),
+            RouteState::Backoff {
+                next_retry_secs: 0,
+                last_error: "x".into(),
+                flow_id: Some("fl-1".into()),
+                attempts: 3,
+            }
+        );
+        // Terminal beats everything, even a stale `listening`.
+        assert_eq!(
+            route_state_for_flow(
+                "fl-1",
+                &FlowReport {
+                    listening: true,
+                    fatal: Some("revoked".into()),
+                    ..base
+                }
+            ),
+            RouteState::Failed {
+                reason: "revoked".into()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn reenable_clears_terminal_failed() {
         let (r, _dir) = reconciler(vec![desc("a", 1001, true)]);
@@ -936,6 +1135,6 @@ mod tests {
         assert_eq!(r.list()[0].state, RouteState::Disabled);
         // …re-enable → fresh Pending (Failed cleared).
         assert!(r.set_enabled("a", true).await.unwrap());
-        assert_eq!(r.list()[0].state, RouteState::Pending);
+        assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
     }
 }

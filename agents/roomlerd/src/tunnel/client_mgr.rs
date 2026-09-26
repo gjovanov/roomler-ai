@@ -131,10 +131,14 @@ struct FlowHandle {
 
 /// Live per-flow cells, shared between the supervisor (writes `status` +
 /// `nonce`), the per-session Source (writes `transport` + `session_id` when it
-/// sees `TunnelOpened`), and `flows()` (reads). `kill_flow` reads `nonce` +
-/// `session_id` to reap the demux maps when it aborts the supervisor mid-flight.
+/// sees `TunnelOpened`), the driver's bind hook (`Up`, #1685) and `flows()`
+/// (reads). `kill_flow` reads `nonce` + `session_id` to reap the demux maps
+/// when it aborts the supervisor mid-flight.
 #[derive(Default)]
-struct FlowLive {
+pub(crate) struct FlowLive {
+    /// `Up` ONLY once the local listener is bound (#1685) — never on
+    /// `rc:tunnel.opened`, which the server also answers for a node whose
+    /// data plane then fails to come up.
     status: Mutex<FlowStatus>,
     /// Negotiated transport, learned from the pass-through `TunnelOpened`.
     transport: Mutex<Option<String>>,
@@ -154,9 +158,59 @@ struct FlowLive {
     /// and by the route reconciler, which turns it into the terminal
     /// `RouteState::Failed` for a declared route.
     fatal: Mutex<Option<String>>,
+    /// #1685 — consecutive session attempts that failed (or died on arrival)
+    /// since the flow last served; reset when the listener binds. Read by
+    /// the route reconciler as `RouteState::Backoff::attempts`.
+    failures: std::sync::atomic::AtomicU32,
+    /// #1685 — the last failed attempt's error; cleared when the listener
+    /// binds. Read as `RouteState::Backoff::last_error`.
+    last_error: Mutex<Option<String>>,
+    /// #1685 — when the supervisor's current backoff sleep ends; `None`
+    /// while an attempt is in flight. Read as `next_retry_secs`.
+    retry_at: Mutex<Option<std::time::Instant>>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+impl FlowLive {
+    /// #1685 — the driver bound the local listener: the flow SERVES. The only
+    /// transition to `Up` (fired by the `on_listening` hook); it forgets the
+    /// failures that preceded it.
+    pub(crate) fn mark_listening(&self) {
+        *self.status.lock().unwrap() = FlowStatus::Up;
+        self.failures.store(0, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = None;
+        *self.retry_at.lock().unwrap() = None;
+    }
+
+    /// #1685 — a session attempt failed (or died on arrival) with `error`.
+    pub(crate) fn note_failure(&self, error: String) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = Some(error);
+    }
+
+    /// #1685 — the supervisor sleeps `backoff` before its next attempt.
+    pub(crate) fn note_backoff(&self, backoff: Duration) {
+        *self.retry_at.lock().unwrap() = Some(std::time::Instant::now() + backoff);
+    }
+}
+
+/// #1685 — a flow's liveness as the route reconciler reads it
+/// ([`TunnelClientHub::flow_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowReport {
+    /// The local listener is bound and serving.
+    pub listening: bool,
+    /// The supervisor stopped on a permanent failure (terminal).
+    pub fatal: Option<String>,
+    /// Consecutive session attempts that failed since the flow last served.
+    pub failures: u32,
+    /// The last failed attempt's error.
+    pub last_error: Option<String>,
+    /// Time left until the supervisor's next attempt; `None` while one is in
+    /// flight.
+    pub next_retry_in: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FlowStatus {
     /// Waiting for a live WS / mid-handshake.
     #[default]
@@ -226,7 +280,10 @@ impl TunnelClientHub {
     /// connection gauge. TCP payload only — SOCKS5 UDP-ASSOCIATE bytes are not
     /// counted (they run on `FlowStats` with no session aggregate). The
     /// `transport` column doubles as a liveness signal: `connecting` / `down`
-    /// until a session negotiates a concrete transport.
+    /// until the session's local listener is bound (#1685). A transport the
+    /// server negotiated is not yet a serving flow — setup after
+    /// `rc:tunnel.opened` can still fail — so it shows only once bound;
+    /// [`Self::negotiated_transport`] reads it before that.
     pub fn flows_snapshot(&self) -> Vec<FlowInfo> {
         let flows = self.inner.flows.lock().unwrap();
         let mut out: Vec<FlowInfo> = flows
@@ -349,15 +406,49 @@ impl TunnelClientHub {
             .and_then(|h| h.live.fatal.lock().unwrap().clone())
     }
 
-    /// Whether the flow currently has an established session (status `Up`).
-    /// P6 — lets the route reconciler surface Active vs Pending.
-    pub fn flow_up(&self, id: &str) -> bool {
+    /// #1685 — what the route reconciler needs to tell the truth about a
+    /// declared route's flow, read in one lock walk. `None` for an unknown
+    /// id. `listening` is the bound local listener and nothing less: before
+    /// this the reconciler mapped "a flow exists" straight to `active`, and a
+    /// route to an offline node read `active` while every connect was refused.
+    pub fn flow_report(&self, id: &str) -> Option<FlowReport> {
+        let flows = self.inner.flows.lock().unwrap();
+        let live = &flows.get(id)?.live;
+        Some(FlowReport {
+            listening: *live.status.lock().unwrap() == FlowStatus::Up,
+            fatal: live.fatal.lock().unwrap().clone(),
+            failures: live.failures.load(Ordering::Relaxed),
+            last_error: live.last_error.lock().unwrap().clone(),
+            next_retry_in: live
+                .retry_at
+                .lock()
+                .unwrap()
+                .map(|t| t.saturating_duration_since(std::time::Instant::now())),
+        })
+    }
+
+    /// The transport the server negotiated for this flow, as recorded from
+    /// its most recent `rc:tunnel.opened` — whether or not that session has
+    /// come up since. `None` for an unknown id, or before any open was
+    /// answered. Proves the open was demuxed back to the flow by its nonce;
+    /// it says nothing about the port serving, which is `flow_report`'s
+    /// `listening`.
+    pub fn negotiated_transport(&self, id: &str) -> Option<String> {
+        let flows = self.inner.flows.lock().unwrap();
+        flows.get(id)?.live.transport.lock().unwrap().clone()
+    }
+
+    /// Test seam: the live cells of a registered flow, so a sibling module's
+    /// tests can play the supervisor (a failed attempt, the listener bind)
+    /// without a server.
+    #[cfg(test)]
+    pub(crate) fn flow_live_for_test(&self, id: &str) -> Option<Arc<FlowLive>> {
         self.inner
             .flows
             .lock()
             .unwrap()
             .get(id)
-            .is_some_and(|h| *h.live.status.lock().unwrap() == FlowStatus::Up)
+            .map(|h| h.live.clone())
     }
 
     /// Abort + deregister a flow by id. Reaps the flow's demux entries (in case
@@ -555,6 +646,12 @@ impl TunnelSignalingSink for DaemonSink {
 /// demux. Sniffs the pass-through `TunnelOpened` to record the negotiated
 /// transport + session id into the flow's live cells, then yields it to the
 /// driver. `None` = the session's demux entry was removed (WS drop / kill).
+///
+/// It does NOT mark the flow `Up` (#1685). `rc:tunnel.opened` is the server
+/// accepting the open; the QUIC / DC-pool setup and the local bind come after
+/// it and can still fail — toward an offline node they did, every cycle, and
+/// the flow read `webrtc-dc-v1` in the Flows table for most of each cycle.
+/// Only the driver's bind hook ([`listening_hook`]) sets `Up`.
 struct ChannelSource {
     rx: mpsc::Receiver<ServerMsg>,
     live: Arc<FlowLive>,
@@ -572,10 +669,21 @@ impl TunnelSignalingSource for ChannelSource {
         {
             *self.live.transport.lock().unwrap() = Some(transport.clone());
             *self.live.session_id.lock().unwrap() = Some(*session_id);
-            *self.live.status.lock().unwrap() = FlowStatus::Up;
         }
         Some(msg)
     }
+}
+
+/// #1685 — the driver's bind callback for `flow_id`: the ONE event that makes
+/// the flow (and its declared route) `active`. Flips the flow to `Up` and
+/// forgets the failures before it.
+fn listening_hook(flow_id: &str, live: &Arc<FlowLive>) -> tunnel_core::driver::ListeningHook {
+    let flow_id = flow_id.to_string();
+    let live = live.clone();
+    Arc::new(move |addr: std::net::SocketAddr| {
+        info!(flow = %flow_id, local = %addr, "flow listener bound — the route is serving");
+        live.mark_listening();
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +726,8 @@ async fn run_flow_supervisor(
     let mut quic_over_turn_failing = false;
     loop {
         *live.status.lock().unwrap() = FlowStatus::Connecting;
+        // #1685 — an attempt is in flight (or waiting for the WS): no countdown.
+        *live.retry_at.lock().unwrap() = None;
         // Wait for a live agent WS.
         let sink_tx = match wait_for_sink(&mut sink_rx).await {
             Some(tx) => tx,
@@ -684,6 +794,10 @@ async fn run_flow_supervisor(
                         backoff_s = backoff.as_secs(),
                         "tunnel session ended immediately; backing off rather than re-opening at once"
                     );
+                    live.note_failure(format!(
+                        "session ended {} ms after opening",
+                        ran.as_millis()
+                    ));
                 }
             }
             Err(e) => {
@@ -699,8 +813,11 @@ async fn run_flow_supervisor(
                     return;
                 }
                 warn!(flow = %flow_id, %e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
+                live.note_failure(session_error_summary(&e));
             }
         }
+        // #1685 — publish the countdown the route's `next_retry_secs` shows.
+        live.note_backoff(backoff);
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
@@ -757,6 +874,20 @@ fn permanent_session_error(e: &anyhow::Error) -> Option<String> {
     } else {
         None
     }
+}
+
+/// #1685 — the error a reader sees in `route ls` / the Routes page for a
+/// retrying route. `{e:#}` prints the whole context chain; its outermost link
+/// is `drive_one`'s `tunnel session (flow fl-N): `, which the row already
+/// names, so it is dropped when present. Anything else passes through whole.
+fn session_error_summary(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if let Some(rest) = full.strip_prefix("tunnel session (flow ")
+        && let Some((_, tail)) = rest.split_once("): ")
+    {
+        return tail.to_string();
+    }
+    full
 }
 
 /// Return the current live sink, or wait for one. `None` once the hub's sink
@@ -948,6 +1079,9 @@ async fn drive_one(
             target: target.clone(),
             client_version: hub.inner.client_version.clone(),
             derp,
+            // #1685 — the bound listener is the ONE event that makes the
+            // flow (and its declared route) `active`.
+            on_listening: Some(listening_hook(flow_id, live)),
         },
         supported,
         request,
@@ -1300,6 +1434,151 @@ mod tests {
         assert!(hub.kill_flow("fl-1"));
         assert!(hub.flows_snapshot().is_empty());
         assert!(!hub.kill_flow("fl-1"), "second kill is a no-op false");
+    }
+
+    /// #1685 — `rc:tunnel.opened` is the SERVER accepting the open. The data
+    /// plane (QUIC / DC pool) and the local listener come after it and can
+    /// still fail — in the field the opens toward an offline laptop were
+    /// accepted and then died in setup, every cycle — so seeing it must not
+    /// mark the flow `Up`. `Up` is what the reconciler and the peers overlay
+    /// read as "this port serves"; only the bound listener may set it.
+    #[tokio::test]
+    async fn tunnel_opened_alone_does_not_mark_the_flow_up() {
+        let live = Arc::new(FlowLive::default());
+        let (tx, rx) = mpsc::channel::<ServerMsg>(4);
+        let mut source = ChannelSource {
+            rx,
+            live: live.clone(),
+        };
+        tx.send(ServerMsg::TunnelOpened {
+            session_id: oid(9),
+            transport: "webrtc-dc-v1".into(),
+            dc_pool_size: 4,
+            sctp_rwnd_bytes: 0,
+            ice_servers: vec![],
+            quic_auth_token: None,
+            open_nonce: Some("fl-9.1".into()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            source.recv().await,
+            Some(ServerMsg::TunnelOpened { .. })
+        ));
+        // The informational cells ARE recorded from the frame…
+        assert_eq!(
+            live.transport.lock().unwrap().as_deref(),
+            Some("webrtc-dc-v1")
+        );
+        assert_eq!(*live.session_id.lock().unwrap(), Some(oid(9)));
+        // …but liveness is not: no listener has been bound.
+        assert_ne!(
+            *live.status.lock().unwrap(),
+            FlowStatus::Up,
+            "rc:tunnel.opened must not read as a serving listener"
+        );
+    }
+
+    /// #1685 — the cells the route reconciler reads: a failed attempt counts
+    /// and carries its error plus the countdown; the bind hook is what flips
+    /// the flow to `Up`, and it forgets the failures before it.
+    #[tokio::test]
+    async fn flow_report_follows_failures_and_the_listener_bind() {
+        let hub = TunnelClientHub::new("test".into());
+        let live = Arc::new(FlowLive::default());
+        let abort = tokio::spawn(async {}).abort_handle();
+        hub.inner.flows.lock().unwrap().insert(
+            "fl-7".into(),
+            FlowHandle {
+                abort,
+                kind: FlowKind::Socks5,
+                local: 1081,
+                target: None,
+                node: "0123456789abcdef01234567".into(),
+                requested: "auto".into(),
+                live: live.clone(),
+            },
+        );
+        assert_eq!(hub.flow_report("ghost"), None);
+
+        // Fresh: dialing, nothing failed yet.
+        let fresh = hub.flow_report("fl-7").unwrap();
+        assert!(!fresh.listening);
+        assert_eq!(fresh.failures, 0);
+        assert_eq!(fresh.last_error, None);
+        assert_eq!(fresh.next_retry_in, None);
+
+        // Two failed cycles, the supervisor now sleeping 4 s.
+        live.note_failure("first".into());
+        live.note_failure(
+            "server error during tunnel.open: agent_unavailable: agent is offline".into(),
+        );
+        live.note_backoff(Duration::from_secs(4));
+        let retrying = hub.flow_report("fl-7").unwrap();
+        assert!(!retrying.listening, "a retrying flow does not serve");
+        assert_eq!(retrying.failures, 2);
+        assert_eq!(
+            retrying.last_error.as_deref(),
+            Some("server error during tunnel.open: agent_unavailable: agent is offline"),
+            "the LAST error is what the reader acts on"
+        );
+        let left = retrying.next_retry_in.expect("sleeping ⇒ a countdown");
+        assert!(
+            left <= Duration::from_secs(4) && left > Duration::from_secs(2),
+            "{left:?}"
+        );
+        // The Flows table shows the liveness word, not a negotiated transport…
+        assert_eq!(
+            hub.negotiated_transport("fl-7"),
+            None,
+            "no open answered yet"
+        );
+        *live.transport.lock().unwrap() = Some("webrtc-dc-v1".into());
+        assert_eq!(hub.flows_snapshot()[0].transport, "connecting");
+        // …while the transport the open negotiated is still readable.
+        assert_eq!(
+            hub.negotiated_transport("fl-7").as_deref(),
+            Some("webrtc-dc-v1")
+        );
+        assert_eq!(hub.negotiated_transport("ghost"), None);
+
+        // The node came back: the driver bound the listener.
+        listening_hook("fl-7", &live)("127.0.0.1:1081".parse().unwrap());
+        let serving = hub.flow_report("fl-7").unwrap();
+        assert_eq!(
+            serving,
+            FlowReport {
+                listening: true,
+                fatal: None,
+                failures: 0,
+                last_error: None,
+                next_retry_in: None,
+            }
+        );
+        assert_eq!(hub.flows_snapshot()[0].transport, "webrtc-dc-v1");
+        assert!(
+            hub.active_flow_agent_ids()
+                .contains("0123456789abcdef01234567")
+        );
+    }
+
+    /// #1685 — the route row already names the flow, so the supervisor's
+    /// `tunnel session (flow fl-N): ` context is dropped from the error it
+    /// publishes; an error without that prefix is kept whole.
+    #[test]
+    fn session_error_summary_drops_the_flow_context_only() {
+        let inner = "server error during tunnel.open: agent_unavailable: agent is offline";
+        let wrapped = anyhow::anyhow!("{inner}").context("tunnel session (flow fl-2)");
+        assert_eq!(session_error_summary(&wrapped), inner);
+        let chained = anyhow::anyhow!("deadline has elapsed")
+            .context("waiting for DC pool to open")
+            .context("tunnel session (flow fl-12)");
+        assert_eq!(
+            session_error_summary(&chained),
+            "waiting for DC pool to open: deadline has elapsed"
+        );
+        let bare = anyhow::anyhow!("agent WS egress closed");
+        assert_eq!(session_error_summary(&bare), "agent WS egress closed");
     }
 
     #[test]
