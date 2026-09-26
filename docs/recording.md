@@ -504,10 +504,15 @@ flowchart LR
   (`recorder_running`, `remote_marked`), so the red never drops off a
   recording that is still running. A recording that ends answers so. For an
   indicator of recording, the wrong way to fail is to say nothing is.
+  **No service at all is an answer** (`no_service`: its pipe or socket
+  missing, or nobody listening): nothing records without it, the banner
+  comes down with it, and so do the red and the Stop item.
 - ⚠️ **The red icon is never a macOS template.** The idle icon is one
   (`iconAsTemplate`), so the system tints it to the menu bar, and a tinted dot
-  would not be red. `set_tray_look` turns templating off with the red icon and
-  back on with the idle one.
+  would not be red. `set_tray_look` sets the icon and its template flag in
+  one step (`set_icon_with_as_template`); set apart, macOS draws the idle
+  template untinted for a moment. A change that failed is tried again at the
+  next poll rather than counted as shown.
 - **Start is greyed out, with the reason, wherever the service cannot record.**
   `RecordingState` carries `available` and `unavailable_reason` (additive,
   serde default `false`): false on a service built without the recorder, and
