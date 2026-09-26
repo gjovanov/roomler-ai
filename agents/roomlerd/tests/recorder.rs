@@ -982,6 +982,67 @@ mod process {
         }
     }
 
+    /// `ROOMLERD_RECORDING=0` closes every path at once, and says so: the
+    /// state a client greys Start out with, a start, what the device
+    /// advertises (`available`), the listing and the folder a download is
+    /// served from.
+    #[tokio::test]
+    async fn the_kill_switch_closes_every_path_and_says_so() {
+        use roomlerd::recording::manager::RecordingManager;
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+        let dir = scratch();
+        let manager = |off: bool| {
+            RecordingManager::new(
+                PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+                dir.path().join("config.toml"),
+            )
+            .with_service_identity(false)
+            .with_switched_off(off)
+        };
+        // The control: the same manager with the switch left alone can record.
+        assert!(manager(false).available());
+
+        let m = manager(true);
+        assert!(
+            !m.available(),
+            "a switched-off device must not advertise recording"
+        );
+        match m.status() {
+            Response::Recording(st) => {
+                assert!(!st.available, "{st:?}");
+                assert!(
+                    st.unavailable_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("ROOMLERD_RECORDING=0")),
+                    "{st:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match m.start(RecordStartOpts::default()).await {
+            Response::Error { message } => {
+                assert!(message.contains("ROOMLERD_RECORDING=0"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        match m.list().await {
+            Response::Recordings(l) => {
+                assert!(l.items.is_empty() && l.dir.is_empty(), "{l:?}");
+                assert!(
+                    l.folder_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("switched off")),
+                    "{l:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            m.folder().await.is_none(),
+            "nothing is served while switched off"
+        );
+    }
+
     /// FR-85 P1e — the recorder a daemon launches runs at normal integrity
     /// whatever the daemon runs at: an elevated worker (a UAC-split
     /// administrator's, the service default) hands it a restricted copy of
