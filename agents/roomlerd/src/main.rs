@@ -3193,7 +3193,17 @@ async fn run_cmd(
                 lkgv_unset: cfg.last_known_good_version.is_none(),
             });
         tokio::spawn(async move {
-            roomlerd::companion::refresh_if_stale(respawn_ctx).await;
+            // #1686 — ONE refresher per install. Under a running SCM service
+            // the host refreshes the companion at its own start (it is the
+            // owner the module docs name), and this worker — elevated by
+            // default, so it CAN write %ProgramFiles% — used to run the same
+            // swap concurrently: measured on the reporting host, the worker's
+            // swap 1.4 s after the host's respawn renamed and deleted the
+            // freshly respawned companion's file, which then ran invisibly
+            // (file-id image name) through the next update and blocked it.
+            if !scm_owns_companion {
+                roomlerd::companion::refresh_if_stale(respawn_ctx).await;
+            }
             #[cfg(target_os = "windows")]
             if !scm_owns_companion {
                 let _ = tokio::task::spawn_blocking(move || {
