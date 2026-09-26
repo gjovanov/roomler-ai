@@ -5,14 +5,17 @@
  * `agent-e2e` harness.
  *
  * The viewer always asks for RECORD. The server strips it unless the
- * controller may record AND the device advertises `record`, which a device
- * does only while its owner has switched remote recording on. The harness
- * agents never have, so the answer must be a disabled Record control whose
- * title names the reason, and never a Record button that can only fail.
+ * controller may record AND the device advertises `remote`, which a device
+ * does only while its owner has switched remote recording on. On a device
+ * with a recorder whose owner has not (it advertises `available` alone), the
+ * answer must be a disabled Record control whose title names the reason, and
+ * never a Record button that can only fail. P3c-2: on a device with NO
+ * recorder (it advertises nothing), there is nothing to allow or refuse, and
+ * the toolbar shows no Record control at all.
  *
  * Skip-conditions mirror `remote-file-upload-smoke.spec.ts`: no seeded tenant,
- * or no online agent. The spec also skips on an agent that DOES advertise
- * `record` (that case is `remote-recording-smoke.spec.ts`'s).
+ * or no online agent of the kind a test needs. An agent that DOES advertise
+ * `remote` is `remote-recording-smoke.spec.ts`'s case.
  */
 import { test, expect } from '@playwright/test'
 
@@ -58,23 +61,50 @@ test.describe('Remote recording — a refusal is explained (FR-85 P3c)', () => {
     context,
   }) => {
     const token = await adminLogin()
-    const agent = (await onlineAgents(token)).find(
-      (a) => !(a.capabilities?.record ?? []).includes('remote'),
-    )
-    test.skip(!agent, 'no online agent without the record capability')
+    const agent = (await onlineAgents(token)).find((a) => {
+      const record = a.capabilities?.record ?? []
+      return record.includes('available') && !record.includes('remote')
+    })
+    test.skip(!agent, 'no online agent with a recorder its owner has not opted in')
 
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
-    await page.goto(`${BASE_URL}/tenant/${TENANT_ID}/agent/${agent!.id}/remote`)
-    await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
-    await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 60_000 })
-
+    await connectTo(page, context, token, agent!.id)
     const refused = page.getByTestId('rc-record-refused')
     await expect(refused).toBeVisible({ timeout: 15_000 })
     await expect(refused).toHaveAttribute('title', /owner hasn't allowed remote recording/)
     // No working Record button: nothing to press that could only fail.
     await expect(page.getByTestId('rc-record-btn')).toHaveCount(0)
   })
+
+  test('a device with no recorder shows no Record control at all (P3c-2)', async ({
+    page,
+    context,
+  }) => {
+    const token = await adminLogin()
+    const agent = (await onlineAgents(token)).find(
+      (a) => (a.capabilities?.record ?? []).length === 0,
+    )
+    test.skip(!agent, 'no online agent without a recorder')
+
+    await connectTo(page, context, token, agent!.id)
+    // Give the toolbar the same 15 s the refusal gets to appear, then
+    // require that it never did: no disabled control, no button.
+    await page.waitForTimeout(15_000)
+    await expect(page.getByTestId('rc-record-refused')).toHaveCount(0)
+    await expect(page.getByTestId('rc-record-btn')).toHaveCount(0)
+  })
 })
+
+async function connectTo(
+  page: import('@playwright/test').Page,
+  context: import('@playwright/test').BrowserContext,
+  token: string,
+  agentId: string,
+) {
+  await context.addInitScript((tok) => {
+    window.localStorage.setItem('access_token', tok)
+    window.localStorage.setItem('refresh_token', tok)
+  }, token)
+  await page.goto(`${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`)
+  await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
+  await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 60_000 })
+}

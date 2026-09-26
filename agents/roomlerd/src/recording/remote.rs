@@ -139,13 +139,19 @@ pub fn advertised() -> Vec<String> {
     )
 }
 
-/// Pure half of [`advertised`]: `remote` only while the owner's gate is on
-/// AND a recorder can run here (a SYSTEM/root service cannot, until P1e);
-/// `remote-audio` only on top of that, with the audio gate on and an audio
-/// build. Nothing at all otherwise — silence is how the hub learns "no".
+/// Pure half of [`advertised`]. Nothing at all unless a recorder can serve a
+/// remote session here: silence is how the hub learns "no recorder", and a
+/// viewer then shows no Record control. Then `available` (P3c-2: the device
+/// HAS the feature — capability, never permission); `remote` only while the
+/// owner's gate is on; `remote-audio` only on top of that, with the audio
+/// gate on and an audio build.
 pub fn advertise(g: Gates, can_record: bool, audio_built: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if g.enabled && can_record {
+    if !can_record {
+        return out;
+    }
+    out.push(RecordCap::Available.wire().to_string());
+    if g.enabled {
         out.push(RecordCap::Remote.wire().to_string());
         if g.audio && audio_built {
             out.push(RecordCap::RemoteAudio.wire().to_string());
@@ -1168,21 +1174,26 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_advertised_unless_the_owner_opted_in_and_a_recorder_can_run() {
-        assert!(advertise(Gates::default(), true, true).is_empty());
+    fn nothing_is_served_unless_the_owner_opted_in_and_a_recorder_can_run() {
+        // P3c-2: a recorder that could serve says only that it exists.
+        assert_eq!(advertise(Gates::default(), true, true), vec!["available"]);
         assert!(
             advertise(on(), false, true).is_empty(),
-            "a SYSTEM/root service cannot record until P1e — it must not claim to"
+            "a host that cannot record a remote session must claim nothing, not even `available`"
         );
-        assert_eq!(advertise(on(), true, true), vec!["remote"]);
+        assert!(advertise(Gates::default(), false, true).is_empty());
+        assert_eq!(advertise(on(), true, true), vec!["available", "remote"]);
         let both = Gates {
             enabled: true,
             audio: true,
         };
-        assert_eq!(advertise(both, true, true), vec!["remote", "remote-audio"]);
+        assert_eq!(
+            advertise(both, true, true),
+            vec!["available", "remote", "remote-audio"]
+        );
         assert_eq!(
             advertise(both, true, false),
-            vec!["remote"],
+            vec!["available", "remote"],
             "no audio build, no audio claim"
         );
         // The audio gate alone opts nothing in.
@@ -1190,7 +1201,7 @@ mod tests {
             enabled: false,
             audio: true,
         };
-        assert!(advertise(audio_only, true, true).is_empty());
+        assert_eq!(advertise(audio_only, true, true), vec!["available"]);
     }
 
     #[test]
