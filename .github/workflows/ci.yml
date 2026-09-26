@@ -438,8 +438,9 @@ jobs:
       # tree — a large cost to silence findings that are not defects. Every
       # other class still bites.
       - name: Clippy agent --features full (the capture + encode + input path)
-        # `recording` (FR-85) rides here too: it is not in `full` until its
-        # local surfaces land, so without naming it no lane would lint it.
+        # `recording` (FR-85) rides here too: it is held out of `full` (and so
+        # out of every release) until canary hosts prove it in the field, so
+        # without naming it no lane would lint it.
         run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
 
       - name: Check agent --features vp9-444
@@ -636,20 +637,21 @@ jobs:
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
         run: cargo check -p roomlerd --bins --features scrap-capture
 
-      # FR-85 — `recording` joined `full`, which the macOS release builds.
-      # Without this step the recorder's macOS arms (the unix identity rule,
-      # the Movies folder, the microphone refusal, the `record` subcommand in
-      # main.rs) would compile for the first time at TAG time: the class this
-      # job exists for. `full` itself, as the release builds it (less the
-      # vendored FFmpeg and libvpx), so what is checked is what ships.
-      - name: cargo check agent with the release feature set (FR-85 — `full`, recording included)
+      # FR-85 — the release feature set (`full`, less the vendored FFmpeg
+      # and libvpx), plus `recording`, which is held out of `full` until
+      # canary hosts prove it in the field. Named, so the recorder's macOS
+      # arms (the unix identity rule, the Movies folder, the microphone
+      # refusal, the `record` subcommand in main.rs) never compile for the
+      # first time at TAG time, the class this job exists for, on the day it
+      # rejoins.
+      - name: cargo check agent with the release feature set (FR-85 — `full`, plus `recording`)
         # `full` carries `audio`, and audiopus_sys builds its bundled libopus
         # with CMake, whose CMakeLists declares a minimum below 3.5 that
         # current CMake refuses. The release builds set the same variable on
         # every platform; the first run of this step failed on exactly that.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo check -p roomlerd --lib --bins --features full
+        run: cargo check -p roomlerd --lib --bins --features full,recording
 
       # The desktop companion ships on macOS from rc.455 and owns the
       # permissions panel — the one surface that tells an operator why their
