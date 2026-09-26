@@ -1963,4 +1963,42 @@ SystemContext capture (rc.1–rc.7, hardened through rc.26 behind
 MSI flavour (`wix-perMachine/`). The operator-facing verification procedure lives
 in [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md).
 
+#### 19.8.6 Graceful worker stop (#1683)
+
+The supervisor stops its worker with `TerminateProcess`
+(`win_service/supervisor.rs`, `OwnedProcess::terminate`). A hard kill delivers no
+console control event, so the worker's `terminate_signal()` — `pending()` on
+Windows — never fired, and its `os_initiated_stop` arm never ran. Two things
+were lost on every SCM stop: an **ephemeral** device never self-unenrolled (only
+the server-side reaper collected it, after the TTL — the FR-51 promise held on
+Linux only), and a deliberate stop was miscounted toward `crash_count` on the
+next start (the #1040 wall, on Windows).
+
+The fix is a per-worker **named stop event**
+(`win_service/stop_event.rs`):
+
+- The host **creates the event before it spawns each worker** and passes the
+  name as a hidden `--stop-event <name>` argv (the same channel as
+  `--supervisor scm`). The worker's Windows `terminate_signal()` waits on it and,
+  when it fires, takes the exact `os_initiated_stop` arm a Unix SIGTERM takes.
+- On SCM Stop / Preshutdown the supervisor **signals the event, waits a bounded
+  `WORKER_GRACEFUL_STOP_BUDGET` (8 s), then falls back to `TerminateProcess`**.
+  The service accepts `SERVICE_CONTROL_PRESHUTDOWN` (180 s budget), so 8 s is
+  comfortably inside the window while never letting a wedged worker hold up an OS
+  shutdown; the reaper stays the backstop.
+- **Security** — the event's DACL (`STOP_EVENT_SDDL`, a protected `D:P`) grants
+  **only SYSTEM** `EVENT_ALL_ACCESS` (the sole principal that may `SetEvent`) and
+  interactive users `SYNCHRONIZE` only (wait, never signal). A worker may run as
+  SYSTEM (SystemContext) or as the signed-in user (attended); neither an
+  unprivileged local user nor a second interactive user can stop — or unenroll —
+  a SYSTEM worker through this event. The name is unique per spawn (host PID + a
+  monotonic counter), so a restart never reopens a stale, possibly-signaled
+  handle.
+- **Degrades safely**: if the event can't be created the worker still spawns and
+  the host hard-terminates as before; if the worker can't open/wait it, it falls
+  through to `pending()` and the host's bounded wait times out into
+  `TerminateProcess`. Only the whole-service shutdown signals the event — a
+  session-change swap or crash-respawn still hard-kills, because the device is
+  not leaving.
+
 <!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->

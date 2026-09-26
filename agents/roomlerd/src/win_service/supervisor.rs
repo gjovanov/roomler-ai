@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use super::stop_event::HostStopEvent;
+
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -591,6 +593,43 @@ impl OwnedProcess {
 /// service-stop delay (services have 30 s before SCM force-kills).
 const TERMINATE_WAIT: Duration = Duration::from_millis(1500);
 
+/// #1683 — how long the SCM host waits for a worker to exit on its own after it
+/// signals the stop event ([`stop_event`](super::stop_event)), before it falls
+/// back to `TerminateProcess`.
+///
+/// The worker's graceful path is bounded by construction:
+/// `enrollment::self_unenroll` caps its HTTP call at 3 s, then a config save
+/// and task teardown. 8 s covers that with margin, and sits far inside the
+/// budget we actually have — the service accepts `SERVICE_CONTROL_PRESHUTDOWN`
+/// (`running_status`), whose timeout defaults to 180 s, and a manual `sc stop` /
+/// services.msc polls far longer than 8 s before it reports a timeout. We still
+/// cap it and hard-kill after: a wedged worker must never delay an OS shutdown,
+/// and the server-side reaper is the backstop for any exit that never reaches
+/// self-unenroll. The observed field case (#1683) was `virsh shutdown`, i.e. an
+/// OS shutdown, which is exactly the PRESHUTDOWN path.
+pub(super) const WORKER_GRACEFUL_STOP_BUDGET: Duration = Duration::from_secs(8);
+
+/// #1683 — mint the per-spawn stop event and the `--stop-event <name>` argv to
+/// hand the worker. On failure it logs and returns `(None, empty)` so a spawn is
+/// never blocked on it: the shutdown path then hard-terminates the worker
+/// exactly as it did before this change (the reaper is still the backstop).
+fn stop_event_for_spawn() -> (Option<HostStopEvent>, Vec<String>) {
+    match HostStopEvent::create() {
+        Ok(ev) => {
+            let args = vec!["--stop-event".to_string(), ev.name().to_string()];
+            (Some(ev), args)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "supervisor: could not create the worker stop event; a service stop will \
+                 hard-terminate this worker (an ephemeral device may not self-unenroll)"
+            );
+            (None, Vec::new())
+        }
+    }
+}
+
 /// Decide whether to (re)spawn the worker, and what session it
 /// should attach to. Pure: no side effects, no FFI, easy to unit-
 /// test the state machine.
@@ -954,6 +993,12 @@ struct ActiveWorker {
     is_system_context: bool,
     /// When the worker was spawned. Drives [`reap_resets_counter`].
     spawned_at: Instant,
+    /// #1683 — the stop event this worker was told to wait on (`--stop-event`).
+    /// Signaled on SCM shutdown so an ephemeral worker self-unenrolls before we
+    /// `TerminateProcess` it. `None` if the event could not be created — the
+    /// shutdown path then hard-terminates, exactly as before this change. Held
+    /// here so its handle is closed (RAII) when the worker is reaped or swapped.
+    stop_event: Option<HostStopEvent>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1180,19 +1225,56 @@ pub fn run(
         }
         if shutdown {
             if let Some(w) = current.take() {
-                tracing::info!(
-                    pid = w.process.pid,
-                    "supervisor: terminating worker on shutdown"
-                );
-                w.process.terminate();
-                // Wait for the OS to actually reap it before
-                // returning — see TERMINATE_WAIT for rationale.
-                if !w.process.wait_for_exit(TERMINATE_WAIT) {
-                    tracing::warn!(
+                // #1683 — ask the worker to leave GRACEFULLY first: signal its
+                // stop event and give it a bounded window to self-unenroll (if
+                // ephemeral) and mark a clean shutdown, so a deliberate stop
+                // does not read as a crash next start. Only THEN fall back to
+                // TerminateProcess. Before this, the hard terminate below was
+                // the only path — no console event reached the worker, its
+                // Windows `terminate_signal()` was `pending()`, and an ephemeral
+                // device waited out the server-side reaper's TTL to vanish.
+                let exited_gracefully = match w.stop_event.as_ref() {
+                    Some(ev) => {
+                        tracing::info!(
+                            pid = w.process.pid,
+                            budget_secs = WORKER_GRACEFUL_STOP_BUDGET.as_secs(),
+                            "supervisor: asking worker to stop gracefully (self-unenroll if \
+                             ephemeral) before terminate"
+                        );
+                        ev.signal();
+                        w.process.wait_for_exit(WORKER_GRACEFUL_STOP_BUDGET)
+                    }
+                    None => false,
+                };
+                if exited_gracefully {
+                    tracing::info!(
                         pid = w.process.pid,
-                        "supervisor: worker did not exit within {}ms after terminate",
-                        TERMINATE_WAIT.as_millis()
+                        "supervisor: worker exited gracefully on shutdown"
                     );
+                } else {
+                    if w.stop_event.is_some() {
+                        tracing::warn!(
+                            pid = w.process.pid,
+                            budget_secs = WORKER_GRACEFUL_STOP_BUDGET.as_secs(),
+                            "supervisor: worker did not exit within the graceful-stop budget; \
+                             terminating (the reaper will collect an ephemeral row)"
+                        );
+                    } else {
+                        tracing::info!(
+                            pid = w.process.pid,
+                            "supervisor: terminating worker on shutdown (no stop-event channel)"
+                        );
+                    }
+                    w.process.terminate();
+                    // Wait for the OS to actually reap it before
+                    // returning — see TERMINATE_WAIT for rationale.
+                    if !w.process.wait_for_exit(TERMINATE_WAIT) {
+                        tracing::warn!(
+                            pid = w.process.pid,
+                            "supervisor: worker did not exit within {}ms after terminate",
+                            TERMINATE_WAIT.as_millis()
+                        );
+                    }
                 }
             }
             // Track A — netd goes down LAST (once it hosts the network
@@ -1452,12 +1534,19 @@ pub fn run(
                             Some(t) => (t.raw(), true),
                             None => (token.raw(), false),
                         };
+                        // #1683 — mint this worker's stop event and append
+                        // `--stop-event <name>` so its `terminate_signal()` can
+                        // wait on it. `ev_args` owns the strings `spawn_args`
+                        // borrows, so it must outlive the spawn call.
+                        let (stop_ev, ev_args) = stop_event_for_spawn();
+                        let mut spawn_args: Vec<&str> = args_borrow.clone();
+                        spawn_args.extend(ev_args.iter().map(String::as_str));
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
                         // OwnedHandles outlive this call. CreateProcessAsUserW
                         // duplicates any handles it needs.
-                        match unsafe { spawn_in_session(spawn_handle, &worker_exe, &args_borrow) } {
+                        match unsafe { spawn_in_session(spawn_handle, &worker_exe, &spawn_args) } {
                             Ok(p) => {
                                 tracing::info!(
                                     pid = p.pid,
@@ -1470,6 +1559,7 @@ pub fn run(
                                     session: sid,
                                     is_system_context: false,
                                     spawned_at: Instant::now(),
+                                    stop_event: stop_ev,
                                 });
                                 // rc.51: do NOT reset consecutive_failures
                                 // here — a successful SPAWN is not a healthy
@@ -1589,7 +1679,14 @@ pub fn run(
             #[cfg(feature = "system-context")]
             (SpawnDecision::SpawnSystemInSession(sid), true) if current.is_none() => {
                 use crate::system_context::winlogon_token;
-                let cmdline = winlogon_token::build_cmdline(&worker_exe, &args_borrow);
+                // #1683 — same stop event as the user-context arm. The
+                // SystemContext worker runs as SYSTEM, covered by the `SY` ACE
+                // of the event's DACL. `ev_args` owns the strings `spawn_args`
+                // borrows; both outlive the `build_cmdline` call below.
+                let (stop_ev, ev_args) = stop_event_for_spawn();
+                let mut spawn_args: Vec<&str> = args_borrow.clone();
+                spawn_args.extend(ev_args.iter().map(String::as_str));
+                let cmdline = winlogon_token::build_cmdline(&worker_exe, &spawn_args);
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
                     let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
                         .context("find_winlogon_pid_in_session")?
@@ -1617,6 +1714,7 @@ pub fn run(
                             session: sid,
                             is_system_context: true,
                             spawned_at: Instant::now(),
+                            stop_event: stop_ev,
                         });
                         // rc.51: no consecutive_failures reset here —
                         // the reset is uptime-gated in the reap path.

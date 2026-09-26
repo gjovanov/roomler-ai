@@ -404,6 +404,7 @@ clipboard-win = { version = "5", optional = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",      # ConvertStringSecurityDescriptorToSecurityDescriptorW — the #1683 stop-event DACL (SYSTEM-signals-only)
     "Win32_System_RemoteDesktop",        # WTS* APIs
     "Win32_System_Threading",            # CreateProcessAsUserW, STARTUPINFO
     "Win32_System_Power",                # FR-55 PowerCreateRequest/PowerSetRequest + GetSystemPowerStatus
