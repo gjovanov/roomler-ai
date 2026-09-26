@@ -295,7 +295,15 @@ fn the_oracle_reads_what_was_painted_and_nothing_else() {
 async fn a_recording_plays_back_the_frames_that_went_in() {
     let dir = scratch();
     let opts = options(dir.path());
-    let (result, events) = record_for(opts, CounterCapture::new(30), Duration::from_secs(3)).await;
+    // ⚠️ The screen runs at TWICE the recording's rate, as a 60 Hz display
+    // under a 30 fps recording does. At exactly matched rates the screen's
+    // clock and the recorder's alias: how many of the recorder's ticks find a
+    // new frame depends on the phase between them. Where a tick falls on a
+    // frame boundary, jitter decides which side each frame lands, and a third
+    // of the ticks repeat the last frame with nothing wrong in the recorder.
+    // CI met that phase now and then (61 and 62 of 91 distinct); scanning it
+    // here failed 3 runs of 30 at matched rates and none at twice the rate.
+    let (result, events) = record_for(opts, CounterCapture::new(60), Duration::from_secs(3)).await;
     let summary = result.expect("the recording finalizes");
     assert_eq!(summary.reason, StopReason::Requested);
     let path = summary.path.expect("a finished file");
@@ -328,8 +336,10 @@ async fn a_recording_plays_back_the_frames_that_went_in() {
         "counters went backwards: {:?}",
         d.counters
     );
+    // Within the first ~130 ms (the encoder opens in between): frame 7 of a
+    // 60 fps screen, as frame 3 was of a 30 fps one.
     assert!(
-        d.counters[0] <= 3,
+        d.counters[0] <= 7,
         "the recording starts at the start: {:?}",
         &d.counters[..5]
     );
@@ -340,7 +350,7 @@ async fn a_recording_plays_back_the_frames_that_went_in() {
     };
     assert!(
         unique * 10 >= d.samples * 8,
-        "at least 80% distinct frames at matched rates ({unique} of {})",
+        "at least 80% distinct frames ({unique} of {})",
         d.samples
     );
     // Constant frame rate on the recorder's own clock: 3000 ticks of 90 kHz
