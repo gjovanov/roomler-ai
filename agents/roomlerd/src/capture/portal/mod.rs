@@ -343,6 +343,12 @@ pub mod helper {
         /// "no input", never as a parse failure.
         #[serde(default)]
         pub input_ok: bool,
+        /// FR-85 P1d — whether the compositor draws the pointer into the
+        /// frames (the cursor mode it granted was EMBEDDED). A recording
+        /// says so in its sidecar; `false` from an older helper reads as
+        /// "no pointer", the honest default.
+        #[serde(default)]
+        pub cursor_embedded: bool,
     }
 
     /// Marks the streaming handshake line. A THIRD marker, distinct from the
@@ -518,6 +524,7 @@ pub mod helper {
             height: handle.format.height,
             video_format: handle.format.video_format,
             input_ok,
+            cursor_embedded: session.report.cursor_embedded(),
         };
         match serde_json::to_string(&started) {
             Ok(j) => println!("{STREAM_MARKER}{j}"),
@@ -597,6 +604,8 @@ pub mod helper {
             // Mutter's ScreenCast carries no input; its RemoteDesktop sibling
             // is a separate interface and is not wired here.
             input_ok: false,
+            // `mutter::open` always asks for `cursor-mode` 1, embedded.
+            cursor_embedded: true,
         };
         match serde_json::to_string(&started) {
             Ok(j) => println!("{STREAM_MARKER}{j}"),

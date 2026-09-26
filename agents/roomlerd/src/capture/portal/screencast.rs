@@ -212,6 +212,14 @@ pub struct SessionReport {
     pub pipewire: super::pipewire::PipeWireStatus,
 }
 
+impl SessionReport {
+    /// FR-85 P1d — whether the compositor draws the pointer into the stream:
+    /// what a recording made from it says about its pointer.
+    pub fn cursor_embedded(&self) -> bool {
+        self.cursor_mode_used == CURSOR_EMBEDDED
+    }
+}
+
 /// Why a session could not be opened. Separated from a bare string because
 /// **cancelled is not a failure** — it is a person saying no, and the caller
 /// must not retry it as though it were a transient fault.

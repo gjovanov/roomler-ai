@@ -93,6 +93,21 @@ impl CursorTracker {
             None
         }
     }
+
+    /// FR-85 P1d — the same poll with the shape on EVERY tick, for a
+    /// recording, which draws the pointer itself and keeps its own cache by
+    /// `shape_id` (`capture::pointer::WindowsPointer`). Leaves the "already
+    /// advertised" bookkeeping of [`Self::poll`] alone.
+    #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+    pub fn poll_with_shape(&mut self) -> Option<CursorTick> {
+        let raw = self.inner.poll()?;
+        Some(CursorTick {
+            x: raw.x,
+            y: raw.y,
+            shape_id: raw.shape_id,
+            shape: raw.shape,
+        })
+    }
 }
 
 impl Default for CursorTracker {
