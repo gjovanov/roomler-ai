@@ -548,6 +548,11 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// the platform alone. Both callers are Linux-only, so no other lane sees it.
 #[cfg(target_os = "linux")]
 pub(crate) use unix_priv::drop_to_std;
+/// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
+/// too, so there is one way an account becomes ids (and uid 0 is refused).
+/// Gated to its one consumer, like the drop above.
+#[cfg(all(target_os = "linux", feature = "recording"))]
+pub(crate) use unix_priv::{account_ids, account_name};
 
 #[cfg(unix)]
 mod unix_priv {
@@ -656,6 +661,48 @@ mod unix_priv {
             home,
             name: account.to_string(),
         })
+    }
+
+    /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
+    /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    pub(crate) fn account_ids(
+        account: &str,
+    ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
+        let a = resolve(account)?;
+        Ok((a.uid, a.gid, a.groups))
+    }
+
+    /// FR-85 P1e-unix — the name of the account with `uid` (`getpwuid_r`,
+    /// the buffer grown as [`resolve`] grows its own).
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    pub(crate) fn account_name(uid: libc::uid_t) -> Result<String, String> {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        loop {
+            // SAFETY: every pointer is to memory this frame owns, sized as
+            // passed; the answer points into `buf`, read before it moves.
+            let rc = unsafe {
+                libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+            };
+            if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 {
+                return Err(format!(
+                    "looking up uid {uid} failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                ));
+            }
+            break;
+        }
+        if result.is_null() {
+            return Err(format!("no local account has uid {uid}"));
+        }
+        // SAFETY: `pw_name` points into `buf`, which is still alive.
+        Ok(unsafe { cstr_to_string(pwd.pw_name) })
     }
 
     unsafe fn cstr_to_string(p: *const libc::c_char) -> String {
