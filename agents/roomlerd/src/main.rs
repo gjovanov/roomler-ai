@@ -3192,16 +3192,19 @@ async fn run_cmd(
                 // Read NOW, before this run can promote it five minutes in.
                 lkgv_unset: cfg.last_known_good_version.is_none(),
             });
+        // #1686 — ONE refresher per install. A worker the SCM host spawned
+        // (`run --supervisor scm`) leaves the refresh to that host, which does
+        // it at its own start for the install they share; this worker —
+        // elevated by default, so it CAN write %ProgramFiles% — used to run
+        // the same swap concurrently: measured on the reporting host, its swap
+        // 1.4 s after the host's respawn renamed the fresh companion's file.
+        // Keyed on WHO spawned this worker, not on "some SCM service runs": a
+        // per-user task install beside a running perMachine service still
+        // refreshes its own `%LOCALAPPDATA%` companion.
+        let host_refreshes_companion =
+            matches!(supervision, roomlerd::supervision::Supervision::WindowsScm);
         tokio::spawn(async move {
-            // #1686 — ONE refresher per install. Under a running SCM service
-            // the host refreshes the companion at its own start (it is the
-            // owner the module docs name), and this worker — elevated by
-            // default, so it CAN write %ProgramFiles% — used to run the same
-            // swap concurrently: measured on the reporting host, the worker's
-            // swap 1.4 s after the host's respawn renamed and deleted the
-            // freshly respawned companion's file, which then ran invisibly
-            // (file-id image name) through the next update and blocked it.
-            if !scm_owns_companion {
+            if !host_refreshes_companion {
                 roomlerd::companion::refresh_if_stale(respawn_ctx).await;
             }
             #[cfg(target_os = "windows")]
