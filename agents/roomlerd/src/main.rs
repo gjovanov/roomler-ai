@@ -1532,6 +1532,12 @@ fn exit_for_requested_restart() {
     // restart must never leave the host blackholed for the seconds until the
     // relaunched daemon's own boot reconciler runs (P5/A2).
     roomlerd::purge_exit_routes();
+    // #1684 — likewise idempotent: `run_cmd` already tore the virtual desktop
+    // down on its way here, so this only matters if a future exit path reaches
+    // `exit_for_requested_restart` without unwinding `run_cmd`. Cheap insurance
+    // that systemd never waits out `TimeoutStopSec` on our own desktop tree.
+    #[cfg(target_os = "linux")]
+    virtual_desktop::teardown();
     tracing::info!(
         exit_code = code,
         "requested restart: exiting for the supervisor to relaunch this daemon"
@@ -4173,6 +4179,18 @@ async fn run_cmd(
     if let Some(t) = upd_task {
         t.abort();
     }
+    // #1684 — take our own virtual desktop down BEFORE we leave. Under systemd
+    // `KillMode=control-group`, whatever the daemon spawned that outlives it
+    // (the desktop's setsid'd `at-spi-bus-launcher` grandchild, which ignores
+    // SIGTERM) holds the unit's cgroup non-empty for `TimeoutStopSec` (90 s)
+    // and blocks the restart / stop for that whole time. Reaching every
+    // descendant here — a requested restart, an auto-update's exit, a SIGTERM,
+    // all arrive at this line — leaves systemd an empty cgroup to reap in ~5 s.
+    // Idempotent and a no-op when no desktop was started; a `process::exit`
+    // that never returned through here is covered by the RAII Drop of
+    // `_virtual_desktop` and by `exit_for_requested_restart`.
+    #[cfg(target_os = "linux")]
+    virtual_desktop::teardown();
     // On graceful shutdown, mark the config so the next startup
     // doesn't count this run as a crash. Reload-then-save again to
     // avoid clobbering any concurrent writes (clean_run_task may
