@@ -1,6 +1,6 @@
 # FR-84: The companion and the installer, finished — it starts after install, explains itself, and its pages hold still
 
-**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **proposed 2026-09-25** — P0 (this spec) ·
+**Issue:** [#1633](https://github.com/gjovanov/roomler-ai/issues/1633) · **Status:** **shipped in 0.4.103; field verification in progress (2026-09-26)** — AC1–AC6, AC10, AC13, AC14 verified; AC7 (launchd), AC8, AC9, AC11, AC12 open ·
 **Related:** [#1631](https://github.com/gjovanov/roomler-ai/issues/1631) (web: RC view stuck on the previous device) ·
 [#1632](https://github.com/gjovanov/roomler-ai/issues/1632) (a terminated session leaves the consent prompt up) ·
 [#1035](https://github.com/gjovanov/roomler-ai/issues/1035) (a route port held by a companion the daemon spawned) ·
@@ -268,34 +268,36 @@ keep today's behaviour for the part the older side lacks.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | this PR |
-| S1 | wizard lockstep + one-time `setup-v0.4.102` re-cut | repo variable `SETUP_LOCKSTEP=false` | — |
-| S2 | wizard icon + overlay default for perMachine | revert (assets / UI) | — |
-| D1 | Routes: one connection, stale-while-error, keyed rows, route edit; LocalAPI listener pool + backoff | `localapi_pipe_pool = 1` restores one instance | — |
-| D2 | grouped Settings, per-key `live` truth | an old daemon → flat list | — |
-| D3 | `RestartDaemon` + Apply now | `local_restart_enabled = false` | — |
-| D4 | encoder-caps card; `files_dir` | `files_dir` unset = today's ladder | — |
-| D5 | `/api/agent/self/*`, daemon verbs + `roomler devices`, grid + mesh | any error → the legacy peers table | — |
-| D6 | launch once after install, autostart, Welcome, no-inherit spawn | `companion_autostart = false` | — |
-| D7 | docs, vmtest check, field log | — | — |
+| P0 | spec + ledger row + issue | — | merged #1635 |
+| S1 | wizard lockstep + one-time `setup-v0.4.102` re-cut | repo variable `SETUP_LOCKSTEP=false` | merged #1641; re-cut done 2026-09-25; first lockstep release = `agent-v0.4.103` |
+| S2 | wizard icon + overlay default for perMachine | revert (assets / UI) | merged #1641 |
+| D1 | Routes: one connection, stale-while-error, keyed rows, route edit; LocalAPI listener pool + backoff | `localapi_pipe_pool = 1` restores one instance | merged #1644 |
+| D2 | grouped Settings, per-key `live` truth | an old daemon → flat list | merged #1643 |
+| D3 | `RestartDaemon` + Apply now | `local_restart_enabled = false` | merged #1663 |
+| D4 | encoder-caps card; `files_dir` | `files_dir` unset = today's ladder | merged #1662 |
+| D5 | `/api/agent/self/*`, daemon verbs + `roomler devices`, grid + mesh | any error → the legacy peers table | merged #1646 (server), #1660 (daemon + desktop) |
+| D6 | launch once after install, autostart, Welcome, no-inherit spawn | `companion_autostart = false` | merged #1670 |
+| D7 | docs, vmtest check, field log | — | docs merged #1675; vmtest checks in the deploy repo; field log below |
+| — | release | — | `agent-v0.4.103` (`521598f83`) carries D1–D6 |
+| — | field fixes | revert | #1682 (#1681: the Welcome's Enable read the service probes' log noise — perMachine got the userspace path); #1688 (#1686: the old companion survived an update) — both ride 0.4.104 |
 
 New keys (`files_dir`, `local_restart_enabled`, `companion_autostart`, `localapi_pipe_pool`)
 are registered in the config surface like every other key.
 
 ## Acceptance criteria
 
-- [ ] **AC1** — An `agent-v0.4.N` release produces `setup-v0.4.N` at the same commit with no
+- [x] **AC1** — An `agent-v0.4.N` release produces `setup-v0.4.N` at the same commit with no
       human step, and `/api/setup/{windows,linux,macos}` serve 0.4.N.
-- [ ] **AC2** — The shipped wizard shows a white R on green at 16–256 px (EXE resource and
+- [x] **AC2** — The shipped wizard shows a white R on green at 16–256 px (EXE resource and
       `.app`); CI refuses a placeholder icon.
-- [ ] **AC3** — The wizard's overlay box is checked for perMachine roles and unchecked for
+- [x] **AC3** — The wizard's overlay box is checked for perMachine roles and unchecked for
       perUser roles, unless the user changed it.
-- [ ] **AC4** — With the Routes view open for 10 minutes on the reporting host, no declared
+- [x] **AC4** — With the Routes view open for 10 minutes on the reporting host, no declared
       route or live forward disappears; the 3-open raw pipe probe returns no 231; a failed
       refresh keeps the last data and names the reason.
-- [ ] **AC5** — Editing a live route's port leaves it `active` on the new port; an invalid
+- [x] **AC5** — Editing a live route's port leaves it `active` on the new port; an invalid
       edit leaves the old route running.
-- [ ] **AC6** — Settings shows grouped, collapsible keys with Essentials open; search finds a
+- [x] **AC6** — Settings shows grouped, collapsible keys with Essentials open; search finds a
       key inside a collapsed group; a live key saves without a restart prompt.
 - [ ] **AC7** — Apply now on a supervised Windows service returns the worker in < 10 s with
       `crash_count` unchanged; an unsupervised `roomlerd run` refuses; systemd and launchd
@@ -306,7 +308,7 @@ are registered in the config surface like every other key.
 - [ ] **AC9** — The Overview shows where dropped files land; changing it makes the next drop
       land there without a restart; a SYSTEM-context worker refuses a folder outside the
       active user's profile at set time and at use time.
-- [ ] **AC10** — The desktop grid lists exactly this device's netmap set plus itself
+- [x] **AC10** — The desktop grid lists exactly this device's netmap set plus itself
       (integration test with a negative control under ACL `enforce`), shows display names,
       pages / sorts / searches on the server, keeps column order and visibility across
       restarts, draws the mesh for the same set, and no row carries `machine_id`, owner ids
@@ -317,9 +319,9 @@ are registered in the config surface like every other key.
       later logins start it in the tray.
 - [ ] **AC12** — "Enable" in the Welcome view ends with an overlay IP shown (perMachine) or
       userspace mode on a free port with an explanation (perUser).
-- [ ] **AC13** — A companion the daemon launched holds no handle of the daemon's process
+- [x] **AC13** — A companion the daemon launched holds no handle of the daemon's process
       (handle listing after a daemon restart).
-- [ ] **AC14** — Docs: `docs/desktop-companion.md` created in house style (page map, data
+- [x] **AC14** — Docs: `docs/desktop-companion.md` created in house style (page map, data
       sources, autostart per platform, the restart verb, `files_dir` rules, the devices
       visibility rule, mermaid diagrams) and linked from `docs/README.md`; the installation,
       tunnels, remote-control, api, overlay-communication and deployment docs and the
@@ -349,3 +351,17 @@ are registered in the config surface like every other key.
 |---|---|---|
 | 2026-09-25 | agent 0.4.101 (reporting host) | **Baseline, Routes**: 6 samples of `route ls` + `flows` over 10 s — 7 routes `active`, identical flow ids; 24/24 concurrent `route ls` OK. Raw 3-open pipe burst ×60: open2 = `ERROR_PIPE_BUSY` 60/60, open3 59/60. A .NET `Connect(0)` probe of the same saw 90/90 OK — it waits (`WaitNamedPipe`) where the Rust client does not |
 | 2026-09-25 | production | **Baseline, wizard**: `/api/setup/windows` and `/linux` → `0.4.48`; `/api/setup/macos` → 404; `/api/setup/latest-release` → one release, `setup-v0.4.48` (2026-09-02); agent lane at `agent-v0.4.102` |
+| 2026-09-25 | `setup-v0.4.102` (re-cut by hand) | **S1, one-time**: `/api/setup/{windows,linux,macos}` → `0.4.102` on all three (macOS was 404); every archive with its `.asc` + `.sha256`. Built by the workflow as it stood at that commit, so `targetCommitish: master` and the placeholder icon — AC1/AC2 are for the first lockstep release |
+| 2026-09-25 | agent 0.4.102 (reporting host), before 0.4.103 | **AC4 before**: raw 3-open pipe burst ×60 → open2 `ERROR_PIPE_BUSY` 60/60, open3 60/60. **AC8 before**: the LocalAPI answers `encoder_caps` with `unknown variant` (also on a Linux systemd host) |
+| 2026-09-25 | `setup-v0.4.102` wizard (vmtest win11/wizard/user) | **AC3 before**: Back → role → Continue readings of the overlay box: `daemon-user=false daemon-machine=false daemon-system=false` — unchecked for the perMachine roles (want true). **AC2 before**: the wizard EXE's icon at 16/32/48/256 px is one flat translucent red (`#D20000`, alpha 118) — the 1×1 placeholder, stretched |
+| 2026-09-25 | `agent-v0.4.103` (`521598f83`) | **AC1**: only `agent-v0.4.103` was pushed; `dispatch-setup-release` tagged `setup-v0.4.103` and ran release-setup (green, incl. the alert-close job); `targetCommitish` = `521598f83` = the agent commit; `/api/setup/{windows,linux,macos}` → `roomler-setup-0.4.103-…` on all three. **AC2**: the 0.4.103 wizard EXE's icon — field `#2E7D32` opaque at 32/48/256 (`#2F7E33` at 16), centre `#FFFFFF` at 256; the `.app` carries `CFBundleIconFile icon.png` (512×512, same design); CI's placeholder guard went red→green in #1641 |
+| 2026-09-26 | `setup-v0.4.103` (vmtest win11/wizard/user) | **AC3**: `daemon-user=false daemon-machine=true daemon-system=true`; unticked on `daemon-machine`, then a role flip there and back: `daemon-machine+touched-off=false daemon-user+touched-off=false` — the person's choice sticks. **AC11 (wizard)**: `roomler-desktop.exe --first-run` in the console session as the signed-in user, within the cell's window |
+| 2026-09-26 | agent 0.4.103 (reporting host) | **AC4**: raw 3-open pipe burst ×60 before and after the window → open1/open2/open3 ok **60/60** each (was open2 `231` 60/60). Routes view open 10 min, 20 samples at 30 s: 7 routes, 7 active, 7 flows in every sample; the desktop's own log recorded 0 failed refreshes in the window. A real failure, the daemon restarting under the open view: the desktop log `refresh failed surface="tunnels" failures=1 reason=device service not running (no LocalAPI endpoint)` → 2 s later `refresh recovered`; the frame in between shows "live data unavailable since 03:27:28 · 1 failure · device service not running (no LocalAPI endpoint)" above all 7 declared routes and the live forwards (the last good data), and the next poll's frame has the banner gone and 7 routes `active`. **AC5**: a throwaway SOCKS5 route `active` + LISTENING on 41190 → `route edit --local 41191` → `active` on 41191, 41190 released → `route edit --local 1081` refused ("already used by another enabled route") and the route kept running on 41191; the operator's 7 routes untouched (against an OFFLINE node the probe read `active` with no listener — #1685). **AC7 (SCM)**: `roomler restart` → "pid 52756 exits with code 0; scm relaunches it — back: pid 73676 after 3.6 s", `crash_count` 0→0. **AC13**: after the restart 7/7 declared routes `active` and no listening socket owned by a dead pid. **AC8**: `encoder_caps` = `roomlerd caps` — 12 cells (`av1/h264/hevc_nvenc`, `h264/hevc_amf`, `h264/hevc_d3d12`, `h264/hevc_vulkan`, `h264_mf`, `h264_openh264`, `vp9_libvpx`), `state=ready probe_ms=5693` |
+| 2026-09-26 | agent 0.4.103 (a Linux VAAPI host, via `roomler exec`) | **AC8**: `encoder_caps` = `roomlerd caps` — 6 cells (`h264/hevc_vaapi`, `h264/hevc_vulkan`, `h264_openh264`, `vp9_libvpx`) |
+| 2026-09-26 | agent 0.4.103 (vmtest win11: script + MSI × system / attended / user) | **AC6**: 13 groups; Essentials open with exactly the 9 named keys, every other group closed; searching `localapi_pipe_pool` opened the closed Device group ("1 key matches"), clearing re-closed it; a live key (`files_dir`) saved "in effect now" with no restart bar, a restart-bound key raised it. **AC7**: SCM + SystemContext 4.8 s, SCM attended 5.1 s, MSI SystemContext 9.7 s, MSI attended 6 s; Scheduled Task (script / MSI perUser) "exits with code 9; this command starts it again (task)" → 6.9 s / 7 s; `crash_count` 0→0 on every cell. **AC8**: 3 software cells, card "Software only". **AC9**: SystemContext worker refused `C:\RoomlerDrops` at set time ("…must be inside the active user's profile (C:\Users\vmtest)…"); `~\Drops` saved live → the Overview shows `C:\Users\vmtest\Drops` with no restart. **AC10**: grid = the anchor + self, self chip, server-side search → exactly this device, the mesh with the self ring, a hidden + reordered column survives a reload. **AC11**: `roomler-desktop.exe --first-run` in the console session as the signed-in user (never SYSTEM) on all six; after a quit + `roomler restart` no companion from the daemon within 60 s — on the MSI cells a `--autostart` companion appeared whose parent is `explorer.exe` (Windows' own logon Run processing, late on a freshly booted guest), not the daemon. **AC12 (perUser)**: overlay off → the Welcome's network step "Turn on in userspace mode" → "Connected. This computer is 100.65.20.7 … SOCKS5 127.0.0.1:41080". **AC12 (perMachine) ❌**: attended offered userspace mode, SystemContext disabled the button — both #1681 (fix #1682) |
+| 2026-09-26 | agent 0.4.103 (vmtest Ubuntu 24.04: script + `.deb` × system / user) | **AC7 (systemd)**: "exits with code 9; systemd relaunches it — back: … after 5.5–5.6 s", `crash_count` 0→0 on all four. **AC11**: `/usr/bin/roomler-desktop --first-run` as the user; a quit companion stays quit through a restart |
+| 2026-09-26 | agent 0.4.103 (a WSL host with a virtual desktop) | **AC7**: `roomler restart` → "exits with code 9; systemd relaunches it", new pid, `crash_count` 0→0, `NRestarts` 1→2 — but **96 s** later: the host's `at-spi-bus-launcher` ignored SIGTERM, so systemd waited `TimeoutStopSec` (90 s) + `RestartSec`, and the CLI gave up at 60 s (#1684) |
+| 2026-09-26 | agent 0.4.102 → 0.4.103 (reporting host, auto-update) | **Found #1686**: the old companion survived the update and the new one could not start (Tauri's single-instance lock) — the refresher finds and kills it by IMAGE NAME, and by then Windows listed the companion the previous refresh respawned under an NTFS file id. Both the service host and its worker ran the refresh. Fix #1688 (one refresher per install; found by its started-from path, stopped by PID before the swap) |
+| 2026-09-26 | agent 0.4.102 → 0.4.103 (vmtest win11 MSI attended, the daemon's own updater) | **#1686 before-run**: host `refreshing` 01:08:41.6 → `respawned=true` 01:08:43.9; worker `refreshing` 01:08:42.3 → `respawned=true` 01:08:44.9 — two refreshers, the companion closed and reopened twice in 3 s. This interleaving was benign (the worker checked after the host's respawn); the reporting host's was the other one. A hand-run `roomlerd self-update` over SSH is not a substitute: MSI 1601 twice. Side findings: #1689 (`rc:agent.update` on `auto_update = false` is swallowed silently), #1690 (the `self-update` CLI purges the running service's routes and DNS steer) |
+| 2026-09-26 | agent 0.4.103 (container on a Linux host, `roomlerd run` as PID 1, no supervisor) | **AC7 (orphan)**: `roomler restart` → rc 1, "the daemon refused to restart: this service is not running under a service manager it can identify … exiting would stop it for good rather than restart it"; still running, pid 1 → 1 |
+| 2026-09-26 | agent 0.4.103 (vmtest win11 MSI attended) | **AC13**: the companion the worker respawned in the post-update refresh (its parent has exited), after three daemon restarts: 302 handles — no socket (`\Device\Afd`), no daemon log or config, no `ProgramData\roomler` path, no roomler pipe, no process handle to a `roomlerd`; its files are the WebView2 runtime's, its own `desktop.log` and system resources; no listener owned by a dead pid. The listing's sanity check (the companion's known WebView2 process handles present) guards against an empty read |
