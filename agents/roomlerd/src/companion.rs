@@ -19,14 +19,15 @@
 //! wizard-placed EXE with no marker counts as stale and gets swapped
 //! once, after which the marker tracks.
 //!
-//! Rights model: writing next to the daemon needs whatever rights the
-//! daemon's own directory needs. SYSTEM contexts (SCM host,
-//! SystemContext worker) can write `%ProgramFiles%\Roomler`; a perUser
-//! task daemon owns `%LOCALAPPDATA%\Programs\Roomler`. A user-context
-//! worker under a plain-SCM perMachine install CANNOT write
-//! `%ProgramFiles%` — it logs and skips; the SCM *host* hook covers
-//! that flavour. Failures are always skip-and-retry-next-start, never
-//! fatal.
+//! Ownership: ONE refresher per install (#1686). Under a running SCM service
+//! the service host refreshes at its own start, and the worker does not —
+//! the worker runs elevated by default, so "it cannot write `%ProgramFiles%`
+//! and skips" stopped being true, and the two used to swap concurrently,
+//! each renaming the other's fresh copy under a live companion. A per-user
+//! task daemon owns `%LOCALAPPDATA%\Programs\Roomler` and refreshes itself.
+//! Running companions are found by the path they were started from and
+//! stopped by pid before the swap (`win_service::companion_procs`), never by
+//! image name. Failures are always skip-and-retry-next-start, never fatal.
 
 // FR-27: unconditional now — `ensure_running` has a real body on every
 // platform, where before this module was Windows-only.
@@ -767,17 +768,48 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         .await
         .with_context(|| format!("downloading {}", asset.name))?;
 
-    let was_running = desktop_running();
+    // #1686 — stop every running companion BEFORE the swap, found by the path
+    // it was started from and stopped by pid. The name-based check this
+    // replaces (`tasklist` / `taskkill /IM`) went blind the moment an earlier
+    // swap had renamed and POSIX-deleted a still-running companion's file:
+    // Windows then reports it under a file id, it survived every later
+    // update, and its single-instance lock made each new companion exit 0.
+    // Killed first, so the rename below never moves the file under a live
+    // image and the `.old` delete never unlinks one.
+    let running = crate::win_service::companion_procs::find(&dest);
+    let pids: Vec<u32> = running.iter().map(|p| p.pid).collect();
+    let stopped = if pids.is_empty() {
+        Vec::new()
+    } else {
+        tokio::task::spawn_blocking({
+            let pids = pids.clone();
+            move || {
+                crate::win_service::companion_procs::terminate_and_wait(
+                    &pids,
+                    std::time::Duration::from_secs(10),
+                )
+            }
+        })
+        .await
+        .unwrap_or_default()
+    };
+    if stopped.len() != pids.len() {
+        tracing::warn!(
+            ?pids,
+            ?stopped,
+            "desktop companion refresh: a running companion could not be stopped; \
+             the new one will find its single-instance lock taken until it exits"
+        );
+    }
 
     // Rename-swap: a RUNNING EXE can be renamed (not overwritten) on
-    // Windows, so move the live file aside, copy the new one in, and
-    // clean the `.old` afterwards. PermissionDenied here = wrong
-    // context (user-context worker on a perMachine install) — skip;
-    // the SYSTEM-side hook owns that flavour.
+    // Windows, so move the file aside, copy the new one in, and clean the
+    // `.old` afterwards. PermissionDenied here = a context without write
+    // rights on the install dir — skip; the owner of this install refreshes.
     let old = exe_dir.join(OLD_SUFFIX);
     let _ = std::fs::remove_file(&old);
     if dest.exists() {
-        std::fs::rename(&dest, &old).context("renaming running desktop EXE aside")?;
+        std::fs::rename(&dest, &old).context("renaming the desktop EXE aside")?;
     }
     if let Err(e) = std::fs::copy(&staged, &dest) {
         // Best-effort rollback so the host isn't left with NO desktop.
@@ -790,13 +822,13 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         tracing::warn!(error = %e, "could not write desktop version marker");
     }
 
+    let was_running = !pids.is_empty();
     if was_running {
-        kill_desktop();
         respawn_desktop(respawn, &dest);
     }
 
-    // The old EXE may stay locked for a moment while the killed
-    // process dies; a few short retries, then leave it for the next
+    // The old EXE may stay locked for a moment while a stopped process
+    // finishes exiting; a few short retries, then leave it for the next
     // cycle's pre-delete.
     for _ in 0..3 {
         if std::fs::remove_file(&old).is_ok() || !old.exists() {
@@ -808,6 +840,7 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
     tracing::info!(
         version = own_version,
         respawned = was_running,
+        stopped = ?stopped,
         "desktop companion refreshed"
     );
     Ok(())
@@ -828,54 +861,36 @@ fn pick_desktop_asset(
         .or_else(|| assets.iter().find(|a| is_desktop(&a.name)))
 }
 
-/// Is `roomler-desktop.exe` currently running? `tasklist` image-name
-/// filter — the image name appears verbatim in the table regardless of
-/// UI locale. `pub`: the S1b appdirs migration skips while the desktop
-/// runs (it may hold open handles inside the tree being moved).
+/// The companion beside this daemon — the one install whose companion this
+/// process refreshes, launches and asks about.
+#[cfg(target_os = "windows")]
+fn sibling_desktop() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DESKTOP_EXE)))
+}
+
+/// Is the companion beside this daemon running? Matched by the path it was
+/// STARTED from (#1686), not by image name: a companion whose file an update
+/// renamed or deleted keeps running under a file-id image name, and a
+/// `tasklist IMAGENAME` check stops seeing it. `pub`: the S1b appdirs
+/// migration skips while the desktop runs (it may hold open handles inside
+/// the tree being moved).
 #[cfg(target_os = "windows")]
 pub fn desktop_running() -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {DESKTOP_EXE}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains(DESKTOP_EXE))
-        .unwrap_or(false)
+    sibling_desktop().is_some_and(|exe| !crate::win_service::companion_procs::find(&exe).is_empty())
 }
 
-#[cfg(target_os = "windows")]
-fn kill_desktop() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Abrupt kill is safe for the tray: its state is a thin poll over
-    // the LocalAPI, and pending consent prompts are daemon-side
-    // sentinels the respawned app re-lists within its 1.5 s poll.
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", DESKTOP_EXE])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-}
-
-/// Is `roomler-desktop.exe` running in Terminal Services session `session`?
-/// The launcher's question is "does THIS user already have it open", which a
+/// Is the companion running in Terminal Services session `session`? The
+/// launcher's question is "does THIS user already have it open", which a
 /// machine-wide listing cannot answer on a host with more than one session.
 #[cfg(target_os = "windows")]
 pub(crate) fn desktop_running_in_session(session: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
-        .args([
-            "/FI",
-            &format!("IMAGENAME eq {DESKTOP_EXE}"),
-            "/FI",
-            &format!("SESSION eq {session}"),
-            "/NH",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains(DESKTOP_EXE))
-        .unwrap_or(false)
+    sibling_desktop().is_some_and(|exe| {
+        crate::win_service::companion_procs::find(&exe)
+            .iter()
+            .any(|p| p.session == Some(session))
+    })
 }
 
 #[cfg(target_os = "windows")]

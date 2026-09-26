@@ -32,6 +32,9 @@
 
 #[cfg(feature = "wgc-capture")]
 pub mod capture_smoke;
+/// #1686 — find a running companion by the path it was started from, never
+/// by image name (which a rename or POSIX delete of its file changes).
+pub mod companion_procs;
 /// FR-84 D6 — start the companion from a user-context daemon without
 /// handing it our handles (#1035).
 pub mod companion_spawn;
