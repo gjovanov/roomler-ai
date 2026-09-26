@@ -129,6 +129,26 @@ pub fn start() -> Result<()> {
     }
 }
 
+/// #1705 — the desktop companion's service probes, recognised from RAW argv:
+/// `Some(false)` for `service status`, `Some(true)` for
+/// `service status --as-service`, `None` for everything else (any other
+/// spelling takes the normal path, full startup included).
+///
+/// The companion runs both every 10 s (`probe_service_state`). They ask the
+/// SERVICE MANAGER one question, so the daemon answers them before any of its
+/// own startup — DPI and timer requests, the companion scan, the legacy-tree
+/// migration, the persistent log file — which is read here, ahead of clap and
+/// of every appdirs consumer. Taking the full startup, they flooded the
+/// per-user log with ~17,000 starts a day on every companion host.
+pub fn companion_probe(argv: &[String]) -> Option<bool> {
+    let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    match rest.as_slice() {
+        ["service", "status"] => Some(false),
+        ["service", "status", "--as-service"] => Some(true),
+        _ => None,
+    }
+}
+
 /// Query whether the auto-start hook is currently registered.
 pub fn status() -> Result<AutostartStatus> {
     #[cfg(target_os = "windows")]
@@ -869,6 +889,33 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_companions_two_probes_skip_the_daemon_startup() {
+        let argv = |a: &[&str]| -> Vec<String> {
+            std::iter::once("roomlerd")
+                .chain(a.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(companion_probe(&argv(&["service", "status"])), Some(false));
+        assert_eq!(
+            companion_probe(&argv(&["service", "status", "--as-service"])),
+            Some(true)
+        );
+        // Everything else keeps the full startup: other service verbs, other
+        // commands, a global flag in front, trailing extras, no command.
+        for other in [
+            &["service", "install"][..],
+            &["service", "status", "--as-service", "--verbose"],
+            &["--config", "x.toml", "service", "status"],
+            &["run"],
+            &["status"],
+            &[],
+        ] {
+            assert_eq!(companion_probe(&argv(other)), None, "{other:?}");
+        }
+    }
 
     #[test]
     fn autostart_status_renders_human_readable() {
