@@ -170,3 +170,31 @@ pub fn purge_exit_routes() {
         tunnel_core::overlay::dns::purge_exit_dns();
     }
 }
+
+/// #1690 — [`purge_exit_routes`] for a process that may NOT own the overlay
+/// adapter: `roomlerd self-update` run by hand or through `roomler exec`.
+/// While a daemon is running (it answers the LocalAPI), the routes, the
+/// exit split-default and the DNS steer are that daemon's: its route guard
+/// would re-add the routes within seconds, but nothing re-asserts the DNS
+/// steer before its next start, and the installer is about to stop it — its
+/// own teardown and the new binary's boot reconciler handle what is left.
+/// With no daemon running, the leftovers have no owner and are purged as
+/// before. Returns whether it purged.
+pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
+    if daemon_running {
+        return false;
+    }
+    purge_exit_routes();
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    /// #1690 — a running daemon keeps its routes: `roomlerd self-update`, a
+    /// second process, must not purge them. Only this branch is exercised —
+    /// the other deletes real routes on an `overlay-l3` build.
+    #[test]
+    fn a_running_daemon_keeps_its_routes() {
+        assert!(!super::purge_exit_routes_unless_owned(true));
+    }
+}
