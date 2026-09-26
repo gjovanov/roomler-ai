@@ -2490,10 +2490,10 @@ fn set_org_enabled(cfg: &mut config::AgentConfig, label: &str, enable: bool) -> 
 }
 
 /// True if virtual-desktop mode was requested (`ROOMLERD_VIRTUAL_DESKTOP`).
+/// The one copy is `virtual_desktop::requested` (the indicator and the
+/// recorder ask it too).
 fn virtual_desktop_requested() -> bool {
-    node_env("VIRTUAL_DESKTOP")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    roomlerd::virtual_desktop::requested()
 }
 
 /// Linux: if requested, bring up the virtual desktop, point capture at it via

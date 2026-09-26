@@ -23,6 +23,21 @@ use tracing::{info, warn};
 
 const X11_UNIX_DIR: &str = "/tmp/.X11-unix";
 
+/// Is this daemon configured to run its OWN virtual desktop
+/// (`VIRTUAL_DESKTOP=1` or `true`, through `node_env`: the env var under any
+/// of its names, then the config)?
+///
+/// ⚠️ ONE copy. `main.rs` (whether to start one), the X11 indicator (a
+/// virtual desktop is no consent surface) and the recorder (FR-85: a virtual
+/// desktop is no login screen) all ask this. Two hand-rolled copies once
+/// disagreed: one skipped `node_env`'s config fallback, so a knob set through
+/// `roomler config` was seen by one and not the other.
+pub fn requested() -> bool {
+    tunnel_core::env::node_env("VIRTUAL_DESKTOP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// How long the graceful teardown waits after SIGTERM before it SIGKILLs
 /// whatever is left. Small on purpose: the virtual desktop's D-Bus tree —
 /// `at-spi-bus-launcher` in particular — ignores SIGTERM, so the SIGKILL is

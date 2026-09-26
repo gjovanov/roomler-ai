@@ -124,21 +124,15 @@ pub(super) struct Inner {
 /// today), and a real X session on the same host is unaffected — this reads
 /// the daemon's own configuration, not the display.
 fn display_is_our_own_virtual_desktop() -> bool {
-    // Must stay byte-identical to `main.rs::virtual_desktop_requested`: the two
-    // answer the SAME question from different crates, and a host where they
-    // disagree gets a virtual desktop that main.rs asked for and this refuses to
-    // recognise as its own.
+    // The SAME question `main.rs` asks before starting one, so the same
+    // function (`virtual_desktop::requested`), never a second copy.
     //
-    // They did disagree. This hand-rolled `ROOMLERD_` -> `ROOMLER_AGENT_` pair
-    // skipped `node_env`'s middle arm (`ROOMLER_NODE_`) and, more importantly, its
+    // Two copies did disagree. A hand-rolled pair of env names here skipped
+    // `node_env`'s middle arm (`ROOMLER_NODE_`) and, more importantly, its
     // config fallback — so the knob set through the S2 config surface
     // (`roomler config`, the way an operator is told to set it) was visible to
-    // main.rs and invisible here. The comment claimed "same accessor shape as
-    // main.rs" while being a different shape, which is the exact class of stale
-    // assertion FR-21 exists to remove.
-    tunnel_core::env::node_env("VIRTUAL_DESKTOP")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    // main.rs and invisible here.
+    crate::virtual_desktop::requested()
 }
 
 impl Inner {

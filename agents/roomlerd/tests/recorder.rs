@@ -1123,14 +1123,21 @@ mod process {
             dir.path().join("config.toml"),
         )
         .with_service_identity(true);
+        // What the refusal names: a Windows service with nobody signed in is
+        // at its sign-in screen (decision 6); root elsewhere, the account.
+        let names_why = |m: &str| {
+            if cfg!(windows) {
+                m.contains("sign-in screen")
+            } else {
+                m.contains("this device service runs as")
+            }
+        };
         // Said AHEAD of time, so a client greys its Start out (P2b)…
         match m.status() {
             Response::Recording(st) => {
                 assert!(!st.available, "{st:?}");
                 assert!(
-                    st.unavailable_reason
-                        .as_deref()
-                        .is_some_and(|r| r.contains("this device service runs as")),
+                    st.unavailable_reason.as_deref().is_some_and(names_why),
                     "{st:?}"
                 );
             }
@@ -1138,9 +1145,7 @@ mod process {
         }
         // …and again if a start is attempted anyway.
         match m.start(RecordStartOpts::default()).await {
-            Response::Error { message } => {
-                assert!(message.contains("this device service runs as"), "{message}")
-            }
+            Response::Error { message } => assert!(names_why(&message), "{message}"),
             other => panic!("{other:?}"),
         }
     }
@@ -1169,6 +1174,31 @@ mod process {
                 assert!(message.contains("changed"), "{message}")
             }
             other => panic!("the start went ahead: {other:?}"),
+        }
+    }
+
+    /// FR-85 decision 6 — a login screen that comes up between the decision
+    /// (unattended) and the launch refuses by ITS name: the refusal travels
+    /// whole, so the controller is told `login_screen`, never a bare
+    /// "unavailable" (found in review: it was flattened to a sentence).
+    #[tokio::test]
+    async fn a_login_screen_at_the_launch_refuses_by_its_own_name() {
+        use roomlerd::recording::launch::{Identity, Refusal};
+        use roomlerd::recording::manager::{RecordingManager, RemoteInitiator, StartError};
+        let dir = scratch();
+        let m = RecordingManager::new(
+            PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+            dir.path().join("config.toml"),
+        )
+        .with_identity(Err(Refusal::LoginScreen));
+        let initiator = RemoteInitiator {
+            session_id: bson::oid::ObjectId::new(),
+            controller_user_id: bson::oid::ObjectId::new(),
+            controller_name: "Tester".into(),
+        };
+        match m.start_remote(initiator, false, Identity::Unattended).await {
+            Err(StartError::Unavailable(Refusal::LoginScreen)) => {}
+            other => panic!("not refused as a login screen: {other:?}"),
         }
     }
 

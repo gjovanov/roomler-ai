@@ -134,6 +134,15 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
       "nothing on the device can show that it's being recorded",
     )
     expect(describeRecordReason('a_code_from_a_newer_device')).toBe('a_code_from_a_newer_device')
+
+    // FR-85 decision 6: a login screen is its own refusal, and says what
+    // would let it record — never the bare "can't record right now".
+    ch.deliver({ t: 'rc:record.state', id: 'x', state: 'refused', reason: 'login_screen' })
+    expect(r.state.value).toBe('refused')
+    expect(describeRecordReason(r.reason.value)).toBe(
+      'the device is at its sign-in screen; it can record once someone signs in',
+    )
+    expect(describeRecordReason('login_screen')).not.toBe(describeRecordReason('unavailable'))
   })
 
   it('a device with no recorder gets no Record control; every other strip reason is shown (P3c-2)', () => {

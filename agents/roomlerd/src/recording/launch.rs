@@ -13,8 +13,16 @@
 //! | an ELEVATED user: the default Windows service worker of a UAC-split administrator (`ROOMLERD_ELEVATE_WORKER`) | a restricted copy of the same token: admin groups deny-only, no privileges, medium integrity |
 //! | SYSTEM, with someone signed in at the console | that person's own token |
 //! | root on Linux, with someone signed in at the active graphical session | that person: their uid, gid and groups, in their session's environment |
-//! | SYSTEM or Linux root with nobody signed in | a REMOTE recording only (P1f, [`Identity::Unattended`]): the daemon itself, into the daemon's own folder, locked to the service side; a local one is refused, by name |
+//! | SYSTEM or Linux root, a screen showing that nobody is signed in to: Windows' sign-in screen, a Linux display manager's greeter or root's own desktop, or (Linux) a display or scanout the recorder could reach with no session registered | refused, by name ([`Refusal::LoginScreen`], decision 6): nobody to record as, and someone may be standing at it |
+//! | Linux root with no screen anyone could be at: its own virtual desktop or the synthetic test source, or no active graphical session and no display or DRM scanout the recorder could reach | a REMOTE recording only (P1f, [`Identity::Unattended`]): the daemon itself, into the daemon's own folder, locked to the service side; a local one is refused, by name |
 //! | root on macOS | refused, by name |
+//!
+//! ⚠️ **A login screen is not "nobody"** (FR-85 decision 6). It shows account
+//! names, a person may be standing at it, and nothing on it can say that a
+//! recording runs, so the unattended exception is only for a device with no
+//! screen anyone could be at. Windows always has one: the console session
+//! shows the sign-in screen whenever nobody is signed in, so a Windows service
+//! never records unattended.
 //!
 //! ⚠️ **A restricted COPY, not the linked token.** An elevated administrator's
 //! token links to the filtered one, but without `SeTcbPrivilege` (a worker has
@@ -73,8 +81,20 @@ pub enum Identity {
 /// Why no recorder can be launched here right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// SYSTEM (or root on Linux), and nobody is signed in at the screen.
+    /// Linux root, and no screen anyone could be at: a host running its own
+    /// virtual desktop, or one with no active graphical session and no real
+    /// screen the recorder could reach (`unix::shows_a_screen`). A REMOTE
+    /// recording takes the unattended exception (P1f).
     NoConsoleUser,
+    /// FR-85 decision 6 — SYSTEM (or root on Linux), nobody the recorder can
+    /// run as is signed in, but a screen is showing: its login screen
+    /// (Windows' sign-in screen; on Linux a display manager's greeter or
+    /// root's own desktop), or on Linux a display or scanout the recorder
+    /// could reach with no session registered for it. Someone may be
+    /// standing at it, and nothing on it can say a recording runs, so this
+    /// is never "nobody" for the unattended exception: a remote recording is
+    /// refused, by this name.
+    LoginScreen,
     /// root on macOS: launching the recorder as the person at the screen is
     /// built on Windows and Linux.
     RootDaemon,
@@ -96,6 +116,16 @@ impl Refusal {
                 "this device service runs as root and nobody is signed in at its screen (a \
                  graphical session): a recording is made as the person signed in at the device, \
                  so there is no one to record as"
+            }
+            Self::LoginScreen if cfg!(windows) => {
+                "this device is at its sign-in screen: nobody is signed in to record as, and \
+                 someone may be standing at the screen where nothing could say it is being \
+                 recorded"
+            }
+            Self::LoginScreen => {
+                "this device shows a screen nobody is signed in to (its login screen, or a \
+                 display with no session): someone may be standing at it, nothing on it could say \
+                 it is being recorded, and a recording is made as the person signed in"
             }
             Self::RootDaemon => {
                 "this device service runs as root, and launching the recorder as the person at \
@@ -141,6 +171,14 @@ pub struct Facts {
     /// (Linux, root only) the uid signed in at the active graphical session:
     /// a person's, never a display manager's greeter.
     pub console_uid: Option<u32>,
+    /// (SYSTEM or root only, when nobody the recorder can run as is signed
+    /// in) a screen is showing anyway: on Windows always (the console's
+    /// sign-in screen); on Linux an active graphical session that is not a
+    /// person's (a display manager's greeter, root's own desktop), or a
+    /// display or scanout the recorder could reach with no session for it,
+    /// never the host's own virtual desktop (`unix::shows_a_screen`). FR-85
+    /// decision 6: someone may be standing at it.
+    pub login_screen: bool,
 }
 
 /// The identity rule, as a table.
@@ -149,12 +187,14 @@ pub fn decide_from(f: Facts) -> Result<Identity, Refusal> {
         if f.windows {
             return match f.console_session {
                 Some(session) => Ok(Identity::ConsoleUser { session }),
+                None if f.login_screen => Err(Refusal::LoginScreen),
                 None => Err(Refusal::NoConsoleUser),
             };
         }
         if f.linux {
             return match f.console_uid {
                 Some(uid) => Ok(Identity::SessionUser { uid }),
+                None if f.login_screen => Err(Refusal::LoginScreen),
                 None => Err(Refusal::NoConsoleUser),
             };
         }
@@ -180,17 +220,24 @@ fn facts_with(fresh: bool) -> Facts {
     {
         let _ = fresh;
         let service_account = crate::win_identity::process_is_local_system();
+        let console_session = if service_account {
+            win::signed_in_console_session()
+        } else {
+            None
+        };
         Facts {
             windows: true,
             linux: false,
             service_account,
             above_medium: win::own_integrity_rid().is_none_or(|rid| rid > win::MEDIUM_RID),
-            console_session: if service_account {
-                win::signed_in_console_session()
-            } else {
-                None
-            },
+            console_session,
             console_uid: None,
+            // With nobody signed in, the console shows the sign-in screen: a
+            // Windows device always has one (a headless server's console
+            // session included). A user token that cannot be had, and the
+            // instant the console session is attaching or detaching, read the
+            // same: refused, never unattended.
+            login_screen: service_account && console_session.is_none(),
         }
     }
     #[cfg(unix)]
@@ -198,6 +245,14 @@ fn facts_with(fresh: bool) -> Facts {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot
         // fail.
         let root = unsafe { libc::geteuid() } == 0;
+        #[cfg(target_os = "linux")]
+        let seat = if root {
+            unix::seat(fresh)
+        } else {
+            unix::Seat::Empty
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = fresh;
         Facts {
             windows: false,
             linux: cfg!(target_os = "linux"),
@@ -205,12 +260,16 @@ fn facts_with(fresh: bool) -> Facts {
             above_medium: false,
             console_session: None,
             #[cfg(target_os = "linux")]
-            console_uid: if root { unix::console_uid(fresh) } else { None },
+            console_uid: seat.person(),
             #[cfg(not(target_os = "linux"))]
-            console_uid: {
-                let _ = fresh;
-                None
-            },
+            console_uid: None,
+            // A greeter, or a screen the recorder could reach with no session
+            // registered for it; never the host's own virtual desktop, which
+            // only a remote controller ever sees (`unix::shows_a_screen`).
+            #[cfg(target_os = "linux")]
+            login_screen: root && unix::shows_a_screen(seat, unix::Reach::of_this_process()),
+            #[cfg(not(target_os = "linux"))]
+            login_screen: false,
         }
     }
     #[cfg(not(any(windows, unix)))]
@@ -223,6 +282,7 @@ fn facts_with(fresh: bool) -> Facts {
             above_medium: false,
             console_session: None,
             console_uid: None,
+            login_screen: false,
         }
     }
 }
@@ -587,7 +647,6 @@ pub(crate) mod win {
             _ => None,
         }
     }
-
     /// Is this group one of the admin-equivalent ones the UAC filter disables?
     ///
     /// # Safety
@@ -1533,8 +1592,86 @@ pub(crate) mod unix {
     /// within this.
     const CONSOLE_TTL: Duration = Duration::from_secs(5);
 
+    /// What logind says about who is at the screen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Seat {
+        /// A person is signed in (`Class=user`, not root): record as them.
+        Person(u32),
+        /// A graphical session is active and nobody can be recorded as: a
+        /// display manager's greeter at the login screen, or root's own
+        /// desktop (the recorder never runs as root). Someone may be at it.
+        NoPerson,
+        /// logind lists no active graphical session. NOT proof that nobody
+        /// is at a screen: a display the daemon's environment names, or the
+        /// physical scanout, can still be one ([`shows_a_screen`]).
+        Empty,
+        /// logind could not be asked (no `loginctl`, or it failed). Never
+        /// read as [`Seat::Empty`]'s "no session".
+        Unknown,
+    }
+
+    impl Seat {
+        /// The uid to record as, when there is one.
+        pub(crate) fn person(self) -> Option<u32> {
+            match self {
+                Self::Person(uid) => Some(uid),
+                Self::NoPerson | Self::Empty | Self::Unknown => None,
+            }
+        }
+    }
+
+    /// What a recorder launched as THIS daemon could capture. An unattended
+    /// recorder inherits the daemon's environment, and the capture cascade
+    /// opens whatever that names (`capture::open_for_recording`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Reach {
+        /// The daemon runs its own virtual desktop: only a remote controller
+        /// ever sees that display.
+        pub(crate) own_virtual_desktop: bool,
+        /// The synthetic test source (a test build with it switched on).
+        pub(crate) synthetic: bool,
+        /// `DISPLAY` or `WAYLAND_DISPLAY` in the daemon's environment: a
+        /// display logind may know nothing about.
+        pub(crate) display: bool,
+        /// DRM scanout capture is on: the physical screen, whatever runs on
+        /// it (a text console, a kiosk, a greeter no session registers).
+        pub(crate) drm: bool,
+    }
+
+    impl Reach {
+        pub(crate) fn of_this_process() -> Self {
+            Self {
+                own_virtual_desktop: crate::virtual_desktop::requested(),
+                synthetic: crate::capture::synthetic_frames_requested(),
+                display: std::env::var_os("DISPLAY").is_some()
+                    || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+                drm: cfg!(feature = "drm-capture") && tunnel_core::env::flag("DRM_CAPTURE", false),
+            }
+        }
+    }
+
+    /// FR-85 decision 6 — with nobody to record as, does a screen show that
+    /// someone may be standing at? Then a recording is refused
+    /// ([`super::Refusal::LoginScreen`]); only otherwise may the unattended
+    /// exception apply.
+    ///
+    /// A greeter, or root's own desktop, is one. So is a seat logind reports
+    /// empty, or cannot be asked about, whenever the recorder could still
+    /// reach a real screen: a display named in the daemon's environment, or
+    /// the scanout (found in review — "no logind session" is not "no
+    /// screen"). The host's own virtual desktop and the synthetic source are
+    /// no one's screen, whatever the seat says.
+    pub(crate) fn shows_a_screen(seat: Seat, reach: Reach) -> bool {
+        match seat {
+            Seat::Person(_) => false,
+            _ if reach.own_virtual_desktop || reach.synthetic => false,
+            Seat::NoPerson => true,
+            Seat::Empty | Seat::Unknown => reach.display || reach.drm,
+        }
+    }
+
     /// The last answer to "who is signed in", and when it was had.
-    pub(super) struct ConsoleCache(Mutex<Option<(Instant, Option<u32>)>>);
+    pub(super) struct ConsoleCache(Mutex<Option<(Instant, Seat)>>);
 
     impl ConsoleCache {
         pub(super) const fn new() -> Self {
@@ -1548,33 +1685,114 @@ pub(crate) mod unix {
         /// read twice within a few milliseconds is ONE observation, so a
         /// person who signed in inside the window would be recorded with no
         /// banner (found in review: the re-check was a no-op on the cache).
-        pub(super) fn get(&self, fresh: bool, lookup: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        pub(super) fn get(&self, fresh: bool, lookup: impl FnOnce() -> Seat) -> Seat {
             let mut cached = self.0.lock().unwrap_or_else(|p| p.into_inner());
             if !fresh
-                && let Some((at, uid)) = *cached
+                && let Some((at, seat)) = *cached
                 && at.elapsed() < CONSOLE_TTL
             {
-                return uid;
+                return seat;
             }
-            let uid = lookup();
-            *cached = Some((Instant::now(), uid));
-            uid
+            let seat = lookup();
+            *cached = Some((Instant::now(), seat));
+            seat
         }
     }
 
     static CONSOLE: ConsoleCache = ConsoleCache::new();
 
-    /// The uid signed in at the active graphical session: a person's
-    /// (`Class=user`), never a display manager's greeter. uid 0 counts as
-    /// nobody: the recorder never runs as root. `fresh` asks the system
-    /// now, whatever was asked a moment ago.
-    pub(super) fn console_uid(fresh: bool) -> Option<u32> {
+    /// Who is at the active graphical session. A person is a `Class=user`
+    /// session, never a display manager's greeter, and uid 0 is no person:
+    /// the recorder never runs as root. `fresh` asks the system now,
+    /// whatever was asked a moment ago.
+    ///
+    /// ⚠️ FR-85 decision 6: a greeter is NOT an empty seat. Both mean
+    /// "nobody to record as", but only an empty one can mean nobody is
+    /// looking ([`shows_a_screen`] decides, with what the recorder could
+    /// reach).
+    pub(super) fn seat(fresh: bool) -> Seat {
         CONSOLE.get(fresh, || {
-            crate::companion::graphical_session_matching(None, true)
+            let person = crate::companion::graphical_session_matching(None, true)
                 .ok()
-                .map(|s| s.uid)
-                .filter(|&uid| uid != 0)
+                .map(|s| s.uid);
+            classify(person, any_graphical_session)
         })
+    }
+
+    /// The pure half of [`seat`]: `person` is the uid at the active
+    /// `Class=user` session, if one is; `any_active` asks whether ANY
+    /// graphical session is active (a greeter's included), and is asked only
+    /// when no person was found. An `Err` from it is [`Seat::Unknown`].
+    pub(super) fn classify(
+        person: Option<u32>,
+        any_active: impl FnOnce() -> anyhow::Result<bool>,
+    ) -> Seat {
+        match person {
+            Some(uid) if uid != 0 => Seat::Person(uid),
+            _ => match any_active() {
+                Ok(true) => Seat::NoPerson,
+                Ok(false) => Seat::Empty,
+                Err(_) => Seat::Unknown,
+            },
+        }
+    }
+
+    /// Is ANY graphical session active, a greeter's or root's included? Only
+    /// `Type` and `Active` count: the person walk also needs a `Name` and a
+    /// parseable `User`, and a session it skips for want of one is still a
+    /// screen someone may be at. `Err` when `loginctl` could not be asked at
+    /// all, which is never "no session" (found in review: both folded into
+    /// one `Err` before, and read as an empty seat).
+    fn any_graphical_session() -> anyhow::Result<bool> {
+        use anyhow::Context as _;
+        let list = std::process::Command::new("loginctl")
+            .args(["list-sessions", "--no-legend", "--no-pager"])
+            .output()
+            .context("spawning loginctl")?;
+        anyhow::ensure!(
+            list.status.success(),
+            "loginctl list-sessions: {}",
+            list.status
+        );
+        Ok(any_active_in(
+            &String::from_utf8_lossy(&list.stdout),
+            |id| {
+                std::process::Command::new("loginctl")
+                    .args([
+                        "show-session",
+                        id,
+                        "--no-pager",
+                        "-p",
+                        "Type",
+                        "-p",
+                        "Active",
+                    ])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            },
+        ))
+    }
+
+    /// The pure half of [`any_graphical_session`]. `list` is `loginctl
+    /// list-sessions --no-legend`, of which only the first column is read
+    /// (its other columns move between systemd releases; `companion` reads
+    /// it the same way); `show` is one session's `Type=`/`Active=` lines, or
+    /// `None` for a session that went away between the two asks.
+    pub(super) fn any_active_in(list: &str, show: impl Fn(&str) -> Option<String>) -> bool {
+        list.lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter_map(show)
+            .any(|props| {
+                let field = |k: &str| {
+                    props
+                        .lines()
+                        .find_map(|l| l.trim().strip_prefix(k)?.strip_prefix('='))
+                        .map(str::trim)
+                };
+                matches!(field("Type"), Some("x11" | "wayland")) && field("Active") == Some("yes")
+            })
     }
 
     /// An account, resolved the way the privilege drop resolves one
@@ -1879,18 +2097,153 @@ pub(crate) mod unix {
         #[test]
         fn a_fresh_ask_sees_a_sign_in_the_cache_would_hide() {
             let cache = ConsoleCache::new();
-            assert_eq!(cache.get(false, || None), None, "nobody signed in");
             assert_eq!(
-                cache.get(false, || Some(1000)),
-                None,
+                cache.get(false, || Seat::NoPerson),
+                Seat::NoPerson,
+                "nobody signed in"
+            );
+            assert_eq!(
+                cache.get(false, || Seat::Person(1000)),
+                Seat::NoPerson,
                 "inside the window the cached answer stands"
             );
-            assert_eq!(cache.get(true, || Some(1000)), Some(1000));
+            assert_eq!(cache.get(true, || Seat::Person(1000)), Seat::Person(1000));
             assert_eq!(
-                cache.get(false, || None),
-                Some(1000),
+                cache.get(false, || Seat::Empty),
+                Seat::Person(1000),
                 "the fresh answer refreshed the cache"
             );
+        }
+
+        #[test]
+        fn only_a_person_is_someone_to_record_as() {
+            assert_eq!(Seat::Person(1000).person(), Some(1000));
+            assert_eq!(Seat::NoPerson.person(), None);
+            assert_eq!(Seat::Empty.person(), None);
+            assert_eq!(Seat::Unknown.person(), None);
+        }
+
+        /// FR-85 decision 6: a greeter, and root's own desktop, are a login
+        /// screen — someone may be at them — distinct from no active
+        /// graphical session, and a logind that cannot be asked is neither.
+        /// Red when the second walk is skipped (a greeter reads as nobody),
+        /// or when its failure reads as "no session".
+        #[test]
+        fn a_greeter_is_a_login_screen_not_an_empty_seat() {
+            // A person: no second walk.
+            assert_eq!(
+                classify(Some(1000), || panic!(
+                    "asked for any session with a person found"
+                )),
+                Seat::Person(1000)
+            );
+            // A greeter at the login screen: no `Class=user` session, one active.
+            assert_eq!(classify(None, || Ok(true)), Seat::NoPerson);
+            // root's own desktop: never recorded as, and someone is at it.
+            assert_eq!(classify(Some(0), || Ok(true)), Seat::NoPerson);
+            // logind answers: no active graphical session.
+            assert_eq!(classify(None, || Ok(false)), Seat::Empty);
+            // logind could not be asked: not "no session".
+            assert_eq!(
+                classify(None, || Err(anyhow::anyhow!("spawning loginctl"))),
+                Seat::Unknown
+            );
+        }
+
+        /// The second walk counts any ACTIVE graphical session, whoever's,
+        /// from `loginctl`'s own output (its layout per systemd 255/257):
+        /// only `Type` and `Active` decide. Red when a greeter's session is
+        /// filtered out, or a text console or an inactive session counts.
+        #[test]
+        fn any_active_graphical_session_counts_whoevers_it_is() {
+            let list = "c1  128 gdm     seat0 tty1 active no -\n\
+                        3  1000 alice   seat0 tty2 online no -\n\
+                        7     0 root          pts/0 active no -\n";
+            let props = |c1: &'static str, s3: &'static str, s7: &'static str| {
+                move |id: &str| match id {
+                    "c1" => Some(c1.to_string()),
+                    "3" => Some(s3.to_string()),
+                    "7" => Some(s7.to_string()),
+                    _ => None,
+                }
+            };
+            // The greeter is the active graphical session.
+            assert!(any_active_in(
+                list,
+                props(
+                    "Type=x11\nActive=yes\n",
+                    "Type=wayland\nActive=no\n",
+                    "Type=tty\nActive=yes\n"
+                )
+            ));
+            // A Wayland greeter too.
+            assert!(any_active_in(
+                list,
+                props(
+                    "Type=wayland\nActive=yes\n",
+                    "Type=wayland\nActive=no\n",
+                    "Type=tty\nActive=yes\n"
+                )
+            ));
+            // Only an inactive desktop and an active text console: none.
+            assert!(!any_active_in(
+                list,
+                props(
+                    "Type=x11\nActive=no\n",
+                    "Type=wayland\nActive=no\n",
+                    "Type=tty\nActive=yes\n"
+                )
+            ));
+            // Sessions gone between the two asks, and an empty list: none.
+            assert!(!any_active_in(list, |_| None));
+            assert!(!any_active_in("", |_| panic!("no session to ask about")));
+        }
+
+        /// FR-85 decision 6 — the refusal's whole table. A greeter refuses
+        /// whatever the recorder could reach; an empty or unknown seat
+        /// refuses when a real screen is reachable anyway (review: "no
+        /// logind session" is not "no screen" under DRM, or with a DISPLAY
+        /// inherited from someone's session); the host's own virtual
+        /// desktop and the synthetic source never refuse. Red, each on its
+        /// own: the reach ignored (DISPLAY and DRM record unattended), the
+        /// virtual desktop not recognised (every greeter host refused), an
+        /// unknown seat read as empty-with-nothing-reachable.
+        #[test]
+        fn a_screen_someone_may_be_at_refuses_and_no_ones_does_not() {
+            let none = Reach::default();
+            let display = Reach {
+                display: true,
+                ..none
+            };
+            let drm = Reach { drm: true, ..none };
+            let own = Reach {
+                own_virtual_desktop: true,
+                display: true,
+                ..none
+            };
+            let synthetic = Reach {
+                synthetic: true,
+                ..none
+            };
+            // Someone signed in: recorded as them, never refused here.
+            for r in [none, display, drm, own, synthetic] {
+                assert!(!shows_a_screen(Seat::Person(1000), r), "{r:?}");
+            }
+            // A greeter or root's desktop: refused, unless no one's screen.
+            for r in [none, display, drm] {
+                assert!(shows_a_screen(Seat::NoPerson, r), "{r:?}");
+            }
+            // No session, or none knowable: refused when a screen is reachable.
+            for seat in [Seat::Empty, Seat::Unknown] {
+                assert!(!shows_a_screen(seat, none), "{seat:?}: nothing to capture");
+                assert!(shows_a_screen(seat, display), "{seat:?} with a DISPLAY");
+                assert!(shows_a_screen(seat, drm), "{seat:?} with DRM");
+            }
+            // The host's own virtual desktop and the synthetic source.
+            for seat in [Seat::NoPerson, Seat::Empty, Seat::Unknown] {
+                assert!(!shows_a_screen(seat, own), "{seat:?}");
+                assert!(!shows_a_screen(seat, synthetic), "{seat:?}");
+            }
         }
     }
 }
@@ -1907,6 +2260,7 @@ mod tests {
             above_medium: high,
             console_session: console,
             console_uid: None,
+            login_screen: false,
         }
     }
 
@@ -1919,6 +2273,15 @@ mod tests {
             above_medium: false,
             console_session: None,
             console_uid: console,
+            login_screen: false,
+        }
+    }
+
+    /// The same facts, at a login screen.
+    fn at_login(f: Facts) -> Facts {
+        Facts {
+            login_screen: true,
+            ..f
         }
     }
 
@@ -1958,12 +2321,55 @@ mod tests {
             decide_from(linux(true, Some(1000))),
             Ok(Identity::SessionUser { uid: 1000 })
         );
-        // root on Linux with nobody (or only a greeter): refused, never
-        // "as root".
+        // root on Linux with nobody: refused, never "as root".
         assert_eq!(decide_from(linux(true, None)), Err(Refusal::NoConsoleUser));
         // An ordinary Linux user (a user unit): nothing to change, whoever
         // else is signed in.
         assert_eq!(decide_from(linux(false, Some(1000))), Ok(Identity::Inherit));
+    }
+
+    /// FR-85 decision 6: a login screen is not an empty seat. Nobody is
+    /// signed in to record as, but someone may be standing at it, so the
+    /// refusal is its own — the one the unattended exception never covers.
+    /// Red when `login_screen` is ignored: both read `NoConsoleUser`, and a
+    /// remote recording starts at a greeter with no banner anywhere.
+    #[test]
+    fn a_login_screen_is_not_nobody() {
+        // SYSTEM, a console session with nobody signed in at it.
+        assert_eq!(
+            decide_from(at_login(f(true, true, true, None))),
+            Err(Refusal::LoginScreen)
+        );
+        // root, a greeter (or root's own desktop) at the active session.
+        assert_eq!(
+            decide_from(at_login(linux(true, None))),
+            Err(Refusal::LoginScreen)
+        );
+        // Someone signed in wins, whatever else is on the console.
+        assert_eq!(
+            decide_from(at_login(f(true, true, true, Some(3)))),
+            Ok(Identity::ConsoleUser { session: 3 })
+        );
+        assert_eq!(
+            decide_from(at_login(linux(true, Some(1000)))),
+            Ok(Identity::SessionUser { uid: 1000 })
+        );
+        // An identity that is not the service's never asks.
+        assert_eq!(
+            decide_from(at_login(f(true, false, false, None))),
+            Ok(Identity::Inherit)
+        );
+        assert_eq!(
+            decide_from(at_login(linux(false, None))),
+            Ok(Identity::Inherit)
+        );
+        // The message says what is on the screen, not who the service is.
+        let m = Refusal::LoginScreen.message();
+        assert!(
+            m.contains("sign-in screen") || m.contains("login screen"),
+            "{m}"
+        );
+        assert_ne!(Refusal::LoginScreen, Refusal::NoConsoleUser);
     }
 
     /// The refusal a Linux root daemon gives names root, not SYSTEM.
