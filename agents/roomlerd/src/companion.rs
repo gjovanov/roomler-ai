@@ -19,14 +19,15 @@
 //! wizard-placed EXE with no marker counts as stale and gets swapped
 //! once, after which the marker tracks.
 //!
-//! Rights model: writing next to the daemon needs whatever rights the
-//! daemon's own directory needs. SYSTEM contexts (SCM host,
-//! SystemContext worker) can write `%ProgramFiles%\Roomler`; a perUser
-//! task daemon owns `%LOCALAPPDATA%\Programs\Roomler`. A user-context
-//! worker under a plain-SCM perMachine install CANNOT write
-//! `%ProgramFiles%` — it logs and skips; the SCM *host* hook covers
-//! that flavour. Failures are always skip-and-retry-next-start, never
-//! fatal.
+//! Ownership: ONE refresher per install (#1686). Under a running SCM service
+//! the service host refreshes at its own start, and the worker does not —
+//! the worker runs elevated by default, so "it cannot write `%ProgramFiles%`
+//! and skips" stopped being true, and the two used to swap concurrently,
+//! each renaming the other's fresh copy under a live companion. A per-user
+//! task daemon owns `%LOCALAPPDATA%\Programs\Roomler` and refreshes itself.
+//! Running companions are found by the path they were started from and
+//! stopped by pid before the swap (`win_service::companion_procs`), never by
+//! image name. Failures are always skip-and-retry-next-start, never fatal.
 
 // FR-27: unconditional now — `ensure_running` has a real body on every
 // platform, where before this module was Windows-only.
@@ -158,6 +159,8 @@ pub const DESKTOP_EXE: &str = "roomler-desktop.exe";
 const VERSION_MARKER: &str = "roomler-desktop.exe.version";
 #[cfg(target_os = "windows")]
 const OLD_SUFFIX: &str = "roomler-desktop.exe.old";
+#[cfg(target_os = "windows")]
+const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 
 /// FR-27 — make sure the desktop companion is RUNNING, because it is the only
 /// thing that renders a consent prompt.
@@ -767,50 +770,225 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         .await
         .with_context(|| format!("downloading {}", asset.name))?;
 
-    let was_running = desktop_running();
-
-    // Rename-swap: a RUNNING EXE can be renamed (not overwritten) on
-    // Windows, so move the live file aside, copy the new one in, and
-    // clean the `.old` afterwards. PermissionDenied here = wrong
-    // context (user-context worker on a perMachine install) — skip;
-    // the SYSTEM-side hook owns that flavour.
-    let old = exe_dir.join(OLD_SUFFIX);
-    let _ = std::fs::remove_file(&old);
-    if dest.exists() {
-        std::fs::rename(&dest, &old).context("renaming running desktop EXE aside")?;
-    }
-    if let Err(e) = std::fs::copy(&staged, &dest) {
-        // Best-effort rollback so the host isn't left with NO desktop.
-        if old.exists() {
-            let _ = std::fs::rename(&old, &dest);
+    // #1686 — the swap, in the order `swap` pins (see there), on the blocking
+    // pool: it stops processes and waits for them.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut ops = FsSwap {
+            new: exe_dir.join(NEW_SUFFIX),
+            old: exe_dir.join(OLD_SUFFIX),
+            staged,
+            dest,
+            marker,
+            version: own_version,
+            respawn,
+        };
+        swap(&mut ops)
+    })
+    .await
+    .context("the companion swap task")?;
+    match outcome {
+        SwapOutcome::Swapped { respawned, stopped } => {
+            tracing::info!(
+                version = own_version,
+                respawned,
+                ?stopped,
+                "desktop companion refreshed"
+            );
+            Ok(())
         }
-        return Err(anyhow::Error::new(e).context("copying new desktop EXE into place"));
-    }
-    if let Err(e) = std::fs::write(&marker, format!("{own_version}\n")) {
-        tracing::warn!(error = %e, "could not write desktop version marker");
-    }
-
-    if was_running {
-        kill_desktop();
-        respawn_desktop(respawn, &dest);
-    }
-
-    // The old EXE may stay locked for a moment while the killed
-    // process dies; a few short retries, then leave it for the next
-    // cycle's pre-delete.
-    for _ in 0..3 {
-        if std::fs::remove_file(&old).is_ok() || !old.exists() {
-            break;
+        SwapOutcome::Aborted {
+            reason,
+            respawned_old,
+        } => {
+            anyhow::bail!(
+                "{reason} (the old companion is untouched; respawned it: {respawned_old})"
+            )
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
 
-    tracing::info!(
-        version = own_version,
-        respawned = was_running,
-        "desktop companion refreshed"
-    );
-    Ok(())
+/// #1686 — what the companion swap does to the disk and to running processes,
+/// behind a seam so `swap`'s ORDER is tested on every platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) trait SwapOps {
+    /// Copy the new EXE in BESIDE the old one (`…exe.new`); the old one and
+    /// every running companion are still untouched.
+    fn stage(&mut self) -> Result<()>;
+    /// Running companions (pids) started from the installed path.
+    fn running(&mut self) -> Vec<u32>;
+    /// Stop those pids — each re-verified on the handle that kills it — and
+    /// return the ones confirmed exited.
+    fn stop(&mut self, pids: &[u32]) -> Vec<u32>;
+    /// Installed EXE → `…exe.old`.
+    fn rename_old_aside(&mut self) -> Result<()>;
+    /// `…exe.new` → installed EXE (same directory: an atomic rename).
+    fn promote_new(&mut self) -> Result<()>;
+    /// `…exe.old` → installed EXE (rollback).
+    fn restore_old(&mut self);
+    /// Remove `…exe.new`.
+    fn discard_new(&mut self);
+    fn write_marker(&mut self);
+    /// Start the companion at the installed path (whichever EXE is there).
+    fn respawn(&mut self);
+    /// Remove `…exe.old`, best-effort.
+    fn remove_old(&mut self);
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwapOutcome {
+    Swapped {
+        respawned: bool,
+        stopped: Vec<u32>,
+    },
+    /// Nothing changed on disk. `respawned_old` = companions this swap had
+    /// already stopped were started again, from the old EXE.
+    Aborted {
+        reason: String,
+        respawned_old: bool,
+    },
+}
+
+/// #1686 — the companion swap in the only order that can never leave a
+/// companion dead, or a live image renamed:
+///
+/// 1. stage the new copy beside the old one — a failure here touches nothing;
+/// 2. stop every running companion (verified per handle);
+/// 3. if ANY could not be stopped, abort: renaming a live image aside is how
+///    #1686 started, and a survivor would keep the single-instance lock anyway;
+/// 4. only now rename old → `.old` and new → installed;
+/// 5. respawn if something was running — the NEW one on success, the OLD one
+///    on every abort after step 2 (a person's tray is never left gone).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // exercised by `swap_tests` everywhere
+pub(crate) fn swap<O: SwapOps>(ops: &mut O) -> SwapOutcome {
+    if let Err(e) = ops.stage() {
+        return SwapOutcome::Aborted {
+            reason: format!("staging the new companion failed: {e:#}"),
+            respawned_old: false,
+        };
+    }
+    let pids = ops.running();
+    let stopped = if pids.is_empty() {
+        Vec::new()
+    } else {
+        ops.stop(&pids)
+    };
+    // Put back what this swap stopped, from whatever EXE is installed.
+    let abort = |ops: &mut O, reason: String, stopped: &[u32]| {
+        ops.discard_new();
+        let respawn = !stopped.is_empty();
+        if respawn {
+            ops.respawn();
+        }
+        SwapOutcome::Aborted {
+            reason,
+            respawned_old: respawn,
+        }
+    };
+    if stopped.len() != pids.len() {
+        return abort(
+            ops,
+            format!(
+                "could not stop every running companion (running {pids:?}, stopped {stopped:?})"
+            ),
+            &stopped,
+        );
+    }
+    if let Err(e) = ops.rename_old_aside() {
+        return abort(
+            ops,
+            format!("moving the old companion aside failed: {e:#}"),
+            &stopped,
+        );
+    }
+    if let Err(e) = ops.promote_new() {
+        ops.restore_old();
+        return abort(
+            ops,
+            format!("putting the new companion in place failed: {e:#}"),
+            &stopped,
+        );
+    }
+    ops.write_marker();
+    let respawned = !stopped.is_empty();
+    if respawned {
+        ops.respawn();
+    }
+    ops.remove_old();
+    SwapOutcome::Swapped { respawned, stopped }
+}
+
+#[cfg(target_os = "windows")]
+struct FsSwap {
+    staged: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    new: std::path::PathBuf,
+    old: std::path::PathBuf,
+    marker: std::path::PathBuf,
+    version: &'static str,
+    respawn: RespawnContext,
+}
+
+#[cfg(target_os = "windows")]
+impl SwapOps for FsSwap {
+    fn stage(&mut self) -> Result<()> {
+        let _ = std::fs::remove_file(&self.new);
+        std::fs::copy(&self.staged, &self.new)
+            .map(|_| ())
+            .context("copying the new desktop EXE beside the installed one")
+    }
+    fn running(&mut self) -> Vec<u32> {
+        crate::win_service::companion_procs::find(&self.dest)
+            .iter()
+            .map(|p| p.pid)
+            .collect()
+    }
+    fn stop(&mut self, pids: &[u32]) -> Vec<u32> {
+        crate::win_service::companion_procs::terminate_verified(
+            &self.dest,
+            pids,
+            std::time::Duration::from_secs(10),
+        )
+    }
+    fn rename_old_aside(&mut self) -> Result<()> {
+        // A `.old` from an earlier cycle: its process (if it had one) was
+        // started from the installed path, so `running`/`stop` above found and
+        // stopped it — the file is free now.
+        let _ = std::fs::remove_file(&self.old);
+        if self.dest.exists() {
+            std::fs::rename(&self.dest, &self.old).context("renaming the desktop EXE aside")?;
+        }
+        Ok(())
+    }
+    fn promote_new(&mut self) -> Result<()> {
+        std::fs::rename(&self.new, &self.dest).context("renaming the new desktop EXE into place")
+    }
+    fn restore_old(&mut self) {
+        if self.old.exists() {
+            let _ = std::fs::rename(&self.old, &self.dest);
+        }
+    }
+    fn discard_new(&mut self) {
+        let _ = std::fs::remove_file(&self.new);
+    }
+    fn write_marker(&mut self) {
+        if let Err(e) = std::fs::write(&self.marker, format!("{}\n", self.version)) {
+            tracing::warn!(error = %e, "could not write desktop version marker");
+        }
+    }
+    fn respawn(&mut self) {
+        respawn_desktop(self.respawn, &self.dest);
+    }
+    fn remove_old(&mut self) {
+        // A stopped process may take a moment to release its image; a few
+        // short retries, then leave it for the next cycle.
+        for _ in 0..3 {
+            if std::fs::remove_file(&self.old).is_ok() || !self.old.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
 }
 
 /// Prefer the signed EXE (no `-unsigned` infix) when both are present.
@@ -828,54 +1006,36 @@ fn pick_desktop_asset(
         .or_else(|| assets.iter().find(|a| is_desktop(&a.name)))
 }
 
-/// Is `roomler-desktop.exe` currently running? `tasklist` image-name
-/// filter — the image name appears verbatim in the table regardless of
-/// UI locale. `pub`: the S1b appdirs migration skips while the desktop
-/// runs (it may hold open handles inside the tree being moved).
+/// The companion beside this daemon — the one install whose companion this
+/// process refreshes, launches and asks about.
+#[cfg(target_os = "windows")]
+fn sibling_desktop() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DESKTOP_EXE)))
+}
+
+/// Is the companion beside this daemon running? Matched by the path it was
+/// STARTED from (#1686), not by image name: a companion whose file an update
+/// renamed or deleted keeps running under a file-id image name, and a
+/// `tasklist IMAGENAME` check stops seeing it. `pub`: the S1b appdirs
+/// migration skips while the desktop runs (it may hold open handles inside
+/// the tree being moved).
 #[cfg(target_os = "windows")]
 pub fn desktop_running() -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {DESKTOP_EXE}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains(DESKTOP_EXE))
-        .unwrap_or(false)
+    sibling_desktop().is_some_and(|exe| !crate::win_service::companion_procs::find(&exe).is_empty())
 }
 
-#[cfg(target_os = "windows")]
-fn kill_desktop() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Abrupt kill is safe for the tray: its state is a thin poll over
-    // the LocalAPI, and pending consent prompts are daemon-side
-    // sentinels the respawned app re-lists within its 1.5 s poll.
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", DESKTOP_EXE])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-}
-
-/// Is `roomler-desktop.exe` running in Terminal Services session `session`?
-/// The launcher's question is "does THIS user already have it open", which a
+/// Is the companion running in Terminal Services session `session`? The
+/// launcher's question is "does THIS user already have it open", which a
 /// machine-wide listing cannot answer on a host with more than one session.
 #[cfg(target_os = "windows")]
 pub(crate) fn desktop_running_in_session(session: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
-        .args([
-            "/FI",
-            &format!("IMAGENAME eq {DESKTOP_EXE}"),
-            "/FI",
-            &format!("SESSION eq {session}"),
-            "/NH",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains(DESKTOP_EXE))
-        .unwrap_or(false)
+    sibling_desktop().is_some_and(|exe| {
+        crate::win_service::companion_procs::find(&exe)
+            .iter()
+            .any(|p| p.session == Some(session))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -918,6 +1078,239 @@ fn respawn_desktop(respawn: RespawnContext, dest: &std::path::Path) {
                 Err(e) => tracing::warn!(error = %e, "query_user_token failed for desktop respawn"),
             }
         }
+    }
+}
+
+/// #1686 — the companion swap's ORDER, on every platform (the Windows ops
+/// themselves are exercised by `win_service::companion_procs`' tests, which run
+/// only where Windows does).
+#[cfg(test)]
+mod swap_tests {
+    use super::{SwapOps, SwapOutcome, swap};
+    use anyhow::{Result, anyhow};
+
+    #[derive(Default)]
+    struct Mock {
+        calls: Vec<&'static str>,
+        stage_fails: bool,
+        running: Vec<u32>,
+        /// `None` = stop everything asked.
+        stops_only: Option<Vec<u32>>,
+        aside_fails: bool,
+        promote_fails: bool,
+    }
+
+    impl SwapOps for Mock {
+        fn stage(&mut self) -> Result<()> {
+            self.calls.push("stage");
+            if self.stage_fails {
+                Err(anyhow!("disk full"))
+            } else {
+                Ok(())
+            }
+        }
+        fn running(&mut self) -> Vec<u32> {
+            self.calls.push("running");
+            self.running.clone()
+        }
+        fn stop(&mut self, pids: &[u32]) -> Vec<u32> {
+            self.calls.push("stop");
+            self.stops_only.clone().unwrap_or_else(|| pids.to_vec())
+        }
+        fn rename_old_aside(&mut self) -> Result<()> {
+            self.calls.push("rename_old_aside");
+            if self.aside_fails {
+                Err(anyhow!("sharing violation"))
+            } else {
+                Ok(())
+            }
+        }
+        fn promote_new(&mut self) -> Result<()> {
+            self.calls.push("promote_new");
+            if self.promote_fails {
+                Err(anyhow!("access denied"))
+            } else {
+                Ok(())
+            }
+        }
+        fn restore_old(&mut self) {
+            self.calls.push("restore_old");
+        }
+        fn discard_new(&mut self) {
+            self.calls.push("discard_new");
+        }
+        fn write_marker(&mut self) {
+            self.calls.push("write_marker");
+        }
+        fn respawn(&mut self) {
+            self.calls.push("respawn");
+        }
+        fn remove_old(&mut self) {
+            self.calls.push("remove_old");
+        }
+    }
+
+    #[test]
+    fn a_running_companion_is_stopped_before_any_rename_and_respawned_after() {
+        let mut m = Mock {
+            running: vec![7, 9],
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert_eq!(
+            out,
+            SwapOutcome::Swapped {
+                respawned: true,
+                stopped: vec![7, 9]
+            }
+        );
+        assert_eq!(
+            m.calls,
+            [
+                "stage",
+                "running",
+                "stop",
+                "rename_old_aside",
+                "promote_new",
+                "write_marker",
+                "respawn",
+                "remove_old"
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_running_swaps_without_a_respawn() {
+        let mut m = Mock::default();
+        assert_eq!(
+            swap(&mut m),
+            SwapOutcome::Swapped {
+                respawned: false,
+                stopped: vec![]
+            }
+        );
+        assert!(!m.calls.contains(&"stop") && !m.calls.contains(&"respawn"));
+    }
+
+    /// A failed copy leaves everything as it was — and, before this ordering,
+    /// the companion had already been killed by then and was never respawned.
+    #[test]
+    fn a_failed_stage_touches_nothing_and_kills_nothing() {
+        let mut m = Mock {
+            stage_fails: true,
+            running: vec![7],
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert!(matches!(
+            out,
+            SwapOutcome::Aborted {
+                respawned_old: false,
+                ..
+            }
+        ));
+        assert_eq!(m.calls, ["stage"]);
+    }
+
+    /// Renaming a LIVE image aside is how #1686 began: if any companion
+    /// survives the stop, nothing is renamed — and the ones that were stopped
+    /// are started again, from the old EXE still installed.
+    #[test]
+    fn a_companion_that_would_not_stop_aborts_before_any_rename() {
+        let mut m = Mock {
+            running: vec![7, 9],
+            stops_only: Some(vec![7]),
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert!(matches!(
+            out,
+            SwapOutcome::Aborted {
+                respawned_old: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            m.calls,
+            ["stage", "running", "stop", "discard_new", "respawn"]
+        );
+        assert!(!m.calls.contains(&"rename_old_aside"));
+    }
+
+    #[test]
+    fn a_failed_move_aside_respawns_the_old_companion() {
+        let mut m = Mock {
+            running: vec![7],
+            aside_fails: true,
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert!(matches!(
+            out,
+            SwapOutcome::Aborted {
+                respawned_old: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            m.calls,
+            [
+                "stage",
+                "running",
+                "stop",
+                "rename_old_aside",
+                "discard_new",
+                "respawn"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_promote_restores_the_old_exe_then_respawns_it() {
+        let mut m = Mock {
+            running: vec![7],
+            promote_fails: true,
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert!(matches!(
+            out,
+            SwapOutcome::Aborted {
+                respawned_old: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            m.calls,
+            [
+                "stage",
+                "running",
+                "stop",
+                "rename_old_aside",
+                "promote_new",
+                "restore_old",
+                "discard_new",
+                "respawn"
+            ]
+        );
+    }
+
+    /// Nothing was running and a rename failed: nothing to put back.
+    #[test]
+    fn an_abort_with_nothing_stopped_respawns_nothing() {
+        let mut m = Mock {
+            promote_fails: true,
+            ..Default::default()
+        };
+        let out = swap(&mut m);
+        assert!(matches!(
+            out,
+            SwapOutcome::Aborted {
+                respawned_old: false,
+                ..
+            }
+        ));
+        assert!(!m.calls.contains(&"respawn"));
     }
 }
 
