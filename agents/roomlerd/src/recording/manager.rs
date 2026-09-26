@@ -836,6 +836,8 @@ fn delete_recording(path: &Path) -> Result<(), String> {
     }
     std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let _ = std::fs::remove_file(Sidecar::path_for(path));
+    // FR-85 P5c — and its edit list: nothing else would ever remove it.
+    let _ = std::fs::remove_file(super::edit::EditList::path_for(path));
     Ok(())
 }
 
@@ -1012,8 +1014,15 @@ mod tests {
         let f = dir.path().join("r.mp4");
         std::fs::write(&f, b"x").unwrap();
         std::fs::write(Sidecar::path_for(&f), b"{}").unwrap();
+        let edits = crate::recording::edit::EditList::path_for(&f);
+        std::fs::write(&edits, b"{}").unwrap();
+        // An export beside it is a recording of its own: it stays.
+        let export = dir.path().join("r (edited).mp4");
+        std::fs::write(&export, b"y").unwrap();
         delete_recording(&f).unwrap();
         assert!(!f.exists() && !Sidecar::path_for(&f).exists());
+        assert!(!edits.exists(), "the edit list goes with its recording");
+        assert!(export.exists(), "an export is not the recording's to take");
         assert!(delete_recording(&dir.path().join("missing.mp4")).is_err());
         std::fs::create_dir(dir.path().join("d.mp4")).unwrap();
         assert!(

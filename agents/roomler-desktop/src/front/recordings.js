@@ -248,14 +248,42 @@
     wrap.style.margin = '0';
     const del = smallButton('Delete', () => void deleteRecording(name));
     del.classList.add('danger');
+    // FR-85 P5c — only where this device's service has the export engine.
+    const edit = smallButton('Edit', () => void editRecording(name));
+    edit.hidden = !canEdit;
     wrap.append(
       smallButton('Play', () => void openRecording(name, false)),
+      edit,
       smallButton('Show', () => void openRecording(name, true)),
       del,
     );
     act.appendChild(wrap);
     tr.appendChild(act);
-    return { tr, cells, del };
+    return { tr, cells, del, edit };
+  }
+
+  /* ── FR-85 P5c — the Edit view (`editor.js`) ────────────────────── */
+
+  let canEdit = false;
+
+  function askEngine() {
+    const editor = window.RoomlerEditor;
+    if (!editor) return;
+    void editor.engineAvailable().then((ok) => {
+      canEdit = ok;
+      for (const row of rows.values()) row.edit.hidden = !ok;
+    });
+  }
+
+  async function editRecording(name) {
+    hide($('rec-list-error'));
+    try {
+      await window.RoomlerEditor.open(name);
+    } catch (e) {
+      const el = $('rec-list-error');
+      el.textContent = errorText(e);
+      show(el);
+    }
   }
 
   function fillRow(row, it) {
@@ -468,6 +496,9 @@
     document.addEventListener('roomler:view', (ev) => {
       if (ev.detail === 'recordings') void refresh({ force: true });
     });
+    // An export lands in the folder: the list shows it on the way back.
+    document.addEventListener('roomler:editor-closed', () => void refresh({ force: true }));
+    askEngine();
     setInterval(tick, 1000);
   }
 
