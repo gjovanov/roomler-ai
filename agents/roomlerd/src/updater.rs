@@ -2073,14 +2073,26 @@ pub(crate) fn resolve_check_interval_with(
 static UPDATE_TRIGGER: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<String>>> =
     std::sync::OnceLock::new();
 
-/// Create the forced-update trigger channel and register its sender.
-/// Called once from `run_cmd`; the returned receiver goes to
-/// [`run_periodic`]. When auto-update is disabled the receiver is
-/// simply dropped and [`request_update_now`] reports `false`.
-pub fn install_update_trigger() -> tokio::sync::mpsc::Receiver<Option<String>> {
+/// Create the forced-update trigger channel and register its sender — for
+/// a daemon whose updater will run. Called once from `run_cmd`; the
+/// receiver goes to [`run_periodic`].
+///
+/// ⚠️ #1689: with auto-update off, NOTHING is installed, so
+/// [`request_update_now`] reports `false` and its callers say so (the
+/// `rc:agent.update` arm warns the push was dropped). Installing it anyway
+/// with the receiver merely unused — the doc once promised it would be
+/// "simply dropped" — kept that receiver alive for the whole of `run_cmd`:
+/// every push queued into a channel nobody reads and reported delivered,
+/// while the device stayed where it was.
+pub fn install_update_trigger(
+    auto_update_enabled: bool,
+) -> Option<tokio::sync::mpsc::Receiver<Option<String>>> {
+    if !auto_update_enabled {
+        return None;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let _ = UPDATE_TRIGGER.set(tx);
-    rx
+    Some(rx)
 }
 
 /// Request an immediate update cycle (server-pushed `rc:agent.update`).
@@ -2499,6 +2511,25 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// #1689 — a daemon whose updater is off must report an `rc:agent.update`
+    /// push as undeliverable, so the arm's "update trigger dropped" warning
+    /// fires. RED-FIRST against the old wiring (install unconditionally, hold
+    /// the receiver unread until `run_cmd` returns): this assertion failed
+    /// there, as in the field on 2026-09-26 — `{"delivered":true}`, one INFO
+    /// line, no update, no warning. Installing nothing is what makes a held,
+    /// unread receiver impossible rather than merely avoided.
+    #[test]
+    fn a_disabled_updater_reports_a_push_undeliverable() {
+        assert!(
+            super::install_update_trigger(false).is_none(),
+            "a disabled updater must install no trigger"
+        );
+        assert!(
+            !super::request_update_now(None),
+            "a push to a daemon whose updater is off must report undeliverable"
+        );
+    }
+
     /// #1206 — the post-install watcher must verify the INSTALL path, never
     /// its own path.
     ///
