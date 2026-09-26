@@ -44,7 +44,30 @@ ProtectHome=read-only
 # nor an upgraded host is blocked by ProtectHome=read-only.
 # RETIRED-NAME-ANCHOR: dropping the legacy pair makes systemd deny the daemon its own
 # pre-rename tree mid-migration, under ProtectHome=read-only. See docs/fr/FR-21.
-ReadWritePaths=%h/.config/roomler %h/.local/share/roomler %h/.config/roomler-agent %h/.local/share/roomler-agent
+# ⚠️ The legacy pair carries `-` ("ignore when missing"): a path listed WITHOUT
+# it that does not exist fails the whole unit with 226/NAMESPACE ("Failed to
+# set up mount namespacing: <the legacy config folder>: No such file or
+# directory") — measured on systemd 255 — and a host that never ran the
+# pre-rename agent has neither folder, so the unit could not start there at
+# all WHEREVER THE SANDBOX APPLIES. A user manager applies it only inside an
+# unprivileged user namespace it may mount in. Where it cannot create one,
+# systemd logs "Failed to set up user namespacing for unprivileged user,
+# ignoring"; where it can but may not mount in it (default Ubuntu 24.04:
+# AppArmor's unprivileged-userns restriction) it skips the mounts silently.
+# Either way this unit then runs with NO sandbox at all, which is why a fresh
+# 24.04 guest started it fine (field-verified: the daemon shared the
+# session's mount namespace, no read-only /home). The NEW pair keeps
+# no prefix on purpose: `roomlerd enroll` creates both (the config, and the
+# log folder), and a unit started before enrolling should fail naming the
+# missing folder rather than run with it read-only.
+ReadWritePaths=%h/.config/roomler %h/.local/share/roomler -%h/.config/roomler-agent -%h/.local/share/roomler-agent
+# FR-85 P2c — the recorder's default folder (`~/Videos/Roomler`). Everything
+# else under home stays read-only: a folder chosen elsewhere is refused by the
+# recorder's test write, which falls back and names why in the Recordings
+# view. `-`: a host without ~/Videos must still start (see above). A
+# localized Videos folder (XDG_VIDEOS_DIR=~/Vidéos, …) is not covered and
+# falls back the same way.
+ReadWritePaths=-%h/Videos
 
 [Install]
 WantedBy=default.target

@@ -536,6 +536,60 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" recording::launch
 
+      - name: The Linux user unit's sandbox (FR-85 P2c) — it starts on a fresh host, and the recorder writes ~/Videos
+        # FR-85 P2c. `roomler.service` (the per-user install; what
+        # `install.sh --role daemon` enables without `--system`) runs the
+        # daemon with ProtectHome=read-only. This starts a unit carrying its
+        # sandbox lines VERBATIM, on a runner that never ran the pre-rename
+        # agent, and asks the real recorder where it would write:
+        #   * a ReadWritePaths entry that does not exist, listed WITHOUT
+        #     systemd's `-`, fails the whole unit with 226/NAMESPACE — the
+        #     unit could not start on any such host until P2c;
+        #   * `record --where` must choose ~/Videos/Roomler, and the rest of
+        #     home must stay read-only.
+        # A SYSTEM unit with User= needs no user session on the runner and
+        # ALWAYS sets up the mount namespace, i.e. the configuration where
+        # both failures bite. A user manager applies the sandbox only inside
+        # an unprivileged user namespace it may mount in; where it cannot
+        # create one, or may not mount in it (default Ubuntu 24.04, whose
+        # AppArmor restricts them: field-verified on a vmtest guest), it runs
+        # the unit with no sandbox at all. `%h` is expanded here
+        # because in a system unit it means root's home whatever User= says.
+        run: |
+          set -eu
+          cargo build -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --message-format=json > /tmp/p2c-build.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "roomlerd" and .executable != null) | .executable' /tmp/p2c-build.json | tail -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd binary in the build output"; exit 1; fi
+          ME=$(id -un)
+          H=$(getent passwd "$ME" | cut -d: -f6)
+          # What `roomlerd enroll` leaves behind, and an XDG Videos folder.
+          mkdir -p "$H/.config/roomler" "$H/.local/share/roomler" "$H/Videos"
+          printf 'XDG_VIDEOS_DIR="$HOME/Videos"\n' > "$H/.config/user-dirs.dirs"
+          # Every path the unit lists as optional (`-`), ~/Videos aside, must
+          # be MISSING, as on any host installed after the rename, or the
+          # cell proves nothing about a missing path.
+          for p in $(grep -E '^ReadWritePaths=' agents/roomlerd/packaging/linux/roomler.service | sed 's/^ReadWritePaths=//' | tr ' ' '\n' | grep '^-' | sed "s|^-||; s|%h|$H|g"); do
+            if [ "$p" != "$H/Videos" ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
+          done
+          OUT=/tmp/p2c-where.out
+          {
+            echo "[Service]"
+            echo "Type=oneshot"
+            echo "User=$ME"
+            echo "StandardOutput=file:$OUT"
+            echo "StandardError=journal"
+            echo "ExecStart=/bin/sh -c '\"$BIN\" record --where; if touch \"$H/.p2c-probe\" 2>/dev/null; then echo HOME_WRITABLE; else echo HOME_READ_ONLY; fi'"
+            grep -E '^(NoNewPrivileges|ProtectSystem|ProtectHome|ReadWritePaths)=' agents/roomlerd/packaging/linux/roomler.service | sed "s|%h|$H|g"
+          } | sudo tee /etc/systemd/system/p2c-sandbox.service
+          sudo systemctl daemon-reload
+          if ! sudo systemctl start p2c-sandbox.service; then
+            sudo journalctl -u p2c-sandbox.service --no-pager | tail -20
+            echo "::error::a unit carrying roomler.service's sandbox did not start"; exit 1
+          fi
+          cat "$OUT"
+          grep -q "$H/Videos/Roomler" "$OUT" || { echo "::error::under the sandbox the recorder did not choose ~/Videos/Roomler"; exit 1; }
+          grep -q HOME_READ_ONLY "$OUT" || { echo "::error::the sandbox left the rest of home writable"; exit 1; }
+
       - name: The recorder's pointer on X11 (FR-85 P1d) — XFixes against a real X server
         # FR-85 P1d. XShm frames carry no pointer, so on X11 the recorder
         # draws it, from XFixes `GetCursorImage` placed by the monitor's origin
