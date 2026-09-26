@@ -886,10 +886,10 @@ async fn agent_daemon_originated_forward_reaches_target() {
     assert_eq!(snap[0].target.as_deref(), Some("127.0.0.1:9000"));
     assert_eq!(snap[0].node.as_deref(), Some(b_id.as_str()));
 
-    // Poll flows() until the flow reports its NEGOTIATED transport — proving the
-    // open handshake completed AND the hub demuxed `rc:tunnel.opened` BACK BY
-    // NONCE (the per-session `ChannelSource` records the negotiated transport
-    // only when it yields the `opened` frame to the driver). This is the full
+    // Poll until the flow records its NEGOTIATED transport — proving the open
+    // handshake completed AND the hub demuxed `rc:tunnel.opened` BACK BY NONCE
+    // (the per-session `ChannelSource` records the negotiated transport only
+    // when it yields the `opened` frame to the driver). This is the full
     // daemon-consumer path: create_forward → nonce-stamped `rc:tunnel.open` →
     // server `Principal::Agent` authz (all_users policy) → `rc:tunnel.opened` →
     // nonce demux. It stops at the OPEN, before the in-process WebRTC DC data
@@ -898,12 +898,8 @@ async fn agent_daemon_originated_forward_reaches_target() {
     let mut negotiated = None;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let snap = hub.flows_snapshot();
-        if let Some(f) = snap.first()
-            && f.transport != "connecting"
-            && f.transport != "down"
-        {
-            negotiated = Some(f.transport.clone());
+        if let Some(t) = hub.negotiated_transport(&flow_id) {
+            negotiated = Some(t);
             break;
         }
     }
@@ -912,6 +908,14 @@ async fn agent_daemon_originated_forward_reaches_target() {
         Some("webrtc-dc-v1"),
         "the daemon-originated session must open + demux rc:tunnel.opened by nonce \
          (negotiated transport recorded on the flow)"
+    );
+    // #1685 — an open the server ACCEPTED is not a serving flow: this test never
+    // reaches the data plane, so no listener is bound, and the Flows column
+    // keeps its liveness word instead of claiming the transport.
+    let shown = hub.flows_snapshot()[0].transport.clone();
+    assert!(
+        shown == "connecting" || shown == "down",
+        "an accepted open with no bound listener must not read as serving: {shown}"
     );
 
     // kill_flow tears it down + deregisters.

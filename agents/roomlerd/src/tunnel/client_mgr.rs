@@ -280,7 +280,10 @@ impl TunnelClientHub {
     /// connection gauge. TCP payload only — SOCKS5 UDP-ASSOCIATE bytes are not
     /// counted (they run on `FlowStats` with no session aggregate). The
     /// `transport` column doubles as a liveness signal: `connecting` / `down`
-    /// until a session negotiates a concrete transport.
+    /// until the session's local listener is bound (#1685). A transport the
+    /// server negotiated is not yet a serving flow — setup after
+    /// `rc:tunnel.opened` can still fail — so it shows only once bound;
+    /// [`Self::negotiated_transport`] reads it before that.
     pub fn flows_snapshot(&self) -> Vec<FlowInfo> {
         let flows = self.inner.flows.lock().unwrap();
         let mut out: Vec<FlowInfo> = flows
@@ -422,6 +425,17 @@ impl TunnelClientHub {
                 .unwrap()
                 .map(|t| t.saturating_duration_since(std::time::Instant::now())),
         })
+    }
+
+    /// The transport the server negotiated for this flow, as recorded from
+    /// its most recent `rc:tunnel.opened` — whether or not that session has
+    /// come up since. `None` for an unknown id, or before any open was
+    /// answered. Proves the open was demuxed back to the flow by its nonce;
+    /// it says nothing about the port serving, which is `flow_report`'s
+    /// `listening`.
+    pub fn negotiated_transport(&self, id: &str) -> Option<String> {
+        let flows = self.inner.flows.lock().unwrap();
+        flows.get(id)?.live.transport.lock().unwrap().clone()
     }
 
     /// Test seam: the live cells of a registered flow, so a sibling module's
@@ -1513,9 +1527,20 @@ mod tests {
             left <= Duration::from_secs(4) && left > Duration::from_secs(2),
             "{left:?}"
         );
-        // The Flows table shows the liveness word, not a negotiated transport.
+        // The Flows table shows the liveness word, not a negotiated transport…
+        assert_eq!(
+            hub.negotiated_transport("fl-7"),
+            None,
+            "no open answered yet"
+        );
         *live.transport.lock().unwrap() = Some("webrtc-dc-v1".into());
         assert_eq!(hub.flows_snapshot()[0].transport, "connecting");
+        // …while the transport the open negotiated is still readable.
+        assert_eq!(
+            hub.negotiated_transport("fl-7").as_deref(),
+            Some("webrtc-dc-v1")
+        );
+        assert_eq!(hub.negotiated_transport("ghost"), None);
 
         // The node came back: the driver bound the listener.
         listening_hook("fl-7", &live)("127.0.0.1:1081".parse().unwrap());
