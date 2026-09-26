@@ -349,6 +349,9 @@ async fn run_session(
             // R4: the standalone CLI is not an overlay node — no DERP
             // identity, no derp tunnel flavor; the classic ladder stands.
             derp: None,
+            // #1685: one forward per process and no liveness state to
+            // publish — the daemon's route reconciler is the consumer.
+            on_listening: None,
         },
         supported_transports,
         request_transport,

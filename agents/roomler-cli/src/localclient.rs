@@ -2438,16 +2438,40 @@ fn fmt_route_row(r: &RouteInfo) -> String {
 
 /// Compact human word for a route's live state. `backoff`/`failed` carry
 /// their detail — that's what the operator acts on.
+///
+/// #1685 — `active` is a bound, serving listener and nothing less. A flow
+/// that exists but does not serve carries its `flow_id`: on `pending` its
+/// first session attempt is in flight (`connecting`); on `backoff` the tunnel
+/// session toward the node is what keeps failing (`retrying …`), as opposed
+/// to a `backoff` without one, where the local port could not be bound.
 fn route_state_word(s: &RouteState) -> String {
     match s {
         RouteState::Disabled => "disabled".into(),
-        RouteState::Pending => "pending".into(),
+        RouteState::Pending { flow_id: None } => "pending".into(),
+        RouteState::Pending { flow_id: Some(f) } => format!("connecting ({f})"),
         RouteState::Active { flow_id } => format!("active ({flow_id})"),
         RouteState::Backoff {
             next_retry_secs,
             last_error,
+            flow_id: Some(f),
+            attempts,
+        } => {
+            let next = if *next_retry_secs > 0 {
+                format!(", next in {next_retry_secs}s")
+            } else {
+                String::new()
+            };
+            format!("retrying ({f}, attempt {attempts}{next}): {last_error}")
+        }
+        RouteState::Backoff {
+            next_retry_secs,
+            last_error,
+            flow_id: None,
+            ..
         } => format!("backoff {next_retry_secs}s: {last_error}"),
         RouteState::Failed { reason } => format!("FAILED: {reason} (route enable to retry)"),
+        // A newer daemon's state word — shown, never an error.
+        RouteState::Unknown => "unknown (a newer daemon — update this CLI)".into(),
     }
 }
 
@@ -2616,9 +2640,12 @@ mod tests {
         assert!(active.contains("auto"), "empty transport renders auto");
         assert!(active.contains("active (fl-3)"));
 
+        // Flow creation is what fails (the port is taken): no flow id.
         let backoff = fmt_route_row(&info(RouteState::Backoff {
             next_retry_secs: 12,
             last_error: "port 15432 in use".into(),
+            flow_id: None,
+            attempts: 1,
         }));
         assert!(backoff.contains("backoff 12s: port 15432 in use"));
 
@@ -2628,13 +2655,49 @@ mod tests {
         assert!(failed.contains("FAILED: revoked"));
 
         // A socks5 route has no remote — the column shows the dash.
-        let mut socks = info(RouteState::Pending);
+        let mut socks = info(RouteState::Pending { flow_id: None });
         socks.route.kind = FlowKind::Socks5;
         socks.route.remote = None;
         let row = fmt_route_row(&socks);
         assert!(row.contains("socks5"));
         assert!(row.contains(DASH));
         assert!(row.contains("pending"));
+
+        // #1685 — a flow that exists but does not serve is never `active`.
+        let connecting = fmt_route_row(&info(RouteState::Pending {
+            flow_id: Some("fl-2".into()),
+        }));
+        assert!(connecting.contains("connecting (fl-2)"), "got {connecting}");
+        assert!(!connecting.contains("active"));
+        let retrying = fmt_route_row(&info(RouteState::Backoff {
+            next_retry_secs: 4,
+            last_error: "server error during tunnel.open: agent_unavailable: agent is offline"
+                .into(),
+            flow_id: Some("fl-2".into()),
+            attempts: 3,
+        }));
+        assert!(
+            retrying.contains(
+                "retrying (fl-2, attempt 3, next in 4s): server error during tunnel.open: \
+                 agent_unavailable: agent is offline"
+            ),
+            "got {retrying}"
+        );
+        assert!(!retrying.contains("active"));
+        // An attempt in flight has no countdown.
+        let in_flight = fmt_route_row(&info(RouteState::Backoff {
+            next_retry_secs: 0,
+            last_error: "waiting for DC pool to open: deadline has elapsed".into(),
+            flow_id: Some("fl-2".into()),
+            attempts: 1,
+        }));
+        assert!(
+            in_flight.contains("retrying (fl-2, attempt 1): waiting for DC pool"),
+            "got {in_flight}"
+        );
+        // A state word from a newer daemon renders, it does not error.
+        let unknown = fmt_route_row(&info(RouteState::Unknown));
+        assert!(unknown.contains("unknown"), "got {unknown}");
     }
 
     #[test]
