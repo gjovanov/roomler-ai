@@ -12,7 +12,8 @@
 //! | an ordinary user at normal integrity (a per-user install, a user unit) | the same: nothing to change |
 //! | an ELEVATED user: the default Windows service worker of a UAC-split administrator (`ROOMLERD_ELEVATE_WORKER`) | a restricted copy of the same token: admin groups deny-only, no privileges, medium integrity |
 //! | SYSTEM, with someone signed in at the console | that person's own token |
-//! | SYSTEM with nobody signed in, or root | refused, by name |
+//! | root on Linux, with someone signed in at the active graphical session | that person: their uid, gid and groups, in their session's environment |
+//! | SYSTEM or Linux root with nobody signed in; root on macOS | refused, by name |
 //!
 //! ⚠️ **A restricted COPY, not the linked token.** An elevated administrator's
 //! token links to the filtered one, but without `SeTcbPrivilege` (a worker has
@@ -30,9 +31,18 @@
 //! exists to avoid. Impersonated, every open is checked against the user's own
 //! rights, wherever the path turns out to lead.
 //!
-//! Not yet here: the unix drop to the console user (a root daemon still
-//! refuses), and the unattended exception (a device with nobody signed in
-//! records as the daemon, into the daemon's own folder).
+//! ⚠️ **On Linux the same rule, by the thread's filesystem identity.** The
+//! daemon's own work in the folder runs with the thread's fsuid, fsgid and
+//! supplementary groups switched to the person's ([`unix::FsIdentity`]):
+//! Linux checks every open against those, and the root capabilities that
+//! would bypass the checks leave the thread's effective set with the fsuid.
+//! The groups are switched too, by the raw syscall (glibc's `setgroups`
+//! would change every thread of the daemon): without that, root's group 0
+//! would still open a `root:root 0640` file a link in the folder pointed at.
+//!
+//! Not yet here: the drop on macOS (a root daemon there still refuses), and
+//! the unattended exception (a device with nobody signed in records as the
+//! daemon, into the daemon's own folder).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -49,15 +59,18 @@ pub enum Identity {
     /// (Windows) The token of the person signed in at console session
     /// `session`. This daemon is SYSTEM.
     ConsoleUser { session: u32 },
+    /// (Linux) The account signed in at the active graphical session, by
+    /// uid. This daemon is root.
+    SessionUser { uid: u32 },
 }
 
 /// Why no recorder can be launched here right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// SYSTEM, and nobody is signed in at the console.
+    /// SYSTEM (or root on Linux), and nobody is signed in at the screen.
     NoConsoleUser,
-    /// root on Linux or macOS: launching the recorder as the person at the
-    /// screen is built on Windows first.
+    /// root on macOS: launching the recorder as the person at the screen is
+    /// built on Windows and Linux.
     RootDaemon,
     /// `ROOMLERD_RECORDING=0`: the device's own kill switch.
     SwitchedOff,
@@ -68,15 +81,20 @@ impl Refusal {
     /// refused start).
     pub fn message(self) -> &'static str {
         match self {
-            Self::NoConsoleUser => {
+            Self::NoConsoleUser if cfg!(windows) => {
                 "this device service runs as SYSTEM and nobody is signed in at its screen: a \
                  recording is made as the person signed in at the device, so there is no one to \
                  record as"
             }
+            Self::NoConsoleUser => {
+                "this device service runs as root and nobody is signed in at its screen (a \
+                 graphical session): a recording is made as the person signed in at the device, \
+                 so there is no one to record as"
+            }
             Self::RootDaemon => {
                 "this device service runs as root, and launching the recorder as the person at \
-                 the screen is not built here yet (FR-85 P1e covers Windows): run `roomlerd \
-                 record` in your own session"
+                 the screen is not built on this platform yet (FR-85 P1e covers Windows and \
+                 Linux): run `roomlerd record` in your own session"
             }
             Self::SwitchedOff => {
                 "recording is switched off on this device (ROOMLERD_RECORDING=0 in the \
@@ -104,6 +122,9 @@ pub fn switched_off(value: Option<&str>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Facts {
     pub windows: bool,
+    /// Linux: a root daemon can launch the recorder in the signed-in
+    /// person's session.
+    pub linux: bool,
     /// SYSTEM on Windows, root on unix.
     pub service_account: bool,
     /// (Windows) this process's integrity is above medium.
@@ -111,18 +132,27 @@ pub struct Facts {
     /// (Windows, SYSTEM only) the console session, when a person is signed in
     /// there and their token can be had.
     pub console_session: Option<u32>,
+    /// (Linux, root only) the uid signed in at the active graphical session:
+    /// a person's, never a display manager's greeter.
+    pub console_uid: Option<u32>,
 }
 
 /// The identity rule, as a table.
 pub fn decide_from(f: Facts) -> Result<Identity, Refusal> {
     if f.service_account {
-        if !f.windows {
-            return Err(Refusal::RootDaemon);
+        if f.windows {
+            return match f.console_session {
+                Some(session) => Ok(Identity::ConsoleUser { session }),
+                None => Err(Refusal::NoConsoleUser),
+            };
         }
-        return match f.console_session {
-            Some(session) => Ok(Identity::ConsoleUser { session }),
-            None => Err(Refusal::NoConsoleUser),
-        };
+        if f.linux {
+            return match f.console_uid {
+                Some(uid) => Ok(Identity::SessionUser { uid }),
+                None => Err(Refusal::NoConsoleUser),
+            };
+        }
+        return Err(Refusal::RootDaemon);
     }
     if f.windows && f.above_medium {
         return Ok(Identity::RestrictedCopy);
@@ -137,6 +167,7 @@ pub fn facts() -> Facts {
         let service_account = crate::win_identity::process_is_local_system();
         Facts {
             windows: true,
+            linux: false,
             service_account,
             above_medium: win::own_integrity_rid().is_none_or(|rid| rid > win::MEDIUM_RID),
             console_session: if service_account {
@@ -144,26 +175,35 @@ pub fn facts() -> Facts {
             } else {
                 None
             },
+            console_uid: None,
         }
     }
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot
+        // fail.
+        let root = unsafe { libc::geteuid() } == 0;
         Facts {
             windows: false,
-            // SAFETY: `geteuid` reads the caller's own credentials; it cannot
-            // fail.
-            service_account: unsafe { libc::geteuid() } == 0,
+            linux: cfg!(target_os = "linux"),
+            service_account: root,
             above_medium: false,
             console_session: None,
+            #[cfg(target_os = "linux")]
+            console_uid: if root { unix::console_uid() } else { None },
+            #[cfg(not(target_os = "linux"))]
+            console_uid: None,
         }
     }
     #[cfg(not(any(windows, unix)))]
     {
         Facts {
             windows: false,
+            linux: false,
             service_account: true,
             above_medium: false,
             console_session: None,
+            console_uid: None,
         }
     }
 }
@@ -187,9 +227,9 @@ pub fn describe_self() -> serde_json::Value {
     }
     #[cfg(unix)]
     {
-        // SAFETY: both read the caller's own credentials; they cannot fail.
-        let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
-        serde_json::json!({ "uid": uid, "euid": euid })
+        // SAFETY: all read the caller's own credentials; they cannot fail.
+        let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
+        serde_json::json!({ "uid": uid, "euid": euid, "gid": gid, "groups": own_groups() })
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -257,9 +297,11 @@ pub fn spawn(
         Identity::RestrictedCopy | Identity::ConsoleUser { .. } => {
             win::spawn_as(identity, exe, args, env)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        Identity::SessionUser { uid } => unix::spawn_session_user(uid, exe, args, env),
+        // Windows' identities off Windows, Linux's off Linux.
         _ => Err(std::io::Error::other(
-            "that identity is a Windows one and this is not Windows",
+            "that identity is not one this platform launches",
         )),
     }
 }
@@ -269,19 +311,24 @@ fn spawn_inherit(
     args: &[OsString],
     env: &[(String, String)],
 ) -> std::io::Result<Launched> {
-    use std::process::Stdio;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(args)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(false);
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    launch_piped(cmd)
+}
+
+/// Start `cmd` with stdin and stdout piped (stderr into the daemon's own).
+fn launch_piped(mut cmd: tokio::process::Command) -> std::io::Result<Launched> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(false);
     let mut child = cmd.spawn()?;
     let stdin = child
         .stdin
@@ -312,8 +359,13 @@ pub fn as_identity<R>(identity: Identity, f: impl FnOnce() -> R) -> Result<R, St
             let _as_them = win::Impersonating::begin(&token)?;
             Ok(f())
         }
-        #[cfg(not(windows))]
-        _ => Err("that identity is a Windows one and this is not Windows".into()),
+        #[cfg(target_os = "linux")]
+        Identity::SessionUser { uid } => {
+            let account = unix::Account::by_uid(uid)?;
+            let _as_them = unix::FsIdentity::begin(&account)?;
+            Ok(f())
+        }
+        _ => Err("that identity is not one this platform takes on".into()),
     }
 }
 
@@ -726,6 +778,7 @@ pub(crate) mod win {
                 Err(e) => Err(format!("cannot obtain the console user's token: {e:#}")),
             },
             Identity::Inherit => Err("the daemon's own identity needs no token".into()),
+            Identity::SessionUser { .. } => Err("a Linux identity has no Windows token".into()),
         }
     }
 
@@ -1315,6 +1368,356 @@ pub(crate) mod win {
     }
 }
 
+/// This thread's supplementary groups (the calling thread's own: on Linux
+/// credentials belong to a thread).
+#[cfg(unix)]
+fn own_groups() -> Vec<libc::gid_t> {
+    // SAFETY: a count query, then a fill of a buffer of that size.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut groups = vec![0 as libc::gid_t; n as usize];
+    // SAFETY: `groups` holds `n` entries.
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(n.max(0) as usize);
+    groups
+}
+
+/// The Linux half: who is signed in at the screen, the launch into their
+/// session, and this thread's filesystem identity.
+#[cfg(target_os = "linux")]
+pub(crate) mod unix {
+    use std::ffi::OsString;
+    use std::marker::PhantomData;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use super::Launched;
+
+    /// How long an answer to "who is signed in" is reused. The Recordings
+    /// view polls the state every second while a recording runs, and each
+    /// lookup is several `loginctl` processes; a sign-in or sign-out shows
+    /// within this.
+    const CONSOLE_TTL: Duration = Duration::from_secs(5);
+
+    static CONSOLE: Mutex<Option<(Instant, Option<u32>)>> = Mutex::new(None);
+
+    /// The uid signed in at the active graphical session: a person's
+    /// (`Class=user`), never a display manager's greeter. uid 0 counts as
+    /// nobody: the recorder never runs as root.
+    pub(super) fn console_uid() -> Option<u32> {
+        let mut cached = CONSOLE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, uid)) = *cached
+            && at.elapsed() < CONSOLE_TTL
+        {
+            return uid;
+        }
+        let uid = crate::companion::graphical_session_matching(None, true)
+            .ok()
+            .map(|s| s.uid)
+            .filter(|&uid| uid != 0);
+        *cached = Some((Instant::now(), uid));
+        uid
+    }
+
+    /// An account, resolved the way the privilege drop resolves one
+    /// (`exec`, uid 0 refused).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Account {
+        pub(crate) uid: libc::uid_t,
+        pub(crate) gid: libc::gid_t,
+        pub(crate) groups: Vec<libc::gid_t>,
+        pub(crate) name: String,
+    }
+
+    impl Account {
+        pub(crate) fn by_name(name: &str) -> Result<Self, String> {
+            let (uid, gid, groups) = crate::exec::account_ids(name)?;
+            Ok(Self {
+                uid,
+                gid,
+                groups,
+                name: name.to_string(),
+            })
+        }
+
+        pub(crate) fn by_uid(uid: u32) -> Result<Self, String> {
+            let account = Self::by_name(&crate::exec::account_name(uid)?)?;
+            if account.uid != uid {
+                return Err(format!(
+                    "uid {uid} resolved to {}, whose uid is {}",
+                    account.name, account.uid
+                ));
+            }
+            Ok(account)
+        }
+    }
+
+    /// Launch the recorder in the session signed in as `uid`: the variables
+    /// that put a process in that session, then the one privilege drop
+    /// (`exec::drop_to_std`: groups, then gid, then uid, verified).
+    pub(super) fn spawn_session_user(
+        uid: u32,
+        exe: &Path,
+        args: &[OsString],
+        env: &[(String, String)],
+    ) -> std::io::Result<Launched> {
+        let session =
+            crate::companion::graphical_session_matching(Some(uid), true).map_err(|e| {
+                std::io::Error::other(format!("the session signed in as uid {uid}: {e:#}"))
+            })?;
+        // The two a session is made of (the uid drop is what makes them
+        // usable: the runtime dir is 0700, the bus checks `SO_PEERCRED`),
+        // the display, and the X cookie without which an X11 capture gets
+        // `Authorization required`.
+        let mut session_env = vec![
+            ("XDG_RUNTIME_DIR".to_string(), format!("/run/user/{uid}")),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                format!("unix:path=/run/user/{uid}/bus"),
+            ),
+        ];
+        if let Some(d) = session.display {
+            session_env.push(("DISPLAY".to_string(), d));
+        }
+        if let Some(w) = session.wayland_display {
+            session_env.push(("WAYLAND_DISPLAY".to_string(), w));
+        }
+        if let Some(xa) = crate::apps::find_xauthority(uid) {
+            session_env.push(("XAUTHORITY".to_string(), xa.to_string_lossy().into_owned()));
+        }
+        spawn_as_account(&session.name, &session_env, exe, args, env)
+    }
+
+    /// The launch itself, apart from the session lookup, so a test can run
+    /// it as an account that has no session (`nobody`).
+    pub(super) fn spawn_as_account(
+        account: &str,
+        session_env: &[(String, String)],
+        exe: &Path,
+        args: &[OsString],
+        env: &[(String, String)],
+    ) -> std::io::Result<Launched> {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(session_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        crate::exec::drop_to_std(&mut cmd, account).map_err(std::io::Error::other)?;
+        super::launch_piped(tokio::process::Command::from(cmd))
+    }
+
+    /// Set THIS thread's supplementary groups. The raw syscall on purpose:
+    /// glibc's `setgroups` changes every thread of the process (POSIX asks
+    /// for that), and this must change one.
+    fn set_thread_groups(groups: &[libc::gid_t]) -> std::io::Result<()> {
+        // SAFETY: the kernel reads `len` gids from a live slice.
+        let rc = unsafe { libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The thread's fsuid. `setfsuid` returns the previous value and changes
+    /// nothing for an id it refuses, so asking for an impossible one reads it.
+    fn fsuid() -> libc::uid_t {
+        // SAFETY: `uid_t::MAX` is never a valid uid; nothing changes.
+        unsafe { libc::setfsuid(libc::uid_t::MAX) as libc::uid_t }
+    }
+
+    fn fsgid() -> libc::gid_t {
+        // SAFETY: as `fsuid`.
+        unsafe { libc::setfsgid(libc::gid_t::MAX) as libc::gid_t }
+    }
+
+    fn same_groups(mut a: Vec<libc::gid_t>, b: &[libc::gid_t]) -> bool {
+        let mut b = b.to_vec();
+        a.sort_unstable();
+        a.dedup();
+        b.sort_unstable();
+        b.dedup();
+        a == b
+    }
+
+    /// THIS thread's filesystem identity, an account's until dropped: its
+    /// fsuid, fsgid and supplementary groups. Linux checks every open,
+    /// create and unlink against those, and the capabilities that let root
+    /// skip the checks (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`,
+    /// `CAP_FOWNER`, …) leave the thread's effective set while its fsuid is
+    /// not 0 and come back with it. The Linux form of the Windows
+    /// impersonation (`win::Impersonating`).
+    ///
+    /// Not `Send`: an identity belongs to the thread that took it on.
+    pub(crate) struct FsIdentity {
+        fsuid: libc::uid_t,
+        fsgid: libc::gid_t,
+        groups: Vec<libc::gid_t>,
+        _thread: PhantomData<*const ()>,
+    }
+
+    impl FsIdentity {
+        pub(crate) fn begin(account: &Account) -> Result<Self, String> {
+            // What to return to, read before anything changes, so a guard
+            // taken by a process that is not root puts back what it found.
+            let back = Self {
+                fsuid: fsuid(),
+                fsgid: fsgid(),
+                groups: super::own_groups(),
+                _thread: PhantomData,
+            };
+            set_thread_groups(&account.groups)
+                .map_err(|e| format!("taking on {}'s groups: {e}", account.name))?;
+            // SAFETY: plain credential syscalls on this thread; checked below.
+            unsafe {
+                libc::setfsgid(account.gid);
+                libc::setfsuid(account.uid);
+            }
+            // Verified, never assumed: a thread that is still root, or still
+            // in root's group, would read a link planted in the folder with
+            // root's rights. `back` restores whatever did change.
+            if fsuid() != account.uid
+                || fsgid() != account.gid
+                || !same_groups(super::own_groups(), &account.groups)
+            {
+                return Err(format!(
+                    "the thread did not take on {}'s identity",
+                    account.name
+                ));
+            }
+            Ok(back)
+        }
+    }
+
+    impl Drop for FsIdentity {
+        fn drop(&mut self) {
+            // SAFETY: plain credential syscalls on this thread; checked below.
+            unsafe {
+                libc::setfsuid(self.fsuid);
+                libc::setfsgid(self.fsgid);
+            }
+            let groups_back = set_thread_groups(&self.groups).is_ok();
+            if fsuid() != self.fsuid
+                || fsgid() != self.fsgid
+                || !groups_back
+                || !same_groups(super::own_groups(), &self.groups)
+            {
+                // A pool thread left as someone else would take that identity
+                // into whatever work it runs next. Nothing is safe after this.
+                eprintln!(
+                    "recording: a thread could not become the daemon again after acting as the \
+                     person signed in; aborting"
+                );
+                std::process::abort();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// These need root. Skipped elsewhere, unless the privileged lane
+        /// says root is required, and then an unprivileged run FAILS rather
+        /// than passing by skipping.
+        fn root() -> bool {
+            // SAFETY: reads our own credentials.
+            let root = unsafe { libc::geteuid() } == 0;
+            if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+                panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+            }
+            root
+        }
+
+        fn nobody() -> Account {
+            Account::by_name("nobody").expect("the `nobody` account")
+        }
+
+        /// Work done as the person gets only the person's rights: a folder
+        /// only root may write is refused, a `root:root 0640` file only
+        /// root's group may read is refused (red without the per-thread
+        /// groups: root's group 0 reads it), and afterwards the thread is
+        /// root again.
+        #[test]
+        fn work_done_as_the_person_gets_only_the_persons_rights() {
+            if !root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            // A file only group root may read, in a folder anyone may enter.
+            let open = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let grouped = open.path().join("grouped");
+            std::fs::write(&grouped, b"group root's").unwrap();
+            std::fs::set_permissions(&grouped, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            // The control: root writes one and reads the other.
+            std::fs::write(dir.path().join("as-root"), b"x").unwrap();
+            std::fs::read(&grouped).unwrap();
+
+            let person = nobody();
+            let (write, read) = {
+                let _as_them = FsIdentity::begin(&person).expect("taking on nobody");
+                (
+                    std::fs::write(dir.path().join("as-nobody"), b"x"),
+                    std::fs::read(&grouped),
+                )
+            };
+            let write = write.expect_err("nobody wrote into a folder only root may write");
+            assert_eq!(
+                write.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{write}"
+            );
+            let read = read.expect_err("nobody read a file only root's group may read");
+            assert_eq!(read.kind(), std::io::ErrorKind::PermissionDenied, "{read}");
+
+            // And the thread is root again: the same write goes through.
+            assert_eq!(fsuid(), 0);
+            std::fs::write(dir.path().join("root-again"), b"x")
+                .expect("the thread is root again after the guard");
+        }
+
+        /// The recorder launched as the person IS the person: their uid, not
+        /// root's, and none of root's groups (`id` reports what the child got).
+        #[test]
+        fn the_launch_runs_as_the_person_with_the_persons_groups() {
+            if !root() {
+                return;
+            }
+            let person = nobody();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = rt.block_on(async {
+                use tokio::io::AsyncReadExt;
+                let mut l = spawn_as_account(&person.name, &[], Path::new("/usr/bin/id"), &[], &[])
+                    .expect("launch as nobody");
+                drop(l.stdin.take());
+                let mut out = String::new();
+                l.stdout.read_to_string(&mut out).await.unwrap();
+                l.child.wait().await;
+                out
+            });
+            let uid = format!("uid={}(", person.uid);
+            assert!(out.contains(&uid), "not nobody: {out}");
+            assert!(
+                !out.contains("(root)"),
+                "a root group survived the drop: {out}"
+            );
+        }
+
+        #[test]
+        fn root_is_never_the_account_a_session_resolves_to() {
+            assert!(Account::by_uid(0).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,9 +1725,23 @@ mod tests {
     fn f(windows: bool, service: bool, high: bool, console: Option<u32>) -> Facts {
         Facts {
             windows,
+            linux: false,
             service_account: service,
             above_medium: high,
             console_session: console,
+            console_uid: None,
+        }
+    }
+
+    /// Linux: `console` is the uid at the active graphical session.
+    fn linux(root: bool, console: Option<u32>) -> Facts {
+        Facts {
+            windows: false,
+            linux: true,
+            service_account: root,
+            above_medium: false,
+            console_session: None,
+            console_uid: console,
         }
     }
 
@@ -1354,11 +1771,34 @@ mod tests {
             decide_from(f(true, true, true, None)),
             Err(Refusal::NoConsoleUser)
         );
-        // root: refused until the unix drop exists.
+        // root on macOS: refused until the drop exists there.
         assert_eq!(
             decide_from(f(false, true, false, None)),
             Err(Refusal::RootDaemon)
         );
+        // root on Linux with someone at the screen: as them.
+        assert_eq!(
+            decide_from(linux(true, Some(1000))),
+            Ok(Identity::SessionUser { uid: 1000 })
+        );
+        // root on Linux with nobody (or only a greeter): refused, never
+        // "as root".
+        assert_eq!(decide_from(linux(true, None)), Err(Refusal::NoConsoleUser));
+        // An ordinary Linux user (a user unit): nothing to change, whoever
+        // else is signed in.
+        assert_eq!(decide_from(linux(false, Some(1000))), Ok(Identity::Inherit));
+    }
+
+    /// The refusal a Linux root daemon gives names root, not SYSTEM.
+    #[test]
+    fn a_refusal_names_the_account_this_service_runs_as() {
+        let m = Refusal::NoConsoleUser.message();
+        assert!(m.contains("this device service runs as"), "{m}");
+        if cfg!(windows) {
+            assert!(m.contains("SYSTEM"), "{m}");
+        } else {
+            assert!(m.contains("root") && !m.contains("SYSTEM"), "{m}");
+        }
     }
 
     #[test]

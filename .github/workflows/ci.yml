@@ -509,6 +509,19 @@ jobs:
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
 
+      - name: Linux recorder identity (FR-85) — as root, the drop and the thread's filesystem identity
+        # FR-85 P1e-unix. A root daemon launches the recorder as the person
+        # signed in at the screen, and does its own work in their folder with
+        # the thread's fsuid, fsgid and groups switched to theirs. None of it
+        # can be exercised without root, so the lib test binary is built as
+        # the runner and then run under sudo. ROOMLERD_TEST_REQUIRE_ROOT
+        # turns a skip into a failure: the step cannot pass by not running.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/p1eu.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/p1eu.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" recording::launch
+
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
       # bridge; the default `--workspace` clippy never compiles it
