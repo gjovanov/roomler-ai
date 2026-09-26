@@ -49,6 +49,51 @@ pub fn data_dir() -> Option<PathBuf> {
     roomler_node_core::appdirs::project_dirs().map(|p| p.data_local_dir().join("recordings"))
 }
 
+/// FR-85 P1f — where an UNATTENDED recording goes (a service with nobody
+/// signed in): the daemon's own folder, never a person's. The machine-global
+/// tree on Windows (`%PROGRAMDATA%`, where the service's config lives too),
+/// the daemon's own data dir elsewhere.
+pub fn unattended_default() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(roomler_node_core::appdirs::machine_global_dir().join("recordings"))
+    }
+    #[cfg(not(windows))]
+    {
+        data_dir()
+    }
+}
+
+/// Create `dir` if it is missing and lock it to the service side: a
+/// protected DACL of SYSTEM and Administrators on Windows (`%PROGRAMDATA%`
+/// would otherwise hand Users read), the daemon's own account alone (0700)
+/// elsewhere. Applied at every use, so a folder someone loosened is
+/// tightened again before a recording goes in. A link anywhere on the path
+/// is refused, never followed: a service writing through a link someone
+/// planted is the primitive the identity rule exists to prevent.
+pub fn prepare_unattended(dir: &Path) -> Result<()> {
+    if let Some(link) = link_component(dir) {
+        anyhow::bail!(
+            "{} is a symbolic link or junction: an unattended recording is never written through one",
+            link.display()
+        );
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("{}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("{} is not a plain folder", dir.display());
+    }
+    #[cfg(windows)]
+    super::launch::win::lock_to_service_accounts(dir).map_err(anyhow::Error::msg)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("locking {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Resolve the folder for the next recording: `configured` when set and
 /// usable, otherwise the per-OS default. Never fails outright — the last
 /// resort is the recorder's own data dir.
@@ -244,6 +289,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// P1f — the unattended folder is made, locked to the daemon (0700), and
+    /// tightened again when someone loosened it; a link on its path is
+    /// refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn the_unattended_folder_is_made_locked_and_never_reached_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("unattended");
+        let dir = base.join("recordings");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        prepare_unattended(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_unattended(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700, "a loosened folder is tightened again");
+
+        let target = base.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_unattended(&link.join("recordings")).is_err());
+        assert!(
+            !target.join("recordings").exists(),
+            "the folder was made through the link"
+        );
     }
 
     #[test]
