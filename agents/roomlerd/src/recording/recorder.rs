@@ -11,9 +11,12 @@
 //! while recording.
 //!
 //! Tasks:
-//! - **capture** — pulls frames and keeps only the latest (`watch`), so a slow
-//!   encoder never backs capture up; a size change ends the recording
-//!   (`display_changed`) rather than scaling mid-file.
+//! - **capture** — pulls frames and keeps only the latest (a slot the loop
+//!   takes from), so a slow encoder never backs capture up; a size change ends
+//!   the recording (`display_changed`) rather than scaling mid-file.
+//! - **the pointer** (FR-85 P1d) — drawn by the backend where it can
+//!   ([`crate::capture::open_for_recording`]), otherwise drawn here each tick
+//!   from where the backend says it is ([`super::pointer`]).
 //! - **the loop here** — one tick per `1/fps` on its own clock, encodes the
 //!   latest frame (or repeats the last one on a still screen — constant frame
 //!   rate), forces a keyframe every GOP when the encoder does not keep one
@@ -30,13 +33,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::{mpsc, watch};
 
+use crate::capture::pointer::{PointerSource, RecordedPointer};
 use crate::capture::{Frame, ScreenCapture};
 use crate::encode::VideoEncoder;
 
 use super::folder::{self, PARTIAL_DIR, PARTIAL_SUFFIX};
 use super::mp4::{self, ColorInfo, FragmentedWriter, VideoTrack};
 use super::pacer::{Cadence, TickFifo};
-use super::sidecar::{AudioInfo, Event, Initiator, SIDECAR_VERSION, Sidecar, StopReason};
+use super::pointer::PointerLayer;
+use super::sidecar::{AudioInfo, Event, Initiator, Pointer, SIDECAR_VERSION, Sidecar, StopReason};
 
 /// Everything a recording needs to know before its first frame.
 #[derive(Debug, Clone)]
@@ -225,6 +230,59 @@ pub(crate) fn group_access_units(
     }
 }
 
+/// The newest captured frame, waiting for the loop. Latest wins: a frame the
+/// loop has not taken yet is replaced, never queued, so a slow encoder never
+/// backs capture up. The loop TAKES it, and so owns it outright.
+#[derive(Default)]
+struct Latest(std::sync::Mutex<Option<Frame>>);
+
+impl Latest {
+    fn put(&self, f: Frame) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f);
+    }
+
+    fn take(&self) -> Option<Frame> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// What the loop encodes each tick: the latest frame, with the pointer drawn
+/// on it when the backend does not draw it itself (FR-85 P1d).
+enum Picture {
+    Plain(Arc<Frame>),
+    WithPointer(PointerLayer),
+}
+
+impl Picture {
+    fn new(first: Arc<Frame>, pointer: Option<Box<dyn PointerSource>>) -> Self {
+        match pointer {
+            Some(source) => Self::WithPointer(PointerLayer::new(source, first)),
+            None => Self::Plain(first),
+        }
+    }
+
+    fn replace(&mut self, f: Arc<Frame>) {
+        match self {
+            Self::Plain(p) => *p = f,
+            Self::WithPointer(l) => l.replace(f),
+        }
+    }
+
+    /// The frame for this tick. On a still screen, the same one again.
+    fn frame(&mut self) -> Arc<Frame> {
+        match self {
+            Self::Plain(p) => p.clone(),
+            Self::WithPointer(l) => l.frame(),
+        }
+    }
+}
+
 /// Crop a frame to even dimensions in place (H.264 4:2:0 needs them). No
 /// copy: `stride` already describes the rows.
 fn even(mut f: Frame) -> Frame {
@@ -400,8 +458,22 @@ pub async fn run_with_audio(
         partial = %partial.display(), "recording: started"
     );
 
+    // ── the pointer (FR-85 P1d) ─────────────────────────────────────────────
+    // Asked once, now that the first frame proved the backend works: does it
+    // draw the pointer into its frames, must the recorder draw it, or is
+    // there none? The sidecar keeps the answer.
+    let (pointer, pointer_source) = match capturer.recorded_pointer() {
+        RecordedPointer::InFrame => (Pointer::InFrame, None),
+        RecordedPointer::Drawn(source) => (Pointer::Drawn, Some(source)),
+        RecordedPointer::Absent => (Pointer::Absent, None),
+    };
+    tracing::info!(pointer = pointer.as_str(), "recording: the pointer");
+
     // ── capture task: latest frame wins ─────────────────────────────────────
-    let (latest_tx, mut latest_rx) = watch::channel::<Option<Arc<Frame>>>(None);
+    // A slot the loop TAKES from, so the loop owns each new frame outright
+    // and the pointer layer draws on it in place rather than copying it.
+    let latest = Arc::new(Latest::default());
+    let latest_tx = latest.clone();
     let (cap_stop_tx, mut cap_stop_rx) = watch::channel(false);
     let (cap_fail_tx, mut cap_fail_rx) = watch::channel::<Option<StopReason>>(None);
     let capture = tokio::spawn(async move {
@@ -422,7 +494,7 @@ pub async fn run_with_audio(
                             let _ = cap_fail_tx.send(Some(StopReason::DisplayChanged));
                             break;
                         }
-                        let _ = latest_tx.send(Some(Arc::new(f)));
+                        latest_tx.put(f);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -449,7 +521,7 @@ pub async fn run_with_audio(
     let mut interval = tokio::time::interval(cadence.interval());
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let gop_ticks = cadence.gop_ticks(opts.gop_seconds);
-    let mut last_frame = Arc::new(first);
+    let mut picture = Picture::new(Arc::new(first), pointer_source);
     let mut fifo = TickFifo::default();
     let mut next_tick = 0u64;
     let mut last_keyframe_tick: Option<u64> = None;
@@ -503,10 +575,8 @@ pub async fn run_with_audio(
         }
         next_tick = tick + 1;
 
-        if latest_rx.has_changed().unwrap_or(false)
-            && let Some(f) = latest_rx.borrow_and_update().clone()
-        {
-            last_frame = f;
+        if let Some(f) = latest.take() {
+            picture.replace(Arc::new(f));
         }
         if !opts.encoder_keeps_gop
             && last_keyframe_tick.is_none_or(|k| tick.saturating_sub(k) >= gop_ticks)
@@ -523,7 +593,7 @@ pub async fn run_with_audio(
         while fifo.in_flight() > 8 {
             let _ = fifo.finished();
         }
-        let packets = match encoder.encode(last_frame.clone()).await {
+        let packets = match encoder.encode(picture.frame()).await {
             Ok(p) => {
                 encode_errors = 0;
                 p
@@ -703,6 +773,7 @@ pub async fn run_with_audio(
         events: events_log,
         stop_reason: Some(reason),
         bytes,
+        pointer: Some(pointer),
     });
     if let (Some(p), Some(s)) = (&path, &sidecar)
         && let Err(e) = std::fs::write(Sidecar::path_for(p), s.to_json())
@@ -865,6 +936,8 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
                     events: Vec::new(),
                     stop_reason: Some(StopReason::Interrupted),
                     bytes: s.bytes,
+                    // Unknown: the recorder that knew is gone.
+                    pointer: None,
                 };
                 // A sidecar the dead recorder never wrote: keep an existing
                 // one's facts if there is one, only mark it interrupted.

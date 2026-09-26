@@ -68,4 +68,12 @@ impl Display {
     pub fn height(&self) -> usize {
         self.0.height() as usize
     }
+
+    /// ROOMLER PATCH: where this display sits on the virtual desktop, so a
+    /// point in screen coordinates (the mouse pointer) can be placed in its
+    /// frame. See `dxgi::Display::origin`.
+    pub fn origin(&self) -> (i32, i32) {
+        let (x, y) = self.0.origin();
+        (x as i32, y as i32)
+    }
 }
