@@ -527,12 +527,13 @@ audio = ["dep:audiopus", "dep:cpal"]
 # pacer, recording encoder profile, fragmented MP4 + remux on stop), the local
 # verbs, and the device's half of remote recording.
 #
-# ⚠️ In `full`, and so in every release build, with every gate CLOSED: a local
-# recording starts only when the person at the device presses Record, and a
-# remote one only once the device's owner switches `record_remote_enabled` on
-# (default off) AND the controller holds `RECORD_REMOTE_SCREEN`. The recorder
-# runs as that person at normal integrity (P1e). `ROOMLERD_RECORDING=0`
-# switches the whole surface off without a rebuild.
+# ⚠️ NOT in `full`, and so in no release build: taken back out before any
+# release carried it (the operator, 2026-09-26). It rejoins once the field
+# matrix proves it on canary hosts, an EDR-managed corporate laptop first:
+# on Windows the daemon launches a restricted-token child (P1e) as soon as
+# someone opens the Recordings view, the pattern EDR watches for. Then macOS
+# TCC for that child. CI names the feature explicitly. Where it is compiled
+# in, every gate is closed and `ROOMLERD_RECORDING=0` switches it all off.
 recording = ["dep:mp4-atom"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
@@ -568,7 +569,7 @@ portal-capture = ["dep:zbus"]
 # `drm-capture`.
 uinput-input = []
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]

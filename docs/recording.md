@@ -7,11 +7,17 @@
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
 > P3c (the viewer's Record and Download, §10) and P5a (the export engine: cut
-> and speed up, §11).** It ships in every release build (`recording` is in
-> `full`) with every gate closed: a local recording starts only when the
-> person at the device presses Record, a remote one only once the device's
-> owner allows it. `ROOMLERD_RECORDING=0` in the service's environment
-> switches recording off, local and remote. It is driven by
+> and speed up, §11).** It is in **no release build**: `recording` joined
+> `full` for a day (#1677) and was taken back out before any release carried
+> it (the operator, 2026-09-26). It rejoins once canary hosts prove it in the
+> field: an EDR-managed corporate laptop first, because on Windows the daemon
+> launches a restricted-token child (§6) as soon as someone opens the
+> Recordings view, the pattern EDR watches for; then macOS TCC for that
+> child. Where it is compiled in, every gate is closed: a local recording
+> starts only when the person at the device presses Record, a remote one
+> only once the device's owner allows it, and `ROOMLERD_RECORDING=0` in the
+> service's environment switches recording off, local and remote. It is
+> driven by
 > `roomlerd record`, by the daemon for the LocalAPI recording verbs and
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
