@@ -13,7 +13,8 @@
 //! | an ELEVATED user: the default Windows service worker of a UAC-split administrator (`ROOMLERD_ELEVATE_WORKER`) | a restricted copy of the same token: admin groups deny-only, no privileges, medium integrity |
 //! | SYSTEM, with someone signed in at the console | that person's own token |
 //! | root on Linux, with someone signed in at the active graphical session | that person: their uid, gid and groups, in their session's environment |
-//! | SYSTEM or Linux root with nobody signed in; root on macOS | refused, by name |
+//! | SYSTEM or Linux root with nobody signed in | a REMOTE recording only (P1f, [`Identity::Unattended`]): the daemon itself, into the daemon's own folder, locked to the service side; a local one is refused, by name |
+//! | root on macOS | refused, by name |
 //!
 //! ⚠️ **A restricted COPY, not the linked token.** An elevated administrator's
 //! token links to the filtered one, but without `SeTcbPrivilege` (a worker has
@@ -40,9 +41,7 @@
 //! would change every thread of the daemon): without that, root's group 0
 //! would still open a `root:root 0640` file a link in the folder pointed at.
 //!
-//! Not yet here: the drop on macOS (a root daemon there still refuses), and
-//! the unattended exception (a device with nobody signed in records as the
-//! daemon, into the daemon's own folder).
+//! Not yet here: the drop on macOS (a root daemon there still refuses).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -62,6 +61,13 @@ pub enum Identity {
     /// (Linux) The account signed in at the active graphical session, by
     /// uid. This daemon is root.
     SessionUser { uid: u32 },
+    /// FR-85 P1f — SYSTEM or root with NOBODY signed in: the daemon itself,
+    /// for a REMOTE recording only (a local one needs someone at the device
+    /// to ask for it), into the daemon's own folder, locked to the service
+    /// side ([`crate::recording::folder::unattended_dir`]). Never a person's
+    /// folder: a service writing where a user can plant links is exactly
+    /// what the identity rule exists to prevent.
+    Unattended,
 }
 
 /// Why no recorder can be launched here right now.
@@ -160,10 +166,19 @@ pub fn decide_from(f: Facts) -> Result<Identity, Refusal> {
     Ok(Identity::Inherit)
 }
 
-/// Read the facts for THIS process, now.
+/// Read the facts for THIS process, now (who is signed in may be an answer
+/// from the last few seconds; see [`decide_fresh`]).
 pub fn facts() -> Facts {
+    facts_with(false)
+}
+
+/// `fresh`: ask the system who is signed in, never a cached answer. Windows
+/// asks every time anyway; Linux caches `loginctl`'s answer for a few
+/// seconds unless asked fresh.
+fn facts_with(fresh: bool) -> Facts {
     #[cfg(windows)]
     {
+        let _ = fresh;
         let service_account = crate::win_identity::process_is_local_system();
         Facts {
             windows: true,
@@ -190,13 +205,17 @@ pub fn facts() -> Facts {
             above_medium: false,
             console_session: None,
             #[cfg(target_os = "linux")]
-            console_uid: if root { unix::console_uid() } else { None },
+            console_uid: if root { unix::console_uid(fresh) } else { None },
             #[cfg(not(target_os = "linux"))]
-            console_uid: None,
+            console_uid: {
+                let _ = fresh;
+                None
+            },
         }
     }
     #[cfg(not(any(windows, unix)))]
     {
+        let _ = fresh;
         Facts {
             windows: false,
             linux: false,
@@ -211,6 +230,13 @@ pub fn facts() -> Facts {
 /// Who a recorder launched now would run as, or why none can be.
 pub fn decide() -> Result<Identity, Refusal> {
     decide_from(facts())
+}
+
+/// [`decide`], asking the system afresh who is signed in (P1f): the
+/// launch-time re-check of an unattended start and the watch over a running
+/// one must see a sign-in the moment it happens, never a cached "nobody".
+pub fn decide_fresh() -> Result<Identity, Refusal> {
+    decide_from(facts_with(true))
 }
 
 /// What `roomlerd record --whoami` prints: the identity a recorder actually
@@ -292,7 +318,9 @@ pub fn spawn(
     env: &[(String, String)],
 ) -> std::io::Result<Launched> {
     match identity {
-        Identity::Inherit => spawn_inherit(exe, args, env),
+        // P1f — the unattended recorder is the daemon itself; `--out` points
+        // it at the daemon's own locked folder.
+        Identity::Inherit | Identity::Unattended => spawn_inherit(exe, args, env),
         #[cfg(windows)]
         Identity::RestrictedCopy | Identity::ConsoleUser { .. } => {
             win::spawn_as(identity, exe, args, env)
@@ -352,7 +380,7 @@ fn launch_piped(mut cmd: tokio::process::Command) -> std::io::Result<Launched> {
 /// `Inherit` just runs `f`.
 pub fn as_identity<R>(identity: Identity, f: impl FnOnce() -> R) -> Result<R, String> {
     match identity {
-        Identity::Inherit => Ok(f()),
+        Identity::Inherit | Identity::Unattended => Ok(f()),
         #[cfg(windows)]
         Identity::RestrictedCopy | Identity::ConsoleUser { .. } => {
             let token = win::token_for(identity)?;
@@ -752,6 +780,77 @@ pub(crate) mod win {
         Ok(())
     }
 
+    /// FR-85 P1f — lock `dir` to the service side: a PROTECTED DACL (nothing
+    /// inherited from above, where `%PROGRAMDATA%` grants Users read and
+    /// create) holding exactly SYSTEM and Administrators, both inherited by
+    /// what the recorder creates inside. An unattended recording is a screen
+    /// with nobody at it; only the machine's own side may read it back.
+    pub(crate) fn lock_to_service_accounts(dir: &Path) -> Result<(), String> {
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAceEx, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor,
+            OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_DESCRIPTOR,
+            SetFileSecurityW, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        };
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+        const OBJECT_AND_CONTAINER_INHERIT: u32 = 0x1 | 0x2;
+        let mut system = well_known_sid(WinLocalSystemSid)?;
+        let mut admins = well_known_sid(WinBuiltinAdministratorsSid)?;
+        let (system, admins): (PSID, PSID) =
+            (system.as_mut_ptr().cast(), admins.as_mut_ptr().cast());
+        // SAFETY: both SIDs are valid; the ACL buffer is sized for exactly the
+        // two ACEs and outlives every call that points at it, as does the
+        // descriptor.
+        unsafe {
+            let size = std::mem::size_of::<ACL>() as u32
+                + 2 * (std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u32 - 4)
+                + GetLengthSid(system)
+                + GetLengthSid(admins);
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+            let acl = buf.as_mut_ptr() as *mut ACL;
+            if InitializeAcl(acl, size, ACL_REVISION) == 0
+                || AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    OBJECT_AND_CONTAINER_INHERIT,
+                    GENERIC_ALL,
+                    system,
+                ) == 0
+                || AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    OBJECT_AND_CONTAINER_INHERIT,
+                    GENERIC_ALL,
+                    admins,
+                ) == 0
+            {
+                return Err(last_error("building the unattended folder's DACL"));
+            }
+            let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            let psd = (&mut sd as *mut SECURITY_DESCRIPTOR).cast();
+            // The owner too, explicitly: an owner keeps WRITE_DAC whatever the
+            // DACL says, so a folder that pre-existed with someone else's
+            // ownership would otherwise stay theirs to reopen.
+            if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) == 0
+                || SetSecurityDescriptorDacl(psd, 1, acl, 0) == 0
+                || SetSecurityDescriptorOwner(psd, admins, 0) == 0
+            {
+                return Err(last_error("building the unattended folder's descriptor"));
+            }
+            let path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            if SetFileSecurityW(
+                path.as_ptr(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                psd,
+            ) == 0
+            {
+                return Err(last_error("locking the unattended folder"));
+            }
+        }
+        Ok(())
+    }
+
     /// A token for `identity`: ours restricted, or the console user's.
     pub enum Token {
         Mine(Owned),
@@ -777,7 +876,9 @@ pub(crate) mod win {
                 )),
                 Err(e) => Err(format!("cannot obtain the console user's token: {e:#}")),
             },
-            Identity::Inherit => Err("the daemon's own identity needs no token".into()),
+            Identity::Inherit | Identity::Unattended => {
+                Err("the daemon's own identity needs no token".into())
+            }
             Identity::SessionUser { .. } => Err("a Linux identity has no Windows token".into()),
         }
     }
@@ -1342,6 +1443,36 @@ pub(crate) mod win {
             );
         }
 
+        /// FR-85 P1f — the unattended folder is the service side's alone. A
+        /// folder under the user's own temp dir (whose ACEs hand the user
+        /// full control) is locked by `lock_to_service_accounts`; the
+        /// elevated daemon still writes there, and a write made as the
+        /// restricted copy (the person, admin deny-only) is refused. Red
+        /// without the lock: the user's own ACE lets the copy in.
+        #[test]
+        fn the_unattended_folder_is_the_service_sides_alone() {
+            if admin_group_enabled() != Some(true) {
+                assert!(
+                    std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
+                    "this lane must run elevated for the refusal to be proven"
+                );
+                println!("not elevated: there is no service side to keep a person out for");
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let locked = dir.path().join("unattended");
+            std::fs::create_dir(&locked).unwrap();
+            super::lock_to_service_accounts(&locked).expect("locking the folder");
+            std::fs::write(locked.join("as-the-daemon"), b"x")
+                .expect("the service side writes there: the control");
+            let write = super::super::as_identity(Identity::RestrictedCopy, || {
+                std::fs::write(locked.join("as-a-person"), b"x")
+            })
+            .unwrap();
+            assert!(write.is_err(), "a person wrote into the unattended folder");
+            assert!(!locked.join("as-a-person").exists());
+        }
+
         #[test]
         fn extra_variables_replace_their_namesake_whatever_its_case() {
             let base = vec![
@@ -1402,24 +1533,48 @@ pub(crate) mod unix {
     /// within this.
     const CONSOLE_TTL: Duration = Duration::from_secs(5);
 
-    static CONSOLE: Mutex<Option<(Instant, Option<u32>)>> = Mutex::new(None);
+    /// The last answer to "who is signed in", and when it was had.
+    pub(super) struct ConsoleCache(Mutex<Option<(Instant, Option<u32>)>>);
+
+    impl ConsoleCache {
+        pub(super) const fn new() -> Self {
+            Self(Mutex::new(None))
+        }
+
+        /// `lookup`'s answer, reused for [`CONSOLE_TTL`] unless `fresh`.
+        ///
+        /// ⚠️ P1f's guards pass `fresh`: the re-check before an unattended
+        /// recorder launches, and the watch while one runs. A cached "nobody"
+        /// read twice within a few milliseconds is ONE observation, so a
+        /// person who signed in inside the window would be recorded with no
+        /// banner (found in review: the re-check was a no-op on the cache).
+        pub(super) fn get(&self, fresh: bool, lookup: impl FnOnce() -> Option<u32>) -> Option<u32> {
+            let mut cached = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            if !fresh
+                && let Some((at, uid)) = *cached
+                && at.elapsed() < CONSOLE_TTL
+            {
+                return uid;
+            }
+            let uid = lookup();
+            *cached = Some((Instant::now(), uid));
+            uid
+        }
+    }
+
+    static CONSOLE: ConsoleCache = ConsoleCache::new();
 
     /// The uid signed in at the active graphical session: a person's
     /// (`Class=user`), never a display manager's greeter. uid 0 counts as
-    /// nobody: the recorder never runs as root.
-    pub(super) fn console_uid() -> Option<u32> {
-        let mut cached = CONSOLE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((at, uid)) = *cached
-            && at.elapsed() < CONSOLE_TTL
-        {
-            return uid;
-        }
-        let uid = crate::companion::graphical_session_matching(None, true)
-            .ok()
-            .map(|s| s.uid)
-            .filter(|&uid| uid != 0);
-        *cached = Some((Instant::now(), uid));
-        uid
+    /// nobody: the recorder never runs as root. `fresh` asks the system
+    /// now, whatever was asked a moment ago.
+    pub(super) fn console_uid(fresh: bool) -> Option<u32> {
+        CONSOLE.get(fresh, || {
+            crate::companion::graphical_session_matching(None, true)
+                .ok()
+                .map(|s| s.uid)
+                .filter(|&uid| uid != 0)
+        })
     }
 
     /// An account, resolved the way the privilege drop resolves one
@@ -1714,6 +1869,28 @@ pub(crate) mod unix {
         #[test]
         fn root_is_never_the_account_a_session_resolves_to() {
             assert!(Account::by_uid(0).is_err());
+        }
+
+        /// P1f's guards ask FRESH. Inside its window a cached "nobody" is
+        /// still the answer after someone signed in; a fresh ask goes to the
+        /// system, sees them, and refreshes the cache. Red when `fresh` is
+        /// ignored: the launch re-check and the running watch would read the
+        /// same stale "nobody" and record the person with no banner.
+        #[test]
+        fn a_fresh_ask_sees_a_sign_in_the_cache_would_hide() {
+            let cache = ConsoleCache::new();
+            assert_eq!(cache.get(false, || None), None, "nobody signed in");
+            assert_eq!(
+                cache.get(false, || Some(1000)),
+                None,
+                "inside the window the cached answer stands"
+            );
+            assert_eq!(cache.get(true, || Some(1000)), Some(1000));
+            assert_eq!(
+                cache.get(false, || None),
+                Some(1000),
+                "the fresh answer refreshed the cache"
+            );
         }
     }
 }

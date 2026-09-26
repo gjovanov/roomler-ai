@@ -15,6 +15,12 @@
 #   * clipboard — exercises the clipboard data channel in Phase 3.
 #     Pulls arboard's x11rb back-end transitively but no system X
 #     libs are needed (x11rb is pure-Rust).
+#   * recording — FR-85's recorder, for the remote-recording e2e
+#     specs. A harness agent is root with nobody signed in, so a
+#     remote recording runs UNATTENDED (P1f): as the daemon, into
+#     the daemon's own locked folder, on the synthetic source. It
+#     still needs its owner's `record_remote_enabled`; the specs skip
+#     a device that never opted in.
 #
 # No `--features enigo-input`: enigo on Linux needs an X server to
 # attach to. Phase 2's input round-trip will run in a different image
@@ -32,7 +38,7 @@ COPY . .
 # resolved versions between this build and the workspace.
 RUN cargo build --release -p roomlerd --locked \
     --no-default-features \
-    --features synthetic-frame-source,openh264-encoder,clipboard
+    --features synthetic-frame-source,openh264-encoder,clipboard,recording
 
 # --- Stage 2: Runtime ---
 FROM debian:trixie-slim AS runtime
