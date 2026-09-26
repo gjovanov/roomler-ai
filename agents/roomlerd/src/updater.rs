@@ -2518,6 +2518,10 @@ mod tests {
     /// there, as in the field on 2026-09-26 — `{"delivered":true}`, one INFO
     /// line, no update, no warning. Installing nothing is what makes a held,
     /// unread receiver impossible rather than merely avoided.
+    ///
+    /// ⚠️ `UPDATE_TRIGGER` is process-global and tests share one process: a
+    /// future test here that calls `install_update_trigger(true)` makes this
+    /// one fail at random. Give such a test its own process, or none at all.
     #[test]
     fn a_disabled_updater_reports_a_push_undeliverable() {
         assert!(

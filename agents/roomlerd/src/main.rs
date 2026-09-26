@@ -4097,7 +4097,7 @@ async fn run_cmd(
             async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
         }))
     } else {
-        tracing::info!("auto-update disabled via ROOMLERD_AUTO_UPDATE");
+        tracing::info!("auto-update disabled (auto_update = false / ROOMLERD_AUTO_UPDATE=0)");
         None
     };
 
