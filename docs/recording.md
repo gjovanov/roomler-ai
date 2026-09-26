@@ -376,10 +376,14 @@ flowchart TD
     S -->|"an elevated user<br/>(the service worker of a<br/>UAC-split administrator)"| R["RestrictedCopy:<br/>a restricted copy of the SAME token"]
     S -->|"SYSTEM"| C{"someone signed in<br/>at the console?"}
     C -->|yes| U["ConsoleUser:<br/>that person's own token"]
-    C -->|no| N["refused: nobody to record as"]
+    C -->|"no: the console shows<br/>its sign-in screen"| LS["refused: login_screen<br/>(decision 6)"]
     S -->|"root (Linux)"| L{"someone signed in at the<br/>active graphical session?<br/>(a person, not the greeter)"}
     L -->|yes| SU["SessionUser: their uid, gid<br/>and groups, in their session"]
-    L -->|no| N
+    L -->|no| V{"its own virtual desktop,<br/>or the synthetic source?"}
+    V -->|yes| N["nobody: a REMOTE recording<br/>records unattended (P1f);<br/>a local one is refused"]
+    V -->|no| G{"a greeter or root's desktop active,<br/>or a DISPLAY / DRM scanout<br/>the recorder could reach?"}
+    G -->|yes| LS
+    G -->|"no: no screen at all"| N
     S -->|"root (macOS)"| X["refused: the drop is<br/>not built there yet"]
 ```
 
@@ -423,9 +427,45 @@ into the daemon's log: a service has no stderr of its own to share.
 - **Who is signed in, on Linux**: the active graphical session from
   `loginctl` (the walk the consent companion and the portal helper share),
   `Class=user` only, so a display manager's greeter at the login screen is
-  nobody. uid 0 counts as nobody too: the recorder never runs as root. The
-  answer is reused for 5 s, since the Recordings view polls every second
-  while a recording runs.
+  nobody to record AS. uid 0 counts as nobody too: the recorder never runs
+  as root. When no person is found, a second walk asks whether ANY graphical
+  session is active, reading only `Type` and `Active` (`launch::unix::Seat`):
+  a greeter or root's own desktop is a **login screen** (`NoPerson`), no
+  active session is `Empty`, and a `loginctl` that cannot be asked is
+  `Unknown`, never "no session". The answer is reused for 5 s, since the
+  Recordings view polls every second while a recording runs; the unattended
+  guards ask fresh.
+- ⚠️ **A login screen is not "nobody" (decision 6, `Refusal::LoginScreen`).**
+  It shows account names, a person may be standing at it, and nothing on it
+  can say that a recording runs. So a SYSTEM or root daemon at its login
+  screen refuses every start, local and remote, with its own code,
+  `login_screen`, and the words to go with it. A remote start is refused
+  before the host is asked anything: whoever stands at a sign-in screen must
+  not be asked to approve what could never run there. The device still
+  advertises that it can record (`available`): that is a capability, and
+  who is at the screen is state. Without it the viewer hides the Record
+  control (P3c-2), so a device at its sign-in screen would show no control
+  and no reason; with it, a start says "… once someone signs in". A
+  **Windows** service never records unattended at all: with nobody signed
+  in, its console shows the sign-in screen, a headless server's included.
+- ⚠️ **On Linux, "no session" is not "no screen"** (`unix::shows_a_screen`,
+  found in review). With no person signed in, a recording is refused unless
+  nothing the recorder could capture is a screen someone might be at. A
+  greeter or root's own desktop always refuses. An `Empty` or `Unknown`
+  seat refuses too whenever the recorder could still reach a real screen
+  (`unix::Reach`): a `DISPLAY` or `WAYLAND_DISPLAY` in the daemon's own
+  environment (an unattended recorder inherits it, and logind may know
+  nothing of that display), or DRM scanout capture (`ROOMLERD_DRM_CAPTURE=1`
+  in a build with `drm-capture`: the physical screen, text console and kiosk
+  included). A host running its **own virtual desktop**
+  (`ROOMLERD_VIRTUAL_DESKTOP=1`) records that display, which only a remote
+  controller ever sees, and the **synthetic** test source (a build with
+  `synthetic-frame-source`, never a release) is no one's screen: both keep
+  the unattended exception whatever the seat says
+  (`virtual_desktop::requested`, now the one copy `main.rs` and the X11
+  indicator ask too; `capture::synthetic_frames_requested`, false in any
+  build without the feature, so a stray variable cannot call a real screen
+  no one's).
 - **The folder is decided by the recorder, as the recorder.** A SYSTEM
   daemon's own "Videos" is SYSTEM's, and its write probe passes where the
   person's would not. So the daemon asks `roomlerd record --where`, launched
@@ -436,24 +476,25 @@ into the daemon's log: a service has no stderr of its own to share.
   secure desktop. The recording holds its last frame, and a lock longer than
   about half a minute ends it `capture_failed` (`recorder.rs`, 300 failed
   pulls). It never records the lock screen itself.
-- **Unattended (P1f): nobody signed in, a REMOTE recording only.** A SYSTEM
-  or root daemon with no one at the screen records a remote session as
-  ITSELF (`Identity::Unattended`), into its own folder: the machine-global
-  `%PROGRAMDATA%` tree on Windows (a protected DACL of SYSTEM and
-  Administrators, since `%PROGRAMDATA%` hands Users read and create), its
-  own data dir elsewhere (0700). The lock is re-applied at every use, a link
-  on the path is refused, and `record_dir` is never used: it is a person's
-  setting, and a service writing into a folder a user can rearrange is what
-  this rule forbids. A LOCAL recording still needs someone at the device.
-  A list and a download search the person's folder (as the person) and the
-  unattended one (as the daemon), so a recording made while nobody was
-  signed in stays reachable after someone does. ⚠️ What an unattended
-  recorder can SEE is a field question (P6): the harness's synthetic source
-  is proven, and so is the path to the file. A Linux host with a virtual
-  display should behave like any X session. A Windows service with nobody
-  signed in sits at the logon desktop, which a recorder in the service's
-  session may not be able to capture. That case ends `no_frame` or
-  `capture_failed`, by name, never silently.
+- **Unattended (P1f): no screen anyone could be at, a REMOTE recording
+  only.** A root daemon running its own virtual desktop (or the synthetic
+  test source), or one with no graphical session and no real screen its
+  recorder could reach (above), records a remote session as ITSELF
+  (`Identity::Unattended`), into its own folder: its own
+  data dir (0700), or on Windows the machine-global `%PROGRAMDATA%` tree (a
+  protected DACL of SYSTEM and Administrators, since `%PROGRAMDATA%` hands
+  Users read and create) — kept, and still searched, though since decision 6
+  no Windows recording starts unattended. The lock is re-applied at every
+  use, a link on the path is refused, and `record_dir` is never used: it is
+  a person's setting, and a service writing into a folder a user can
+  rearrange is what this rule forbids. A LOCAL recording still needs someone
+  at the device. A list and a download search the person's folder (as the
+  person) and the unattended one (as the daemon), so a recording made while
+  nobody was signed in stays reachable after someone does, and while the
+  device sits at a login screen. ⚠️ What an unattended recorder can SEE is a
+  field question (P6): the harness's synthetic source is proven, and so is
+  the path to the file. A Linux host with a virtual display should behave
+  like any X session.
 - Not yet: the drop on macOS (a root daemon there refuses). On a GNOME or
   KDE **Wayland** session a recorder launched into it opens its own
   ScreenCast portal session, so the portal may ask the person first (P0's
@@ -682,6 +723,7 @@ sequenceDiagram
 
     V->>D: rc:record.start {id, audio?}
     D->>D: the owner's switch · a recorder here · audio allowed · not busy
+    Note over D: at a login screen ⇒ refused {login_screen}, before anyone is asked
     alt the session was consented ON THE HOST
         D-->>V: rc:record.state pending_consent
         D->>H: "Alice wants to record this screen" (a FRESH prompt id)
@@ -700,7 +742,8 @@ sequenceDiagram
 |---|---|
 | `not_granted` | the session's grant lacks RECORD |
 | `disabled_on_device` | the owner's switch is off, read at the moment of asking and again after the prompt |
-| `unavailable` | there is nobody to record as (SYSTEM with nobody signed in; a root daemon, P1e), or the session is delegated to the macOS GUI worker |
+| `unavailable` | there is nobody to record as (a root daemon on macOS, P1e; the kill switch), or the session is delegated to the macOS GUI worker |
+| `login_screen` | the device is at its login screen (decision 6): Windows' sign-in screen, a Linux greeter or root's own desktop. Refused before the host is asked; `detail` says it. The device still advertises `available`, and records once someone signs in |
 | `audio_not_allowed` | computer audio was asked for and the owner has not allowed it, or the build has no audio |
 | `busy` | a recording is already running, local or remote |
 | `already_starting` | this session is already starting one |
@@ -728,27 +771,36 @@ else the companion's banner reads "Recording your screen for …" and has a
 is not capture-excluded and appears in the recording. With no surface at all the
 start is refused.
 
-⚠️ **The unattended exception (P1f).** A service with nobody signed in has
-nobody to show a banner to, so there the indicator is skipped: the owner's
-`record_remote_enabled` is what allows it, and the controller is told
-(`unattended: true` on the `recording` state). Someone who signs in is never
-recorded without a banner:
+⚠️ **The unattended exception (P1f).** A service with no screen anyone could
+be at (its own virtual desktop, or no graphical session and no real screen its
+recorder could reach, §6) has nobody to show a banner to, so there the
+indicator is skipped: the owner's `record_remote_enabled` is what allows it,
+and the controller is told (`unattended: true` on the `recording` state).
+Someone who signs in, or a login screen that appears, is never recorded without
+a banner:
 - the identity is decided ONCE, before the indicator is skipped;
-- the manager refuses the launch when it no longer holds (`start_failed`, "who
-  is signed in at the device changed");
-- a recording already running stops `session_changed` the moment someone signs
-  in (checked every second).
+- the manager refuses the launch when it no longer holds: `start_failed` ("who
+  is signed in at the device changed"), or `login_screen` when a login screen
+  came up in between (the refusal travels whole, `StartError::Unavailable`);
+- a recording already running stops `session_changed` the moment the answer
+  is anything but "unattended": someone signed in, or a login screen came up
+  (checked every second).
 
 ⚠️ All three ask the system who is signed in FRESH. Linux caches that answer
 for 5 s for the status polls, and a cached "nobody" read twice within
 milliseconds is one observation: review found the launch re-check a no-op on
 the cache, before the check was made fresh.
-- A host at its **login screen** (a display manager's greeter) counts as
-  nobody, the same answer consent gives; whether recording should treat a
-  greeter as attended is an open decision in the spec.
-- A Windows host whose only user is on **RDP** also counts as nobody at the
-  console. Its session-0 recorder cannot capture that desktop, so it ends
-  `no_frame`.
+
+⚠️ **A login screen is never unattended (decision 6).** A display manager's
+greeter, root's own desktop, and Windows' sign-in screen all show a screen a
+person may be standing at, so a start there is refused `login_screen` (with the
+words), before the host is asked anything — consent still treats a greeter as
+nobody to ask, but recording no longer treats it as nobody to record. A Windows
+service therefore never records unattended: its console shows the sign-in
+screen whenever nobody is signed in, and so does a console left at the sign-in
+screen while its only user works over **RDP**. The device goes on advertising
+that it can record, and the viewer says "the device is at its sign-in screen;
+it can record once someone signs in".
 
 ⚠️ **An older companion.** A companion that predates `record` renders an
 unknown prompt kind as a remote-control request. So a record prompt carries the
@@ -778,7 +830,7 @@ sequenceDiagram
         D->>B: B says "recording", then A's banner comes down
         D-->>V2: rc:record.state {recording, id, name}
         D->>D: rc:recording.activity reattached (on B)
-    else nobody, or the owner's OFF, or a sign-in at an unattended one
+    else nobody, or the owner's OFF, or a sign-in (or a login screen) at an unattended one
         D->>D: stop: session_ended / gate_revoked / session_changed
         D->>B: A's banner comes down
         D->>D: rc:recording.activity stopped (on A)
@@ -797,7 +849,8 @@ sequenceDiagram
   told nothing is recording, and the recording goes on waiting.
 - ⚠️ **The grace still watches.** The owner's OFF stops it `gate_revoked`, and
   an unattended recording still stops `session_changed` the moment someone
-  signs in: P1f's watch runs in the grace as well as in the follower.
+  signs in or a login screen comes up: P1f's watch runs in the grace as well
+  as in the follower.
 - ⚠️ **A session's end is the signalling loop's word first.** The loop knows
   every end and says so (`remote::session_ended`): the server's terminate
   (which also echoes the device's own, from its watchdog) and the control
@@ -1173,6 +1226,7 @@ the music in the preview.
 | `recording::remote` unit tests (P3b-2) | a recording is a controller's only when its sidecar says THAT user started it remotely (not a local one, not another controller's, not one with no or a broken sidecar); the list holds exactly those; a directory, and a link at a recording's name, are never opened (the link case where the OS lets a test make one). ⚠️ The link cell stays green with EITHER layer removed, the `symlink_metadata` pre-check or the no-follow open, because each refuses a link on its own; it is red only with both gone. A green run after deleting one is not evidence that the other is redundant: the pre-check also keeps a FIFO from blocking the handler in `open`, and the no-follow open closes the swap between the check and the open | "Test the recorder (FR-85)" |
 | `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |
 | `tests/control_dc_record.rs`, unattended (P1f); `tests/recorder.rs`; `recording::launch::unix` | a service with nobody signed in refuses a LOCAL start, then records a remote session with NO indicator surface at all (companion down, session unlisted), says `unattended: true`, and writes into the daemon's own folder (0700 on unix), never the person's `record_dir`. When someone signs in, it stops `session_changed` (red without the watch: it ran on, bannerless), and the controller still lists and downloads it. A fresh ask for who is signed in sees a sign-in the 5 s cache would hide (red when `fresh` is ignored). The identity is decided once: a remote start decided unattended is refused when someone is signed in by the time the recorder launches (red without the check) | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`) |
+| `tests/control_dc_record.rs`, a login screen (decision 6); `recording::launch` | a device at its login screen still advertises `available` and `remote`, refuses a local start, and refuses a remote one `login_screen` with the words, reported as a refusal, before the host is asked (no prompt stands), and with nothing at all to show a banner still `login_screen`, never an unattended recording, no file anywhere. An unattended recording stops `session_changed` when a login screen comes up, and at that login screen the controller still lists and downloads it. The decision table: SYSTEM or root at a login screen is `LoginScreen`, someone signed in wins over it, an identity that is not the service's never asks. The Linux seat (from review): any ACTIVE graphical session counts, whoever's, read from `loginctl`'s own output (a greeter, a Wayland greeter; not a text console, not an inactive desktop); a `loginctl` that cannot be asked is `Unknown`, never `Empty`; the whole `shows_a_screen` table (a greeter refuses whatever the recorder could reach; an empty or unknown seat refuses with a `DISPLAY` or DRM; the host's own virtual desktop and the synthetic source never refuse). A login screen found at the launch re-check is `StartError::Unavailable(LoginScreen)`, `login_screen` on the wire. Red, each on its own: the login screen read as nobody (it records unattended), the early refusal removed (the prompt stands), the code folded into `unavailable`, the capability tied to who is signed in (nothing advertised), the watch stopping only for a sign-in (it runs on), the unattended folder listed only while unattended recording is possible (the file leaves the list), the reach ignored, the second walk skipped | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`, `--lib recording::`) |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `a_recorder_being_available_is_not_permission_to_record` (P3c-2); `rc:recording.activity` owned by `remote` | same |
 | `crates/db` (P3a) | `RECORD_REMOTE_SCREEN` is named, inside `ALL`, in no managed row below `ADMINISTRATOR`, and outside `DEFAULT_ADMIN` | same |
 | `crates/modules/fleet` (P3a) | `record_grant`'s table: kept only when the controller may AND the device serves it, each refusal with its reason, a grant without RECORD untouched; P3c-2: a device with no recorder is `device_cannot_record` whoever asks, and the caps words read by equality (`available` alone is not serving, `remote` alone is, `remote-audio` alone is nothing); the hub strips RECORD from the effective grant and names why in `SessionCreated` (no recorder, then not opted in, then served); a coalesced duplicate repeats the reason | "Run fleet module unit tests" |

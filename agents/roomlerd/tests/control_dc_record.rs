@@ -175,6 +175,16 @@ fn a_dropped_unattended_recording_still_stops_when_someone_signs_in() -> Result<
 }
 
 #[test]
+fn a_host_at_its_login_screen_is_refused_by_name_and_never_asked() -> Result<()> {
+    rt().block_on(a_host_at_its_login_screen_is_refused_by_name_and_never_asked_cell())
+}
+
+#[test]
+fn an_unattended_recording_stops_when_a_login_screen_appears() -> Result<()> {
+    rt().block_on(an_unattended_recording_stops_when_a_login_screen_appears_cell())
+}
+
+#[test]
 fn a_question_whose_session_dropped_is_withdrawn() -> Result<()> {
     rt().block_on(a_question_whose_session_dropped_is_withdrawn_cell())
 }
@@ -1385,6 +1395,178 @@ async fn a_dropped_unattended_recording_still_stops_when_someone_signs_in_cell()
             "a detached unattended recording was not stopped for the sign-in"
         );
         let file = s.unattended.join(&name);
+        let _ = std::fs::remove_file(Sidecar::path_for(&file));
+        let _ = std::fs::remove_file(&file);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    s.manager.set_identity(Some(Ok(Identity::Inherit)));
+    outcome
+}
+
+/// FR-85 decision 6 — a device at its LOGIN SCREEN is not "nobody signed
+/// in": someone may be standing at it, and nothing on a sign-in screen can
+/// say a recording runs. So it never records unattended. A start is refused
+/// by its own name, with the words, before anyone is asked (whoever stands at
+/// a sign-in screen must not be asked to approve what could never run), and
+/// with nothing at all to show a banner it is still `login_screen`, never an
+/// unattended recording. The device goes on advertising that it can record:
+/// who is at the screen changes, the capability does not.
+///
+/// Red: the login screen read as "nobody" (it records, unattended); the
+/// early refusal gone (the host is asked first); the code folded into
+/// `unavailable`; the capability tied to who is signed in (no `available`).
+async fn a_host_at_its_login_screen_is_refused_by_name_and_never_asked_cell() -> Result<()> {
+    use roomlerd::recording::launch::{Identity, Refusal};
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    s.manager.set_identity(Some(Err(Refusal::LoginScreen)));
+    let outcome = async {
+        let caps = remote::advertised();
+        assert!(
+            caps.iter().any(|c| c == "available") && caps.iter().any(|c| c == "remote"),
+            "a device at its login screen stopped advertising it can record: {caps:?}"
+        );
+
+        // A local start: nobody there to ask for one either.
+        match s
+            .manager
+            .start(tunnel_core::localapi::RecordStartOpts::default())
+            .await
+        {
+            tunnel_core::localapi::Response::Error { message } => assert!(
+                message.contains("sign-in screen") || message.contains("login screen"),
+                "{message}"
+            ),
+            other => panic!("a local recording started at a login screen: {other:?}"),
+        }
+
+        let before = (mp4s(&s.out).len(), mp4s(&s.unattended).len());
+
+        // A session consented on the host: refused before the question.
+        let mut r = rig(Opts {
+            prompt_window: Some(Duration::from_secs(20)),
+            ..Default::default()
+        })
+        .await?;
+        r.send(json!({"t": "rc:record.start", "id": "ls1"})).await?;
+        let v = r.state(START).await?;
+        assert_eq!(
+            (v["id"].as_str(), v["state"].as_str(), v["reason"].as_str()),
+            (Some("ls1"), Some("refused"), Some("login_screen")),
+            "{v}"
+        );
+        let detail = v["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("screen") && detail.contains("record"),
+            "the refusal carries no words: {v}"
+        );
+        let asked = std::fs::read_dir(r.broker.sentinel_dir())
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.path().extension().is_some_and(|x| x == "pending"))
+            })
+            .unwrap_or(false);
+        assert!(
+            !asked,
+            "the person at a sign-in screen was asked to approve"
+        );
+        assert_eq!(
+            r.reports()
+                .into_iter()
+                .map(|(k, why, _)| (k, why))
+                .collect::<Vec<_>>(),
+            vec![(RecordingActivityKind::Refused, Some("login_screen".into()))]
+        );
+
+        // Nothing at all to show a banner: still refused, never unattended.
+        let mut r = rig(Opts {
+            companion: false,
+            listed: false,
+            ..Default::default()
+        })
+        .await?;
+        r.send(json!({"t": "rc:record.start", "id": "ls2"})).await?;
+        let v = r.state(START).await?;
+        assert_eq!(
+            (v["state"].as_str(), v["reason"].as_str()),
+            (Some("refused"), Some("login_screen")),
+            "a login screen recorded as if nobody were there: {v}"
+        );
+        assert!(v.get("unattended").is_none(), "{v}");
+        assert!(!s.manager.state().active, "a recorder is running anyway");
+        assert!(!r.banner_says_recording());
+        assert_eq!(
+            (mp4s(&s.out).len(), mp4s(&s.unattended).len()),
+            before,
+            "a refused start wrote a file"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    s.manager.set_identity(Some(Ok(Identity::Inherit)));
+    outcome
+}
+
+/// FR-85 decision 6 — an UNATTENDED recording (nobody at any screen) ends
+/// `session_changed` the moment the device shows a login screen: it has one
+/// to show now, and someone may be at it. What it recorded stays its
+/// controller's: listed and downloadable while the device sits at that login
+/// screen, where nothing new can be recorded.
+///
+/// Red: the watch stopping only for a SIGN-IN (it runs on, bannerless, in
+/// front of the login screen); the unattended folder listed only while the
+/// device could record unattended (the file vanishes from the list).
+async fn an_unattended_recording_stops_when_a_login_screen_appears_cell() -> Result<()> {
+    use roomlerd::recording::launch::{Identity, Refusal};
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    s.manager.set_identity(Some(Err(Refusal::NoConsoleUser)));
+    let outcome = async {
+        let mut r = rig(Opts {
+            companion: false,
+            listed: false,
+            ..Default::default()
+        })
+        .await?;
+        r.send(json!({"t": "rc:record.start", "id": "lu1"})).await?;
+        let v = r.state(START).await?;
+        assert_eq!(
+            (v["state"].as_str(), v["unattended"].as_bool()),
+            (Some("recording"), Some(true)),
+            "{v}"
+        );
+        let name = v["name"].as_str().expect("a file name").to_string();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(s.manager.state().active, "it stopped on its own");
+
+        // The device's display manager puts up its login screen.
+        s.manager.set_identity(Some(Err(Refusal::LoginScreen)));
+        let v = r.until_not_recording(STOP).await?;
+        assert_eq!(
+            (v["state"].as_str(), v["reason"].as_str()),
+            (Some("stopped"), Some("session_changed")),
+            "an unattended recording ran on in front of a login screen: {v}"
+        );
+
+        let file = s.unattended.join(&name);
+        assert!(file.is_file(), "{} missing", file.display());
+        r.send(json!({"t": "rc:record.list", "id": "lul"})).await?;
+        let v = r.next_of("rc:record.list", START).await?;
+        assert!(
+            v["items"]
+                .as_array()
+                .is_some_and(|i| i.iter().any(|i| i["name"] == name.as_str())),
+            "at the login screen the controller's recording is gone from its list: {v}"
+        );
+        let on_disk = std::fs::read(&file)?;
+        let (_, got, _) = r.download(&name, 0).await?.expect("the download");
+        assert!(got == on_disk, "the download differs from the file");
+
         let _ = std::fs::remove_file(Sidecar::path_for(&file));
         let _ = std::fs::remove_file(&file);
         Ok::<(), anyhow::Error>(())
