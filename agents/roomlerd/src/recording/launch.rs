@@ -59,6 +59,8 @@ pub enum Refusal {
     /// root on Linux or macOS: launching the recorder as the person at the
     /// screen is built on Windows first.
     RootDaemon,
+    /// `ROOMLERD_RECORDING=0`: the device's own kill switch.
+    SwitchedOff,
 }
 
 impl Refusal {
@@ -76,8 +78,25 @@ impl Refusal {
                  the screen is not built here yet (FR-85 P1e covers Windows): run `roomlerd \
                  record` in your own session"
             }
+            Self::SwitchedOff => {
+                "recording is switched off on this device (ROOMLERD_RECORDING=0 in the \
+                 service's environment)"
+            }
         }
     }
+}
+
+/// `ROOMLERD_RECORDING` switches recording off with `0`, `false`, `off` or
+/// `no`, in any case. Anything else, unset included, leaves it on: a
+/// misspelt value must not quietly disable a feature someone relies on, and
+/// the gates that keep it closed by default are elsewhere.
+pub fn switched_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// What the decision reads. Split out so its table is a unit test on every
@@ -1340,6 +1359,24 @@ mod tests {
             decide_from(f(false, true, false, None)),
             Err(Refusal::RootDaemon)
         );
+    }
+
+    #[test]
+    fn the_kill_switch_reads_only_an_explicit_off() {
+        for off in ["0", "false", "OFF", " no ", "False"] {
+            assert!(switched_off(Some(off)), "{off:?}");
+        }
+        // Unset, empty, on, or a typo: recording stays as its gates say.
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("of"),
+            Some("disable"),
+        ] {
+            assert!(!switched_off(on), "{on:?}");
+        }
     }
 
     /// A test run is an ordinary account or an elevated one, never SYSTEM

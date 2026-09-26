@@ -523,9 +523,15 @@ viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundatio
 # `src/audio/`.
 audio = ["dep:audiopus", "dep:cpal"]
 # FR-85 — HQ screen recording: the `roomlerd record` child (own capturer, CFR
-# pacer, recording encoder profile, fragmented MP4 + remux on stop). Kept OUT
-# of `full` until the local surfaces land (P2), so no release build carries it
-# yet; CI enables it explicitly for the `recorder` test binary.
+# pacer, recording encoder profile, fragmented MP4 + remux on stop), the local
+# verbs, and the device's half of remote recording.
+#
+# ⚠️ In `full`, and so in every release build, with every gate CLOSED: a local
+# recording starts only when the person at the device presses Record, and a
+# remote one only once the device's owner switches `record_remote_enabled` on
+# (default off) AND the controller holds `RECORD_REMOTE_SCREEN`. The recorder
+# runs as that person at normal integrity (P1e). `ROOMLERD_RECORDING=0`
+# switches the whole surface off without a rebuild.
 recording = ["dep:mp4-atom"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
@@ -561,7 +567,7 @@ portal-capture = ["dep:zbus"]
 # `drm-capture`.
 uinput-input = []
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]

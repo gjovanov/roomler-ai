@@ -636,6 +636,21 @@ jobs:
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
         run: cargo check -p roomlerd --bins --features scrap-capture
 
+      # FR-85 — `recording` joined `full`, which the macOS release builds.
+      # Without this step the recorder's macOS arms (the unix identity rule,
+      # the Movies folder, the microphone refusal, the `record` subcommand in
+      # main.rs) would compile for the first time at TAG time: the class this
+      # job exists for. `full` itself, as the release builds it (less the
+      # vendored FFmpeg and libvpx), so what is checked is what ships.
+      - name: cargo check agent with the release feature set (FR-85 — `full`, recording included)
+        # `full` carries `audio`, and audiopus_sys builds its bundled libopus
+        # with CMake, whose CMakeLists declares a minimum below 3.5 that
+        # current CMake refuses. The release builds set the same variable on
+        # every platform; the first run of this step failed on exactly that.
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo check -p roomlerd --lib --bins --features full
+
       # The desktop companion ships on macOS from rc.455 and owns the
       # permissions panel — the one surface that tells an operator why their
       # remote screen is blank. Its macOS arms (the TCC probes, `open` for the
