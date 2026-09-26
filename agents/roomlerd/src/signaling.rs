@@ -3349,9 +3349,13 @@ async fn handle_server_msg(
             }
             info!(?pin, "rc:agent.update — operator-triggered self-update");
             if !crate::updater::request_update_now(pin) {
+                // Name the config key as well as the env var: the field case
+                // (#1689) was `auto_update = false` in config.toml, and an
+                // operator greps for the key they set.
                 warn!(
-                    "update trigger dropped — auto-updater not running \
-                     (ROOMLERD_AUTO_UPDATE=0?) or a trigger is already queued"
+                    "update trigger dropped — auto-update is off on this device \
+                     (auto_update = false / ROOMLERD_AUTO_UPDATE=0), or 4 triggers \
+                     are already queued"
                 );
             }
         }
