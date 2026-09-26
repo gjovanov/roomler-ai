@@ -120,7 +120,7 @@ pub struct RecordingManager {
     state: Arc<StdMutex<RecordingState>>,
     active: Mutex<Option<Active>>,
     /// Set by a test; `None` = decide from this process ([`launch::decide`]).
-    identity_override: Option<Result<Identity, Refusal>>,
+    identity_override: StdMutex<Option<Result<Identity, Refusal>>>,
     /// `ROOMLERD_RECORDING=0`, read once at start like every `ROOMLERD_*`
     /// kill switch: the whole recording surface answers "switched off".
     switched_off: bool,
@@ -133,6 +133,9 @@ pub struct RecordingManager {
     /// FR-85 P3 — the initiator of the most recent start when it was REMOTE
     /// (`None` for a local one). Meaningful only while the state is active.
     remote: StdMutex<Option<RemoteInitiator>>,
+    /// FR-85 P1f — the unattended folder; `None` = the daemon's own
+    /// ([`folder::unattended_default`]). A test points it at a scratch dir.
+    unattended_dir: Option<PathBuf>,
 }
 
 impl RecordingManager {
@@ -142,12 +145,96 @@ impl RecordingManager {
             config_path,
             state: Arc::new(StdMutex::new(RecordingState::default())),
             active: Mutex::new(None),
-            identity_override: None,
+            identity_override: StdMutex::new(None),
             switched_off: launch::switched_off(tunnel_core::env::node_env("RECORDING").as_deref()),
             where_cache: StdMutex::new(None),
             child_env: Vec::new(),
             start_timeout: START_TIMEOUT,
             remote: StdMutex::new(None),
+            unattended_dir: None,
+        }
+    }
+
+    /// FR-85 P1f — the identity a REMOTE recording starts under: as
+    /// [`Self::identity`], except that a service with nobody signed in
+    /// records as itself ([`Identity::Unattended`]) instead of refusing.
+    /// Never for a local recording: that needs someone at the device to ask
+    /// for it. The kill switch still answers first.
+    pub fn identity_remote(&self) -> Result<Identity, Refusal> {
+        match self.identity() {
+            Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
+            other => other,
+        }
+    }
+
+    /// FR-85 P1f — can a REMOTE controller record here (what the device
+    /// advertises, and the remote precheck)?
+    pub fn available_remote(&self) -> bool {
+        self.identity_remote().is_ok()
+    }
+
+    /// FR-85 P1f — point the unattended folder somewhere else (a test's
+    /// scratch dir, never a person's folder).
+    pub fn with_unattended_dir(mut self, dir: PathBuf) -> Self {
+        self.unattended_dir = Some(dir);
+        self
+    }
+
+    /// The unattended folder, created and locked to the service side.
+    fn unattended_folder(&self) -> Result<PathBuf, String> {
+        let dir = self
+            .unattended_dir
+            .clone()
+            .or_else(folder::unattended_default)
+            .ok_or_else(|| "this platform has no folder for an unattended recording".to_string())?;
+        folder::prepare_unattended(&dir).map_err(|e| format!("{e:#}"))?;
+        Ok(dir)
+    }
+
+    /// FR-85 P1f — where a REMOTE controller's recordings can be, and as whom
+    /// each is read: the person's folder, as the person (P1e), when someone
+    /// is signed in; and the unattended folder, as the daemon (only the
+    /// service side can write there), wherever one exists. So a recording
+    /// made while nobody was signed in stays reachable after someone does.
+    pub async fn remote_places(&self) -> Vec<(PathBuf, Identity)> {
+        let mut out = Vec::new();
+        if let Ok(identity) = self.identity()
+            && let Ok(choice) = self.folder_choice().await
+        {
+            out.push((choice.dir, identity));
+        }
+        if self.identity_remote().is_ok() {
+            let dir = self
+                .unattended_dir
+                .clone()
+                .or_else(folder::unattended_default);
+            if let Some(dir) = dir
+                && std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir())
+                && !out.iter().any(|(d, _)| d == &dir)
+            {
+                out.push((dir, Identity::Unattended));
+            }
+        }
+        out
+    }
+
+    /// Run blocking `f` as `identity` on a blocking thread (see
+    /// [`Self::as_user`], which is this for the current identity).
+    pub async fn as_identity<R: Send + 'static>(
+        &self,
+        identity: Identity,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> Option<R> {
+        match tokio::task::spawn_blocking(move || launch::as_identity(identity, f)).await {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "recording: could not act as the recorder's identity");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "recording: the blocking task failed");
+                None
+            }
         }
     }
 
@@ -156,10 +243,34 @@ impl RecordingManager {
     /// comes first, so it answers every path — a local start, a remote one,
     /// what the device advertises, and the listing.
     pub fn identity(&self) -> Result<Identity, Refusal> {
+        self.identity_with(false)
+    }
+
+    /// `fresh`: who is signed in, asked of the system now ([`launch::decide_fresh`]).
+    fn identity_with(&self, fresh: bool) -> Result<Identity, Refusal> {
         if self.switched_off {
             return Err(Refusal::SwitchedOff);
         }
-        self.identity_override.unwrap_or_else(launch::decide)
+        let overridden = *self
+            .identity_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        overridden.unwrap_or_else(if fresh {
+            launch::decide_fresh
+        } else {
+            launch::decide
+        })
+    }
+
+    /// FR-85 P1f — [`Self::identity_remote`], asking the system afresh who is
+    /// signed in: what an unattended start is decided on, what the launch
+    /// re-checks, and what the watch over a running one reads. A cached
+    /// "nobody" read twice is one observation, not two.
+    pub fn identity_remote_fresh(&self) -> Result<Identity, Refusal> {
+        match self.identity_with(true) {
+            Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
+            other => other,
+        }
     }
 
     /// Set the kill switch the way `ROOMLERD_RECORDING=0` would — for the
@@ -213,8 +324,21 @@ impl RecordingManager {
     /// Override the identity decision outright (a test that must exercise a
     /// particular launch).
     pub fn with_identity(mut self, identity: Result<Identity, Refusal>) -> Self {
-        self.identity_override = Some(identity);
+        *self
+            .identity_override
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner()) = Some(identity);
         self
+    }
+
+    /// Switch the identity decision of a manager already in use (`None` =
+    /// decide from this process again) — for a test binary whose one
+    /// process-wide manager serves an attended cell and an unattended one.
+    pub fn set_identity(&self, identity: Option<Result<Identity, Refusal>>) {
+        *self
+            .identity_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = identity;
     }
 
     /// Extra environment for every recorder this manager launches — how a
@@ -273,27 +397,51 @@ impl RecordingManager {
     /// ⚠️ Never the microphone. It is not a parameter here, so no caller can
     /// pass it through: a remote controller switching on a host's microphone
     /// is not a thing this path can express.
+    ///
+    /// FR-85 P1f — `identity` is the one the caller decided its gates under
+    /// ([`Self::identity_remote`]): an unattended start skipped the on-screen
+    /// indicator because nobody was signed in. If that is no longer true when
+    /// the recorder launches (someone signed in meanwhile), the start is
+    /// refused rather than recording a person with no banner.
     pub async fn start_remote(
         &self,
         initiator: RemoteInitiator,
         system_audio: bool,
+        identity: Identity,
     ) -> Result<RecordingState, StartError> {
         let opts = RecordStartOpts {
             system_audio,
             microphone: false,
             ..Default::default()
         };
-        self.start_inner(opts, Some(initiator)).await
+        self.start_inner(opts, Some((initiator, identity))).await
     }
 
     async fn start_inner(
         &self,
         opts: RecordStartOpts,
-        remote: Option<RemoteInitiator>,
+        remote: Option<(RemoteInitiator, Identity)>,
     ) -> Result<RecordingState, StartError> {
-        let identity = self
-            .identity()
-            .map_err(|r| StartError::Unavailable(r.message().into()))?;
+        let (remote, identity) = match remote {
+            Some((initiator, decided)) => {
+                let now = self
+                    .identity_remote_fresh()
+                    .map_err(|r| StartError::Unavailable(r.message().into()))?;
+                if now != decided {
+                    return Err(StartError::Failed(
+                        "who is signed in at the device changed while the recording started; \
+                         ask again"
+                            .into(),
+                    ));
+                }
+                (Some(initiator), now)
+            }
+            None => (
+                None,
+                self.identity()
+                    .map_err(|r| StartError::Unavailable(r.message().into()))?,
+            ),
+        };
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
             && !*a.ended.borrow()
@@ -320,7 +468,16 @@ impl RecordingManager {
             self.config_path.clone().into(),
         ];
         let configured = self.configured_dir();
-        if let Some(dir) = &configured {
+        if identity == Identity::Unattended {
+            // P1f — the daemon's own folder, locked to the service side, and
+            // never `record_dir`: that is a person's setting, and a service
+            // writing into a folder a user can rearrange is what the identity
+            // rule forbids.
+            let dir = self.unattended_folder().map_err(|e| {
+                StartError::Failed(format!("the unattended recordings folder: {e}"))
+            })?;
+            args.extend(["--out".into(), dir.into()]);
+        } else if let Some(dir) = &configured {
             args.extend(["--out".into(), dir.into()]);
         }
         // FR-85 P1c — both default OFF. The child refuses, by name, a source
@@ -439,8 +596,11 @@ impl RecordingManager {
         match outcome {
             Ok(()) if snap.active => {
                 // The recorder just decided its folder, as itself: the
-                // freshest answer a listing could have.
-                if let Some(dir) = snap.path.as_deref().and_then(|p| Path::new(p).parent()) {
+                // freshest answer a listing could have. Not an unattended
+                // one's: that folder is the daemon's, not a person's choice.
+                if identity != Identity::Unattended
+                    && let Some(dir) = snap.path.as_deref().and_then(|p| Path::new(p).parent())
+                {
                     self.remember_folder(
                         identity,
                         configured,
@@ -675,14 +835,7 @@ impl RecordingManager {
         f: impl FnOnce() -> R + Send + 'static,
     ) -> Option<R> {
         let identity = self.identity().ok()?;
-        match tokio::task::spawn_blocking(move || launch::as_identity(identity, f)).await {
-            Ok(Ok(r)) => Some(r),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "recording: could not act as the recorder's identity");
-                None
-            }
-            Err(_) => None,
-        }
+        self.as_identity(identity, f).await
     }
 
     /// The folder recordings go to, and the finished recordings in it.
