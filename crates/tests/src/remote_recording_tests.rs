@@ -9,7 +9,10 @@
 //!    holder of `RECORD_REMOTE_SCREEN` — and ⚠️ never under break-glass;
 //! 2. the device serves it — its caps advertise `record: ["remote"]` (in the
 //!    hello, or re-announced in a heartbeat), which an agent does only while
-//!    its owner's gate is on.
+//!    its owner's gate is on. P3c-2: a device with a recorder whose owner has
+//!    not opted in advertises `available` alone (`device_not_opted_in`); one
+//!    with no recorder advertises nothing (`device_cannot_record`, named
+//!    first, whoever asks: the viewer then shows no Record control).
 //!
 //! Every cell is here, each with the positive control beside it, because a
 //! strip that fires for every request would pass every "refused" cell. And
@@ -214,8 +217,10 @@ async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64
 async fn record_survives_only_for_an_allowed_controller_on_an_opted_in_device() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr85rec1").await;
-    let (serves, _serves_ws) = connect_agent(&app, &seeded, "mach-fr85-serves", &["remote"]).await;
-    let (plain, _plain_ws) = connect_agent(&app, &seeded, "mach-fr85-plain", &[]).await;
+    let (serves, _serves_ws) =
+        connect_agent(&app, &seeded, "mach-fr85-serves", &["available", "remote"]).await;
+    let (plain, _plain_ws) = connect_agent(&app, &seeded, "mach-fr85-plain", &["available"]).await;
+    let (none, _none_ws) = connect_agent(&app, &seeded, "mach-fr85-none", &[]).await;
     let owner = &seeded.admin.access_token;
     let member = &seeded.member.access_token;
 
@@ -231,12 +236,20 @@ async fn record_survives_only_for_an_allowed_controller_on_an_opted_in_device() 
     let a = ask_to_record(&app, owner, &plain, None).await;
     assert!(!a.records(), "{}", a.permissions);
     assert_eq!(a.why.as_deref(), Some("device_not_opted_in"));
+    // P3c-2 — nor on one with no recorder at all, which says so.
+    let a = ask_to_record(&app, owner, &none, None).await;
+    assert!(!a.records(), "{}", a.permissions);
+    assert_eq!(a.why.as_deref(), Some("device_cannot_record"));
 
     // A member who may control but NOT record.
     give_member(&app, &seeded, "controller", REMOTE_CONTROL).await;
     let a = ask_to_record(&app, member, &serves, None).await;
     assert!(!a.records(), "{}", a.permissions);
     assert_eq!(a.why.as_deref(), Some("controller_not_allowed"));
+    // No recorder is named before the controller's own refusal: there is
+    // nothing on that device to allow or refuse.
+    let a = ask_to_record(&app, member, &none, None).await;
+    assert_eq!(a.why.as_deref(), Some("device_cannot_record"));
 
     // The same member, now holding RECORD_REMOTE_SCREEN (the positive control
     // for the cell above: the strip is the permission, not the member).
@@ -324,14 +337,14 @@ async fn ask_until(
 async fn a_heartbeat_opts_a_device_in_and_out_without_a_reconnect() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr85rec4").await;
-    let (agent, mut agent_ws) = connect_agent(&app, &seeded, "mach-fr85-hb", &[]).await;
+    let (agent, mut agent_ws) = connect_agent(&app, &seeded, "mach-fr85-hb", &["available"]).await;
     let owner = &seeded.admin.access_token;
 
     let a = ask_to_record(&app, owner, &agent, None).await;
     assert_eq!(a.why.as_deref(), Some("device_not_opted_in"));
     drop(a);
 
-    heartbeat(&mut agent_ws, Some(&["remote"])).await;
+    heartbeat(&mut agent_ws, Some(&["available", "remote"])).await;
     assert_eq!(
         ask_until(&app, owner, &agent, None).await,
         None,
@@ -349,13 +362,24 @@ async fn a_heartbeat_opts_a_device_in_and_out_without_a_reconnect() {
     );
     drop(a);
 
-    heartbeat(&mut agent_ws, Some(&[])).await;
+    heartbeat(&mut agent_ws, Some(&["available"])).await;
     assert_eq!(
         ask_until(&app, owner, &agent, Some("device_not_opted_in"))
             .await
             .as_deref(),
         Some("device_not_opted_in"),
         "an OFF announced in a heartbeat must reach the hub"
+    );
+
+    // P3c-2 — and a recorder that goes away (`ROOMLERD_RECORDING=0` takes
+    // effect, say) announces nothing at all.
+    heartbeat(&mut agent_ws, Some(&[])).await;
+    assert_eq!(
+        ask_until(&app, owner, &agent, Some("device_cannot_record"))
+            .await
+            .as_deref(),
+        Some("device_cannot_record"),
+        "a device that stops advertising a recorder must read as having none"
     );
 }
 

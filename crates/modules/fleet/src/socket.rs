@@ -21,7 +21,7 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    models::{ConsentMode, RecordCap, RpcCap},
+    models::{ConsentMode, RpcCap},
     signaling::{AgentSysStats, ClientMsg, Owner, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
 };
@@ -135,10 +135,11 @@ pub async fn handle_agent_socket(
     // caller for the answer. Equality-matched through `has_rpc`: `ssh` is a
     // prefix of it, and every pre-FR-83 agent advertises `ssh`.
     let acks_ssh_grants = caps.has_rpc(RpcCap::SshGrantAck);
-    // FR-85 P3 — the agent serves remote recording AND its owner opted in
-    // (it advertises `remote` only while that gate is on). Equality-matched:
-    // `remote` is a prefix of `remote-audio`.
-    let records = caps.has_record(RecordCap::Remote);
+    // FR-85 P3 — whether the agent serves remote recording (it advertises
+    // `remote` only while its owner's gate is on), and P3c-2, whether it has
+    // a recorder at all (`available`). Equality-matched: `remote` is a
+    // prefix of `remote-audio`.
+    let records = crate::hub::RecordSupport::from_caps(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -566,7 +567,7 @@ pub async fn handle_agent_socket(
                                 if let Some(caps) = caps.as_ref() {
                                     state.rc_hub.set_agent_record_support(
                                         agent_id,
-                                        caps.has_record(RecordCap::Remote),
+                                        crate::hub::RecordSupport::from_caps(caps),
                                     );
                                 }
                                 if let Err(e) = state
