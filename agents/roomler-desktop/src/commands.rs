@@ -1291,6 +1291,10 @@ pub struct RestartReport {
     /// [`cmd_restart_wait`] waits for another.
     pub pid: u32,
     pub started_at_ms: u64,
+    /// #1684 — how long the supervisor says the relaunch may take, in seconds
+    /// (systemd: `TimeoutStopSec + RestartSec`); `None` for a non-systemd or
+    /// older daemon. [`cmd_restart_wait`] waits at least this long.
+    pub restart_within_s: Option<u64>,
     /// Refused: the daemon's own reason, shown verbatim.
     pub refusal: Option<String>,
     /// The daemon predates the verb.
@@ -1316,6 +1320,7 @@ pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String>
         exit_code: 0,
         pid: 0,
         started_at_ms: 0,
+        restart_within_s: None,
         refusal: None,
         predates: false,
     };
@@ -1325,8 +1330,9 @@ pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String>
             restart_by,
             exit_code,
             leaving,
+            restart_within_s,
         } => {
-            tracing::info!(%supervisor, %restart_by, exit_code, pid = ?leaving.pid, %reason,
+            tracing::info!(%supervisor, %restart_by, exit_code, pid = ?leaving.pid, restart_within_s, %reason,
                 "restart accepted by the device service");
             report.started = true;
             report.supervisor = supervisor;
@@ -1334,6 +1340,7 @@ pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String>
             report.exit_code = exit_code;
             report.pid = leaving.pid.unwrap_or(0);
             report.started_at_ms = leaving.started_at_ms.unwrap_or(0);
+            report.restart_within_s = restart_within_s;
         }
         localapi::RestartAnswer::Refused(why) => {
             tracing::info!(refusal = %why, "restart refused by the device service");
@@ -1356,17 +1363,23 @@ pub async fn cmd_restart_wait(
     old_pid: u32,
     old_started_at_ms: u64,
     restart_by: String,
+    // #1684 — the supervisor's stop+relaunch bound from `cmd_restart_daemon`'s
+    // report (`None` for a non-systemd/older daemon). Optional so an older
+    // front that omits it still behaves as before. The wait never shortens
+    // below the 60 s floor.
+    restart_within_s: Option<u64>,
 ) -> Result<Option<u32>, String> {
     let start = || async {
         tokio::task::spawn_blocking(run_service_start)
             .await
             .map_err(|e| format!("service start task: {e}"))?
     };
+    let wait = localapi::restart_wait(restart_within_s, std::time::Duration::from_secs(60));
     localapi::wait_for_restart(
         localapi::DaemonInstance::leaving(old_pid, old_started_at_ms),
         restart_by == "caller",
         start,
-        std::time::Duration::from_secs(60),
+        wait,
     )
     .await
     .inspect_err(|why| tracing::warn!(%why, "restart: the device service did not come back"))

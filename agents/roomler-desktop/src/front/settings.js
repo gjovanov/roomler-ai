@@ -158,6 +158,10 @@
       oldPid: r.pid,
       oldStartedAtMs: r.started_at_ms,
       restartBy: r.restart_by,
+      // #1684 — wait as long as the supervisor says the relaunch may take
+      // (systemd: TimeoutStopSec + RestartSec). null/undefined ⇒ the 60 s
+      // floor, i.e. today's behaviour.
+      restartWithinS: r.restart_within_s ?? null,
     });
   }
 

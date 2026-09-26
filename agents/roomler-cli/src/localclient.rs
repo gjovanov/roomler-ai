@@ -1336,13 +1336,14 @@ pub async fn restart(
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let answer = client.restart_daemon(reason).await.map_err(daemon_err)?;
     drop(client);
-    let (supervisor, restart_by, exit_code, leaving) = match answer {
+    let (supervisor, restart_by, exit_code, leaving, restart_within_s) = match answer {
         localapi::RestartAnswer::Accepted {
             supervisor,
             restart_by,
             exit_code,
             leaving,
-        } => (supervisor, restart_by, exit_code, leaving),
+            restart_within_s,
+        } => (supervisor, restart_by, exit_code, leaving, restart_within_s),
         localapi::RestartAnswer::Refused(why) => bail!("the daemon refused to restart: {why}"),
         localapi::RestartAnswer::Unsupported(_) => bail!(
             "this daemon predates `roomler restart` — restart it through its service manager \
@@ -1364,12 +1365,23 @@ pub async fn restart(
     if no_wait {
         return Ok(());
     }
+    // #1684 — wait as long as the supervisor says the relaunch can take (systemd
+    // reports `TimeoutStopSec + RestartSec`), never less than the historic
+    // floor. A SIGTERM-deaf process in the unit's cgroup can push a stop out to
+    // 90 s + `RestartSec`, well past the fixed 60 s that made the verdict lie.
+    let wait = localapi::restart_wait(restart_within_s, RESTART_WAIT);
+    if wait > RESTART_WAIT {
+        println!(
+            "(the service manager may take up to {} s to stop and relaunch; waiting that long)",
+            wait.as_secs()
+        );
+    }
     let started = std::time::Instant::now();
     let start = || {
         let exe = daemon_exe.clone();
         async move { start_daemon_service(exe).await }
     };
-    match localapi::wait_for_restart(leaving, caller_starts, start, RESTART_WAIT).await {
+    match localapi::wait_for_restart(leaving, caller_starts, start, wait).await {
         Ok(pid) => {
             println!(
                 "back: pid {} after {:.1} s",
