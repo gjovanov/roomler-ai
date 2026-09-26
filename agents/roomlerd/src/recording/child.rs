@@ -387,8 +387,9 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
     };
 
     // The recorder's own capturer, at native resolution — never the live
-    // pump's capped rung.
-    let capturer = crate::capture::open_default(opts.fps, crate::capture::DownscalePolicy::Never);
+    // pump's capped rung — and with the pointer in its frames wherever the
+    // backend can draw it (FR-85 P1d).
+    let capturer = crate::capture::open_for_recording(opts.fps);
 
     let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
     let stop_tx = Arc::new(stop_tx);

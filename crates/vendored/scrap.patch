@@ -1,6 +1,22 @@
+diff -ruN --strip-trailing-cr upstream/src/common/dxgi.rs vendored/src/common/dxgi.rs
+--- upstream/src/common/dxgi.rs	2018-01-04 12:35:10.000000000 +0100
++++ vendored/src/common/dxgi.rs	2026-09-26 13:01:42.133413400 +0200
+@@ -68,4 +68,12 @@
+     pub fn height(&self) -> usize {
+         self.0.height() as usize
+     }
++
++    /// ROOMLER PATCH: where this display sits on the virtual desktop, so a
++    /// point in screen coordinates (the mouse pointer) can be placed in its
++    /// frame. See `dxgi::Display::origin`.
++    pub fn origin(&self) -> (i32, i32) {
++        let (x, y) = self.0.origin();
++        (x as i32, y as i32)
++    }
+ }
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-08-26 00:35:05.772337800 +0200
++++ vendored/src/common/quartz.rs	2026-09-26 13:01:42.131800500 +0200
 @@ -9,16 +9,75 @@
  }
  
@@ -119,9 +135,49 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
 +        self.0.pixel_height()
 +    }
  }
+diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11.rs
+--- upstream/src/common/x11.rs	2018-04-08 11:24:21.000000000 +0200
++++ vendored/src/common/x11.rs	2026-09-26 13:01:42.133413400 +0200
+@@ -68,4 +68,13 @@
+     pub fn height(&self) -> usize {
+         self.0.rect().h as usize
+     }
++
++    /// ROOMLER PATCH: where this monitor sits on the X screen, in root-window
++    /// pixels. The capturer reads exactly this rectangle of the root, so a
++    /// point in root coordinates (the mouse pointer) is in the frame at
++    /// `point - origin`. Upstream keeps the rectangle to the capturer.
++    pub fn origin(&self) -> (i32, i32) {
++        let r = self.0.rect();
++        (i32::from(r.x), i32::from(r.y))
++    }
+ }
+diff -ruN --strip-trailing-cr upstream/src/dxgi/mod.rs vendored/src/dxgi/mod.rs
+--- upstream/src/dxgi/mod.rs	2018-04-08 13:02:22.000000000 +0200
++++ vendored/src/dxgi/mod.rs	2026-09-26 13:01:42.125134400 +0200
+@@ -395,6 +395,19 @@
+         self.desc.Rotation
+     }
+ 
++    /// ROOMLER PATCH: the output's top-left on the virtual desktop.
++    ///
++    /// `Displays::new().next()` is the FIRST output DXGI enumerates, not
++    /// necessarily the primary monitor, so it need not sit at (0, 0). Screen
++    /// coordinates (the mouse pointer's, from `GetCursorInfo`) land in this
++    /// output's frame at `point - origin`.
++    pub fn origin(&self) -> (LONG, LONG) {
++        (
++            self.desc.DesktopCoordinates.left,
++            self.desc.DesktopCoordinates.top,
++        )
++    }
++
+     pub fn name(&self) -> &[u16] {
+         let s = &self.desc.DeviceName;
+         let i = s.iter()
 diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
 --- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/display.rs	2026-08-26 00:35:05.840398000 +0200
++++ vendored/src/quartz/display.rs	2026-09-26 13:01:42.127655300 +0200
 @@ -40,6 +40,48 @@
          unsafe { CGDisplayPixelsHigh(self.0) }
      }
@@ -173,7 +229,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz
      }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-08-26 00:35:05.843639300 +0200
++++ vendored/src/quartz/ffi.rs	2026-09-26 13:01:42.127655300 +0200
 @@ -9,6 +9,8 @@
  pub type CFNumberRef = *mut c_void;
  pub type CFStringRef = *mut c_void;
@@ -222,7 +278,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub fn IOSurfaceDecrementUseCount(buffer: IOSurfaceRef);
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-08-26 00:35:05.824054100 +0200
++++ vendored/src/quartz/frame.rs	2026-09-26 13:01:42.128651100 +0200
 @@ -3,7 +3,9 @@
  
  pub struct Frame {

@@ -1,9 +1,9 @@
 # Screen recording
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
-> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
-> its audio on Windows and Linux, and on Windows and Linux the identity
-> rule: it runs as the person at the device, §6), P2a (the local verbs), P2b
+> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core
+> and its mouse pointer, §1; its audio on Windows and Linux; and on Windows
+> and Linux the identity rule: it runs as the person at the device, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
 > P3c (the viewer's Record and Download, §10), P5a (the export engine: cut
@@ -37,9 +37,11 @@ capped by the viewer's rung, so recording it would give transport quality.
 ```mermaid
 flowchart LR
     subgraph child["roomlerd record (its own process)"]
-        CAP["capturer<br/>capture::open_default<br/>(native resolution)"] -->|latest frame wins| W[("watch")]
+        CAP["capturer<br/>capture::open_for_recording<br/>(native resolution, the pointer<br/>in the frame where it can)"] -->|latest frame wins| W[("latest slot")]
         W --> P{{"pacer tick<br/>1/fps on its own clock"}}
         P -->|"same frame again<br/>on a still screen"| ENC["encoder<br/>recording profile"]
+        P -.->|"DXGI, X11: the recorder<br/>draws the pointer"| PTR["PointerLayer"]
+        PTR -.-> ENC
         ENC -->|"Annex-B access units<br/>(TickFifo → PTS)"| FW["FragmentedWriter<br/>moof+mdat per GOP"]
     end
     FW -->|"stop / guard / parent gone"| FIN["finalize<br/>remux → moov-first MP4"]
@@ -50,8 +52,9 @@ flowchart LR
 
 | Stage | Code | Why it is shaped this way |
 |---|---|---|
-| Capture | `recording/recorder.rs` capture task | Its **own** capturer, never a tap on the live pump (`peer.rs`), which is capped by the viewer's rung and is the most-tuned path in the product. A second capturer costs a second WGC session, or one of DXGI's ~4 duplication seats. Only the latest frame is kept, so a slow encoder never backs capture up. |
+| Capture | `recording/recorder.rs` capture task | Its **own** capturer (`capture::open_for_recording`), never a tap on the live pump (`peer.rs`), which is capped by the viewer's rung and is the most-tuned path in the product. A second capturer costs a second WGC session, or one of DXGI's ~4 duplication seats. Only the latest frame is kept, so a slow encoder never backs capture up. |
 | Pacer | `recording/pacer.rs` `Cadence`, `TickFifo` | A backend's `Frame.monotonic_us` has a different origin per backend (wall-clock on the portal), and capture is change-driven. The recorder stamps frames on its own `Instant`, one tick per `1/fps`, and repeats the last frame on a still screen. An encoder that falls behind leaves a gap in tick numbers: the previous frame lasts longer, and the file never runs fast. |
+| Pointer | `capture/pointer.rs`, `recording/pointer.rs` `PointerLayer` | Drawn by the backend where it can. Where it cannot (DXGI, X11), the backend says where the pointer is and the recorder draws it, on the tick rather than on the capture. See [The pointer](#the-pointer-p1d). |
 | Encoder | `encode/openh264_backend.rs` `new_recording` / the H.264 cascade | See §3. |
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
@@ -60,6 +63,69 @@ flowchart LR
 probe, so a driver fault in a recording's encoder costs the recorder, never
 the daemon or a live session. It stops when its stdin closes, so a recorder
 never outlives whatever launched it.
+
+### The pointer (P1d)
+
+The live path keeps the pointer **out** of its frames on purpose. It streams
+the pointer on a channel of its own (`capture/cursor.rs`) and the browser
+draws it, because a pointer baked into video lags by the video's latency. A
+recording has no second channel. So the recorder opens its capturer with
+`capture::open_for_recording`, which asks every backend that can draw the
+pointer to draw it. It then asks the backend once, after the first frame, how
+the pointer gets in (`ScreenCapture::recorded_pointer`), and the sidecar
+keeps the answer (§8).
+
+| Backend | The pointer | Sidecar `pointer` |
+|---|---|---|
+| WGC (Windows' default) | drawn by WGC. The recorder's session has cursor capture on; the live session's stays off unless `ROOMLERD_WGC_CURSOR=1` | `in_frame` |
+| CoreGraphics (macOS) | drawn by WindowServer (`kCGDisplayStreamShowCursor`, a vendored scrap patch that predates this) | `in_frame` |
+| the portal, mutter (Wayland) | drawn by the compositor, where the portal grants an embedded cursor | `in_frame`, or `none` where it offers only a hidden one |
+| DXGI (Windows' fallback) | drawn by the recorder: `GetCursorInfo` for where, the live tracker's decoded bitmap for what, placed by the output's origin on the virtual desktop (DXGI's first output need not be the primary monitor) | `drawn` |
+| X11 | drawn by the recorder: XFixes `GetCursorImage`, placed by the monitor's origin on the root window | `drawn` |
+| DRM, the SystemContext capture | none | `none` |
+
+```mermaid
+sequenceDiagram
+    participant C as capture task
+    participant S as latest slot
+    participant L as recorder loop + PointerLayer
+    participant E as encoder
+    C->>S: a new frame (replaces one not yet taken)
+    loop every 1/fps tick
+        L->>S: take()
+        opt a new frame
+            L->>L: it becomes the canvas, owned, so it is drawn on in place
+        end
+        L->>L: poll the pointer source
+        opt the pointer moved or changed shape
+            L->>L: put back what it covered, draw it at its new place
+        end
+        L->>E: the canvas
+    end
+```
+
+- ⚠️ **Drawn on the tick, not on the capture.** A pointer moving over a still
+  screen produces no new capture: DXGI and X11's damage tracking both report
+  "unchanged". A pointer drawn only on new captures would freeze until
+  something else on screen changed.
+- ⚠️ **The encoder may still hold the previous tick's frame.** The canvas
+  changes through `Arc::make_mut`, so a frame someone else holds is copied
+  first and never written under them. The loop *takes* each new capture from
+  its slot (a `watch` kept a reference, which would have forced that copy on
+  every new frame), so normally the pointer is drawn in place and nothing is
+  copied.
+- ⚠️ **A new capture is never patched with the old one's pixels.** What the
+  pointer covered belongs to the capture it was drawn on, and is dropped with
+  it.
+- A still pointer on a still screen costs nothing: the same frame goes out
+  again.
+- Windows' cursor bitmaps are straight alpha (as the live tracker and the
+  browser treat them) and are premultiplied once per shape. XFixes' are
+  premultiplied already. A malformed pixel saturates rather than wrapping to
+  a dark speck.
+- Owed to the field (P6): DXGI's pointer at a scale factor other than 100 %,
+  an X11 desktop whose primary monitor is not at the root's origin, and a
+  portal that grants only a hidden cursor.
 
 ## 2. The file
 
@@ -449,8 +515,10 @@ flowchart LR
 `remote` with the controller's **user id**, because remote downloads are
 owned by user and not by session id), start and end times, size and fps,
 codec and the backend that encoded it, colour, audio sources, frames,
-late ticks, events, the stop reason, and bytes. ⚠️ **Never content**: no
-window titles, and nothing typed.
+late ticks, events, the stop reason, bytes, and how the pointer got in
+(`in_frame`, `drawn` or `none`, §1; absent from a sidecar written before P1d,
+or rebuilt by the reconciler). ⚠️ **Never content**: no window titles, and
+nothing typed.
 
 ## 9. Audio (P1c)
 
@@ -934,6 +1002,10 @@ the music in the preview.
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
 | `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `recording::pointer` unit tests (P1d) | the pointer lands where the source says and nowhere else; a translucent pixel blends (premultiplied "over"), a transparent one changes nothing, a malformed one saturates; moving it leaves no trail (byte-equal to drawing it once at the new place); hiding it gives the frame back byte for byte; clipped at every edge and never wrapped, wholly outside draws nothing; row padding respected; an unchanged pointer re-uses the same frame; **the frame the encoder still holds is never written** (red when the canvas is written without `make_mut`); a new capture is not patched with the old one's pixels (red when `replace` keeps them), and gets the pointer even when it did not move; a frame that is not BGRA passes untouched; a scaled frame takes the position through the ratio; one poll per frame | "Test the recorder (FR-85)" (`--lib recording::`) |
+| `capture::pointer` unit tests (P1d) | Windows' straight alpha premultiplied, XFixes' words read as B, G, R, A; a short or absurd image refused, never read past; the hotspot and the display's origin both taken off, a monitor left of the primary included. Windows only: a recording's WGC session draws the pointer, the live one only under `ROOMLERD_WGC_CURSOR=1` | every unfiltered `--lib` run ("Test agent under vp9-444"); the WGC cell in "Windows recorder identity (FR-85)", which also compiles and lints the Windows capture code (WGC, DXGI, the cursor tracker) that no other lane builds |
+| `capture::pointer::x11_tests` (P1d) | against a real X server: the pointer warped to a known place reads back there less its hotspot, and less a monitor's origin; it follows a second warp; an unchanged shape is not rebuilt | `ci.yml` "The recorder's pointer on X11 (FR-85 P1d)", under Xvfb. `ROOMLERD_TEST_X11=1` makes a missing server a failure, never a skip |
+| `tests/recorder.rs`, the pointer (P1d) | a "backend" that cannot draw the pointer hands the recorder a source: a 32×32 white square at A for the first half of the recording, at B after, and the screen goes **still** well before it moves. Decoded back, the first frame has it at A and nowhere else, it reaches B over the still screen, no frame has both (no trail), and once at B it stays there; the sidecar says `drawn`. The plain counter recording's sidecar says `none`. Red with the layer bypassed, and with the covered pixels never put back. ⚠️ Over a CHANGING screen the put-back cell stayed green (every tick brought a fresh capture that hid the trail), which is why the screen goes still | "Test the recorder (FR-85)", `--test recorder` |
 | `recording::edit` unit tests (P5a) | the keep / cut / 4× / keep list maps every output frame to exactly the frame the oracle expects; keeping everything is the identity (the control); an hour at 1.5× lands on the frame integer arithmetic says, no drift; what follows the last segment is kept and a long list is clipped; a bad list is refused by name (version, no segments, not from 0, a gap, an empty segment, nothing kept); speeds are 1.25–16 in quarter steps (NaN, infinity, 1×, 17× refused); the file reads as written | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `tests/export.rs` (P5a) | a recording whose every frame paints its own index, exported keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s, decodes to exactly `0..59, 120, 124 … 236, 240..299` (150 frames, 5 s, moov first, the recording byte-identical); the same comparison against the unedited source fails (the oracle discriminates); keeping everything reproduces the recording frame for frame; a cancelled export and one that keeps nothing leave no file and nothing staged; the real `roomlerd media probe` / `export` process (a cut plus 2× shows frames 30, 32 … 58, the `done` event says `audio: none`, the recording being silent), and a list naming `../elsewhere.mp4` is refused `bad_edit_list`. Red, each on its own cell: the map ignoring speed, the frame choice off by one, the cancel check removed, the name check removed | same step, `--test export` |
 | `recording::edit` and `recording::export_audio` unit tests (P5b) | the sound of keep / cut / 4× / keep: the kept stretches play from their own source sample, the speed-up is muted, the cut is gone, and the sound is exactly as long as the picture; a volume is 0 to 1 (1.5, NaN and −0.1 refused by name; 0 is a volume, the recording muted), and music needs a file; music defaults to half volume and looping, and an absent `original_volume` means as recorded; the music's gain is silent before its start, ramps in from it, and ramps out to the export's end; a music time too large to count in samples saturates instead of wrapping to an early start | "Test the recorder (FR-85)" (`--lib recording::`; `export_audio`'s in the `audio` run) |

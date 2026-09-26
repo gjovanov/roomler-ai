@@ -1306,6 +1306,7 @@ mod tests {
                 events: Vec::new(),
                 stop_reason: None,
                 bytes: 17,
+                pointer: None,
             };
             std::fs::write(Sidecar::path_for(&path), sc.to_json()).unwrap();
         }
