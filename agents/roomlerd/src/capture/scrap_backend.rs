@@ -67,6 +67,33 @@ pub struct ScrapCapture {
     /// FR-29 — frames the damage tracker proved were unnecessary. Shared with
     /// the worker; surfaced through `ScreenCapture::frames_unchanged`.
     unchanged: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// FR-85 P1d — the captured display's top-left in screen coordinates
+    /// (the virtual desktop on Windows, the root window on X11), where a
+    /// recording places the pointer. Unused on macOS, which draws its own,
+    /// and in a Windows build without the cursor tracker (`mf-encoder`).
+    #[cfg_attr(
+        any(
+            target_os = "macos",
+            all(target_os = "windows", not(feature = "mf-encoder"))
+        ),
+        allow(dead_code)
+    )]
+    origin: (i32, i32),
+}
+
+/// FR-85 P1d — where a display sits in screen coordinates. DXGI's first
+/// output need not be the primary monitor, and an X11 monitor is a rectangle
+/// of the root window, so neither is assumed to be at (0, 0).
+#[cfg(not(target_os = "macos"))]
+fn display_origin(d: &Display) -> (i32, i32) {
+    d.origin()
+}
+
+/// macOS: CoreGraphics draws the pointer into the frame itself, so the
+/// origin is never used.
+#[cfg(target_os = "macos")]
+fn display_origin(_d: &Display) -> (i32, i32) {
+    (0, 0)
 }
 
 impl ScrapCapture {
@@ -88,7 +115,7 @@ impl ScrapCapture {
         // Build the Capturer on the worker thread so it never crosses
         // thread boundaries; use a ready-ack channel to surface any
         // init failure back to the caller synchronously.
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
+        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32, (i32, i32))>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
         // FR-29 — counted on the worker, read by the pump's heartbeat. Kept
         // separate from `frames_empty` so "idle screen, working as intended"
@@ -110,6 +137,9 @@ impl ScrapCapture {
                         Ok(d) => d,
                         Err(e) => break Err(anyhow!("no primary display: {e}")),
                     };
+                    // FR-85 P1d — read before the capturer consumes the
+                    // display: where the pointer's screen coordinates land.
+                    let origin = display_origin(&display);
                     match Capturer::new(display) {
                         // Dims come from the CAPTURER, never the Display.
                         //
@@ -125,7 +155,7 @@ impl ScrapCapture {
                         Ok(cap) => {
                             let w = cap.width() as u32;
                             let h = cap.height() as u32;
-                            break Ok((cap, w, h));
+                            break Ok((cap, w, h, origin));
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::PermissionDenied
@@ -144,9 +174,9 @@ impl ScrapCapture {
                     }
                 };
                 #[allow(unused_mut)]
-                let (mut cap, mut w, mut h) = match init_outcome {
+                let (mut cap, mut w, mut h, _origin) = match init_outcome {
                     Ok(v) => {
-                        let _ = ready_tx.send(Ok((v.1, v.2)));
+                        let _ = ready_tx.send(Ok((v.1, v.2, v.3)));
                         v
                     }
                     Err(e) => {
@@ -310,7 +340,7 @@ impl ScrapCapture {
             })
             .context("spawning capture thread")?;
 
-        let (width, height) = ready_rx
+        let (width, height, origin) = ready_rx
             .recv()
             .context("capture thread never responded")??;
 
@@ -323,6 +353,7 @@ impl ScrapCapture {
             last_frame_at: None,
             desired,
             unchanged,
+            origin,
         })
     }
 
@@ -495,6 +526,35 @@ impl ScreenCapture for ScrapCapture {
         Display::all()
             .map(|v| v.len().min(u8::MAX as usize) as u8)
             .unwrap_or(1)
+    }
+
+    /// FR-85 P1d. CoreGraphics draws the pointer (the vendored scrap patch
+    /// asks for `kCGDisplayStreamShowCursor`); DXGI and XShm hand back the
+    /// framebuffer without it, so there the recorder draws it.
+    fn recorded_pointer(&mut self) -> super::pointer::RecordedPointer {
+        use super::pointer::RecordedPointer;
+        #[cfg(target_os = "macos")]
+        {
+            RecordedPointer::InFrame
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match super::pointer::X11Pointer::open(self.origin) {
+                Some(p) => RecordedPointer::Drawn(Box::new(p)),
+                None => RecordedPointer::Absent,
+            }
+        }
+        #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+        {
+            RecordedPointer::Drawn(Box::new(super::pointer::WindowsPointer::new(self.origin)))
+        }
+        #[cfg(any(
+            all(target_os = "windows", not(feature = "mf-encoder")),
+            not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+        ))]
+        {
+            RecordedPointer::Absent
+        }
     }
 }
 

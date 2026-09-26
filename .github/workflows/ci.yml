@@ -508,6 +508,10 @@ jobs:
         # speed-up, and music looped, faded and mixed under it. Without
         # `audio` the same binary proves a recording's sound is reported
         # `not_carried`, never dropped in silence.
+        #
+        # FR-85 P1d — `recorder` again: a pointer the "backend" cannot draw is
+        # drawn by the recorder, decoded back where the source said, with no
+        # trail when it moves; `recording::pointer` holds the layer's units.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
@@ -529,6 +533,19 @@ jobs:
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/p1eu.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" recording::launch
+
+      - name: The recorder's pointer on X11 (FR-85 P1d) — XFixes against a real X server
+        # FR-85 P1d. XShm frames carry no pointer, so on X11 the recorder
+        # draws it, from XFixes `GetCursorImage` placed by the monitor's origin
+        # on the root window. A unit test cannot fake a server's answer, so
+        # this one runs against Xvfb: the pointer warped to a known place
+        # reads back there, less its hotspot and less a monitor's origin.
+        # ROOMLERD_TEST_X11 turns a missing server into a failure: the step
+        # cannot pass by running nothing.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb xauth
+          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture --lib capture::pointer -- --nocapture
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
@@ -820,6 +837,17 @@ jobs:
       - name: The identity rule — the recorder launched as the person, end to end
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder -- process::an_elevated process::the_manager_records_as_the_person --nocapture
+      # FR-85 P1d — the pointer's Windows half sits in code no lane compiled:
+      # WGC, the live cursor tracker and scrap's DXGI path are built only by
+      # release-agent.yml, at tag time. `wgc-capture`, `mf-encoder` and
+      # `scrap-capture` bring them in. The units: a recording's WGC session
+      # draws the pointer and the live one does not (unless
+      # ROOMLERD_WGC_CURSOR=1), and the pointer's placement.
+      - name: The recorder's pointer — Windows capture compiles, lints, and its units pass
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
 
   ffmpeg-encoder-check:
     # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored

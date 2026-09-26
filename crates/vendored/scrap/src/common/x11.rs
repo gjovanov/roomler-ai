@@ -68,4 +68,13 @@ impl Display {
     pub fn height(&self) -> usize {
         self.0.rect().h as usize
     }
+
+    /// ROOMLER PATCH: where this monitor sits on the X screen, in root-window
+    /// pixels. The capturer reads exactly this rectangle of the root, so a
+    /// point in root coordinates (the mouse pointer) is in the frame at
+    /// `point - origin`. Upstream keeps the rectangle to the capturer.
+    pub fn origin(&self) -> (i32, i32) {
+        let r = self.0.rect();
+        (i32::from(r.x), i32::from(r.y))
+    }
 }
