@@ -1565,6 +1565,14 @@ pub enum Response {
         /// When it started ([`NodeStatus::started_at_ms`]).
         #[serde(default)]
         started_at_ms: u64,
+        /// #1684 — how long, in seconds, a stop + relaunch of this daemon may
+        /// take, as its supervisor reports it (systemd: `TimeoutStopSec +
+        /// RestartSec`). A caller waits at LEAST this long before giving up, so
+        /// a SIGTERM-deaf process in the unit's cgroup can't make the verdict
+        /// lie. Additive: absent from an older daemon (and every non-systemd
+        /// supervisor), where the caller keeps its own fixed wait.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restart_within_s: Option<u64>,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -3452,6 +3460,10 @@ pub enum RestartAnswer {
         restart_by: String,
         exit_code: i32,
         leaving: DaemonInstance,
+        /// #1684 — the supervisor's own bound on how long the relaunch may
+        /// take, in seconds; `None` when unknown (an older daemon, or a
+        /// non-systemd supervisor). A caller waits at least this long.
+        restart_within_s: Option<u64>,
     },
     /// Refused, with the daemon's own reason (shown verbatim).
     Refused(String),
@@ -3516,11 +3528,13 @@ impl RestartAnswer {
                 exit_code,
                 pid,
                 started_at_ms,
+                restart_within_s,
             } => RestartAnswer::Accepted {
                 supervisor,
                 restart_by,
                 exit_code,
                 leaving: DaemonInstance::leaving(pid, started_at_ms),
+                restart_within_s,
             },
             Response::Error { message } if is_unknown_verb(&message) => {
                 RestartAnswer::Unsupported(message)
@@ -3536,6 +3550,33 @@ impl RestartAnswer {
 /// message in a client keys on this, and only this.
 pub fn is_unknown_verb(message: &str) -> bool {
     message.contains("unknown variant")
+}
+
+/// #1684 — margin added to the supervisor's own stop+relaunch bound
+/// ([`Response::DaemonRestarting::restart_within_s`]) before a caller gives up:
+/// the bound covers `TimeoutStopSec + RestartSec`, after which the relaunched
+/// daemon still has to boot and open its LocalAPI. Success returns the instant
+/// a new daemon answers, so this only moves the give-up point.
+pub const RESTART_WAIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// #1684 — the most a caller will ever wait, whatever the supervisor reports: a
+/// unit with `TimeoutStopSec=1h` must not turn `roomler restart` into an
+/// hour-long hang.
+pub const RESTART_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// #1684 — how long a caller should wait for the relaunched daemon: at least
+/// `floor` (the historic fixed wait, so a wait never SHORTENS), and at least
+/// the supervisor's reported bound plus [`RESTART_WAIT_MARGIN`], capped at
+/// [`RESTART_WAIT_CAP`]. `hint` is `Response::DaemonRestarting::restart_within_s`
+/// — `None` (an older daemon, or a non-systemd supervisor) keeps `floor`.
+pub fn restart_wait(hint: Option<u64>, floor: std::time::Duration) -> std::time::Duration {
+    let want = match hint {
+        Some(secs) => {
+            floor.max(std::time::Duration::from_secs(secs).saturating_add(RESTART_WAIT_MARGIN))
+        }
+        None => floor,
+    };
+    want.min(RESTART_WAIT_CAP)
 }
 
 /// FR-84 D3 — how often a caller waiting out a restart polls `Status`.
@@ -4289,13 +4330,35 @@ mod tests {
             exit_code: 9,
             pid: 4242,
             started_at_ms: 1_700_000_000_000,
+            restart_within_s: None,
         };
         let wire = serde_json::to_string(&resp).unwrap();
+        // #1684 — `restart_within_s` is additive: absent (skipped) when `None`,
+        // so the wire an older client parses is byte-identical.
         assert_eq!(
             wire,
             r#"{"t":"daemon_restarting","d":{"supervisor":"systemd","restart_by":"supervisor","exit_code":9,"pid":4242,"started_at_ms":1700000000000}}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), resp);
+        // Present when known, and it round-trips. (Built explicitly — `..base`
+        // record-update syntax is not allowed on an enum variant.)
+        let with_hint = Response::DaemonRestarting {
+            supervisor: "systemd".into(),
+            restart_by: "supervisor".into(),
+            exit_code: 9,
+            pid: 4242,
+            started_at_ms: 1_700_000_000_000,
+            restart_within_s: Some(95),
+        };
+        let wire_hint = serde_json::to_string(&with_hint).unwrap();
+        assert!(
+            wire_hint.contains(r#""restart_within_s":95"#),
+            "{wire_hint}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&wire_hint).unwrap(),
+            with_hint
+        );
         assert!(matches!(
             serde_json::from_str::<Response>(
                 r#"{"t":"daemon_restarting","d":{"supervisor":"scm","restart_by":"supervisor","exit_code":0}}"#
@@ -4304,6 +4367,7 @@ mod tests {
             Response::DaemonRestarting {
                 pid: 0,
                 started_at_ms: 0,
+                restart_within_s: None,
                 ..
             }
         ));
@@ -4340,11 +4404,34 @@ mod tests {
     fn restart_answer_classifies_accept_refuse_and_old_daemon() {
         assert_eq!(
             RestartAnswer::from_response(Response::DaemonRestarting {
+                supervisor: "systemd".into(),
+                restart_by: "supervisor".into(),
+                exit_code: 9,
+                pid: 11,
+                started_at_ms: 22,
+                restart_within_s: Some(95),
+            }),
+            RestartAnswer::Accepted {
+                supervisor: "systemd".into(),
+                restart_by: "supervisor".into(),
+                exit_code: 9,
+                leaving: DaemonInstance {
+                    pid: Some(11),
+                    started_at_ms: Some(22),
+                },
+                restart_within_s: Some(95),
+            }
+        );
+        // A non-systemd (or older) daemon carries no bound; the caller keeps
+        // its floor.
+        assert_eq!(
+            RestartAnswer::from_response(Response::DaemonRestarting {
                 supervisor: "task".into(),
                 restart_by: "caller".into(),
                 exit_code: 9,
                 pid: 11,
                 started_at_ms: 22,
+                restart_within_s: None,
             }),
             RestartAnswer::Accepted {
                 supervisor: "task".into(),
@@ -4354,8 +4441,22 @@ mod tests {
                     pid: Some(11),
                     started_at_ms: Some(22),
                 },
+                restart_within_s: None,
             }
         );
+        // The wait follows the bound, and never shortens below the floor.
+        let floor = std::time::Duration::from_secs(60);
+        assert_eq!(restart_wait(None, floor), floor);
+        assert_eq!(restart_wait(Some(10), floor), floor); // 10+15 < 60
+        assert_eq!(
+            restart_wait(Some(95), floor),
+            std::time::Duration::from_secs(95) + RESTART_WAIT_MARGIN
+        );
+        // …and never past the cap: a unit with TimeoutStopSec=1h must not turn
+        // `roomler restart` into an hour-long hang.
+        assert!(RESTART_WAIT_CAP > std::time::Duration::from_secs(95) + RESTART_WAIT_MARGIN);
+        assert_eq!(restart_wait(Some(3600), floor), RESTART_WAIT_CAP);
+        assert_eq!(restart_wait(Some(u64::MAX), floor), RESTART_WAIT_CAP);
         let refusal = "restarting from this device is turned off (local_restart_enabled = false)";
         assert_eq!(
             RestartAnswer::from_response(Response::Error {
@@ -4485,6 +4586,7 @@ mod tests {
                     exit_code: 0,
                     pid: 1,
                     started_at_ms: 2,
+                    restart_within_s: None,
                 }
             } else {
                 Response::Error {
