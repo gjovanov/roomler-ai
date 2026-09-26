@@ -1757,22 +1757,24 @@ const AGENT_STATE_RUNS: &[&[&str]] = &[
 const AGENT_STATE_RUNS: &[&[&str]] = &[
     &["etc", "roomler"],
     &["library", "application support", "live.roomler.roomler"],
+    &["library", "caches", "live.roomler.roomler"],
+    // RETIRED-NAME-ANCHOR(4): a pre-rename Mac keeps its state (its config included) in the old segment's folder.
     &[
         "library",
         "application support",
         "live.roomler.roomler-agent",
     ],
-    &["library", "caches", "live.roomler.roomler"],
     &["var", "log", "roomler"],
 ];
 #[cfg(all(unix, not(target_os = "macos")))]
 const AGENT_STATE_RUNS: &[&[&str]] = &[
     &["etc", "roomler"],
     &[".config", "roomler"],
-    &[".config", "roomler-agent"],
     &[".local", "share", "roomler"],
-    &[".local", "share", "roomler-agent"],
     &[".local", "state", "roomler"],
+    // RETIRED-NAME-ANCHOR(2): a pre-rename host keeps its config and data in the old segment's trees.
+    &[".config", "roomler-agent"],
+    &[".local", "share", "roomler-agent"],
     &[".cache", "roomler"],
     &["var", "log", "roomler"],
 ];
@@ -2885,7 +2887,7 @@ mod tests {
     /// platform, with a stand-in config holding a marker "secret".
     fn agent_state_fixture(tag: &str) -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!(
-            "roomler-agentstate-{tag}-{}",
+            "roomler-statefixture-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -2921,7 +2923,7 @@ mod tests {
         {
             for p in [
                 r"C:\ProgramData\roomler\roomler\config.toml",
-                r"\\?\C:\PROGRAMDATA\Roomler\roomler-agent\service-logs\x.log",
+                r"\\?\C:\PROGRAMDATA\Roomler\ROOMLER\service-logs\x.log",
                 r"C:\Users\u\AppData\Roaming\roomler\roomler\config\config.toml",
                 r"C:\Users\u\AppData\Local\roomler\roomler\data\desktop\desktop.log",
             ] {
