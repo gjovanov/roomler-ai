@@ -1729,7 +1729,7 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
 
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
-fn daemon_unreachable(e: std::io::Error) -> String {
+pub(crate) fn daemon_unreachable(e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         "device service not running".to_string()
     } else {
@@ -1818,7 +1818,7 @@ fn recording_unsupported(message: &str) -> bool {
 
 /// The daemon's words, minus the transport prefix; an old service's
 /// "unknown variant" becomes a sentence a person can act on.
-fn explain_recording_error(message: &str) -> String {
+pub(crate) fn explain_recording_error(message: &str) -> String {
     if message.contains("unknown variant") {
         return "The device service predates screen recording — update it, then try again."
             .to_string();
@@ -1960,7 +1960,7 @@ pub async fn cmd_recording_delete(name: String) -> Result<(), String> {
 /// A recording's file name from the page: a bare `*.mp4` name, nothing
 /// that could leave the folder. The daemon checks the same rule before a
 /// delete; opening a file is the companion's own act, so it checks here.
-fn check_recording_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_recording_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.contains(['/', '\\', ':'])
         || name.contains("..")
@@ -2317,7 +2317,7 @@ fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
 /// spawning the console-mode `roomlerd` pops a console each time — and
 /// `cmd_status` polls the service state every 10 s, so without this the tray
 /// flashes a terminal every 10 s. No-op on non-Windows.
-fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
@@ -2424,7 +2424,7 @@ fn classify_service_state(task: Option<&str>, scm: Option<&str>) -> (String, boo
 /// still resolves), then finally the bare new name relying on PATH.
 // RETIRED-NAME-ANCHOR(5): the legacy pair is the fallback that lets a mixed or
 // in-flight install still resolve a daemon. See docs/fr/FR-21.
-fn agent_exe_path() -> Result<PathBuf, String> {
+pub(crate) fn agent_exe_path() -> Result<PathBuf, String> {
     let (new_name, old_name) = if cfg!(windows) {
         ("roomlerd.exe", "roomler-agent.exe")
     } else {

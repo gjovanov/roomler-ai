@@ -7,7 +7,8 @@
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
 > P3c (the viewer's Record and Download, §10), P5a (the export engine: cut
-> and speed up, §11) and P5b (the export's sound and background music).**
+> and speed up, §11), P5b (the export's sound and background music) and P5c
+> (roomler-desktop's Edit view).**
 > It is in **no release build**: `recording` joined `full` for a day (#1677)
 > and was taken back out before any release carried it (the operator,
 > 2026-09-26). It rejoins once canary hosts prove it in the field: an
@@ -24,7 +25,7 @@
 > by `roomlerd media` for an export (§11), which touches only the files the
 > person hands it. Still to come: the microphone on macOS, delivery out of
 > the recorder's data folder (P2c), re-attaching after a dropped session
-> (P3b-3), and the editor's Edit view in roomler-desktop (P5c).
+> (P3b-3), and editing a hardware encoder's recording (P4).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -401,7 +402,7 @@ flowchart LR
 |---|---|
 | **Record this screen** | Start / Stop, the frame rate (30 or 60) and the encoder (automatic, GPU only, software only), a blinking REC chip with the running time, size, encoder and resolution. The options lock while a recording runs. How the last one ended is one sentence (`describeLast`); every closed stop reason and refusal code has words. |
 | **Where recordings are saved** | The folder in use, whether it is the default or one the person chose, **Change folder…** (the native picker), **Use the default folder**, and **Open folder**. A fallback is named ("Not the usual folder: … is under OneDrive"). |
-| **Saved recordings** | Newest first, from the sidecars: when, how long, size, by whom (this device, or a remote controller by name), how it ended on hover. **Play** (the OS's default player), **Show** (selected in the file manager), **Delete** (two clicks, no modal: the first arms it for 4 s). |
+| **Saved recordings** | Newest first, from the sidecars: when, how long, size, by whom (this device, or a remote controller by name), how it ended on hover. **Play** (the OS's default player), **Edit** (P5c, §11; only where the service has the export engine), **Show** (selected in the file manager), **Delete** (two clicks, no modal: the first arms it for 4 s). |
 | **Tray** | **Start recording** / **Stop recording (m:ss)**, and the tooltip `Roomler — recording m:ss`, following the recorder whoever started it. A refusal opens the Recordings view with the sentence. |
 
 - **Start is greyed out, with the reason, wherever the service cannot record.**
@@ -815,8 +816,75 @@ interleaves as a recording does.
   whole export. An unreadable music file is refused `music_unreadable`, and
   music on a build without audio `audio_unavailable`.
 
-Not yet: the Edit view in roomler-desktop (P5c); FFmpeg's decoder for
-hardware recordings, and AAC for the sound (P4).
+### The Edit view (P5c)
+
+roomler-desktop's editor. **Edit** on a saved recording's row puts that one
+recording in place of the list (`src/front/editor.js`, with its commands in
+`src/editor.rs`). The button shows only where this device's service has the
+engine: `cmd_media_available` runs `roomlerd media --help` once.
+
+```mermaid
+sequenceDiagram
+    participant P as the page (editor.js)
+    participant C as roomler-desktop (editor.rs)
+    participant D as roomlerd (LocalAPI)
+    participant E as roomlerd media (as the person)
+    P->>C: cmd_media_probe(name)
+    C->>D: RecordingsList: the folder
+    C->>E: media probe <folder>/<name>
+    E-->>P: length, sound, editable (or why not)
+    P->>C: cmd_edit_load(name)
+    Note over P: split · keep · cut · speed up · music
+    P->>C: cmd_edit_save(name, list), 400 ms after each change
+    C->>C: <name>.edit.json, replaced whole
+    P->>C: cmd_export_start(name, encoder)
+    C->>E: media export --edl <name>.edit.json
+    loop every 400 ms
+      P->>C: cmd_export_status
+      E-->>C: progress, then done or refused
+    end
+    P->>C: cmd_export_cancel: {"cmd":"cancel"} on the engine's stdin
+```
+
+| Part | What it does |
+|---|---|
+| **Preview and timeline** | The recording plays in the view. Below it the pieces lie on its timeline, each as wide as its share; a click selects a piece and moves the playhead there. **Split at the playhead** makes two (never one shorter than 200 ms). **Keep**, **Cut** and **Speed up** (1.5×, 2×, 4×, 8×, 16×) act on the selected piece. The summary says how long the export will be. |
+| **Sound** | The recording's own sound (0–100 %, greyed out when it has none), muted under a speed-up; **Add music…** through the native picker (MP3, M4A/AAC, FLAC, Ogg, WAV), with its volume, start, fade in, fade out and loop. |
+| **Export** | The encoder, **Export**, a progress bar and **Cancel export**; then the new file's name, length, size and what its sound is, with **Play** and **Show in folder**. Every refusal code has words; one this page does not know reads as itself. |
+
+- **Every change is saved** beside the recording as `<name>.mp4.edit.json`,
+  the name roomlerd looks for, 400 ms after the last one, and reopening the
+  recording restores it. A saved list that does not fit (another version, a
+  gap, a bad speed) starts over from the whole recording and says so. The
+  file is replaced whole: a crash mid-write leaves the previous list.
+- ⚠️ **An export waits for the last save.** The engine reads the list from
+  disk, so an Export clicked inside the 400 ms would otherwise export the
+  edit as it was one click earlier.
+- **Splits stay the person's.** Keeping, cutting or speeding up a piece never
+  merges its neighbours, even when they end up doing the same thing: the
+  split was made to be used.
+- **The page never names a path.** Every file is the daemon's folder joined
+  with a checked bare name, the rule Play and Show follow. The music file is
+  the one exception: it comes from the native dialog, and the engine reads it
+  as the person.
+- **The engine runs as the person**, launched by the companion, never by the
+  daemon, one export at a time. A run that ends without `done` or `refused`
+  (a crash, a kill) is reported `engine_failed` with the end of its stderr,
+  never left behind a bar that stopped moving. Closing the companion does
+  not cancel an export: a finished file is harmless.
+- **The preview is the asset protocol, one file at a time.** Its scope starts
+  empty (`tauri.conf.json`); `cmd_preview_src` allows exactly the recording
+  being edited, and the CSP takes media only from there. A cut is skipped and
+  a speed-up plays at its rate, muted, as the export will. Where the webview
+  cannot play the recording, the view says so, and the timeline and the
+  export still work. Leaving the view, or closing the window to the tray,
+  pauses it.
+- Deleting a recording deletes its edit list too. An export beside it is a
+  recording of its own and stays.
+
+Not yet: FFmpeg's decoder for hardware recordings, and AAC for the sound
+(P4); a thumbnail strip where the webview cannot play a recording; hearing
+the music in the preview.
 
 ## 12. Tests
 
@@ -832,6 +900,7 @@ hardware recordings, and AAC for the sound (P4).
 | `tests/export.rs` (P5a) | a recording whose every frame paints its own index, exported keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s, decodes to exactly `0..59, 120, 124 … 236, 240..299` (150 frames, 5 s, moov first, the recording byte-identical); the same comparison against the unedited source fails (the oracle discriminates); keeping everything reproduces the recording frame for frame; a cancelled export and one that keeps nothing leave no file and nothing staged; the real `roomlerd media probe` / `export` process (a cut plus 2× shows frames 30, 32 … 58, the `done` event says `audio: none`, the recording being silent), and a list naming `../elsewhere.mp4` is refused `bad_edit_list`. Red, each on its own cell: the map ignoring speed, the frame choice off by one, the cancel check removed, the name check removed | same step, `--test export` |
 | `recording::edit` and `recording::export_audio` unit tests (P5b) | the sound of keep / cut / 4× / keep: the kept stretches play from their own source sample, the speed-up is muted, the cut is gone, and the sound is exactly as long as the picture; a volume is 0 to 1 (1.5, NaN and −0.1 refused by name; 0 is a volume, the recording muted), and music needs a file; music defaults to half volume and looping, and an absent `original_volume` means as recorded; the music's gain is silent before its start, ramps in from it, and ramps out to the export's end; a music time too large to count in samples saturates instead of wrapping to an early start | "Test the recorder (FR-85)" (`--lib recording::`; `export_audio`'s in the `audio` run) |
 | `tests/export.rs`, `mod sound` (P5b) | a recording whose sound is a STEPPED tone, second k playing 300 + 100·k Hz, so every second of an export names the second of the recording it came from (the oracle reads the recording's own second 3 as 600 Hz first). Keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s: the export's seconds 0, 1, 3 and 4 play 300, 400, 1100 and 1200 Hz at full level, second 2 (the speed-up) is muted, and the sound lasts as long as the picture. Music (a 2 s WAV at 44.1 kHz, so it is resampled) under a keep and a 4× speed-up: at its volume and pitch, still playing after its own 2 s (it looped), quieter while it fades in. Both together: under the speed-up only the music is heard. `original_volume` 0 with no music gives a file with no audio track (`audio: none`). A file that is not music, a WAV declaring 0 Hz (which panics symphonia 0.5.5's probe) and one declaring 1 Hz are refused `music_unreadable`, with nothing left staged; a 50 ms blip plays once. Red, each on its own cell: a speed-up not muted, the sound ignoring the cut, the music never looping, the fade-in ignored, the music's volume ignored, the panic guard removed, the rate range widened, the loop minimum removed (and, in the unit test, the saturation removed). ⚠️ The 1 Hz cell stays green with EITHER rate check deleted (at open, per buffer): each refuses that WAV on its own, so it is red only with the range widened | same step, the `audio` run of `--test export` |
+| `recording::edit` and `recording::manager` unit tests (P5c) | the edit list roomler-desktop writes is one roomlerd reads: `agents/roomler-desktop/tests/fixtures/edit-list.json`, the file the page's own test pins its output to, plans to 5 s with its music as written (red when roomlerd reads `looped` for `loop`); deleting a recording takes its edit list with it and leaves an export beside it (red when the list is left behind) | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
@@ -850,10 +919,12 @@ hardware recordings, and AAC for the sound (P4).
 | `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/companion/recordings.spec.ts` (P3b) | the remote-recording card: absent against a service that predates the gates; computer audio offered only once remote recording is allowed; each toggle saved through `cmd_config_set`; a refused toggle said and not faked; a remote recording's status names who it is for | "Frontend checks" |
 | `ui/src/__tests__/companion/viewing.spec.ts` (P3b) | the REAL banner (`panel-viewing.html` / `.js`): who is watching; a RECORDING controller leads, even when another viewer came first (red when the lookup is removed); Stop recording stops the recording and not the session; the notice comes down when the recording ends | "Frontend checks" |
+| `ui/src/__tests__/companion/editor.spec.ts` (P5c) | roomler-desktop's REAL Edit section and `editor.js` in jsdom against a mocked `invoke`. The pieces: every split kept whatever its neighbours do (red when an action merges them), no sliver, the export's length as roomlerd's map; the page writes EXACTLY the shared fixture (red when it writes `looped`); a saved list read back fitted, clipped to a shorter recording, a kept last piece carried to a longer one, or started over and said (red when a gap is accepted); the preview's skip, rate and mute. The view: opens on the whole recording and hides the list; split and cut saved after a pause, not per click; speed from the timeline; music added and saved; saved edits restored; edits that do not fit said; a recording it cannot edit refused with the reason; everything cut greys Export out with why; an export that waits for the last save (red when it does not), shows its progress, locks the edits, names the new file and its sound, and opens it by its BARE name; a refusal in words; cancel through the service; an export already running shown on open. The Edit button shows only where the service has the engine (red when it shows without it) and opens that recording | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/composables/useRemoteRecording.spec.ts` (P3c) | the viewer's half of the `record` channel, against a scripted channel and an injected save sink: the status and the list asked for as the channel opens; a recording followed from the prompt to its end, a refusal said in words; a channel that closes mid-recording reads as ended with its session; a download written in order, with the device's SHA-256 shown; a transfer the session cut, resumed from the bytes already held (red when it restarts from 0); in memory, a file kept only when its SHA-256 matches (red when any file is kept); a short file is an error (red without the length check); a refusal ends a transfer by name and a cancel tells the device; one transfer at a time | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/composables/useRemoteControl.spec.ts`, the record channel (P3c) | RECORD read out of the effective grant by equality (a newer `RECORDING` is not it; red with a prefix match) and never assumed when a server sends no grant; the channel opened from the grant, once per PeerConnection (red without the already-open guard), and never without a PeerConnection | "Frontend checks" |
 | `ui/e2e/remote-recording-refused.spec.ts`, `remote-recording-smoke.spec.ts` (P3c) | against the `agent-e2e` harness: a device that never opted in shows a disabled Record control whose tooltip says why, and no Record button; on a device that advertises `record`, Record ends in the REC chip or in a refusal said in words. ⚠️ The harness agents cannot serve it yet: they run as root with nobody at a console, which the identity rule refuses (P1e), so none advertises `record` and the smoke spec skips until the unattended exception (P1f) | the k8s agent lane (`scripts/e2e-k8s.sh`); each skips without a seeded tenant or a fitting device |
 | `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
+| `agents/roomler-desktop` editor unit tests (P5c) | the event prefix is the recorder's; the probe's answer skips log lines and keeps a refusal; an export folded from the engine's events; a run that ends without an answer is `engine_failed` with its exit (red without the fallback) and a refusal the engine said is kept as said; the stderr tail reads everything and keeps the end; an edit list round-trips under roomlerd's name with no temporary file left; it names its own recording and nothing else, and needs one (red without the check); a directory at a recording's name is not one | `ci.yml` "Test the desktop companion (roomler-desktop)" |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
 roomlerd test step is `--lib`, which is why `tests/file_dc.rs` has never run in

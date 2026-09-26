@@ -566,6 +566,30 @@ mod tests {
         assert_eq!(l.original_volume, None, "absent = as recorded");
     }
 
+    /// FR-85 P5c — the list roomler-desktop's Edit view writes. Its own test
+    /// (`ui/src/__tests__/companion/editor.spec.ts`) pins the page's output
+    /// to this same file, so a change on either side fails one of the two.
+    #[test]
+    fn the_list_the_desktop_writes_is_one_this_reads() {
+        let l: EditList = serde_json::from_str(include_str!(
+            "../../../roomler-desktop/tests/fixtures/edit-list.json"
+        ))
+        .unwrap();
+        let plan = l.plan(10_000).unwrap();
+        assert_eq!(
+            plan.out_ms(),
+            5000,
+            "keep 2 s, cut 2 s, 4 s at 4×, keep 2 s"
+        );
+        assert_eq!(l.original_volume, Some(0.8));
+        let m = l.music.expect("music");
+        assert_eq!(m.path, r"C:\Users\me\Music\song.mp3");
+        assert_eq!(
+            (m.volume, m.start_ms, m.fade_in_ms, m.fade_out_ms, m.looped),
+            (0.35, 1000, 2000, 1500, false)
+        );
+    }
+
     /// The saved shape is the one roomler-desktop writes.
     #[test]
     fn the_file_reads_as_written() {
