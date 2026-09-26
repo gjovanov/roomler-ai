@@ -443,6 +443,9 @@
       <!-- Recordings (FR-85) -->
       <section id="view-recordings" class="view" hidden>
         <div class="view-head"><h2>Recordings</h2></div>
+        <!-- FR-85 P5c — the list and the Edit view take turns: `editor.js`
+             hides this while one recording is being edited. -->
+        <div id="rec-main">
         <p class="view-sub">
           Record this screen to a high-quality video file. Recordings stay on
           this device, in the folder below.
@@ -538,6 +541,111 @@
             </table>
           </div>
           <p id="rec-list-error" class="error small" hidden></p>
+        </div>
+        </div>
+
+        <!-- FR-85 P5c — the Edit view: one recording, in place of the list.
+             Non-destructive: the edits are saved beside the recording as
+             `<name>.edit.json`, and an export is a new file beside it. -->
+        <div id="rec-editor" hidden>
+          <div class="actions" style="margin-top: 0">
+            <button type="button" id="ed-back">← Recordings</button>
+          </div>
+          <div class="card">
+            <div class="card-title-row">
+              <h3 id="ed-title">Edit</h3>
+              <span id="ed-summary" class="muted small"></span>
+            </div>
+            <p id="ed-banner" class="banner banner-warn small" hidden></p>
+            <div id="ed-body" hidden>
+              <div class="ed-preview">
+                <video id="ed-video" preload="metadata" playsinline></video>
+              </div>
+              <p id="ed-preview-note" class="muted small" hidden></p>
+              <div class="actions">
+                <button type="button" id="ed-play">Play</button>
+                <span id="ed-time" class="mono small">0:00 / 0:00</span>
+              </div>
+              <div id="ed-timeline" class="ed-timeline" role="group" aria-label="Timeline: click a piece to select it">
+                <div id="ed-playhead" class="ed-playhead"></div>
+              </div>
+              <p id="ed-selection" class="muted small"></p>
+              <div class="actions">
+                <button type="button" id="ed-split">Split at the playhead</button>
+                <button type="button" id="ed-keep">Keep</button>
+                <button type="button" id="ed-cut">Cut</button>
+                <label>
+                  <select id="ed-speed" aria-label="Speed">
+                    <option value="1.5">1.5×</option>
+                    <option value="2" selected>2×</option>
+                    <option value="4">4×</option>
+                    <option value="8">8×</option>
+                    <option value="16">16×</option>
+                  </select>
+                </label>
+                <button type="button" id="ed-speed-apply">Speed up</button>
+              </div>
+              <p id="ed-note" class="muted small" hidden></p>
+            </div>
+          </div>
+
+          <div class="card" id="ed-sound" hidden>
+            <h3>Sound</h3>
+            <div class="actions" style="margin-top: 0">
+              <label>The recording's sound
+                <input type="range" id="ed-original-volume" min="0" max="100" value="100" />
+                <span id="ed-original-volume-value" class="mono small">100 %</span>
+              </label>
+            </div>
+            <p id="ed-original-note" class="muted small" hidden>This recording has no sound of its own.</p>
+            <p class="muted small" style="margin: 0 0 8px">
+              Muted where a piece is sped up: sped-up speech is noise. Music plays on under it.
+            </p>
+            <div class="actions">
+              <button type="button" id="ed-music-pick">Add music…</button>
+              <span id="ed-music-name" class="mono small"></span>
+              <button type="button" id="ed-music-remove" hidden>Remove music</button>
+            </div>
+            <div id="ed-music-options" class="actions" hidden>
+              <label>Volume <input type="range" id="ed-music-volume" min="0" max="100" value="50" /></label>
+              <label>Starts at <input type="number" id="ed-music-start" min="0" step="0.5" value="0" /> s</label>
+              <label>Fade in <input type="number" id="ed-music-fade-in" min="0" step="0.5" value="0" /> s</label>
+              <label>Fade out <input type="number" id="ed-music-fade-out" min="0" step="0.5" value="0" /> s</label>
+              <label><input type="checkbox" id="ed-music-loop" checked /> Loop</label>
+            </div>
+            <p id="ed-music-error" class="error small" hidden></p>
+          </div>
+
+          <div class="card" id="ed-export-card" hidden>
+            <h3>Export</h3>
+            <p class="muted small" style="margin: 0 0 8px">
+              A new file beside the recording. The recording itself is never changed.
+            </p>
+            <div class="actions">
+              <label>Encoder
+                <select id="ed-encoder">
+                  <option value="auto" selected>Automatic (GPU, else software)</option>
+                  <option value="hardware">GPU only</option>
+                  <option value="software">Software only</option>
+                </select>
+              </label>
+              <button type="button" id="ed-export" class="primary">Export</button>
+              <button type="button" id="ed-export-cancel" class="danger" hidden>Cancel export</button>
+            </div>
+            <p id="ed-export-why" class="muted small" hidden></p>
+            <progress id="ed-progress" max="1" value="0" hidden></progress>
+            <p id="ed-export-status" class="muted small" hidden></p>
+            <div id="ed-result" hidden>
+              <p id="ed-result-text" class="small"></p>
+              <div class="actions">
+                <button type="button" id="ed-result-play">Play</button>
+                <button type="button" id="ed-result-show">Show in folder</button>
+              </div>
+            </div>
+            <p id="ed-export-error" class="error small" hidden></p>
+            <p id="ed-saved" class="muted small" hidden></p>
+            <p id="ed-save-error" class="error small" hidden></p>
+          </div>
         </div>
       </section>
 
@@ -971,6 +1079,7 @@
     <script src="devices.js"></script>
     <script src="tunnels.js"></script>
     <script src="recordings.js"></script>
+    <script src="editor.js"></script>
     <script src="settings.js"></script>
     <script src="onboarding.js"></script>
     <script src="welcome.js"></script>

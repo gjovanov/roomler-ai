@@ -44,7 +44,10 @@ roomler-localapi = { path = "../../crates/localapi" }
 # static `src/front/` HTML, so devUrl isn't load-bearing for any
 # workflow — embedding via custom-protocol is the only mode that
 # makes sense.
-tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
+# `protocol-asset` (FR-85 P5c): the Edit view's `<video>` preview. The scope
+# starts EMPTY (`tauri.conf.json`); `cmd_preview_src` allows one recording at
+# a time, never a folder.
+tauri = { version = "2", features = ["tray-icon", "custom-protocol", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
@@ -77,6 +80,10 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+# FR-85 P5c — the edit-list save/load tests write into a real folder.
+tempfile = { workspace = true }
 
 # FR-27 — the Linux companion, as its OWN Debian package.
 #
