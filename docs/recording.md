@@ -8,6 +8,7 @@
 > own locked folder, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
+> P3b-3 (a dropped session's recording waits a minute for its controller),
 > P3c (the viewer's Record and Download, §10), P3c-2 (no Record control on a
 > device with no recorder), P5a (the export engine: cut
 > and speed up, §11), P5b (the export's sound and background music) and P5c
@@ -27,8 +28,8 @@
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
 > person hands it. Still to come: the microphone on macOS, delivery out of
-> the recorder's data folder (P2c), re-attaching after a dropped session
-> (P3b-3), and editing a hardware encoder's recording (P4).
+> the recorder's data folder (P2c), and editing a hardware encoder's
+> recording (P4).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -689,8 +690,10 @@ sequenceDiagram
 
 A recording ends `requested` (the controller's Stop), `host_stopped` (the host's
 Stop: the banner, the tray, the Recordings view, `roomler record stop`),
-`gate_revoked`, `session_ended`, or with the recorder's own reasons (`disk_low`,
-`max_duration`, …). The device reports every outcome as `rc:recording.activity`.
+`gate_revoked`, `session_ended` (its session dropped and nobody came back
+within the re-attach grace, P3b-3 below), or with the recorder's own reasons
+(`disk_low`, `max_duration`, …). The device reports every outcome as
+`rc:recording.activity`.
 
 ⚠️ **A fresh prompt id, never the session's.** The session already has an
 answered prompt. A decision recorded against its id, or anything derived from
@@ -730,6 +733,113 @@ the cache, before the check was made fresh.
 unknown prompt kind as a remote-control request. So a record prompt carries the
 whole question in its detail line, the one field every companion shows as it
 is.
+
+### A dropped session, and coming back to it (P3b-3)
+
+The reconnect ladder mints a new session id on every drop, so a relay flap or a
+reloaded viewer used to cost the recording (`session_ended` at once). Now the
+recording **outlives its session for the re-attach grace**
+(`manager::REATTACH_GRACE`, 60 s) and waits for its controller.
+
+```mermaid
+sequenceDiagram
+    participant V1 as viewer, session A
+    participant D as device (remote.rs)
+    participant B as banner (indicator)
+    participant V2 as viewer, session B (same user)
+    V1-xD: session A drops (its record channel closes)
+    D->>D: session_gone: DETACH the recording (not stopped)
+    Note over B: A's banner KEPT, "reconnecting", with its Stop
+    D->>D: grace_watch, every second
+    alt the same controller is back within the grace
+        V2->>D: rc:record.status (as its record channel opens)
+        D->>D: retarget_remote(A → B)
+        D->>B: B says "recording", then A's banner comes down
+        D-->>V2: rc:record.state {recording, id, name}
+        D->>D: rc:recording.activity reattached (on B)
+    else nobody, or the owner's OFF, or a sign-in at an unattended one
+        D->>D: stop: session_ended / gate_revoked / session_changed
+        D->>B: A's banner comes down
+        D->>D: rc:recording.activity stopped (on A)
+    end
+```
+
+- ⚠️ **A recording is never unseen.** The signalling loop hides a session from
+  the banner the moment it ends, but the indicator keeps the entry of a session
+  that is RECORDING (`ViewerIndicator::hide_session`), marked `reconnecting`,
+  until the recording ends or moves (`end_recording`). The companion's banner
+  then reads "reconnecting", keeps **Stop recording**, and drops **Disconnect**
+  when no session is left to disconnect.
+- ⚠️ **Only the same controller.** The recording is picked up by the same USER
+  on a new session holding RECORD (the channel exists only then), when its
+  `record` channel asks for the status. Another controller of the device is
+  told nothing is recording, and the recording goes on waiting.
+- ⚠️ **The grace still watches.** The owner's OFF stops it `gate_revoked`, and
+  an unattended recording still stops `session_changed` the moment someone
+  signs in: P1f's watch runs in the grace as well as in the follower.
+- ⚠️ **A session's end is the signalling loop's word first.** The loop knows
+  every end and says so (`remote::session_ended`): the server's terminate
+  (which also echoes the device's own, from its watchdog) and the control
+  connection lost. It says so BEFORE closing the peer, because that close has
+  a 5 s budget, and one that overruns it is dropped before it reaches the
+  `record` channel, which then stays `Open` for good. Before this, such a
+  recording never detached, and its controller's next session was told
+  "idle" while the device went on recording (found by review).
+- ⚠️ **And from the channel's STATE, not only from its callback.** A close
+  from the FAR end always reaches `Closed` and fires `on_close`. A channel
+  closed from the device's own side is set `Closing`, and whether it then
+  reaches `Closed` and fires `on_close` is a race inside webrtc-rs's read
+  loop. In the tests, most such drops (8 of 13) stayed `Closing` for good.
+  Every network drop is that case: nothing arrives from the controller, and
+  the device's session watchdog closes the peer itself. So `end_session` runs
+  once, from whichever comes first: the loop, `on_close`, or a look at the
+  channel every 500 ms (`channel_gone`, which is `Closing` or `Closed`). The
+  follower, the download pump and the controller's next session use the same
+  test. Found by the Linux lane, where the cells closed the controller's peer
+  first. On every Windows run its reset reached the device first; on Linux it
+  did not. The cells now drop the way a network does, with the device's peer
+  closing first.
+- ⚠️⚠️ **The host's Disconnect is not a drop** (`remote::host_ended`, from the
+  loop's kill arm: the banner's Disconnect and the badge's). The person at
+  the device sent the controller away, so the recording stops then and
+  there, `host_stopped`, and waits for nobody. Detaching it, as a drop is,
+  kept recording someone who had just ended the session, and a controller
+  whose device auto-grants would have reconnected straight back into it
+  (found by review).
+- ⚠️ **A deliberate Disconnect in the viewer stops the recording first**
+  (`stopBeforeLeaving`, then the terminate). The device cannot tell a
+  hang-up from the reconnect ladder's retry (both are `controller_hangup`),
+  and a retry is exactly what the grace keeps a recording running for.
+  Leaving the page sends the Stop without waiting; a Stop lost with the
+  channel is covered by the grace.
+- ⚠️ **The grace acts on ITS recording only** (`Slot`, by session; the
+  recording by its file). By the time it looks again, its recording may
+  have ended by itself and another begun; "whatever is recording" would be
+  that other one, which it would stop `session_ended` and report as its own.
+  A new detach over another session's recording, over but not yet looked at,
+  finishes that one (its report, its banner) rather than orphan it.
+- ⚠️ **The grace claims a recording before stopping it.** While its file
+  finalizes, the controller's next session can neither pick it up nor
+  detach it again; both would report its ending a second time.
+- **One speaker per recording** (`Speakers`, keyed by its file): the
+  follower that last claimed it, or the grace while it waits. A pick-up
+  claims it before anything awaits, which silences the dropped session's
+  follower; a NEW recording's claim does not silence the follower of the one
+  before, which still reports its ending. A stop a session asked for itself
+  (the controller's Stop, the owner's OFF, the host's Disconnect) is not
+  detached if the session ends while the file finalizes: that session's
+  follower reports it.
+- **A re-offer on the same session** (its old peer replaced; the session
+  goes on) is picked up like any other, but the banner is left alone: "the
+  old banner" is this one.
+- **Known limit:** a detached recording reports its ending on the queue of
+  the connection its session lived on. If the control connection itself was
+  lost (a pod roll) and nobody picks the recording up, that last report has
+  nowhere to go, and the server keeps `started` with no ending.
+- The viewer shows **REC · reconnecting** meanwhile. It adopts the recording's
+  id from the device's answer, so a reloaded page can stop a recording it did
+  not start. If it comes back to find nothing recording, it says the recording
+  ended while it was away.
 
 ### Downloading a remote recording (P3b-2)
 
@@ -811,8 +921,12 @@ without a PeerConnection or a save dialog.
   the reconnect ladder's next session opens its `record` channel, it asks for
   the rest from the bytes already held.
 
-Not yet: the 60 s re-attach after a dropped session, which needs something on
-screen for a recording with no session to show it (P3b-3).
+- **Coming back** (P3b-3): when the session drops mid-recording, the toolbar
+  reads **REC · reconnecting**. The next session's `record` channel asks for
+  the status and picks the recording up (see "A dropped session" above).
+- **Leaving** (P3b-3): **Disconnect** stops a running recording first and
+  waits for the device's answer (at most 3 s), because to the device a
+  hang-up looks like a drop. Leaving the page sends the Stop without waiting.
 
 ### Decision and claim, like SSH
 
@@ -1032,6 +1146,9 @@ the music in the preview.
 | `recording::remote` unit tests (P3b) | nothing advertised unless a recorder can run, then `available` (P3c-2), `remote` only when the owner opted in as well, `remote-audio` only on top with an audio build; the prechecks refuse in order and by name; the wire parses (audio off unless asked; a `microphone` field is ignored) and speaks the documented state shape; the controller is told a file name, never a path; `adopt` signals only a change | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `tests/control_dc_record.rs` (P3b) | A loopback PeerConnection pair, the PRODUCTION `record` handler and the real recorder child. The owner's switch and the audio gate refuse by name, leave no file and no banner, and are reported to the server; a grant without RECORD gets a refusing channel. No indicator surface means no recording and no running recorder. An auto-granted session records: the banner is up before the file, a second start is `busy`, Stop ends it `requested`, and the sidecar names the controller with no microphone. A host-consented session asks again with a FRESH prompt id (never the session's), the detail line carries the question, a deny holds for a minute (`rate_limited`), and an approval records. The owner's OFF ends it `gate_revoked`, the host's Stop `host_stopped`, the controller going away `session_ended` | same step, `--test control_dc_record` |
 | `rc_sessions` (P3b) | the banner's `recording` follows the session, survives a re-announce, and cannot be set on a session the banner does not show | the default `--lib` step |
+| `rc_sessions`, `indicator` (P3b-3) | a session that ends while RECORDING keeps its banner entry, `reconnecting` on the wire (absent otherwise), with nothing to disconnect; a watcher's goes at once; the kept entry goes with its recording; on a live session the recording's end only clears `recording`. Through the indicator: `hide_session` keeps a recording session's banner, `end_recording` takes it down | every unfiltered `--lib` run |
+| `tests/control_dc_record.rs` (P3b-3) | a session dropped mid-recording the way a network drops it (the DEVICE's peer closed first, so its channel usually stops at `Closing` without `on_close`; then the loop's `hide_session`): the recording goes on, its banner `reconnecting`. The SAME controller's new session asks for the status and gets the same recording (id, file), its banner takes over and the old one goes; the old session reported `started` only, the new one `reattached` then `stopped`. Another controller is told `idle`, the banner stays, and after the grace it ends `session_ended` (reported once, on the dropped session). An unattended one whose session dropped still ends `session_changed` the moment someone signs in (red without the watch in the grace). A Record question whose session drops comes off the host's screen, and an Allow after it starts nothing, over six sessions: a drop that lands on `Closed` fires `on_close` and would pass without the channel watch (one session was red without it in 3 runs of 4). From review: the host's Disconnect stops the recording `host_stopped`, reported once, and the controller's next session finds nothing to pick up (red when it is detached like a drop); a session the loop ends with its channel still OPEN is detached and picked up (red without `session_ended`); the grace, looking again after a second controller's recording began, leaves that one running and reports its own, over, once (red when it looks at "whatever is recording"); a re-offer on the same session keeps its banner (red when the pick-up takes it down) | "Test the recorder (FR-85)", `--test control_dc_record` |
+| `recording::remote` unit tests (P3b-3) | the slot hands a detached recording to one party: one the grace is stopping is never picked up, the same session never detaches twice, a detach over another session's recording hands that one back; one speaker per recording: a pick-up's claim silences the dropped session's follower, a NEW recording's claim does not silence the last one's | "Test the recorder (FR-85)" |
 | `recording::remote` unit tests (P3b-2) | a recording is a controller's only when its sidecar says THAT user started it remotely (not a local one, not another controller's, not one with no or a broken sidecar); the list holds exactly those; a directory, and a link at a recording's name, are never opened (the link case where the OS lets a test make one). ⚠️ The link cell stays green with EITHER layer removed, the `symlink_metadata` pre-check or the no-follow open, because each refuses a link on its own; it is red only with both gone. A green run after deleting one is not evidence that the other is redundant: the pre-check also keeps a FIFO from blocking the handler in `open`, and the no-follow open closes the swap between the check and the open | "Test the recorder (FR-85)" |
 | `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |
 | `tests/control_dc_record.rs`, unattended (P1f); `tests/recorder.rs`; `recording::launch::unix` | a service with nobody signed in refuses a LOCAL start, then records a remote session with NO indicator surface at all (companion down, session unlisted), says `unattended: true`, and writes into the daemon's own folder (0700 on unix), never the person's `record_dir`. When someone signs in, it stops `session_changed` (red without the watch: it ran on, bannerless), and the controller still lists and downloads it. A fresh ask for who is signed in sees a sign-in the 5 s cache would hide (red when `fresh` is ignored). The identity is decided once: a remote start decided unattended is refused when someone is signed in by the time the recorder launches (red without the check) | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`) |
@@ -1043,9 +1160,9 @@ the music in the preview.
 | `agents/roomler-cli` | `record` verbs parse; lengths and endings read plainly | same |
 | `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/companion/recordings.spec.ts` (P3b) | the remote-recording card: absent against a service that predates the gates; computer audio offered only once remote recording is allowed; each toggle saved through `cmd_config_set`; a refused toggle said and not faked; a remote recording's status names who it is for | "Frontend checks" |
-| `ui/src/__tests__/companion/viewing.spec.ts` (P3b) | the REAL banner (`panel-viewing.html` / `.js`): who is watching; a RECORDING controller leads, even when another viewer came first (red when the lookup is removed); Stop recording stops the recording and not the session; the notice comes down when the recording ends | "Frontend checks" |
+| `ui/src/__tests__/companion/viewing.spec.ts` (P3b) | the REAL banner (`panel-viewing.html` / `.js`): who is watching; a RECORDING controller leads, even when another viewer came first (red when the lookup is removed); Stop recording stops the recording and not the session; the notice comes down when the recording ends; P3b-3: a dropped session's recording reads "reconnecting" with its Stop and no Disconnect, and Disconnect returns while another session is live beside it | "Frontend checks" |
 | `ui/src/__tests__/companion/editor.spec.ts` (P5c) | roomler-desktop's REAL Edit section and `editor.js` in jsdom against a mocked `invoke`. The pieces: every split kept whatever its neighbours do (red when an action merges them), no sliver, the export's length as roomlerd's map; the page writes EXACTLY the shared fixture (red when it writes `looped`); a saved list read back fitted, clipped to a shorter recording, a kept last piece carried to a longer one, or started over and said (red when a gap is accepted); the preview's skip, rate and mute. The view: opens on the whole recording and hides the list; split and cut saved after a pause, not per click; speed from the timeline; music added and saved; saved edits restored; edits that do not fit said; a recording it cannot edit refused with the reason; everything cut greys Export out with why; an export that waits for the last save (red when it does not), shows its progress, locks the edits, names the new file and its sound, and opens it by its BARE name; a refusal in words; cancel through the service; an export already running shown on open. The Edit button shows only where the service has the engine (red when it shows without it) and opens that recording | "Frontend checks" (`bun run test:unit`) |
-| `ui/src/__tests__/composables/useRemoteRecording.spec.ts` (P3c) | the viewer's half of the `record` channel, against a scripted channel and an injected save sink: the status and the list asked for as the channel opens; a recording followed from the prompt to its end, a refusal said in words; a channel that closes mid-recording reads as ended with its session; a download written in order, with the device's SHA-256 shown; a transfer the session cut, resumed from the bytes already held (red when it restarts from 0); in memory, a file kept only when its SHA-256 matches (red when any file is kept); a short file is an error (red without the length check); a refusal ends a transfer by name and a cancel tells the device; one transfer at a time; P3c-2: `showsRecordRefusal` hides the control for `device_cannot_record` only, and shows every other reason, one from a newer server included | "Frontend checks" (`bun run test:unit`) |
+| `ui/src/__tests__/composables/useRemoteRecording.spec.ts` (P3c) | the viewer's half of the `record` channel, against a scripted channel and an injected save sink: the status and the list asked for as the channel opens; a recording followed from the prompt to its end, a refusal said in words; a channel that closes mid-recording reads as reconnecting (P3b-3; a standing question dies with the session), the next session's channel picks the recording up and Stop names its id, even on a reloaded page, and coming back to nothing recording says it ended meanwhile; a download written in order, with the device's SHA-256 shown; a transfer the session cut, resumed from the bytes already held (red when it restarts from 0); in memory, a file kept only when its SHA-256 matches (red when any file is kept); a short file is an error (red without the length check); a refusal ends a transfer by name and a cancel tells the device; one transfer at a time; P3c-2: `showsRecordRefusal` hides the control for `device_cannot_record` only, and shows every other reason, one from a newer server included; P3b-3: a deliberate Disconnect stops a recording first and waits for the device's answer (or its timeout), and asks nothing of a channel already gone | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/composables/useRemoteControl.spec.ts`, the record channel (P3c) | RECORD read out of the effective grant by equality (a newer `RECORDING` is not it; red with a prefix match) and never assumed when a server sends no grant; the channel opened from the grant, once per PeerConnection (red without the already-open guard), and never without a PeerConnection | "Frontend checks" |
 | `ui/e2e/remote-recording-refused.spec.ts`, `remote-recording-smoke.spec.ts` (P3c) | against the `agent-e2e` harness: a device with a recorder that never opted in (`available` alone) shows a disabled Record control whose tooltip says why, and no Record button; a device with no recorder shows neither (P3c-2); on a device that advertises `remote`, Record ends in the REC chip or in a refusal said in words. The harness agents run as root with nobody at a console, so there a recording is UNATTENDED (P1f): `Dockerfile.agent-e2e` carries `recording` from P1f on, and a harness image built before it advertises nothing, so the smoke spec skips | the k8s agent lane (`scripts/e2e-k8s.sh`); each skips without a seeded tenant or a fitting device |
 | `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |

@@ -38,6 +38,9 @@ struct Entry {
     kill: KillSender,
     /// FR-85 P3 — this controller is recording the screen.
     recording: bool,
+    /// FR-85 P3b-3 — the session ended while recording, and the entry stays
+    /// for the recording's re-attach grace: the banner says "reconnecting".
+    detached: bool,
 }
 
 /// Cheap to clone; every clone sees the same map.
@@ -79,12 +82,49 @@ impl RcSessionRegistry {
                 started_at_ms,
                 kill,
                 recording,
+                detached: false,
             },
         );
     }
 
     pub fn remove(&self, session: &ObjectId) {
         self.inner.lock().unwrap().remove(session);
+    }
+
+    /// FR-85 P3b-3 — `session` ended. Its entry goes, UNLESS it is recording:
+    /// a remote recording outlives its session for the re-attach grace, and
+    /// the banner must keep saying so. `true` = the entry was kept (detached).
+    pub fn session_ended(&self, session: &ObjectId) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(session) {
+            Some(e) if e.recording => {
+                e.detached = true;
+                true
+            }
+            _ => {
+                map.remove(session);
+                false
+            }
+        }
+    }
+
+    /// FR-85 P3b-3 — the recording of `session` ended, or moved to its
+    /// controller's next session. The entry stops saying "recording"; one
+    /// that was kept only for the recording (its session gone) is removed.
+    /// `true` = removed.
+    pub fn recording_ended(&self, session: &ObjectId) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(session) {
+            Some(e) if e.detached => {
+                map.remove(session);
+                true
+            }
+            Some(e) => {
+                e.recording = false;
+                false
+            }
+            None => false,
+        }
     }
 
     /// FR-85 P3 — mark `session` as recording (or not). `false` = no such
@@ -118,6 +158,7 @@ impl RcSessionRegistry {
                         org: e.org.clone(),
                         started_at_ms: e.started_at_ms,
                         recording: e.recording,
+                        reconnecting: e.detached,
                     },
                 )
             })
@@ -138,11 +179,14 @@ impl RcSessionRegistry {
     /// before the session had, which is the wrong way round for a control the
     /// operator is watching for an effect.
     pub fn disconnect(&self, session: &ObjectId) -> bool {
+        // FR-85 P3b-3 — a DETACHED entry has no session left to tear down
+        // (only its recording remains, which the banner's Stop ends).
         let Some(kill) = self
             .inner
             .lock()
             .unwrap()
             .get(session)
+            .filter(|e| !e.detached)
             .map(|e| e.kill.clone())
         else {
             return false;
@@ -259,5 +303,55 @@ mod tests {
             !reg.set_recording(&ObjectId::new(), true),
             "no banner, no recording"
         );
+    }
+
+    /// FR-85 P3b-3 — a session that ends while RECORDING keeps its banner
+    /// entry, marked reconnecting, for as long as the recording lasts; one
+    /// that was only watching goes at once. When the recording ends (or moves
+    /// to the controller's next session), the kept entry goes too.
+    #[test]
+    fn a_recording_keeps_its_banner_after_its_session_ends() {
+        let (reg, ids, _rx) = reg_with(2);
+        assert!(reg.set_recording(&ids[1], true));
+        assert!(!reg.session_ended(&ids[0]), "a watcher's entry is not kept");
+        assert!(reg.session_ended(&ids[1]), "a recording's entry is kept");
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, ids[1].to_hex());
+        assert!(listed[0].recording && listed[0].reconnecting, "{listed:?}");
+        // Nothing to disconnect: the session is gone, only the recording is
+        // left, and the banner's Stop ends that.
+        assert!(!reg.disconnect(&ids[1]));
+
+        assert!(
+            reg.recording_ended(&ids[1]),
+            "the kept entry goes with its recording"
+        );
+        assert!(reg.list().is_empty());
+    }
+
+    /// The same ending on a LIVE session only clears "recording": the session
+    /// itself is still there to be shown.
+    #[test]
+    fn a_recording_that_ends_on_a_live_session_leaves_the_session() {
+        let (reg, ids, _rx) = reg_with(1);
+        assert!(reg.set_recording(&ids[0], true));
+        assert!(!reg.recording_ended(&ids[0]));
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].recording && !listed[0].reconnecting);
+        // An unknown session is nothing to end.
+        assert!(!reg.recording_ended(&ObjectId::new()));
+    }
+
+    #[test]
+    fn a_reconnecting_entry_is_said_on_the_wire_and_absent_otherwise() {
+        let (reg, ids, _rx) = reg_with(1);
+        let plain = serde_json::to_value(&reg.list()[0]).unwrap();
+        assert!(plain.get("reconnecting").is_none(), "{plain}");
+        reg.set_recording(&ids[0], true);
+        reg.session_ended(&ids[0]);
+        let kept = serde_json::to_value(&reg.list()[0]).unwrap();
+        assert_eq!(kept["reconnecting"], true, "{kept}");
     }
 }
