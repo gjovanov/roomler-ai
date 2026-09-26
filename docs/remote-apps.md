@@ -343,7 +343,12 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 | 2026-09-25 | three cluster nodes, over Fleet RPC | AC10, the Xvfb tier | `sources: x11`, `NOT listed: (nothing)`, `missing tools: (none)`, one root xterm each — complete and honest |
 | 2026-09-25 | GNOME Wayland (Asahi), over Fleet RPC | AC10, the missing-helper tier | the agent prints `missing tools: tmux …`; the viewer's parser was read and found to drop it — **P5 never reached a screen** |
 | 2026-09-25 | the WSL node | AC10 | refuses Fleet RPC (`exec_enabled` off — the device-owned gate) — *advertised, unprobed* |
-| owed | a headless host and the GNOME Wayland host, after the next agent release | the P6 pass | `roomlerd apps-probe` printing `reason [no_session]: …` where today it prints *"no manageable desktop found"*; the Apps dialog showing the `tmux` warning that today never renders |
+| 2026-09-26 | two headless cluster nodes, agent-v0.4.103, over Fleet RPC | P6, the `no_session` tier (the nodes run the daemon's own Xvfb, so the probe is run with `DISPLAY` unset to reach the session arm) | **before** (0.4.102, the arm's only output): *"no manageable desktop found. Either apps are disabled in the config, or there is no X display…"*; **after**: `reason [no_session]: No active graphical login session on this host — nobody is at its screen — …`, with the `config:` line naming `/etc/roomler/config.toml` and `enabled = true` |
+| 2026-09-26 | the same node, `DISPLAY` as the daemon has it | AC3 on 0.4.103 | Daemon arm unchanged: `supported: true`, `sources: x11`, one root xterm |
+| 2026-09-26 | GNOME Wayland (Asahi), 0.4.103 | the live session arm | `supported: true` · `NOT listed: native Wayland windows…` · `missing tools: tmux …` — the P2/P5 arms byte-for-byte |
+| 2026-09-26 | the server's `agents` collection | the hello on 0.4.103 | every online Linux/Windows device advertises `status · list · focus · launch`; macOS `null`; each probed host's `list` matches its live state |
+| 2026-09-26 | the hosted server | the viewer half | **not yet deployable**: `/health` still `0.4.102`, and the served `RemoteControl-*.js` has none of the P6 strings — the deployed dialog still drops `missing_tools` until a server promote |
+| owed | the GNOME Wayland host and a headless host, in a browser, after a server promote | the viewer half of P6 | the Apps dialog showing the `tmux` warning, and the `no_session` reason instead of *"No windows reported"* |
 
 Still owed to a human: a window streamed to the browser and a switch between
 two (somebody must answer the picker), and native enumeration on a wlroots host
