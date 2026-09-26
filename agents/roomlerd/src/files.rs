@@ -1304,6 +1304,20 @@ impl FilesHandler {
         *guard = None;
     }
 
+    /// The session is over: drop an upload's state (its file closes; the
+    /// partial stays for a resume, as [`Self::abort`]) and stop a download
+    /// at its pump's next check. A download over a link slower than disk
+    /// waits on the channel's send buffer, and after a network drop that
+    /// buffer never drains: only its cancel flag (or the channel's state)
+    /// ends the pump, which otherwise ran on holding the file, the channel
+    /// and the transfer guard the updater defers for (found in review).
+    pub async fn end_session(&self) {
+        self.abort().await;
+        if let Some(state) = self.outgoing.lock().await.as_ref() {
+            state.cancel.store(true, Ordering::Release);
+        }
+    }
+
     /// rc.19: cancel an in-flight incoming upload. Removes the per-id
     /// staging dir + registry entry. Called from the
     /// `FilesIncoming::Cancel` arm in peer.rs (P2 wiring) when the
@@ -3642,6 +3656,43 @@ mod tests {
             }
         }
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// The session is over: a download's pump is told to stop (and an
+    /// upload's state goes, as [`FilesHandler::abort`]). Red without the
+    /// download half: after a drop its pump waits on a send buffer that
+    /// never drains, holding the file, the channel and the transfer guard
+    /// the updater defers for.
+    #[tokio::test]
+    async fn a_session_end_stops_the_download() {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-session-end-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let file_path = base.join("x.bin");
+        tokio::fs::write(&file_path, b"xx").await.unwrap();
+
+        let h = FilesHandler::new();
+        let offer = h
+            .begin_outgoing("session-end-d1".into(), &file_path.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        assert!(!offer.cancel.load(Ordering::Acquire));
+        h.end_session().await;
+        let told = offer.cancel.load(Ordering::Acquire);
+        // Twice is fine (the channel's own close may come after), and with
+        // no upload in flight there is none left.
+        h.end_session().await;
+        let upload_left = h.current_id().await;
+
+        h.finish_outgoing("session-end-d1").await;
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        assert!(told, "the download's pump was not told to stop");
+        assert_eq!(upload_left, None);
     }
 
     #[tokio::test]

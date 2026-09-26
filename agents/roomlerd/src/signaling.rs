@@ -2809,7 +2809,7 @@ async fn handle_server_msg(
                 banner_org,
             );
 
-            reply_for_session(
+            if let Err(e) = reply_for_session(
                 ws,
                 delegated,
                 &ClientMsg::SdpAnswer {
@@ -2818,7 +2818,15 @@ async fn handle_server_msg(
                 },
             )
             .await
-            .map_err(|e| ConnectError::Transient(e.context("sending answer")))?;
+            {
+                // The answer never left, so nobody will connect to this peer,
+                // and it is in no map `close_all_peers` walks: close it here
+                // (dropping a WebRTC peer frees none of its sockets) and take
+                // down the banner just raised for it (found in review).
+                indicator.hide_session(session_id.to_hex());
+                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                return Err(ConnectError::Transient(e.context("sending answer")));
+            }
             peers.insert(session_id, peer);
             // 2026-07-27 — first live session engages the GPU-clock pin
             // (opt-in, `ROOMLERD_GPU_CLOCK_PIN`; no-op otherwise).
