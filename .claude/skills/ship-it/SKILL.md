@@ -97,6 +97,18 @@ carries no digest.
 - Rehearse with `signing_mode=local` dispatches, **never** with throwaway
   `agent-v*` tags.
 - macOS is all-or-nothing on six `APPLE_*` secrets.
+- ⚠️ **There is no canary channel.** The updater (`pick_latest_release`) and
+  `/api/agent/latest-release` skip drafts only; a PRE-release is accepted. So
+  publishing ANY `agent-v*` release, even one marked pre-release, reaches the
+  whole fleet. A canary is a `workflow_dispatch` with `publish_release=false`
+  from a branch that changes the feature line. Its signed artifact is
+  installed by hand, with auto-update off on that host.
+- 🔒 **`0.4.106` is RESERVED** for the FR-85 Windows canary (branch
+  `fr85-canary-0.4.106`, never merged; the operator, 2026-09-26). **Never tag
+  `agent-v0.4.106`: the next fleet release is `0.4.107`.** A fleet build and a
+  canary that share a version cannot upgrade into each other: the MSI's
+  `MajorUpgrade` refuses the same version, and the updater calls it
+  "up to date".
 
 ## 4 · Break-glass: the build-host path
 
