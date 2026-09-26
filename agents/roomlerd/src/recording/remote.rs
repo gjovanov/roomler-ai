@@ -87,7 +87,7 @@ use tracing::{info, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
-use super::launch::Identity;
+use super::launch::{Identity, Refusal};
 use super::manager::{RecordingManager, RemoteInitiator, StartError};
 
 /// After a host says no, the same session may not ask again for this long:
@@ -475,12 +475,21 @@ fn manager() -> Option<&'static Arc<RecordingManager>> {
 /// asking afresh who is signed in runs `loginctl` on Linux. An answer that
 /// cannot be had reads as "nobody to record as" at a start (refused) and as
 /// "someone" in the watch (stopped): closed both ways.
-async fn fresh_remote_identity(
-    m: &'static Arc<RecordingManager>,
-) -> Result<Identity, super::launch::Refusal> {
+async fn fresh_remote_identity(m: &'static Arc<RecordingManager>) -> Result<Identity, Refusal> {
     tokio::task::spawn_blocking(move || m.identity_remote_fresh())
         .await
-        .unwrap_or(Err(super::launch::Refusal::NoConsoleUser))
+        .unwrap_or(Err(Refusal::NoConsoleUser))
+}
+
+/// The wire code and words for a remote start the identity rule refuses. A
+/// login screen has its own code (decision 6): the controller's fix is to
+/// wait for someone to sign in, which "unavailable" would never say.
+fn identity_refusal(r: Refusal) -> (&'static str, Option<String>) {
+    let code = match r {
+        Refusal::LoginScreen => "login_screen",
+        Refusal::NoConsoleUser | Refusal::RootDaemon | Refusal::SwitchedOff => "unavailable",
+    };
+    (code, Some(r.message().into()))
 }
 
 /// What this device advertises in `AgentCaps.record` right now.
@@ -1000,6 +1009,16 @@ impl Handler {
         let m = manager()?;
         let sid = self.ctx.session_id;
 
+        // FR-85 decision 6 — a device at its login screen is refused before
+        // anyone is asked: whoever stands at a sign-in screen must not be
+        // asked to approve what could never run there. The answer after the
+        // question is decided afresh below, whatever this one said.
+        if self.ctx.prompt_window.is_some()
+            && let Err(r @ Refusal::LoginScreen) = fresh_remote_identity(m).await
+        {
+            return Some(identity_refusal(r));
+        }
+
         if let Some(window) = self.ctx.prompt_window {
             if self
                 .last_deny
@@ -1060,7 +1079,7 @@ impl Handler {
         // in.
         let identity = match fresh_remote_identity(m).await {
             Ok(i) => i,
-            Err(r) => return Some(("unavailable", Some(r.message().into()))),
+            Err(r) => return Some(identity_refusal(r)),
         };
         let unattended = identity == Identity::Unattended;
 
