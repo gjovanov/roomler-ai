@@ -223,16 +223,22 @@ pub struct AgentCaps {
     /// FR-85 P3 — what this agent can record for a REMOTE controller, as
     /// [`RecordCap`] wire words:
     ///
+    /// * `"available"` (P3c-2) — a recorder can serve a remote session here,
+    ///   whether or not the owner allows it. It says the device HAS the
+    ///   feature, never that anyone may use it.
     /// * `"remote"` — the device's owner switched remote recording on
     ///   (`record_remote_enabled`), and the agent serves the `record`
     ///   DataChannel.
     /// * `"remote-audio"` — and allows the computer's audio in one
     ///   (`record_remote_audio`). The microphone is never offered remotely.
     ///
-    /// Advertised only while the device gate is on, so an old agent, or one
-    /// whose owner never opted in, never receives `Permissions::RECORD`: the
-    /// hub strips it. ⚠️ `remote` is a PREFIX of `remote-audio`; matching is
-    /// equality ([`AgentCaps::has_record`]), never `starts_with`.
+    /// `remote` is advertised only while the device gate is on, so an old
+    /// agent, or one whose owner never opted in, never receives
+    /// `Permissions::RECORD`: the hub strips it. `available` only lets the
+    /// hub tell "cannot record here at all" (a viewer shows nothing) from
+    /// "the owner has not allowed it" (a viewer says so). ⚠️ `remote` is a
+    /// PREFIX of `remote-audio`; matching is equality
+    /// ([`AgentCaps::has_record`]), never `starts_with`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub record: Vec<String>,
     /// Clipboard-DC protocol-v2 capability list. Extends the coarse
@@ -654,6 +660,9 @@ pub enum RecordCap {
     Remote,
     /// …and may include what the computer plays.
     RemoteAudio,
+    /// P3c-2 — a recorder can serve a remote session on this device, whether
+    /// or not its owner allows it. Capability, never permission.
+    Available,
 }
 
 impl RecordCap {
@@ -663,11 +672,12 @@ impl RecordCap {
         match self {
             Self::Remote => "remote",
             Self::RemoteAudio => "remote-audio",
+            Self::Available => "available",
         }
     }
 
     /// Every word THIS build knows about.
-    pub const ALL: [RecordCap; 2] = [Self::Remote, Self::RemoteAudio];
+    pub const ALL: [RecordCap; 3] = [Self::Remote, Self::RemoteAudio, Self::Available];
 
     /// Parse a wire word; `None` for anything unrecognised (ignored, never
     /// an error — see [`AgentCaps::has_rpc`]).
@@ -3382,7 +3392,8 @@ pub enum AuditKind {
         #[serde(default, deserialize_with = "crate::permissions::deserialize_stored")]
         permissions: Permissions,
         /// FR-85 P3 — why `RECORD` was stripped from the requested grant
-        /// (`controller_not_allowed` / `device_not_opted_in`); `None` = not
+        /// (`device_cannot_record` / `controller_not_allowed` /
+        /// `device_not_opted_in`); `None` = not
         /// requested, or granted. The server's DECISION, kept here beside the
         /// grant; what the host then did lives in `recording_activity`. A
         /// field rather than a new variant, so a pod on an older build can
@@ -4463,10 +4474,30 @@ mod tests {
         assert!(!future.has_record(RecordCap::Remote));
         // The wire words are a compatibility surface.
         let words: Vec<&str> = RecordCap::ALL.iter().map(|c| c.wire()).collect();
-        assert_eq!(words, vec!["remote", "remote-audio"]);
+        assert_eq!(words, vec!["remote", "remote-audio", "available"]);
         for c in RecordCap::ALL {
             assert_eq!(RecordCap::from_wire(c.wire()), Some(c));
         }
+    }
+
+    /// P3c-2 — `available` says the device HAS a recorder; it is never
+    /// permission. An agent whose owner has not opted in advertises it alone,
+    /// and that must not read as serving remote recording.
+    #[test]
+    fn a_recorder_being_available_is_not_permission_to_record() {
+        let not_opted_in = AgentCaps {
+            record: vec!["available".into()],
+            ..Default::default()
+        };
+        assert!(not_opted_in.has_record(RecordCap::Available));
+        assert!(!not_opted_in.has_record(RecordCap::Remote));
+        assert!(!not_opted_in.has_record(RecordCap::RemoteAudio));
+        let serving = AgentCaps {
+            record: vec!["available".into(), "remote".into()],
+            ..Default::default()
+        };
+        assert!(serving.has_record(RecordCap::Remote));
+        assert!(!serving.has_record(RecordCap::RemoteAudio));
     }
 
     /// ⚠️ `ssh` is a PREFIX of `ssh-consent`, and the difference between them

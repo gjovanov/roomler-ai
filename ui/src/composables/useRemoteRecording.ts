@@ -80,6 +80,7 @@ export const BLOB_CAP = 2 * 1024 * 1024 * 1024
  */
 export const RECORD_REASONS: Record<string, string> = {
   // the server
+  device_cannot_record: "this device can't record its screen",
   controller_not_allowed: "you don't have permission to record remote screens",
   device_not_opted_in: "this device's owner hasn't allowed remote recording",
   // the device, refusing a start
@@ -123,6 +124,18 @@ export const RECORD_REASONS: Record<string, string> = {
 export function describeRecordReason(code: string | null | undefined): string {
   if (!code) return ''
   return RECORD_REASONS[code] ?? code
+}
+
+/**
+ * FR-85 P3c-2 — whether the toolbar shows a disabled Record control for the
+ * server's strip reason. Not for `device_cannot_record`: a device with no
+ * recorder (every agent before recording, a build without it, one switched
+ * off) has nothing to allow or refuse, and a control there would explain a
+ * permission nobody could grant, on every session. Every other reason is
+ * shown, so a controller learns what would let them record.
+ */
+export function showsRecordRefusal(code: string | null | undefined): boolean {
+  return !!code && code !== 'device_cannot_record'
 }
 
 /** A file the person picks (Chromium), or memory with a size cap. */

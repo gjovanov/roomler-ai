@@ -469,7 +469,7 @@
         </v-card>
       </v-menu>
       <span
-        v-else-if="rc.phase.value === 'connected' && rc.recordRefused.value"
+        v-else-if="rc.phase.value === 'connected' && showsRecordRefusal(rc.recordRefused.value)"
         :title="`Recording unavailable: ${describeRecordReason(rc.recordRefused.value)}`"
         data-testid="rc-record-refused"
       >
@@ -1822,7 +1822,11 @@ import {
 } from '@/composables/videoCells'
 import { useI18n } from 'vue-i18n'
 import { useSnackbar } from '@/composables/useSnackbar'
-import { describeRecordReason, type RemoteRecordingItem } from '@/composables/useRemoteRecording'
+import {
+  describeRecordReason,
+  showsRecordRefusal,
+  type RemoteRecordingItem,
+} from '@/composables/useRemoteRecording'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 
