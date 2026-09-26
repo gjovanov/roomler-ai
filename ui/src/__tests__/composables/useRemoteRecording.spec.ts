@@ -152,13 +152,105 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     expect(describeRecordReason('device_cannot_record')).toBe("this device can't record its screen")
   })
 
-  it('a channel that closes mid-recording reads as ended with its session', () => {
+  it('a channel that closes mid-recording reads as reconnecting, not ended (P3b-3)', () => {
     const r = useRemoteRecording()
     const { ch } = fakeChannel()
     r.attach(ch)
     ch.deliver({ t: 'rc:record.state', id: 'a', state: 'recording' })
     ch.close()
+    // The device goes on recording for this controller's next session.
+    expect([r.state.value, r.reason.value]).toEqual(['reconnecting', null])
+    // A question still standing when the session went dies with it.
+    const p = useRemoteRecording()
+    const q = fakeChannel()
+    p.attach(q.ch)
+    q.ch.deliver({ t: 'rc:record.state', id: 'b', state: 'pending_consent' })
+    q.ch.close()
+    expect([p.state.value, p.reason.value]).toEqual(['stopped', 'session_ended'])
+  })
+
+  it("the next session's channel picks the recording up, and Stop names it (P3b-3)", () => {
+    const r = useRemoteRecording()
+    const first = fakeChannel()
+    r.attach(first.ch)
+    r.start(false)
+    const started = first.sent.find((m) => m.t === 'rc:record.start')!
+    first.ch.deliver({ t: 'rc:record.state', id: started.id, state: 'recording' })
+    first.ch.close()
+    expect(r.state.value).toBe('reconnecting')
+
+    // The new session's channel asks for the status as it opens; the device
+    // answers with the SAME recording.
+    const next = fakeChannel(false)
+    r.attach(next.ch)
+    next.ch.reopen()
+    expect(next.sent[0]).toEqual({ t: 'rc:record.status' })
+    next.ch.deliver({ t: 'rc:record.state', id: started.id, state: 'recording', name: 'r.mp4' })
+    expect(r.state.value).toBe('recording')
+    r.stop()
+    expect(next.sent.at(-1)).toEqual({ t: 'rc:record.stop', id: started.id })
+
+    // A page that never started it (a reload) still stops it by its id.
+    const fresh = useRemoteRecording()
+    const again = fakeChannel()
+    fresh.attach(again.ch)
+    again.ch.deliver({ t: 'rc:record.state', id: 'device-side-id', state: 'recording' })
+    fresh.stop()
+    expect(again.sent.at(-1)).toEqual({ t: 'rc:record.stop', id: 'device-side-id' })
+  })
+
+  it('a deliberate Disconnect stops the recording first, and waits for the answer (P3b-3)', async () => {
+    const r = useRemoteRecording()
+    const { ch, sent } = fakeChannel()
+    r.attach(ch)
+    ch.deliver({ t: 'rc:record.state', id: 'a', state: 'recording' })
+    let left = false
+    const leaving = r.stopBeforeLeaving(2000).then(() => {
+      left = true
+    })
+    expect(sent.at(-1)).toEqual({ t: 'rc:record.stop', id: 'a' })
+    await new Promise((res) => setTimeout(res, 120))
+    expect(left, 'it left before the device said the recording stopped').toBe(false)
+    ch.deliver({ t: 'rc:record.state', id: 'a', state: 'stopped', reason: 'requested' })
+    await leaving
+    expect(left).toBe(true)
+
+    // No answer: the Disconnect goes ahead anyway, after the wait.
+    const q = useRemoteRecording()
+    const silent = fakeChannel()
+    q.attach(silent.ch)
+    silent.ch.deliver({ t: 'rc:record.state', id: 'b', state: 'recording' })
+    const t0 = Date.now()
+    await q.stopBeforeLeaving(150)
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(140)
+
+    // Nothing recording (or its channel already gone): nothing to stop.
+    const idle = useRemoteRecording()
+    const nothing = fakeChannel()
+    idle.attach(nothing.ch)
+    await idle.stopBeforeLeaving(5000)
+    expect(nothing.sent.some((m) => m.t === 'rc:record.stop')).toBe(false)
+    const gone = useRemoteRecording()
+    const dropped = fakeChannel()
+    gone.attach(dropped.ch)
+    dropped.ch.deliver({ t: 'rc:record.state', id: 'c', state: 'recording' })
+    dropped.ch.close()
+    await gone.stopBeforeLeaving(5000)
+    expect(dropped.sent.some((m) => m.t === 'rc:record.stop')).toBe(false)
+  })
+
+  it('back after a drop with nothing recording: it ended while this session was away (P3b-3)', () => {
+    const r = useRemoteRecording()
+    const first = fakeChannel()
+    r.attach(first.ch)
+    first.ch.deliver({ t: 'rc:record.state', id: 'a', state: 'recording' })
+    first.ch.close()
+    const next = fakeChannel()
+    r.attach(next.ch)
+    next.ch.deliver({ t: 'rc:record.state', id: '', state: 'idle' })
     expect([r.state.value, r.reason.value]).toEqual(['stopped', 'session_ended'])
+    // Its file is one more to list.
+    expect(next.sent.some((m) => m.t === 'rc:record.list')).toBe(true)
   })
 
   it('downloads a recording to disk: header, chunks in order, the device’s hash shown', async () => {

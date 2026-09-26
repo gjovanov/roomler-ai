@@ -31,6 +31,7 @@
       $('v-who').textContent = 'Being viewed'
       $('v-sub').textContent = ''
       $('v-rec-stop').hidden = true
+      $('v-stop').hidden = false
       return
     }
     // FR-85 P3b — a controller RECORDING outranks one merely watching: it is
@@ -44,6 +45,14 @@
       (recorder ? `Recording your screen for ${who}` : `Being viewed by ${who}`) +
       (extra > 0 ? ` +${extra}` : '')
     $('v-rec-stop').hidden = !recorder
+    // FR-85 P3b-3 — a recording whose session dropped goes on for up to a
+    // minute while its controller reconnects. Say so, and keep only its Stop:
+    // there is no session left to disconnect.
+    $('v-stop').hidden = sessions.every((s) => s.reconnecting)
+    if (first.reconnecting) {
+      $('v-sub').textContent = 'reconnecting · it stops in a minute unless they come back'
+      return
+    }
 
     // The GRANT matters as much as the name: "watching" and "typing on this
     // machine" are different things to be told about.
