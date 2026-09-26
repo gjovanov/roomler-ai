@@ -919,6 +919,22 @@ fn capture_env_prefers_scrap() -> bool {
         .unwrap_or(false)
 }
 
+/// FR-85 decision 6 — does this process capture the synthetic test source?
+/// Always `false` in a build without `synthetic-frame-source`, whatever the
+/// environment says: the capture ignores the variable there, so trusting it
+/// would let a stray variable call a real screen "no one's" (the recorder's
+/// unattended exception reads this).
+pub fn synthetic_frames_requested() -> bool {
+    #[cfg(feature = "synthetic-frame-source")]
+    {
+        synthetic_env_enabled()
+    }
+    #[cfg(not(feature = "synthetic-frame-source"))]
+    {
+        false
+    }
+}
+
 /// Phase 1 — runtime gate for the synthetic-frame-source backend.
 /// True iff `ROOMLERD_SYNTHETIC_FRAMES` parses as truthy
 /// (`1` / `true` / `yes` / `on`, case-insensitive). Anything else

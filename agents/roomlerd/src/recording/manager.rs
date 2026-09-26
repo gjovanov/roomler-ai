@@ -93,9 +93,10 @@ pub struct RemoteInitiator {
 /// a closed set rather than a sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    /// No recorder can be launched here now: SYSTEM with nobody signed in,
-    /// or root (P1e's [`Refusal`]).
-    Unavailable(String),
+    /// No recorder can be launched here now (P1e's [`Refusal`]): SYSTEM or
+    /// root with nobody to record as, a login screen, the kill switch. The
+    /// refusal itself, so a caller can name it (decision 6: `login_screen`).
+    Unavailable(Refusal),
     /// A recording is already running (one at a time).
     Busy,
     /// The recorder refused, failed, or missed its start deadline.
@@ -105,7 +106,8 @@ pub enum StartError {
 impl StartError {
     pub fn message(&self) -> String {
         match self {
-            Self::Unavailable(m) | Self::Failed(m) => m.clone(),
+            Self::Unavailable(r) => r.message().into(),
+            Self::Failed(m) => m.clone(),
             Self::Busy => "a recording is already running".into(),
         }
     }
@@ -237,10 +239,10 @@ impl RecordingManager {
     /// advertises, and the remote precheck)?
     ///
     /// ⚠️ A login screen (decision 6) still CAN: it is who is at the screen
-    /// right now, not what the device is, and the capability is advertised
-    /// once per connection — a device that booted to its sign-in screen
-    /// would hide the Record control until it reconnected, long after
-    /// someone signed in. A start there is refused by name instead.
+    /// right now, not what the device is. `available` is a capability, and a
+    /// viewer hides the Record control without it (P3c-2), so a device at its
+    /// sign-in screen would show no control and no reason at all. A start
+    /// there is refused by name instead ("… once someone signs in").
     pub fn available_remote(&self) -> bool {
         matches!(self.identity_remote(), Ok(_) | Err(Refusal::LoginScreen))
     }
@@ -381,9 +383,13 @@ impl RecordingManager {
     /// container and still need to drive the whole path. `true` = this
     /// platform's service refusal; `false` = record as this process.
     pub fn with_service_identity(self, service_identity: bool) -> Self {
-        // SYSTEM and Linux root with nobody to record as; root on macOS,
-        // where the drop is not built.
-        let refusal = if cfg!(any(windows, target_os = "linux")) {
+        // What each platform's service really answers with nobody to record
+        // as: SYSTEM is at the console's sign-in screen (decision 6: a
+        // Windows service never has an empty seat); Linux root on a host
+        // with no screen at all; root on macOS, where the drop is not built.
+        let refusal = if cfg!(windows) {
+            Refusal::LoginScreen
+        } else if cfg!(target_os = "linux") {
             Refusal::NoConsoleUser
         } else {
             Refusal::RootDaemon
@@ -500,7 +506,7 @@ impl RecordingManager {
             Some((initiator, decided)) => {
                 let now = self
                     .identity_remote_fresh()
-                    .map_err(|r| StartError::Unavailable(r.message().into()))?;
+                    .map_err(StartError::Unavailable)?;
                 if now != decided {
                     return Err(StartError::Failed(
                         "who is signed in at the device changed while the recording started; \
@@ -510,11 +516,7 @@ impl RecordingManager {
                 }
                 (Some(initiator), now)
             }
-            None => (
-                None,
-                self.identity()
-                    .map_err(|r| StartError::Unavailable(r.message().into()))?,
-            ),
+            None => (None, self.identity().map_err(StartError::Unavailable)?),
         };
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()

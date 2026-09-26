@@ -1151,7 +1151,9 @@ impl Handler {
                 self.ctx.indicator.end_recording(sid);
                 Some(match e {
                     StartError::Busy => ("busy", None),
-                    StartError::Unavailable(d) => ("unavailable", Some(d)),
+                    // The launch re-check found a refusal (a login screen
+                    // that came up since the decision): its own name.
+                    StartError::Unavailable(r) => identity_refusal(r),
                     StartError::Failed(d) => ("start_failed", Some(d)),
                 })
             }
@@ -1812,6 +1814,33 @@ mod tests {
             stopping: false,
             indicator: crate::indicator::ViewerIndicator::disabled(),
             outbound: mpsc::channel::<ClientMsg>(1).0,
+        }
+    }
+
+    /// FR-85 decision 6 — a login screen has its own wire code, with the
+    /// device's words; every other identity refusal is `unavailable`, with
+    /// its words. Red when the code is folded into `unavailable`: the viewer
+    /// would say "can't record right now" where "once someone signs in" is
+    /// the answer.
+    #[test]
+    fn a_login_screen_is_its_own_refusal_on_the_wire() {
+        assert_eq!(
+            identity_refusal(Refusal::LoginScreen),
+            (
+                "login_screen",
+                Some(Refusal::LoginScreen.message().to_string())
+            )
+        );
+        for r in [
+            Refusal::NoConsoleUser,
+            Refusal::RootDaemon,
+            Refusal::SwitchedOff,
+        ] {
+            assert_eq!(
+                identity_refusal(r),
+                ("unavailable", Some(r.message().to_string())),
+                "{r:?}"
+            );
         }
     }
 
