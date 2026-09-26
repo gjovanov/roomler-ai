@@ -93,21 +93,43 @@ pub fn find(exe: &Path) -> Vec<CompanionProcess> {
     out
 }
 
-/// Terminate each pid and wait (up to `timeout` in total) for it to be gone.
-/// Returns the pids that are confirmed exited. Best-effort by design: a pid
-/// that vanished on its own, or that we may not open, simply is not counted.
-pub fn terminate_and_wait(pids: &[u32], timeout: Duration) -> Vec<u32> {
+/// Stop each pid that is STILL a process started from `exe`, and wait (up to
+/// `timeout` in total) for it to be gone. Returns the pids confirmed exited.
+///
+/// The check and the kill go through ONE handle: a pid is only a number, and
+/// between [`find`] and here (a `spawn_blocking` hop at least) the process can
+/// exit and the pid be reused. Run as SYSTEM, `PROCESS_TERMINATE` opens almost
+/// anything, so a kill by a bare pid could take an unrelated process down.
+/// Holding the handle pins the process object; re-verifying its started-from
+/// path on that same handle makes "the process we verified" and "the process
+/// we kill" the same object. A pid that no longer verifies is left alone and
+/// not counted.
+pub fn terminate_verified(exe: &Path, pids: &[u32], timeout: Duration) -> Vec<u32> {
+    let want = normalize(exe);
     let deadline = std::time::Instant::now() + timeout;
     let mut gone = Vec::new();
     for &pid in pids {
         // SAFETY: plain OpenProcess; the handle is owned below.
-        let h = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, FALSE, pid) };
+        let h = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE
+                    | PROCESS_SYNCHRONIZE
+                    | PROCESS_QUERY_INFORMATION
+                    | PROCESS_VM_READ,
+                FALSE,
+                pid,
+            )
+        };
         if h.is_null() {
             continue;
         }
         let h = OwnedHandle(h);
-        // SAFETY: `h` is a live process handle with PROCESS_TERMINATE. The
-        // exit code (1) marks a kill, distinct from the tray's own clean quit.
+        if started_from(h.0).is_none_or(|p| normalize(&p) != want) {
+            continue;
+        }
+        // SAFETY: `h` is a live process handle with PROCESS_TERMINATE, just
+        // verified to be ours. The exit code (1) marks a kill, distinct from
+        // the tray's own clean quit.
         unsafe {
             TerminateProcess(h.0, 1);
         }
@@ -181,14 +203,21 @@ fn loaded_path(pid: u32) -> Option<PathBuf> {
         return None;
     }
     let h = OwnedHandle(h);
+    started_from(h.0)
+}
+
+/// [`loaded_path`] on a handle the caller already holds (with at least
+/// `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`).
+fn started_from(h: HANDLE) -> Option<PathBuf> {
     // The FIRST module of the list is the executable itself.
     let mut first: HMODULE = std::ptr::null_mut();
     let mut needed = 0u32;
-    // SAFETY: `h` has QUERY_INFORMATION|VM_READ; the out-buffer holds one
-    // HMODULE and its size is passed; `needed` is a valid out-pointer.
+    // SAFETY: `h` has QUERY_INFORMATION|VM_READ (caller's contract); the
+    // out-buffer holds one HMODULE and its size is passed; `needed` is a
+    // valid out-pointer.
     let ok = unsafe {
         K32EnumProcessModules(
-            h.0,
+            h,
             &mut first,
             std::mem::size_of::<HMODULE>() as u32,
             &mut needed,
@@ -200,7 +229,7 @@ fn loaded_path(pid: u32) -> Option<PathBuf> {
     let mut buf = vec![0u16; 32_768];
     // SAFETY: `h` as above; `first` is a module of that process; `buf` is
     // sized as passed.
-    let n = unsafe { K32GetModuleFileNameExW(h.0, first, buf.as_mut_ptr(), buf.len() as u32) };
+    let n = unsafe { K32GetModuleFileNameExW(h, first, buf.as_mut_ptr(), buf.len() as u32) };
     if n == 0 {
         return None;
     }
@@ -257,7 +286,7 @@ mod tests {
     /// #1686: identity by the path a program was STARTED from, and stop by pid.
     /// Start a program from a path, then do to its file what the refresh does
     /// to the companion's — rename it aside — and check `find` still names it,
-    /// with its session, and `terminate_and_wait` stops it.
+    /// with its session, and `terminate_verified` stops it.
     ///
     /// What this cannot do is recreate the field state itself. On the reporting
     /// host the old companion ran from an image POSIX-unlinked into
@@ -298,7 +327,7 @@ mod tests {
         std::fs::write(&newer, b"the next swap's copy").expect("write the next copy");
         let replace_refused = std::fs::rename(&newer, &aside).is_err();
 
-        let stopped = terminate_and_wait(&[child.id()], Duration::from_secs(10));
+        let stopped = terminate_verified(&exe, &[child.id()], Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
@@ -324,6 +353,44 @@ mod tests {
         assert!(
             find(&exe).iter().all(|p| p.pid != child.id()),
             "gone once stopped"
+        );
+    }
+
+    /// The pid-reuse guard: a pid handed to `terminate_verified` that is NOT
+    /// (or no longer) a process started from `exe` is left running — the
+    /// check and the kill are one handle, so a reused pid cannot be killed on
+    /// the strength of what `find` saw earlier.
+    #[test]
+    fn a_pid_that_does_not_verify_against_the_path_is_left_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let system32 = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let ours = dir
+            .path()
+            .join(format!("fr1686-ours-{}.exe", std::process::id()));
+        let other = dir
+            .path()
+            .join(format!("fr1686-other-{}.exe", std::process::id()));
+        for p in [&ours, &other] {
+            std::fs::copy(Path::new(&system32).join(r"System32\cmd.exe"), p).expect("copy cmd.exe");
+        }
+        let mut bystander = std::process::Command::new(&other)
+            .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn the bystander");
+
+        // The bystander's pid, claimed to be a process started from `ours`.
+        let stopped = terminate_verified(&ours, &[bystander.id()], Duration::from_secs(2));
+        let still_running = bystander.try_wait().ok().flatten().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+
+        assert!(
+            stopped.is_empty(),
+            "nothing it could not verify is counted as stopped"
+        );
+        assert!(
+            still_running,
+            "a process started from another path is never killed"
         );
     }
 }
