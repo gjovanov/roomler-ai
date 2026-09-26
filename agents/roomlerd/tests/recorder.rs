@@ -102,6 +102,9 @@ struct CounterCapture {
     /// FR-85 P1d — a pointer this "backend" cannot draw itself, handed to
     /// the recorder to draw (as DXGI and X11 do).
     pointer: Option<Box<dyn PointerSource>>,
+    /// FR-85 P1d — after this many frames the screen goes still: no new
+    /// frame, the way DXGI, or X11's damage tracking, reports "unchanged".
+    still_after: Option<u64>,
 }
 
 impl CounterCapture {
@@ -113,6 +116,7 @@ impl CounterCapture {
             resize_after: None,
             fail: false,
             pointer: None,
+            still_after: None,
         }
     }
 }
@@ -130,6 +134,10 @@ impl ScreenCapture for CounterCapture {
             tokio::time::sleep(due - now).await;
         }
         self.n = (self.start.elapsed().as_nanos() / self.interval.as_nanos()) as u64;
+        if self.still_after.is_some_and(|k| self.n >= k) {
+            self.n += 1;
+            return Ok(None);
+        }
         let (w, h) = match self.resize_after {
             Some(k) if self.n >= k => (W + 64, H),
             _ => (W, H),
@@ -436,12 +444,19 @@ fn patch_luma(y_plane: &[u8], stride: usize, cx: usize, cy: usize) -> u32 {
 /// mid-grey test screen, at A for the first half of the recording and at B
 /// for the rest. Decoded back, the square is where the source said, and
 /// moving it leaves nothing behind.
+///
+/// ⚠️ The screen goes STILL (no new capture) well before the pointer moves.
+/// That is the case that matters: over a changing screen every tick brings a
+/// fresh capture, which hides a pointer drawn only on captures, and a trail
+/// left by pixels never put back. Measured: with the put-back removed, this
+/// cell stayed green while the screen kept changing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pointer_a_backend_cannot_draw_is_drawn_into_the_recording() {
     const SIDE: u32 = 32;
     let (a, b) = ((96, 112), (224, 112));
     let dir = scratch();
     let mut cap = CounterCapture::new(30);
+    cap.still_after = Some(20);
     cap.pointer = Some(Box::new(Walk {
         polls: 0,
         switch_after: 45,
