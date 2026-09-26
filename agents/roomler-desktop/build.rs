@@ -61,5 +61,12 @@ fn main() {
     write_if_missing(Path::new("icons/icon.ico"), PLACEHOLDER_ICO);
     write_if_missing(Path::new("icons/icon.png"), PLACEHOLDER_PNG);
     write_if_missing(Path::new("icons/tray.png"), PLACEHOLDER_PNG);
+    // FR-85 — the tray's two icons are embedded by `tauri::include_image!`
+    // (tray.rs), which cargo cannot see as inputs: without these a
+    // regenerated icon ships its old pixels on an incremental build.
+    // (tauri-build emits its own `rerun-if-changed` lines, so these only add
+    // to the list.)
+    println!("cargo:rerun-if-changed=icons/tray.png");
+    println!("cargo:rerun-if-changed=icons/tray-recording.png");
     tauri_build::build()
 }

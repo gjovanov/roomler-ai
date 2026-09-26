@@ -1004,7 +1004,7 @@ pub struct ConsentRequest {
 /// There was no LocalAPI verb for this at all before, which is why the banner
 /// existed only as the Windows-native overlay inside the daemon — no thin
 /// client could see a session, let alone end one.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct RcSessionInfo {
     /// Hex `ObjectId` — the handle [`Request::RcDisconnect`] takes.
     pub session_id: String,

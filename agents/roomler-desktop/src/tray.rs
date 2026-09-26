@@ -8,7 +8,9 @@
 //!   - Open Roomler       — show the main window (Overview view)
 //!   - Start/Stop recording — FR-85: record this screen through the device
 //!                           service; the label and the tray tooltip follow
-//!                           the recorder (a light poll, every 3 s)
+//!                           the recorder (a light poll, every 3 s), and
+//!                           the ICON turns red while any recording runs,
+//!                           this device's own or a controller's
 //!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Welcome tour…      — FR-84 D6: the first-run tour, again
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
@@ -19,6 +21,9 @@
 //!
 //! Navigation: the SPA is one page with a hash router (`app.js`), so
 //! `show_window` navigates by evaluating `location.hash = '#/<view>'`.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -150,19 +155,125 @@ const FALLBACK_TRAY_ID: &str = "roomler-desktop-tray";
 /// FR-85 — the Start/Stop recording menu item.
 const RECORD_ITEM_ID: &str = "record_toggle";
 
+/// FR-85 — the configured tray's icon while nothing records: the menu-bar
+/// template `app.trayIcon` names.
+const TRAY_IDLE: tauri::image::Image<'static> = tauri::include_image!("icons/tray.png");
+/// FR-85 — the tray while a recording runs: the mark in full colour with a
+/// red dot (`scripts/gen-tray-icons.py`).
+const TRAY_RECORDING: tauri::image::Image<'static> =
+    tauri::include_image!("icons/tray-recording.png");
+
+/// FR-85 — the configured tray's icon for the recorder's state, and whether
+/// it is a macOS template. ⚠️ The red one is never a template: the system
+/// tints a template to the menu bar's colour, and a recording must read as
+/// red (docs/remote-control.md §11.3).
+fn tray_look(recording: bool) -> (tauri::image::Image<'static>, bool) {
+    if recording {
+        (TRAY_RECORDING, false)
+    } else {
+        (TRAY_IDLE, true)
+    }
+}
+
+/// FR-85 — the two things that turn the tray red, each learned by a poll:
+/// - a controller's recording MARKED on a session (the session watch in
+///   `main.rs`, every 750 ms, the poll the "being viewed" banner rides). The
+///   daemon marks a remote recording before its first frame is written, so
+///   the red comes up with the banner (AC5: "the host's banner and red dot");
+/// - the recorder RUNNING (`spawn_recording_watch`, every 3 s), which also
+///   covers a recording the person started here.
+///
+/// ⚠️ Each changes only when its poll is ANSWERED. A poll that failed (the
+/// pipe busy for a moment) keeps what the last answer said, so the red never
+/// drops off a recording that is still running; a recording that ended
+/// answers so. (The FR-84 D1 rule: a failed refresh keeps the last good
+/// data. For an indicator of recording, the wrong way to fail is to say
+/// nothing is.) A service that is not there at all IS an answer
+/// ([`no_service`]): nothing records without it, and the banner comes down
+/// with it, so the tray must too.
+static REMOTE_MARKED: AtomicBool = AtomicBool::new(false);
+static RECORDER_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Whether the tray is red now. Both watches apply it; the lock makes one
+/// change at a time.
+static SHOWN_RED: Mutex<bool> = Mutex::new(false);
+
+/// FR-85 — the device service is not there at all: its pipe or socket is
+/// missing, or nobody listens on it. That is an ANSWER (nothing records
+/// without it), unlike a busy or failing one.
+pub fn no_service(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// FR-85 — the recorder's input after a poll. `Some(answer)`: the service
+/// answered, and `Some(None)` is no service at all, so nothing records.
+/// `None`: the poll failed; what the last answer said stands.
+fn recorder_running(answer: Option<Option<&roomler_localapi::RecordingState>>, was: bool) -> bool {
+    match answer {
+        Some(state) => state.is_some_and(|s| s.active),
+        None => was,
+    }
+}
+
+/// FR-85 — whether any session carries a recording mark, or what the last
+/// answer said when the poll failed (`None`).
+fn remote_marked(answer: Option<&[roomler_localapi::RcSessionInfo]>, was: bool) -> bool {
+    answer.map_or(was, |sessions| sessions.iter().any(|s| s.recording))
+}
+
+/// FR-85 — the session watch's answer (`main.rs`): `None` when the poll
+/// failed.
+pub fn sessions_answered<R: Runtime>(
+    app: &AppHandle<R>,
+    answer: Option<&[roomler_localapi::RcSessionInfo]>,
+) {
+    let was = REMOTE_MARKED.load(Ordering::Acquire);
+    REMOTE_MARKED.store(remote_marked(answer, was), Ordering::Release);
+    apply_red(app);
+}
+
+/// Red while either says a recording runs; back after.
+fn apply_red<R: Runtime>(app: &AppHandle<R>) {
+    let Ok(mut shown) = SHOWN_RED.lock() else {
+        return;
+    };
+    // Read UNDER the lock: read before it, a watch holding a stale pair
+    // could apply it after the other watch had applied the fresh one.
+    let want = REMOTE_MARKED.load(Ordering::Acquire) || RECORDER_RUNNING.load(Ordering::Acquire);
+    if *shown == want {
+        return;
+    }
+    let mut applied = false;
+    for id in [CONFIG_TRAY_ID, FALLBACK_TRAY_ID] {
+        if let Some(tray) = app.tray_by_id(id) {
+            applied |= set_tray_look(app, &tray, id == CONFIG_TRAY_ID, want);
+        }
+    }
+    // Only a change that took counts as shown: one that failed (Explorer
+    // restarting, a temp file that could not be written) is tried again at
+    // the next poll, rather than leave a whole recording without the red.
+    if applied {
+        *shown = want;
+    }
+}
+
 /// What the tray shows for the recorder's state. Pure, so the wording is
-/// tested: `None` = the service has no recorder (or is down) and the item is
-/// disabled.
+/// tested: a service without a recorder answers `available: false` and the
+/// item is disabled; `None` (nothing has answered yet) is the tray as
+/// `install` builds it, the item disabled too. A controller's recording
+/// names them: the person at the device sees who is recording their screen.
 fn record_labels(state: Option<&roomler_localapi::RecordingState>) -> (String, bool, String) {
     match state {
         Some(s) if s.active => {
             let secs = s.duration_ms / 1000;
             let t = format!("{}:{:02}", secs / 60, secs % 60);
-            (
-                format!("Stop recording ({t})"),
-                true,
-                format!("Roomler — recording {t}"),
-            )
+            let tooltip = match s.remote_controller.as_deref() {
+                Some(who) => format!("Roomler — {who} is recording, {t}"),
+                None => format!("Roomler — recording {t}"),
+            };
+            (format!("Stop recording ({t})"), true, tooltip)
         }
         // Start only where the service says a recording can start at all.
         Some(s) => ("Start recording".into(), s.available, "Roomler".into()),
@@ -170,31 +281,75 @@ fn record_labels(state: Option<&roomler_localapi::RecordingState>) -> (String, b
     }
 }
 
-/// Keep the menu item and the tooltip in step with the recorder, started by
-/// this item, the Recordings view, or `roomler record` alike. One LocalAPI
-/// request every 3 s — the listener keeps a pool of instances (FR-84 D1).
+/// Keep the menu item, the tooltip and the icon in step with the recorder,
+/// started by this item, the Recordings view, `roomler record` or a
+/// controller alike. One LocalAPI request every 3 s — the listener keeps a
+/// pool of instances (FR-84 D1).
 fn spawn_recording_watch<R: Runtime>(app: AppHandle<R>, item: MenuItem<R>) {
     tauri::async_runtime::spawn(async move {
         let mut shown: Option<(String, bool, String)> = None;
         loop {
-            let state = match roomler_localapi::connect().await {
-                Ok(mut c) => c.record_status().await.ok(),
+            // `Some(Some(state))` answered; `Some(None)` there is no service
+            // at all; `None` the poll failed.
+            let answer = match roomler_localapi::connect().await {
+                Ok(mut c) => c.record_status().await.ok().map(Some),
+                Err(e) if no_service(&e) => Some(None),
                 Err(_) => None,
             };
-            let labels = record_labels(state.as_ref());
-            if shown.as_ref() != Some(&labels) {
-                let _ = item.set_text(&labels.0);
-                let _ = item.set_enabled(labels.1);
-                for id in [CONFIG_TRAY_ID, FALLBACK_TRAY_ID] {
-                    if let Some(tray) = app.tray_by_id(id) {
-                        let _ = tray.set_tooltip(Some(&labels.2));
+            // Only an answer changes the tray, the words as well as the icon
+            // (`recorder_running`), so the two never disagree. Until the
+            // first answer it stays as `install` built it: the item disabled.
+            if let Some(state) = answer.as_ref() {
+                let labels = record_labels(state.as_ref());
+                if shown.as_ref() != Some(&labels) {
+                    let _ = item.set_text(&labels.0);
+                    let _ = item.set_enabled(labels.1);
+                    for id in [CONFIG_TRAY_ID, FALLBACK_TRAY_ID] {
+                        if let Some(tray) = app.tray_by_id(id) {
+                            let _ = tray.set_tooltip(Some(&labels.2));
+                        }
                     }
+                    shown = Some(labels);
                 }
-                shown = Some(labels);
             }
+            let was = RECORDER_RUNNING.load(Ordering::Acquire);
+            RECORDER_RUNNING.store(
+                recorder_running(answer.as_ref().map(Option::as_ref), was),
+                Ordering::Release,
+            );
+            apply_red(&app);
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
+}
+
+/// FR-85 — turn the tray red while a recording runs, and back after. The
+/// fallback tray (built when `app.trayIcon` names none) idles on the app
+/// icon, as `install` built it. `true` = the icon changed.
+fn set_tray_look<R: Runtime>(
+    app: &AppHandle<R>,
+    tray: &tauri::tray::TrayIcon<R>,
+    configured: bool,
+    recording: bool,
+) -> bool {
+    let (icon, template) = if configured || recording {
+        tray_look(recording)
+    } else {
+        match app.default_window_icon() {
+            Some(icon) => (icon.clone(), false),
+            None => return false,
+        }
+    };
+    // The icon and its template flag in ONE step: set apart, macOS draws
+    // the idle template untinted for a moment, invisible on a dark menu bar.
+    // Elsewhere this is `set_icon`.
+    match tray.set_icon_with_as_template(Some(icon), template) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(%e, recording, "tray: could not change the icon");
+            false
+        }
+    }
 }
 
 /// Start or stop a recording from the tray. A refusal (not the console
@@ -321,5 +476,127 @@ mod tests {
             record_labels(None),
             ("Start recording".into(), false, "Roomler".into())
         );
+        // A controller's recording names them: the person at the device sees
+        // who is recording, not just that something is.
+        let remote = roomler_localapi::RecordingState {
+            available: true,
+            active: true,
+            duration_ms: 5_000,
+            remote_controller: Some("Tester".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            record_labels(Some(&remote)),
+            (
+                "Stop recording (0:05)".into(),
+                true,
+                "Roomler — Tester is recording, 0:05".into()
+            )
+        );
+    }
+
+    /// FR-85 — the red follows the service's answers, and a poll that fails
+    /// changes nothing: a busy pipe mid-recording must not take the red off
+    /// (nor put it on). Both inputs: the recorder, and a controller's mark on
+    /// a session, which only a session RECORDING sets (a viewer's does not).
+    #[test]
+    fn only_an_answer_moves_the_red() {
+        let idle = roomler_localapi::RecordingState {
+            available: true,
+            ..Default::default()
+        };
+        let live = roomler_localapi::RecordingState {
+            available: true,
+            active: true,
+            ..Default::default()
+        };
+        assert!(
+            recorder_running(Some(Some(&live)), false),
+            "a recording started"
+        );
+        assert!(
+            !recorder_running(Some(Some(&idle)), true),
+            "a recording ended"
+        );
+        assert!(
+            recorder_running(None, true),
+            "a failed poll took the red off"
+        );
+        assert!(
+            !recorder_running(None, false),
+            "a failed poll turned it red"
+        );
+        // No service at all is an answer: nothing records without it.
+        assert!(
+            !recorder_running(Some(None), true),
+            "the red outlived the device service"
+        );
+        use std::io::{Error, ErrorKind};
+        assert!(no_service(&Error::from(ErrorKind::NotFound)));
+        assert!(no_service(&Error::from(ErrorKind::ConnectionRefused)));
+        for busy in [ErrorKind::TimedOut, ErrorKind::WouldBlock, ErrorKind::Other] {
+            assert!(
+                !no_service(&Error::from(busy)),
+                "{busy:?} read as no service"
+            );
+        }
+
+        let session = |recording| roomler_localapi::RcSessionInfo {
+            session_id: "0".repeat(24),
+            recording,
+            ..Default::default()
+        };
+        let watched = [session(false)];
+        let recorded = [session(false), session(true)];
+        assert!(
+            remote_marked(Some(&recorded), false),
+            "a controller records"
+        );
+        assert!(!remote_marked(Some(&watched), true), "a viewer is not red");
+        assert!(!remote_marked(Some(&[]), true), "no session is not red");
+        assert!(remote_marked(None, true), "a failed poll took the red off");
+        assert!(!remote_marked(None, false), "a failed poll turned it red");
+    }
+
+    /// The red, fully opaque pixels of `img`, anywhere or only in its
+    /// bottom-right quarter.
+    fn red_pixels(img: &tauri::image::Image<'_>, bottom_right_only: bool) -> usize {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        img.rgba()
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(i, p)| {
+                let (x, y) = (i % w, i / w);
+                (!bottom_right_only || (x >= w / 2 && y >= h / 2))
+                    && p[0] > 200
+                    && p[1] < 100
+                    && p[2] < 100
+                    && p[3] > 200
+            })
+            .count()
+    }
+
+    /// FR-85 — a recording turns the tray red (docs/remote-control.md
+    /// §11.3). The icon swapped in has a red dot, in its bottom-right corner
+    /// and nowhere else; the idle one has no red at all; the red one is never
+    /// a macOS template (the system would tint it) and is the idle one's
+    /// size, so the menu bar does not jump.
+    #[test]
+    fn a_recording_turns_the_tray_red() {
+        let (rec, rec_template) = tray_look(true);
+        let (idle, idle_template) = tray_look(false);
+        assert!(!rec_template, "a template would be tinted, never red");
+        assert!(idle_template, "the idle tray is the menu-bar template");
+        assert!(
+            red_pixels(&rec, true) > 100,
+            "the recording icon has no red dot"
+        );
+        assert_eq!(
+            red_pixels(&rec, false),
+            red_pixels(&rec, true),
+            "red outside the dot's corner"
+        );
+        assert_eq!(red_pixels(&idle, false), 0, "the idle icon has red in it");
+        assert_eq!((rec.width(), rec.height()), (idle.width(), idle.height()));
     }
 }
