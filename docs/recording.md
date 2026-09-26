@@ -2,8 +2,8 @@
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
-> its audio on Windows and Linux, and on Windows the identity rule: it runs as
-> the person at the device, §6), P2a (the local verbs), P2b
+> its audio on Windows and Linux, and on Windows and Linux the identity
+> rule: it runs as the person at the device, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
 > P3c (the viewer's Record and Download, §10) and P5a (the export engine: cut
@@ -307,7 +307,10 @@ flowchart TD
     S -->|"SYSTEM"| C{"someone signed in<br/>at the console?"}
     C -->|yes| U["ConsoleUser:<br/>that person's own token"]
     C -->|no| N["refused: nobody to record as"]
-    S -->|"root (Linux, macOS)"| X["refused: the drop to the<br/>console user is not built yet"]
+    S -->|"root (Linux)"| L{"someone signed in at the<br/>active graphical session?<br/>(a person, not the greeter)"}
+    L -->|yes| SU["SessionUser: their uid, gid<br/>and groups, in their session"]
+    L -->|no| N
+    S -->|"root (macOS)"| X["refused: the drop is<br/>not built there yet"]
 ```
 
 | The recorder's identity | How it is made | Its environment | Its desktop |
@@ -315,6 +318,7 @@ flowchart TD
 | **Inherit** | `tokio::process`, as before P1e | the daemon's | the daemon's |
 | **RestrictedCopy** | `CreateRestrictedToken` from the daemon's OWN token: every admin-equivalent group deny-only, every privilege but traverse removed, then medium integrity, the owner and the default DACL made the user's | the daemon's (the same person) | the worker's |
 | **ConsoleUser** | `WTSQueryUserToken` (the SSH console-user path) | the person's own (`CreateEnvironmentBlock`) | `winsta0\default` |
+| **SessionUser** (Linux) | `exec::drop_to_std`, the one privilege drop the SSH and portal paths use: supplementary groups, then gid, then uid, verified | the session's: `XDG_RUNTIME_DIR`, the session bus, `DISPLAY` or `WAYLAND_DISPLAY`, the X cookie (`XAUTHORITY`, found as the window list finds it), `HOME`, `USER`, `LOGNAME` | their session's |
 
 Both token launches use `CreateProcessAsUserW` with a **bounded handle list**
 (stdin, stdout, stderr and nothing else), and the recorder's stderr is copied
@@ -335,6 +339,23 @@ into the daemon's log: a service has no stderr of its own to share.
   rule forbids. Impersonated, every open is checked against the person's own
   rights. A failed `RevertToSelf` aborts the process: a pool thread left
   wearing someone else's identity is worse than a restart.
+- ⚠️ **On Linux, the same work by the thread's filesystem identity**
+  (`launch::unix::FsIdentity`): the thread's fsuid, fsgid and supplementary
+  groups become the person's, and Linux checks every open, create and unlink
+  against those. The capabilities that let root skip the checks
+  (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`, …) leave the
+  thread's effective set while its fsuid is not 0 and come back with it. The
+  groups change by the raw syscall, because glibc's `setgroups` changes every
+  thread of the daemon; without them, root's group 0 would still read a
+  `root:root 0640` file that a link in the folder pointed at. Every switch is
+  verified, and a thread that cannot become the daemon again aborts the
+  process, as on Windows.
+- **Who is signed in, on Linux**: the active graphical session from
+  `loginctl` (the walk the consent companion and the portal helper share),
+  `Class=user` only, so a display manager's greeter at the login screen is
+  nobody. uid 0 counts as nobody too: the recorder never runs as root. The
+  answer is reused for 5 s, since the Recordings view polls every second
+  while a recording runs.
 - **The folder is decided by the recorder, as the recorder.** A SYSTEM
   daemon's own "Videos" is SYSTEM's, and its write probe passes where the
   person's would not. So the daemon asks `roomlerd record --where`, launched
@@ -345,9 +366,11 @@ into the daemon's log: a service has no stderr of its own to share.
   secure desktop. The recording holds its last frame, and a lock longer than
   about half a minute ends it `capture_failed` (`recorder.rs`, 300 failed
   pulls). It never records the lock screen itself.
-- Not yet: the unix drop to the console user (a root daemon refuses), and the
+- Not yet: the drop on macOS (a root daemon there refuses), and the
   unattended exception (a device with nobody signed in records as the daemon,
-  into the daemon's own folder).
+  into the daemon's own folder). On a GNOME or KDE **Wayland** session a
+  recorder launched into it opens its own ScreenCast portal session, so the
+  portal may ask the person first (P0's restore-token question).
 
 ## 7. roomler-desktop — the Recordings view and the tray (P2b)
 
@@ -766,6 +789,7 @@ recordings (P4).
 |---|---|---|
 | `recording::*` unit tests | Annex-B split and parameter sets; the fragmented writer (keyframe cuts, refusals, never overwriting); remux sample order with `moov` first; truncated recovery; audio interleave; the pacer's tick math and FIFO; folder probe, validation, names, OneDrive/UNC; sidecar round trip; the manager's event folding, delete-name rules and listing; the identity rule as a table | `ci.yml` "Test the recorder (FR-85)" (`--lib recording::`) |
 | `recording::launch` unit tests, Windows (P1e) | every argument comes back whole through Windows's own parser (`CommandLineToArgvW`): a display name full of quotes, backslashes and `--out` stays ONE argument; an added variable replaces its namesake whatever its case; **work done as the recorder gets only the recorder's rights**: an elevated run writes into an Administrators-only folder, and the same write made through `as_identity(RestrictedCopy)` is refused, then the thread is itself again (red without the impersonation) | `ci.yml` "Windows recorder identity (FR-85)", elevated on purpose (`ROOMLERD_TEST_REQUIRE_ELEVATED` fails a runner that is not) |
+| `recording::launch` unit tests, Linux as root (P1e-unix) | work done as the person gets only the person's rights: a folder only root may write is refused, a `root:root 0640` file only root's group may read is refused, and afterwards the thread is root again; the launch runs as the person with none of root's groups (`id` says so); root is never the account a session resolves to. Red, each on its own cell: the fsuid left alone, the groups left alone (root's group 0 reads the file), the restore skipped, the drop skipped. The decision table gains the Linux rows (as the person; refused with nobody, or only a greeter, at the screen; a user unit unchanged), and the refusal names root, not SYSTEM | `ci.yml` "Linux recorder identity (FR-85)": the lib test binary built as the runner and run under `sudo`; `ROOMLERD_TEST_REQUIRE_ROOT` fails a run that is not root instead of passing by skipping |
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
 | `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |

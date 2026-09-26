@@ -196,7 +196,9 @@ impl RecordingManager {
     /// container and still need to drive the whole path. `true` = this
     /// platform's service refusal; `false` = record as this process.
     pub fn with_service_identity(self, service_identity: bool) -> Self {
-        let refusal = if cfg!(windows) {
+        // SYSTEM and Linux root with nobody to record as; root on macOS,
+        // where the drop is not built.
+        let refusal = if cfg!(any(windows, target_os = "linux")) {
             Refusal::NoConsoleUser
         } else {
             Refusal::RootDaemon
