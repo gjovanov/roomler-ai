@@ -1643,12 +1643,13 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permissions: Option<crate::permissions::Permissions>,
         /// FR-85 P3 — why `RECORD` was taken out of the requested grant, when
-        /// it was: `controller_not_allowed` (not the device's owner, an
-        /// ADMINISTRATOR or a `RECORD_REMOTE_SCREEN` holder — or a
-        /// break-glass session) or `device_not_opted_in` (the device's owner
-        /// has not switched remote recording on). The viewer says so rather
-        /// than just hiding a button. Additive: absent = not requested, or
-        /// granted.
+        /// it was: `device_cannot_record` (P3c-2: no recorder on the device
+        /// at all — the viewer shows no Record control), `controller_not_allowed`
+        /// (not the device's owner, an ADMINISTRATOR or a
+        /// `RECORD_REMOTE_SCREEN` holder — or a break-glass session) or
+        /// `device_not_opted_in` (the device's owner has not switched remote
+        /// recording on). The viewer says so for the last two rather than
+        /// just hiding a button. Additive: absent = not requested, or granted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record_refused: Option<String>,
     },

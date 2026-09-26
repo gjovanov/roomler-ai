@@ -8,6 +8,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   describeRecordReason,
+  showsRecordRefusal,
   useRemoteRecording,
   type RecordChannel,
   type RecordSink,
@@ -133,6 +134,22 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
       "nothing on the device can show that it's being recorded",
     )
     expect(describeRecordReason('a_code_from_a_newer_device')).toBe('a_code_from_a_newer_device')
+  })
+
+  it('a device with no recorder gets no Record control; every other strip reason is shown (P3c-2)', () => {
+    // Nothing there to allow or refuse: no disabled control on every session
+    // to every device that predates recording.
+    expect(showsRecordRefusal('device_cannot_record')).toBe(false)
+    // What a controller can act on, or ask for, is still said.
+    expect(showsRecordRefusal('device_not_opted_in')).toBe(true)
+    expect(showsRecordRefusal('controller_not_allowed')).toBe(true)
+    // A reason from a newer server is shown, never swallowed.
+    expect(showsRecordRefusal('a_code_from_a_newer_server')).toBe(true)
+    // No refusal, no control.
+    expect(showsRecordRefusal(null)).toBe(false)
+    expect(showsRecordRefusal(undefined)).toBe(false)
+    expect(showsRecordRefusal('')).toBe(false)
+    expect(describeRecordReason('device_cannot_record')).toBe("this device can't record its screen")
   })
 
   it('a channel that closes mid-recording reads as ended with its session', () => {
