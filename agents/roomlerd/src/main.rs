@@ -1064,6 +1064,19 @@ async fn daemon_main() -> Result<()> {
         return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
     }
 
+    // #1705 — the desktop companion's service probes (every 10 s) answer one
+    // question about the service manager; none of the daemon setup below is
+    // theirs, and its startup lines used to flood the per-user log.
+    if let Some(as_service) = service::companion_probe(&std::env::args().collect::<Vec<_>>()) {
+        return if as_service {
+            service_status_as_service()
+        } else {
+            let s = service::status().context("querying auto-start status")?;
+            println!("Auto-start: {s}");
+            Ok(())
+        };
+    }
+
     // Set per-monitor-V2 DPI awareness as the very first thing on
     // Windows. Capture frames (WGC / DXGI / scrap) are always physical
     // pixels regardless of awareness, but enigo's mouse-position APIs
