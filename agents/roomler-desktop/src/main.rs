@@ -265,8 +265,11 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
                     .filter(|p| p.surface != "native")
                     .map(|p| p.session_id)
                     .collect();
-                let live = c.rc_sessions().await.unwrap_or_default();
-                (pending, live)
+                let live = c.rc_sessions().await;
+                // FR-85 — the tray turns red with the banner, from this same
+                // answer; a failed poll leaves it as the last answer said.
+                tray::sessions_answered(&app, live.as_deref().ok());
+                (pending, live.unwrap_or_default())
             }
             // Daemon down / pipe absent ⇒ nothing pending, nothing live.
             Err(_) => (HashSet::new(), Vec::new()),
