@@ -397,6 +397,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Environment",          # CreateEnvironmentBlock
     "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot (find winlogon.exe pid for M3 A1)
+    "Win32_System_ProcessStatus",        # K32GetModuleFileNameExW (kernel32) — a running companion's STARTED-from path, which survives a rename/POSIX delete of its file (#1686)
     "Win32_UI_HiDpi",                    # SetProcessDpiAwarenessContext (mouse offset fix)
     "Win32_UI_Input_KeyboardAndMouse",   # SendInput + VkKeyScanExW + MapVirtualKeyExW (rc.122 real-VK text injection for the legacy console)
     "Win32_UI_WindowsAndMessaging",      # GetDesktopWindow + GetSystemMetrics (M3 A1 GDI fallback)
