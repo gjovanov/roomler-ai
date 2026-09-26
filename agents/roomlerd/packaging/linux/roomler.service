@@ -49,11 +49,14 @@ ProtectHome=read-only
 # set up mount namespacing: <the legacy config folder>: No such file or
 # directory") — measured on systemd 255 — and a host that never ran the
 # pre-rename agent has neither folder, so the unit could not start there at
-# all WHEREVER THE SANDBOX APPLIES. A user manager applies it only if it can
-# create an unprivileged user namespace; where it cannot (e.g. Ubuntu 24.04's
-# default AppArmor restriction) systemd logs "Failed to set up user
-# namespacing for unprivileged user, ignoring" and runs this unit with NO
-# sandbox at all, which is why such a host started fine. The NEW pair keeps
+# all WHEREVER THE SANDBOX APPLIES. A user manager applies it only inside an
+# unprivileged user namespace it may mount in. Where it cannot create one,
+# systemd logs "Failed to set up user namespacing for unprivileged user,
+# ignoring"; where it can but may not mount in it (default Ubuntu 24.04:
+# AppArmor's unprivileged-userns restriction) it skips the mounts silently.
+# Either way this unit then runs with NO sandbox at all, which is why a fresh
+# 24.04 guest started it fine (field-verified: the daemon shared the
+# session's mount namespace, no read-only /home). The NEW pair keeps
 # no prefix on purpose: `roomlerd enroll` creates both (the config, and the
 # log folder), and a unit started before enrolling should fail naming the
 # missing folder rather than run with it read-only.
