@@ -97,6 +97,10 @@ Considered and rejected:
   holds sockets inside the range (one bound to the public IP); DNAT only captures NEW
   inbound flows and established carriers ride conntrack, and jupiter has run with the
   overlap since S6. Optional hardening if cold-inbound dials to fleet hosts ever matter.
+  → **They did** ([#1665](https://github.com/gjovanov/roomler-ai/issues/1665)): after a
+  roll both hosts sat on DERP. Done 2026-09-26: the overlay port is pinned to 21640 and
+  `ip_local_reserved_ports=40000-49999` keeps ephemeral sockets out
+  (`docs/deployment.md` › Cluster hosts).
 
 ## Related
 
