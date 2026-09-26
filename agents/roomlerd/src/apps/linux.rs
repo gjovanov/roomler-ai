@@ -645,7 +645,7 @@ fn probe(target: &Target) -> Probe {
 /// `DISPLAY` and nothing else. The compositor-generated name is a glob
 /// (`.mutter-Xwaylandauth.XXXXXX`), so the directory is scanned rather than a
 /// path guessed.
-fn find_xauthority(uid: u32) -> Option<PathBuf> {
+pub(crate) fn find_xauthority(uid: u32) -> Option<PathBuf> {
     let run = PathBuf::from(format!("/run/user/{uid}"));
     // Newest first: a compositor restart leaves the old cookie behind, and the
     // stale one authorises nothing.

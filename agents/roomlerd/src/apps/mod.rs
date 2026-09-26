@@ -53,6 +53,11 @@ use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
 mod linux;
+/// FR-85 P1e-unix — the recorder, launched into a person's X session, needs
+/// the same cookie the window list does. Gated to that one consumer, so a
+/// build without the recorder has no unused re-export.
+#[cfg(all(target_os = "linux", feature = "recording"))]
+pub(crate) use linux::find_xauthority;
 #[cfg(target_os = "windows")]
 mod windows;
 
