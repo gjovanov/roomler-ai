@@ -11,6 +11,11 @@
 # overshoots (and is usually not a multiple of 4), which shears every captured
 # frame on macOS. Field-hit on a MacBook Pro, 2026-08-23.
 #
+# FR-85 P1d adds `Display::origin()` for DXGI and X11: where the captured
+# display sits in screen coordinates, so a recording can place the mouse
+# pointer in the frame. DXGI's first output need not be the primary monitor,
+# and an X11 monitor is a rectangle of the root window.
+#
 #   scripts/revendor-scrap.sh [version]           rebuild the vendored tree from
 #                                                 upstream + patch (use on a bump)
 #   scripts/revendor-scrap.sh --check [version]   verify tree == upstream+patch
