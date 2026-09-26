@@ -59,9 +59,19 @@ pub struct StatusReport {
 /// the blocking pool keeps the tray responsive.
 #[tauri::command]
 pub async fn cmd_status() -> StatusReport {
-    tokio::task::spawn_blocking(status_report)
+    let mut report = tokio::task::spawn_blocking(status_report)
         .await
-        .unwrap_or_else(|_| status_report())
+        .unwrap_or_else(|_| status_report());
+    // #1701 — the file said "not enrolled"; ask the daemon before believing it.
+    if !report.enrolled
+        && let Some(id) = daemon_node_status()
+            .await
+            .as_ref()
+            .and_then(daemon_identity)
+    {
+        apply_daemon_identity(&mut report, id);
+    }
+    report
 }
 
 /// The blocking status-probe body — run on the blocking pool by [`cmd_status`],
@@ -94,6 +104,65 @@ fn status_report() -> StatusReport {
         config_dir: resolve_config_dir_string(is_scm),
         config_split: config_split_detected(),
     }
+}
+
+/// What the daemon says about its own enrollment (#1701).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonIdentity {
+    agent_id: String,
+    tenant_id: String,
+    server_url: Option<String>,
+    device_name: String,
+}
+
+/// An enrolled daemon names its node and its tenant — it only serves the
+/// LocalAPI once it has loaded an enrolled config — so both must be present.
+/// The primary org carries the agent id and server the file would have.
+fn daemon_identity(s: &NodeStatus) -> Option<DaemonIdentity> {
+    let tenant_id = s.tenant_id.clone().filter(|t| !t.is_empty())?;
+    if s.node_id.is_empty() {
+        return None;
+    }
+    let primary = s.orgs.iter().find(|o| o.primary);
+    Some(DaemonIdentity {
+        agent_id: primary
+            .and_then(|o| o.agent_id.clone())
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| s.node_id.clone()),
+        tenant_id,
+        server_url: primary
+            .map(|o| o.server_url.clone())
+            .filter(|u| !u.is_empty()),
+        device_name: s.name.clone(),
+    })
+}
+
+/// Fill a report the config FILE could not answer with the daemon's word.
+///
+/// ⚠️ #1701: on a SystemContext install the config sits in
+/// `%PROGRAMDATA%\roomler\roomler\`, which W4(c) restricts to SYSTEM +
+/// Administrators — rightly, it holds the agent token — so the companion,
+/// the signed-in user on a filtered token, gets access denied, and
+/// `enrolled` read `false` on an enrolled, connected device: the Welcome
+/// said "Not enrolled yet" and disabled Enable. The file stays the first
+/// source (the only one while the daemon is down); the daemon never
+/// overrides it.
+fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
+    if report.enrolled {
+        return;
+    }
+    report.enrolled = true;
+    report.agent_id = Some(id.agent_id);
+    report.tenant_id = Some(id.tenant_id);
+    report.server_url = id.server_url;
+    report.device_name = Some(id.device_name);
+}
+
+/// The daemon's `status`, best-effort: a daemon that is down simply leaves
+/// the file's answer standing.
+async fn daemon_node_status() -> Option<NodeStatus> {
+    let mut client = localapi::connect().await.ok()?;
+    client.status().await.ok()
 }
 
 /// The daemon log directory to show / open. `logging::log_dir()` only works IN
@@ -2547,6 +2616,80 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `status` answer shaped like the one the SystemContext daemon gave the
+    /// signed-in user over the LocalAPI in the field (#1701).
+    fn daemon_status(node_id: &str, tenant: Option<&str>) -> NodeStatus {
+        let tenant_json = tenant
+            .map(|t| format!(r#","tenant_id":"{t}""#))
+            .unwrap_or_default();
+        serde_json::from_str(&format!(
+            r#"{{"node_id":"{node_id}","name":"vmtest-w-ins-sys-104457","version":"0.4.104",
+                "mode":"service","connected":true{tenant_json},
+                "orgs":[{{"label":"primary","server_url":"https://roomler.ai","agent_id":"{node_id}",
+                          "primary":true,"enabled":true,"connected":true}}]}}"#
+        ))
+        .expect("a NodeStatus the daemon could send")
+    }
+
+    fn report(enrolled: bool) -> StatusReport {
+        StatusReport {
+            enrolled,
+            agent_id: enrolled.then(|| "from-file".to_string()),
+            tenant_id: enrolled.then(|| "tenant-from-file".to_string()),
+            server_url: enrolled.then(|| "https://file.example".to_string()),
+            device_name: enrolled.then(|| "file-name".to_string()),
+            agent_version: "0.4.104".to_string(),
+            config_schema_version: None,
+            service_running: true,
+            service_kind: "scmService".to_string(),
+            attention: None,
+            attention_message: None,
+            attention_reason: None,
+            log_dir: String::new(),
+            config_dir: String::new(),
+            config_split: false,
+        }
+    }
+
+    // #1701 — a SystemContext install keeps its config where only SYSTEM +
+    // Administrators may read it (W4(c)), so the companion — the signed-in
+    // user — cannot load it. The daemon, asked over the LocalAPI, says it is
+    // enrolled; the companion must believe it, not print "Not enrolled yet".
+    #[test]
+    fn an_unreadable_config_is_answered_by_the_daemon() {
+        let mut r = report(false);
+        let id = daemon_identity(&daemon_status(
+            "6ab7a24f352abff7547c5062",
+            Some("6a975e17971e2d55ddcdedb2"),
+        ));
+        assert!(id.is_some(), "an enrolled daemon names its node and tenant");
+        apply_daemon_identity(&mut r, id.unwrap());
+        assert!(r.enrolled);
+        assert_eq!(r.agent_id.as_deref(), Some("6ab7a24f352abff7547c5062"));
+        assert_eq!(r.tenant_id.as_deref(), Some("6a975e17971e2d55ddcdedb2"));
+        assert_eq!(r.server_url.as_deref(), Some("https://roomler.ai"));
+        assert_eq!(r.device_name.as_deref(), Some("vmtest-w-ins-sys-104457"));
+    }
+
+    #[test]
+    fn a_daemon_without_a_node_or_tenant_is_not_an_enrollment() {
+        assert!(daemon_identity(&daemon_status("", Some("t"))).is_none());
+        assert!(daemon_identity(&daemon_status("6ab7", None)).is_none());
+    }
+
+    #[test]
+    fn a_readable_config_stays_the_answer() {
+        // The file is the first source — the only one while the daemon is
+        // down — and a daemon answer never overwrites it.
+        let mut r = report(true);
+        apply_daemon_identity(
+            &mut r,
+            daemon_identity(&daemon_status("6ab7", Some("t"))).unwrap(),
+        );
+        assert_eq!(r.agent_id.as_deref(), Some("from-file"));
+        assert_eq!(r.server_url.as_deref(), Some("https://file.example"));
+    }
 
     // #1681 — stdout as `roomlerd service status [--as-service]` really prints
     // it: tracing INFO lines (ANSI and all) on STDOUT, the answer last. The
