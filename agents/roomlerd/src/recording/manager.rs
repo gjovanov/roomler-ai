@@ -222,6 +222,10 @@ impl RecordingManager {
     /// records as itself ([`Identity::Unattended`]) instead of refusing.
     /// Never for a local recording: that needs someone at the device to ask
     /// for it. The kill switch still answers first.
+    ///
+    /// ⚠️ Only [`Refusal::NoConsoleUser`] is "nobody". A login screen
+    /// ([`Refusal::LoginScreen`], decision 6) stays refused: someone may be
+    /// standing at it, and an unattended recording shows them nothing.
     pub fn identity_remote(&self) -> Result<Identity, Refusal> {
         match self.identity() {
             Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
@@ -231,8 +235,14 @@ impl RecordingManager {
 
     /// FR-85 P1f — can a REMOTE controller record here (what the device
     /// advertises, and the remote precheck)?
+    ///
+    /// ⚠️ A login screen (decision 6) still CAN: it is who is at the screen
+    /// right now, not what the device is, and the capability is advertised
+    /// once per connection — a device that booted to its sign-in screen
+    /// would hide the Record control until it reconnected, long after
+    /// someone signed in. A start there is refused by name instead.
     pub fn available_remote(&self) -> bool {
-        self.identity_remote().is_ok()
+        matches!(self.identity_remote(), Ok(_) | Err(Refusal::LoginScreen))
     }
 
     /// FR-85 P1f — point the unattended folder somewhere else (a test's
@@ -257,7 +267,9 @@ impl RecordingManager {
     /// each is read: the person's folder, as the person (P1e), when someone
     /// is signed in; and the unattended folder, as the daemon (only the
     /// service side can write there), wherever one exists. So a recording
-    /// made while nobody was signed in stays reachable after someone does.
+    /// made while nobody was signed in stays reachable after someone does —
+    /// or while the device sits at its login screen, where nothing new can
+    /// be recorded (decision 6) but what was made stays its controller's.
     pub async fn remote_places(&self) -> Vec<(PathBuf, Identity)> {
         let mut out = Vec::new();
         if let Ok(identity) = self.identity()
@@ -265,7 +277,7 @@ impl RecordingManager {
         {
             out.push((choice.dir, identity));
         }
-        if self.identity_remote().is_ok() {
+        if self.available_remote() {
             let dir = self
                 .unattended_dir
                 .clone()
