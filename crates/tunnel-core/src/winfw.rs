@@ -727,20 +727,28 @@ mod tests {
     /// NAMES — what PowerShell calls `Name`, distinct from the display name.
     const OUR_EXE: &str = r"C:\Program Files\Roomler\roomlerd.exe";
 
+    /// The two Block rules a fresh 0.4.104 attended guest held while its
+    /// prompt was up (#1712 review, field-read): ids and program spelled
+    /// exactly as the store had them — the prompt lower-cases the path in
+    /// both the id and `App=`.
     fn prompt_block(proto: u32) -> StoredRule {
-        let id = format!(
-            "{} Query User{{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}}C:\\program files\\roomler\\roomlerd.exe",
-            if proto == 6 { "TCP" } else { "UDP" }
-        );
+        let (tag, guid) = if proto == 6 {
+            ("TCP", "C7351DFF-C214-482C-83AB-2C48537B62E8")
+        } else {
+            ("UDP", "9A4DA9F2-F9BF-4137-913A-0165EF107A8F")
+        };
+        let id = format!("{tag} Query User{{{guid}}}C:\\program files\\roomler\\roomlerd.exe");
         let value = format!(
             "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol={proto}|Profile=Public|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|Desc=Roomler Daemon|Defer=User|"
         );
         parse_stored_rule(&id, &value).expect("fixture parses")
     }
 
+    /// Our own rule as netsh wrote it on the same guest: a `{GUID}` id, the
+    /// display name, no `Profile=` token (= all profiles).
     fn our_allow() -> StoredRule {
         parse_stored_rule(
-            "{9D0F7A2B-1C3E-4F5A-8B6C-7D8E9F0A1B2C}",
+            "{F5EF881B-E1FF-4064-8704-30B2B9E8FDC4}",
             &format!(
                 "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=17|App={OUR_EXE}|Name=Roomler UDP-In (roomlerd)|Desc=|EmbedCtxt=|"
             ),
@@ -883,8 +891,8 @@ mod tests {
     #[test]
     fn prompt_written_ids_are_recognised_by_their_exact_prefix() {
         for id in [
-            "TCP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
-            "UDP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
+            "TCP Query User{C7351DFF-C214-482C-83AB-2C48537B62E8}C:\\program files\\roomler\\roomlerd.exe",
+            "UDP Query User{9A4DA9F2-F9BF-4137-913A-0165EF107A8F}C:\\program files\\roomler\\roomlerd.exe",
             "TCP Query User{",
         ] {
             assert!(is_prompt_written_id(id), "{id:?}");
@@ -1004,8 +1012,8 @@ mod tests {
         assert_eq!(
             picked,
             [
-                "TCP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
-                "UDP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
+                "TCP Query User{C7351DFF-C214-482C-83AB-2C48537B62E8}C:\\program files\\roomler\\roomlerd.exe",
+                "UDP Query User{9A4DA9F2-F9BF-4137-913A-0165EF107A8F}C:\\program files\\roomler\\roomlerd.exe",
                 // A disabled prompt Block for our path is still the prompt's.
                 "UDP Query User{7}C:\\program files\\roomler\\roomlerd.exe",
                 // An env-var spelling of our path IS our path.
@@ -1015,6 +1023,58 @@ mod tests {
         // And with nothing of the prompt's in the store, nothing is picked.
         let picked = prompt_block_rules_for_program_with(&store[..1], OUR_EXE, lookup);
         assert!(picked.is_empty());
+    }
+
+    /// The store of a fresh 0.4.104 attended guest, read in the field while
+    /// its prompt was up (#1712 review): exactly three rules named
+    /// `roomlerd.exe`. Both decisions this module makes, against that store
+    /// verbatim — the cleanup takes the prompt's two Blocks and nothing else,
+    /// and the self-heal sees our netsh-written Allow as current.
+    #[test]
+    fn field_guest_store_from_1698_drives_both_decisions() {
+        let store = [
+            parse_stored_rule(
+                "TCP Query User{C7351DFF-C214-482C-83AB-2C48537B62E8}C:\\program files\\roomler\\roomlerd.exe",
+                "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=6|Profile=Public|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|Desc=Roomler Daemon|Defer=User|",
+            )
+            .unwrap(),
+            parse_stored_rule(
+                "UDP Query User{9A4DA9F2-F9BF-4137-913A-0165EF107A8F}C:\\program files\\roomler\\roomlerd.exe",
+                "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|Profile=Public|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|Desc=Roomler Daemon|Defer=User|",
+            )
+            .unwrap(),
+            parse_stored_rule(
+                "{F5EF881B-E1FF-4064-8704-30B2B9E8FDC4}",
+                &format!(
+                    "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=17|App={OUR_EXE}|Name=Roomler UDP-In (roomlerd)|"
+                ),
+            )
+            .unwrap(),
+        ];
+        // The id signature separates the prompt's rules from ours.
+        assert!(is_prompt_written_id(&store[0].id));
+        assert!(is_prompt_written_id(&store[1].id));
+        assert!(!is_prompt_written_id(&store[2].id));
+        // The cleanup: the prompt's two Blocks, by id, nothing else — even
+        // though their `App=` is lower-cased and ours is not.
+        let picked: Vec<&str> = prompt_block_rules_for_program_with(&store, OUR_EXE, no_env)
+            .into_iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                "TCP Query User{C7351DFF-C214-482C-83AB-2C48537B62E8}C:\\program files\\roomler\\roomlerd.exe",
+                "UDP Query User{9A4DA9F2-F9BF-4137-913A-0165EF107A8F}C:\\program files\\roomler\\roomlerd.exe",
+            ]
+        );
+        // The self-heal: our Allow is present once, unrestricted, current.
+        let rule = UdpInAllowRule::for_exe(Path::new(OUR_EXE));
+        assert!(rule_is_current_with(&store, &rule, no_env));
+        // And after the cleanup has run (the two Blocks gone), still current,
+        // and nothing left to remove.
+        assert!(rule_is_current_with(&store[2..], &rule, no_env));
+        assert!(prompt_block_rules_for_program_with(&store[2..], OUR_EXE, no_env).is_empty());
     }
 
     // ── the PowerShell removal ───────────────────────────────────────────
