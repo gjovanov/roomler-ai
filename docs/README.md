@@ -103,7 +103,7 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 | [overlay-nat-traversal.md](overlay-nat-traversal.md) | The carrier cascade mechanics: NAT-type probing, srflx hole-punch, cooldowns, PathMonitor |
 | [peer-relays.md](peer-relays.md) | The org relay (FR-19): one of the org's own devices forwarding its peers' WireGuard ciphertext over UDP 3478, so relayed pairs stop crossing the API pod — why it is a relay kind and not a tier, the five default-deny gates and who owns each, the mint and its audit vocabulary, the two-key bind, revocation as a push, **what the relay operator can still see**, and the measured ~74× pod offload |
 | [overlay-exit-nodes.md](overlay-exit-nodes.md) | Tailscale-style exit nodes: full-egress routing (v4+v6+DNS) with the never-self-wedge safety model |
-| [overlay-wfp.md](overlay-wfp.md) | Windows: surviving a Group-Policy-locked firewall via the Windows Filtering Platform |
+| [overlay-wfp.md](overlay-wfp.md) | Windows: surviving a Group-Policy-locked firewall via the Windows Filtering Platform — and the daemon's own Defender rule, written by the service host before the worker's first bind (#1698) |
 | [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, the shared carrier plane, mux NAT |
 | [tunnels.md](tunnels.md) | Concepts & protocol: forwards, SOCKS5 (TCP+UDP), mesh mode, declared routes, transports, LocalAPI, CLI |
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |

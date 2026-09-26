@@ -1615,28 +1615,26 @@ mod system {
         Err(last_err.expect("attempts >= 1 ⇒ f ran at least once"))
     }
 
-    /// P9 — is the Windows net-hygiene pass disabled? Only an explicit
-    /// `0`/`false`/`no`/`off` disables (`ROOMLERD_TUN_HYGIENE`); unset /
-    /// anything else keeps the default ON. Pure so the parse is testable.
-    #[cfg(windows)]
-    fn hygiene_disabled(v: Option<&str>) -> bool {
-        matches!(
-            v.map(|s| s.trim().to_ascii_lowercase()),
-            Some(t) if t == "0" || t == "false" || t == "no" || t == "off"
-        )
-    }
-
     /// P9 — one-shot Windows network hygiene at TUN bring-up (call site in
     /// [`SystemTun::up`]). Two consumer-box gaps, both field-hit 2026-07-28:
     ///
     /// * **Inbound-allow firewall rule for THIS binary's UDP** (the WG socket
-    ///   on the PHYSICAL adapters): a fresh install has none — a Windows
-    ///   *service* never gets the interactive "Allow access?" prompt — so
-    ///   unsolicited WG dials (LAN direct, srflx punch) die at the Public
-    ///   profile's default-deny. A home laptop could not accept LAN-direct
-    ///   until exactly this rule was added by hand. Rule name carries the exe
-    ///   stem so `roomlerd` and the `roomler` tunnel client don't fight;
-    ///   delete+add keeps the recorded program path current across upgrades.
+    ///   on the PHYSICAL adapters): a fresh install has none, so unsolicited
+    ///   WG dials (LAN direct, srflx punch) die at the Public profile's
+    ///   default-deny. A home laptop could not accept LAN-direct until exactly
+    ///   this rule was added by hand. Rule name carries the exe stem so
+    ///   `roomlerd` and the `roomler` tunnel client don't fight; delete+add
+    ///   keeps the recorded program path current across upgrades. The ONE
+    ///   definition is [`crate::winfw::UdpInAllowRule`], shared with the SCM
+    ///   service host — #1698: P9's premise that "a Windows *service* never
+    ///   gets the interactive prompt" holds for a SYSTEM worker only. The
+    ///   ATTENDED worker runs in the signed-in user's session, bound its UDP
+    ///   before this detached thread had added the rule, got the prompt, and
+    ///   the prompt's Block rules beat this Allow on every Public network. So
+    ///   the host now installs the rule BEFORE the first worker spawn, and this
+    ///   pass is the self-heal — which heals only when the store does not
+    ///   already hold exactly our rule, because delete+add is not atomic and a
+    ///   bind landing in that gap is the same prompt again.
     /// * **`NetworkCategory=Private` for the roomler adapter**: belt and
     ///   braces for hosts where the WFP hard-permit could not install
     ///   (GPO-locked) — an Unidentified-network TUN otherwise lands in the
@@ -1652,56 +1650,42 @@ mod system {
     /// per-binary and unaffected.
     #[cfg(windows)]
     fn spawn_windows_net_hygiene(if_name: String) {
-        if hygiene_disabled(crate::env::node_env("TUN_HYGIENE").as_deref()) {
+        if crate::winfw::hygiene_disabled(crate::env::node_env("TUN_HYGIENE").as_deref()) {
             tracing::info!("overlay: Windows net hygiene disabled via ROOMLERD_TUN_HYGIENE");
             return;
         }
         std::thread::spawn(move || {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            // 1) Inbound-allow for this binary's UDP, all profiles.
-            if let Ok(exe) = std::env::current_exe() {
-                let stem = exe
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "roomler".into());
-                let rule = format!("Roomler UDP-In ({stem})");
-                let exe = exe.to_string_lossy().to_string();
-                // Delete first (stale program path from a moved install), then
-                // add — idempotent end state, current path always recorded.
-                let _ = std::process::Command::new("netsh")
-                    .args([
-                        "advfirewall",
-                        "firewall",
-                        "delete",
-                        "rule",
-                        &format!("name={rule}"),
-                    ])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output();
-                match std::process::Command::new("netsh")
-                    .args([
-                        "advfirewall",
-                        "firewall",
-                        "add",
-                        "rule",
-                        &format!("name={rule}"),
-                        "dir=in",
-                        "action=allow",
-                        "protocol=udp",
-                        &format!("program={exe}"),
-                    ])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output()
-                {
-                    Ok(o) if o.status.success() => {
-                        tracing::info!(rule = %rule, "overlay: firewall inbound-UDP allow installed for this binary")
+            // Per netsh call. This thread is detached, so the bound only
+            // keeps a wedged firewall service from pinning the thread forever.
+            const NETSH_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+            // 1) Inbound-allow for this binary's UDP, all profiles — the ONE
+            //    definition in `crate::winfw`, shared with the SCM service host
+            //    (#1698). Heal only when the store does not already hold
+            //    exactly our rule: delete+add is not atomic, and in the gap an
+            //    attended worker's next bind has no rule for its path.
+            if let Some(rule) = crate::winfw::UdpInAllowRule::for_current_exe() {
+                if crate::winfw::current_rule_present(&rule) == Some(true) {
+                    tracing::debug!(
+                        rule = %rule.name,
+                        "overlay: firewall inbound-UDP allow already current; nothing to heal"
+                    );
+                } else {
+                    use crate::winfw::EnsureOutcome;
+                    match crate::winfw::ensure_udp_in_allow(&rule, NETSH_CALL_TIMEOUT) {
+                        EnsureOutcome::Installed => tracing::info!(
+                            rule = %rule.name,
+                            "overlay: firewall inbound-UDP allow installed for this binary"
+                        ),
+                        EnsureOutcome::AddFailed { status, stderr } => tracing::debug!(
+                            rule = %rule.name, ?status, %stderr,
+                            "overlay: firewall rule add failed (unelevated?)"
+                        ),
+                        EnsureOutcome::Failed(e) => {
+                            tracing::debug!(rule = %rule.name, %e, "overlay: netsh unavailable")
+                        }
                     }
-                    Ok(o) => tracing::debug!(
-                        rule = %rule, status = %o.status,
-                        "overlay: firewall rule add failed (unelevated?)"
-                    ),
-                    Err(e) => tracing::debug!(rule = %rule, %e, "overlay: netsh unavailable"),
                 }
             }
             // 2) THIS overlay adapter → Private profile (registration lags
@@ -4704,20 +4688,8 @@ mod system {
             assert_eq!(o.v6_onlink_plen, 96);
         }
 
-        /// P9 — the net-hygiene kill-switch parse: only an explicit falsy
-        /// value disables; unset / anything else keeps the default ON.
-        #[cfg(windows)]
-        #[test]
-        fn hygiene_kill_switch_parse() {
-            use super::hygiene_disabled;
-            assert!(!hygiene_disabled(None));
-            assert!(!hygiene_disabled(Some("1")));
-            assert!(!hygiene_disabled(Some("weird")));
-            assert!(hygiene_disabled(Some("0")));
-            assert!(hygiene_disabled(Some(" FALSE ")));
-            assert!(hygiene_disabled(Some("no")));
-            assert!(hygiene_disabled(Some("off")));
-        }
+        // P9's `hygiene_kill_switch_parse` moved to `crate::winfw::tests`
+        // with the parser (#1698), where it runs on every platform.
 
         /// rc.209 — the Wintun create-retry policy: succeed as soon as a try
         /// returns `Ok`, without running further attempts or sleeping.
