@@ -1069,7 +1069,7 @@ impl AgentPeer {
                     // view-effective gets explicit errors instead of silent
                     // transfers.
                     "files" if !permissions.contains(Permissions::FILES) => {
-                        attach_files_denied(dc, session_id)
+                        attach_files_denied(dc, session_id, &session_end)
                     }
                     "files" => attach_files_handler(dc, session_id, &session_end),
                     // FR-85 P3b — the same attach-time gate for RECORD: the
@@ -8631,8 +8631,15 @@ fn attach_cursor_handler(
             // no cursor showing) nothing is ever sent, so no failed send ends
             // the loop either — it went on at 120 Hz for every dropped
             // session, for the life of the daemon.
-            if channel_gone(dc.ready_state()) {
+            let state = dc.ready_state();
+            if channel_gone(state) {
                 return;
+            }
+            // Attached before the channel opens (`on_data_channel` fires
+            // first): a send now would fail and end the poller for good, so
+            // wait for `Open` (found in review; Windows with a pointer).
+            if state == webrtc::data_channel::data_channel_state::RTCDataChannelState::Connecting {
+                continue;
             }
             match tracker.poll() {
                 Some(tick) => {
@@ -9027,6 +9034,8 @@ fn attach_clipboard_handler(
                 }
             })
         }));
+        // The stub holds its channel too: let go when the session ends.
+        on_session_end(&dc, session_end, || async {});
         return;
     }
     // v2.2 — the process-SHARED clipboard worker (also used by the
@@ -9062,6 +9071,13 @@ fn attach_clipboard_handler(
     // pre-P3 global Unwatch killed every session's).
     let watch_token: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
 
+    // Set once the watch is torn down for good (the channel closed, or the
+    // session ended). Read and written under `watch_token`'s lock, so a
+    // Subscribe already in flight when the teardown runs installs nothing
+    // after it (found in review: its subscription would never be unwatched,
+    // and the shared worker would feed it forever).
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // DC close, or the session's end → tear down the watcher + forwarder so
     // the arboard worker stops ticking and the task doesn't outlive the
     // session. Both can fire; the second finds nothing left to stop.
@@ -9069,13 +9085,14 @@ fn attach_clipboard_handler(
         let cb = cb.clone();
         let watch_task = watch_task.clone();
         let watch_token = watch_token.clone();
+        let stopped = stopped.clone();
         move || {
-            if let Some(id) = watch_token
-                .lock()
-                .expect("clipboard watch_token poisoned")
-                .take()
             {
-                cb.unwatch(id);
+                let mut token = watch_token.lock().expect("clipboard watch_token poisoned");
+                stopped.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(id) = token.take() {
+                    cb.unwatch(id);
+                }
             }
             let old = watch_task
                 .lock()
@@ -9093,7 +9110,6 @@ fn attach_clipboard_handler(
             Box::pin(async {})
         }));
     }
-    on_session_end(&dc, session_end, move || async move { stop_watching() });
 
     let dc_for_handler = dc.clone();
     dc.on_message(Box::new(move |msg| {
@@ -9104,6 +9120,7 @@ fn attach_clipboard_handler(
         let img_tx_lock = img_tx_lock.clone();
         let watch_task = watch_task.clone();
         let watch_token = watch_token.clone();
+        let stopped = stopped.clone();
         Box::pin(async move {
             // v2 — binary frames are PNG chunks for the in-flight
             // browser → agent image transfer (announced by a preceding
@@ -9396,12 +9413,20 @@ fn attach_clipboard_handler(
                     // A re-subscribe within THIS session replaces only its
                     // own prior subscription (other sessions' feeds are
                     // untouched — the P3 multi-subscriber registry).
-                    if let Some(old) = watch_token
-                        .lock()
-                        .expect("clipboard watch_token poisoned")
-                        .replace(token)
                     {
-                        cb.unwatch(old);
+                        let mut installed =
+                            watch_token.lock().expect("clipboard watch_token poisoned");
+                        // Torn down while this was in flight: nothing may
+                        // outlive the teardown (its forwarder ends with the
+                        // subscription).
+                        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(installed);
+                            cb.unwatch(token);
+                            return;
+                        }
+                        if let Some(old) = installed.replace(token) {
+                            cb.unwatch(old);
+                        }
                     }
                     info!(%session_id, text = want_text, image = want_image, html = want_html, native = want_native, "clipboard: change subscription installed");
                     let dc_for_events = dc.clone();
@@ -9567,6 +9592,8 @@ fn attach_clipboard_handler(
             }
         })
     }));
+    // Last, after the callbacks are in place (see `on_session_end`).
+    on_session_end(&dc, session_end, move || async move { stop_watching() });
 }
 
 /// Complete an inbound rich transfer (`clipboard:img-end` /
@@ -9891,7 +9918,11 @@ async fn send_clipboard_image(
 /// the browser's per-transfer waiter rejects instead of timing out) and
 /// binary chunks are dropped. Mirrors the clipboard gate's reject-don't-serve
 /// posture; installed when the session's grant lacks `Permissions::FILES`.
-pub fn attach_files_denied(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+pub fn attach_files_denied(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
     info!(
         session = %session_id,
         "files DC attached in DENY mode — session lacks FILES permission"
@@ -9918,6 +9949,8 @@ pub fn attach_files_denied(dc: Arc<RTCDataChannel>, session_id: bson::oid::Objec
             .await;
         })
     }));
+    // The stub holds its channel too: let go when the session ends.
+    on_session_end(&dc, session_end, || async {});
 }
 
 pub fn attach_files_handler(
@@ -9937,9 +9970,6 @@ pub fn attach_files_handler(
         })
     }));
     let handler_for_end = handler.clone();
-    on_session_end(&dc, session_end, move || async move {
-        handler_for_end.abort().await;
-    });
     dc.on_message(Box::new(move |msg| {
         let dc = dc_for_handler.clone();
         let handler = handler.clone();
@@ -9951,6 +9981,11 @@ pub fn attach_files_handler(
             }
         })
     }));
+    // Last, after the callbacks are in place (see `on_session_end`). An
+    // upload's state goes, and a download's pump stops (`end_session`).
+    on_session_end(&dc, session_end, move || async move {
+        handler_for_end.end_session().await;
+    });
 }
 
 /// Has this channel closed, or begun to? `Closing` counts: a channel closed
@@ -9961,13 +9996,21 @@ fn channel_gone(state: webrtc::data_channel::data_channel_state::RTCDataChannelS
     matches!(state, S::Closing | S::Closed)
 }
 
-/// Run `teardown` once, when the session ends ([`AgentPeer::session_end`]),
-/// then let go of the channel's callbacks: they hold the handler, and the
-/// handler holds the channel, so without this neither is ever freed.
+/// When the session ends ([`AgentPeer::session_end`]): let go of the
+/// channel's callbacks (they hold the handler, and the handler holds the
+/// channel, so otherwise neither is ever freed), then run `teardown` once.
 ///
 /// ⚠️ For what a handler must release even when its channel never says it
 /// closed. Its own `on_close` stays as well, for a channel the controller
 /// closes while the session goes on; the teardown must be safe to run twice.
+///
+/// ⚠️ Call it LAST in an attach, after the channel's real callbacks are in
+/// place: a channel can still arrive after the session ended (`close` cancels
+/// first, and the peer's own close takes a while), and a swap that ran before
+/// the real callbacks landed would be overwritten by them (found in review).
+/// The callbacks go FIRST, then the teardown, so no new message starts work
+/// the teardown has already passed; a message already in flight is the
+/// handler's own race to close (see the clipboard's `stopped`).
 fn on_session_end<F, Fut>(
     dc: &Arc<RTCDataChannel>,
     session_end: &tokio_util::sync::CancellationToken,
@@ -9980,9 +10023,9 @@ fn on_session_end<F, Fut>(
     let session_end = session_end.clone();
     tokio::spawn(async move {
         session_end.cancelled().await;
-        teardown().await;
         dc.on_message(Box::new(|_| Box::pin(async {})));
         dc.on_close(Box::new(|| Box::pin(async {})));
+        teardown().await;
     });
 }
 
@@ -10429,11 +10472,16 @@ async fn zip_pump_loop(
             Ok(n) => n,
             Err(e) => return Err(anyhow::anyhow!("duplex read: {e}")),
         };
-        // Backpressure on SCTP send buffer.
+        // Backpressure on SCTP send buffer. ⚠️ After a drop the buffer
+        // never drains (only a SACK lowers it), so the channel's state ends
+        // the wait too — not only a cancel the browser can no longer send.
         while dc.buffered_amount().await > BACKPRESSURE_HIGH {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(anyhow::anyhow!("cancelled by browser"));
+            }
+            if channel_gone(dc.ready_state()) {
+                return Err(anyhow::anyhow!("the channel closed"));
             }
         }
         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
@@ -10480,10 +10528,15 @@ async fn pump_outgoing_file(
         // Backpressure: poll buffered_amount and yield until it
         // drops below the high-watermark. webrtc-rs's DC reports
         // bufferedAmount synchronously.
+        // ⚠️ After a drop the buffer never drains (only a SACK lowers it):
+        // the channel's state ends the wait too (see `zip_pump_loop`).
         while dc.buffered_amount().await > BACKPRESSURE_HIGH as usize {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             if offer.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(anyhow::anyhow!("cancelled by browser"));
+            }
+            if channel_gone(dc.ready_state()) {
+                return Err(anyhow::anyhow!("the channel closed"));
             }
         }
         let n = file.read(&mut buf).await?;
@@ -11864,12 +11917,10 @@ mod session_end_tests {
     /// Where the tracker reports no pointer, the poller sends nothing after
     /// its one `cursor:hide`, so no failed send ends it: only the state or
     /// the session can. Red with the check reading only `Closed`: the
-    /// channel sits at `Closing` and the poller runs on at 120 Hz.
-    ///
-    /// Not on a Windows build with `mf-encoder`: there the tracker reports
-    /// the real pointer, and the first send on a channel that is not open
-    /// ends the poller before anything is closed.
-    #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+    /// channel sits at `Closing` and the poller runs on at 120 Hz. (It waits
+    /// through `Connecting` without sending, so this holds where the tracker
+    /// does report a pointer too; red on Windows `mf-encoder` without that
+    /// wait: its first send ends the poller before anything is closed.)
     #[tokio::test]
     async fn the_cursor_poller_ends_when_its_channel_stops_at_closing() {
         let (_pc, dc) = lone_channel("cursor").await;
@@ -11894,7 +11945,6 @@ mod session_end_tests {
     /// The session's end ends the poller while its channel still looks
     /// alive: a peer torn down fires nothing on its channels. Red without
     /// the session-end arm.
-    #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
     #[tokio::test]
     async fn the_cursor_poller_ends_with_its_session() {
         let (_pc, dc) = lone_channel("cursor").await;
@@ -11919,8 +11969,10 @@ mod session_end_tests {
 
     /// The teardown runs once, when the session ends and not before, and the
     /// channel's callbacks are let go: they held the handler, which held the
-    /// channel. Red without the release: the callback's capture is never
-    /// dropped.
+    /// channel. And they go FIRST: by the time the teardown runs, no new
+    /// message can start work behind it. Red without the release (the
+    /// callback's capture is never dropped), and with the teardown first
+    /// (it still sees the callback held).
     #[tokio::test]
     async fn a_session_end_runs_the_teardown_and_lets_go_of_the_channel() {
         let (_pc, dc) = lone_channel("files").await;
@@ -11931,9 +11983,13 @@ mod session_end_tests {
             Box::pin(async {})
         }));
         let ran = Arc::new(AtomicUsize::new(0));
+        let held_at_teardown = Arc::new(AtomicUsize::new(usize::MAX));
         let end = CancellationToken::new();
         let r = ran.clone();
+        let (h, seen) = (held.clone(), held_at_teardown.clone());
         on_session_end(&dc, &end, move || async move {
+            // Less the teardown's own clone.
+            seen.store(Arc::strong_count(&h) - 1, Ordering::SeqCst);
             r.fetch_add(1, Ordering::SeqCst);
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -11942,7 +11998,11 @@ mod session_end_tests {
             0,
             "ran before the session ended"
         );
-        assert_eq!(Arc::strong_count(&held), 2);
+        assert_eq!(
+            Arc::strong_count(&held),
+            3,
+            "the test, the callback, the teardown"
+        );
         end.cancel();
         assert!(
             eventually(Duration::from_secs(2), || ran.load(Ordering::SeqCst) == 1).await,
@@ -11953,6 +12013,11 @@ mod session_end_tests {
             "the channel's callback was never let go"
         );
         assert_eq!(ran.load(Ordering::SeqCst), 1, "ran more than once");
+        assert_eq!(
+            held_at_teardown.load(Ordering::SeqCst),
+            1,
+            "the teardown ran while the channel's callback was still in place"
+        );
     }
 
     /// The files handler is wired to its session's end: when the session
