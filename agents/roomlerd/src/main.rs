@@ -171,6 +171,16 @@ enum Command {
         /// (`supervision::detect_here`).
         #[arg(long, hide = true, value_parser = ["scm", "task"])]
         supervisor: Option<String>,
+        /// #1683 (Windows) — the named Win32 event the SCM service host signals
+        /// to ask this worker to stop GRACEFULLY (self-unenroll if ephemeral,
+        /// mark a clean shutdown) before it falls back to `TerminateProcess`.
+        /// The host creates it with a DACL that lets only SYSTEM signal it; the
+        /// worker needs only SYNCHRONIZE to wait. Passed only by
+        /// `win_service::supervisor` (`--stop-event <name>`); ignored on every
+        /// other platform. Hidden: a person passing it by hand is claiming to be
+        /// a service host, and no host will be signaling that event.
+        #[arg(long, hide = true)]
+        stop_event: Option<String>,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -1223,6 +1233,8 @@ async fn daemon_main() -> Result<()> {
         supervised: false,
         // Likewise the Windows spawners always say which one they are.
         supervisor: None,
+        // #1683 — only the SCM service host passes a stop-event name.
+        stop_event: None,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1270,11 +1282,13 @@ async fn daemon_main() -> Result<()> {
             encoder,
             supervised,
             supervisor,
+            stop_event,
         } => run_cmd(
             &config_path,
             encoder.as_deref(),
             supervised,
             supervisor.as_deref(),
+            stop_event.as_deref(),
         )
         .await
         .map(|restart| {
@@ -2554,11 +2568,17 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
 /// the FR-43 supervisor (which cycles a worker in seconds) reproduced the full
 /// chain to `rollback installer downloaded — spawning + exiting`.
 ///
-/// Windows has no SIGTERM — the service path handles its own SCM stop — so
-/// this never resolves there.
-async fn terminate_signal() {
+/// Windows has no SIGTERM. Its deliberate stop arrives as an SCM
+/// Stop / Preshutdown, which the service host turns into a signal on a named
+/// event and hands this worker as `--stop-event <name>` (#1683). When that
+/// `stop_event` is set, this waits on the event; when it fires, the OS-initiated
+/// arm runs and an ephemeral device self-unenrolls, exactly as a Unix SIGTERM
+/// makes it. Without a name (a hand-run `roomlerd run`, any non-service host),
+/// it never resolves there — as before.
+async fn terminate_signal(stop_event: Option<&str>) {
     #[cfg(unix)]
     {
+        let _ = stop_event;
         use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
@@ -2577,8 +2597,46 @@ async fn terminate_signal() {
             }
         }
     }
-    #[cfg(not(unix))]
-    std::future::pending::<()>().await;
+    #[cfg(windows)]
+    {
+        match stop_event {
+            Some(name) => {
+                // Polls the event on the runtime — never a blocking task. The
+                // other arms of this `select!` win by dropping this future, and
+                // `main()` then drops the runtime, which waits for every
+                // `spawn_blocking` task to RETURN: a blocking wait here would
+                // have held process exit hostage on every non-SCM exit (an
+                // auto-update, a requested restart). Dropping the poll closes
+                // the handle and leaves nothing behind
+                // (`stop_event::wait_for_stop_event`).
+                match roomlerd::win_service::stop_event::wait_for_stop_event(name).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "service host requested a graceful stop (stop event signaled)"
+                        );
+                    }
+                    Err(e) => {
+                        // Could not open/probe the event — degrade to today's
+                        // behaviour: never fire this arm, let the host's bounded
+                        // wait time out into TerminateProcess. Do NOT treat this
+                        // as a stop, or we would fabricate a self-unenroll.
+                        tracing::warn!(
+                            error = %e,
+                            "could not wait on the SCM stop event; a service stop will fall back \
+                             to TerminateProcess (an ephemeral device may not self-unenroll)"
+                        );
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stop_event;
+        std::future::pending::<()>().await;
+    }
 }
 
 /// How `run` terminates when another process already owns the
@@ -2661,6 +2719,10 @@ async fn run_cmd(
     cli_encoder: Option<&str>,
     supervised: bool,
     supervisor_flag: Option<&str>,
+    // #1683 (Windows) — the SCM host's stop event, waited on by
+    // `terminate_signal`. `None` on every non-service run and every other
+    // platform.
+    stop_event: Option<&str>,
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
@@ -4165,9 +4227,10 @@ async fn run_cmd(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         // Being asked to stop is not failing to run. See `terminate_signal`
-        // for what this cost before it existed (#1040).
-        _ = terminate_signal() => {
-            tracing::info!("SIGTERM received; shutting down gracefully");
+        // for what this cost before it existed (#1040 on Unix; #1683 on the
+        // Windows SCM service, where the stop arrived only as a hard kill).
+        _ = terminate_signal(stop_event) => {
+            tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
             os_initiated_stop = true;
             let _ = shutdown_tx.send(true);
@@ -4202,12 +4265,34 @@ async fn run_cmd(
             // and best-effort (the fn caps at 3 s; the reaper is the backstop
             // for every exit that never reaches this line), and only on the
             // signal arms — the internal arm is the updater restarting us.
-            if current.ephemeral && os_initiated_stop {
+            //
+            // #1683 — and never while an UPDATE is in flight. On Windows the
+            // MSI stops the service while it replaces the binary; by then the
+            // worker that spawned the installer has exited 0 and the SCM host
+            // has respawned this one, which receives that stop as an
+            // OS-initiated stop, indistinguishable from `sc stop`. Unenrolling
+            // here would delete the device on every auto-update and bring the
+            // new version up holding a dead token — the exact outcome the
+            // internal-arm rule above exists to prevent. `update_in_flight`
+            // reads the `update-attempt` marker the installer spawn touches
+            // (rollbacks included); the policy itself is one pure table
+            // (`updater::should_self_unenroll`). Platform-neutral on purpose.
+            let update_in_flight = updater::update_in_flight();
+            if updater::should_self_unenroll(current.ephemeral, os_initiated_stop, update_in_flight)
+            {
                 match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
                     Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
                     Err(e) => tracing::warn!(error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
+            } else if current.ephemeral && os_initiated_stop {
+                // The one way the gate says no to an ephemeral OS stop. Named,
+                // so "why is this row still here?" has an answer in the log.
+                tracing::info!(
+                    window_secs = updater::UPDATE_STOP_WINDOW.as_secs(),
+                    "ephemeral device NOT unenrolling: an update is in flight — the installer \
+                     stopped the service; this device stays enrolled"
+                );
             }
             config::mark_clean_shutdown(&mut current);
             if let Err(e) = config::save(config_path, &current) {

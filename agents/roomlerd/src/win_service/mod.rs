@@ -40,6 +40,9 @@ pub mod companion_procs;
 pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
+/// #1683 — the graceful-stop event the SCM host signals so a worker (an
+/// ephemeral device especially) self-unenrolls before it is TerminateProcess'd.
+pub mod stop_event;
 pub mod supervisor;
 pub mod system_context_attempt;
 pub mod system_context_probe;

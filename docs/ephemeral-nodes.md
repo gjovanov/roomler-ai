@@ -19,11 +19,17 @@ roomlerd enroll --server … --token <key> --name runner-1 --ephemeral
         ▼
 roomlerd run          … the device works like any other …
         │
-        ├── clean stop (SIGTERM/SIGINT, e.g. `docker stop`)
+        ├── clean stop
+        │     • Unix: SIGTERM / SIGINT (e.g. `docker stop`, `systemctl stop`)
+        │     • Windows SCM service: SCM Stop / Preshutdown — the service host
+        │       signals the worker's stop event and waits (#1683)
+        │       (an update's OWN service stop is not a leave — the device
+        │        stays enrolled; see below)
         │       → the daemon calls POST /api/agent/self/unenroll
         │       → removed within seconds
         │
-        └── unclean stop (SIGKILL, power loss, network partition)
+        └── unclean stop (SIGKILL, power loss, network partition, or a Windows
+            worker that did not exit inside the host's graceful-stop budget)
                 → the server-side reaper removes it once it has been
                   silent past its TTL (default 15 min, 60 s floor)
 ```
@@ -106,6 +112,26 @@ exec roomlerd run
 - `docker stop` sends SIGTERM → the daemon de-enrolls within seconds. The
   auto-updater's internal restart does **not** de-enroll (that would delete
   the device on every update).
+- **On the Windows SCM service** the stop arrives as SCM Stop / Preshutdown, not
+  a signal, and the service host stops its worker with `TerminateProcess` — a
+  hard kill the worker never sees. So the host first **signals a named stop
+  event** and waits a bounded time (`WORKER_GRACEFUL_STOP_BUDGET`, 8 s) for the
+  worker to self-unenroll and mark a clean shutdown, and only then falls back to
+  `TerminateProcess`. The event's DACL lets **only SYSTEM signal** it, so an
+  unprivileged local user cannot stop (or unenroll) a SYSTEM worker. Before
+  #1683 the hard kill was the only path and a Windows-service ephemeral device
+  always waited out the reaper's TTL. Mechanism: `docs/remote-control.md`
+  (service host) and `agents/roomlerd/src/win_service/stop_event.rs`.
+- **An update's own service stop never unenrolls.** The MSI stops the service
+  while it replaces the binary — by then the worker that spawned the installer
+  has already exited 0 and the SCM host has respawned a fresh one, which receives
+  that stop as an OS-initiated stop, indistinguishable from `sc stop`. So the
+  self-unenroll is gated on "no update in flight"
+  (`updater::should_self_unenroll`, platform-neutral): an installer spawned
+  within the last `UPDATE_STOP_WINDOW` (10 min — the `update-attempt` marker that
+  `spawn_installer_with_watch` touches, rollbacks included) keeps the device
+  enrolled and logs why. An operator stop inside that window leaves the row to
+  the reaper — which is what every Windows-service stop did before #1683.
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
