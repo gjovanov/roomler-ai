@@ -272,9 +272,9 @@ sequenceDiagram
     participant N as roomlerd (new process)
     C->>D: RestartDaemon {reason}
     D->>D: decide: supervised? enabled? recording? < 30 s since the last?
-    D-->>C: DaemonRestarting {supervisor, restart_by, exit_code, pid, started_at_ms}
+    D-->>C: DaemonRestarting {supervisor, restart_by, exit_code, pid, started_at_ms, restart_within_s}
     Note over D: shutdown starts only after the answer is written
-    D->>D: the auto-updater's graceful path (clean shutdown recorded, exit routes purged)
+    D->>D: the auto-updater's graceful path (clean shutdown recorded, exit routes purged, virtual desktop torn down)
     D->>S: exit(code)
     S->>N: start
     C->>N: Status until a DIFFERENT pid + start time answers
@@ -283,6 +283,33 @@ sequenceDiagram
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
   (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1480`).
+- ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
+  daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
+  systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
+  setsid'd `at-spi-bus-launcher` grandchild, which **ignores SIGTERM** — keeps the unit's
+  cgroup non-empty until systemd SIGKILLs it after `TimeoutStopSec` (90 s), then pays
+  `RestartSec`: a `roomler restart` took **96 s**. So every graceful exit now tears the whole
+  desktop tree down (`virtual_desktop::teardown`, `agents/roomlerd/src/virtual_desktop.rs`) —
+  the tree is spawned into its own process group, and teardown unions the group members with
+  the parent-link closure of the daemon's direct children (which reaches a setsid'd
+  grandchild, since `setsid` changes the session and group but never the parent), SIGTERMs,
+  waits a 2 s grace, then SIGKILLs the remainder. systemd then finds an empty cgroup and
+  relaunches after `RestartSec` (~5 s). ⚠️ It SIGKILLs **as root**, so it never signals a
+  recycled pid: the daemon's own children are reaped only **after the last signal** (an
+  unreaped zombie keeps its pid — and, for Xvfb, the desktop's pgid — reserved), and any
+  other pid is signalled only after its `/proc` **starttime** is re-read and matches the
+  snapshot that selected it (`same_process`). Both rules are unit-tested against a scripted
+  process table (`kill_tree_signals_everything_before_it_reaps_anything`,
+  `kill_tree_never_signals_a_recycled_pid`).
+- **The wait follows the supervisor.** A caller waits for the relaunched daemon at least as
+  long as the supervisor says a stop + relaunch can take — under systemd,
+  `TimeoutStopSec + RestartSec`, read from `systemctl show` and carried as the additive
+  `restart_within_s` in `DaemonRestarting` — plus a margin, never below the 60 s floor and
+  never past 10 minutes (`localapi::restart_wait`, `RESTART_WAIT_CAP`: a unit with
+  `TimeoutStopSec=1h` must not make `roomler restart` hang for an hour). Before this, a fixed
+  60 s wait was shorter than the supervisor's
+  worst case, so the CLI reported failure on a restart that had in fact worked. `restart_within_s`
+  is absent for every non-systemd supervisor and from an older daemon, where the wait stays 60 s.
 - **Refusals are named and shown verbatim:** no supervisor it can prove,
   `local_restart_enabled = false` (read on every request, so turning it off applies to the
   very next one), a screen recording in progress (FR-85), a previous restart less than 30 s
