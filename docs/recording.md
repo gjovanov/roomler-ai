@@ -229,10 +229,10 @@ but the recorder skipped would only be a courtesy.
   does a `~/Videos` created after the service started (systemd sets up the
   sandbox once, at start). The root system unit (`roomlerd.service`) has no
   such sandbox. ⚠️ Nor, in effect, does the user unit wherever its user
-  manager cannot create an unprivileged user namespace (e.g. Ubuntu 24.04,
-  whose AppArmor restricts them by default): systemd then runs it with no
-  sandbox at all, and the recorder writes wherever the person can
-  (`docs/installation.md`). Moving a finished file from the data folder into
+  manager cannot mount inside an unprivileged user namespace (default
+  Ubuntu 24.04, whose AppArmor restricts them: field-verified): systemd then
+  runs it with no sandbox at all, and the recorder writes wherever the
+  person can (`docs/installation.md`). Moving a finished file from the data folder into
   the chosen folder as the person was weighed and deferred: built only if
   people ask for it (the operator, 2026-09-26).
 - **Override** (`--out`, or the config key `record_dir`): absolute, local, no

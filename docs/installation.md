@@ -155,16 +155,27 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   starting on any host that never ran the pre-rename agent, wherever the
   sandbox applies. CI starts a unit with these sandbox lines on a fresh
   runner (`ci.yml`, "The Linux user unit's sandbox").
-- ⚠️ **The sandbox is best-effort for a user unit.** A user manager can apply
-  it only by creating an unprivileged user namespace. Where it cannot (e.g.
-  Ubuntu 24.04, whose AppArmor restricts unprivileged user namespaces by
-  default), systemd logs `Failed to set up user namespacing for unprivileged
-  user, ignoring` and runs the unit with **no sandbox at all**: home fully
-  writable, `ProtectSystem` off. Measured on systemd 255 with
-  `user.max_user_namespaces=0`: the same unit that fails `226/NAMESPACE` with
-  namespaces allowed starts there, and writes `~/Videos`. So what the unit
-  can reach differs by host; the root system unit (`roomlerd.service`) has no
-  sandbox either way.
+- ⚠️ **The sandbox is best-effort for a user unit.** A user manager applies
+  it only inside an unprivileged user namespace in which it may mount, and
+  otherwise runs the unit with **no sandbox at all** (home fully writable,
+  `ProtectSystem` off), in one of two ways:
+  - it cannot create the namespace: systemd logs `Failed to set up user
+    namespacing for unprivileged user, ignoring` (measured on systemd 255
+    with `user.max_user_namespaces=0`: the unit that fails `226/NAMESPACE`
+    with namespaces allowed starts, and writes `~/Videos`);
+  - it creates one but may not mount in it: **default Ubuntu 24.04**, whose
+    AppArmor restricts unprivileged user namespaces
+    (`kernel.apparmor_restrict_unprivileged_userns=1`). systemd skips the
+    mounts at debug level, so no journal line shows it. Field-verified on a
+    fresh 24.04 vmtest guest (kernel 6.8, systemd 255): the running daemon's
+    user namespace differs from the session's but its **mount** namespace is
+    the same, `/home` has no read-only remount, and the unit started without
+    the pre-rename folders.
+
+  🔑 To tell which a host got, compare `readlink /proc/self/ns/mnt` with the
+  daemon's `/proc/<pid>/ns/mnt` (the same means unsandboxed); the journal
+  cannot say. The root system unit (`roomlerd.service`) has no sandbox
+  either way.
 - `--role tunnel` installs just the CLI (tarball or `.deb`).
 - Useful flags: `--download-only`, `--no-enroll`.
 - Headless servers: the daemon's virtual-desktop mode gives the machine a

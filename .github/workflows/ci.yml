@@ -549,12 +549,11 @@ jobs:
         #     home must stay read-only.
         # A SYSTEM unit with User= needs no user session on the runner and
         # ALWAYS sets up the mount namespace, i.e. the configuration where
-        # both failures bite. A user manager applies the sandbox only where it
-        # can create an unprivileged user namespace: where it cannot (e.g.
-        # under Ubuntu 24.04's default AppArmor restriction) systemd logs
-        # "Failed to set up user namespacing for unprivileged user, ignoring"
-        # and runs the unit with no sandbox at all (measured, systemd 255,
-        # with user.max_user_namespaces=0). `%h` is expanded here
+        # both failures bite. A user manager applies the sandbox only inside
+        # an unprivileged user namespace it may mount in; where it cannot
+        # create one, or may not mount in it (default Ubuntu 24.04, whose
+        # AppArmor restricts them: field-verified on a vmtest guest), it runs
+        # the unit with no sandbox at all. `%h` is expanded here
         # because in a system unit it means root's home whatever User= says.
         run: |
           set -eu
