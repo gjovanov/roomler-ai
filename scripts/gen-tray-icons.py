@@ -23,10 +23,11 @@ regenerating is a command rather than an afternoon in a paint program.
     python3 scripts/gen-tray-icons.py --target setup    # the setup wizard
 
 Requires Pillow. `desktop` writes agents/roomler-desktop/icons/ (app icon,
-menu-bar template, .ico). `setup` writes agents/roomler-setup/icons/ — the
-same R on GREEN (#2E7D32), so a wizard and a companion side by side in a
-taskbar are told apart at a glance; app icon + .ico only, the wizard has no
-tray. CI asserts both sets are real (ci.yml "Assert the icons are real").
+menu-bar template, the tray while a recording runs, .ico). `setup` writes
+agents/roomler-setup/icons/ — the same R on GREEN (#2E7D32), so a wizard and
+a companion side by side in a taskbar are told apart at a glance; app icon +
+.ico only, the wizard has no tray. CI asserts both sets are real (ci.yml
+"Assert the icons are real").
 """
 
 import argparse
@@ -42,6 +43,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BRAND = (21, 101, 192, 255)  # #1565C0, from favicon.svg
 SETUP = (46, 125, 50, 255)  # #2E7D32 — the wizard's green (operator, 2026-09-25)
 WHITE = (255, 255, 255, 255)
+RED = (229, 57, 53, 255)  # #E53935 — the dot on the tray while recording (FR-85)
 
 # target → (output dir, background, whether a menu-bar/tray icon is written)
 TARGETS = {
@@ -93,6 +95,23 @@ def _mark(size: int, fg, bg):
     return img.resize((size, size), Image.LANCZOS)
 
 
+def _recording_mark(size: int):
+    """FR-85 — the tray while a recording runs: the mark in full colour with
+    a red dot at the bottom right, ringed in white so it reads on the blue
+    mark and on a light or a dark menu bar or taskbar alike."""
+    img = _mark(size, WHITE, BRAND)
+    n = size * SS
+    dot = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(dot)
+    r = int(n * 0.22)  # the red dot's radius
+    ring = max(SS, int(n * 0.05))  # the white ring around it
+    c = n - r - ring - 1  # touching the bottom-right corner
+    d.ellipse([c - r - ring, c - r - ring, c + r + ring, c + r + ring], fill=WHITE)
+    d.ellipse([c - r, c - r, c + r, c + r], fill=RED)
+    img.alpha_composite(dot.resize((size, size), Image.LANCZOS))
+    return img
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -117,6 +136,12 @@ def main(argv=None) -> None:
         tray = _mark(44, (0, 0, 0, 0), (0, 0, 0, 255))
         tray.save(out / "tray.png")
         written.append("tray.png")
+
+        # FR-85 — the tray while a recording runs. NOT a template: the
+        # system tints a template to the menu bar, and this one has to stay
+        # red. roomler-desktop swaps it in (tray.rs) and back out after.
+        _recording_mark(44).save(out / "tray-recording.png")
+        written.append("tray-recording.png")
 
     # Windows wants the classic sizes in one file.
     _mark(256, WHITE, bg).save(out / "icon.ico", sizes=ICO_SIZES)

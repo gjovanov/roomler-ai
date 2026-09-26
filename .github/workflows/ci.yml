@@ -124,6 +124,8 @@ jobs:
 
           desktop = pathlib.Path("agents/roomler-desktop/icons")
           check_png(desktop / "tray.png", 16)
+          # FR-85 — the tray while a recording runs (tray.rs swaps it in).
+          check_png(desktop / "tray-recording.png", 16)
           check_png(desktop / "icon.png", 128)
           check_ico(desktop / "icon.ico")
 

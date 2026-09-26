@@ -468,7 +468,7 @@ tray item. Both only ASK the daemon; every decision stays there (§6).
 flowchart LR
     subgraph companion["roomler-desktop (the person's session)"]
       V["Recordings view<br/>recordings.js"]
-      T["tray item<br/>Start / Stop recording"]
+      T["tray<br/>Start / Stop recording,<br/>RED while one runs"]
       P["native folder picker<br/>cmd_pick_record_dir"]
     end
     subgraph daemon["roomlerd (LocalAPI)"]
@@ -478,7 +478,7 @@ flowchart LR
     end
     V -- "cmd_recordings_view:<br/>status + list + record_dir,<br/>ONE connection" --> G
     V -- "cmd_record_start / stop / delete" --> G
-    T -- "RecordStatus every 3 s,<br/>Start / Stop" --> G
+    T -- "RecordStatus every 3 s,<br/>RcSessions every 750 ms (main.rs),<br/>Start / Stop" --> G
     P -- "a folder" --> V
     V -- "cmd_config_set record_dir" --> G
     G --> M
@@ -490,8 +490,29 @@ flowchart LR
 | **Record this screen** | Start / Stop, the frame rate (30 or 60) and the encoder (automatic, GPU only, software only), a blinking REC chip with the running time, size, encoder and resolution. The options lock while a recording runs. How the last one ended is one sentence (`describeLast`); every closed stop reason and refusal code has words. |
 | **Where recordings are saved** | The folder in use, whether it is the default or one the person chose, **Change folder…** (the native picker), **Use the default folder**, and **Open folder**. A fallback is named ("Not the usual folder: … is under OneDrive"). |
 | **Saved recordings** | Newest first, from the sidecars: when, how long, size, by whom (this device, or a remote controller by name), how it ended on hover. **Play** (the OS's default player), **Edit** (P5c, §11; only where the service has the export engine), **Show** (selected in the file manager), **Delete** (two clicks, no modal: the first arms it for 4 s). |
-| **Tray** | **Start recording** / **Stop recording (m:ss)**, and the tooltip `Roomler — recording m:ss`, following the recorder whoever started it. A refusal opens the Recordings view with the sentence. |
+| **Tray** | **Start recording** / **Stop recording (m:ss)**, and the tooltip `Roomler — recording m:ss`, following the recorder whoever started it; a controller's recording names them (`Roomler — <name> is recording, m:ss`). **The icon turns red** (the mark in full colour with a red dot, `icons/tray-recording.png`) while any recording runs, this device's own or a controller's, and back when it ends. A refusal opens the Recordings view with the sentence. |
 
+- ⚠️ **The red comes up with the banner.** Two polls turn it on, and either
+  is enough. The session watch (`main.rs`, every 750 ms, the poll the "being
+  viewed" banner rides) sees a controller's recording MARKED on a session. The
+  daemon sets that mark before the recording's first frame (§10, the
+  indicator), so the red and the banner appear together (AC5). The tray's own
+  `RecordStatus` poll (every 3 s) sees the recorder running, which also covers
+  a recording the person started here.
+- ⚠️ **Only an answer changes the tray.** A poll that failed (the pipe busy
+  for a moment) leaves the words and the icon as the last answer left them
+  (`recorder_running`, `remote_marked`), so the red never drops off a
+  recording that is still running. A recording that ends answers so. For an
+  indicator of recording, the wrong way to fail is to say nothing is.
+  **No service at all is an answer** (`no_service`: its pipe or socket
+  missing, or nobody listening): nothing records without it, the banner
+  comes down with it, and so do the red and the Stop item.
+- ⚠️ **The red icon is never a macOS template.** The idle icon is one
+  (`iconAsTemplate`), so the system tints it to the menu bar, and a tinted dot
+  would not be red. `set_tray_look` sets the icon and its template flag in
+  one step (`set_icon_with_as_template`); set apart, macOS draws the idle
+  template untinted for a moment. A change that failed is tried again at the
+  next poll rather than counted as shown.
 - **Start is greyed out, with the reason, wherever the service cannot record.**
   `RecordingState` carries `available` and `unavailable_reason` (additive,
   serde default `false`): false on a service built without the recorder, and
@@ -1165,7 +1186,7 @@ the music in the preview.
 | `ui/src/__tests__/composables/useRemoteRecording.spec.ts` (P3c) | the viewer's half of the `record` channel, against a scripted channel and an injected save sink: the status and the list asked for as the channel opens; a recording followed from the prompt to its end, a refusal said in words; a channel that closes mid-recording reads as reconnecting (P3b-3; a standing question dies with the session), the next session's channel picks the recording up and Stop names its id, even on a reloaded page, and coming back to nothing recording says it ended meanwhile; a download written in order, with the device's SHA-256 shown; a transfer the session cut, resumed from the bytes already held (red when it restarts from 0); in memory, a file kept only when its SHA-256 matches (red when any file is kept); a short file is an error (red without the length check); a refusal ends a transfer by name and a cancel tells the device; one transfer at a time; P3c-2: `showsRecordRefusal` hides the control for `device_cannot_record` only, and shows every other reason, one from a newer server included; P3b-3: a deliberate Disconnect stops a recording first and waits for the device's answer (or its timeout), and asks nothing of a channel already gone | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/composables/useRemoteControl.spec.ts`, the record channel (P3c) | RECORD read out of the effective grant by equality (a newer `RECORDING` is not it; red with a prefix match) and never assumed when a server sends no grant; the channel opened from the grant, once per PeerConnection (red without the already-open guard), and never without a PeerConnection | "Frontend checks" |
 | `ui/e2e/remote-recording-refused.spec.ts`, `remote-recording-smoke.spec.ts` (P3c) | against the `agent-e2e` harness: a device with a recorder that never opted in (`available` alone) shows a disabled Record control whose tooltip says why, and no Record button; a device with no recorder shows neither (P3c-2); on a device that advertises `remote`, Record ends in the REC chip or in a refusal said in words. The harness agents run as root with nobody at a console, so there a recording is UNATTENDED (P1f): `Dockerfile.agent-e2e` carries `recording` from P1f on, and a harness image built before it advertises nothing, so the smoke spec skips | the k8s agent lane (`scripts/e2e-k8s.sh`); each skips without a seeded tenant or a fitting device |
-| `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
+| `agents/roomler-desktop` | the tray's wording and when its item is enabled, and a controller's recording named in the tooltip; the tray's red: the icon swapped in has a red dot in its corner and nowhere else, the idle one no red, the red one is not a template, and only an answer moves either input (a failed poll neither takes the red off nor puts it on; a viewer's session is not red, a recording one is); only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
 | `agents/roomler-desktop` editor unit tests (P5c) | the event prefix is the recorder's; the probe's answer skips log lines and keeps a refusal; an export folded from the engine's events; a run that ends without an answer is `engine_failed` with its exit (red without the fallback) and a refusal the engine said is kept as said; the stderr tail reads everything and keeps the end; an edit list round-trips under roomlerd's name with no temporary file left; it names its own recording and nothing else, and needs one (red without the check); a directory at a recording's name is not one | `ci.yml` "Test the desktop companion (roomler-desktop)" |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
