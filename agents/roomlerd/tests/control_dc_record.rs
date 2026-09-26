@@ -31,7 +31,7 @@ use roomler_ai_remote_control::signaling::ClientMsg;
 use roomlerd::consent::{ConsentBroker, Mode};
 use roomlerd::indicator::ViewerIndicator;
 use roomlerd::rc_sessions::RcSessionRegistry;
-use roomlerd::recording::manager::RecordingManager;
+use roomlerd::recording::manager::{GRACE_POLL, RecordingManager};
 use roomlerd::recording::remote::{self, Companion, SessionCtx};
 use roomlerd::recording::sidecar::{Initiator, Sidecar};
 use serde_json::{Value, json};
@@ -179,6 +179,26 @@ fn a_question_whose_session_dropped_is_withdrawn() -> Result<()> {
     rt().block_on(a_question_whose_session_dropped_is_withdrawn_cell())
 }
 
+#[test]
+fn the_hosts_disconnect_stops_the_recording() -> Result<()> {
+    rt().block_on(the_hosts_disconnect_stops_the_recording_cell())
+}
+
+#[test]
+fn a_session_the_loop_ends_is_detached_though_its_channel_stays_open() -> Result<()> {
+    rt().block_on(a_session_the_loop_ends_is_detached_though_its_channel_stays_open_cell())
+}
+
+#[test]
+fn the_grace_never_stops_another_recording() -> Result<()> {
+    rt().block_on(the_grace_never_stops_another_recording_cell())
+}
+
+#[test]
+fn a_reoffer_on_the_same_session_keeps_its_banner() -> Result<()> {
+    rt().block_on(a_reoffer_on_the_same_session_keeps_its_banner_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -235,6 +255,9 @@ struct Opts {
     device: Option<Device>,
     /// P3b-3 — who controls (a fresh user when `None`).
     controller: Option<ObjectId>,
+    /// P3b-3 — the session (a fresh one when `None`): the same one again is
+    /// a re-offer, its old peer replaced.
+    session_id: Option<ObjectId>,
 }
 
 impl Default for Opts {
@@ -246,6 +269,7 @@ impl Default for Opts {
             listed: true,
             device: None,
             controller: None,
+            session_id: None,
         }
     }
 }
@@ -402,7 +426,7 @@ impl Rig {
 async fn rig(opts: Opts) -> Result<Rig> {
     let s = setup();
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
-    let session_id = ObjectId::new();
+    let session_id = opts.session_id.unwrap_or_default();
     // `ObjectId`'s default is a fresh one: a new user unless the test names one.
     let controller_user_id = opts.controller.unwrap_or_default();
 
@@ -1427,6 +1451,317 @@ async fn a_question_whose_session_dropped_is_withdrawn_cell() -> Result<()> {
         !s.manager.state().active,
         "a recording started for a session that is gone"
     );
+    Ok(())
+}
+
+/// Every report of `r` until one of `kind` arrives, or `within` passes.
+async fn reports_until(
+    r: &mut Rig,
+    kind: RecordingActivityKind,
+    within: Duration,
+) -> Vec<(RecordingActivityKind, Option<String>)> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut out = Vec::new();
+    loop {
+        out.extend(r.reports().into_iter().map(|(k, why, _)| (k, why)));
+        if out.iter().any(|(k, _)| *k == kind) || tokio::time::Instant::now() >= deadline {
+            return out;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether `cond` holds within `within`.
+async fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while !cond() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
+/// P3b-3 — the HOST's Disconnect is not a drop. The person at the device
+/// sent the controller away, so the recording stops then and there,
+/// `host_stopped`, reported once, its banner down, and the controller's
+/// next session finds nothing to pick up (red when it is detached like a
+/// drop: it runs on, waiting for them, and ends `session_ended`).
+async fn the_hosts_disconnect_stops_the_recording_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let on_device = || Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        ..Default::default()
+    };
+    let mut a = rig(on_device()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "h1"})).await?;
+    let v = a.state(START).await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    let name = v["name"].as_str().expect("a file name").to_string();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // The signalling loop's kill arm: the recording first, then the peer
+    // and the banner, as for any session end.
+    remote::host_ended(a.session_id);
+    a.drop_session().await?;
+    let t = tokio::time::Instant::now();
+    while s.manager.state().active && t.elapsed() < STOP {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let st = s.manager.state();
+    assert!(
+        !st.active,
+        "the host's Disconnect left the recording running"
+    );
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("host_stopped"),
+        "the host's Disconnect did not stop it"
+    );
+    let kinds = reports_until(
+        &mut a,
+        RecordingActivityKind::Stopped,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        kinds,
+        vec![
+            (RecordingActivityKind::Started, None),
+            (RecordingActivityKind::Stopped, Some("host_stopped".into())),
+        ]
+    );
+    assert!(
+        eventually(Duration::from_secs(3), || device
+            .registry
+            .list()
+            .iter()
+            .all(|e| !e.recording))
+        .await,
+        "the banner outlived the recording"
+    );
+    // The controller comes back: there is nothing to pick up.
+    let mut b = rig(on_device()).await?;
+    b.send(json!({"t": "rc:record.status"})).await?;
+    assert_eq!(b.state(START).await?["state"], "idle");
+    let file = s.out.join(&name);
+    let _ = std::fs::remove_file(Sidecar::path_for(&file));
+    let _ = std::fs::remove_file(&file);
+    Ok(())
+}
+
+/// P3b-3 — a session the signalling loop ends (the server's terminate, the
+/// control connection lost) is over even when its channel never closes: a
+/// peer whose close overran its budget is dropped before its channels are
+/// touched. The recording is detached, and its controller picks it up (red
+/// without `session_ended`: nothing detaches, and they are told `idle`).
+async fn a_session_the_loop_ends_is_detached_though_its_channel_stays_open_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let on_device = || Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        ..Default::default()
+    };
+    let mut a = rig(on_device()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "l1"})).await?;
+    let v = a.state(START).await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    let name = v["name"].as_str().expect("a file name").to_string();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // The loop ends the session; its peer is never closed.
+    remote::session_ended(a.session_id);
+    a.indicator.hide_session(a.session_id.to_hex());
+
+    let mut b = rig(on_device()).await?;
+    b.send(json!({"t": "rc:record.status"})).await?;
+    let v = b.state(START).await?;
+    assert_eq!(
+        (v["state"].as_str(), v["id"].as_str(), v["name"].as_str()),
+        (Some("recording"), Some("l1"), Some(name.as_str())),
+        "a session the loop ended kept its recording: {v}"
+    );
+    b.send(json!({"t": "rc:record.stop", "id": "l1"})).await?;
+    let v = b.until_not_recording(STOP).await?;
+    assert_eq!(v["reason"], "requested", "{v}");
+    let b_kinds = reports_until(
+        &mut b,
+        RecordingActivityKind::Stopped,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        b_kinds,
+        vec![
+            (RecordingActivityKind::Reattached, None),
+            (RecordingActivityKind::Stopped, Some("requested".into())),
+        ]
+    );
+    let a_kinds: Vec<_> = a.reports().into_iter().map(|(k, _, _)| k).collect();
+    assert_eq!(a_kinds, vec![RecordingActivityKind::Started]);
+    a.drop_session().await?;
+    let file = s.out.join(&name);
+    let _ = std::fs::remove_file(Sidecar::path_for(&file));
+    let _ = std::fs::remove_file(&file);
+    Ok(())
+}
+
+/// P3b-3 — the grace acts on ITS recording only. A detached recording ends
+/// by itself (the host's Stop) and another controller starts one before the
+/// grace looks again: at that look the grace finds its own recording over
+/// and reports THAT, once, on its own session, and leaves the other one be
+/// (red when it looks at "whatever is recording": it stops the other
+/// controller's recording `session_ended`).
+async fn the_grace_never_stops_another_recording_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    // A long pause between the grace's looks, for the second recording to
+    // begin inside it.
+    let poll = Duration::from_secs(15);
+    s.manager.set_grace_poll(poll);
+    let outcome = async {
+        let (device, _kill) = Device::new();
+        let on_device = || Opts {
+            device: Some(device.clone()),
+            ..Default::default()
+        };
+        let mut a = rig(on_device()).await?;
+        a.send(json!({"t": "rc:record.start", "id": "n1"})).await?;
+        let v = a.state(START).await?;
+        assert_eq!(v["state"], "recording", "{v}");
+        let name_a = v["name"].as_str().unwrap().to_string();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        a.drop_session().await?;
+        let dropped = tokio::time::Instant::now();
+        // The drop is seen (≤ 500 ms) and the grace's first look passes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The host stops it, and another controller starts a recording.
+        let _ = s.manager.stop().await;
+        assert!(!s.manager.state().active, "the host's Stop did not stop it");
+        let mut c = rig(on_device()).await?;
+        c.send(json!({"t": "rc:record.start", "id": "n2"})).await?;
+        let v = c.state(START).await?;
+        assert_eq!(v["state"], "recording", "{v}");
+        let name_c = v["name"].as_str().unwrap().to_string();
+        assert!(
+            dropped.elapsed() < poll - Duration::from_secs(1),
+            "the second recording began after the grace looked again: this cell proves nothing"
+        );
+
+        // Past A's grace and the grace's next look.
+        tokio::time::sleep_until(dropped + poll + Duration::from_secs(2)).await;
+        assert!(
+            s.manager
+                .active_remote()
+                .is_some_and(|r| r.session_id == c.session_id),
+            "the grace stopped another controller's recording"
+        );
+        let a_kinds = reports_until(
+            &mut a,
+            RecordingActivityKind::Stopped,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(
+            a_kinds,
+            vec![
+                (RecordingActivityKind::Started, None),
+                (RecordingActivityKind::Stopped, Some("host_stopped".into())),
+            ]
+        );
+        let banner = device.registry.list();
+        assert!(
+            banner.len() == 1
+                && banner[0].session_id == c.session_id.to_hex()
+                && banner[0].recording,
+            "the banners are wrong: {banner:?}"
+        );
+        c.send(json!({"t": "rc:record.stop", "id": "n2"})).await?;
+        let v = c.until_not_recording(STOP).await?;
+        assert_eq!(v["reason"], "requested", "{v}");
+        let c_kinds: Vec<_> = c.reports().into_iter().map(|(k, _, _)| k).collect();
+        assert_eq!(c_kinds.first(), Some(&RecordingActivityKind::Started));
+        for n in [&name_a, &name_c] {
+            let file = s.out.join(n);
+            let _ = std::fs::remove_file(Sidecar::path_for(&file));
+            let _ = std::fs::remove_file(&file);
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    s.manager.set_grace_poll(GRACE_POLL);
+    outcome
+}
+
+/// P3b-3 — a re-offer on the SAME session id (its old peer replaced; the
+/// session goes on): the recording carries on under the new peer, and its
+/// banner keeps saying so (red when the pick-up takes "the old banner"
+/// down: it is this one).
+async fn a_reoffer_on_the_same_session_keeps_its_banner_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let session = ObjectId::new();
+    let same = |listed| Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        session_id: Some(session),
+        listed,
+        ..Default::default()
+    };
+    let mut a = rig(same(true)).await?;
+    a.send(json!({"t": "rc:record.start", "id": "s1"})).await?;
+    let v = a.state(START).await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    let name = v["name"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // The loop replaces the peer. No `hide_session`: the session goes on.
+    let _ = a.pcs.1.close().await;
+    let _ = a.pcs.0.close().await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // The session is listed already.
+    let mut b = rig(same(false)).await?;
+    b.send(json!({"t": "rc:record.status"})).await?;
+    let v = b.state(START).await?;
+    assert_eq!(
+        (v["state"].as_str(), v["id"].as_str()),
+        (Some("recording"), Some("s1")),
+        "{v}"
+    );
+    let banner = device.registry.list();
+    assert!(
+        banner.len() == 1
+            && banner[0].session_id == session.to_hex()
+            && banner[0].recording
+            && !banner[0].reconnecting,
+        "the re-offer took the banner down while it records: {banner:?}"
+    );
+    b.send(json!({"t": "rc:record.stop", "id": "s1"})).await?;
+    let v = b.until_not_recording(STOP).await?;
+    assert_eq!(v["reason"], "requested", "{v}");
+    let file = s.out.join(&name);
+    let _ = std::fs::remove_file(Sidecar::path_for(&file));
+    let _ = std::fs::remove_file(&file);
     Ok(())
 }
 

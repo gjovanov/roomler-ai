@@ -18,7 +18,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -140,7 +140,14 @@ pub struct RecordingManager {
     /// started it, waiting for its controller to come back
     /// ([`REATTACH_GRACE`], unless a test shortens it).
     reattach_grace: Duration,
+    /// FR-85 P3b-3 — how often the grace looks at a detached recording, in
+    /// ms ([`GRACE_POLL`]). A test lengthens it to put a second recording
+    /// between two looks, which the grace must never stop.
+    grace_poll_ms: AtomicU64,
 }
+
+/// FR-85 P3b-3 — how often the grace looks at a detached recording.
+pub const GRACE_POLL: Duration = Duration::from_secs(1);
 
 /// FR-85 P3b-3 — the re-attach grace. The reconnect ladder mints a new
 /// session id on every drop, and a relay flap or a reloaded viewer should not
@@ -163,7 +170,20 @@ impl RecordingManager {
             remote: StdMutex::new(None),
             unattended_dir: None,
             reattach_grace: REATTACH_GRACE,
+            grace_poll_ms: AtomicU64::new(GRACE_POLL.as_millis() as u64),
         }
+    }
+
+    /// FR-85 P3b-3 — how often the grace looks at a detached recording.
+    pub fn grace_poll(&self) -> Duration {
+        Duration::from_millis(self.grace_poll_ms.load(Ordering::Acquire))
+    }
+
+    /// FR-85 P3b-3 — change how often the grace looks (tests; a grace
+    /// already watching keeps its own pace).
+    pub fn set_grace_poll(&self, every: Duration) {
+        self.grace_poll_ms
+            .store(every.as_millis() as u64, Ordering::Release);
     }
 
     /// FR-85 P3b-3 — shorten the re-attach grace (tests).
