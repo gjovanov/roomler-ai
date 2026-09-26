@@ -548,8 +548,14 @@ jobs:
         #   * `record --where` must choose ~/Videos/Roomler, and the rest of
         #     home must stay read-only.
         # A SYSTEM unit with User= needs no user session on the runner and
-        # sets up the same mount namespace; `%h` is expanded here because in
-        # a system unit it means root's home whatever User= says.
+        # ALWAYS sets up the mount namespace, i.e. the configuration where
+        # both failures bite. A user manager applies the sandbox only where it
+        # can create an unprivileged user namespace: where it cannot (e.g.
+        # under Ubuntu 24.04's default AppArmor restriction) systemd logs
+        # "Failed to set up user namespacing for unprivileged user, ignoring"
+        # and runs the unit with no sandbox at all (measured, systemd 255,
+        # with user.max_user_namespaces=0). `%h` is expanded here
+        # because in a system unit it means root's home whatever User= says.
         run: |
           set -eu
           cargo build -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --message-format=json > /tmp/p2c-build.json
@@ -557,11 +563,15 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd binary in the build output"; exit 1; fi
           ME=$(id -un)
           H=$(getent passwd "$ME" | cut -d: -f6)
-          # What `roomlerd enroll` leaves behind, and an XDG Videos folder;
-          # no pre-rename folders, like any host installed after the rename.
+          # What `roomlerd enroll` leaves behind, and an XDG Videos folder.
           mkdir -p "$H/.config/roomler" "$H/.local/share/roomler" "$H/Videos"
           printf 'XDG_VIDEOS_DIR="$HOME/Videos"\n' > "$H/.config/user-dirs.dirs"
-          if [ "$(ls -d "$H"/.config/roomler* | wc -l)" != 1 ]; then echo "::error::the runner has another roomler config folder (a pre-rename one?); the cell proves nothing"; exit 1; fi
+          # Every path the unit lists as optional (`-`), ~/Videos aside, must
+          # be MISSING, as on any host installed after the rename, or the
+          # cell proves nothing about a missing path.
+          for p in $(grep -E '^ReadWritePaths=' agents/roomlerd/packaging/linux/roomler.service | sed 's/^ReadWritePaths=//' | tr ' ' '\n' | grep '^-' | sed "s|^-||; s|%h|$H|g"); do
+            if [ "$p" != "$H/Videos" ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
+          done
           OUT=/tmp/p2c-where.out
           {
             echo "[Service]"
