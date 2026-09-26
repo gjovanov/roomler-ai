@@ -23,6 +23,13 @@
  *     which then saves through `cmd_route_update` (an atomic replace in the
  *     daemon; an invalid edit leaves the old route running).
  *
+ * #1685 — the State column is the port's truth: `active` only once the
+ * route's listener is bound and serving; `connecting` while its first
+ * session attempt is in flight; `retrying (N, next in Ss) — <error>` while
+ * the tunnel session toward the node keeps failing, with `· device offline`
+ * appended when the Devices data already knows why. A state word this build
+ * does not know (a newer daemon) is shown as its word, never as an error.
+ *
  * The add-route form offers a picker of known agent peers (from the central
  * device view — PeerInfo.agent_id is the join key) with a free-text escape
  * hatch for an id that isn't in the mesh list.
@@ -134,6 +141,13 @@
     return agentId.length > 10 ? agentId.slice(0, 8) + '…' : agentId;
   }
 
+  // true / false when the mesh view knows the device, null when it does not.
+  function peerOnline(agentId) {
+    if (!agentId) return null;
+    const hit = agentPeers().find((p) => p.agent_id === agentId);
+    return hit ? !!hit.online : null;
+  }
+
   /* ── row plumbing ───────────────────────────────────────────────── */
 
   function td(text, cls) {
@@ -185,17 +199,41 @@
   /* ── declared routes ────────────────────────────────────────────── */
 
   // Compact human word for a RouteState (adjacently tagged on `state`).
+  // #1685 — a flow that exists but does not serve carries its `flow_id`: on
+  // `pending` its first session attempt is in flight; on `backoff` the tunnel
+  // session toward the node is what keeps failing, as opposed to a `backoff`
+  // without one, where the local port could not be bound. A daemon older
+  // than #1685 sends neither field and renders exactly as before.
   function stateLabel(s) {
     switch (s.state) {
       case 'disabled': return { text: 'disabled', cls: 'muted' };
-      case 'pending': return { text: 'pending', cls: 'muted' };
+      case 'pending':
+        return s.flow_id ? { text: 'connecting', cls: 'muted' } : { text: 'pending', cls: 'muted' };
       case 'active': return { text: 'active', cls: 'ok' };
-      case 'backoff':
+      case 'backoff': {
+        if (s.flow_id) {
+          const n = s.attempts > 0 ? s.attempts : 1;
+          const next = s.next_retry_secs > 0 ? ', next in ' + s.next_retry_secs + 's' : '';
+          return { text: 'retrying (' + n + next + ') — ' + s.last_error, cls: 'warn' };
+        }
         return { text: 'retrying in ' + s.next_retry_secs + 's: ' + s.last_error, cls: 'warn' };
+      }
       case 'failed':
         return { text: 'FAILED: ' + s.reason, cls: 'err' };
+      // A newer daemon's state word: shown as-is, never an error.
       default: return { text: s.state || '—', cls: 'muted' };
     }
+  }
+
+  // #1685 — say WHY a route is not serving when the Devices data already
+  // knows: its target device is offline.
+  function stateText(r) {
+    const st = stateLabel(r.state);
+    const s = r.state || {};
+    if ((s.state === 'pending' || s.state === 'backoff') && peerOnline(r.route.node) === false) {
+      return { text: st.text + ' · device offline', cls: st.cls };
+    }
+    return st;
   }
 
   // The flow backing an active route, for its live Traffic column.
@@ -243,7 +281,7 @@
     setText(row.cells.local, '127.0.0.1:' + d.local);
     setText(row.cells.remote, d.remote || '—');
     setText(row.cells.device, deviceLabel(d.node));
-    const st = stateLabel(r.state);
+    const st = stateText(r);
     if (row.stateText.data !== st.text) row.stateText.data = st.text;
     setClass(row.cells.state, st.cls || '');
     // Live traffic rides in the state cell ("active · ↓ 2 MiB ↑ 1 MiB") —

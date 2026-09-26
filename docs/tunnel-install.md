@@ -299,12 +299,28 @@ roomler route rm pg       # remove entirely
 ```
 
 Omit `--remote` for a supervised SOCKS5 listener toward the node. The
-`STATE` column shows the reconciler's view: `pending` → `active (fl-N)`,
-`backoff Ns: <error>` while flow creation retries (e.g. the port is
-taken), and `FAILED: <reason>` — terminal, reserved for failures that
-can't heal by retrying (enrollment revoked, cross-tenant); fix the cause
-and `route enable` to retry. The desktop app's **Tunnels** section shows
-and manages the same list.
+`STATE` column tells the truth about the local port — `active` is a
+**bound, serving listener** and nothing less (#1685):
+
+| `route ls` shows | Meaning | Listener on `127.0.0.1:<local>` |
+|---|---|---|
+| `pending` | declared; the reconciler has not created its flow yet | no |
+| `connecting (fl-N)` | the flow exists; its first tunnel session toward the node is being opened | no |
+| `active (fl-N)` | the tunnel session is up and the listener is bound | **yes** |
+| `retrying (fl-N, attempt K, next in Ss): <error>` | the session failed K times in a row — the node is offline, the daemon's control connection is down, or the transport setup failed; `<error>` is the last attempt's | no |
+| `backoff Ss: <error>` | the flow itself could not be created — its local port is taken (`route still cannot bind its local port` in the log names the holder) | no |
+| `FAILED: <reason>` | terminal — a failure that cannot heal by retrying (enrollment revoked, cross-tenant); fix the cause and `route enable` | no |
+| `disabled` | declared, not supervised | no |
+
+⚠️ Before #1685 `active` meant "a hub flow exists for this route", so a
+route to a switched-off machine read `active (fl-N)` with **no** listener
+and every connect refused, indistinguishable from a healthy one; its
+daemon log looped `tunnel session failed; retrying flow=fl-N`. A
+`roomler` or companion older than the fix reading a newer daemon shows such
+a route as `pending` / `backoff Ss: <error>` — true, less specific — because
+the wire keeps its state words and only adds fields. The desktop app's
+**Routes** page shows and manages the same list, appending `· device
+offline` when the Devices data already knows why.
 
 Notes:
 - The daemon writes the routes into its own `config.toml`; on

@@ -245,6 +245,15 @@ pub enum Target {
     Socks5,
 }
 
+/// #1685 — called by the driver the moment the session's local listener is
+/// bound, with the address it serves on. That bind is the ONLY point at which
+/// "this route is active" becomes true: `rc:tunnel.opened` is the server
+/// accepting the open, and the QUIC / DC-pool setup after it can still fail —
+/// toward an offline node it does, every cycle. An owner that publishes a
+/// liveness state (the daemon's route reconciler) flips it from here; the
+/// standalone CLI passes `None`.
+pub type ListeningHook = Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>;
+
 /// Everything the caller must supply to identify + version a tunnel session,
 /// beyond the signaling seam + local port. Bundled so the driver's public
 /// entry point stays a manageable arity and so the daemon (P3b-2) can build it
@@ -261,6 +270,25 @@ pub struct SessionParams {
     /// `Some` only in the daemon (an overlay node with an established `/derp`
     /// WS); the standalone CLI passes `None` and keeps the classic ladder.
     pub derp: Option<crate::transport::derp::DerpTunnelHandle>,
+    /// #1685 — told when the local listener is bound (see [`ListeningHook`]).
+    /// `None` when the caller has no liveness state to publish.
+    pub on_listening: Option<ListeningHook>,
+}
+
+/// Bind the session's loopback listener and, once it is bound, tell the owner
+/// (#1685). The hook fires only on success: a failed bind is an error the
+/// caller propagates, never a serving route.
+async fn bind_local_listener(
+    local: u16,
+    on_listening: Option<&ListeningHook>,
+) -> Result<TcpListener> {
+    let listener = TcpListener::bind(("127.0.0.1", local))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{local}"))?;
+    if let Some(hook) = on_listening {
+        hook(listener.local_addr()?);
+    }
+    Ok(listener)
 }
 
 /// One session attempt over a caller-supplied signaling link: handshake, open
@@ -382,6 +410,7 @@ pub async fn run_tunnel_session(
             &params.target,
             session,
             Some(derp),
+            params.on_listening.clone(),
         )
         .await;
     }
@@ -396,6 +425,7 @@ pub async fn run_tunnel_session(
             &params.target,
             session,
             None,
+            params.on_listening.clone(),
         )
         .await;
     }
@@ -407,6 +437,7 @@ pub async fn run_tunnel_session(
         local,
         &params.target,
         session,
+        params.on_listening.clone(),
     )
     .await?;
     Ok(SessionOutcome::Completed)
@@ -424,6 +455,7 @@ async fn run_webrtc_session(
     local: u16,
     target: &Target,
     session: Arc<SessionThroughput>,
+    on_listening: Option<ListeningHook>,
 ) -> Result<()> {
     // ────────────── Build TunnelPeer + SDP/ICE handshake ───────────
     let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
@@ -547,9 +579,7 @@ async fn run_webrtc_session(
     }
 
     // ────────────── Local TCP listener ─────────────────────────────
-    let listener = TcpListener::bind(("127.0.0.1", local))
-        .await
-        .with_context(|| format!("binding 127.0.0.1:{local}"))?;
+    let listener = bind_local_listener(local, on_listening.as_ref()).await?;
     info!(local = %listener.local_addr()?, "listening for local TCP connections");
 
     let flow_counter = Arc::new(AtomicU32::new(1));
@@ -1066,6 +1096,7 @@ async fn run_quic_session(
     // relay. Everything after the connection (auth, dispatcher, flows) is
     // transport-agnostic and shared.
     derp: Option<crate::transport::derp::DerpTunnelHandle>,
+    on_listening: Option<ListeningHook>,
 ) -> Result<SessionOutcome> {
     let Some(token) = quic_auth_token else {
         warn!("server negotiated a quic flavor but sent no quic_auth_token — cannot authenticate");
@@ -1240,9 +1271,7 @@ async fn run_quic_session(
     let _peer = Arc::new(peer);
 
     // ────────────── Local TCP listener ─────────────────────────────
-    let listener = TcpListener::bind(("127.0.0.1", local))
-        .await
-        .with_context(|| format!("binding 127.0.0.1:{local}"))?;
+    let listener = bind_local_listener(local, on_listening.as_ref()).await?;
     info!(local = %listener.local_addr()?, "listening for local TCP connections (quic-v1)");
     let flow_counter = Arc::new(AtomicU32::new(1));
     // P7 backstop: shared consecutive-forward-timeout streak + a "session is
@@ -1825,6 +1854,43 @@ mod tests {
     use crate::signaling_link::TunnelSignalingSink;
     use async_trait::async_trait;
     use tokio::sync::mpsc;
+
+    /// #1685 — the owner learns that the listener serves from the bind
+    /// itself: never before it, never from a failed bind, and a caller with
+    /// no hook (the standalone CLI) is fine.
+    #[tokio::test]
+    async fn the_listening_hook_fires_after_a_successful_bind_only() {
+        let fired = Arc::new(std::sync::Mutex::new(Vec::<std::net::SocketAddr>::new()));
+        let hook: ListeningHook = {
+            let fired = fired.clone();
+            Arc::new(move |addr| fired.lock().unwrap().push(addr))
+        };
+        // Occupy the port so the first bind fails.
+        let held = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = held.local_addr().unwrap().port();
+        let err = bind_local_listener(port, Some(&hook))
+            .await
+            .expect_err("the port is held");
+        assert!(
+            format!("{err:#}").contains(&format!("binding 127.0.0.1:{port}")),
+            "{err:#}"
+        );
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "a failed bind is not a serving listener"
+        );
+        drop(held);
+
+        let listener = bind_local_listener(port, Some(&hook)).await.unwrap();
+        assert_eq!(
+            fired.lock().unwrap().as_slice(),
+            &[listener.local_addr().unwrap()],
+            "fired once, with the bound address"
+        );
+        drop(listener);
+        assert!(bind_local_listener(port, None).await.is_ok());
+        assert_eq!(fired.lock().unwrap().len(), 1, "no hook, no call");
+    }
 
     /// The whole point of [`AbortOnDrop`]: a bare `JoinHandle` DETACHES on
     /// drop, so an early `?` left the dispatcher running and pinning the peer
