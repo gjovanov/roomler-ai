@@ -1963,4 +1963,63 @@ SystemContext capture (rc.1–rc.7, hardened through rc.26 behind
 MSI flavour (`wix-perMachine/`). The operator-facing verification procedure lives
 in [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md).
 
+#### 19.8.6 Graceful worker stop (#1683)
+
+The supervisor stops its worker with `TerminateProcess`
+(`win_service/supervisor.rs`, `OwnedProcess::terminate`). A hard kill delivers no
+console control event, so the worker's `terminate_signal()` — `pending()` on
+Windows — never fired, and its `os_initiated_stop` arm never ran. Two things
+were lost on every SCM stop: an **ephemeral** device never self-unenrolled (only
+the server-side reaper collected it, after the TTL — the FR-51 promise held on
+Linux only), and a deliberate stop was miscounted toward `crash_count` on the
+next start (the #1040 wall, on Windows).
+
+The fix is a per-worker **named stop event**
+(`win_service/stop_event.rs`):
+
+- The host **creates the event before it spawns each worker** and passes the
+  name as a hidden `--stop-event <name>` argv (the same channel as
+  `--supervisor scm`). The worker's Windows `terminate_signal()` waits on it and,
+  when it fires, takes the exact `os_initiated_stop` arm a Unix SIGTERM takes.
+- The worker **polls the event on the async runtime** — `WaitForSingleObject(h,
+  0)` every `STOP_EVENT_POLL` (250 ms) — rather than parking a blocking task on
+  it. Its `select!` has other arms (an update's internal shutdown, FR-84 D3's
+  requested restart), and `main()` drops the runtime at the end of its
+  `block_on`, which waits for every `spawn_blocking` task to *return*: a blocking
+  wait that lost the select would have kept process exit waiting for a signal
+  that never comes, so the worker never left on an auto-update and a requested
+  restart never landed. The handle lives inside the future and closes when it is
+  dropped; 250 ms of latency is nothing against the 8 s budget.
+- On SCM Stop / Preshutdown the supervisor **signals the event, waits a bounded
+  `WORKER_GRACEFUL_STOP_BUDGET` (8 s), then falls back to `TerminateProcess`**.
+  The service accepts `SERVICE_CONTROL_PRESHUTDOWN` (180 s budget), so 8 s is
+  comfortably inside the window while never letting a wedged worker hold up an OS
+  shutdown; the reaper stays the backstop.
+- **An update's own service stop never unenrolls.** The MSI stops the service
+  while it replaces the binary; by then the worker that spawned `msiexec` has
+  exited 0 and the host has respawned a fresh one (`decide_exit_reaction(0)` →
+  `Respawn`), which receives that stop as an `os_initiated_stop`. The
+  self-unenroll is therefore gated by the pure
+  `updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight)`
+  — true only for `(true, true, false)` — where `update_in_flight()` reads the
+  `update-attempt` marker `spawn_installer_with_watch` touches (rollbacks
+  included) against `UPDATE_STOP_WINDOW` (10 min; the MSI's stop can lag the
+  spawn by minutes under EDR). A suppressed unenroll is logged by name. The gate
+  is platform-neutral; Linux never needed it only because `dpkg -i` does not
+  restart `roomlerd`.
+- **Security** — the event's DACL (`STOP_EVENT_SDDL`, a protected `D:P`) grants
+  **only SYSTEM** `EVENT_ALL_ACCESS` (the sole principal that may `SetEvent`) and
+  interactive users `SYNCHRONIZE` only (wait, never signal). A worker may run as
+  SYSTEM (SystemContext) or as the signed-in user (attended); neither an
+  unprivileged local user nor a second interactive user can stop — or unenroll —
+  a SYSTEM worker through this event. The name is unique per spawn (host PID + a
+  monotonic counter), so a restart never reopens a stale, possibly-signaled
+  handle.
+- **Degrades safely**: if the event can't be created the worker still spawns and
+  the host hard-terminates as before; if the worker can't open/wait it, it falls
+  through to `pending()` and the host's bounded wait times out into
+  `TerminateProcess`. Only the whole-service shutdown signals the event — a
+  session-change swap or crash-respawn still hard-kills, because the device is
+  not leaving.
+
 <!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->
