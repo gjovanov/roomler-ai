@@ -17,9 +17,16 @@
 //! **The write rule.** The recorder writes into a folder only as that folder's
 //! user (the identity rule — it runs as the console user at normal integrity),
 //! staging in `<dir>/.roomler-partial/` and renaming on finish. When the folder
-//! refuses the write (the Linux user unit's `ProtectHome=read-only`, CFA), it
-//! stages in its own data dir instead, and roomler-desktop — the same user —
-//! moves the file into place.
+//! refuses the write (CFA, a folder policy, the Linux user unit's sandbox) it
+//! falls back — the default folder, then `~/Roomler Recordings`, then its own
+//! data dir — and the Recordings view says why.
+//!
+//! FR-85 P2c — the Linux user unit (`roomler.service`) runs the daemon with
+//! `ProtectHome=read-only`; it lists `~/Videos` as writable, so the default
+//! folder works there, and a folder anywhere else is named as the sandbox's
+//! ([`sandboxed`]). Moving a finished file from the data dir into the chosen
+//! folder as the person (roomler-desktop) was weighed and deferred: built only
+//! if people ask for it (the operator, 2026-09-26).
 
 use std::path::{Path, PathBuf};
 
@@ -108,10 +115,14 @@ pub fn resolve(configured: Option<&Path>) -> FolderChoice {
             }
             Err(e) => {
                 let fallback = default_choice();
+                let why = match sandboxed(&e) {
+                    Some(sandbox) => format!(": it is {sandbox}"),
+                    None => format!(" ({e:#})"),
+                };
                 return FolderChoice {
                     dir: fallback.dir,
                     reason: Some(format!(
-                        "the configured folder {} is not writable ({e:#}); using {}",
+                        "the configured folder {} is not writable{why}; using {}",
                         dir.display(),
                         fallback
                             .reason
@@ -124,6 +135,26 @@ pub fn resolve(configured: Option<&Path>) -> FolderChoice {
         }
     }
     default_choice()
+}
+
+/// FR-85 P2c — the words for a test write the SERVICE'S SANDBOX refused.
+///
+/// A read-only file system on Linux is, in practice, the user unit's
+/// sandbox (`roomler.service`: `ProtectHome=read-only`, with only the
+/// daemon's own folders and `~/Videos` writable), so the Recordings view
+/// names it as that rather than showing "Read-only file system (os error
+/// 30)", which tells nobody what to do. `None` for any other refusal, which
+/// keeps its own words. Nothing else in the rule changes: the recording
+/// still falls back, and the view shows the reason beside the folder.
+pub fn sandboxed(e: &anyhow::Error) -> Option<&'static str> {
+    let read_only = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ReadOnlyFilesystem)
+    });
+    (cfg!(target_os = "linux") && read_only).then_some(
+        "read-only for the Roomler service (on a Linux desktop it runs sandboxed: it can write \
+         only in ~/Videos and its own folders)",
+    )
 }
 
 fn default_choice() -> FolderChoice {
@@ -143,10 +174,14 @@ fn default_choice() -> FolderChoice {
                         reason: None,
                     };
                 }
-                Err(e) => format!(
-                    "{} refused a test write ({e:#}) — Controlled Folder Access, or a folder policy",
-                    p.display()
-                ),
+                Err(e) => match sandboxed(&e) {
+                    Some(sandbox) => format!("{} is {sandbox}", p.display()),
+                    None => format!(
+                        "{} refused a test write ({e:#}) — Controlled Folder Access, or a folder \
+                         policy",
+                        p.display()
+                    ),
+                },
             },
         },
         None => "this account has no Videos folder".into(),
@@ -162,9 +197,13 @@ fn default_choice() -> FolderChoice {
     let dir = data_dir().unwrap_or_else(std::env::temp_dir);
     FolderChoice {
         dir,
-        reason: Some(
-            "no user folder accepted a test write; using the recorder's own data folder".into(),
-        ),
+        // What passed the preferred folder over still says WHY: on a
+        // sandboxed Linux service that is the one sentence that names the
+        // cause (P2c: a localized Videos folder lands here).
+        reason: Some(format!(
+            "{passed_over}; no other folder of yours accepted a test write either, so the \
+             recorder's own data folder"
+        )),
     }
 }
 
@@ -387,6 +426,33 @@ mod tests {
         let choice = resolve(Some(&not_a_dir));
         assert_ne!(choice.dir, not_a_dir);
         assert!(choice.reason.unwrap().contains("not writable"));
+    }
+
+    /// FR-85 P2c — a folder the service's sandbox keeps read-only is NAMED
+    /// as that (on Linux, where the user unit is the sandbox), and every
+    /// other refusal keeps its own words. Red when the sandbox is not
+    /// recognised: the view then shows only "Read-only file system".
+    #[test]
+    fn a_read_only_folder_is_named_as_the_services_sandbox() {
+        let erofs =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem))
+                .context("test write in /home/someone/Desktop/rec");
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("test write in /home/someone/Desktop/rec");
+        if cfg!(target_os = "linux") {
+            let why = sandboxed(&erofs).expect("a read-only file system is the sandbox");
+            assert!(
+                why.contains("Roomler service") && why.contains("~/Videos"),
+                "{why}"
+            );
+        } else {
+            assert_eq!(
+                sandboxed(&erofs),
+                None,
+                "only the Linux user unit sandboxes"
+            );
+        }
+        assert_eq!(sandboxed(&denied), None, "a refusal of another kind");
     }
 
     #[test]
