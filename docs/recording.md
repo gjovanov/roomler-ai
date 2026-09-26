@@ -3,10 +3,13 @@
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core
 > and its mouse pointer, §1; its audio on Windows and Linux; and on Windows
-> and Linux the identity rule: it runs as the person at the device, §6), P2a (the local verbs), P2b
+> and Linux the identity rule: it runs as the person at the device, or, for a
+> remote recording on a host nobody is signed in to, as the service into its
+> own locked folder, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
 > remote recording), P3b (the device's half of it), P3b-2 (downloading it),
-> P3c (the viewer's Record and Download, §10), P5a (the export engine: cut
+> P3c (the viewer's Record and Download, §10), P3c-2 (no Record control on a
+> device with no recorder), P5a (the export engine: cut
 > and speed up, §11), P5b (the export's sound and background music) and P5c
 > (roomler-desktop's Edit view).**
 > It is in **no release build**: `recording` joined `full` for a day (#1677)
