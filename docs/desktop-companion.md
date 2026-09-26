@@ -130,6 +130,20 @@ service predates route editing"* (`src/commands.rs:1100`), never as a blank page
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
 it), the new flow retries on its backoff until the port frees.
 
+**A route's state is the port's truth (#1685).** `active` is shown only once the route's
+tunnel session is up and its local listener is **bound** — the daemon flips it from the bind
+itself (`tunnel_core::driver::ListeningHook`), not from `rc:tunnel.opened`, which the server
+also answers for a node whose data plane then fails to come up. Until then the page shows
+`connecting` (first attempt in flight) or `retrying (N, next in Ss) — <last error>` (the
+session failed N times in a row), and appends `· device offline` when the Devices data
+already knows the target is offline. Field, 2026-09-25: three routes to an offline laptop
+read `active` with nothing listening while the daemon log looped `tunnel session failed;
+retrying`. The wire keeps its state words and adds fields (`flow_id`, `attempts`), so a
+companion older than the fix shows those routes as `pending` / `retrying in Ss: <error>`
+rather than losing the page to a tag it cannot parse; a companion from the fix on shows a
+state word it does not know (a newer daemon) as that word, never as an error
+(`stateLabel`, `src/front/tunnels.js`).
+
 ## 4. Polling rules every page follows
 
 - **Poll only while visible.** A page's own timer runs only while its view is the current

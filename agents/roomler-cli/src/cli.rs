@@ -577,8 +577,9 @@ enum RouteAction {
         /// Route id (from `route ls`).
         id: String,
     },
-    /// List declared routes with their live state
-    /// (pending / active / backoff / failed / disabled).
+    /// List declared routes with their live state (pending / connecting /
+    /// active / retrying / backoff / failed / disabled). `active` means the
+    /// local port is bound and serving.
     Ls {
         #[command(flatten)]
         fmt: OutputFmt,

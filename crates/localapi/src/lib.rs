@@ -841,6 +841,25 @@ fn route_enabled_default() -> bool {
 }
 
 /// Runtime state of a declared route, computed by the daemon's reconciler.
+///
+/// #1685 — `Active` means the route's local listener is BOUND and serving.
+/// Before it, `Active` meant only "a hub flow exists for this route": a route
+/// to an offline node read `active` while nothing listened on its port and
+/// every connect was refused, and the reader had no way to tell it from a
+/// healthy one. The two retrying shapes are told apart by `flow_id`: absent,
+/// the reconciler could not CREATE the flow (its port is taken); present, the
+/// flow exists and its tunnel SESSION toward the node is what is not up (node
+/// offline, control WS down, transport setup failing).
+///
+/// Wire compatibility: the tag set is unchanged and every new field is
+/// additive (`default`, skipped when empty). A reader parses this enum with
+/// serde, and a tag it does not know fails the WHOLE `RouteList` reply — a
+/// companion older than a new tag would lose its Routes page for as long as
+/// any route sat in that state. So a pre-#1685 reader sees `pending` /
+/// `backoff … <error>` for a route that is dialing or retrying — statements it
+/// already renders truthfully, never a false `active` — and a reader from this
+/// version on maps a tag it does not know to [`RouteState::Unknown`].
+///
 /// `Failed` is TERMINAL: a permanent open-failure (enrollment revoked,
 /// cross-tenant, ACL policy deny) stops supervision for the route until an
 /// operator re-enables it — without this, a revoked route would hammer the
@@ -850,18 +869,53 @@ fn route_enabled_default() -> bool {
 pub enum RouteState {
     /// `enabled = false` — not supervised.
     Disabled,
-    /// Declared and enabled; the reconciler hasn't (re)created its flow yet.
-    Pending,
-    /// Live flow exists.
+    /// Declared and enabled, not serving yet. `flow_id` (#1685) is present
+    /// once the daemon has a flow for the route whose first session attempt
+    /// is in flight — "connecting" — and absent while the reconciler has not
+    /// created the flow. Serialises as the bare `{"state":"pending"}` when
+    /// absent, byte-identical to the pre-#1685 wire.
+    Pending {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flow_id: Option<String>,
+    },
+    /// The route's local listener is bound and serving through `flow_id`.
     Active { flow_id: String },
-    /// Flow creation failed retryably (port taken, WS down); the reconciler
-    /// retries with backoff.
+    /// Not serving; retrying with backoff. Without `flow_id`: flow creation
+    /// failed (the local port is taken) and the reconciler retries in
+    /// `next_retry_secs`. With `flow_id` (#1685): the flow exists and its
+    /// tunnel session is what failed — `last_error` is the last attempt's
+    /// error, `attempts` the consecutive failures since the route last
+    /// served, `next_retry_secs` the wait before the next attempt (`0` while
+    /// one is in flight).
     Backoff {
         next_retry_secs: u64,
         last_error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flow_id: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        attempts: u32,
     },
     /// Permanent failure — requires operator re-enable (or remove).
     Failed { reason: String },
+    /// A `state` word this reader does not know — a newer daemon (#1685).
+    /// Rendered as its word, never an error; a daemon never produces it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RouteState {
+    /// The hub flow behind this state, if one exists (#1685): always for
+    /// `Active`; for `Pending` / `Backoff` when the flow exists and is what
+    /// is dialing or retrying.
+    pub fn flow_id(&self) -> Option<&str> {
+        match self {
+            RouteState::Active { flow_id } => Some(flow_id),
+            RouteState::Pending { flow_id } | RouteState::Backoff { flow_id, .. } => {
+                flow_id.as_deref()
+            }
+            RouteState::Disabled | RouteState::Failed { .. } | RouteState::Unknown => None,
+        }
+    }
 }
 
 /// A declared route joined with its live runtime state — the
@@ -4780,12 +4834,16 @@ mod tests {
             state: RouteState::Backoff {
                 next_retry_secs: 30,
                 last_error: "bind: in use".into(),
+                flow_id: None,
+                attempts: 0,
             },
         };
         let s = serde_json::to_string(&Response::Routes(vec![info.clone()])).unwrap();
         assert!(
-            s.contains(r#""state":{"state":"backoff","next_retry_secs":30"#),
-            "got {s}"
+            s.contains(
+                r#""state":{"state":"backoff","next_retry_secs":30,"last_error":"bind: in use"}"#
+            ),
+            "the pre-#1685 backoff shape is byte-identical: {s}"
         );
         assert_eq!(
             serde_json::from_str::<Response>(&s).unwrap(),
@@ -4818,6 +4876,139 @@ mod tests {
             })
             .unwrap(),
             r#"{"state":"failed","reason":"revoked"}"#
+        );
+    }
+
+    /// #1685 — the route-state wire is ADDITIVE in both directions. The tag
+    /// set is unchanged and the new fields are skipped when empty, so a
+    /// reader that predates them (the pre-#1685 enum, reproduced here as a
+    /// pre-#1685 companion / CLI would compile it) parses everything a new
+    /// daemon emits and renders a dialing or retrying route as `pending` /
+    /// `backoff … <error>` — true, never a false `active`. A reader from this
+    /// version on maps a tag it does not know to `Unknown` instead of failing
+    /// the whole `RouteList` reply.
+    #[test]
+    fn route_state_wire_is_additive_and_an_older_reader_still_parses_it() {
+        /// `RouteState` exactly as shipped before #1685.
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum OldRouteState {
+            Disabled,
+            Pending,
+            Active {
+                flow_id: String,
+            },
+            Backoff {
+                next_retry_secs: u64,
+                last_error: String,
+            },
+            Failed {
+                reason: String,
+            },
+        }
+
+        // Byte-identical to the old wire when the new fields are empty.
+        assert_eq!(
+            serde_json::to_string(&RouteState::Pending { flow_id: None }).unwrap(),
+            r#"{"state":"pending"}"#
+        );
+        // The new daemon's "connecting" and "retrying" shapes…
+        let connecting = RouteState::Pending {
+            flow_id: Some("fl-2".into()),
+        };
+        let retrying = RouteState::Backoff {
+            next_retry_secs: 4,
+            last_error: "server error during tunnel.open: agent_unavailable: agent is offline"
+                .into(),
+            flow_id: Some("fl-2".into()),
+            attempts: 3,
+        };
+        let connecting_json = serde_json::to_string(&connecting).unwrap();
+        let retrying_json = serde_json::to_string(&retrying).unwrap();
+        assert_eq!(connecting_json, r#"{"state":"pending","flow_id":"fl-2"}"#);
+        assert_eq!(
+            retrying_json,
+            r#"{"state":"backoff","next_retry_secs":4,"last_error":"server error during tunnel.open: agent_unavailable: agent is offline","flow_id":"fl-2","attempts":3}"#
+        );
+        // …round-trip on this version…
+        assert_eq!(
+            serde_json::from_str::<RouteState>(&connecting_json).unwrap(),
+            connecting
+        );
+        assert_eq!(
+            serde_json::from_str::<RouteState>(&retrying_json).unwrap(),
+            retrying
+        );
+        // …and an OLDER reader parses them too, as true (if less specific)
+        // statements — never `active`.
+        assert_eq!(
+            serde_json::from_str::<OldRouteState>(&connecting_json).unwrap(),
+            OldRouteState::Pending
+        );
+        assert_eq!(
+            serde_json::from_str::<OldRouteState>(&retrying_json).unwrap(),
+            OldRouteState::Backoff {
+                next_retry_secs: 4,
+                last_error: "server error during tunnel.open: agent_unavailable: agent is offline"
+                    .into(),
+            }
+        );
+        // An OLDER daemon's rows parse on this version with the new fields
+        // at their defaults.
+        assert_eq!(
+            serde_json::from_str::<RouteState>(r#"{"state":"pending"}"#).unwrap(),
+            RouteState::Pending { flow_id: None }
+        );
+        assert_eq!(
+            serde_json::from_str::<RouteState>(
+                r#"{"state":"backoff","next_retry_secs":30,"last_error":"bind: in use"}"#
+            )
+            .unwrap(),
+            RouteState::Backoff {
+                next_retry_secs: 30,
+                last_error: "bind: in use".into(),
+                flow_id: None,
+                attempts: 0,
+            }
+        );
+        assert_eq!(
+            RouteState::Active {
+                flow_id: "fl-1".into()
+            }
+            .flow_id(),
+            Some("fl-1")
+        );
+        assert_eq!(retrying.flow_id(), Some("fl-2"));
+        assert_eq!(RouteState::Disabled.flow_id(), None);
+
+        // A tag from a daemon NEWER than this reader: the row survives as
+        // `Unknown`, and so does the rest of the reply.
+        let newer: Response = serde_json::from_str(
+            r#"{"t":"routes","d":[
+                {"route":{"id":"a","kind":"socks5","node":"aabbcc","local":1081},"state":{"state":"draining","flow_id":"fl-9","reason":"x"}},
+                {"route":{"id":"b","kind":"socks5","node":"aabbcc","local":1082},"state":{"state":"active","flow_id":"fl-3"}}
+            ]}"#,
+        )
+        .unwrap();
+        match newer {
+            Response::Routes(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].state, RouteState::Unknown);
+                assert_eq!(rows[0].state.flow_id(), None);
+                assert_eq!(
+                    rows[1].state,
+                    RouteState::Active {
+                        flow_id: "fl-3".into()
+                    }
+                );
+            }
+            other => panic!("expected routes: {other:?}"),
+        }
+        // …whereas the OLD reader could not: a new tag failed its whole reply.
+        // (That is why #1685 kept the tag set and added fields instead.)
+        assert!(
+            serde_json::from_str::<OldRouteState>(r#"{"state":"connecting","flow_id":"fl-2"}"#)
+                .is_err()
         );
     }
 
