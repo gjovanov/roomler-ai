@@ -16,9 +16,11 @@
 #![cfg(all(feature = "recording", feature = "openh264-encoder"))]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use roomlerd::capture::pointer::{PointerSample, PointerShape, PointerSource, RecordedPointer};
 use roomlerd::capture::{Damage, Frame, PixelFormat, ScreenCapture};
 use roomlerd::encode::VideoEncoder;
 use roomlerd::encode::openh264_backend::Openh264Encoder;
@@ -28,7 +30,7 @@ use roomlerd::recording::mp4::{ProgressiveFile, VIDEO_TRACK_ID};
 use roomlerd::recording::recorder::{
     self, EncoderFactory, RecordOptions, RecorderEvent, StartError, StartRefusal,
 };
-use roomlerd::recording::sidecar::{Initiator, Sidecar, StopReason};
+use roomlerd::recording::sidecar::{Initiator, Pointer, Sidecar, StopReason};
 use tokio::sync::{mpsc, watch};
 
 const W: u32 = 320;
@@ -97,6 +99,12 @@ struct CounterCapture {
     n: u64,
     resize_after: Option<u64>,
     fail: bool,
+    /// FR-85 P1d — a pointer this "backend" cannot draw itself, handed to
+    /// the recorder to draw (as DXGI and X11 do).
+    pointer: Option<Box<dyn PointerSource>>,
+    /// FR-85 P1d — after this many frames the screen goes still: no new
+    /// frame, the way DXGI, or X11's damage tracking, reports "unchanged".
+    still_after: Option<u64>,
 }
 
 impl CounterCapture {
@@ -107,6 +115,8 @@ impl CounterCapture {
             n: 0,
             resize_after: None,
             fail: false,
+            pointer: None,
+            still_after: None,
         }
     }
 }
@@ -124,6 +134,10 @@ impl ScreenCapture for CounterCapture {
             tokio::time::sleep(due - now).await;
         }
         self.n = (self.start.elapsed().as_nanos() / self.interval.as_nanos()) as u64;
+        if self.still_after.is_some_and(|k| self.n >= k) {
+            self.n += 1;
+            return Ok(None);
+        }
         let (w, h) = match self.resize_after {
             Some(k) if self.n >= k => (W + 64, H),
             _ => (W, H),
@@ -145,6 +159,13 @@ impl ScreenCapture for CounterCapture {
 
     fn monitor_count(&self) -> u8 {
         1
+    }
+
+    fn recorded_pointer(&mut self) -> RecordedPointer {
+        match self.pointer.take() {
+            Some(p) => RecordedPointer::Drawn(p),
+            None => RecordedPointer::Absent,
+        }
     }
 }
 
@@ -206,6 +227,21 @@ struct Decoded {
 /// Decode every video sample of a progressive recording with openh264 and
 /// read the counter back out of each picture.
 fn decode_counters(path: &Path) -> Decoded {
+    let (counters, samples, dts) = decode_pictures(path, read_counter);
+    Decoded {
+        counters,
+        samples,
+        dts,
+    }
+}
+
+/// Decode every video sample and hand each picture's luma plane (and its
+/// stride) to `read`. Returns what `read` said per picture, the sample count
+/// and the samples' decode times.
+fn decode_pictures<T>(
+    path: &Path,
+    mut read: impl FnMut(&[u8], usize) -> T,
+) -> (Vec<T>, usize, Vec<u64>) {
     use openh264::formats::YUVSource;
     let pf = ProgressiveFile::open(path).expect("open the recording");
     assert!(pf.moov_offset < pf.mdat_offset, "moov must precede mdat");
@@ -213,7 +249,7 @@ fn decode_counters(path: &Path) -> Decoded {
     let ps = pf.avc_parameter_sets_annexb().expect("avcC");
     let mut dec = openh264::decoder::Decoder::new().expect("openh264 decoder");
     let mut f = std::fs::File::open(path).unwrap();
-    let mut counters = Vec::new();
+    let mut out = Vec::new();
     for (i, s) in samples.iter().enumerate() {
         let bytes = pf.read_sample(&mut f, s).unwrap();
         let mut annexb = length_prefixed_to_annexb(&bytes).expect("a well-formed sample");
@@ -223,14 +259,10 @@ fn decode_counters(path: &Path) -> Decoded {
         }
         if let Some(yuv) = dec.decode(&annexb).expect("decode") {
             let (ys, _, _) = yuv.strides();
-            counters.push(read_counter(yuv.y(), ys));
+            out.push(read(yuv.y(), ys));
         }
     }
-    Decoded {
-        counters,
-        samples: samples.len(),
-        dts: samples.iter().map(|s| s.dts).collect(),
-    }
+    (out, samples.len(), samples.iter().map(|s| s.dts).collect())
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -328,6 +360,9 @@ async fn a_recording_plays_back_the_frames_that_went_in() {
     assert_eq!(sc.encoder, "openh264");
     assert_eq!(sc.frames as usize, d.samples);
     assert!(matches!(sc.initiator, Initiator::Local { .. }));
+    // A backend that neither draws the pointer nor says where it is: the
+    // sidecar says there is none, rather than leaving it to be guessed.
+    assert_eq!(sc.pointer, Some(Pointer::Absent));
 
     // And the event stream said it too.
     assert!(matches!(
@@ -361,6 +396,124 @@ async fn a_display_that_changes_size_ends_the_file_cleanly() {
         d.samples >= 20 && d.samples <= 40,
         "{} frames before the resize",
         d.samples
+    );
+}
+
+// ── the pointer (FR-85 P1d) ──────────────────────────────────────────────────
+
+/// Where the test pointer is: at `a` for the first `switch_after` polls, at
+/// `b` from then on. The recorder polls once per recorded frame.
+struct Walk {
+    polls: usize,
+    switch_after: usize,
+    a: (i32, i32),
+    b: (i32, i32),
+    shape: Arc<PointerShape>,
+}
+
+impl PointerSource for Walk {
+    fn poll(&mut self) -> Option<PointerSample> {
+        self.polls += 1;
+        let (x, y) = if self.polls <= self.switch_after {
+            self.a
+        } else {
+            self.b
+        };
+        Some(PointerSample {
+            x,
+            y,
+            shape_id: 1,
+            shape: self.shape.clone(),
+        })
+    }
+}
+
+/// Mean luma of the 8×8 patch centred on (`cx`, `cy`).
+fn patch_luma(y_plane: &[u8], stride: usize, cx: usize, cy: usize) -> u32 {
+    let mut sum = 0u32;
+    for dy in 0..8 {
+        for dx in 0..8 {
+            sum += u32::from(y_plane[(cy - 4 + dy) * stride + cx - 4 + dx]);
+        }
+    }
+    sum / 64
+}
+
+/// FR-85 P1d. A backend that cannot draw the pointer (DXGI, X11) says where
+/// it is, and the recorder draws it: here a 32×32 white square on the
+/// mid-grey test screen, at A for the first half of the recording and at B
+/// for the rest. Decoded back, the square is where the source said, and
+/// moving it leaves nothing behind.
+///
+/// ⚠️ The screen goes STILL (no new capture) well before the pointer moves.
+/// That is the case that matters: over a changing screen every tick brings a
+/// fresh capture, which hides a pointer drawn only on captures, and a trail
+/// left by pixels never put back. Measured: with the put-back removed, this
+/// cell stayed green while the screen kept changing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pointer_a_backend_cannot_draw_is_drawn_into_the_recording() {
+    const SIDE: u32 = 32;
+    let (a, b) = ((96, 112), (224, 112));
+    let dir = scratch();
+    let mut cap = CounterCapture::new(30);
+    cap.still_after = Some(20);
+    cap.pointer = Some(Box::new(Walk {
+        polls: 0,
+        switch_after: 45,
+        a,
+        b,
+        shape: Arc::new(PointerShape {
+            width: SIDE,
+            height: SIDE,
+            bgra: vec![0xFF; (SIDE * SIDE * 4) as usize],
+        }),
+    }));
+    let (result, _) = record_for(options(dir.path()), cap, Duration::from_secs(3)).await;
+    let summary = result.expect("the recording finalizes");
+    assert_eq!(
+        summary.sidecar.as_ref().and_then(|s| s.pointer),
+        Some(Pointer::Drawn),
+        "the sidecar says the recorder drew the pointer"
+    );
+    let path = summary.path.expect("a finished file");
+
+    // Is the square at A, at B? (Its centre; the grey around it reads ~126,
+    // white ~235 after BT.601 limited range and H.264.)
+    let centre = |p: (i32, i32)| {
+        (
+            (p.0 as u32 + SIDE / 2) as usize,
+            (p.1 as u32 + SIDE / 2) as usize,
+        )
+    };
+    let (ca, cb) = (centre(a), centre(b));
+    let (seen, samples, _) = decode_pictures(&path, |y, s| {
+        (
+            patch_luma(y, s, ca.0, ca.1) > 180,
+            patch_luma(y, s, cb.0, cb.1) > 180,
+        )
+    });
+    assert_eq!(seen.len(), samples, "every sample decoded to a picture");
+    assert!(
+        seen[0].0 && !seen[0].1,
+        "the first frame has the pointer at A and nowhere else: {:?}",
+        &seen[..3]
+    );
+    assert!(
+        seen.iter().any(|&(at_a, at_b)| at_b && !at_a),
+        "the pointer reached B: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|&(at_a, at_b)| at_a && at_b),
+        "the pointer left a copy behind when it moved: {seen:?}"
+    );
+    let first_b = seen.iter().position(|&(_, at_b)| at_b).unwrap();
+    assert!(
+        seen[..first_b].iter().all(|&(at_a, _)| at_a),
+        "the pointer was at A on every frame before it moved: {seen:?}"
+    );
+    assert!(
+        seen[first_b..].iter().all(|&(at_a, at_b)| at_b && !at_a),
+        "once at B it stayed at B: {seen:?}"
     );
 }
 

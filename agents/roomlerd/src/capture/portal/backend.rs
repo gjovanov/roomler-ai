@@ -37,6 +37,8 @@ pub struct PortalCapture {
     /// present while it owns the process's injected input. `Drop` unregisters
     /// with it, so a stale drop can never tear down a successor's route.
     input_route_generation: Option<u64>,
+    /// FR-85 P1d — the compositor draws the pointer into the frames.
+    cursor_embedded: bool,
 }
 
 impl PortalCapture {
@@ -181,6 +183,7 @@ impl PortalCapture {
             width,
             height,
             input_route_generation,
+            cursor_embedded: started.cursor_embedded,
         })
     }
 
@@ -278,6 +281,17 @@ impl ScreenCapture for PortalCapture {
     fn monitor_count(&self) -> u8 {
         // The portal hands us exactly the one source the user picked.
         1
+    }
+
+    /// FR-85 P1d. The helper asks for an embedded cursor wherever the portal
+    /// offers one; a portal that offers only hidden (or metadata) leaves the
+    /// recording without a pointer, and its sidecar says so.
+    fn recorded_pointer(&mut self) -> crate::capture::pointer::RecordedPointer {
+        if self.cursor_embedded {
+            crate::capture::pointer::RecordedPointer::InFrame
+        } else {
+            crate::capture::pointer::RecordedPointer::Absent
+        }
     }
 }
 

@@ -71,6 +71,7 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::{IInspectable, Interface};
 
+use super::pointer::{PointerRequest, RecordedPointer};
 use super::{Damage, DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 /// Number of buffers in the frame pool. `2` is the canonical WGC
@@ -147,6 +148,20 @@ pub struct WgcCapture {
     _worker: thread::JoinHandle<()>,
     _shutdown: Arc<std::sync::atomic::AtomicBool>,
     start: Instant,
+    /// FR-85 P1d — the session was opened with cursor capture ON, so the
+    /// pointer is in every frame (a recording's session; or the live one
+    /// under `ROOMLERD_WGC_CURSOR=1`).
+    pointer_in_frame: bool,
+}
+
+/// FR-85 P1d — whether a WGC session draws the pointer into its frames.
+///
+/// ⚠️ The live path stays OFF unless `ROOMLERD_WGC_CURSOR=1`: it streams the
+/// pointer on its own channel, and a baked one would show twice, the baked
+/// copy lagging by the video's latency. A recording has no other channel, so
+/// it is always ON there.
+fn bake_cursor(request: PointerRequest, env_escape_hatch: bool) -> bool {
+    request == PointerRequest::InFrame || env_escape_hatch
 }
 
 impl WgcCapture {
@@ -154,6 +169,16 @@ impl WgcCapture {
     /// early if D3D11 / WinRT / WGC is unavailable; the caller treats
     /// `Err` as "fall back to scrap".
     pub fn primary(target_fps: u32, downscale: DownscalePolicy) -> Result<Self> {
+        Self::primary_with(target_fps, downscale, PointerRequest::Separate)
+    }
+
+    /// [`Self::primary`], saying whether the pointer belongs in the frames
+    /// (FR-85 P1d: a recording asks for it; the live path does not).
+    pub fn primary_with(
+        target_fps: u32,
+        downscale: DownscalePolicy,
+        pointer: PointerRequest,
+    ) -> Result<Self> {
         let hmon = unsafe {
             // (0, 0) + DEFAULTTOPRIMARY yields the primary monitor's
             // HMONITOR regardless of whether the origin is inside it
@@ -168,7 +193,7 @@ impl WgcCapture {
                 "MonitorFromPoint returned NULL — no primary display?"
             ));
         }
-        Self::for_monitor(hmon, 0, target_fps, downscale)
+        Self::for_monitor(hmon, 0, target_fps, downscale, pointer)
     }
 
     /// Build a capture bound to an explicit HMONITOR. `monitor_index`
@@ -179,7 +204,9 @@ impl WgcCapture {
         monitor_index: u8,
         target_fps: u32,
         downscale: DownscalePolicy,
+        pointer: PointerRequest,
     ) -> Result<Self> {
+        let pointer_in_frame = bake_cursor(pointer, tunnel_core::env::flag("WGC_CURSOR", false));
         let shared = Arc::new(SharedSlot {
             latest: Mutex::new(None),
             notify: Notify::new(),
@@ -207,6 +234,7 @@ impl WgcCapture {
                     hmon,
                     shared_for_worker,
                     shutdown_for_worker,
+                    pointer_in_frame,
                     ready_tx.clone(),
                 ) {
                     tracing::error!(%e, "wgc worker init failed");
@@ -234,6 +262,7 @@ impl WgcCapture {
             _worker: worker,
             _shutdown: shutdown,
             start: Instant::now(),
+            pointer_in_frame,
         })
     }
 
@@ -307,6 +336,17 @@ impl ScreenCapture for WgcCapture {
             1
         }
     }
+
+    fn recorded_pointer(&mut self) -> RecordedPointer {
+        // A session opened with cursor capture on draws the pointer itself —
+        // shape, position and hardware cursor included. On a Windows build
+        // before 2004, where the switch does not exist, WGC always draws it.
+        if self.pointer_in_frame {
+            RecordedPointer::InFrame
+        } else {
+            RecordedPointer::Absent
+        }
+    }
 }
 
 /// Translate an internal `FramePayload` into the public `Frame` type.
@@ -344,6 +384,7 @@ fn worker_main(
     hmon: HMONITOR,
     shared: Arc<SharedSlot>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    bake_cursor: bool,
     ready_tx: std::sync::mpsc::Sender<Result<SizeInt32>>,
 ) -> Result<()> {
     // RoInitialize must be called on every thread that touches WinRT
@@ -417,8 +458,9 @@ fn worker_main(
     // hint) or the shape bitmap. Baking it in too would double the
     // cursor (baked one lags at video latency behind the low-latency
     // overlay). Escape hatch: ROOMLERD_WGC_CURSOR=1 re-bakes it
-    // without a rebuild if a field regression appears.
-    let bake_cursor = tunnel_core::env::flag("WGC_CURSOR", false);
+    // without a rebuild if a field regression appears. FR-85 P1d: a
+    // RECORDING's session always bakes it — the file has no other channel
+    // (`bake_cursor`, decided by the constructor).
     let _ = session.SetIsCursorCaptureEnabled(bake_cursor);
 
     // Size is known now — ack to the constructor so it can return.
@@ -784,6 +826,17 @@ impl Drop for RoUninitializeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-85 P1d. The live session keeps the pointer out of its frames
+    /// unless the escape hatch says otherwise (it streams the pointer on its
+    /// own channel); a recording's session always draws it in.
+    #[test]
+    fn only_a_recording_or_the_escape_hatch_bakes_the_pointer() {
+        assert!(!bake_cursor(PointerRequest::Separate, false));
+        assert!(bake_cursor(PointerRequest::Separate, true));
+        assert!(bake_cursor(PointerRequest::InFrame, false));
+        assert!(bake_cursor(PointerRequest::InFrame, true));
+    }
 
     /// On a headless host (CI) WGC init usually fails because there's
     /// no primary monitor; we only exercise a clean failure path.

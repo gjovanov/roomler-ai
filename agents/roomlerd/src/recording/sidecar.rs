@@ -96,6 +96,34 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
+/// FR-85 P1d — how the mouse pointer got into the recording. A closed set,
+/// like [`StopReason`]: "why is there no pointer?" deserves an answer that is
+/// already written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pointer {
+    /// The capture backend drew it (WGC, CoreGraphics, a compositor's
+    /// embedded cursor).
+    InFrame,
+    /// The recorder drew it, from where the backend said it was (DXGI, X11).
+    Drawn,
+    /// The recording has no pointer: the backend neither draws it nor says
+    /// where it is (DRM, the SystemContext capture, a portal that offers only
+    /// a hidden cursor).
+    #[serde(rename = "none")]
+    Absent,
+}
+
+impl Pointer {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InFrame => "in_frame",
+            Self::Drawn => "drawn",
+            Self::Absent => "none",
+        }
+    }
+}
+
 /// Which audio went into the file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioInfo {
@@ -138,6 +166,10 @@ pub struct Sidecar {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     pub bytes: u64,
+    /// FR-85 P1d — how the pointer got in. Missing from a sidecar written
+    /// before P1d, and from one the reconciler rebuilt after a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<Pointer>,
 }
 
 pub const SIDECAR_VERSION: u32 = 1;
@@ -190,6 +222,7 @@ mod tests {
             }],
             stop_reason: Some(StopReason::Requested),
             bytes: 12_345,
+            pointer: Some(Pointer::Drawn),
         }
     }
 
@@ -238,6 +271,25 @@ mod tests {
         v["a_field_from_the_future"] = serde_json::json!(42);
         let back: Sidecar = serde_json::from_value(v).unwrap();
         assert_eq!(back, sample());
+    }
+
+    #[test]
+    fn the_pointer_is_named_on_the_wire_and_absent_when_unknown() {
+        for p in [Pointer::InFrame, Pointer::Drawn, Pointer::Absent] {
+            assert_eq!(
+                serde_json::to_string(&p).unwrap(),
+                format!("\"{}\"", p.as_str())
+            );
+        }
+        // A sidecar from before P1d (no `pointer`) still reads, as unknown.
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v.as_object_mut().unwrap().remove("pointer");
+        let back: Sidecar = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pointer, None);
+        // And an unknown one is not written as `null`.
+        let mut s = sample();
+        s.pointer = None;
+        assert!(!s.to_json().contains("pointer"));
     }
 
     #[test]

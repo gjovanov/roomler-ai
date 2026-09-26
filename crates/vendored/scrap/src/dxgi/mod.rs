@@ -395,6 +395,19 @@ impl Display {
         self.desc.Rotation
     }
 
+    /// ROOMLER PATCH: the output's top-left on the virtual desktop.
+    ///
+    /// `Displays::new().next()` is the FIRST output DXGI enumerates, not
+    /// necessarily the primary monitor, so it need not sit at (0, 0). Screen
+    /// coordinates (the mouse pointer's, from `GetCursorInfo`) land in this
+    /// output's frame at `point - origin`.
+    pub fn origin(&self) -> (LONG, LONG) {
+        (
+            self.desc.DesktopCoordinates.left,
+            self.desc.DesktopCoordinates.top,
+        )
+    }
+
     pub fn name(&self) -> &[u16] {
         let s = &self.desc.DeviceName;
         let i = s.iter()

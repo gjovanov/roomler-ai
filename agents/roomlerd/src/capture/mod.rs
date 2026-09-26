@@ -46,6 +46,10 @@ pub mod synthetic_backend;
 
 pub mod cursor;
 
+/// FR-85 P1d — the mouse pointer in a recording: whether each backend draws
+/// it into the frame, and where it is when the recorder has to draw it.
+pub mod pointer;
+
 /// A captured frame, in an encoder-agnostic representation.
 ///
 /// We don't commit to a specific colour space in the trait — backends can
@@ -376,6 +380,16 @@ pub trait ScreenCapture: Send {
     fn unavailable(&self) -> Option<&CaptureUnavailable> {
         None
     }
+
+    /// FR-85 P1d — how the mouse pointer gets into a RECORDING made from this
+    /// capturer. Asked once, by the recorder, after the first frame. The live
+    /// pumps never ask: they stream the pointer on its own channel.
+    ///
+    /// The default is honest for a backend that cannot tell: no pointer, and
+    /// the recording's sidecar says so rather than leaving someone to wonder.
+    fn recorded_pointer(&mut self) -> pointer::RecordedPointer {
+        pointer::RecordedPointer::Absent
+    }
 }
 
 /// P8a — re-project tracked damage through a downscale. Per-EDGE
@@ -662,7 +676,32 @@ impl Default for ReopenBackoff {
 /// high-resolution sources. Pass `DownscalePolicy::Never` when a
 /// hardware encoder is handling the frame; pass `Auto` (the default)
 /// when the encoder is software openh264.
-pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
+///
+/// The live path: the pointer stays OUT of the frames wherever a backend can
+/// leave it out, because it travels on its own channel (`cursor.rs`).
+pub fn open_default(target_fps: u32, downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
+    open_with(target_fps, downscale, pointer::PointerRequest::Separate)
+}
+
+/// FR-85 P1d — the recorder's capturer: native resolution, and the pointer
+/// drawn INTO the frames wherever the backend can draw it (WGC's session is
+/// opened with cursor capture on; the live path's never is). The backends
+/// that cannot draw it report where it is instead
+/// ([`ScreenCapture::recorded_pointer`]), and the recorder draws it.
+pub fn open_for_recording(target_fps: u32) -> Box<dyn ScreenCapture> {
+    open_with(
+        target_fps,
+        DownscalePolicy::Never,
+        pointer::PointerRequest::InFrame,
+    )
+}
+
+/// The backend cascade, shared by the live path and the recorder.
+fn open_with(
+    _target_fps: u32,
+    _downscale: DownscalePolicy,
+    _pointer: pointer::PointerRequest,
+) -> Box<dyn ScreenCapture> {
     // Phase 1 — synthetic-frame-source short-circuit. When the agent
     // is running inside the agent-e2e Pod (or any headless CI
     // context that sets the env var), bypass the scrap / WGC /
@@ -736,7 +775,7 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
     #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
     {
         if !capture_env_prefers_scrap() {
-            match wgc_backend::WgcCapture::primary(_target_fps, _downscale) {
+            match wgc_backend::WgcCapture::primary_with(_target_fps, _downscale, _pointer) {
                 Ok(c) => {
                     tracing::info!(
                         width = c.width(),
