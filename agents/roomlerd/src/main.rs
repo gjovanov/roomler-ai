@@ -2588,23 +2588,22 @@ async fn terminate_signal(stop_event: Option<&str>) {
     {
         match stop_event {
             Some(name) => {
-                let name = name.to_string();
-                // `WaitForSingleObject` blocks, so run it off the async runtime.
-                // If another shutdown arm wins the `select!` and this future is
-                // dropped, the blocking wait parks until the process exits
-                // moments later — acceptable for a process that is stopping.
-                let res = tokio::task::spawn_blocking(move || {
-                    roomlerd::win_service::stop_event::wait_for_stop_event(&name)
-                })
-                .await;
-                match res {
-                    Ok(Ok(())) => {
+                // Polls the event on the runtime — never a blocking task. The
+                // other arms of this `select!` win by dropping this future, and
+                // `main()` then drops the runtime, which waits for every
+                // `spawn_blocking` task to RETURN: a blocking wait here would
+                // have held process exit hostage on every non-SCM exit (an
+                // auto-update, a requested restart). Dropping the poll closes
+                // the handle and leaves nothing behind
+                // (`stop_event::wait_for_stop_event`).
+                match roomlerd::win_service::stop_event::wait_for_stop_event(name).await {
+                    Ok(()) => {
                         tracing::info!(
                             "service host requested a graceful stop (stop event signaled)"
                         );
                     }
-                    Ok(Err(e)) => {
-                        // Could not open/wait the event — degrade to today's
+                    Err(e) => {
+                        // Could not open/probe the event — degrade to today's
                         // behaviour: never fire this arm, let the host's bounded
                         // wait time out into TerminateProcess. Do NOT treat this
                         // as a stop, or we would fabricate a self-unenroll.
@@ -2613,10 +2612,6 @@ async fn terminate_signal(stop_event: Option<&str>) {
                             "could not wait on the SCM stop event; a service stop will fall back \
                              to TerminateProcess (an ephemeral device may not self-unenroll)"
                         );
-                        std::future::pending::<()>().await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "stop-event wait task failed to join");
                         std::future::pending::<()>().await;
                     }
                 }
@@ -4257,12 +4252,34 @@ async fn run_cmd(
             // and best-effort (the fn caps at 3 s; the reaper is the backstop
             // for every exit that never reaches this line), and only on the
             // signal arms — the internal arm is the updater restarting us.
-            if current.ephemeral && os_initiated_stop {
+            //
+            // #1683 — and never while an UPDATE is in flight. On Windows the
+            // MSI stops the service while it replaces the binary; by then the
+            // worker that spawned the installer has exited 0 and the SCM host
+            // has respawned this one, which receives that stop as an
+            // OS-initiated stop, indistinguishable from `sc stop`. Unenrolling
+            // here would delete the device on every auto-update and bring the
+            // new version up holding a dead token — the exact outcome the
+            // internal-arm rule above exists to prevent. `update_in_flight`
+            // reads the `update-attempt` marker the installer spawn touches
+            // (rollbacks included); the policy itself is one pure table
+            // (`updater::should_self_unenroll`). Platform-neutral on purpose.
+            let update_in_flight = updater::update_in_flight();
+            if updater::should_self_unenroll(current.ephemeral, os_initiated_stop, update_in_flight)
+            {
                 match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
                     Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
                     Err(e) => tracing::warn!(error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
+            } else if current.ephemeral && os_initiated_stop {
+                // The one way the gate says no to an ephemeral OS stop. Named,
+                // so "why is this row still here?" has an answer in the log.
+                tracing::info!(
+                    window_secs = updater::UPDATE_STOP_WINDOW.as_secs(),
+                    "ephemeral device NOT unenrolling: an update is in flight — the installer \
+                     stopped the service; this device stays enrolled"
+                );
             }
             config::mark_clean_shutdown(&mut current);
             if let Err(e) = config::save(config_path, &current) {
