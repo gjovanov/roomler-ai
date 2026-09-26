@@ -9,9 +9,11 @@
 //! staged in .roomler-partial → finalize (moov-first)
 //! ```
 //!
-//! - **Video only in P5a.** An export has no audio track yet; P5b carries the
-//!   original audio through cuts and speed-ups, and adds music. The `done`
-//!   event says so, so a caller never presents a silent file as complete.
+//! - **The sound (P5b)** is [`super::export_audio`]'s: the recording's own
+//!   audio through the same plan (muted under a speed-up) and music under it,
+//!   one Opus track interleaved with the video. A build without `audio`
+//!   carries none and says so (`not_carried`), and refuses music
+//!   (`audio_unavailable`): a caller never presents a silent file as complete.
 //! - **openh264 decodes what the software encoder writes** (Constrained
 //!   Baseline). A hardware encoder's High-profile recording is refused by name
 //!   (`decoder_unavailable`) until FR-85 P4 vendors FFmpeg's decoder: never a
@@ -47,6 +49,9 @@ pub struct ExportSummary {
     pub duration_ms: u64,
     pub bytes: u64,
     pub encoder: String,
+    /// `none`, `original`, `music`, `original_and_music`, or `not_carried`
+    /// (the recording had audio and this build cannot encode any).
+    pub audio: &'static str,
 }
 
 /// Why an export did not happen, as a closed code and a sentence.
@@ -64,6 +69,10 @@ pub enum ExportError {
     Decode(String),
     Write(String),
     Cancelled,
+    /// The music file does not open or decode.
+    Music(String),
+    /// Music was asked for and this build has no audio encoder.
+    AudioUnavailable,
 }
 
 impl ExportError {
@@ -76,12 +85,18 @@ impl ExportError {
             Self::Decode(_) => "decode_failed",
             Self::Write(_) => "write_failed",
             Self::Cancelled => "cancelled",
+            Self::Music(_) => "music_unreadable",
+            Self::AudioUnavailable => "audio_unavailable",
         }
     }
 
     pub fn detail(&self) -> String {
         match self {
             Self::Source(d) | Self::Encoder(d) | Self::Decode(d) | Self::Write(d) => d.clone(),
+            Self::Music(d) => d.clone(),
+            Self::AudioUnavailable => {
+                "this build of roomlerd has no audio encoder, so it cannot add music".into()
+            }
             Self::DecoderUnavailable { profile } => format!(
                 "this recording's video is H.264 profile {profile} (a hardware encoder's); \
                  editing it needs the decoder that arrives with FR-85 P4. Recordings made with \
@@ -146,6 +161,18 @@ pub fn source_fps(samples: &[mp4::ProgressiveSample], timescale: u32) -> u32 {
         .clamp(1, 60)
 }
 
+/// P5b — a sound failure, said by the part that failed.
+#[cfg(feature = "audio")]
+fn audio_failed(e: super::export_audio::AudioError) -> ExportError {
+    use super::export_audio::AudioError;
+    match e {
+        AudioError::Music(d) => ExportError::Music(d),
+        AudioError::Original(d) => ExportError::Decode(format!("the recording's audio: {d}")),
+        AudioError::Encode(d) => ExportError::Encoder(format!("the audio encoder: {d}")),
+        AudioError::Write(d) => ExportError::Write(d),
+    }
+}
+
 /// Export `source` through `edits` to `dest` (which must not exist).
 /// `progress(done, total)` is called as frames are written; `cancel` is
 /// polled once per frame.
@@ -178,6 +205,25 @@ pub async fn export(
     let dts: Vec<u64> = samples.iter().map(|s| to_90k(s.dts - first.dts)).collect();
     let duration_ms = (last.dts - first.dts + u64::from(last.duration)) * 1000 / ts;
     let plan: Plan = edits.plan(duration_ms).map_err(ExportError::EditList)?;
+
+    // P5b — the export's sound, when it has any.
+    #[cfg(feature = "audio")]
+    let mut audio =
+        super::export_audio::ExportAudio::new(source, &plan, edits).map_err(audio_failed)?;
+    #[cfg(not(feature = "audio"))]
+    if edits.music.is_some() {
+        return Err(ExportError::AudioUnavailable);
+    }
+    #[cfg(feature = "audio")]
+    let audio_carried = audio
+        .as_ref()
+        .map(|a| a.carries().as_str())
+        .unwrap_or("none");
+    #[cfg(not(feature = "audio"))]
+    let audio_carried = match src.audio_format() {
+        Ok(Some(_)) => "not_carried",
+        _ => "none",
+    };
 
     let fps = source_fps(&samples, format.timescale);
     let cadence = Cadence::new(fps);
@@ -270,6 +316,16 @@ pub async fn export(
                     .map_err(|e| ExportError::Encoder(format!("{e:#}")))?;
                 encoder_name = e.name().to_string();
                 encoder = Some(e);
+                #[cfg(feature = "audio")]
+                let audio_track = audio.as_ref().map(|a| mp4::AudioTrack {
+                    sample_rate: super::audio::RATE,
+                    channels: super::audio::CHANNELS as u8,
+                    codec: mp4::AudioCodec::Opus {
+                        pre_skip: a.pre_skip(),
+                    },
+                });
+                #[cfg(not(feature = "audio"))]
+                let audio_track = None;
                 writer = Some(
                     FragmentedWriter::create(
                         &partial,
@@ -279,7 +335,7 @@ pub async fn export(
                             fps,
                             color: ColorInfo::BT601_LIMITED,
                         },
-                        None,
+                        audio_track,
                     )
                     .map_err(|e| ExportError::Write(format!("{e:#}")))?,
                 );
@@ -300,6 +356,17 @@ pub async fn export(
                     Err(e) => return Err(ExportError::Write(format!("{e:#}"))),
                 }
             }
+            // The sound up to the end of this frame, so the file interleaves
+            // as a recording does.
+            #[cfg(feature = "audio")]
+            if let Some(a) = audio.as_mut() {
+                let frame_end = cadence.pts(n as u64 + 1) * u64::from(super::audio::RATE)
+                    / u64::from(mp4::VIDEO_TIMESCALE);
+                a.produce_until(frame_end, &mut |packet| {
+                    w.push_audio(&packet, super::audio::FRAME as u32)
+                })
+                .map_err(audio_failed)?;
+            }
             if (n as u64 + 1).is_multiple_of(30) || n as u64 + 1 == total {
                 progress(n as u64 + 1, total);
             }
@@ -307,6 +374,15 @@ pub async fn export(
         Ok(())
     }
     .await;
+
+    // The rest of the sound, to the export's end.
+    #[cfg(feature = "audio")]
+    let result = match (result, audio.as_mut(), writer.as_mut()) {
+        (Ok(()), Some(a), Some(w)) => a
+            .finish(&mut |packet| w.push_audio(&packet, super::audio::FRAME as u32))
+            .map_err(audio_failed),
+        (r, _, _) => r,
+    };
 
     // A failed or cancelled export leaves nothing behind.
     let writer = match (result, writer) {
@@ -337,6 +413,7 @@ pub async fn export(
         duration_ms: summary.duration_ms,
         bytes: summary.bytes,
         encoder: encoder_name,
+        audio: audio_carried,
     })
 }
 

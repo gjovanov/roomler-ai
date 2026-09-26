@@ -11,7 +11,7 @@
 //! - `probe <file>` → one `probe` event: length, size, rate, and whether this
 //!   build can edit it (`editable`, and why not).
 //! - `export --edl <file>` → `progress` events, then `done` (the new file,
-//!   frames, length, bytes, and `audio: "not_carried"` until P5b), or
+//!   frames, length, bytes, and what its sound carries: `audio`), or
 //!   `refused` with a closed `code`.
 //!
 //! An export stops on `{"cmd":"cancel"}` on stdin, and leaves nothing
@@ -149,9 +149,11 @@ pub async fn export(edl_path: &Path, encoder: &str) -> Result<()> {
                 "duration_ms": s.duration_ms,
                 "bytes": s.bytes,
                 "encoder": s.encoder,
-                // P5a is video only: say so, never present a silent file as
-                // the whole export.
-                "audio": "not_carried",
+                // What the file's sound is: `none`, `original`, `music`,
+                // `original_and_music`, or `not_carried` (the recording had
+                // audio this build cannot encode) — never a silent file
+                // presented as the whole export.
+                "audio": s.audio,
             }));
             Ok(())
         }
