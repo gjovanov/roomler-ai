@@ -172,9 +172,17 @@ install's prompt left behind.
 
 A rule is removed iff **direction inbound ∧ action Block ∧ program path equal
 to our `roomlerd.exe`** (case-insensitive, `%VAR%` expanded, `/`→`\`, `\\?\`
-stripped). `inbound_block_rules_for_program` in `winfw.rs` is the whole
+stripped) **∧ its store id starts with `TCP Query User{` or
+`UDP Query User{`** — the notification prompt's own id signature, matched
+case-sensitively. `prompt_block_rules_for_program` in `winfw.rs` is the whole
 decision; its table test holds every neighbour it must not touch.
 
+- ⚠️ **A deliberate Block is left alone.** The id condition is what keeps
+  this from being tampering: a Block an administrator placed on
+  `roomlerd.exe` through `netsh`, `wf.msc` or `New-NetFirewallRule` has a
+  `{GUID}` or the caller's own id, never the prompt's shape, and stays exactly
+  where it is at every start. The device owner's local setting is a floor
+  (compare `consent::strictest_of`); only the prompt's leftovers are ours.
 - ⚠️ **Never by display name.** The prompt names its rules after the exe's
   FileDescription (`Roomler Daemon`); any program can carry that name, and a
   same-named `roomlerd.exe` in another directory is a different program.
@@ -191,9 +199,8 @@ decision; its table test holds every neighbour it must not touch.
   there is something to remove, so the steady state spawns nothing. The store
   is never written: the firewall service owns writes.
 - GPO-delivered rules live under `SOFTWARE\Policies\…` and are neither read
-  nor removable. A deliberate *local* inbound Block for `roomlerd.exe` is
-  removed too — the place for a policy block is GPO, and the daemon-side
-  switch is `ROOMLERD_TUN_HYGIENE=0`.
+  nor removable. The daemon-side switch for the whole pass is
+  `ROOMLERD_TUN_HYGIENE=0`.
 
 ### The self-heal, without the gap
 

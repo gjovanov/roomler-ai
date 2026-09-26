@@ -104,10 +104,13 @@ pub(crate) fn prepare_before_first_spawn(worker_exe: &Path) -> FirewallPrep {
     };
 
     let started = Instant::now();
-    let blocks_removed = match winfw::remove_inbound_block_rules_for(worker_exe, REMOVE_TIMEOUT) {
+    // Only rules the Windows Security prompt wrote (their store id carries
+    // its signature) — a Block an administrator placed deliberately is theirs
+    // and stays, whatever its program.
+    let blocks_removed = match winfw::remove_prompt_block_rules_for(worker_exe, REMOVE_TIMEOUT) {
         CleanupOutcome::NothingToRemove => {
             tracing::debug!(
-                "service: no inbound Block rules for this binary in the firewall store"
+                "service: no prompt-written inbound Block rules for this binary in the firewall store"
             );
             0
         }
@@ -117,8 +120,7 @@ pub(crate) fn prepare_before_first_spawn(worker_exe: &Path) -> FirewallPrep {
                 ?ids,
                 ?remaining,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "service: removed inbound Block rules for this binary (written by a Windows \
-                 Security prompt, #1698)"
+                "service: removed prompt-written inbound Block rules for this binary (#1698)"
             );
             ids.len()
         }

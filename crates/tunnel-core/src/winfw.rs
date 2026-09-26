@@ -268,28 +268,51 @@ fn expand_env(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     out
 }
 
-/// The cleanup's whole decision: an **inbound Block** rule whose recorded
-/// program is **exactly** `our_exe` — nothing else.
+/// The store-id prefixes the Windows Security notification prompt gives the
+/// rules it writes: `TCP Query User{<GUID>}<path>` and
+/// `UDP Query User{<GUID>}<path>` (the field guest in #1698 carried exactly
+/// these). Rules from `netsh`, `wf.msc`, `New-NetFirewallRule` or a GPO get a
+/// `{GUID}` or the caller's own string, never this shape.
+pub const PROMPT_ID_PREFIXES: [&str; 2] = ["TCP Query User{", "UDP Query User{"];
+
+/// Does this store id carry the prompt's signature? Case-sensitive: it is an
+/// internal id the firewall service writes, not a display string.
+pub fn is_prompt_written_id(id: &str) -> bool {
+    PROMPT_ID_PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
+/// The cleanup's whole decision — four conditions, all required: the rule is
+/// **inbound**, its action is **Block**, its recorded program is **exactly**
+/// `our_exe`, and its store id is one **the Windows Security prompt wrote**
+/// ([`is_prompt_written_id`]). Nothing else.
 ///
+/// * The id condition is what keeps this from being tampering. A Block an
+///   administrator placed deliberately — `netsh … add rule name="Block
+///   roomler" dir=in action=block program=<our exe>`, `wf.msc`,
+///   `New-NetFirewallRule` — has a `{GUID}` or the caller's own id and is
+///   left exactly where it is, at every start. The device owner's local
+///   setting is a floor (compare `consent::strictest_of`); only the prompt's
+///   own leftovers are ours to clear.
 /// * Display name is deliberately NOT part of it. A prompt-written rule is
 ///   named after the exe's FileDescription ("Roomler Daemon"), and any other
 ///   program can carry that name.
-/// * Allow rules are never selected, whatever their name or program.
+/// * Allow rules are never selected, whatever their id, name or program —
+///   including the prompt's own Allow pair when someone clicked Allow.
 /// * A rule for any other path — including a same-named binary in another
 ///   directory — is never selected.
-/// * A rule missing any of the three fields is left alone: what cannot be
+/// * A rule missing any of the fields is left alone: what cannot be
 ///   classified is not ours to remove.
-pub fn inbound_block_rules_for_program<'a>(
+pub fn prompt_block_rules_for_program<'a>(
     rules: &'a [StoredRule],
     our_exe: &str,
 ) -> Vec<&'a StoredRule> {
-    inbound_block_rules_for_program_with(rules, our_exe, |k| {
+    prompt_block_rules_for_program_with(rules, our_exe, |k| {
         std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
     })
 }
 
-/// [`inbound_block_rules_for_program`] with an injected `%VAR%` lookup.
-pub fn inbound_block_rules_for_program_with<'a>(
+/// [`prompt_block_rules_for_program`] with an injected `%VAR%` lookup.
+pub fn prompt_block_rules_for_program_with<'a>(
     rules: &'a [StoredRule],
     our_exe: &str,
     lookup: impl Fn(&str) -> Option<String>,
@@ -298,7 +321,8 @@ pub fn inbound_block_rules_for_program_with<'a>(
     rules
         .iter()
         .filter(|r| {
-            r.direction == Some(Direction::In)
+            is_prompt_written_id(&r.id)
+                && r.direction == Some(Direction::In)
                 && r.action == Some(Action::Block)
                 && r.program
                     .as_deref()
@@ -632,10 +656,10 @@ mod win {
         read_local_store().ok().map(|s| rule_is_current(&s, rule))
     }
 
-    /// What [`remove_inbound_block_rules_for`] achieved.
+    /// What [`remove_prompt_block_rules_for`] achieved.
     #[derive(Debug)]
     pub enum CleanupOutcome {
-        /// The store holds no inbound Block rule for this path.
+        /// The store holds no prompt-written inbound Block rule for this path.
         NothingToRemove,
         /// PowerShell returned success for these ids; `remaining` is how
         /// many matching rules a re-read of the store still saw (`None` if
@@ -656,18 +680,18 @@ mod win {
         StoreUnreadable(std::io::Error),
     }
 
-    /// Remove every inbound Block rule whose program is exactly `exe`
-    /// ([`inbound_block_rules_for_program`] is the whole decision), by store
-    /// id, through the firewall service. One bounded PowerShell spawn, and
-    /// only when there is something to remove — the steady state costs a
-    /// registry read.
-    pub fn remove_inbound_block_rules_for(exe: &Path, timeout: Duration) -> CleanupOutcome {
+    /// Remove every **prompt-written** inbound Block rule whose program is
+    /// exactly `exe` ([`prompt_block_rules_for_program`] is the whole
+    /// decision — a deliberate Block is never selected), by store id, through
+    /// the firewall service. One bounded PowerShell spawn, and only when there
+    /// is something to remove — the steady state costs a registry read.
+    pub fn remove_prompt_block_rules_for(exe: &Path, timeout: Duration) -> CleanupOutcome {
         let store = match read_local_store() {
             Ok(s) => s,
             Err(e) => return CleanupOutcome::StoreUnreadable(e),
         };
         let exe_str = exe.to_string_lossy();
-        let ids: Vec<String> = inbound_block_rules_for_program(&store, &exe_str)
+        let ids: Vec<String> = prompt_block_rules_for_program(&store, &exe_str)
             .into_iter()
             .map(|r| r.id.clone())
             .collect();
@@ -679,7 +703,7 @@ mod win {
             Ok(o) if o.status.success() => {
                 let remaining = read_local_store()
                     .ok()
-                    .map(|s| inbound_block_rules_for_program(&s, &exe_str).len());
+                    .map(|s| prompt_block_rules_for_program(&s, &exe_str).len());
                 CleanupOutcome::Removed { ids, remaining }
             }
             Ok(o) => CleanupOutcome::RemoveFailed {
@@ -854,10 +878,36 @@ mod tests {
 
     // ── the cleanup predicate ────────────────────────────────────────────
 
-    /// The whole decision, against a store that holds everything the
-    /// predicate must NOT touch next to the two rules it must.
+    /// The prompt's id signature, and only that: case-sensitive, both
+    /// protocols, nothing that merely mentions the words.
     #[test]
-    fn cleanup_selects_only_inbound_block_rules_for_our_exact_path() {
+    fn prompt_written_ids_are_recognised_by_their_exact_prefix() {
+        for id in [
+            "TCP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
+            "UDP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
+            "TCP Query User{",
+        ] {
+            assert!(is_prompt_written_id(id), "{id:?}");
+        }
+        for id in [
+            "{8C1F3A5B-2D4E-4F60-9A7B-1C2D3E4F5A6B}", // netsh / wf.msc
+            "Block roomler",                          // New-NetFirewallRule -Name
+            "tcp query user{1}x",                     // wrong case
+            "TCP Query User 1",                       // no brace
+            " TCP Query User{1}",                     // not a prefix
+            "ICMP Query User{1}",
+            "",
+        ] {
+            assert!(!is_prompt_written_id(id), "{id:?}");
+        }
+    }
+
+    /// The whole decision, against a store that holds everything the
+    /// predicate must NOT touch next to the rules it must. Every row that is
+    /// a Block for our exact path but NOT prompt-written is the tampering
+    /// case the id condition exists for.
+    #[test]
+    fn cleanup_selects_only_prompt_written_inbound_blocks_for_our_exact_path() {
         let other_exe_same_name = parse_stored_rule(
             "TCP Query User{1}C:\\users\\x\\downloads\\roomlerd.exe",
             "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=6|App=C:\\users\\x\\downloads\\roomlerd.exe|Name=Roomler Daemon|",
@@ -869,35 +919,61 @@ mod tests {
         )
         .unwrap();
         let outbound_block_ours = parse_stored_rule(
-            "{3}",
+            "UDP Query User{3}C:\\program files\\roomler\\roomlerd.exe",
             &format!("v2.33|Action=Block|Active=TRUE|Dir=Out|Protocol=17|App={OUR_EXE}|Name=x|"),
         )
         .unwrap();
         let block_without_program = parse_stored_rule(
-            "{4}",
+            "UDP Query User{4}",
             "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|LPort=5000|Name=Roomler Daemon|",
         )
         .unwrap();
         let block_missing_action = parse_stored_rule(
-            "{5}",
+            "UDP Query User{5}C:\\program files\\roomler\\roomlerd.exe",
             &format!("v2.33|Active=TRUE|Dir=In|Protocol=17|App={OUR_EXE}|Name=x|"),
         )
         .unwrap();
-        let prompt_allow_ours = parse_stored_rule(
+        // The prompt's own Allow pair — someone clicked Allow. Never touched.
+        let prompt_allow_ours_udp = parse_stored_rule(
             "UDP Query User{6}C:\\program files\\roomler\\roomlerd.exe",
             "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=17|Profile=Private|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|",
         )
         .unwrap();
-        let disabled_block_ours = parse_stored_rule(
-            "{7}",
+        let prompt_allow_ours_tcp = parse_stored_rule(
+            "TCP Query User{6}C:\\program files\\roomler\\roomlerd.exe",
+            "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|",
+        )
+        .unwrap();
+        // A prompt-written Block an admin later disabled: still the prompt's.
+        let disabled_prompt_block_ours = parse_stored_rule(
+            "UDP Query User{7}C:\\program files\\roomler\\roomlerd.exe",
+            "v2.33|Action=Block|Active=FALSE|Dir=In|Protocol=17|Profile=Public|App=C:\\program files\\roomler\\roomlerd.exe|Name=Roomler Daemon|",
+        )
+        .unwrap();
+        // Synthetic: a prompt-shaped id whose path uses the %VAR% spelling,
+        // to lock normalisation under the full predicate.
+        let env_form_prompt_block_ours = parse_stored_rule(
+            "TCP Query User{8}C:\\program files\\roomler\\roomlerd.exe",
+            "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=6|App=%ProgramFiles%\\Roomler\\roomlerd.exe|Name=Roomler Daemon|",
+        )
+        .unwrap();
+        // DELIBERATE Blocks for our exact program — an administrator's
+        // decision, in every id shape the tools produce. Never selected.
+        let deliberate_block_netsh = parse_stored_rule(
+            "{8C1F3A5B-2D4E-4F60-9A7B-1C2D3E4F5A6B}",
+            &format!("v2.33|Action=Block|Active=TRUE|Dir=In|App={OUR_EXE}|Name=Block roomler|"),
+        )
+        .unwrap();
+        let deliberate_block_powershell = parse_stored_rule(
+            "Block roomler",
             &format!(
-                "v2.33|Action=Block|Active=FALSE|Dir=In|Protocol=6|App={OUR_EXE}|Name=an admin's|"
+                "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|App={OUR_EXE}|Name=Block roomler|Desc=security team|"
             ),
         )
         .unwrap();
-        let env_form_block_ours = parse_stored_rule(
-            "{8}",
-            "v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|App=%ProgramFiles%\\Roomler\\roomlerd.exe|Name=x|",
+        let deliberate_block_lowercase_lookalike = parse_stored_rule(
+            "udp query user{9}c:\\program files\\roomler\\roomlerd.exe",
+            &format!("v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|App={OUR_EXE}|Name=Roomler Daemon|"),
         )
         .unwrap();
 
@@ -905,19 +981,23 @@ mod tests {
             our_allow(),
             prompt_block(6),
             other_exe_same_name,
+            deliberate_block_netsh,
             prompt_block(17),
             other_program_our_display_name,
             outbound_block_ours,
             block_without_program,
+            deliberate_block_powershell,
             block_missing_action,
-            prompt_allow_ours,
-            disabled_block_ours,
-            env_form_block_ours,
+            prompt_allow_ours_udp,
+            prompt_allow_ours_tcp,
+            disabled_prompt_block_ours,
+            env_form_prompt_block_ours,
+            deliberate_block_lowercase_lookalike,
         ];
         let lookup = |k: &str| {
             (k.eq_ignore_ascii_case("ProgramFiles")).then(|| r"C:\Program Files".to_string())
         };
-        let picked: Vec<&str> = inbound_block_rules_for_program_with(&store, OUR_EXE, lookup)
+        let picked: Vec<&str> = prompt_block_rules_for_program_with(&store, OUR_EXE, lookup)
             .into_iter()
             .map(|r| r.id.as_str())
             .collect();
@@ -926,14 +1006,14 @@ mod tests {
             [
                 "TCP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
                 "UDP Query User{5B2C1D0E-8F7A-4C3B-9D1E-0F2A3B4C5D6E}C:\\program files\\roomler\\roomlerd.exe",
-                // A disabled Block for our path is still a Block for our path.
-                "{7}",
+                // A disabled prompt Block for our path is still the prompt's.
+                "UDP Query User{7}C:\\program files\\roomler\\roomlerd.exe",
                 // An env-var spelling of our path IS our path.
-                "{8}",
+                "TCP Query User{8}C:\\program files\\roomler\\roomlerd.exe",
             ]
         );
-        // And with nothing of ours in the store, nothing is picked.
-        let picked = inbound_block_rules_for_program_with(&store[..1], OUR_EXE, lookup);
+        // And with nothing of the prompt's in the store, nothing is picked.
+        let picked = prompt_block_rules_for_program_with(&store[..1], OUR_EXE, lookup);
         assert!(picked.is_empty());
     }
 
@@ -1057,12 +1137,12 @@ mod tests {
                 .filter(|r| r.display_name.as_deref() == Some(rule.name.as_str()))
                 .collect();
             println!(
-                "{}: {} rule(s) named {:?}; current={}; inbound Block rules for this path: {:?}",
+                "{}: {} rule(s) named {:?}; current={}; prompt-written inbound Block rules for this path: {:?}",
                 exe,
                 named.len(),
                 rule.name,
                 rule_is_current(&store, &rule),
-                inbound_block_rules_for_program(&store, exe)
+                prompt_block_rules_for_program(&store, exe)
                     .iter()
                     .map(|r| (&r.id, &r.display_name, r.protocol))
                     .collect::<Vec<_>>()
