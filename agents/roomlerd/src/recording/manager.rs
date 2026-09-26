@@ -93,9 +93,10 @@ pub struct RemoteInitiator {
 /// a closed set rather than a sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    /// No recorder can be launched here now: SYSTEM with nobody signed in,
-    /// or root (P1e's [`Refusal`]).
-    Unavailable(String),
+    /// No recorder can be launched here now (P1e's [`Refusal`]): SYSTEM or
+    /// root with nobody to record as, a login screen, the kill switch. The
+    /// refusal itself, so a caller can name it (decision 6: `login_screen`).
+    Unavailable(Refusal),
     /// A recording is already running (one at a time).
     Busy,
     /// The recorder refused, failed, or missed its start deadline.
@@ -105,7 +106,8 @@ pub enum StartError {
 impl StartError {
     pub fn message(&self) -> String {
         match self {
-            Self::Unavailable(m) | Self::Failed(m) => m.clone(),
+            Self::Unavailable(r) => r.message().into(),
+            Self::Failed(m) => m.clone(),
             Self::Busy => "a recording is already running".into(),
         }
     }
@@ -222,6 +224,10 @@ impl RecordingManager {
     /// records as itself ([`Identity::Unattended`]) instead of refusing.
     /// Never for a local recording: that needs someone at the device to ask
     /// for it. The kill switch still answers first.
+    ///
+    /// ⚠️ Only [`Refusal::NoConsoleUser`] is "nobody". A login screen
+    /// ([`Refusal::LoginScreen`], decision 6) stays refused: someone may be
+    /// standing at it, and an unattended recording shows them nothing.
     pub fn identity_remote(&self) -> Result<Identity, Refusal> {
         match self.identity() {
             Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
@@ -231,8 +237,14 @@ impl RecordingManager {
 
     /// FR-85 P1f — can a REMOTE controller record here (what the device
     /// advertises, and the remote precheck)?
+    ///
+    /// ⚠️ A login screen (decision 6) still CAN: it is who is at the screen
+    /// right now, not what the device is. `available` is a capability, and a
+    /// viewer hides the Record control without it (P3c-2), so a device at its
+    /// sign-in screen would show no control and no reason at all. A start
+    /// there is refused by name instead ("… once someone signs in").
     pub fn available_remote(&self) -> bool {
-        self.identity_remote().is_ok()
+        matches!(self.identity_remote(), Ok(_) | Err(Refusal::LoginScreen))
     }
 
     /// FR-85 P1f — point the unattended folder somewhere else (a test's
@@ -257,7 +269,9 @@ impl RecordingManager {
     /// each is read: the person's folder, as the person (P1e), when someone
     /// is signed in; and the unattended folder, as the daemon (only the
     /// service side can write there), wherever one exists. So a recording
-    /// made while nobody was signed in stays reachable after someone does.
+    /// made while nobody was signed in stays reachable after someone does —
+    /// or while the device sits at its login screen, where nothing new can
+    /// be recorded (decision 6) but what was made stays its controller's.
     pub async fn remote_places(&self) -> Vec<(PathBuf, Identity)> {
         let mut out = Vec::new();
         if let Ok(identity) = self.identity()
@@ -265,7 +279,7 @@ impl RecordingManager {
         {
             out.push((choice.dir, identity));
         }
-        if self.identity_remote().is_ok() {
+        if self.available_remote() {
             let dir = self
                 .unattended_dir
                 .clone()
@@ -369,9 +383,13 @@ impl RecordingManager {
     /// container and still need to drive the whole path. `true` = this
     /// platform's service refusal; `false` = record as this process.
     pub fn with_service_identity(self, service_identity: bool) -> Self {
-        // SYSTEM and Linux root with nobody to record as; root on macOS,
-        // where the drop is not built.
-        let refusal = if cfg!(any(windows, target_os = "linux")) {
+        // What each platform's service really answers with nobody to record
+        // as: SYSTEM is at the console's sign-in screen (decision 6: a
+        // Windows service never has an empty seat); Linux root on a host
+        // with no screen at all; root on macOS, where the drop is not built.
+        let refusal = if cfg!(windows) {
+            Refusal::LoginScreen
+        } else if cfg!(target_os = "linux") {
             Refusal::NoConsoleUser
         } else {
             Refusal::RootDaemon
@@ -488,7 +506,7 @@ impl RecordingManager {
             Some((initiator, decided)) => {
                 let now = self
                     .identity_remote_fresh()
-                    .map_err(|r| StartError::Unavailable(r.message().into()))?;
+                    .map_err(StartError::Unavailable)?;
                 if now != decided {
                     return Err(StartError::Failed(
                         "who is signed in at the device changed while the recording started; \
@@ -498,11 +516,7 @@ impl RecordingManager {
                 }
                 (Some(initiator), now)
             }
-            None => (
-                None,
-                self.identity()
-                    .map_err(|r| StartError::Unavailable(r.message().into()))?,
-            ),
+            None => (None, self.identity().map_err(StartError::Unavailable)?),
         };
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
