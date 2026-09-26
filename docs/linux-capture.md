@@ -89,6 +89,16 @@ probe and every capture, and captures it with the unchanged scrap + damage
 path. This is the hardware-encode test bed on the WSL2 dev host, and the
 remote-apps surface of FR-56 rides on it.
 
+The children are spawned into their **own process group**, and on any graceful
+exit the daemon tears the whole tree down —
+`virtual_desktop::teardown` — SIGTERM → 2 s grace → SIGKILL, reaching
+every descendant including a setsid'd grandchild (`at-spi-bus-launcher`, a D-Bus
+service that **ignores SIGTERM**) via the parent-link closure of the daemon's
+direct children. Without it, under systemd `KillMode=control-group` that
+grandchild held the unit's cgroup non-empty until systemd's `TimeoutStopSec`
+(90 s) SIGKILLed it, so `roomler restart` took 96 s (#1684). See
+[`desktop-companion.md` §7](desktop-companion.md#7-apply-now--restarting-the-service-from-the-companion).
+
 ⚠️ **A virtual-desktop host is not a consent surface**, even though its X
 display connects: the only viewer of that Xvfb is a remote controller, so the
 native consent panel would be drawn where nobody can see it (`indicator/x11.rs:499`
