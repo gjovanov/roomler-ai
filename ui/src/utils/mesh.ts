@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 // Pure edge-interpretation helpers for the mesh graph (wave 4). Kept out
 // of the component so the labelling and asymmetry rules are unit-testable
