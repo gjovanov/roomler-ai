@@ -81,8 +81,9 @@ pub struct LiveSession {
     pub pending_request: Option<ServerMsg>,
 
     /// FR-85 P3 — why `Permissions::RECORD` was stripped from this grant, when
-    /// it was asked for and refused (`controller_not_allowed`,
-    /// `device_not_opted_in`). Kept so a DUPLICATE request coalesced onto this
+    /// it was asked for and refused (`device_cannot_record`,
+    /// `controller_not_allowed`, `device_not_opted_in`). Kept so a DUPLICATE
+    /// request coalesced onto this
     /// session (#1045) is answered with the same reason: the effective grant
     /// it repeats lacks RECORD, and a bare `None` would read as "never asked".
     pub record_refused: Option<&'static str>,

@@ -26,7 +26,7 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase,
+    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, RecordCap, SessionPhase,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
@@ -122,25 +122,66 @@ pub struct ConnectedAgent {
     /// never sends, and every grant to it would wait out the bound and then
     /// be refused.
     pub supports_ssh_grant_ack: bool,
-    /// FR-85 P3 — the agent advertises `AgentCaps.record` containing
-    /// `remote`: it serves the `record` DataChannel AND its owner switched
-    /// remote recording on (the agent advertises it only while that gate is
-    /// on). Kept per CONNECTION, like [`Self::supports_ssh_grant_ack`]: the
-    /// stored row outlives an owner's OFF and a rollback alike. `false` ⇒
+    /// FR-85 P3 — what the agent says about remote recording in
+    /// `AgentCaps.record`. Kept per CONNECTION, like
+    /// [`Self::supports_ssh_grant_ack`]: the stored row outlives an owner's
+    /// OFF and a rollback alike. Anything but [`RecordSupport::Serves`] ⇒
     /// `create_session` strips `Permissions::RECORD`.
-    pub supports_record: bool,
+    pub record_support: RecordSupport,
+}
+
+/// FR-85 P3 — what a device says about remote recording, from its caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordSupport {
+    /// No recorder can serve a remote session here: an agent that predates
+    /// recording, a build without it, `ROOMLERD_RECORDING=0`, or a host that
+    /// cannot record at all. Nothing to offer a controller.
+    #[default]
+    None,
+    /// P3c-2 — a recorder could, but the owner has not allowed remote
+    /// recording (`available` without `remote`).
+    NotOptedIn,
+    /// The owner allowed it: the agent serves the `record` DataChannel
+    /// (`remote`).
+    Serves,
+}
+
+impl RecordSupport {
+    /// ⚠️ Equality matching on the words (`has_record`): `remote` is a
+    /// prefix of `remote-audio`. `remote` alone also reads as a recorder,
+    /// because an agent built before `available` existed says only that.
+    pub fn from_caps(caps: &AgentCaps) -> Self {
+        if caps.has_record(RecordCap::Remote) {
+            Self::Serves
+        } else if caps.has_record(RecordCap::Available) {
+            Self::NotOptedIn
+        } else {
+            Self::None
+        }
+    }
 }
 
 /// FR-85 P3 — the RECORD part of a grant: kept only when the controller may
 /// record AND the agent serves it; otherwise stripped, with the reason (for
 /// the audit and the viewer). A grant without RECORD passes untouched.
+///
+/// P3c-2 — a device with no recorder at all is named FIRST
+/// (`device_cannot_record`): there is nothing there to allow or refuse, and
+/// a viewer shows no Record control for it rather than one that explains a
+/// permission nobody could grant.
 pub fn record_grant(
     permissions: Permissions,
     may_record: bool,
-    agent_records: bool,
+    device: RecordSupport,
 ) -> (Permissions, Option<&'static str>) {
     if !permissions.contains(Permissions::RECORD) {
         return (permissions, None);
+    }
+    if device == RecordSupport::None {
+        return (
+            permissions - Permissions::RECORD,
+            Some("device_cannot_record"),
+        );
     }
     if !may_record {
         return (
@@ -148,7 +189,7 @@ pub fn record_grant(
             Some("controller_not_allowed"),
         );
     }
-    if !agent_records {
+    if device != RecordSupport::Serves {
         return (
             permissions - Permissions::RECORD,
             Some("device_not_opted_in"),
@@ -357,8 +398,8 @@ impl Hub {
             // exactly as before FR-83.
             supports_ssh_grant_ack: false,
             // FR-85 P3 — set by `set_agent_record_support` right after
-            // registration; `false` (RECORD stripped) until it is.
-            supports_record: false,
+            // registration; `None` (RECORD stripped) until it is.
+            record_support: RecordSupport::None,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -875,7 +916,7 @@ impl Hub {
                 return Err(Error::AgentBusy);
             }
             agent.active_sessions += 1;
-            (agent.tenant_id, agent.input_arbiter, agent.supports_record)
+            (agent.tenant_id, agent.input_arbiter, agent.record_support)
         };
 
         // Multi-user P3 back-compat — the FILES bit becomes agent-ENFORCED in
@@ -1532,11 +1573,12 @@ impl Hub {
         }
     }
 
-    /// FR-85 P3 — record whether the agent serves remote recording (its
-    /// hello's `AgentCaps.record` contains `remote`).
-    pub fn set_agent_record_support(&self, agent_id: ObjectId, records: bool) {
+    /// FR-85 P3 — record what the agent says about remote recording (its
+    /// hello's, or a heartbeat's, `AgentCaps.record`; see
+    /// [`RecordSupport::from_caps`]).
+    pub fn set_agent_record_support(&self, agent_id: ObjectId, support: RecordSupport) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_record = records;
+            entry.record_support = support;
         }
     }
 
@@ -2399,26 +2441,71 @@ mod tests {
     /// controller may record, and the device serves it. Each refusal is named.
     #[test]
     fn record_is_granted_only_when_the_controller_may_and_the_device_serves_it() {
+        use RecordSupport::{None as NoRecorder, NotOptedIn, Serves};
         let want = Permissions::VIEW | Permissions::RECORD;
-        assert_eq!(record_grant(want, true, true), (want, None));
+        assert_eq!(record_grant(want, true, Serves), (want, None));
         assert_eq!(
-            record_grant(want, false, true),
+            record_grant(want, false, Serves),
             (Permissions::VIEW, Some("controller_not_allowed"))
         );
         assert_eq!(
-            record_grant(want, true, false),
+            record_grant(want, true, NotOptedIn),
             (Permissions::VIEW, Some("device_not_opted_in"))
         );
         // Both refusals: the controller's is the one named (it is what the
         // viewer's user can do something about least).
         assert_eq!(
-            record_grant(want, false, false),
+            record_grant(want, false, NotOptedIn),
             (Permissions::VIEW, Some("controller_not_allowed"))
         );
+        // P3c-2 — a device with no recorder is named before anything else,
+        // whoever asks: there is nothing to allow or refuse there, and the
+        // viewer shows no Record control for it.
+        for may in [true, false] {
+            assert_eq!(
+                record_grant(want, may, NoRecorder),
+                (Permissions::VIEW, Some("device_cannot_record"))
+            );
+        }
         // A grant that never asked for RECORD passes untouched, with no reason.
         assert_eq!(
-            record_grant(Permissions::default(), false, false),
+            record_grant(Permissions::default(), false, NoRecorder),
             (Permissions::default(), None)
+        );
+    }
+
+    /// P3c-2 — the caps words, read by equality: `available` alone is a
+    /// recorder whose owner has not opted in; `remote` (with or without
+    /// `available`, since an agent built before `available` sends only
+    /// `remote`) serves; nothing, or a word from the future, is no recorder.
+    #[test]
+    fn record_support_reads_the_caps_words_by_equality() {
+        let caps = |words: &[&str]| AgentCaps {
+            record: words.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(RecordSupport::from_caps(&caps(&[])), RecordSupport::None);
+        assert_eq!(
+            RecordSupport::from_caps(&caps(&["available"])),
+            RecordSupport::NotOptedIn
+        );
+        assert_eq!(
+            RecordSupport::from_caps(&caps(&["available", "remote"])),
+            RecordSupport::Serves
+        );
+        assert_eq!(
+            RecordSupport::from_caps(&caps(&["remote"])),
+            RecordSupport::Serves
+        );
+        // `remote-audio` without `remote` is not serving: `remote` is a
+        // prefix of it, and only equality keeps them apart.
+        assert_eq!(
+            RecordSupport::from_caps(&caps(&["remote-audio"])),
+            RecordSupport::None
+        );
+        assert_eq!(
+            RecordSupport::from_caps(&caps(&["available-4k"])),
+            RecordSupport::None
         );
     }
 
@@ -2470,12 +2557,18 @@ mod tests {
             }
         };
 
-        // The device has not advertised the cap (its owner never opted in).
+        // The device has advertised nothing: no recorder there at all.
+        let (p, why) = ask(&hub, true);
+        assert!(!p.contains(Permissions::RECORD));
+        assert_eq!(why.as_deref(), Some("device_cannot_record"));
+
+        // A recorder, but its owner never opted in.
+        hub.set_agent_record_support(agent_id, RecordSupport::NotOptedIn);
         let (p, why) = ask(&hub, true);
         assert!(!p.contains(Permissions::RECORD));
         assert_eq!(why.as_deref(), Some("device_not_opted_in"));
 
-        hub.set_agent_record_support(agent_id, true);
+        hub.set_agent_record_support(agent_id, RecordSupport::Serves);
         let (p, why) = ask(&hub, true);
         assert!(p.contains(Permissions::RECORD), "both gates allow it");
         assert_eq!(why, None);
@@ -2529,6 +2622,9 @@ mod tests {
             true,
             false,
         );
+        // A recorder whose owner has not opted in (P3c-2: without it, the
+        // device would read as having no recorder at all).
+        hub.set_agent_record_support(agent_id, RecordSupport::NotOptedIn);
         let (tx, mut rx) = mpsc::channel(8);
         let user = ObjectId::new();
         let ask = |hub: &Hub| {
