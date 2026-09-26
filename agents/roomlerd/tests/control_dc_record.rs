@@ -50,6 +50,9 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Setup {
     /// Where recordings land (the configured `record_dir`).
     out: PathBuf,
+    /// P1f — where an UNATTENDED recording lands (the daemon's own folder;
+    /// a scratch one here).
+    unattended: PathBuf,
     /// Consent markers, one sub-directory per test.
     consent_root: PathBuf,
     manager: Arc<RecordingManager>,
@@ -63,6 +66,7 @@ fn setup() -> &'static Setup {
     SETUP.get_or_init(|| {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("Recordings");
+        let unattended = dir.path().join("Unattended");
         let consent_root = dir.path().join("consent");
         std::fs::create_dir_all(&consent_root).unwrap();
         let cfg_path = dir.path().join("config.toml");
@@ -72,11 +76,13 @@ fn setup() -> &'static Setup {
         let manager = Arc::new(
             RecordingManager::new(PathBuf::from(env!("CARGO_BIN_EXE_roomlerd")), cfg_path)
                 .with_service_identity(false)
+                .with_unattended_dir(unattended.clone())
                 .with_child_env([("ROOMLERD_SYNTHETIC_FRAMES", "1")]),
         );
         remote::install(manager.clone());
         Setup {
             out,
+            unattended,
             consent_root,
             manager,
             _dir: dir,
@@ -141,6 +147,11 @@ fn every_way_it_ends_is_named() -> Result<()> {
 #[test]
 fn a_controller_downloads_only_its_own_recordings_and_can_resume() -> Result<()> {
     rt().block_on(a_controller_downloads_only_its_own_recordings_and_can_resume_cell())
+}
+
+#[test]
+fn an_unattended_host_records_into_its_own_locked_folder() -> Result<()> {
+    rt().block_on(an_unattended_host_records_into_its_own_locked_folder_cell())
 }
 
 /// The owner's two gates, as a local `ConfigSet` would set them.
@@ -919,6 +930,101 @@ async fn a_controller_downloads_only_its_own_recordings_and_can_resume_cell() ->
     let _ = std::fs::remove_file(Sidecar::path_for(&file));
     let _ = std::fs::remove_file(&file);
     Ok(())
+}
+
+/// P1f — an UNATTENDED host (a service with nobody signed in) records a
+/// remote session with no banner, because there is nobody to show one to:
+/// the owner's gate is what allows it, and the controller is told it records
+/// unattended. A LOCAL start there is still refused. The file goes into the
+/// daemon's own folder, locked to the service side, never the person's
+/// `record_dir`. When someone SIGNS IN, the recording they never saw start
+/// ends `session_changed` (red without the watch: it runs on, bannerless),
+/// and it stays listed and downloadable for the controller afterwards.
+async fn an_unattended_host_records_into_its_own_locked_folder_cell() -> Result<()> {
+    use roomlerd::recording::launch::{Identity, Refusal};
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    s.manager.set_identity(Some(Err(Refusal::NoConsoleUser)));
+    let outcome = async {
+        // A local start needs someone at the device.
+        match s
+            .manager
+            .start(tunnel_core::localapi::RecordStartOpts::default())
+            .await
+        {
+            tunnel_core::localapi::Response::Error { message } => {
+                assert!(message.contains("nobody is signed in"), "{message}")
+            }
+            other => panic!("a local recording started unattended: {other:?}"),
+        }
+
+        let before = mp4s(&s.out).len();
+        // Nothing at all could show a banner: the companion down, the
+        // session not on the registry.
+        let mut r = rig(Opts {
+            companion: false,
+            listed: false,
+            ..Default::default()
+        })
+        .await?;
+        r.send(json!({"t": "rc:record.start", "id": "u1"})).await?;
+        let v = r.state(START).await?;
+        assert_eq!(v["state"], "recording", "{v}");
+        assert_eq!(v["unattended"], true, "the controller is not told: {v}");
+        let name = v["name"].as_str().expect("a file name").to_string();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(s.manager.state().active, "it stopped on its own");
+
+        // Someone signs in at the device.
+        s.manager.set_identity(Some(Ok(Identity::Inherit)));
+        let v = r.until_not_recording(STOP).await?;
+        assert_eq!(v["state"], "stopped", "{v}");
+        assert_eq!(
+            v["reason"], "session_changed",
+            "an unattended recording ran on after someone signed in: {v}"
+        );
+
+        let file = s.unattended.join(&name);
+        assert!(
+            file.is_file(),
+            "not in the daemon's own folder: {}",
+            file.display()
+        );
+        assert_eq!(
+            mp4s(&s.out).len(),
+            before,
+            "an unattended recording reached the person's folder"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&s.unattended)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "the folder is not locked to the service");
+        }
+
+        // Someone is signed in now, and the controller still lists it and
+        // downloads it whole (the unattended folder, read as the daemon).
+        r.send(json!({"t": "rc:record.list", "id": "ul"})).await?;
+        let v = r.next_of("rc:record.list", START).await?;
+        assert!(
+            v["items"]
+                .as_array()
+                .is_some_and(|i| i.iter().any(|i| i["name"] == name.as_str())),
+            "{v}"
+        );
+        let on_disk = std::fs::read(&file)?;
+        let (_, got, _) = r.download(&name, 0).await?.expect("the download");
+        assert!(got == on_disk, "the download differs from the file");
+
+        let _ = std::fs::remove_file(Sidecar::path_for(&file));
+        let _ = std::fs::remove_file(&file);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    s.manager.set_identity(Some(Ok(Identity::Inherit)));
+    outcome
 }
 
 fn remove(out: &Path, v: &Value) -> Option<()> {
