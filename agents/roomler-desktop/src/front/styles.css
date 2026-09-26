@@ -976,3 +976,74 @@ button.wl-skip:hover {
 .ok {
   color: var(--ok);
 }
+
+/* ── FR-85 P5c — the Edit view ─────────────────────────────────────── */
+
+.ed-preview video {
+  display: block;
+  width: 100%;
+  max-height: 340px;
+  background: #000;
+  border-radius: 6px;
+}
+
+/* The pieces lie on the recording's timeline, each as wide as its share of
+ * it; the playhead rides on top and never takes a click. */
+.ed-timeline {
+  position: relative;
+  height: 44px;
+  margin: 10px 0 4px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.ed-seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  margin: 0;
+  padding: 0 4px;
+  border: none;
+  border-right: 1px solid var(--bg-elev);
+  border-radius: 0;
+  font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.ed-keep  { background: var(--primary-tint); color: var(--fg); }
+.ed-speed { background: rgba(180, 83, 9, 0.18); color: var(--warn); }
+.ed-cut {
+  color: var(--muted);
+  background: repeating-linear-gradient(
+    135deg,
+    var(--bg-inset) 0 6px,
+    var(--border) 6px 12px
+  );
+  text-decoration: line-through;
+}
+
+.ed-selected {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.ed-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--error);
+  pointer-events: none;
+  z-index: 1;
+}
+
+#ed-progress {
+  width: 100%;
+  margin-top: 8px;
+}
