@@ -1511,6 +1511,12 @@ impl FilesHandler {
     /// flag and the next loop iteration will exit.
     pub async fn begin_outgoing(&self, id: String, path: &str) -> Result<OutgoingOffer> {
         let resolved = validate_outgoing_path(path).context("validating outgoing path")?;
+        if is_agent_secret(&resolved) {
+            return Err(anyhow!(
+                "{} holds the agent's own credentials — file transfer never sends it",
+                resolved.display()
+            ));
+        }
 
         // Stat to surface a real error before we set state, AND get
         // the size for the offer.
@@ -1684,7 +1690,24 @@ fn validate_outgoing_path(input: &str) -> Result<PathBuf> {
 /// back to the default Downloads/ target with a warning log so the
 /// upload doesn't silently drop the operator's data.
 async fn resolve_dest_path(input: &str) -> Result<PathBuf> {
+    resolve_dest_path_for(input, &writer_context(), &files_dir::Rules::from_env()).await
+}
+
+/// [`resolve_dest_path`] for an explicit writer — the seam the tests use,
+/// since a test process is never SYSTEM.
+async fn resolve_dest_path_for(
+    input: &str,
+    writer: &files_dir::Writer,
+    rules: &files_dir::Rules,
+) -> Result<PathBuf> {
     let canonical = validate_outgoing_path(input).context("validating dest_path")?;
+    if let Some(run) = agent_state_run(&canonical) {
+        return Err(anyhow!(
+            "dest_path {} is inside the agent's own configuration and state (…{run}…) — \
+             file transfer never writes there",
+            canonical.display()
+        ));
+    }
     let meta = tokio::fs::metadata(&canonical)
         .await
         .with_context(|| format!("stat {}", canonical.display()))?;
@@ -1694,7 +1717,113 @@ async fn resolve_dest_path(input: &str) -> Result<PathBuf> {
             canonical.display()
         ));
     }
+    check_dest_placement(&canonical, writer, rules)
+        .map_err(|e| anyhow!("dest_path refused: {e}"))?;
     Ok(canonical)
+}
+
+/// FR-84 D4's placement rule, applied to a per-upload destination: a
+/// PRIVILEGED writer (SYSTEM / root) writes only inside the active user's
+/// profile — the same place the drop folder itself must be — and, with
+/// nobody signed in, nowhere a controller chose. A controller with FILES
+/// acts on the person's files; writing where only the machine may is what
+/// `exec` and SSH are gated for. An unprivileged writer is bounded by the
+/// OS's own rights on the write.
+fn check_dest_placement(
+    canonical: &std::path::Path,
+    writer: &files_dir::Writer,
+    rules: &files_dir::Rules,
+) -> Result<(), String> {
+    if !writer.privileged {
+        return Ok(());
+    }
+    let plain = files_dir::strip_verbatim(canonical.to_path_buf());
+    let placed = files_dir::resolve(&plain.to_string_lossy(), writer, rules)?;
+    files_dir::check_placement_on_disk(&placed, writer, rules)
+}
+
+/// Component runs that name the agent's OWN configuration and state — its
+/// config (enrollment token, SSH host key, WireGuard keys), logs, caches —
+/// matched anywhere in a canonical path, case-folded where the file system
+/// is. Every profile's copy counts, not only this process's: a SYSTEM or
+/// root worker can reach every user's.
+#[cfg(target_os = "windows")]
+const AGENT_STATE_RUNS: &[&[&str]] = &[
+    &["programdata", "roomler"],
+    &["appdata", "roaming", "roomler"],
+    &["appdata", "local", "roomler"],
+];
+#[cfg(target_os = "macos")]
+const AGENT_STATE_RUNS: &[&[&str]] = &[
+    &["etc", "roomler"],
+    &["library", "application support", "live.roomler.roomler"],
+    &[
+        "library",
+        "application support",
+        "live.roomler.roomler-agent",
+    ],
+    &["library", "caches", "live.roomler.roomler"],
+    &["var", "log", "roomler"],
+];
+#[cfg(all(unix, not(target_os = "macos")))]
+const AGENT_STATE_RUNS: &[&[&str]] = &[
+    &["etc", "roomler"],
+    &[".config", "roomler"],
+    &[".config", "roomler-agent"],
+    &[".local", "share", "roomler"],
+    &[".local", "share", "roomler-agent"],
+    &[".local", "state", "roomler"],
+    &[".cache", "roomler"],
+    &["var", "log", "roomler"],
+];
+
+/// File names inside the agent's state that carry secrets: the config and
+/// every sibling the writer leaves (`.prev`, `.tmp.<pid>`, archived copies),
+/// and the Wayland portal's restore tokens.
+const AGENT_SECRET_PREFIXES: &[&str] = &["config.toml", "portal-restore-token"];
+
+fn fold_case() -> bool {
+    cfg!(any(target_os = "windows", target_os = "macos"))
+}
+
+/// The run of [`AGENT_STATE_RUNS`] `path` passes through, if any.
+fn agent_state_run(path: &std::path::Path) -> Option<String> {
+    let comps: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                Some(if fold_case() {
+                    s.to_lowercase()
+                } else {
+                    s.into_owned()
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    AGENT_STATE_RUNS.iter().find_map(|run| {
+        comps
+            .windows(run.len())
+            .any(|w| w.iter().zip(run.iter()).all(|(a, b)| a == b))
+            .then(|| run.join("/"))
+    })
+}
+
+/// A secret-bearing file of the agent's own: never leaves the host by file
+/// transfer, whatever the daemon's privilege. The rest of its state — logs,
+/// crash dumps, uploads — stays reachable: that is how a supporter fetches
+/// them from the drawer.
+fn is_agent_secret(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy()) else {
+        return false;
+    };
+    let name = if fold_case() {
+        name.to_lowercase()
+    } else {
+        name.into_owned()
+    };
+    AGENT_SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) && agent_state_run(path).is_some()
 }
 
 /// Best-effort MIME guess from a filename's extension. Used in the
@@ -2062,6 +2191,12 @@ where
 
             if !meta.is_file() {
                 continue; // skip pipes / sockets / device files
+            }
+            if is_agent_secret(&path) {
+                // A folder download of e.g. the machine-global root carries
+                // its logs and crash dumps — never the agent's credentials.
+                tracing::debug!(file = %path.display(), "zip walk: skipping the agent's own secret");
+                continue;
             }
 
             // Per-component-sanitised relative path inside the zip.
@@ -2744,6 +2879,192 @@ mod tests {
         // the metadata check.
         let res = resolve_dest_path(r"\\?\GLOBALROOT\Device\HarddiskVolume2\foo").await;
         assert!(res.is_err());
+    }
+
+    /// A temp tree laid out like the agent's own per-user state on this
+    /// platform, with a stand-in config holding a marker "secret".
+    fn agent_state_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-agentstate-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = if cfg!(target_os = "windows") {
+            base.join("AppData")
+                .join("Roaming")
+                .join("roomler")
+                .join("roomler")
+        } else if cfg!(target_os = "macos") {
+            base.join("Library")
+                .join("Application Support")
+                .join("live.roomler.roomler")
+        } else {
+            base.join(".config").join("roomler")
+        };
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("config.toml"), AGENT_SECRET_MARKER).unwrap();
+        (base, state)
+    }
+
+    const AGENT_SECRET_MARKER: &[u8] = b"agent_token = \"marker-7f3a9c\"\n";
+
+    // The agent's own configuration and state — its enrollment token, its
+    // SSH host key, its logs — is never a file-transfer source or target,
+    // whatever the daemon's privilege: a controller with FILES acts on the
+    // person's files, not the daemon's.
+    #[test]
+    fn the_agents_own_state_is_recognised_in_every_spelling() {
+        use std::path::Path;
+        #[cfg(target_os = "windows")]
+        {
+            for p in [
+                r"C:\ProgramData\roomler\roomler\config.toml",
+                r"\\?\C:\PROGRAMDATA\Roomler\roomler-agent\service-logs\x.log",
+                r"C:\Users\u\AppData\Roaming\roomler\roomler\config\config.toml",
+                r"C:\Users\u\AppData\Local\roomler\roomler\data\desktop\desktop.log",
+            ] {
+                assert!(agent_state_run(Path::new(p)).is_some(), "{p}");
+            }
+            for p in [
+                r"C:\Users\u\Documents\roomler\notes.txt",
+                r"C:\ProgramData\Microsoft\x",
+                r"C:\Users\u\AppData\Local\Temp\roomler-x\y",
+            ] {
+                assert!(agent_state_run(Path::new(p)).is_none(), "{p}");
+            }
+        }
+        #[cfg(unix)]
+        {
+            for p in [
+                "/etc/roomler/config.toml",
+                "/private/etc/roomler/config.toml",
+                "/home/u/.config/roomler/config.toml",
+                "/root/.local/share/roomler/logs/roomlerd.log",
+            ] {
+                assert!(agent_state_run(Path::new(p)).is_some(), "{p}");
+            }
+            for p in ["/home/u/Documents/roomler/x", "/tmp/roomler-x/y"] {
+                assert!(agent_state_run(Path::new(p)).is_none(), "{p}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_never_lands_in_the_agents_own_state() {
+        let (base, state) = agent_state_fixture("up");
+        let res = resolve_dest_path_for(
+            &state.to_string_lossy(),
+            &files_dir::Writer::unprivileged(None),
+            &files_dir::Rules::from_env(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            res.is_err(),
+            "agent state is never an upload target: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_own_config_is_never_a_download() {
+        let (base, state) = agent_state_fixture("down");
+        std::fs::write(state.join("config.toml.prev"), AGENT_SECRET_MARKER).unwrap();
+        std::fs::create_dir_all(state.join("logs")).unwrap();
+        std::fs::write(state.join("logs").join("roomlerd.log"), b"a log line\n").unwrap();
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let config = FilesHandler::new()
+            .begin_outgoing("o1".into(), &path(&state.join("config.toml")))
+            .await
+            .is_err();
+        let prev = FilesHandler::new()
+            .begin_outgoing("o2".into(), &path(&state.join("config.toml.prev")))
+            .await
+            .is_err();
+        // Support still works: the drawer lists the agent's folders and a
+        // log downloads — only the secret-bearing files are refused.
+        let log_ok = FilesHandler::new()
+            .begin_outgoing("o3".into(), &path(&state.join("logs").join("roomlerd.log")))
+            .await
+            .is_ok();
+        let listing_ok = list_dir(&path(&state)).await.is_ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(config, "the agent's config is never a download");
+        assert!(prev, "nor its .prev sibling");
+        assert!(log_ok, "a log is still a download");
+        assert!(listing_ok, "the agent's folders are still listed");
+    }
+
+    #[tokio::test]
+    async fn a_folder_download_leaves_the_agents_secrets_out() {
+        let (base, state) = agent_state_fixture("zip");
+        std::fs::write(base.join("keep.txt"), b"a person's file").unwrap();
+        std::fs::write(state.join("service.log"), b"a diagnostic line").unwrap();
+        let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let root = base.clone();
+        let walk = tokio::spawn(async move { walk_and_zip(zip_writer, &root, cancel).await });
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = Vec::new();
+            zip_reader.read_to_end(&mut out).await.unwrap();
+            out
+        });
+        walk.await.unwrap().expect("walk_and_zip");
+        let zip = drain.await.unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        let has = |needle: &[u8]| zip.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"a person's file"), "the person's file is in the zip");
+        assert!(has(b"a diagnostic line"), "the agent's logs still are");
+        assert!(!has(AGENT_SECRET_MARKER), "the agent's config never is");
+    }
+
+    // FR-84 D4's placement rule binds a per-upload destination too: a
+    // PRIVILEGED writer (SYSTEM / root) writes only inside the active
+    // user's profile, where the drop folder itself must be.
+    #[tokio::test]
+    async fn a_privileged_upload_stays_inside_the_active_profile() {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-destpriv-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = base.join("home");
+        let inside = home.join("Documents");
+        let outside = base.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let home_s = std::fs::canonicalize(&home).unwrap();
+        let home_s = files_dir::strip_verbatim(home_s)
+            .to_string_lossy()
+            .into_owned();
+        let rules = files_dir::Rules::from_env();
+        let system = files_dir::Writer {
+            privileged: true,
+            active_home: Some(home_s.clone()),
+        };
+        let nobody = files_dir::Writer {
+            privileged: true,
+            active_home: None,
+        };
+        let user = files_dir::Writer::unprivileged(Some(home_s));
+        let ok_inside = resolve_dest_path_for(&inside.to_string_lossy(), &system, &rules).await;
+        let outside_sys = resolve_dest_path_for(&outside.to_string_lossy(), &system, &rules).await;
+        let no_one = resolve_dest_path_for(&inside.to_string_lossy(), &nobody, &rules).await;
+        let outside_user = resolve_dest_path_for(&outside.to_string_lossy(), &user, &rules).await;
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(ok_inside.is_ok(), "inside the profile: {ok_inside:?}");
+        let e = outside_sys.expect_err("SYSTEM outside the profile is refused");
+        assert!(format!("{e:#}").contains("profile"), "{e:#}");
+        assert!(
+            no_one.is_err(),
+            "SYSTEM with nobody signed in writes nowhere it chose"
+        );
+        // An unprivileged writer is bounded by the OS's own rights, not here.
+        assert!(outside_user.is_ok(), "{outside_user:?}");
     }
 
     #[tokio::test]
