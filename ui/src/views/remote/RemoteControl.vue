@@ -335,6 +335,21 @@
         <v-icon start size="x-small">mdi-record</v-icon>
         REC {{ fmtClock(rec.durationMs.value) }}
       </v-chip>
+      <!-- FR-85 P3b-3 — the session dropped mid-recording: the device goes on
+           recording for up to a minute, and this session's next connection
+           picks it up. -->
+      <v-chip
+        v-if="rec.state.value === 'reconnecting'"
+        color="warning"
+        size="small"
+        variant="flat"
+        class="mr-1"
+        title="The device goes on recording for up to a minute while this session reconnects."
+        data-testid="rc-rec-reconnecting"
+      >
+        <v-icon start size="x-small">mdi-record</v-icon>
+        REC · reconnecting
+      </v-chip>
       <v-menu
         v-if="rc.phase.value === 'connected' && rc.recordGranted.value"
         :close-on-content-click="false"

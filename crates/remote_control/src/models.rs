@@ -3237,6 +3237,12 @@ pub enum RecordingActivityKind {
     Refused,
     /// The controller downloaded a recording (`name`, `bytes`).
     Downloaded,
+    /// P3b-3 — the recording's own session dropped, and it continued on a
+    /// new session of the SAME controller within the re-attach grace.
+    /// Reported on the new session; the `Started` on the old one says where
+    /// it began. An older server that does not know the word drops just this
+    /// report.
+    Reattached,
 }
 
 /// FR-85 P3 — one thing a device reported about a remote recording.
@@ -4477,6 +4483,28 @@ mod tests {
         assert_eq!(words, vec!["remote", "remote-audio", "available"]);
         for c in RecordCap::ALL {
             assert_eq!(RecordCap::from_wire(c.wire()), Some(c));
+        }
+    }
+
+    /// FR-85 — the activity words a device reports are a compatibility
+    /// surface (the server stores them, the admin reads them): pinned, with
+    /// P3b-3's `reattached`.
+    #[test]
+    fn recording_activity_kinds_keep_their_wire_names() {
+        use RecordingActivityKind::*;
+        for (k, w) in [
+            (PromptGranted, "prompt_granted"),
+            (PromptDenied, "prompt_denied"),
+            (PromptTimedOut, "prompt_timed_out"),
+            (Started, "started"),
+            (Stopped, "stopped"),
+            (Refused, "refused"),
+            (Downloaded, "downloaded"),
+            (Reattached, "reattached"),
+        ] {
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(w));
+            let back: RecordingActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
+            assert_eq!(back, k);
         }
     }
 
