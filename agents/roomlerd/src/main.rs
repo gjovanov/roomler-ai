@@ -3136,10 +3136,11 @@ async fn run_cmd(
         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
         .unwrap_or(true);
     let update_interval = updater::resolve_check_interval(&cfg);
-    // S1a — forced-update trigger channel (rc:agent.update → run_periodic).
-    // When auto-update is disabled the receiver is dropped below and
-    // triggers report undeliverable.
-    let update_trigger_rx = updater::install_update_trigger();
+    // S1a — forced-update trigger channel (rc:agent.update → run_periodic),
+    // installed only when the updater runs: with it off a push reports
+    // undeliverable and the arm says so (#1689) — never queues into a
+    // receiver nobody reads.
+    let update_trigger_rx = updater::install_update_trigger(auto_update_enabled);
 
     // S1a — bring the roomler-desktop companion EXE up to this daemon's
     // version (it ships outside both MSIs, so self-updates never touched
@@ -4085,7 +4086,7 @@ async fn run_cmd(
     // tears down cleanly before the running binary gets overwritten.
     // Disable entirely with `ROOMLERD_AUTO_UPDATE=0` for air-
     // gapped / operator-managed deployments.
-    let upd_task = if auto_update_enabled {
+    let upd_task = if let Some(update_trigger_rx) = update_trigger_rx {
         tracing::info!(
             interval_h = update_interval.as_secs() / 3600,
             "auto-updater armed"
@@ -4096,7 +4097,7 @@ async fn run_cmd(
             async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
         }))
     } else {
-        tracing::info!("auto-update disabled via ROOMLERD_AUTO_UPDATE");
+        tracing::info!("auto-update disabled (auto_update = false / ROOMLERD_AUTO_UPDATE=0)");
         None
     };
 
