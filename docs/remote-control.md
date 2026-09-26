@@ -1981,11 +1981,32 @@ The fix is a per-worker **named stop event**
   name as a hidden `--stop-event <name>` argv (the same channel as
   `--supervisor scm`). The worker's Windows `terminate_signal()` waits on it and,
   when it fires, takes the exact `os_initiated_stop` arm a Unix SIGTERM takes.
+- The worker **polls the event on the async runtime** — `WaitForSingleObject(h,
+  0)` every `STOP_EVENT_POLL` (250 ms) — rather than parking a blocking task on
+  it. Its `select!` has other arms (an update's internal shutdown, FR-84 D3's
+  requested restart), and `main()` drops the runtime at the end of its
+  `block_on`, which waits for every `spawn_blocking` task to *return*: a blocking
+  wait that lost the select would have kept process exit waiting for a signal
+  that never comes, so the worker never left on an auto-update and a requested
+  restart never landed. The handle lives inside the future and closes when it is
+  dropped; 250 ms of latency is nothing against the 8 s budget.
 - On SCM Stop / Preshutdown the supervisor **signals the event, waits a bounded
   `WORKER_GRACEFUL_STOP_BUDGET` (8 s), then falls back to `TerminateProcess`**.
   The service accepts `SERVICE_CONTROL_PRESHUTDOWN` (180 s budget), so 8 s is
   comfortably inside the window while never letting a wedged worker hold up an OS
   shutdown; the reaper stays the backstop.
+- **An update's own service stop never unenrolls.** The MSI stops the service
+  while it replaces the binary; by then the worker that spawned `msiexec` has
+  exited 0 and the host has respawned a fresh one (`decide_exit_reaction(0)` →
+  `Respawn`), which receives that stop as an `os_initiated_stop`. The
+  self-unenroll is therefore gated by the pure
+  `updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight)`
+  — true only for `(true, true, false)` — where `update_in_flight()` reads the
+  `update-attempt` marker `spawn_installer_with_watch` touches (rollbacks
+  included) against `UPDATE_STOP_WINDOW` (10 min; the MSI's stop can lag the
+  spawn by minutes under EDR). A suppressed unenroll is logged by name. The gate
+  is platform-neutral; Linux never needed it only because `dpkg -i` does not
+  restart `roomlerd`.
 - **Security** — the event's DACL (`STOP_EVENT_SDDL`, a protected `D:P`) grants
   **only SYSTEM** `EVENT_ALL_ACCESS` (the sole principal that may `SetEvent`) and
   interactive users `SYNCHRONIZE` only (wait, never signal). A worker may run as

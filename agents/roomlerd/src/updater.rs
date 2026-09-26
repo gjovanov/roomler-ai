@@ -206,6 +206,48 @@ fn recent_update_attempt_at(marker_path: &std::path::Path, cooldown: Duration) -
     elapsed < cooldown
 }
 
+/// #1683 — how long after an installer was spawned a service stop is read as
+/// **the installer's own stop**, not an operator's or the OS's.
+///
+/// On Windows the MSI always stops the `Roomler` service (a `StopServices`
+/// standard action / the `RegisterService` CA's `delete_service`), and by then
+/// the worker that spawned `msiexec` has already exited 0 and the SCM host has
+/// respawned a fresh one. That fresh worker receives the stop as an
+/// `os_initiated_stop` — the same arm a `sc stop` takes — so without this gate an
+/// EPHEMERAL device would self-unenroll on every auto-update and the new version
+/// would come up holding a dead token, exactly what FR-51 rules out ("the
+/// internal arm is the updater restarting us; de-enrolling there would delete
+/// the device on every update"). Linux never had this: `dpkg -i` does not
+/// restart `roomlerd` at all.
+///
+/// 10 minutes because the MSI's stop can lag the spawn by minutes under EDR /
+/// a slow host. The cost of a long window is small and fails safe: an operator
+/// stop *inside* it leaves the ephemeral row to the server-side reaper — which
+/// is today's behaviour on every Windows service host.
+pub const UPDATE_STOP_WINDOW: Duration = Duration::from_secs(600);
+
+/// #1683 — is an update in flight right now? True when this daemon (or the
+/// worker this one replaced under the SCM host) spawned an installer within
+/// [`UPDATE_STOP_WINDOW`]: `spawn_installer_with_watch` touches the
+/// `update-attempt` marker right before it launches the installer, and the
+/// rollback path goes through the same function. Platform-neutral.
+pub fn update_in_flight() -> bool {
+    recent_update_attempt(UPDATE_STOP_WINDOW)
+}
+
+/// #1683 — may an ephemeral device remove itself on this exit? Pure so the
+/// whole policy is one table test. True ONLY for an ephemeral device, on an
+/// OS/service-manager-initiated stop, with NO update in flight: the internal
+/// arm (the updater restarting us) never unenrolls, and neither does the stop
+/// the installer itself issues while it replaces the binary.
+pub fn should_self_unenroll(
+    ephemeral: bool,
+    os_initiated_stop: bool,
+    update_in_flight: bool,
+) -> bool {
+    ephemeral && os_initiated_stop && !update_in_flight
+}
+
 /// A parsed release from the GitHub API. Only the fields we need.
 #[derive(Debug, Deserialize)]
 pub struct GithubRelease {
@@ -2770,6 +2812,47 @@ mod tests {
         // change should require an explicit reason to land. A too-short
         // cooldown re-opens the install-storm window from operator.
         assert_eq!(STARTUP_UPDATE_COOLDOWN, Duration::from_secs(300));
+    }
+
+    /// #1683 — the whole self-unenroll policy as one table. The
+    /// `(ephemeral, os_initiated_stop, update_in_flight) = (true, true, true)`
+    /// row is the MSI update's own service stop: the SCM host respawned a
+    /// worker after the updater's exit-0, and the installer then stopped the
+    /// service. Before the gate, the inline condition unenrolled the device on
+    /// every auto-update and the new version came up holding a dead token.
+    #[test]
+    fn should_self_unenroll_only_on_an_os_stop_with_no_update_in_flight() {
+        let table: [((bool, bool, bool), bool); 8] = [
+            ((false, false, false), false),
+            ((false, false, true), false),
+            // A permanent device never removes itself, whatever stopped it.
+            ((false, true, false), false),
+            ((false, true, true), false),
+            // The internal arm (the updater restarting us): never.
+            ((true, false, false), false),
+            ((true, false, true), false),
+            // The ONE case: ephemeral, an OS/service-manager stop, no update.
+            ((true, true, false), true),
+            // The installer's own service stop: the device stays enrolled.
+            ((true, true, true), false),
+        ];
+        for ((ephemeral, os_stop, in_flight), want) in table {
+            assert_eq!(
+                should_self_unenroll(ephemeral, os_stop, in_flight),
+                want,
+                "ephemeral={ephemeral} os_initiated_stop={os_stop} update_in_flight={in_flight}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_stop_window_is_ten_minutes_and_outlasts_the_startup_cooldown() {
+        // Lock the value and its relation: the MSI's stop can lag the installer
+        // spawn by minutes under EDR, and the window must not be shorter than
+        // the startup cooldown that already reads a fresh marker as "an
+        // install is in flight".
+        assert_eq!(UPDATE_STOP_WINDOW, Duration::from_secs(600));
+        assert!(UPDATE_STOP_WINDOW >= STARTUP_UPDATE_COOLDOWN);
     }
 
     #[test]
