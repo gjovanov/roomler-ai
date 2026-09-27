@@ -1478,7 +1478,7 @@ const KEYS: &[KeyMeta] = &[
         // progress; the capability follows on the next heartbeat.
         live: true,
         kind: "bool",
-        description: "FR-85 - let a remote controller record this screen during a session (default off). The recording is made and kept on this device, with a banner on screen while it runs; the controller downloads it. Off also stops a remote recording in progress. Device-only: never pushable through remote config.",
+        description: "FR-85 - let a remote controller record this screen during a session (default off). The recording is made and kept on this device, with a banner on screen while it runs; the controller downloads it. Off also stops a remote recording in progress. Device-only: never pushable through remote config. On a supervised Mac the signed-in person's own setting decides (their GUI worker records); the root daemon's copy has no effect there.",
     },
     KeyMeta {
         key: "record_remote_audio",

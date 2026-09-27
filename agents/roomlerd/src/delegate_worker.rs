@@ -81,6 +81,52 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// What this worker tells the daemon it can do: the capture grants it holds
+/// (FR-43 P2c) and, FR-85 P1e-mac, its `record` caps — the DEVICE's row
+/// advertises them, because a delegated session records here, with this
+/// process's recorder and under the person's own gates.
+fn own_caps() -> roomler_ai_remote_control::models::AgentCaps {
+    let caps = crate::encode::caps::detect();
+    #[cfg(feature = "recording")]
+    let caps = roomler_ai_remote_control::models::AgentCaps {
+        record: crate::recording::remote::advertised(),
+        ..caps
+    };
+    caps
+}
+
+/// FR-85 P1e-mac — the person's remote-recording gates, watched so a change
+/// re-sends [`own_caps`]. Without the recorder there is nothing to watch.
+#[cfg(feature = "recording")]
+type GateWatch = tokio::sync::watch::Receiver<crate::recording::remote::Gates>;
+#[cfg(not(feature = "recording"))]
+struct GateWatch;
+
+fn watch_gates() -> GateWatch {
+    #[cfg(feature = "recording")]
+    {
+        crate::recording::remote::subscribe_gates()
+    }
+    #[cfg(not(feature = "recording"))]
+    {
+        GateWatch
+    }
+}
+
+/// Resolves when the gates change; never, without the recorder (or if their
+/// sender is ever gone, which a `static` cannot be — pending beats spinning).
+async fn gates_changed(w: &mut GateWatch) {
+    #[cfg(feature = "recording")]
+    {
+        if w.changed().await.is_ok() {
+            return;
+        }
+    }
+    #[cfg(not(feature = "recording"))]
+    let _ = w;
+    std::future::pending::<()>().await
+}
+
 /// Run the worker's side of the channel for the process lifetime.
 ///
 /// Returns immediately unless this process was started as `run --supervised`,
@@ -226,11 +272,16 @@ async fn attach_once(
     //
     // Sent once per attach rather than on a timer: a permission change on macOS
     // requires re-launching the process anyway (TCC grants are read at start),
-    // so a re-attach is exactly when it can differ.
+    // so a re-attach is exactly when it can differ. FR-85 P1e-mac — except the
+    // `record` caps, which follow the person's live remote-recording gate: a
+    // change re-sends them (the arm below). Subscribed BEFORE the first
+    // announcement, so a change in between is never missed.
+    let mut gates = watch_gates();
     {
-        let caps = crate::encode::caps::detect();
+        let caps = own_caps();
         tracing::info!(
             permissions = ?caps.permissions,
+            record = ?caps.record,
             "delegation: announcing our capabilities to the daemon"
         );
         write_frame(
@@ -309,6 +360,23 @@ async fn attach_once(
             }
             _ = tokio::time::sleep(PING_EVERY) => {
                 write_frame(&mut wr, &DelegateFrame::Ping).await?;
+            }
+            // FR-85 P1e-mac — the person switched remote recording on or off:
+            // the device's row must say so within a heartbeat, and an OFF
+            // must stop the hub granting RECORD.
+            () = gates_changed(&mut gates) => {
+                let caps = own_caps();
+                tracing::info!(
+                    record = ?caps.record,
+                    "delegation: the remote-recording gates changed; re-announcing our capabilities"
+                );
+                write_frame(
+                    &mut wr,
+                    &DelegateFrame::WorkerCaps {
+                        caps: Box::new(caps),
+                    },
+                )
+                .await?;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {

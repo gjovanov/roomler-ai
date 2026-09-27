@@ -15,7 +15,7 @@
 //! | root on Linux, with someone signed in at the active graphical session | that person: their uid, gid and groups, in their session's environment |
 //! | SYSTEM or Linux root, a screen showing that nobody is signed in to: Windows' sign-in screen, a Linux display manager's greeter or root's own desktop, or (Linux) a display or scanout the recorder could reach with no session registered | refused, by name ([`Refusal::LoginScreen`], decision 6): nobody to record as, and someone may be standing at it |
 //! | Linux root with no screen anyone could be at: its own virtual desktop or the synthetic test source, or no active graphical session and no display or DRM scanout the recorder could reach | a REMOTE recording only (P1f, [`Identity::Unattended`]): the daemon itself, into the daemon's own folder, locked to the service side; a local one is refused, by name |
-//! | root on macOS | refused, by name |
+//! | root on macOS | refused, by name: a root daemon there has no WindowServer and can never see the screen. A supervised Mac records in its GUI WORKER instead, which is the person, in their session, with the Screen Recording grant it already captures with (the row above; FR-85 P1e-mac) |
 //!
 //! ⚠️ **A login screen is not "nobody"** (FR-85 decision 6). It shows account
 //! names, a person may be standing at it, and nothing on it can say that a
@@ -49,7 +49,13 @@
 //! would change every thread of the daemon): without that, root's group 0
 //! would still open a `root:root 0640` file a link in the folder pointed at.
 //!
-//! Not yet here: the drop on macOS (a root daemon there still refuses).
+//! macOS (P1e-mac) is not a drop: nothing root starts can reach the person's
+//! GUI session except through `launchctl asuser` and `sudo -u`, and the
+//! supervisor already starts one such process, the GUI worker, which holds
+//! the grants. A delegated session's `record` channel opens on the worker's
+//! peer, so the worker records, and the daemon only carries the record context
+//! across (`delegate::SessionParams::record`) and advertises the worker's
+//! `record` caps.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -95,8 +101,8 @@ pub enum Refusal {
     /// is never "nobody" for the unattended exception: a remote recording is
     /// refused, by this name.
     LoginScreen,
-    /// root on macOS: launching the recorder as the person at the screen is
-    /// built on Windows and Linux.
+    /// root on macOS: no WindowServer, so no screen. A supervised Mac records
+    /// in its GUI worker (P1e-mac); this refusal is the root daemon's own.
     RootDaemon,
     /// `ROOMLERD_RECORDING=0`: the device's own kill switch.
     SwitchedOff,
@@ -128,9 +134,9 @@ impl Refusal {
                  it is being recorded, and a recording is made as the person signed in"
             }
             Self::RootDaemon => {
-                "this device service runs as root, and launching the recorder as the person at \
-                 the screen is not built on this platform yet (FR-85 P1e covers Windows and \
-                 Linux): run `roomlerd record` in your own session"
+                "this device service runs as root, which cannot see the screen on macOS: \
+                 recordings are made by its GUI worker, in your own session \
+                 (`macos_supervise_gui_worker`), or by `roomlerd record` run in your session"
             }
             Self::SwitchedOff => {
                 "recording is switched off on this device (ROOMLERD_RECORDING=0 in the \
