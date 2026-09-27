@@ -1088,7 +1088,16 @@ async fn connect_once(
     crate::exec::register_secret(&cfg.agent_token);
 
     // Say hello.
-    let hello_caps = stub_caps(cfg.overlay_multi_org);
+    let mut hello_caps = stub_caps(cfg.overlay_multi_org);
+    // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
+    // worker can record. Saying the root daemon's own list (nothing) would
+    // strip RECORD for the 30 s until the first heartbeat corrects it, after
+    // every reconnect. Primary org only, like the heartbeat.
+    if ctx.is_primary
+        && let Some(record) = delegation.host().and_then(|d| d.effective_record())
+    {
+        hello_caps.record = record;
+    }
     // FR-85 P3b — what the hello told the server about remote recording, so
     // the heartbeat re-announces the moment the owner's gate changes it.
     let mut last_announced_record: Vec<String> = hello_caps.record.clone();

@@ -980,6 +980,11 @@ sequenceDiagram
   socket (in the user's temp folder, where the companion looks first). The
   root daemon's `/var/run/roomler/roomler.sock` is root-only, and its
   recording verbs refuse `RootDaemon`.
+  ⚠️ So `sudo roomler config set record_remote_enabled …` changes the ROOT
+  daemon's copy, which a supervised Mac does not read for remote recording
+  (the key's own description says so). ANDing it in as a second gate would
+  make remote recording a double opt-in, a change to the shipped model: an
+  open decision for the operator, not taken here.
 - **Local recording** on a supervised Mac needs nothing from P1e-mac: the
   companion's verbs land on the worker, whose recorder runs as itself
   (`Inherit`).
