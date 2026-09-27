@@ -84,13 +84,38 @@ The WSL sibling is a genuinely separate machine identity (it already runs its ow
 
 ## Acceptance criteria
 
-- [ ] the recording is **≤ 90 s** and has no narration
+- [x] the recording is **≤ 90 s** and has no narration
+      *89.4 s, one take, no narration (the 09-01 take, the one embedded).*
 - [ ] it shows a real enrolment that transitions a device to **online** on camera
-- [ ] it shows the target's actual desktop in a browser tab, with input working
+      *Not met by the recording that shipped. The 08-31 take enrolled for real but
+      off camera, and was then lost; the 09-01 re-shoot — the embedded one — shows
+      two machines pinging each other across the mesh instead. The operator
+      accepted that take's two cosmetic details (the closing MagicDNS scene, the
+      Terminal title bar), not this substitution, and this spec never recorded it.*
+- [x] it shows the target's actual desktop in a browser tab, with input working
+      *A Windows 11 desktop in a browser tab, with the ping commands typed into the
+      remote shells on camera — the take had to fix the Mac swallowing the first
+      nineteen characters after a focus click, which is the input path working.*
 - [ ] it shows a shell and a forwarded port
-- [ ] `scripts/record-demo.sh` reproduces it end to end from a clean `demo` org
-- [ ] it is embedded at the top of the README, above the pillar sections
-- [ ] neo16's GROX membership and `100.65.4.2` are **unchanged** afterwards
+      *Not met: the cut shows a terminal inside the remote desktop and a mesh ping,
+      but no `roomler ssh` shell and no `roomler forward` — the same substitution as
+      the enrolment above. Re-shoot, or amend this criterion with the operator.*
+- [x] `scripts/record-demo.sh` reproduces it end to end from a clean `demo` org
+      *Proven the hard way: the first take was lost to a worktree cleanup and
+      re-shot from the harness on master, "exactly what the harness was for".*
+- [x] it is embedded at the top of the README, above the pillar sections
+      *A GIF preview (`docs/assets/demo-preview.gif`) linking the full 90 s MP4, on
+      the README's first screen — above "Run it" and the pillar sections (#1122).
+      A repo MP4 cannot play inline on GitHub; the README's own comment says so.*
+- [x] neo16's GROX membership and `100.65.4.2` are **unchanged** afterwards
+      *Re-checked on neo16 2026-09-25: its primary org still holds `100.65.4.2`. And
+      since removal is final — a re-enrolled node never gets its old address back —
+      still holding `.4.2` proves the membership was never broken.*
+
+Evidence: [08-31 result](https://github.com/gjovanov/roomler-ai/issues/965#issuecomment-5484395643),
+[09-01 re-shoot](https://github.com/gjovanov/roomler-ai/issues/965#issuecomment-5491708816),
+[09-01 shot, embedded, accepted](https://github.com/gjovanov/roomler-ai/issues/965#issuecomment-5493932498).
+*Five ticked 2026-09-25; two left open for the substitution above.*
 
 ## Open decisions
 

@@ -119,19 +119,28 @@ five-minute fix and the two days this cost in the field.
 
 ## Acceptance criteria
 
-- [ ] on a device in two orgs, `roomlerd org ls` shows each org's overlay mode
-- [ ] `roomler status` shows it per org
-- [ ] `roomler peers` renders an overlay-off org **differently** from an org with
+- [x] on a device in two orgs, `roomlerd org ls` shows each org's overlay mode
+- [x] `roomler status` shows it per org
+- [x] `roomler peers` renders an overlay-off org **differently** from an org with
       an overlay and no peers — verified by producing both states on one device
-- [ ] `roomlerd org overlay <label> tun` puts the device on that org's mesh after
+- [x] `roomlerd org overlay <label> tun` puts the device on that org's mesh after
       a restart, verified by a ping across it
-- [ ] `enroll --overlay` into a second org enables **that** org, and leaves the
+- [x] `enroll --overlay` into a second org enables **that** org, and leaves the
       primary's flag untouched
-- [ ] `enroll` without `--overlay` on an org that already had one does not turn
+- [x] `enroll` without `--overlay` on an org that already had one does not turn
       it off (regression lock on the one-way invariant)
-- [ ] `roomler peers --org <label>` prints only that org
-- [ ] an older daemon reporting no `overlay_mode` renders as it does today, not
+- [x] `roomler peers --org <label>` prints only that org
+- [x] an older daemon reporting no `overlay_mode` renders as it does today, not
       as "off" (absent ≠ off — the same trap as an absent age reading 0 ms)
+
+Evidence for all eight: field-verified on `agent-v0.4.41`, 2026-09-01, with the
+live output for each — including the older daemon rendering `overlay ?` and the
+round trip back to the mesh at 0 % loss
+([#1084 — Result](https://github.com/gjovanov/roomler-ai/issues/1084#issuecomment-5490117524)).
+The two `enroll` criteria are also locked by
+`overlay_flag_enables_the_org_that_was_actually_enrolled` and
+`overlay_flag_never_downgrades_an_org_that_already_participates` in `org_join.rs`,
+which `--lib` CI runs. *Ticked 2026-09-25 — verified on 09-01, never ticked in the spec.*
 
 ## Out of scope
 

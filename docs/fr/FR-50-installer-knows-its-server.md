@@ -155,17 +155,30 @@ that could regress is the population whose served bytes do not change.
 
 ## Acceptance criteria
 
-- [ ] `curl <self-hosted>/api/setup/install.sh` returns a script whose `SERVER`
+- [x] `curl <self-hosted>/api/setup/install.sh` returns a script whose `SERVER`
       is that host, not `roomler.ai` — verified against a **running** self-host
       instance, not a unit test
-- [ ] `curl https://roomler.ai/api/setup/install.sh` is byte-identical to the
+      *Self-hosted stack on 0.4.40, failing baseline captured first:
+      `SERVER="https://roomler.ai"` before, `"http://localhost:8080"` after.*
+- [x] `curl https://roomler.ai/api/setup/install.sh` is byte-identical to the
       committed `scripts/install.sh`
-- [ ] the same holds for `install.ps1`
-- [ ] a `frontend_url` carrying a shell metacharacter serves the compiled-in
+      *On real prod, 2026-09-01: `curl … | diff - scripts/install.sh` → identical.*
+- [x] the same holds for `install.ps1`
+      *Same run: identical.*
+- [x] a `frontend_url` carrying a shell metacharacter serves the compiled-in
       default and logs a refusal (unit test)
-- [ ] editing the `SERVER=` line in either script fails `cargo test -p roomler-ai-api`
-- [ ] `docs/self-hosting.md` and `README.md` no longer instruct the reader to
+      *Unit-tested and field-tested: `…/oops"; rm -rf /; #` served the default and
+      logged a warning naming the value.*
+- [x] editing the `SERVER=` line in either script fails `cargo test -p roomler-ai-api`
+      *Checked by making the edit, not by reading the assertion.*
+- [x] `docs/self-hosting.md` and `README.md` no longer instruct the reader to
       pass `--server` on the served path
+      *`self-hosting.md` per the result; `README.md` re-checked 2026-09-25 — it does
+      not mention `--server` at all, and `self-hosting.md` names it only as an
+      optional override and a fallback for a wrong `ROOMLER_PUBLIC_URL`.*
+
+Evidence for all six: [#1083 — Result, field-verified on production](https://github.com/gjovanov/roomler-ai/issues/1083#issuecomment-5490112040).
+*Ticked 2026-09-25 — verified on 09-01, never ticked in the spec.*
 
 ## Out of scope
 
