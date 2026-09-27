@@ -317,10 +317,28 @@ pub use win::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_serv
 /// current value, and the pump only wakes when the value changes
 /// (no busy loop on consumers).
 ///
-/// Drop the returned `JoinHandle` to abort the task; it has no
-/// internal shutdown channel because it's cheap to abort and
-/// shutdown of the agent ends the runtime anyway.
-pub fn spawn_monitor() -> (
+/// ⚠️ The task ends when `until` is cancelled — the SESSION's end
+/// (#1738). Dropping the returned `JoinHandle` does NOT stop it: tokio
+/// detaches a task whose handle is dropped, it never aborts one. The
+/// receiver-count exit (every `Receiver` gone) is only a backstop, and
+/// it cannot fire while a consumer waits on `changed()`: that wait ends
+/// only when the SENDER — owned by this task — drops. Before #1738 the
+/// host-locked emitter was exactly such a consumer, so every session
+/// left its monitor and its emitter polling for the life of the daemon.
+pub fn spawn_monitor(
+    until: tokio_util::sync::CancellationToken,
+) -> (
+    tokio::sync::watch::Receiver<LockState>,
+    tokio::task::JoinHandle<()>,
+) {
+    spawn_monitor_every(POLL_INTERVAL, until)
+}
+
+/// [`spawn_monitor`] at `interval` (the tests poll fast).
+fn spawn_monitor_every(
+    interval: Duration,
+    until: tokio_util::sync::CancellationToken,
+) -> (
     tokio::sync::watch::Receiver<LockState>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -334,15 +352,19 @@ pub fn spawn_monitor() -> (
     let handle = tokio::spawn(async move {
         let mut last = initial;
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            // Receiver-gone-shutdown: when every receiver has been
-            // dropped (the owning media pump exited), the watch
-            // sender's `is_closed()` flips. Without this check the
-            // monitor task can outlive its consumers indefinitely
-            // because `tx.send()` only fires on state *change* —
-            // a steady-Unlocked session never tries to send, never
-            // notices the receivers are gone, and leaks the task
-            // until runtime shutdown.
+            tokio::select! {
+                biased;
+                _ = until.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            // Receiver-gone-shutdown, the BACKSTOP (the session's
+            // `until` is the real end, #1738): when every receiver has
+            // been dropped, the watch sender's `is_closed()` flips.
+            // Without this check the monitor task can outlive its
+            // consumers indefinitely because `tx.send()` only fires on
+            // state *change* — a steady-Unlocked session never tries to
+            // send, never notices the receivers are gone, and leaks the
+            // task until runtime shutdown.
             if tx.is_closed() {
                 return;
             }
@@ -418,6 +440,56 @@ mod tests {
         // sends bad capture frames.
         assert_eq!(classify(true, "default"), LockState::Locked);
         assert_eq!(classify(true, "DEFAULT"), LockState::Locked);
+    }
+
+    /// #1738 — the monitor ends with its SESSION, even while a consumer
+    /// waits on `changed()`. That consumer keeps the channel open, so the
+    /// receiver-count exit can never fire: before the fix the pair polled
+    /// for the life of the daemon, once per session ever held.
+    #[tokio::test]
+    async fn the_monitor_ends_with_its_session_even_while_a_consumer_waits() {
+        const TICK: Duration = Duration::from_millis(10);
+        let until = tokio_util::sync::CancellationToken::new();
+        let (rx, monitor) = spawn_monitor_every(TICK, until.clone());
+        // The host-locked emitter's shape: parked on `changed()`, which
+        // only ends when the sender (the monitor's) drops.
+        let mut waiting = rx.clone();
+        let consumer = tokio::spawn(async move { while waiting.changed().await.is_ok() {} });
+
+        // Many polls later, with the handle still held: both alive — the
+        // leak's precondition, and proof the monitor is really polling.
+        tokio::time::sleep(TICK * 20).await;
+        assert!(
+            !monitor.is_finished(),
+            "the monitor runs while its session lives"
+        );
+        assert!(!consumer.is_finished());
+
+        until.cancel();
+        tokio::time::timeout(TICK * 50, monitor)
+            .await
+            .expect("the monitor ends when its session does")
+            .unwrap();
+        tokio::time::timeout(TICK * 50, consumer)
+            .await
+            .expect("the consumer's wait ends once the sender is gone")
+            .unwrap();
+        // A late reader still reads the last state, never a panic.
+        let _last = *rx.borrow();
+    }
+
+    /// The backstop still holds: with every receiver gone, the monitor
+    /// ends on its own even if nobody cancels it.
+    #[tokio::test]
+    async fn the_monitor_also_ends_when_every_receiver_is_gone() {
+        const TICK: Duration = Duration::from_millis(10);
+        let until = tokio_util::sync::CancellationToken::new();
+        let (rx, monitor) = spawn_monitor_every(TICK, until);
+        drop(rx);
+        tokio::time::timeout(TICK * 50, monitor)
+            .await
+            .expect("no receiver left ⇒ the monitor ends")
+            .unwrap();
     }
 
     #[test]
