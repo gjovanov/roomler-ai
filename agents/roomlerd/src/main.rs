@@ -620,6 +620,21 @@ enum Command {
         #[arg(long)]
         no_restart: bool,
     },
+    /// #1727 — keep the SystemContext mode this machine was last switched
+    /// to: `enable-system-context` if the last recorded switch was an
+    /// enable, `disable-system-context` otherwise. What the perMachine MSI
+    /// runs when its command line has no `ENABLE_SYSTEM_CONTEXT` — a
+    /// person running `msiexec /i` by hand. Every install recreates the
+    /// service and loses the switch with it; the record
+    /// (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`) is what
+    /// survives. Requires admin.
+    #[command(hide = true)]
+    KeepSystemContext {
+        /// Skip the post-write service restart. Mirrors
+        /// `enable-system-context --no-restart`.
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Write a single name=value entry into the `Roomler`
     /// SCM `Environment` REG_MULTI_SZ block. Omit `--value` to REMOVE
     /// the entry. Operators may use this directly, or the higher-level
@@ -1504,6 +1519,7 @@ async fn daemon_main() -> Result<()> {
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
         Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
+        Command::KeepSystemContext { no_restart } => keep_system_context_cmd(no_restart),
         Command::SetServiceEnvVar { name, value } => {
             set_service_env_var_cmd(&name, value.as_deref())
         }
@@ -4478,7 +4494,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
-    const COMMAND: &str = "enable-system-context";
+    const COMMAND: &str = attempt::ENABLE_COMMAND;
 
     // Stage 1: env-var write. On failure, record telemetry so the
     // installer wizard (which reads %PROGRAMDATA%\roomler\
@@ -4535,7 +4551,7 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
-    const COMMAND: &str = "disable-system-context";
+    const COMMAND: &str = attempt::DISABLE_COMMAND;
 
     if let Err(e) = environment::unset_service_env_var(SYSTEM_CONTEXT_ENV_VAR) {
         let hint = "Re-run from an elevated shell.";
@@ -4577,6 +4593,49 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
     bail!("`disable-system-context` is Windows-only.")
+}
+
+/// #1727 — the perMachine MSI's action when its command line does not
+/// name a mode. It cannot read the mode itself: the switch lives in the
+/// service's `Environment`, which RegisterService (and a major upgrade's
+/// removal of the old product) has already deleted by the time this runs,
+/// and an MSI condition cannot read a REG_MULTI_SZ at all. So it follows
+/// the product's own record of the last switch.
+///
+/// An unreadable record reads as "off": that is what an install with no
+/// property always did, so no host is worse off than before.
+#[cfg(target_os = "windows")]
+fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
+    use roomlerd::win_service::system_context_attempt as attempt;
+
+    let last = attempt::read_last().unwrap_or_else(|e| {
+        eprintln!(
+            "keep-system-context: cannot read {} ({e}); treating it as off",
+            attempt::path().display()
+        );
+        None
+    });
+    let on = attempt::last_switched_on(last.as_ref());
+    match &last {
+        Some(a) => println!(
+            "keep-system-context: the last recorded switch was `{}` ({:?}) at {} -> SystemContext {}",
+            a.command,
+            a.stage,
+            a.ts,
+            if on { "ON" } else { "off" }
+        ),
+        None => println!("keep-system-context: no recorded switch -> SystemContext off"),
+    }
+    if on {
+        enable_system_context_cmd(no_restart)
+    } else {
+        disable_system_context_cmd(no_restart)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keep_system_context_cmd(_no_restart: bool) -> Result<()> {
+    bail!("`keep-system-context` is Windows-only.")
 }
 
 #[cfg(target_os = "windows")]
@@ -5754,6 +5813,19 @@ mod tests {
         match cli.command {
             Some(Command::DisableSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected DisableSystemContext, got {other:?}"),
+        }
+    }
+
+    /// #1727 — the exact spelling `wix-perMachine/main.wxs` puts in the
+    /// `KeepSystemContext` action's ExeCommand. That action is
+    /// Return='ignore', so a name that stopped parsing would fail silently
+    /// and every hand-run install would leave SystemContext off again.
+    #[test]
+    fn parses_keep_system_context_as_the_msi_spells_it() {
+        let cli = Cli::try_parse_from(["roomlerd", "keep-system-context"]).unwrap();
+        match cli.command {
+            Some(Command::KeepSystemContext { no_restart }) => assert!(!no_restart),
+            other => panic!("expected KeepSystemContext, got {other:?}"),
         }
     }
 

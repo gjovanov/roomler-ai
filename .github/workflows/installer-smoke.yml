@@ -22,8 +22,10 @@
 #     desktop session that GitHub-hosted Windows runners don't expose;
 #     requires a self-hosted runner on a real Win11 VM. Phase 6 plan
 #     called this risk out — see commit message.
-#   * Per-Machine MSI. Same install/uninstall flow but admin-elevated.
-#     Add when this per-User flow is green + we want to widen coverage.
+#   * The per-Machine MSI's full install assertions. It IS installed now,
+#     since #1727: four upgrades that check the SystemContext switch in the
+#     service's Environment survives a hand-run install. It is not put
+#     through the per-User payload and registry asserts below.
 #   * REAL code signing. The smoke doesn't ship anywhere, so it never
 #     touches Azure Artifact Signing. It DOES exercise the sign-windows
 #     action in `local` mode when the WIN_TEST_PFX_* secrets exist, which
@@ -67,6 +69,9 @@ on:
       # self-update silently removed the daemon on a field MacBook.
       - 'agents/roomlerd/packaging/macos/**'
       - 'agents/roomlerd/build.rs'
+      # #1727 — the per-Machine MSI runs `roomlerd keep-system-context`, which
+      # decides from this module; a change to it changes what an install does.
+      - 'agents/roomlerd/src/win_service/system_context_attempt.rs'
       - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
 
@@ -607,6 +612,99 @@ jobs:
           $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'per-Machine MSI not produced by cargo-wix' }
           Write-Host "per-Machine MSI compiles clean: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
+
+      - name: A hand-run per-Machine upgrade keeps the SystemContext mode (#1727)
+        # The per-Machine MSI's first INSTALL coverage. A person running
+        # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
+        # SystemContext OFF: the property defaulted to "0", and every install
+        # recreates the service, taking the ROOMLERD_ENABLE_SYSTEM_SWAP entry of
+        # its Environment with it. A SystemContext laptop went offline that way
+        # (2026-09-26). The fix keeps the mode the machine was last switched to
+        # (`roomlerd keep-system-context`, from the product's own record).
+        #
+        # Four builds of the SAME binary at rising versions, so each install is
+        # a real major upgrade (RemoveExistingProducts runs the old product's
+        # service uninstall), the shape a hand-run install of a newer release
+        # has. ⚠️ Windows Installer ignores a version's FOURTH field when it
+        # decides an upgrade, so the versions differ in the third.
+        #
+        # What this CAN prove on a hosted runner: the switch in the service's
+        # Environment, the record, and that the service is Running after each
+        # step. What it cannot: the winlogon-token swap itself (the header's
+        # "not in scope"), which needs a real interactive session.
+        #
+        # Negative control: on master the v2 cell fails (the swap is gone).
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'pm-msi'
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          New-Item -ItemType Directory -Path $out, $logDir -Force | Out-Null
+
+          Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
+          $wixDir = "agents\roomlerd\wix"
+          Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
+          Copy-Item "agents\roomlerd\wix-perMachine\main.wxs" "$wixDir\main.wxs" -Force
+          try {
+            foreach ($n in 1..4) {
+              cargo wix -p roomlerd --nocapture --no-build --install-version "0.0.$n-smoke.1"
+              if ($LASTEXITCODE -ne 0) { throw "cargo wix failed for v$n" }
+              $msi = Get-ChildItem 'target/wix/*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              Move-Item $msi.FullName (Join-Path $out "pm-$n.msi") -Force
+            }
+          } finally {
+            Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
+          }
+
+          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
+            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
+            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
+            if ($p.ExitCode -ne 0) {
+              Get-Content $log -Tail 120
+              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
+            }
+          }
+          function Get-Swap {
+            $block = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment
+            [bool](@($block) -contains 'ROOMLERD_ENABLE_SYSTEM_SWAP=1')
+          }
+          function Assert-Mode([string]$label, [bool]$want, [string]$version) {
+            $svc = $null
+            foreach ($i in 1..60) {
+              $svc = Get-Service Roomler -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Running') { break }
+              Start-Sleep -Seconds 1
+            }
+            $swap = Get-Swap
+            $rec = Get-Content "$env:ProgramData\roomler\last-system-context-attempt.json" -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+            $products = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like 'Roomler*per-Machine*' })
+            Write-Host ("{0}: swap={1} (want {2}) service={3} record={4}/{5} products={6}" -f $label, $swap, $want, $svc.Status, $rec.command, $rec.stage, (($products | ForEach-Object { $_.DisplayVersion }) -join ','))
+            if ($swap -ne $want) { throw "${label}: the SystemContext swap is $swap, want $want" }
+            if (-not $svc -or $svc.Status -ne 'Running') { throw "${label}: the Roomler service is $($svc.Status), want Running" }
+            if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $version) {
+              throw "${label}: want exactly one per-Machine product at $version, found: $(($products | ForEach-Object { $_.DisplayVersion }) -join ',')"
+            }
+          }
+
+          try {
+            Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1.log') 'ENABLE_SYSTEM_CONTEXT=1'
+            Assert-Mode 'v1, installed with =1' $true '0.0.1.1'
+            # THE regression cell: a person upgrading by hand, no property.
+            Invoke-Msi '/i' (Join-Path $out 'pm-2.msi') (Join-Path $logDir 'pm-2.log') ''
+            Assert-Mode 'v2, hand-run upgrade with no property' $true '0.0.2.1'
+            Invoke-Msi '/i' (Join-Path $out 'pm-3.msi') (Join-Path $logDir 'pm-3.log') 'ENABLE_SYSTEM_CONTEXT=0'
+            Assert-Mode 'v3, upgrade with an explicit =0' $false '0.0.3.1'
+            Invoke-Msi '/i' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-4.log') ''
+            Assert-Mode 'v4, hand-run upgrade with no property' $false '0.0.4.1'
+          } finally {
+            Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item "$env:ProgramData\roomler\last-system-context-attempt.json" $logDir -Force -ErrorAction SilentlyContinue
+          }
+
+          Invoke-Msi '/x' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-uninstall.log') ''
+          if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived the uninstall' }
+          Write-Host 'per-Machine uninstall removed the service'
 
       - name: Upload MSI logs on failure
         if: failure()

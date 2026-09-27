@@ -113,8 +113,8 @@
                          stable identity across upgrade; perMachine keys off the
                          file itself (KeyPath='yes'), Win64='yes' like siblings. -->
                     <Component Id='AgentExe' Guid='6E4F5B23-7A3D-4F2C-8E5D-9F2C3E5F7A04' Win64='yes'>
-                        <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; five
-                             CustomActions reference it and upgrades key off it, so it is frozen
+                        <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; every
+                             CustomAction references it and upgrades key off it, so it is frozen
                              deliberately. docs/fr/FR-21 -->
                         <File
                             Id='roomler_agent_exe'
@@ -385,14 +385,21 @@
           deferred (LocalSystem) execution sequence; without that
           attribute msiexec drops public properties at InstallInitialize.
 
-          Default value `0` so the DisableSystemContext CA's condition
-          fires on plain `permachine` installs (the orchestrator passes
-          ENABLE_SYSTEM_CONTEXT=0 explicitly, but a wholly-omitted
-          property would also default to "0" here and still trigger
-          the disable CA — desired behaviour for headless fleet installs
-          that forget the property entirely).
+          #1727: NO default value. "1" and "0" mean what they always
+          meant, and every caller that passes one is unchanged: the
+          wizard, install.ps1, and the auto-updater, which passes "1"
+          whenever the service has the swap on (updater.rs, rc.56).
+          When the command line does not say (a person running
+          `msiexec /i` by hand), KeepSystemContext below restores the
+          mode the machine was last switched to.
+
+          It used to default to "0", which ran DisableSystemContext: a
+          hand-run install on a SystemContext host switched it OFF, the
+          worker lost the machine-global config it reads in that mode,
+          and the device crash-looped offline until someone ran
+          `roomlerd enable-system-context` (field, 2026-09-26).
         -->
-        <Property Id='ENABLE_SYSTEM_CONTEXT' Value='0' Secure='yes' />
+        <Property Id='ENABLE_SYSTEM_CONTEXT' Secure='yes' />
 
         <!--
           rc.44 forward action: flip the SystemContext gate on. Runs
@@ -433,8 +440,9 @@
         <!--
           rc.44 symmetric disable for plain-perMachine installs over
           a SystemContext-on host (and IT-fleet quiet installs that
-          want SystemContext off). Conditioned on ENABLE_SYSTEM_CONTEXT="0"
-          so it fires on both explicit `=0` and the default value. The
+          want SystemContext off). Conditioned on an explicit
+          ENABLE_SYSTEM_CONTEXT="0" (#1727: there is no default any more;
+          see KeepSystemContext). The
           underlying `disable-system-context` subcommand is idempotent —
           unsetting an already-absent env var is a no-op, restart of an
           already-running service after a no-op env change is a noisy
@@ -444,6 +452,29 @@
             Id='DisableSystemContext'
             FileKey='roomler_agent_exe'
             ExeCommand='disable-system-context'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
+        <!--
+          #1727: no ENABLE_SYSTEM_CONTEXT on the command line. Keep the
+          mode the machine was last switched to. An MSI condition cannot
+          tell: the switch lives in the service's Environment, a
+          REG_MULTI_SZ that AppSearch hands over with its NUL separators
+          (a condition sees an empty string, measured), and by the time a
+          deferred action runs, RegisterService (and a major upgrade's
+          removal of the old product) has deleted the service with it. So
+          the freshly laid binary decides, from the product's own record
+          of the last enable/disable in %PROGRAMDATA%\roomler, which no
+          install touches. It then runs the matching enable or disable, so
+          it also restarts the service. Return="ignore", like
+          DisableSystemContext: the StartRoomlerSvc ServiceControl still
+          starts the service if this fails.
+        -->
+        <CustomAction
+            Id='KeepSystemContext'
+            FileKey='roomler_agent_exe'
+            ExeCommand='keep-system-context'
             Execute='deferred'
             Impersonate='no'
             Return='ignore' />
@@ -484,6 +515,9 @@
             </Custom>
             <Custom Action='DisableSystemContext' After='RegisterService'>
                 ENABLE_SYSTEM_CONTEXT="0" AND NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='KeepSystemContext' After='RegisterService'>
+                NOT ENABLE_SYSTEM_CONTEXT AND NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='UnregisterService' Before='RemoveFiles'>
                 REMOVE="ALL"
