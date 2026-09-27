@@ -1048,6 +1048,101 @@ jobs:
         # They need the library present, not a GPU.
         run: cargo test -p roomlerd --features ffmpeg-encoder --lib
 
+  recording-ffmpeg:
+    # FR-85 P4 — the recorder and the export engine against the vendored
+    # FFmpeg that carries the AAC encoder and the H.264 decoder (the
+    # `-h264dec-aac` asset, built by vendor-ffmpeg-*.yml from `fr85-p4`).
+    #
+    # The `rust` job's recorder step builds WITHOUT `ffmpeg-encoder`, so it
+    # proves the Opus path only; `ffmpeg-encoder-check` links FFmpeg but not
+    # `recording`. Nothing else compiles the two together, and the codec a
+    # recording carries is decided by exactly that pairing at runtime.
+    #
+    # ⚠️ `ROOMLER_EXPECT_FFMPEG_AAC=1` turns "this FFmpeg has no AAC encoder"
+    # from a skip into a FAILURE. Without it, a wrong asset (or a flip back)
+    # would fall back to Opus and every test here would pass on the codec this
+    # lane exists to prove.
+    #
+    # Its own job, like `ffmpeg-encoder-check`: a feature set nothing else
+    # builds is a cold compile, and it must not spend another job's timeout.
+    # Until P4c flips the release assets, this lane is the only thing that
+    # runs the AAC path at all.
+    name: Recording with FFmpeg AAC (FR-85 P4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # ⚠️ `vp9-444` rides along ON PURPOSE, as in `ffmpeg-encoder-check`:
+      # every shipped build that has `ffmpeg-encoder` has it, and without it
+      # clippy reports `dead_code` on items that ARE used — from call sites
+      # inside `#[cfg(feature = "vp9-444")]` functions in peer.rs.
+      REC_FEATURES: recording,openh264-encoder,synthetic-frame-source,audio,ffmpeg-encoder,vp9-444,vp9-444-bindgen
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          shared-key: ci-recording-ffmpeg
+          cache-on-failure: true
+      - name: Configure apt retries and refresh the index
+        run: |
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+      - name: Install build deps
+        # libclang: bindgen (ffmpeg-sys-next, env-libvpx-sys). libasound2-dev:
+        # cpal, for `audio`. cmake: libopus from source (audiopus_sys).
+        # libvpx-dev: `vp9-444` (see the job's env). Plain apt, not the cached
+        # action — a handful of packages do not pay for a cache key that can
+        # silently restore nothing.
+        run: sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libasound2-dev cmake libvpx-dev
+      - name: Fetch the vendored FFmpeg with the AAC encoder + H.264 decoder
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download vendored-ffmpeg-9.0.1 \
+            --repo "${{ github.repository }}" \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz' \
+            --dir /tmp/ffdl
+          sudo mkdir -p /opt/roomler-ffmpeg
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz \
+            -C /opt/roomler-ffmpeg --strip-components=1
+          # The .pc files hardcode the vendor machine's prefix.
+          sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" \
+            /opt/roomler-ffmpeg/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=/opt/roomler-ffmpeg"
+            echo "PKG_CONFIG_PATH=/opt/roomler-ffmpeg/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=/opt/roomler-ffmpeg/lib"
+          } >> "$GITHUB_ENV"
+      - name: Prove pkg-config resolved the VENDORED tree
+        run: |
+          set -euo pipefail
+          prefix=$(pkg-config --variable=prefix libavcodec)
+          echo "libavcodec $(pkg-config --modversion libavcodec) from $prefix"
+          if [ "$prefix" != "/opt/roomler-ffmpeg" ]; then
+            echo "::error::pkg-config resolved libavcodec to '$prefix', not the vendored tree — this lane would be testing the wrong library"
+            exit 1
+          fi
+      - name: Clippy the recorder with FFmpeg (incl. tests)
+        run: cargo clippy -p roomlerd --features "$REC_FEATURES" --all-targets -- -D warnings
+      - name: The recorder and the export record AAC — never a quiet Opus fallback
+        # `--lib recording::`: the encoder (1024-sample frames, the declared
+        # priming, the standard AudioSpecificConfig) and a click that must
+        # decode exactly as far after the first video frame as it was made.
+        # `--test recorder`: a recording's track is AAC end to end, and its
+        # sidecar says so. `--test export`: an export writes AAC, and a
+        # recording whose own track is AAC is read back through the edit.
+        env:
+          ROOMLER_EXPECT_FFMPEG_AAC: "1"
+        run: |
+          cargo test -p roomlerd --features "$REC_FEATURES" --lib recording::
+          cargo test -p roomlerd --features "$REC_FEATURES" --test recorder
+          cargo test -p roomlerd --features "$REC_FEATURES" --test export
+
   fr-registry:
     name: FR registry integrity
     runs-on: ubuntu-latest

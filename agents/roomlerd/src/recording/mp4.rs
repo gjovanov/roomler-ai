@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mp4_atom::{
-    Audio, Avc1, Avcc, Co64, Codec, Colr, Decode as _, Dinf, Dops, Dref, Encode as _, FixedPoint,
-    Ftyp, Hdlr, Matrix, Mdhd, Mdia, Mfhd, Minf, Moof, Moov, Mvex, Mvhd, Opus, Pasp, Smhd, Stbl,
-    Stco, Stsc, StscEntry, Stsd, Stss, Stsz, StszSamples, Stts, SttsEntry, Tfdt, Tfhd, Tkhd, Traf,
-    Trak, Trex, Trun, TrunEntry, Url, Visual, Vmhd,
+    Audio, Avc1, Avcc, Co64, Codec, Colr, Decode as _, Dinf, Dops, Dref, Encode as _, Esds,
+    FixedPoint, Ftyp, Hdlr, Matrix, Mdhd, Mdia, Mfhd, Minf, Moof, Moov, Mp4a, Mvex, Mvhd, Opus,
+    Pasp, Smhd, Stbl, Stco, Stsc, StscEntry, Stsd, Stss, Stsz, StszSamples, Stts, SttsEntry, Tfdt,
+    Tfhd, Tkhd, Traf, Trak, Trex, Trun, TrunEntry, Url, Visual, Vmhd, esds,
 };
 
 use super::annexb::AccessUnit;
@@ -104,7 +104,7 @@ impl VideoTrack {
     }
 }
 
-/// The audio track of a recording (P1c feeds it; the layout is ready now).
+/// The audio track of a recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioTrack {
     /// Media timescale = sample rate.
@@ -117,7 +117,22 @@ pub struct AudioTrack {
 pub enum AudioCodec {
     /// Opus in ISOBMFF (`Opus` + `dOps`). `pre_skip` in 48 kHz samples.
     Opus { pre_skip: u16 },
+    /// FR-85 P4 — AAC-LC (`mp4a` + `esds`, object type 0x40): what every
+    /// player and editor opens, where Opus-in-MP4 does not play in QuickTime.
+    /// `asc` is the encoder's AudioSpecificConfig; `bitrate` is informative
+    /// (the `esds` average).
+    ///
+    /// ⚠️ No priming delay is written anywhere: the recorder feeds the encoder
+    /// from `delay` samples past the first video frame
+    /// (`audio_codec::AudioEncoder::unsignalled_delay`), so decoded sample k
+    /// IS recording time k in every player, edit list or not.
+    Aac { asc: Vec<u8>, bitrate: u32 },
 }
+
+/// ISO/IEC 14496-1 `objectTypeIndication` for MPEG-4 Audio (AAC).
+const OTI_MPEG4_AUDIO: u8 = 0x40;
+/// ISO/IEC 14496-1 `streamType` for an audio stream.
+const STREAM_TYPE_AUDIO: u8 = 0x05;
 
 /// What happened to a pushed video access unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,22 +630,52 @@ fn video_trak(
 }
 
 fn audio_trak(a: &AudioTrack, media_duration: u64, tables: StblTables) -> Trak {
-    let codec = match a.codec {
+    let entry = Audio {
+        data_reference_index: 1,
+        channel_count: u16::from(a.channels),
+        sample_size: 16,
+        sample_rate: FixedPoint::new(a.sample_rate.min(u32::from(u16::MAX)) as u16, 0),
+    };
+    let codec = match &a.codec {
         AudioCodec::Opus { pre_skip } => Codec::Opus(Opus {
-            audio: Audio {
-                data_reference_index: 1,
-                channel_count: u16::from(a.channels),
-                sample_size: 16,
-                sample_rate: FixedPoint::new(a.sample_rate.min(u32::from(u16::MAX)) as u16, 0),
-            },
+            audio: entry,
             dops: Dops {
                 output_channel_count: a.channels,
-                pre_skip,
+                pre_skip: *pre_skip,
                 input_sample_rate: a.sample_rate,
                 output_gain: 0,
             },
             btrt: None,
         }),
+        AudioCodec::Aac { asc, bitrate } => {
+            let (profile, freq_index, chan_conf) = asc_fields(asc);
+            Codec::Mp4a(Mp4a {
+                audio: entry,
+                esds: Esds {
+                    es_desc: esds::EsDescriptor {
+                        // ISO/IEC 14496-14 §3.1.2: 0 in a stored file.
+                        es_id: 0,
+                        dec_config: esds::DecoderConfig {
+                            object_type_indication: OTI_MPEG4_AUDIO,
+                            stream_type: STREAM_TYPE_AUDIO,
+                            up_stream: 0,
+                            buffer_size_db: Default::default(),
+                            max_bitrate: *bitrate,
+                            avg_bitrate: *bitrate,
+                            dec_specific: Some(esds::DecoderSpecific {
+                                profile,
+                                freq_index,
+                                chan_conf,
+                                raw: asc.clone(),
+                            }),
+                        },
+                        sl_config: esds::SLConfig::default(),
+                    },
+                },
+                btrt: None,
+                taic: None,
+            })
+        }
     };
     Trak {
         tkhd: Tkhd {
@@ -667,6 +712,39 @@ fn audio_trak(a: &AudioTrack, media_duration: u64, tables: StblTables) -> Trak {
             },
         },
         ..Default::default()
+    }
+}
+
+/// The sampling-frequency index of an AudioSpecificConfig (ISO/IEC 14496-3
+/// §1.6.3.4), or `None` for a rate that needs the explicit 24-bit escape.
+fn aac_freq_index(rate: u32) -> Option<u8> {
+    const RATES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+        8_000, 7_350,
+    ];
+    RATES.iter().position(|&r| r == rate).map(|i| i as u8)
+}
+
+/// FR-85 P4 — the two-byte AudioSpecificConfig of AAC-LC at `rate` with
+/// `channels` (1–7): what an encoder that hands none over would have said.
+pub fn aac_lc_asc(rate: u32, channels: u8) -> Option<Vec<u8>> {
+    const AOT_AAC_LC: u8 = 2;
+    let fi = aac_freq_index(rate)?;
+    if !(1..=7).contains(&channels) {
+        return None;
+    }
+    Some(vec![
+        (AOT_AAC_LC << 3) | (fi >> 1),
+        ((fi & 1) << 7) | (channels << 3),
+    ])
+}
+
+/// An AudioSpecificConfig's leading fields (object type, frequency index,
+/// channel configuration); zeros where it is too short to say.
+fn asc_fields(asc: &[u8]) -> (u8, u8, u8) {
+    match asc {
+        [a, b, ..] => (a >> 3, ((a & 0x07) << 1) | (b >> 7), (b >> 3) & 0x0F),
+        _ => (0, 0, 0),
     }
 }
 
@@ -1193,12 +1271,13 @@ pub struct VideoFormat {
 }
 
 /// FR-85 P5b — a recording's audio, as an export sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioFormat {
     pub channels: u16,
-    /// Samples (48 kHz) an Opus decoder drops from the start.
-    pub pre_skip: u16,
     pub timescale: u32,
+    /// Opus with the `pre_skip` (48 kHz samples) a decoder drops from the
+    /// start, or AAC with its AudioSpecificConfig (P4).
+    pub codec: AudioCodec,
 }
 
 /// One sample of a progressive file.
@@ -1341,7 +1420,8 @@ impl ProgressiveFile {
     }
 
     /// FR-85 P5b — the audio track, when the recording has one: its channel
-    /// count and the Opus `pre_skip` a decoder must drop from the start.
+    /// count and codec (Opus with the `pre_skip` a decoder must drop from the
+    /// start, or — P4 — AAC with its AudioSpecificConfig).
     /// `None` = no audio track (recordings are silent unless asked).
     pub fn audio_format(&self) -> Result<Option<AudioFormat>> {
         let Some(trak) = self
@@ -1352,13 +1432,45 @@ impl ProgressiveFile {
         else {
             return Ok(None);
         };
+        let timescale = trak.mdia.mdhd.timescale;
         match trak.mdia.minf.stbl.stsd.codecs.first() {
             Some(Codec::Opus(opus)) => Ok(Some(AudioFormat {
                 channels: opus.audio.channel_count,
-                pre_skip: opus.dops.pre_skip,
-                timescale: trak.mdia.mdhd.timescale,
+                timescale,
+                codec: AudioCodec::Opus {
+                    pre_skip: opus.dops.pre_skip,
+                },
             })),
-            Some(_) => bail!("mp4: the audio track is not Opus"),
+            Some(Codec::Mp4a(m)) => {
+                let config = &m.esds.es_desc.dec_config;
+                if config.object_type_indication != OTI_MPEG4_AUDIO {
+                    bail!(
+                        "mp4: the audio track is MPEG object type {:#04x}, not AAC",
+                        config.object_type_indication
+                    );
+                }
+                let Some(ds) = &config.dec_specific else {
+                    bail!("mp4: the AAC track carries no AudioSpecificConfig");
+                };
+                let asc = if ds.raw.is_empty() {
+                    // A hand-built config: the fields are all there is.
+                    vec![
+                        (ds.profile << 3) | (ds.freq_index >> 1),
+                        ((ds.freq_index & 1) << 7) | (ds.chan_conf << 3),
+                    ]
+                } else {
+                    ds.raw.clone()
+                };
+                Ok(Some(AudioFormat {
+                    channels: m.audio.channel_count,
+                    timescale,
+                    codec: AudioCodec::Aac {
+                        asc,
+                        bitrate: config.avg_bitrate,
+                    },
+                }))
+            }
+            Some(_) => bail!("mp4: the audio track is neither Opus nor AAC"),
             None => bail!("mp4: the audio track has an empty stsd"),
         }
     }
@@ -1641,6 +1753,97 @@ mod tests {
         let mut f = File::open(&dest).unwrap();
         assert_eq!(pf.read_sample(&mut f, &a[149]).unwrap(), vec![0xF8, 4, 87]);
         assert_eq!(pf.samples(VIDEO_TRACK_ID).unwrap().len(), 90);
+    }
+
+    /// FR-85 P4 — an AAC track survives the crash-safe file AND the remux
+    /// with its AudioSpecificConfig intact: the one field a decoder cannot
+    /// start without.
+    #[test]
+    fn an_aac_track_keeps_its_config_through_the_remux() {
+        let dir = scratch("aac");
+        let partial = dir.join("r.mp4.partial");
+        let asc = aac_lc_asc(48_000, 2).unwrap();
+        let audio = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AudioCodec::Aac {
+                asc: asc.clone(),
+                bitrate: 192_000,
+            },
+        };
+        let mut w = FragmentedWriter::create(&partial, video(), Some(audio)).unwrap();
+        // 1024-sample AAC frames: 45 per second against 30 video frames.
+        let mut pushed = 0u64;
+        for i in 0..90u32 {
+            w.push_video(u64::from(i) * 3000, &au(i, i % 30 == 0), false)
+                .unwrap();
+            while pushed * 1024 < u64::from(i + 1) * 1600 {
+                w.push_audio(&[0x21, pushed as u8], 1024).unwrap();
+                pushed += 1;
+            }
+        }
+        w.finish().unwrap();
+        let dest = dir.join("r.mp4");
+        let sum = finalize(&partial, &dest).unwrap();
+        assert_eq!(sum.audio_samples, pushed);
+        let pf = ProgressiveFile::open(&dest).unwrap();
+        let format = pf.audio_format().unwrap().expect("an audio track");
+        assert_eq!(format.channels, 2);
+        assert_eq!(format.timescale, 48_000);
+        assert_eq!(
+            format.codec,
+            AudioCodec::Aac {
+                asc,
+                bitrate: 192_000
+            }
+        );
+        let a = pf.samples(AUDIO_TRACK_ID).unwrap();
+        assert!(a.iter().all(|s| s.duration == 1024 && s.sync));
+        let mut f = File::open(&dest).unwrap();
+        assert_eq!(
+            pf.read_sample(&mut f, &a[a.len() - 1]).unwrap(),
+            vec![0x21, (pushed - 1) as u8]
+        );
+    }
+
+    /// The negative control of the round trip: an Opus track reads back as
+    /// Opus, never as AAC (the reader dispatches on the sample entry).
+    #[test]
+    fn an_opus_track_reads_back_as_opus() {
+        let dir = scratch("opus-read");
+        let partial = dir.join("r.mp4.partial");
+        let audio = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AudioCodec::Opus { pre_skip: 312 },
+        };
+        let mut w = FragmentedWriter::create(&partial, video(), Some(audio)).unwrap();
+        for i in 0..31u32 {
+            w.push_video(u64::from(i) * 3000, &au(i, i % 30 == 0), false)
+                .unwrap();
+            w.push_audio(&[0xF8, i as u8], 960).unwrap();
+        }
+        w.finish().unwrap();
+        let dest = dir.join("r.mp4");
+        finalize(&partial, &dest).unwrap();
+        let format = ProgressiveFile::open(&dest)
+            .unwrap()
+            .audio_format()
+            .unwrap()
+            .unwrap();
+        assert_eq!(format.codec, AudioCodec::Opus { pre_skip: 312 });
+    }
+
+    #[test]
+    fn the_audio_specific_config_is_the_standard_two_bytes() {
+        // ISO/IEC 14496-3: AAC-LC (2), 48 kHz (index 3), stereo (2) — the
+        // bytes FFmpeg's encoder and every muxer write.
+        assert_eq!(aac_lc_asc(48_000, 2), Some(vec![0x11, 0x90]));
+        assert_eq!(aac_lc_asc(44_100, 1), Some(vec![0x12, 0x08]));
+        assert_eq!(asc_fields(&[0x11, 0x90]), (2, 3, 2));
+        assert_eq!(aac_lc_asc(47_999, 2), None, "not a table rate");
+        assert_eq!(aac_lc_asc(48_000, 0), None);
+        assert_eq!(aac_lc_asc(48_000, 8), None);
     }
 
     #[test]
