@@ -13,23 +13,24 @@
 > device with no recorder), P5a (the export engine: cut
 > and speed up, §11), P5b (the export's sound and background music) and P5c
 > (roomler-desktop's Edit view).**
-> It is in **no release build**: `recording` joined `full` for a day (#1677)
-> and was taken back out before any release carried it (the operator,
-> 2026-09-26). It rejoins once canary hosts prove it in the field: an
-> EDR-managed corporate laptop first, because on Windows the daemon launches
-> a restricted-token child (§6) as soon as someone opens the Recordings
-> view, the pattern EDR watches for; then macOS TCC for that child. Where it
-> is compiled in, every gate is closed: a local recording starts only when
-> the person at the device presses Record, a remote one only once the
-> device's owner allows it, and `ROOMLERD_RECORDING=0` in the service's
+> It is in **every release build from the one after 0.4.108**: `recording` is
+> in `full` again, together with the FFmpeg assets that carry AAC and the H.264
+> decoder (P4c, §9 and §11). It was out of `full` from 2026-09-26 (#1692, the
+> operator: canary hosts first) until both canaries passed on 2026-09-27: an
+> EDR-managed corporate laptop, with 0 Defender events and its SystemContext
+> worker launching the recorder with the console user's token; and macOS TCC
+> for the recorder child on a supervised Mac, where the Screen Recording grant
+> survived the update. The restricted-token launch (§6, an elevated
+> user-context worker) runs on no EDR host in this fleet, so it is still
+> unproven there. Every gate is closed by default: a local recording starts
+> only when the person at the device presses Record, a remote one only once
+> the device's owner allows it, and `ROOMLERD_RECORDING=0` in the service's
 > environment switches recording off, local and remote. It is driven by
 > `roomlerd record`, by the daemon for the LocalAPI recording verbs and
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
-> person hands it. Still to come: the microphone on macOS, and the release
-> assets that carry AAC and the H.264 decoder (P4c; the code is in, §9 and
-> §11).
+> person hands it. Still to come: the microphone on macOS.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live

@@ -340,7 +340,7 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 9.0` needs 9.x.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz' \
             --dir /tmp/ffdl
           # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
           # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
@@ -354,9 +354,12 @@ jobs:
           # which the offline `dpkg --install` fallback could not satisfy
           # without leaving a daemon that fails to load). Rollback = drop
           # that suffix. FR-78 P0 added `-vulkan` (three Vulkan encoders,
-          # dlopen'd — no new DT_NEEDED); rollback = drop that one.
+          # dlopen'd — no new DT_NEEDED); rollback = drop that one. FR-85 P4c
+          # added `-h264dec-aac` (the software h264 decoder the recorder's
+          # editor needs and the aac encoder for its sound, inside libavcodec,
+          # no new DT_NEEDED); rollback = drop that one.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -408,7 +411,11 @@ jobs:
           #    .github/ffmpeg-patches/ AND the vcpkg port at the recipe's
           #    $baseline. lgpl-source-offer.yml publishes what it was built from
           #    as `…corresponding-source.inputs.txt` (`<hash> <name>` per patch,
-          #    plus `<sha> vcpkg-baseline`); compare it with this checkout.
+          #    `<sha> vcpkg-baseline`, and the sha256 of each recipe file it
+          #    ships); compare it with this checkout. The recipe counts since
+          #    FR-85 P4c: the configure options live there, not in a patch, so
+          #    a build whose options changed passed this gate against an offer
+          #    that described the old ones.
           #    ⚠️ From #1249 (2026-09-02) to 2026-09-24 every release shipped a
           #    patched FFmpeg while the offered source omitted the patch and
           #    said "we apply no patches", and nothing checked. Fail closed:
@@ -423,7 +430,10 @@ jobs:
             echo "::error::no \$baseline in vendor-ffmpeg-windows.yml — re-derive this gate's parse"; exit 1
           fi
           want=$( { for f in "${committed[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done
-                    printf '%s %s\n' "$baseline" vcpkg-baseline; } | sort )
+                    printf '%s %s\n' "$baseline" vcpkg-baseline
+                    for r in vendor-ffmpeg-windows.yml vendor-ffmpeg-macos.yml; do
+                      printf '%s %s\n' "$(sha256sum "$GITHUB_WORKSPACE/.github/workflows/$r" | cut -d' ' -f1)" "recipe/$r"
+                    done; } | sort )
           mkdir -p /tmp/offer
           if ! gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" \
                --pattern 'ffmpeg-n9.0.1-corresponding-source.inputs.txt' --dir /tmp/offer --clobber; then
@@ -431,10 +441,10 @@ jobs:
           fi
           got=$(awk 'NF{print tolower($1), $NF}' /tmp/offer/ffmpeg-n9.0.1-corresponding-source.inputs.txt | sort)
           if [ "$want" != "$got" ]; then
-            echo "::error::the published LGPL corresponding source was not built from this checkout's FFmpeg patches and vcpkg baseline — dispatch lgpl-source-offer.yml before tagging"
+            echo "::error::the published LGPL corresponding source was not built from this checkout's FFmpeg patches, vcpkg baseline and build recipe — dispatch lgpl-source-offer.yml before tagging"
             echo "--- this checkout ---"; echo "$want"; echo "--- in the offer ---"; echo "$got"; exit 1
           fi
-          echo "FR-24 gate OK: the LGPL offer carries ${#committed[@]} patch(es) + vcpkg baseline ${baseline:0:8}"
+          echo "FR-24 gate OK: the LGPL offer carries ${#committed[@]} patch(es) + vcpkg baseline ${baseline:0:8} + this checkout's recipe"
 
       - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
         # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
@@ -1080,10 +1090,12 @@ jobs:
           # Rollback = drop the `-minimal` suffix here; the full zip stays on
           # the same release untouched. FR-78 P0 added `-d3d12-vulkan` (six
           # more encoders, both backends dlopen'd by FFmpeg — no new import);
-          # rollback = drop that suffix.
+          # rollback = drop that suffix. FR-85 P4c added `-h264dec-aac` (the
+          # software h264 decoder the recorder's editor needs and the aac
+          # encoder for its sound; no new import); rollback = drop that one.
           gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip*' --dir $dl
-          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip"
+            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
@@ -1695,16 +1707,29 @@ jobs:
           # re-pin from the first measured release run, never from an
           # estimate, or the baseline swallows exactly the regression it
           # exists to catch.
-          $p4bBaseline = 13.13
+          # FR-85 P4c re-baseline (AC9): the screen recorder and its FFmpeg
+          # (the h264 decoder + the aac encoder) are DELIBERATE scope. The
+          # unpublished rehearsal of that branch (run 36346825023, 2026-09-27)
+          # measured both flavours at 17.67 MB: 0.4.105 (no recorder) was 15.89,
+          # the canary with `recording` 17.04, and P4c + everything merged
+          # since then +0.63. The old 13.13 baseline had fired the warning on
+          # every release since ssh-server, which is noise, not a signal.
+          # The ceiling moves 18 -> 22 with it. Against a 17.67 baseline, an 18
+          # ceiling sat INSIDE the +2 warn band, so any growth hard-failed a
+          # tag with no warning a release earlier, the opposite of this guard's
+          # design. 22 restores warn (19.67) before fail, with ~4.3 MB of
+          # headroom (the guard has kept ~5 over its baseline since P4b).
+          $p4bBaseline = 17.67
+          $ceilingMB = 22
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
           Write-Host "::notice::baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 18) {
-            Write-Host "::error::MSI exceeds the 18 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
+          if ($maxMsi -gt $ceilingMB) {
+            Write-Host "::error::MSI exceeds the $ceilingMB MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
             exit 1
           } elseif ($deltaMB -gt 2) {
-            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 18 MB ceiling). Re-baseline deliberately or investigate."
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the $ceilingMB MB ceiling). Re-baseline deliberately or investigate."
           } else {
             Write-Host "::notice::MSI within the P4b size budget."
           }
@@ -2064,17 +2089,19 @@ jobs:
           # It is also minimal (--disable-everything + the three
           # *_videotoolbox encoders): 775 KB packed, ~1.8 MB of dylibs,
           # against ~20 MB for the untrimmed tree that would have doubled
-          # the .pkg.
+          # the .pkg. FR-85 P4c added `-h264dec-aac` (the software h264
+          # decoder the recorder's editor needs and the aac encoder for its
+          # sound; 1,071,108 B packed, ~3.0 MB of dylibs); rollback = drop it.
           mkdir -p /tmp/ffdl "$RUNNER_TEMP/roomler-ffmpeg"
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-macos-arm64-lgpl-shared-h264dec-aac.tar.xz' \
             --dir /tmp/ffdl --clobber
           # NOTE: no --strip-components. The macOS tarball is packed as
           # `tar cJf … lib include` from the install prefix, so lib/ and
           # include/ are already at the root — unlike the Linux one, which
           # has a wrapping directory and does strip 1.
-          tar xf /tmp/ffdl/ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz \
+          tar xf /tmp/ffdl/ffmpeg-9.0.1-macos-arm64-lgpl-shared-h264dec-aac.tar.xz \
             -C "$RUNNER_TEMP/roomler-ffmpeg"
           # BSD sed needs an explicit (empty) backup suffix; GNU `sed -i`
           # would silently create files named after the next argument.

@@ -94,6 +94,7 @@ jobs:
             --enable-videotoolbox \
             --enable-encoder=h264_videotoolbox,hevc_videotoolbox,av1_videotoolbox \
             --enable-parser=h264,hevc,av1 \
+            --enable-decoder=h264 --enable-encoder=aac \
             --install-name-dir=@rpath \
             --enable-pic \
             || { echo "=== configure failed; last errors in config.log ==="; \
@@ -172,13 +173,22 @@ jobs:
             /* And the trim must actually have taken — if a general decoder or
                an unrelated encoder survived, --disable-everything did not
                apply and this is the fat tree again. */
-            if (avcodec_find_decoder_by_name("h264")) {
-              fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1;
+            /* FR-85 P4 — the recorder's editor decodes H.264 in software and its
+               sound is AAC: both must be IN. HEVC decoding stays OUT on purpose
+               (nothing records HEVC; THIRD-PARTY-NOTICES ships no software HEVC). */
+            if (!avcodec_find_decoder_by_name("h264")) {
+              fprintf(stderr, "MISSING decoder h264\n"); return 1;
+            }
+            if (!avcodec_find_encoder_by_name("aac")) {
+              fprintf(stderr, "MISSING encoder aac\n"); return 1;
+            }
+            if (avcodec_find_decoder_by_name("hevc")) {
+              fprintf(stderr, "hevc DECODER present — trim did not take\n"); return 1;
             }
             if (avcodec_find_encoder_by_name("mpeg4")) {
               fprintf(stderr, "mpeg4 encoder present — trim did not take\n"); return 1;
             }
-            printf("probe OK: required videotoolbox encoders present, registry trimmed\n");
+            printf("probe OK: required videotoolbox encoders + the h264 decoder + the aac encoder present, registry trimmed\n");
             return 0;
           }
           EOC
@@ -195,7 +205,10 @@ jobs:
         run: |
           set -euo pipefail
           cd "$OUT"
-          TAR="ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz"
+          # FR-85 P4: `-h264dec-aac` (the software h264 decoder and the aac
+          # encoder) is this asset's first suffix; release-agent.yml picks by
+          # name, so rollback = drop it (the unsuffixed tarball stays).
+          TAR="ffmpeg-9.0.1-macos-arm64-lgpl-shared-h264dec-aac.tar.xz"
           tar cJf "$RUNNER_TEMP/$TAR" lib include
           cd "$RUNNER_TEMP"
           shasum -a 256 "$TAR" | tee "$TAR.sha256"
