@@ -264,6 +264,25 @@ jobs:
       - name: Run clippy on the audited crates (incl. test targets)
         run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core --all-targets -- -D warnings
 
+      # The integration crate cannot RUN here (it needs MongoDB + Redis), but
+      # it can still be compiled — and compiling it is what was missing. It sat
+      # broken for an unknown stretch because `OverlayNodeDao::create` grew
+      # three fields and its 8 test callers didn't: `--workspace` clippy skips
+      # `#[cfg(test)]` bodies, and no step named this crate, so all 288
+      # integration tests were unrunnable while every PR went green.
+      #
+      # A type-check needs no services and catches that whole class on the
+      # commit that introduces it. It does NOT tell you the tests pass — only
+      # that they still build. Running them remains a separate lane.
+      #
+      # ⚠️ It sits in THIS lane, straight after the clippy above, on purpose:
+      # clippy builds the non-workspace deps with plain rustc in check mode,
+      # the same metadata `cargo check` needs, so here it re-checks only the
+      # workspace crates (~26 s). Placed alone in the unit lane (PR #1743's
+      # first run) it re-checked ~800 dependencies from scratch: 369 s.
+      - name: Type-check the integration test crate
+        run: cargo check -p roomler-ai-tests --all-targets
+
       # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
       # regenerates its FFI bindings via bindgen against the installed
       # libvpx headers. The apt package on Ubuntu 24.04 (the GH-hosted
@@ -407,23 +426,10 @@ jobs:
       # `*.mp4` name is ever opened; a refusal the daemon ANSWERED for a
       # `record_*` key is final), alongside the FR-84 D1 refresh ledger and
       # the config-path split, which were already here and already unrun.
-      # The GTK/WebKit dev packages it links are installed above for the
-      # workspace clippy.
+      # The GTK/WebKit dev packages it links come from the system-deps
+      # composite above.
       - name: Test the desktop companion (roomler-desktop)
         run: cargo test -p roomler-desktop --bins
-
-      # The integration crate cannot RUN here (it needs MongoDB + Redis), but
-      # it can still be compiled — and compiling it is what was missing. It sat
-      # broken for an unknown stretch because `OverlayNodeDao::create` grew
-      # three fields and its 8 test callers didn't: `--workspace` clippy skips
-      # `#[cfg(test)]` bodies, and no step named this crate, so all 288
-      # integration tests were unrunnable while every PR went green.
-      #
-      # A type-check needs no services and catches that whole class on the
-      # commit that introduces it. It does NOT tell you the tests pass — only
-      # that they still build. Running them remains a separate lane.
-      - name: Type-check the integration test crate
-        run: cargo check -p roomler-ai-tests --all-targets
 
   rust-agent:
     name: Agent tests (vp9-444, overlay, kernel TUN)
