@@ -1088,7 +1088,16 @@ async fn connect_once(
     crate::exec::register_secret(&cfg.agent_token);
 
     // Say hello.
-    let hello_caps = stub_caps(cfg.overlay_multi_org);
+    let mut hello_caps = stub_caps(cfg.overlay_multi_org);
+    // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
+    // worker can record. Saying the root daemon's own list (nothing) would
+    // strip RECORD for the 30 s until the first heartbeat corrects it, after
+    // every reconnect. Primary org only, like the heartbeat.
+    if ctx.is_primary
+        && let Some(record) = delegation.host().and_then(|d| d.effective_record())
+    {
+        hello_caps.record = record;
+    }
     // FR-85 P3b — what the hello told the server about remote recording, so
     // the heartbeat re-announces the moment the owner's gate changes it.
     let mut last_announced_record: Vec<String> = hello_caps.record.clone();
@@ -1611,7 +1620,17 @@ async fn connect_once(
                 // FR-85 P3b — the owner's remote-recording gate is live, so its
                 // word is news too: an OFF must stop the hub granting RECORD
                 // within a beat, not at the next reconnect.
-                let record_now = record_caps();
+                //
+                // FR-85 P1e-mac — on a supervised Mac, the WORKER's word: a
+                // delegated session records there, with the person's recorder
+                // and gates, while this root daemon can record nothing. PRIMARY
+                // ORG ONLY, like delegation itself: a secondary org's session is
+                // never handed to the worker, so its row keeps our own caps.
+                let record_now = ctx
+                    .is_primary
+                    .then(|| delegate.as_ref().and_then(|d| d.effective_record()))
+                    .flatten()
+                    .unwrap_or_else(record_caps);
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                 {
@@ -1788,11 +1807,24 @@ async fn connect_once(
                                 pending_chunk_framing.insert(sid, p.chunk_framing);
                                 pending_audio.insert(sid, p.audio);
                                 pending_permissions.insert(sid, p.permissions);
-                                // No record context: a delegated session is
-                                // one whose daemon cannot record (FR-85 P3b).
+                                // FR-85 P1e-mac — the record context the daemon
+                                // resolved. This worker is the half that records:
+                                // it owns the peer, and its recorder runs as the
+                                // person, in their GUI session. None from an older
+                                // daemon (or an unparseable id): the channel then
+                                // refuses `unavailable`, as before.
+                                let record = p.record.and_then(|r| {
+                                    Some(RecordMeta {
+                                        controller_user_id: bson::oid::ObjectId::parse_str(
+                                            &r.controller_user_id,
+                                        )
+                                        .ok()?,
+                                        prompt_window: r.prompt_window_ms.map(Duration::from_millis),
+                                    })
+                                });
                                 pending_session_meta.insert(
                                     sid,
-                                    (p.controller_name, p.input_mode, p.asking_org, None),
+                                    (p.controller_name, p.input_mode, p.asking_org, record),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
                             }
@@ -2347,39 +2379,6 @@ async fn handle_server_msg(
                     None,
                 ),
             );
-            // FR-43 P2b-3 — hand the SAME resolved values to the GUI worker, if
-            // one is attached. `Request` is not delegated (consent and the
-            // upstream reply belong to the daemon, which is the enrolled
-            // identity), but everything it resolves here is consumed by the
-            // `SdpOffer` handler — which IS delegated. Without this the worker
-            // defaults all seven, and the one that matters silently is
-            // `transport`: `None` means the legacy RTP track, so a browser that
-            // negotiated `data-channel-h264` gets a black screen while the
-            // agent happily encodes into a pipe nobody reads.
-            if let Some(delegate) = delegate
-                && ctx.is_primary
-            {
-                let sent = delegate.send_params(crate::delegate::DelegateFrame::SessionParams(
-                    Box::new(crate::delegate::SessionParams {
-                        session_id: session_id.to_hex(),
-                        codec: chosen.clone(),
-                        transport: negotiated_transport.clone(),
-                        chroma: chroma_pref.clone(),
-                        chunk_framing: chunk_framing.unwrap_or(false),
-                        audio: audio_negotiated,
-                        permissions,
-                        controller_name: controller_name.clone(),
-                        input_mode,
-                        asking_org: asking_org.clone(),
-                    }),
-                ));
-                if !sent {
-                    // No worker, or its queue is full. Not fatal — the daemon
-                    // still serves the session itself, which on macOS means a
-                    // blank screen but a working, terminable session.
-                    tracing::debug!(%session_id, "no worker to hand session params to");
-                }
-            }
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -2448,14 +2447,60 @@ async fn handle_server_msg(
             // session consented ON THE HOST asks the host again (same window)
             // before it may record; an auto-granted one does not ask, its
             // owner having opted into remote recording on the device.
+            let record_prompt_window = match effective_mode {
+                crate::consent::Mode::AutoGrant => None,
+                crate::consent::Mode::Prompt { timeout } => Some(timeout),
+            };
             if let Some(meta) = pending_session_meta.get_mut(&session_id) {
                 meta.3 = Some(RecordMeta {
                     controller_user_id,
-                    prompt_window: match effective_mode {
-                        crate::consent::Mode::AutoGrant => None,
-                        crate::consent::Mode::Prompt { timeout } => Some(timeout),
-                    },
+                    prompt_window: record_prompt_window,
                 });
+            }
+            // FR-43 P2b-3 — hand the SAME resolved values to the GUI worker, if
+            // one is attached. `Request` is not delegated (consent and the
+            // upstream reply belong to the daemon, which is the enrolled
+            // identity), but everything it resolves here is consumed by the
+            // `SdpOffer` handler — which IS delegated. Without this the worker
+            // defaults all seven, and the one that matters silently is
+            // `transport`: `None` means the legacy RTP track, so a browser that
+            // negotiated `data-channel-h264` gets a black screen while the
+            // agent happily encodes into a pipe nobody reads.
+            //
+            // FR-85 P1e-mac — sent HERE, after the consent mode is resolved, so
+            // the record context travels with the rest: a supervised Mac's
+            // worker is the half that records, and without it every delegated
+            // session's `record` channel refused `unavailable`. Still ahead of
+            // the offer that consumes it (the server sends that only after this
+            // request is answered), on the same ordered channel.
+            if let Some(delegate) = delegate
+                && ctx.is_primary
+            {
+                let sent = delegate.send_params(crate::delegate::DelegateFrame::SessionParams(
+                    Box::new(crate::delegate::SessionParams {
+                        session_id: session_id.to_hex(),
+                        codec: chosen.clone(),
+                        transport: negotiated_transport.clone(),
+                        chroma: chroma_pref.clone(),
+                        chunk_framing: chunk_framing.unwrap_or(false),
+                        audio: audio_negotiated,
+                        permissions,
+                        controller_name: controller_name.clone(),
+                        input_mode,
+                        asking_org: asking_org.clone(),
+                        record: Some(crate::delegate::DelegatedRecord {
+                            controller_user_id: controller_user_id.to_hex(),
+                            prompt_window_ms: record_prompt_window
+                                .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
+                        }),
+                    }),
+                ));
+                if !sent {
+                    // No worker, or its queue is full. Not fatal — the daemon
+                    // still serves the session itself, which on macOS means a
+                    // blank screen but a working, terminable session.
+                    tracing::debug!(%session_id, "no worker to hand session params to");
+                }
             }
             let session_hex = session_id.to_hex();
             // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
@@ -2761,8 +2806,12 @@ async fn handle_server_msg(
 
             // FR-85 P3b — the `record` channel's context, BEFORE the answer:
             // a channel cannot open until the offer is answered, so it can
-            // never see this unset. A delegated session carries none (its
-            // daemon cannot record) and its channel refuses `unavailable`.
+            // never see this unset. P1e-mac: on a supervised Mac's worker, a
+            // delegated session's context came from the daemon
+            // (`SessionParams.record`), and the consent broker, indicator and
+            // companion are THIS process's — the person's own, in their GUI
+            // session. Only a daemon older than P1e-mac sends none, and the
+            // channel then refuses `unavailable`.
             #[cfg(feature = "recording")]
             if let Some(meta) = record_meta {
                 peer.set_record_ctx(crate::recording::remote::SessionCtx {
@@ -2876,8 +2925,9 @@ async fn handle_server_msg(
             //
             // FR-85 P3b-3 — said BEFORE the close: a close that overruns its
             // budget never reaches the `record` channel, which would then
-            // stay open and its recording undetached for good. (A delegated
-            // session never records.)
+            // stay open and its recording undetached for good. (On a supervised
+            // Mac this arm runs in the WORKER for a delegated session, where
+            // its recording lives — P1e-mac.)
             #[cfg(feature = "recording")]
             crate::recording::remote::session_ended(session_id);
             if let Some(peer) = peers.remove(&session_id) {
