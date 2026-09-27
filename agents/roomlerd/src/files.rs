@@ -941,8 +941,8 @@ pub(crate) struct IncomingTransfer {
 }
 
 /// Agent → Browser download state. One outgoing transfer is active
-/// at any time. The `cancel` flag is checked between chunks so a
-/// `files:cancel` message exits the pump cleanly.
+/// at any time. `cancel` stops its pump: a `files:cancel` from the
+/// browser, or the session ending ([`FilesHandler::end_session`]).
 pub(crate) struct OutgoingTransfer {
     pub id: String,
     pub path: PathBuf,
@@ -951,7 +951,12 @@ pub(crate) struct OutgoingTransfer {
     /// today (which reads-until-EOF).
     #[allow(dead_code)]
     pub size: u64,
-    pub cancel: Arc<AtomicBool>,
+    /// #1730 — a TOKEN, not a flag: the pumps race every await against it.
+    /// A flag read between awaits was never read by a pump parked inside
+    /// one (a send on a channel whose peer vanished never returns), so a
+    /// download cut by a dropped session held its file, its channel and
+    /// this transfer's updater guard for good.
+    pub cancel: tokio_util::sync::CancellationToken,
     /// rc.19: ACTIVE_TRANSFERS counter guard (see IncomingTransfer).
     pub _active_guard: ActiveTransferGuard,
 }
@@ -1326,7 +1331,7 @@ impl FilesHandler {
         self.ended.store(true, Ordering::Release);
         self.abort().await;
         if let Some(state) = self.outgoing.lock().await.as_ref() {
-            state.cancel.store(true, Ordering::Release);
+            state.cancel.cancel();
         }
     }
 
@@ -1573,7 +1578,7 @@ impl FilesHandler {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "download.bin".to_string());
         let mime = guess_mime(&name);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
 
         let mut guard = self.outgoing.lock().await;
         // Under the lock: `end_session` flags first, then takes it.
@@ -1619,9 +1624,9 @@ impl FilesHandler {
             .with_context(|| format!("opening {}", state.path.display()))
     }
 
-    /// Flip the cancel flag on the active outgoing transfer if its
-    /// id matches. The pump task checks the flag between chunks and
-    /// exits cleanly. Returns true if a matching transfer was found.
+    /// Stop the active outgoing transfer if its id matches: its pump
+    /// ends wherever it is waiting (#1730). Returns true if a matching
+    /// transfer was found.
     pub async fn cancel_outgoing(&self, id: &str) -> bool {
         let guard = self.outgoing.lock().await;
         let Some(state) = guard.as_ref() else {
@@ -1630,7 +1635,7 @@ impl FilesHandler {
         if state.id != id {
             return false;
         }
-        state.cancel.store(true, Ordering::Release);
+        state.cancel.cancel();
         true
     }
 
@@ -1648,14 +1653,14 @@ impl FilesHandler {
 
 /// Metadata returned from [`FilesHandler::begin_outgoing`]. The peer
 /// layer uses these to format `files:offer` and to drive the pump
-/// (cancellation flag).
+/// (its stop token, [`OutgoingTransfer::cancel`]).
 pub struct OutgoingOffer {
     pub id: String,
     pub path: PathBuf,
     pub name: String,
     pub size: Option<u64>,
     pub mime: Option<&'static str>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,7 +2128,7 @@ impl FilesHandler {
             .map(sanitize_filename)
             .unwrap_or_else(|| "folder".to_string());
         let zip_name = format!("{folder_name}.zip");
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
 
         let mut guard = self.outgoing.lock().await;
         // Under the lock: `end_session` flags first, then takes it.
@@ -2170,7 +2175,7 @@ impl FilesHandler {
 pub async fn walk_and_zip<W>(
     writer: W,
     root: &std::path::Path,
-    cancel: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<u32>
 where
     W: tokio::io::AsyncWrite + Unpin + Send,
@@ -2190,7 +2195,7 @@ where
     let mut count: u32 = 0;
 
     while let Some(dir) = stack.pop() {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(anyhow!("cancelled by browser"));
         }
         let mut read_dir = match tokio::fs::read_dir(&dir).await {
@@ -2201,7 +2206,7 @@ where
             }
         };
         while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if cancel.load(Ordering::Acquire) {
+            if cancel.is_cancelled() {
                 return Err(anyhow!("cancelled by browser"));
             }
             count = count.saturating_add(1);
@@ -3070,7 +3075,7 @@ mod tests {
         std::fs::write(base.join("keep.txt"), b"a person's file").unwrap();
         std::fs::write(state.join("service.log"), b"a diagnostic line").unwrap();
         let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
         let root = base.clone();
         let walk = tokio::spawn(async move { walk_and_zip(zip_writer, &root, cancel).await });
         let drain = tokio::spawn(async move {
@@ -3583,7 +3588,7 @@ mod tests {
         // the production topology (walk_and_zip writes to a duplex,
         // a separate task pumps the reader half to the DC).
         let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
         let folder_clone = folder.clone();
         let cancel_clone = cancel.clone();
         let walk_handle = tokio::spawn(async move {
@@ -3707,9 +3712,9 @@ mod tests {
             .begin_outgoing("session-end-d1".into(), &file_path.to_string_lossy())
             .await
             .expect("begin_outgoing");
-        assert!(!offer.cancel.load(Ordering::Acquire));
+        assert!(!offer.cancel.is_cancelled());
         h.end_session().await;
-        let told = offer.cancel.load(Ordering::Acquire);
+        let told = offer.cancel.is_cancelled();
         // Twice is fine (the channel's own close may come after), and with
         // no upload in flight there is none left.
         h.end_session().await;
@@ -3762,10 +3767,10 @@ mod tests {
             .begin_outgoing("c1".into(), &file_path.to_string_lossy())
             .await
             .expect("begin_outgoing");
-        assert!(!offer.cancel.load(Ordering::Acquire));
+        assert!(!offer.cancel.is_cancelled());
         let cancelled = h.cancel_outgoing("c1").await;
         assert!(cancelled);
-        assert!(offer.cancel.load(Ordering::Acquire));
+        assert!(offer.cancel.is_cancelled());
 
         // Mismatched id → false, no flag change on a fresh transfer.
         let cancelled_other = h.cancel_outgoing("nonexistent").await;
