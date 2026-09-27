@@ -6,9 +6,55 @@ on:
   pull_request:
     branches: [master]
 
+# FR-6 wave 14 (#773): compile faster, cache smaller. Line tables keep
+# file:line in a failing test's backtrace; what this drops is the full
+# type/variable DWARF, which is most of what every test binary links and
+# most of what each cargo cache family stores (the single `ci-linux` family
+# had reached 4.1 GB against a 10 GB pool shared by every job below).
+# Debug ASSERTIONS are a separate profile setting and stay on.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+# A new push to a PR supersedes its previous run: cancel that run instead of
+# letting a stack of stale ones hold the account's concurrent-job slots (one
+# run of this file is 17 jobs). Master runs are never cancelled: each one
+# verifies a merged commit, and it is the only kind of run that SAVES the
+# cargo caches (see the Rust lanes below).
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  rust:
-    name: Rust checks
+  # ─── The Rust lanes (FR-6 wave 14, #773, 2026-09-27) ──────────────────────
+  #
+  # These five jobs were ONE job, "Rust checks", until it grew to ~35 serial
+  # steps: 18–21 min on a WARM cache and 35–45 min cold, over 58 runs. Test
+  # EXECUTION was ~3.5 min of that. The rest was compiling workspace crates
+  # one feature configuration after another — `roomlerd` alone in ~12 of
+  # them, 40–80 s each — which no cargo cache helps: Swatinem caches the
+  # third-party deps, never the workspace. Split five ways, the same work
+  # runs in parallel. The aggregate job `rust` after the lanes keeps the name
+  # "Rust checks", so anything keyed on that name still works.
+  #
+  # Every lane:
+  #   * installs the SAME system packages through one composite
+  #     (./.github/actions/ci-linux-system-deps), so no step can pass or fail
+  #     by which lane it landed in;
+  #   * has its own cargo cache family (`ci-<lane>`), holding exactly the
+  #     deps its own feature sets compile;
+  #   * SAVES that cache only from a master push. A cache saved on
+  #     `refs/pull/N/merge` can be restored only by later runs of that same
+  #     PR, yet every PR run wrote ~9–10 GB across the jobs of this file. On
+  #     2026-09-27 the pool held 13.1 of its 15.0 GB on PR refs and LRU had
+  #     evicted master's `ci-linux`, the one entry every PR restores from:
+  #     the key run 36331413828 restored with a full match at 15:58 returned
+  #     `No cache found` at 18:15 (run 36339984289, 36.8 min). PR runs now
+  #     restore master's caches read-only.
+  rust-lint:
+    name: Rust lint (fmt, clippy)
+    # History of the single "Rust checks" job these lanes replaced — its
+    # cache-key mechanism still applies to every lane:
+    #
     # FR-69 P5b — 30 minutes, not 20: the job builds clippy for the whole
     # workspace plus the unit tests of five audited crates, and since the
     # module crates arrived (P2–P5a) a COLD-cache run — every rerun is one,
@@ -24,7 +70,11 @@ jobs:
     # Measured on 2026-09-04 under the then-30-minute ceiling: cancelled at
     # 31 min 29 s in `Test tunnel-core --features overlay-l3,overlay-netstack`
     # with every prior step green.
-    timeout-minutes: 50
+    #
+    # Wave 14: every lane runs well under 10 min warm; 30 leaves a cold lane
+    # (the first run after any edit to this file) room to finish without
+    # letting a hung step idle for most of an hour.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
     # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
@@ -51,12 +101,16 @@ jobs:
         # blowing the repo's 10 GB Actions-cache budget and LRU-evicting
         # the release lane's caches (agent-v0.3.0-rc.176 rebuilt FFmpeg
         # from source for 29 min because of it).
+        #
+        # FR-6 wave 14: one family per lane, and only a master push saves
+        # (`save-if`). The note above this lane says why.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          shared-key: ci-linux
+          shared-key: ci-lint
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           # Rotate the cache key whenever THIS WORKFLOW changes. Without
           # this, a step that adds compile surface without touching
           # Cargo.lock (2026-08-21: `Run API unit tests` pulled the whole
@@ -163,92 +217,13 @@ jobs:
       - name: Vendored webrtc-sctp drift check
         run: bash scripts/revendor-webrtc-sctp.sh --check
 
-      # Belt for the cold path of the cached-apt steps below: apt retries
-      # transient mirror failures instead of stalling into the job timeout.
-      #
-      # The `apt-get update` is what keeps the cached-apt steps from poisoning
-      # their own cache keys, and it is why it must run BEFORE them. The runner
-      # image ships a stale apt index; cache-apt-pkgs-action resolves pinned
-      # versions from it, the mirror has already superseded them, every fetch
-      # 404s — and the action then logs `Caching 0 installed packages`,
-      # **saves the empty set under the key** and exits `success`. Every later
-      # run is a cache HIT on nothing. That is how `ci-gtk-v1` died, and then
-      # `ci-gtk-v2` was poisoned AT BIRTH by the same mechanism minutes later,
-      # so the key bump alone did not take.
-      #
-      # ⚠️ A fresh key is NOT a fix by itself — only an index the action can
-      # resolve against is. The guards below are the safety net and the metric,
-      # not the cure: their `did not deliver` warning must be ABSENT on a
-      # healthy cache.
-      #
-      # ⚠️ But a guard's alarm is a metric only once it has stayed SILENT on a
-      # known-good input. The libvpx guard fired on every green run from 09-06
-      # to 09-24 against caches that were full the whole time, because
-      # `ldconfig -p` reads /etc/ld.so.cache rather than the disk (#1604) — 17
-      # days of warnings that described the detector, not the cache.
-      - name: Configure apt retries and refresh the index
-        run: |
-          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
-
-      # rc.18 added a Tauri-tray companion (agents/roomler-tray) that
-      # pulls in glib-sys / gobject-sys on Linux. Workspace clippy walks
-      # every crate, so the build needs libglib2.0-dev + libgtk-3-dev
-      # available even before the vp9-444 / scrap apt step further down.
-      # Cached via cache-apt-pkgs-action: on a cache hit the packages
-      # restore from the Actions cache in seconds with ZERO mirror
-      # contact — the 2026-08-18 mirror-stall class (25m47s for this one
-      # step, run 32191779671) can only ever bite the first run after
-      # the package list or runner image changes.
-      - name: Install system deps for workspace clippy (cached apt)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
-          # v1 -> v2 on 2026-09-23 to abandon a POISONED cache entry: the run
-          # below saved an EMPTY set under the v1 key, so every later run got a
-          # cache *hit* on nothing and failed without even the 404s to explain
-          # it. A cache key is the only way to disown a bad entry.
-          #
-          # v2 -> v3 the same evening, because v2 was poisoned AT BIRTH: its
-          # very first run missed the fresh key, 404'd on 11 packages against
-          # the image's stale index, and saved EMPTY again. The bump only works
-          # now that the step above refreshes the index first — that ordering,
-          # not the number, is what makes v3 able to hold a real set.
-          # Verification: the first run must log `Caching N installed packages`
-          # with N > 0 and NO `did not deliver` warning; the next must hit with
-          # no warning either.
-          version: ci-gtk-v3
-
-      # 2026-09-23: this lane broke on master and every PR, and the shape is the
-      # one this file already documents twice below — the action installs
-      # NOTHING and reports success. Here the action resolved pinned versions
-      # from the runner image's apt index, the mirror had already superseded
-      # every one of them, and all 16 fetches 404'd:
-      #
-      #   E: Failed to fetch …/libglib2.0-dev_2.80.0-6ubuntu3.8_amd64.deb  404
-      #   E: Unable to fetch some archives…
-      #   Caching 0 installed packages... done
-      #   Skipped all manifest write. No packages to install.
-      #   ##[end-action …;outcome=success;conclusion=success]
-      #
-      # clippy then died on `glib-2.0.pc` with the 404s 400 lines upstream. The
-      # guard is the same one the vp9-444 and ffmpeg lanes already carry, and it
-      # was simply never added here — ask pkg-config, which is what the build
-      # actually consults, never the action's status. `apt-get update` first:
-      # the stale index IS the root cause, so a fallback that skipped it would
-      # re-resolve the same missing versions.
-      - name: Verify the GTK set really landed (fallback to apt-get)
-        run: |
-          if ! pkg-config --exists glib-2.0 webkit2gtk-4.1; then
-            echo "::warning::cached apt set did not deliver the GTK dev packages — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
-              libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
-              libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
-          fi
-          for m in glib-2.0 gtk+-3.0 webkit2gtk-4.1; do
-            pkg-config --exists "$m" || { echo "::error::$m still not found by pkg-config after the fallback install"; exit 1; }
-          done
+      # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
+      # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
+      # audio, bindgen), from cache-apt-pkgs-action with the guards against
+      # its silent-empty-restore failure. One definition for every lane: the
+      # composite carries the full history of why each guard exists.
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        uses: ./.github/actions/ci-linux-system-deps
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
@@ -288,6 +263,91 @@ jobs:
       # dead code, which only `--all-targets` surfaces.
       - name: Run clippy on the audited crates (incl. test targets)
         run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core --all-targets -- -D warnings
+
+      # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
+      # regenerates its FFI bindings via bindgen against the installed
+      # libvpx headers. The apt package on Ubuntu 24.04 (the GH-hosted
+      # runner image since 2026-04) ships libvpx 1.14+, but env-libvpx-sys
+      # 5.1.3's pre-generated bindings cap at 1.13.0. Without the
+      # bindgen feature the build script panics with "Expected file
+      # generated/vpx-ffi-1.14.0.rs not found but 'generate' cargo
+      # feature not used." `libclang-dev` (installed above) is the
+      # bindgen runtime requirement.
+      # The capture path is linted by NO other lane. `--workspace` clippy
+      # compiles roomlerd with DEFAULT features, and its default is `[]`, so
+      # `capture/scrap_backend.rs` — the screen-capture backend on every OS —
+      # is never even compiled there. The two agent feature lanes miss it too:
+      # `vp9-444` does not enable `scrap-capture`, and `cargo check` does not
+      # fail on warnings anyway. Same trap this file already documents for
+      # `clipboard` and `ssh-server`, and it had already sprung: an
+      # `unused_mut` in scrap_backend.rs survived indefinitely, and FR-29's
+      # `capture/x11_damage.rs` landed with no lint coverage at all.
+      #
+      # `dead_code` is allowed deliberately. This feature set legitimately
+      # leaves the ffmpeg-encoder paths unconstructed (`RatePlan`, `FfmpegDc`,
+      # …), and enabling `ffmpeg-encoder` here would need the vendored FFmpeg
+      # tree — a large cost to silence findings that are not defects. Every
+      # other class still bites.
+      - name: Clippy agent --features full (the capture + encode + input path)
+        # `recording` (FR-85) rides here too: it is held out of `full` (and so
+        # out of every release) until canary hosts prove it in the field, so
+        # without naming it no lane would lint it.
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
+
+      # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
+      # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
+      # bridge; the default `--workspace` clippy never compiles it
+      # (opt-in), so lint + test it explicitly here — mirrors the
+      # vp9-444 gate, catching an L3-path regression before it ships
+      # under the flag.
+      - name: Clippy tunnel-core --features overlay-l3,overlay-netstack
+        # BOTH overlay features, because the release build ships both
+        # (`release-agent.yml`: `overlay-l3,overlay-netstack`) and neither the
+        # default `--workspace` clippy nor an `overlay-l3`-only lane compiles
+        # `overlay::netstack*`. That gap hid a broken TEST helper in
+        # netstack_socks.rs for two weeks: #111 added two `PeerInfo` fields
+        # without updating a literal that only exists under `overlay-netstack`,
+        # and no lane ever compiled it. `--all-targets` covers test code, which
+        # is exactly where that class of break lands.
+        run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
+
+      - name: Clippy roomlerd --features overlay-l3
+        # Phase 3b: the agent's overlay glue (overlay.rs + the main /
+        # signaling hooks) only compiles under the opt-in feature, so the
+        # default --workspace clippy never sees it. Lint it explicitly.
+        run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
+
+  rust-unit:
+    name: Rust unit tests (server + crates)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
+        # clippy: this lane runs neither.
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        # rust-lint's cache step carries the notes: this lane's own family,
+        # saved only from a master push, keyed on this file.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-unit
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
+      # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
+      # audio, bindgen), from cache-apt-pkgs-action with the guards against
+      # its silent-empty-restore failure. One definition for every lane: the
+      # composite carries the full history of why each guard exists.
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        uses: ./.github/actions/ci-linux-system-deps
 
       # `crates/api` unit tests ran in NO lane until now: the clippy step above
       # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
@@ -365,86 +425,40 @@ jobs:
       - name: Type-check the integration test crate
         run: cargo check -p roomler-ai-tests --all-targets
 
-      # Phase Y feature gate. The `vp9-444` feature compiles libvpx
-      # via `env-libvpx-sys` (needs pkg-config + libvpx system lib),
-      # plus `dcv-color-primitives`. Default workspace clippy never
-      # exercises this path because the feature is opt-in. Catch
-      # breakage here so the standard release lane (which is still
-      # `--features full`, no vp9-444 yet) doesn't ship a regression
-      # latent under the feature flag — and so the `bun run e2e`
-      # VP9-444 spec doesn't drift away from the agent it's testing.
-      - name: Install libvpx (cached apt)
-        uses: awalsh128/cache-apt-pkgs-action@v1
+  rust-agent:
+    name: Agent tests (vp9-444, overlay, kernel TUN)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
+        # clippy: this lane runs neither.
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        # rust-lint's cache step carries the notes: this lane's own family,
+        # saved only from a master push, keyed on this file.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
         with:
-          # libasound2-dev is for the `audio` half of `full` in the capture
-          # clippy lane below — without it alsa-sys fails its build script and
-          # the lane dies before linting anything. Bump `version:` whenever
-          # this list changes, or the action serves the previously cached set.
-          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
-          # v2 -> v3 on 2026-09-23 (#1593) on a premise that turned out WRONG
-          # (corrected 2026-09-24): the v2 entry was never empty — its restores
-          # delivered libvpx (`Restoring 18 packages from cache… libvpx9=…tar
-          # restoring…`). The `did not deliver libvpx` warning that fired on
-          # every run was the guard below misreading a stale /etc/ld.so.cache
-          # (see its comment). The bump was harmless and not needed; only the
-          # 09-04 entry was truly empty (manifest missing ⇒ exit 127 at load).
-          version: ci-vpx-v3
-      # 2026-09-04: the cache action restored NOTHING (its own manifest was
-      # missing: `cat: …/cache-apt-pkgs/manifest_all.log: No such file`) and
-      # did not fail the job — the vp9-444 test binary then died at LOAD with
-      # `libvpx.so.9: cannot open shared object file` (exit 127) on master
-      # and on every PR of that hour. The action's silence is the hazard, so
-      # the lane verifies the runtime lib is really there and installs the
-      # set directly when it is not. The check is the loader's own view
-      # (`ldconfig -p`), not the action's status.
-      #
-      # ⚠️ `ldconfig -p` prints /etc/ld.so.cache, NOT the filesystem, and the
-      # cache action restores a package by untarring its files — it never runs
-      # the postinst that refreshes that cache. So on every cache HIT, from
-      # 09-06 to 09-24, this check saw no libvpx right after `libvpx9=…tar
-      # restoring…` and "fell back" to a full apt install, warning that the
-      # cache "did not deliver" when it had. `sudo ldconfig` first makes the
-      # cache match the disk, so the warning now means what it says.
-      - name: Verify libvpx really landed (fallback to apt-get)
-        run: |
-          sudo ldconfig
-          if ! ldconfig -p | grep -q 'libvpx\.so'; then
-            echo "::warning::cached apt set did not deliver libvpx — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
-          fi
-          ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
+          workspaces: '. -> target'
+          shared-key: ci-agent
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
-      # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
-      # regenerates its FFI bindings via bindgen against the installed
-      # libvpx headers. The apt package on Ubuntu 24.04 (the GH-hosted
-      # runner image since 2026-04) ships libvpx 1.14+, but env-libvpx-sys
-      # 5.1.3's pre-generated bindings cap at 1.13.0. Without the
-      # bindgen feature the build script panics with "Expected file
-      # generated/vpx-ffi-1.14.0.rs not found but 'generate' cargo
-      # feature not used." `libclang-dev` (installed above) is the
-      # bindgen runtime requirement.
-      # The capture path is linted by NO other lane. `--workspace` clippy
-      # compiles roomlerd with DEFAULT features, and its default is `[]`, so
-      # `capture/scrap_backend.rs` — the screen-capture backend on every OS —
-      # is never even compiled there. The two agent feature lanes miss it too:
-      # `vp9-444` does not enable `scrap-capture`, and `cargo check` does not
-      # fail on warnings anyway. Same trap this file already documents for
-      # `clipboard` and `ssh-server`, and it had already sprung: an
-      # `unused_mut` in scrap_backend.rs survived indefinitely, and FR-29's
-      # `capture/x11_damage.rs` landed with no lint coverage at all.
-      #
-      # `dead_code` is allowed deliberately. This feature set legitimately
-      # leaves the ffmpeg-encoder paths unconstructed (`RatePlan`, `FfmpegDc`,
-      # …), and enabling `ffmpeg-encoder` here would need the vendored FFmpeg
-      # tree — a large cost to silence findings that are not defects. Every
-      # other class still bites.
-      - name: Clippy agent --features full (the capture + encode + input path)
-        # `recording` (FR-85) rides here too: it is held out of `full` (and so
-        # out of every release) until canary hosts prove it in the field, so
-        # without naming it no lane would lint it.
-        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
+      # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
+      # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
+      # audio, bindgen), from cache-apt-pkgs-action with the guards against
+      # its silent-empty-restore failure. One definition for every lane: the
+      # composite carries the full history of why each guard exists.
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        uses: ./.github/actions/ci-linux-system-deps
 
+      # `vp9-444-bindgen`, and why Linux needs the pair: see the note on
+      # rust-lint's "Clippy agent --features full" step.
       - name: Check agent --features vp9-444
         run: cargo check -p roomlerd --features vp9-444,vp9-444-bindgen
 
@@ -477,6 +491,75 @@ jobs:
         #     under test on a real Linux host, which a Windows dev box cannot
         #     exercise at all. russh is pure Rust; the cost is compile time.
         run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server --lib
+
+      - name: Test tunnel-core --features overlay-l3,overlay-netstack
+        # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
+        # test — all in-process over 127.0.0.1, no real device.
+        # `--test-threads=1`: several tests each stand up a full loopback
+        # WebRTC/QUIC peer PAIR (ICE + SCTP 8-DC pool). Run in parallel on a
+        # 2-core CI runner they starve each other and intermittently blow the
+        # pool-open timeout (`Elapsed`) — flaky on master + PRs alike. Serial
+        # execution keeps at most one peer-pair up at a time; the tests are
+        # individually fast (<1s), so the whole step stays well under a minute.
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib -- --test-threads=1
+
+      - name: Multi-org shared TUN against real kernel networking
+        # The mux's bookkeeping is unit-tested against a fake device; the half
+        # that touches the OS — a REFUSED registration leaving no address
+        # behind, a disjoint block really getting one, a released org really
+        # losing it — was never run against a kernel, because reproducing it
+        # in the field needs a third organization and there is no way to
+        # retire a throwaway one (docs/multi-org.md §12). A `tun` device is
+        # free here, so it runs on every push instead.
+        #
+        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test skips
+        # itself silently everywhere else, including developer machines).
+        # Built as the normal user and only RUN under sudo, so root never
+        # takes ownership of the shared cargo cache.
+        run: |
+          sudo modprobe tun || true
+          # Build FIRST with human diagnostics. The json pass below would
+          # otherwise swallow a compile error into records jq drops, leaving
+          # only an empty $BIN and "sudo: : command not found".
+          cargo test -p roomlerd --features overlay-l3 --lib --no-run
+          BIN=$(cargo test -p roomlerd --features overlay-l3 --lib \
+                  --no-run --message-format=json \
+                | jq -r 'select(.profile.test == true) | .executable' | head -1)
+          echo "test binary: $BIN"
+          sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
+            --test-threads=1 --nocapture
+
+  rust-recorder:
+    name: Recorder tests (FR-85)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
+        # clippy: this lane runs neither.
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        # rust-lint's cache step carries the notes: this lane's own family,
+        # saved only from a master push, keyed on this file.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-recorder
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
+      # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
+      # audio, bindgen), from cache-apt-pkgs-action with the guards against
+      # its silent-empty-restore failure. One definition for every lane: the
+      # composite carries the full history of why each guard exists.
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        uses: ./.github/actions/ci-linux-system-deps
 
       - name: Test the recorder (FR-85) — unit tests + the recorder integration binary
         # ⚠️ Named explicitly, twice, on purpose. Every other roomlerd test
@@ -514,14 +597,14 @@ jobs:
         # FR-85 P1d — `recorder` again: a pointer the "backend" cannot draw is
         # drawn by the recorder, decoded back where the source said, with no
         # trail when it moves; `recording::pointer` holds the layer's units.
+        #
+        # FR-6 wave 14: the WITH-`audio` half of this step now runs in the
+        # `rust-recorder-audio` lane, in parallel with this one.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test export
 
       - name: Linux recorder identity (FR-85) — as root, the drop and the thread's filesystem identity
         # FR-85 P1e-unix. A root daemon launches the recorder as the person
@@ -590,6 +673,48 @@ jobs:
           grep -q "$H/Videos/Roomler" "$OUT" || { echo "::error::under the sandbox the recorder did not choose ~/Videos/Roomler"; exit 1; }
           grep -q HOME_READ_ONLY "$OUT" || { echo "::error::the sandbox left the rest of home writable"; exit 1; }
 
+  rust-recorder-audio:
+    name: Recorder tests with audio + X11 pointer (FR-85)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
+        # clippy: this lane runs neither.
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        # rust-lint's cache step carries the notes: this lane's own family,
+        # saved only from a master push, keyed on this file.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-recorder-audio
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
+      # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
+      # audio, bindgen), from cache-apt-pkgs-action with the guards against
+      # its silent-empty-restore failure. One definition for every lane: the
+      # composite carries the full history of why each guard exists.
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        uses: ./.github/actions/ci-linux-system-deps
+
+      - name: Test the recorder WITH audio (FR-85 P1c, P5b) — unit tests + the recorder integration binary
+        # The WITH-`audio` half of rust-recorder's "Test the recorder
+        # (FR-85)" step. That step's note says what each binary proves and
+        # why the recorder is tested both with and without `audio`. It has
+        # its own lane (FR-6 wave 14) so the two halves compile in parallel.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --lib recording::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test export
+
       - name: The recorder's pointer on X11 (FR-85 P1d) — XFixes against a real X server
         # FR-85 P1d. XShm frames carry no pointer, so on X11 the recorder
         # draws it, from XFixes `GetCursorImage` placed by the monitor's origin
@@ -603,65 +728,28 @@ jobs:
           sudo apt-get install -y --no-install-recommends xvfb xauth
           xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture --lib capture::pointer -- --nocapture
 
-      # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
-      # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
-      # bridge; the default `--workspace` clippy never compiles it
-      # (opt-in), so lint + test it explicitly here — mirrors the
-      # vp9-444 gate, catching an L3-path regression before it ships
-      # under the flag.
-      - name: Clippy tunnel-core --features overlay-l3,overlay-netstack
-        # BOTH overlay features, because the release build ships both
-        # (`release-agent.yml`: `overlay-l3,overlay-netstack`) and neither the
-        # default `--workspace` clippy nor an `overlay-l3`-only lane compiles
-        # `overlay::netstack*`. That gap hid a broken TEST helper in
-        # netstack_socks.rs for two weeks: #111 added two `PeerInfo` fields
-        # without updating a literal that only exists under `overlay-netstack`,
-        # and no lane ever compiled it. `--all-targets` covers test code, which
-        # is exactly where that class of break lands.
-        run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
-
-      - name: Test tunnel-core --features overlay-l3,overlay-netstack
-        # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
-        # test — all in-process over 127.0.0.1, no real device.
-        # `--test-threads=1`: several tests each stand up a full loopback
-        # WebRTC/QUIC peer PAIR (ICE + SCTP 8-DC pool). Run in parallel on a
-        # 2-core CI runner they starve each other and intermittently blow the
-        # pool-open timeout (`Elapsed`) — flaky on master + PRs alike. Serial
-        # execution keeps at most one peer-pair up at a time; the tests are
-        # individually fast (<1s), so the whole step stays well under a minute.
-        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib -- --test-threads=1
-
-      - name: Clippy roomlerd --features overlay-l3
-        # Phase 3b: the agent's overlay glue (overlay.rs + the main /
-        # signaling hooks) only compiles under the opt-in feature, so the
-        # default --workspace clippy never sees it. Lint it explicitly.
-        run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
-
-      - name: Multi-org shared TUN against real kernel networking
-        # The mux's bookkeeping is unit-tested against a fake device; the half
-        # that touches the OS — a REFUSED registration leaving no address
-        # behind, a disjoint block really getting one, a released org really
-        # losing it — was never run against a kernel, because reproducing it
-        # in the field needs a third organization and there is no way to
-        # retire a throwaway one (docs/multi-org.md §12). A `tun` device is
-        # free here, so it runs on every push instead.
-        #
-        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test skips
-        # itself silently everywhere else, including developer machines).
-        # Built as the normal user and only RUN under sudo, so root never
-        # takes ownership of the shared cargo cache.
+  rust:
+    # The name the five lanes above shared when they were one job. It builds
+    # nothing: it fails unless every lane succeeded, so this one check still
+    # answers "is Rust green?" for people, `gh pr checks`, and the autopilot
+    # board. `!cancelled()` rather than `always()`: a superseded PR run that
+    # the concurrency group cancels should not start a runner just to fail.
+    name: Rust checks
+    if: ${{ !cancelled() }}
+    needs: [rust-lint, rust-unit, rust-agent, rust-recorder, rust-recorder-audio]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every Rust lane succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          sudo modprobe tun || true
-          # Build FIRST with human diagnostics. The json pass below would
-          # otherwise swallow a compile error into records jq drops, leaving
-          # only an empty $BIN and "sudo: : command not found".
-          cargo test -p roomlerd --features overlay-l3 --lib --no-run
-          BIN=$(cargo test -p roomlerd --features overlay-l3 --lib \
-                  --no-run --message-format=json \
-                | jq -r 'select(.profile.test == true) | .executable' | head -1)
-          echo "test binary: $BIN"
-          sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
-            --test-threads=1 --nocapture
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(" ")')
+          if [ -n "$bad" ]; then
+            echo "::error::Rust lanes that did not succeed: $bad"
+            exit 1
+          fi
 
   macos-overlay-check:
     # The agent's macOS build exists ONLY in release-agent.yml, so a
@@ -685,6 +773,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-overlay-check
+          # Only a master push saves (FR-6 wave 14 — the note above the Rust
+          # lanes): a PR-ref cache only its own PR can reuse, and each one
+          # evicts master entries every PR restores from.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
@@ -812,8 +904,8 @@ jobs:
             --test-threads=1 --nocapture
 
   windows-overlay-clippy:
-    # Windows-only code was entirely UN-LINTED: the Rust job runs on
-    # ubuntu-latest, so its `-D warnings` never compiles the 66
+    # Windows-only code was entirely UN-LINTED: the Rust lanes run on
+    # ubuntu-latest, so their `-D warnings` never compiles the 66
     # `#[cfg(windows)]` sites in overlay/ (wfp.rs alone is 456 LOC), the
     # win_service supervisor, or the Windows halves of tun.rs/dns.rs/nat.rs.
     # A dead-code warning shipped in rc.359 sat invisible for 5 rc's
@@ -838,6 +930,7 @@ jobs:
         with:
           shared-key: ci-windows-clippy
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
       # `ssh-server` is in the set because this is the ONLY lane that lints the
@@ -883,6 +976,7 @@ jobs:
         with:
           shared-key: ci-windows-recorder
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy roomlerd (recording, incl. tests)
         run: cargo clippy -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --tests -- -D warnings
       - name: The identity rule — unit tests (the table, argv, env, impersonation)
@@ -943,7 +1037,9 @@ jobs:
         with:
           shared-key: ci-ffmpeg-encoder
           cache-on-failure: true
-      # Same ordering requirement as the rust job: the index must be fresh
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # Same ordering requirement as the Rust lanes' system-deps composite
+      # (./.github/actions/ci-linux-system-deps): the index must be fresh
       # BEFORE the cached-apt step, or a cache miss resolves superseded
       # versions, 404s, and saves an EMPTY set under the key — poisoning it for
       # every later run. This job had no refresh at all before its cache step
@@ -1088,6 +1184,7 @@ jobs:
         with:
           shared-key: ci-recording-ffmpeg
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Configure apt retries and refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
@@ -1482,6 +1579,7 @@ jobs:
           workspaces: '. -> target'
           shared-key: ci-profiles
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Configure apt retries
