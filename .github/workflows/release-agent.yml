@@ -2161,7 +2161,10 @@ jobs:
         # go to the desktop companion, which works.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
+        # FR-85 CANARY BRANCH ONLY — never merged. `recording` rides this
+        # one macOS build for the Mac canary (reserved 0.4.109, 2026-09-27);
+        # on master it stays out of every release build.
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder,recording" --target aarch64-apple-darwin
 
       # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
       # payload was the .app and nothing else — so `roomler peers` was
