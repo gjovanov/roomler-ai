@@ -27,6 +27,11 @@ pub struct AgentInternal {
 
     // State for closing
     pub(crate) done_tx: Mutex<Option<mpsc::Sender<()>>>,
+    // VENDOR PATCH (#1740): raised by close() before its candidate sweep and
+    // never lowered. The mDNS resolutions end on it, and add_candidate()
+    // reads it under the local-candidates lock to turn away a candidate
+    // gathered after the close.
+    pub(crate) closed: watch::Sender<bool>,
     // force candidate to be contacted immediately (instead of waiting for task ticker)
     pub(crate) force_candidate_contact_tx: mpsc::Sender<bool>,
     pub(crate) done_and_force_candidate_contact_rx:
@@ -98,6 +103,7 @@ impl AgentInternal {
             on_connected_rx: Mutex::new(Some(on_connected_rx)),
 
             done_tx: Mutex::new(Some(done_tx)),
+            closed: watch::channel(false).0,
             force_candidate_contact_tx,
             done_and_force_candidate_contact_rx: Mutex::new(Some((
                 done_rx,
@@ -586,6 +592,23 @@ impl AgentInternal {
         let network_type = c.network_type();
         {
             let mut local_candidates = self.local_candidates.lock().await;
+            // VENDOR PATCH (#1740): a candidate whose gathering finished after
+            // close() (a late STUN or TURN answer) was started above and kept,
+            // and nothing would ever close it: its receive loop held the agent,
+            // and the agent every socket. Read under the lock close()'s sweep
+            // takes, after close() raised the flag, so a candidate lands either
+            // before the sweep (which closes it) or here.
+            let closed = *self.closed.borrow();
+            if closed {
+                if let Err(err) = c.close().await {
+                    log::warn!(
+                        "[{}]: Failed to close a candidate gathered after close: {}",
+                        self.get_name(),
+                        err
+                    );
+                }
+                return Ok(());
+            }
             if let Some(cands) = local_candidates.get(&network_type) {
                 for cand in cands {
                     if cand.equal(&**c) {
@@ -640,6 +663,9 @@ impl AgentInternal {
             }
             done_tx.take();
         };
+        // VENDOR PATCH (#1740): before the sweep, so a candidate gathered from
+        // here on is turned away by add_candidate() instead of outliving us.
+        self.closed.send_replace(true);
         self.delete_all_candidates().await;
         {
             let mut started_ch_tx = self.started_ch_tx.lock().await;

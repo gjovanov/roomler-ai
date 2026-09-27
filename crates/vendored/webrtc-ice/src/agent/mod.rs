@@ -33,7 +33,7 @@ use stun::fingerprint::*;
 use stun::integrity::*;
 use stun::message::*;
 use stun::xoraddr::*;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::time::{Duration, Instant};
 use util::vnet::net::*;
 use util::Buffer;
@@ -287,14 +287,25 @@ impl Agent {
                 return Err(Error::ErrAddressParseFailed);
             }
 
-            let ai = Arc::clone(&self.internal);
+            // VENDOR PATCH (#1740): the resolution ends with the agent, and
+            // holds it only weakly. `DnsConn::query` never notices its conn
+            // closing and has no deadline, so a name nobody answers (a browser
+            // off this LAN, i.e. nearly every remote peer) was asked for once a
+            // second forever, and this task kept the closed agent alive with
+            // every socket its candidates own, plus the mDNS socket. pion ends
+            // the same query when the agent closes its mDNS conn.
+            let ai = Arc::downgrade(&self.internal);
+            let mut closed = self.internal.closed.subscribe();
             let host_candidate = Arc::clone(c);
             let mdns_conn = self.mdns_conn.clone();
             tokio::spawn(async move {
                 if let Some(mdns_conn) = mdns_conn {
-                    if let Ok(candidate) =
-                        Self::resolve_and_add_multicast_candidate(mdns_conn, host_candidate).await
-                    {
+                    let resolved = tokio::select! {
+                        resolved = Self::resolve_and_add_multicast_candidate(mdns_conn, host_candidate) => resolved,
+                        // Closed, or dropped without a close: done either way.
+                        _ = closed.wait_for(|closed| *closed) => return,
+                    };
+                    if let (Ok(candidate), Some(ai)) = (resolved, ai.upgrade()) {
                         ai.add_remote_candidate(&candidate).await;
                     }
                 }
@@ -497,7 +508,10 @@ impl Agent {
         mdns_conn: Arc<DnsConn>,
         c: Arc<dyn Candidate + Send + Sync>,
     ) -> Result<Arc<dyn Candidate + Send + Sync>> {
-        //TODO: hook up _close_query_signal_tx to Agent or Candidate's Close signal?
+        // VENDOR PATCH (#1740): the signal half lives for the whole query
+        // (dropping it would end the query at once); the caller instead races
+        // the query against the agent's close. Upstream's TODO here was
+        // "hook up _close_query_signal_tx to Agent or Candidate's Close signal?".
         let (_close_query_signal_tx, close_query_signal_rx) = mpsc::channel(1);
         let src = match mdns_conn.query(&c.address(), close_query_signal_rx).await {
             Ok((_, src)) => src,

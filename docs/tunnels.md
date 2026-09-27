@@ -209,6 +209,90 @@ stayed flat.
   `roomlerd` inside a container; `pgrep -x roomlerd | head -1` returns whichever comes
   first, and a bare `grep -c roomlerd` sums both. Ask systemd for `MainPID`.
 
+### ⚠️ The same trap, a third time: a closed ICE agent kept by its mDNS resolution (#1740)
+
+Fixed in the vendored `webrtc-ice` ([#1740](https://github.com/gjovanov/roomler-ai/issues/1740)).
+Here the peer **was** `close()`d, and the close did run to the end. It still freed
+nothing below the ICE agent.
+
+A browser hides its LAN host candidates behind `<uuid>.local` names. `roomlerd`'s
+`mdns_resolve` asks the OS resolver first. When that gets no answer within 750 ms, which
+is the normal case for a browser that is not on the agent's LAN, the candidate goes
+unmodified to webrtc-ice. webrtc-ice resolves it itself: a task that asks `224.0.0.251`
+**once a second until someone answers**. The query has no deadline and never notices the
+agent closing, and the task held a strong `Arc` of the agent's internals. So every
+ended session left its ICE agent alive for the life of the daemon, together with every
+UDP socket its candidates owned, the mDNS socket, and the query itself.
+
+```mermaid
+sequenceDiagram
+    participant B as browser (controller)
+    participant R as roomlerd mdns_resolve
+    participant A as webrtc-ice agent
+    participant Q as resolution task
+    participant M as mDNS socket :5353
+
+    B->>R: host candidate <uuid>.local
+    R->>R: OS resolver, 750 ms: no answer (browser off this LAN)
+    R->>A: add_remote_candidate (unmodified)
+    A->>Q: spawn: holds the agent's internals + the mDNS conn
+    loop every 1 s until answered
+        Q->>M: QM query <uuid>.local
+    end
+    Note over A: session ends: pc.close() → agent.close()
+    alt before #1740
+        Note over Q: never answered, never told: asks forever,<br/>and the closed agent keeps every socket bound
+    else after #1740
+        A-->>Q: close() raises `closed` (a watch) → the task returns
+        Note over A: agent, candidates, sockets freed
+    end
+```
+
+The fix, in the vendored crate (`crates/vendored/webrtc-ice.patch`), is to race the
+resolution against the agent's close. The task now holds the agent only weakly, which
+is what pion does when it closes the agent's mDNS conn. The same patch also closes a
+narrower door: a candidate whose gathering finished **after** `close()` (a late STUN or
+TURN answer). It was started and kept, and its receive loop held the agent. Now it is
+closed on arrival. Both are locked by `agents/roomlerd/src/ice_lifetime_tests.rs`, which
+counts the tasks alive on a runtime of its own. Without the patch, a closed agent
+leaves one behind in each test; with it, none. CI runs them in its Linux lib-test
+lane, where a host that cannot open the mDNS socket fails the mDNS test instead of
+passing it vacuously. They also pass natively on Windows, where the mDNS socket opens
+too, so Windows hosts had the leak as well.
+
+**Measured** on a vmtest Ubuntu root daemon with the #1730 drop harness (the production
+viewer's container SIGKILLed once it streams). Per ended session:
+
+*(field A/B in progress — the table lands before the merge.)*
+
+The signature, one line on the host: the daemon asking, once a second, for the same
+`<uuid>.local` names, names that belong to sessions which ended long ago.
+
+```bash
+sudo timeout 10 tcpdump -ni any 'udp dst port 5353' | grep -oE '[0-9a-f-]{36}\.local' | sort | uniq -c
+```
+
+#### What made it hard to find
+
+- ⚠️ **The peer's own objects were all freed**, and that made "the session leaked"
+  look disproven. Weak probes on the `RTCPeerConnection` and on its SCTP and DTLS
+  transports all read 0 ten seconds after the close. The leak was one level down,
+  in an ICE agent that nothing in the peer referenced any more.
+- ⚠️ **The noise at every close looked like the evidence.** Each session end logs
+  `Failed to close candidate … the agent is closed`. Those are the *browser's*
+  candidates: they were never started and never had a socket.
+- 🔑 **The task dump named no crate at all.** Release inlining left only the leaf
+  shape: one task per unanswered name, `PollFn → {Sleep, mpsc::recv, mpsc::recv}`.
+  That is exactly `webrtc_mdns::DnsConn::query`'s loop, and the `tcpdump` above
+  confirmed it: four names, ten queries each, two sessions after they ended.
+- ⚠️ **It was filed as a per-*drop* residue, but nothing about it is specific to a
+  drop.** The drop harness was simply the only thing measuring it. The unit test
+  closes an agent that never had a session at all.
+
+The same investigation found the control channel owning itself: its `on_message`
+closure held a strong clone of the channel it is stored in, so a session's control
+channel, and everything its handler captures, was never freed. It now holds a `Weak`.
+
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
