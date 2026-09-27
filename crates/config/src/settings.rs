@@ -44,6 +44,53 @@ pub struct Settings {
     /// exactly today's server.
     #[serde(default)]
     pub modules: ModulesSettings,
+    /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
+    #[serde(default)]
+    pub diag: DiagSettings,
+}
+
+/// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.
+///
+/// A `roomler2` pod went silent twice in 9 h — not one log line, `/health`
+/// unanswered — until the liveness probe killed it ~105 s later, taking the
+/// only evidence with it. The watchdog notices the runtime has stopped
+/// making progress, writes every thread's stack and syscall to a file in
+/// `stall_dump_dir`, and the NEXT process logs that file at boot. The
+/// directory must outlive a container restart (an `emptyDir` in the
+/// deployment) or the dump dies with the container it describes.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiagSettings {
+    /// `false` turns the watchdog off entirely (no heartbeat, no handler).
+    #[serde(default = "diag_default_on")]
+    pub stall_watchdog: bool,
+    /// How long the runtime's heartbeat may go unseen before it counts as a
+    /// stall. Well inside the liveness budget (5 × 15 s probes + grace).
+    #[serde(default = "diag_default_threshold_secs")]
+    pub stall_threshold_secs: u64,
+    #[serde(default = "diag_default_dump_dir")]
+    pub stall_dump_dir: String,
+}
+
+fn diag_default_on() -> bool {
+    true
+}
+
+fn diag_default_threshold_secs() -> u64 {
+    10
+}
+
+fn diag_default_dump_dir() -> String {
+    "/var/lib/roomler/diag".to_string()
+}
+
+impl Default for DiagSettings {
+    fn default() -> Self {
+        Self {
+            stall_watchdog: diag_default_on(),
+            stall_threshold_secs: diag_default_threshold_secs(),
+            stall_dump_dir: diag_default_dump_dir(),
+        }
+    }
 }
 
 /// FR-69 — the per-module runtime switches (`[modules]`, env
