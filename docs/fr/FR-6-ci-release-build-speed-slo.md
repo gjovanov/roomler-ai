@@ -93,12 +93,16 @@ itself on the affected run's page. Baseline when the program started: releases t
 - [x] All five lanes publish + restore asset pairs (10 assets live on `seed-cache`)
 - [x] A failed/cancelled rehearsal cannot leave the lane silently cold (alert issue +
       run-page warnings, field-proven by #683 and the 403 warning that found #728)
-- [ ] PR CI warm ≤10 min with a hard cap — held at 4.9–7 min from #587, then **regressed**:
-      18–21 min warm and 35–45 min cold over 58 runs by 2026-09-27 (the single "Rust
-      checks" job had grown to ~35 serial steps, and PR-ref cache saves were evicting
-      master's). Re-ticked only when wave 14's warm numbers are measured.
+- [x] PR CI warm ≤10 min with a hard cap — held at 4.9–7 min from #587, then
+      **regressed** to 18–21 min warm and 35–45 min cold over 58 runs by 2026-09-27
+      (the single "Rust checks" job had grown to ~35 serial steps, and PR-ref cache saves
+      were evicting master's). Wave 14 restored it (field, run 36348497216 on #1745): the
+      **whole CI in 6 min 21 s**, `Rust checks` critical path 5.8 min, every lane
+      restoring master's cache with a full match; each lane has `timeout-minutes: 30`.
 - [ ] PR runs write no cargo caches, and master holds one generation per Swatinem
-      family (wave 14; checked with `gh cache list` after a day of PR traffic)
+      family (wave 14; checked with `gh cache list` after a day of PR traffic). First
+      evidence: #1745's run wrote no `v0-rust-*` entry and none exists on any PR ref;
+      after the seeding runs every master family held exactly one generation
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
@@ -114,6 +118,18 @@ itself on the affected run's page. Baseline when the program started: releases t
 - Runner-pool queue time is outside repo control (observed 35–70 min during bursts);
   rehearsal concurrency caps our own contribution. A self-hosted Windows runner is the
   reserve option.
+- **The cache pool is at capacity on master alone** (wave 14 finding). With PR-ref saves
+  gone, master's own families add up to ~10–12 GB: the five Rust lanes 5.6 GB (vs the
+  single 4.1 GB `ci-linux` they replaced, since shared deps now sit in several
+  families), `ci-integration` 1.1 GB, and the rest ~0.4–0.8 GB each. The pool read
+  10.2 GB right after seeding, and the first victims were the small, early-saved
+  entries: Windows clippy, recording-ffmpeg, the apt sets. LRU picks the least recently
+  *restored* entry, and every PR restores the lanes, so the critical path stays warm
+  and churn lands on the rarer jobs. Two ways out: raise the repo's cache storage limit
+  (GitHub bills above 10 GB and needs a payment method on the account; the storage-limit
+  API answers 402 without one), or trim families (e.g. `recorder` + `recorder-audio`
+  sharing one). The registry copy each family carries is only ~167 MB for the whole
+  lockfile, so deduplicating it is not the lever.
 
 ## Out of scope
 
@@ -139,3 +155,19 @@ itself on the affected run's page. Baseline when the program started: releases t
   warm run, test execution was ~3.5 of the 20 minutes; the rest was `roomlerd` and
   friends compiled in ~12 feature configurations, one after another. Wave 14 plan and
   numbers: #773.
+- 2026-09-27: **Wave 14 (#1743) cold numbers.** Its own PR runs are cold by
+  construction, since the `ci.yml` edit rotates every key: the `Rust checks` critical
+  path fell from 36.8 to ~17 min cold and the whole CI from 36.9 to 18.2 min (run
+  36345672545). Cold runner variance is ~30%: identical lint steps took 316 s and
+  426 s on two runners. The first master run after the merge seeded every lane
+  (36346857140, 21.8 min cold), and the janitor fired from its new `workflow_run`
+  trigger 2 s after it finished. The pool then held one generation per family, all
+  on master. A wrong turn, recorded: the first layout put the integration type-check
+  in the unit lane, where it re-checked ~800 dependencies from scratch (369 s against
+  31 s beside the clippy whose check-mode artifacts it reuses).
+- 2026-09-27: **Wave 14 warm result** (#1745, run 36348497216, the first PR after the
+  seeding). **Whole CI 6 min 21 s** (was 20+ warm, 36.8 cold). Lanes: lint 5.8, unit
+  3.4, agent 4.3, recorder 4.7, recorder + audio 3.8 min. Each restored master's cache
+  with a full match. Also Windows recorder 6.0 (was 7.3), macOS 3.0 (was 4.6), profiles
+  1.6 min. The PR wrote no `v0-rust-*` cache. The pool read 10.2 GB: see the capacity
+  item under Open decisions.
