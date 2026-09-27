@@ -364,6 +364,253 @@ async fn the_media_process_probes_and_exports() {
     assert_eq!(r["code"], "bad_edit_list", "{r}");
 }
 
+// ── FR-85 P4 — a hardware encoder's recording ───────────────────────────────
+
+/// Recordings a hardware encoder made, committed: 90 frames (3 s) of the
+/// counter pattern each, encoded by `h264_nvenc` with no B-frames and a 2 s
+/// GOP (the recording profile's shape), written by the recorder's own writer
+/// — once in High profile (the default 4:2:0) and once in High 4:4:4 (the
+/// opt-in chroma). `make_the_hardware_fixtures` regenerates them.
+struct Fixture {
+    name: &'static str,
+    pix_fmt: &'static str,
+    profile_arg: &'static str,
+    profile: u8,
+}
+
+const FIXTURES: [Fixture; 2] = [
+    Fixture {
+        name: "export-high-profile.mp4",
+        pix_fmt: "yuv420p",
+        profile_arg: "high",
+        profile: 100,
+    },
+    Fixture {
+        name: "export-high444-profile.mp4",
+        pix_fmt: "yuv444p",
+        profile_arg: "high444p",
+        profile: 244,
+    },
+];
+
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// Regenerate the fixtures — by hand, on a machine whose `ffmpeg` CLI has a
+/// working `h264_nvenc`:
+/// `cargo test -p roomlerd --features recording,openh264-encoder --test export -- --ignored make_the_hardware_fixtures`
+#[test]
+#[ignore = "writes the committed fixtures; needs an ffmpeg CLI with a working h264_nvenc"]
+fn make_the_hardware_fixtures() {
+    for f in &FIXTURES {
+        make_fixture(f);
+    }
+}
+
+fn make_fixture(fixture: &Fixture) {
+    use roomlerd::recording::annexb::{h264, split_nals};
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    const FRAMES: u16 = 90;
+    let size = format!("{W}x{H}");
+    let rate = FPS.to_string();
+    let gop = (FPS * 2).to_string();
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+        ])
+        .args(["-s", &size, "-r", &rate, "-i", "-"])
+        .args(["-c:v", "h264_nvenc", "-profile:v", fixture.profile_arg])
+        .args(["-preset", "p6", "-tune", "hq"])
+        .args([
+            "-rc", "vbr", "-cq", "23", "-b:v", "0", "-bf", "0", "-g", &gop,
+        ])
+        .args([
+            "-pix_fmt",
+            fixture.pix_fmt,
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "smpte170m",
+        ])
+        .args(["-color_primaries", "smpte170m", "-color_trc", "smpte170m"])
+        .args(["-bsf:v", "h264_metadata=aud=insert", "-f", "h264", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("an ffmpeg CLI on PATH");
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || {
+        for i in 0..FRAMES {
+            stdin.write_all(&render(i)).unwrap();
+        }
+    });
+    let mut stream = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stream)
+        .unwrap();
+    feeder.join().unwrap();
+    assert!(child.wait().unwrap().success(), "ffmpeg failed");
+
+    // One access unit per delimiter; the delimiters themselves are dropped,
+    // since the recorder's encoders write none.
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    for nal in split_nals(&stream) {
+        if h264::nal_type(nal) == Some(h264::AUD) {
+            units.push(Vec::new());
+            continue;
+        }
+        let au = units
+            .last_mut()
+            .expect("the stream starts with a delimiter");
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(nal);
+    }
+    assert_eq!(
+        units.len(),
+        usize::from(FRAMES),
+        "one access unit per frame"
+    );
+
+    let dest = fixture_path(fixture.name);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let partial = std::env::temp_dir().join(format!(
+        "fr85-{}-{}.partial",
+        fixture.profile,
+        std::process::id()
+    ));
+    let mut w = FragmentedWriter::create(
+        &partial,
+        VideoTrack {
+            width: W,
+            height: H,
+            fps: FPS,
+            color: ColorInfo::BT601_LIMITED,
+        },
+        None,
+    )
+    .unwrap();
+    for (i, au) in units.iter().enumerate() {
+        let key = split_nals(au)
+            .iter()
+            .any(|n| h264::nal_type(n) == Some(h264::SLICE_IDR));
+        w.push_video(i as u64 * TICK, au, key).unwrap();
+    }
+    w.finish().unwrap();
+    let _ = std::fs::remove_file(&dest);
+    mp4::finalize(&partial, &dest).unwrap();
+    std::fs::remove_file(&partial).unwrap();
+    let format = ProgressiveFile::open(&dest)
+        .unwrap()
+        .video_format()
+        .unwrap();
+    assert_eq!(format.profile, fixture.profile, "{}", fixture.name);
+}
+
+/// The fixtures are what they claim: High and High 4:4:4, 90 frames of the
+/// counter each — so the tests below are about a hardware encoder's
+/// recordings, and a build without FFmpeg's decoder MUST refuse them.
+#[test]
+fn the_hardware_fixtures_are_what_they_claim() {
+    for f in &FIXTURES {
+        let pf = ProgressiveFile::open(&fixture_path(f.name)).expect("the committed fixture");
+        let format = pf.video_format().unwrap();
+        assert_eq!(format.profile, f.profile, "{}", f.name);
+        assert_eq!((format.width, format.height), (W, H), "{}", f.name);
+        assert_eq!(pf.samples(VIDEO_TRACK_ID).unwrap().len(), 90, "{}", f.name);
+    }
+}
+
+/// FR-85 P4 — a hardware encoder's recording exports frame for frame where
+/// the build's FFmpeg carries its H.264 decoder: keep 0–1 s · cut 1–2 s ·
+/// keep 2–3 s is exactly counters `0..30 ++ 60..90`, in 4:2:0 and in 4:4:4.
+/// Where the decoder is absent, the same export is refused
+/// `decoder_unavailable` by name (the control: neither fixture is Baseline,
+/// so openh264 alone cannot read them).
+#[tokio::test]
+async fn a_hardware_recording_exports_frame_for_frame_where_ffmpeg_decodes_it() {
+    use roomlerd::recording::decode::{h264_decoder_available, h264_decoder_expected};
+    let available = h264_decoder_available();
+    assert!(
+        available || !h264_decoder_expected(),
+        "ROOMLER_EXPECT_FFMPEG_H264_DECODER=1 but the linked FFmpeg has no H.264 decoder"
+    );
+    for f in &FIXTURES {
+        let d = dir();
+        let source = d.path().join("source.mp4");
+        std::fs::copy(fixture_path(f.name), &source).unwrap();
+        let edits = edit_list(vec![
+            seg(0, 1000, Action::Keep),
+            seg(1000, 2000, Action::Cut),
+            seg(2000, 3000, Action::Keep),
+        ]);
+        let dest = export::edited_name(&source).unwrap();
+        let result = export::export(
+            &source,
+            &edits,
+            &dest,
+            software(),
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .await;
+        if !available {
+            match result {
+                Err(ExportError::DecoderUnavailable { profile }) if profile == f.profile => {}
+                other => panic!(
+                    "{}: a build without the decoder refuses by name: {other:?}",
+                    f.name
+                ),
+            }
+            assert!(!dest.exists(), "{}: nothing written", f.name);
+            continue;
+        }
+        let s = result.unwrap_or_else(|e| panic!("{}: {} — {}", f.name, e.code(), e.detail()));
+        let expected: Vec<u16> = (0..30).chain(60..90).collect();
+        assert_eq!(counters(&dest), expected, "{}", f.name);
+        assert_eq!(s.frames, 60, "{}", f.name);
+    }
+}
+
+/// And the probe says so, before any export is tried: a hardware recording
+/// is `editable` exactly where the decoder is linked in.
+#[tokio::test]
+async fn the_probe_says_a_hardware_recording_is_editable_only_with_the_decoder() {
+    use roomlerd::recording::child::parse_event_line;
+    use roomlerd::recording::decode::h264_decoder_available;
+    for f in &FIXTURES {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_roomlerd"))
+            .args(["media", "probe"])
+            .arg(fixture_path(f.name))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("roomlerd media probe");
+        let probe = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(parse_event_line)
+            .expect("a probe event");
+        assert_eq!(probe["ev"], "probe", "{probe}");
+        assert_eq!(probe["profile"], f.profile, "{probe}");
+        assert_eq!(probe["editable"], h264_decoder_available(), "{probe}");
+        if !h264_decoder_available() {
+            let reason = probe["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains("no decoder"), "{reason}");
+        }
+    }
+}
+
 /// FR-85 P5b — an export's sound. The oracle is the audio counterpart of the
 /// frame counter: a STEPPED tone, second k of the recording playing
 /// (300 + 100·k) Hz, so every second of an export names the second of the

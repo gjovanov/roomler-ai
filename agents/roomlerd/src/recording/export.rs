@@ -4,7 +4,7 @@
 //! file out, beside it. The recording itself is never written.
 //!
 //! ```text
-//! demux (ProgressiveFile) → decode (openh264) → pick the frame each output
+//! demux (ProgressiveFile) → decode (openh264 | FFmpeg h264) → pick the frame each output
 //! tick shows (edit::Plan) → encode (the recording profile) → fragmented MP4
 //! staged in .roomler-partial → finalize (moov-first)
 //! ```
@@ -16,9 +16,10 @@
 //!   carries none and says so (`not_carried`), and refuses music
 //!   (`audio_unavailable`): a caller never presents a silent file as complete.
 //! - **openh264 decodes what the software encoder writes** (Constrained
-//!   Baseline). A hardware encoder's High-profile recording is refused by name
-//!   (`decoder_unavailable`) until FR-85 P4 vendors FFmpeg's decoder: never a
-//!   garbled export.
+//!   Baseline); **FFmpeg's `h264` decodes a hardware encoder's High profile**
+//!   where the build's FFmpeg carries it (FR-85 P4, [`super::decode`]).
+//!   Anything this build cannot read is refused by name
+//!   (`decoder_unavailable`): never a garbled export.
 //! - **It decodes forward**, jumping to the keyframe before the next frame
 //!   it needs when that keyframe is ahead. A cut costs at most one GOP (2 s) of
 //!   decoding, never the whole stretch it removes. H.264 needs every frame
@@ -32,15 +33,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::annexb::length_prefixed_to_annexb;
+use super::decode::VideoDecoder;
 use super::edit::{EditList, Invalid, Plan};
 use super::folder::{PARTIAL_DIR, PARTIAL_SUFFIX};
 use super::mp4::{self, ColorInfo, FragmentedWriter, ProgressiveFile, VideoTrack};
 use super::pacer::{Cadence, TickFifo};
 use super::recorder::{EncoderFactory, PartialLock, group_access_units};
-use crate::capture::{Damage, Frame, PixelFormat};
-
-/// H.264 `profile_idc` 66: what openh264's decoder reads.
-const BASELINE: u8 = 66;
+use crate::capture::Frame;
 
 /// A finished export.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,9 +98,9 @@ impl ExportError {
                 "this build of roomlerd has no audio encoder, so it cannot add music".into()
             }
             Self::DecoderUnavailable { profile } => format!(
-                "this recording's video is H.264 profile {profile} (a hardware encoder's); \
-                 editing it needs the decoder that arrives with FR-85 P4. Recordings made with \
-                 the software encoder (profile 66) can be edited now"
+                "this recording's video is H.264 profile {profile} (a hardware encoder's), and \
+                 this build of roomlerd has no decoder for it (its FFmpeg carries no H.264 \
+                 decoder). Recordings made with the software encoder (profile 66) can be edited"
             ),
             Self::EditList(e) => e.to_string(),
             Self::Cancelled => "the export was cancelled".into(),
@@ -121,28 +120,6 @@ pub fn edited_name(source: &Path) -> Option<PathBuf> {
     (2u32..1000)
         .map(|n| dir.join(format!("{stem} (edited {n}).mp4")))
         .find(|p| !p.exists())
-}
-
-/// A decoded picture as the BGRA frame every recording encoder takes.
-fn bgra_frame(pic: &openh264::decoder::DecodedYUV<'_>) -> Frame {
-    use openh264::formats::YUVSource;
-    let (w, h) = pic.dimensions();
-    let mut data = vec![0u8; w * h * 4];
-    pic.write_rgba8(&mut data);
-    for px in data.chunks_exact_mut(4) {
-        px.swap(0, 2);
-    }
-    Frame {
-        width: w as u32,
-        height: h as u32,
-        stride: (w * 4) as u32,
-        pixel_format: PixelFormat::Bgra,
-        data,
-        monotonic_us: 0,
-        monitor: 0,
-        damage: Damage::Unknown,
-        source: None,
-    }
 }
 
 /// The source's frame rate from its sample durations (the most common one):
@@ -189,11 +166,14 @@ pub async fn export(
     let format = src
         .video_format()
         .map_err(|e| ExportError::Source(format!("{e:#}")))?;
-    if format.profile != BASELINE {
-        return Err(ExportError::DecoderUnavailable {
+    // P4 — openh264 for the software encoder's Baseline, FFmpeg's decoder
+    // for everything else where this build carries it (`decode` module).
+    let mut decoder = VideoDecoder::for_profile(format.profile).map_err(|e| {
+        tracing::info!(profile = format.profile, %e, "export: no decoder for this recording");
+        ExportError::DecoderUnavailable {
             profile: format.profile,
-        });
-    }
+        }
+    })?;
     let samples = src
         .samples(mp4::VIDEO_TRACK_ID)
         .map_err(|e| ExportError::Source(format!("{e:#}")))?;
@@ -244,8 +224,6 @@ pub async fn export(
         .map_err(|e| ExportError::Source(format!("{e:#}")))?;
     let mut file = std::fs::File::open(source)
         .map_err(|e| ExportError::Source(format!("{}: {e}", source.display())))?;
-    let mut decoder = openh264::decoder::Decoder::new()
-        .map_err(|e| ExportError::Decode(format!("openh264 decoder: {e}")))?;
 
     // Staged beside the destination, locked like a recording's partial.
     let dest_dir = dest
@@ -297,14 +275,11 @@ pub async fn export(
                         au.extend_from_slice(&params);
                     }
                     au.extend_from_slice(&nals);
-                    let pic = decoder
-                        .decode(&au)
-                        .map_err(|e| ExportError::Decode(format!("sample {i}: {e}")))?;
-                    if i == want {
-                        let pic = pic.ok_or_else(|| {
-                            ExportError::Decode(format!("sample {i} produced no picture"))
-                        })?;
-                        picture = Some(Arc::new(bgra_frame(&pic)));
+                    if let Some(pic) = decoder
+                        .decode(&au, i, i == want)
+                        .map_err(ExportError::Decode)?
+                    {
+                        picture = Some(Arc::new(pic));
                     }
                 }
                 decoded = Some(want);

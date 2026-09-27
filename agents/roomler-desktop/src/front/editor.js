@@ -197,7 +197,7 @@
   const REFUSALS = {
     bad_edit_list: 'the edits cannot be followed',
     source_unreadable: 'the recording cannot be read',
-    decoder_unavailable: 'this recording was made with the GPU encoder, which this version cannot edit yet',
+    decoder_unavailable: 'this recording was made with the GPU encoder, and this device has no decoder for it',
     encoder_unavailable: 'no video encoder could be opened',
     decode_failed: 'the recording could not be decoded',
     write_failed: 'the new file could not be written',
