@@ -84,7 +84,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 11 | 08-24 | Hard-bounded macOS GUI probe | #661 |
 | 12 | 08-25 | Run-salted keys (reservation wedge) | #675, #677 |
 | 13 | 08-26 | **Seeds → release assets** (+ shakeout: mktemp for tar paths, dispatcher watches composites, `contents: write` on the OIDC-narrowed Windows jobs) | #722, #725, #726, #728 |
-| 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | this PR |
+| 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
 
 ## Acceptance criteria
 
