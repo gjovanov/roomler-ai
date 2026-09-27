@@ -456,6 +456,14 @@ pub fn gates() -> Gates {
     *gates_tx().borrow()
 }
 
+/// FR-85 P1e-mac — be told when the gates change. A supervised Mac's GUI worker
+/// re-sends its caps to the daemon on each change, because the DEVICE's row
+/// advertises the worker's `record` caps and an OFF must reach the hub within
+/// a heartbeat, not at the next attach.
+pub fn subscribe_gates() -> watch::Receiver<Gates> {
+    gates_tx().subscribe()
+}
+
 // ── The recorder this process runs ─────────────────────────────────────────
 
 static MANAGER: OnceLock<Arc<RecordingManager>> = OnceLock::new();
