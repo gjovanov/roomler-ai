@@ -357,9 +357,11 @@ sequenceDiagram
 - ⚠️ **The recorder runs as the person signed in at the device, at normal
   integrity, whatever the daemon runs as** (P1e, `recording/launch.rs`, see
   "Who the recorder runs as" below). Where there is nobody to record as —
-  SYSTEM with nobody signed in, or a Linux/macOS root daemon, whose drop to
-  the console user is not built yet — a local recording is refused, and says
-  why. `roomlerd record` run in your own session always works.
+  SYSTEM with nobody signed in, or a macOS root daemon, which has no screen
+  at all — a local recording is refused, and says why. On a supervised Mac
+  the companion talks to the GUI worker, which is the person, and records
+  there (P1e-mac, "A supervised Mac" below). `roomlerd record` run in your
+  own session always works.
 - **One recording at a time.** A second start answers an error. A child that
   exits without saying how it ended (a crash, bad arguments, a binary built
   without the recorder) ends as `recorder_exited` with a sentence, never as a
@@ -402,7 +404,7 @@ flowchart TD
     V -->|no| G{"a greeter or root's desktop active,<br/>or a DISPLAY / DRM scanout<br/>the recorder could reach?"}
     G -->|yes| LS
     G -->|"no: no screen at all"| N
-    S -->|"root (macOS)"| X["refused: the drop is<br/>not built there yet"]
+    S -->|"root (macOS)"| X["refused: root has no screen.<br/>A supervised Mac records in<br/>its GUI worker (P1e-mac)"]
 ```
 
 | The recorder's identity | How it is made | Its environment | Its desktop |
@@ -513,7 +515,9 @@ into the daemon's log: a service has no stderr of its own to share.
   field question (P6): the harness's synthetic source is proven, and so is
   the path to the file. A Linux host with a virtual display should behave
   like any X session.
-- Not yet: the drop on macOS (a root daemon there refuses). On a GNOME or
+- macOS is not a drop (P1e-mac): a root daemon has no WindowServer and
+  refuses, and a SUPERVISED Mac records in its GUI worker, which is the
+  person already ("A supervised Mac" below). On a GNOME or
   KDE **Wayland** session a recorder launched into it opens its own
   ScreenCast portal session, so the portal may ask the person first (P0's
   restore-token question).
@@ -760,7 +764,7 @@ sequenceDiagram
 |---|---|
 | `not_granted` | the session's grant lacks RECORD |
 | `disabled_on_device` | the owner's switch is off, read at the moment of asking and again after the prompt |
-| `unavailable` | there is nobody to record as (a root daemon on macOS, P1e; the kill switch), or the session is delegated to the macOS GUI worker |
+| `unavailable` | there is nobody to record as (the kill switch; a macOS root daemon, which has no screen), or the session was handed to a macOS GUI worker by a daemon older than P1e-mac, which sent no record context |
 | `login_screen` | the device is at its login screen (decision 6): Windows' sign-in screen, a Linux greeter or root's own desktop. Refused before the host is asked; `detail` says it. The device still advertises `available`, and records once someone signs in |
 | `audio_not_allowed` | computer audio was asked for and the owner has not allowed it, or the build has no audio |
 | `busy` | a recording is already running, local or remote |
@@ -932,6 +936,72 @@ sequenceDiagram
   id from the device's answer, so a reloaded page can stop a recording it did
   not start. If it comes back to find nothing recording, it says the recording
   ended while it was away.
+
+### A supervised Mac (P1e-mac)
+
+A macOS root daemon has no WindowServer, so it can never see the screen. With
+`macos_supervise_gui_worker` on (FR-43), it starts a **GUI worker** as the
+console user with `launchctl asuser` and `sudo -u`, and hands each primary-org
+remote-control session to it. The worker already holds the Screen Recording
+grant it captures with. So P1e-mac is **not a privilege drop**: the worker
+records. The root daemon never records anything itself; it resolves consent,
+carries the record context across and advertises what the worker can do.
+
+```mermaid
+sequenceDiagram
+    participant V as viewer
+    participant S as server (hub)
+    participant D as root daemon
+    participant W as GUI worker (the person)
+    participant R as roomlerd record (the person)
+    W->>D: WorkerCaps { record: [available, remote] } (at attach, and on every gate change)
+    D->>S: heartbeat caps.record = the worker's (primary org only)
+    V->>S: rc:session.request (RECORD)
+    S->>D: rc:session.request (RECORD kept: may_record and the cap)
+    D->>D: consent (the local floor) → RecordMeta { controller, prompt window }
+    D->>W: SessionParams { …, record: DelegatedRecord } (then the offer)
+    W->>W: its peer; the record channel gets the context
+    V->>W: rc:record.start (P2P, the record channel)
+    W->>R: spawn as itself: the person, in their GUI session, holding the grant
+    W->>D: RecordingActivity (admitted: a session handed over with RECORD)
+    D->>S: rc:recording.activity
+```
+
+| Piece | Where | What it guarantees |
+|---|---|---|
+| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2482` (sent AFTER the consent mode is resolved), `signaling.rs:1807` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1084`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:88` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:586` (`effective_record`), `signaling.rs:1622` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:363` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| The worker's account of a recording | `delegate.rs:548` (noted where the grant crosses), `delegate.rs:788` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
+
+- **Whose gates:** the worker's, which are the person's own config: the
+  worker runs without `--config`, so it reads the user's. The companion's
+  Recordings view and settings reach the worker over its per-user LocalAPI
+  socket (in the user's temp folder, where the companion looks first). The
+  root daemon's `/var/run/roomler/roomler.sock` is root-only, and its
+  recording verbs refuse `RootDaemon`.
+  ⚠️ So `sudo roomler config set record_remote_enabled …` changes the ROOT
+  daemon's copy, which a supervised Mac does not read for remote recording
+  (the key's own description says so). ANDing it in as a second gate would
+  make remote recording a double opt-in, a change to the shipped model: an
+  open decision for the operator, not taken here.
+- **Local recording** on a supervised Mac needs nothing from P1e-mac: the
+  companion's verbs land on the worker, whose recorder runs as itself
+  (`Inherit`).
+- ⚠️ **Primary org only.** A secondary org's session is never handed to the
+  worker, so its row keeps the daemon's own caps: none.
+- ⚠️ **A user switch ends the recording.** The supervisor replaces the worker
+  for the new console user and stops the old worker's process group, recorder
+  included. The partial is finalized as `interrupted` the next time that
+  person records (the recorder reconciles its staging folder as it starts,
+  `child.rs:358`); a recording never follows a user switch.
+- ⚠️ **Not built on macOS yet:** the microphone and computer audio (P1c-mac:
+  cpal, `NSMicrophoneUsageDescription`, the `audio-input` entitlement,
+  ScreenCaptureKit on 13+). They are refused by name. The banner is not
+  capture-excluded there, so it appears in the recording.
+- **Unsupervised Mac** (the default): the per-user LaunchAgent is its own
+  enrollment and records as the person, like any user install; the root row
+  cannot capture at all, so it offers no Record control.
 
 ### Downloading a remote recording (P3b-2)
 
