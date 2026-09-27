@@ -191,8 +191,9 @@ pub struct DelegatedRecord {
 /// FR-85 P1e-mac — how many delegated `RECORD` sessions the daemon remembers
 /// for [`DelegateHost::relay_upstream`]. Oldest out first: a claim about a
 /// session this far back has no live session left for the server to file it
-/// under anyway.
-const RECORD_SESSIONS_KEPT: usize = 64;
+/// under anyway. Generous (≈ 30 KB), so a controller cannot push a live
+/// recording's session out by opening sessions while it records.
+const RECORD_SESSIONS_KEPT: usize = 1024;
 
 /// What the worker's signalling loop receives over the delegation channel.
 ///
@@ -547,23 +548,18 @@ impl DelegateHost {
     pub fn send_params(&self, frame: DelegateFrame) -> bool {
         // FR-85 P1e-mac — remembered HERE, where the grant crosses, so the
         // relay's admission of a worker's `RecordingActivity` cannot drift from
-        // what the worker was actually given.
-        if let DelegateFrame::SessionParams(p) = &frame
-            && p.permissions
-                .contains(roomler_ai_remote_control::permissions::Permissions::RECORD)
-        {
-            let mut held = self
-                .inner
-                .record_sessions
-                .lock()
-                .expect("record sessions mutex");
-            if !held.iter().any(|s| *s == p.session_id) {
-                held.push_back(p.session_id.clone());
-                while held.len() > RECORD_SESSIONS_KEPT {
-                    held.pop_front();
-                }
+        // what the worker was actually given — and only once it DID cross: a
+        // session nobody was attached to receive, or whose params a full queue
+        // dropped, is not one any worker can have a recording of.
+        let recorded = match &frame {
+            DelegateFrame::SessionParams(p)
+                if p.permissions
+                    .contains(roomler_ai_remote_control::permissions::Permissions::RECORD) =>
+            {
+                Some(p.session_id.clone())
             }
-        }
+            _ => None,
+        };
         let tx = self
             .inner
             .to_worker
@@ -571,7 +567,23 @@ impl DelegateHost {
             .expect("to_worker mutex")
             .clone();
         let Some(tx) = tx else { return false };
-        tx.try_send(frame).is_ok()
+        if tx.try_send(frame).is_err() {
+            return false;
+        }
+        if let Some(session_id) = recorded {
+            let mut held = self
+                .inner
+                .record_sessions
+                .lock()
+                .expect("record sessions mutex");
+            if !held.iter().any(|s| *s == session_id) {
+                held.push_back(session_id);
+                while held.len() > RECORD_SESSIONS_KEPT {
+                    held.pop_front();
+                }
+            }
+        }
+        true
     }
 
     /// FR-85 P1e-mac — the `record` caps this DEVICE should advertise, given
@@ -614,6 +626,16 @@ impl DelegateHost {
     /// caller can forget at one of the four places a worker can stop.
     pub fn revoke(&self) {
         *self.inner.secret.lock().expect("secret mutex") = None;
+        // FR-85 P1e-mac — and what that worker was handed. The next worker is
+        // a new one (another console user, after a switch), and it must not
+        // report on sessions it never had. A transient channel drop does not
+        // come here, so a worker re-attaching keeps its memory, and the claims
+        // a recording makes after its session ends still pass.
+        self.inner
+            .record_sessions
+            .lock()
+            .expect("record sessions mutex")
+            .clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -1386,24 +1408,45 @@ mod params_tests {
     /// FR-85 P1e-mac — the worker may report recording activity ONLY about a
     /// session the daemon handed it with `RECORD`. Anything else is the
     /// device's own account of itself, forged by an unprivileged process.
+    /// A worker "attached" the way `run` attaches one: its queue set. Deep
+    /// enough for the bound test, and held so a send is never refused full.
+    fn attach_worker(host: &DelegateHost) -> tokio::sync::mpsc::Receiver<DelegateFrame> {
+        let (tx, rx) = tokio::sync::mpsc::channel(RECORD_SESSIONS_KEPT * 2);
+        *host.inner.to_worker.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    fn hand_over(
+        host: &DelegateHost,
+        id: bson::oid::ObjectId,
+        permissions: roomler_ai_remote_control::permissions::Permissions,
+    ) -> bool {
+        host.send_params(DelegateFrame::SessionParams(Box::new(params(
+            &id.to_hex(),
+            permissions,
+        ))))
+    }
+
     #[test]
     fn only_a_session_handed_over_with_record_may_report_recording_activity() {
         use roomler_ai_remote_control::permissions::Permissions;
         let host = DelegateHost::new();
+        let _worker = attach_worker(&host);
         let (recorded, watched, never) = (
             bson::oid::ObjectId::new(),
             bson::oid::ObjectId::new(),
             bson::oid::ObjectId::new(),
         );
-        // No worker attached: nothing is SENT, but the grant is still noted.
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &recorded.to_hex(),
-            Permissions::VIEW | Permissions::RECORD,
-        ))));
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &watched.to_hex(),
-            Permissions::VIEW | Permissions::INPUT,
-        ))));
+        assert!(hand_over(
+            &host,
+            recorded,
+            Permissions::VIEW | Permissions::RECORD
+        ));
+        assert!(hand_over(
+            &host,
+            watched,
+            Permissions::VIEW | Permissions::INPUT
+        ));
 
         assert!(host.records_session_of(&activity(recorded)));
         assert!(
@@ -1433,14 +1476,12 @@ mod params_tests {
     fn the_record_session_memory_is_bounded() {
         use roomler_ai_remote_control::permissions::Permissions;
         let host = DelegateHost::new();
+        let _worker = attach_worker(&host);
         let first = bson::oid::ObjectId::new();
         for id in std::iter::once(first)
             .chain((0..RECORD_SESSIONS_KEPT).map(|_| bson::oid::ObjectId::new()))
         {
-            host.send_params(DelegateFrame::SessionParams(Box::new(params(
-                &id.to_hex(),
-                Permissions::RECORD,
-            ))));
+            assert!(hand_over(&host, id, Permissions::RECORD));
         }
         assert!(
             !host.records_session_of(&activity(first)),
@@ -1463,6 +1504,89 @@ mod params_tests {
         assert_eq!(
             host.inner.record_sessions.lock().unwrap().len(),
             RECORD_SESSIONS_KEPT
+        );
+    }
+
+    /// Review finding — "noted" means DELIVERED: with no worker attached (or
+    /// a queue that refuses), no worker can have a recording of the session,
+    /// so nobody may report on it.
+    #[test]
+    fn a_session_no_worker_received_is_not_noted() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let host = DelegateHost::new();
+        let sid = bson::oid::ObjectId::new();
+        assert!(
+            !hand_over(&host, sid, Permissions::VIEW | Permissions::RECORD),
+            "nobody attached: the params went nowhere"
+        );
+        assert!(!host.records_session_of(&activity(sid)));
+
+        // A full queue drops them too.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(DelegateFrame::Ping).unwrap();
+        *host.inner.to_worker.lock().unwrap() = Some(tx);
+        assert!(!hand_over(
+            &host,
+            sid,
+            Permissions::VIEW | Permissions::RECORD
+        ));
+        assert!(!host.records_session_of(&activity(sid)));
+    }
+
+    /// Review finding — a revoked worker's sessions are forgotten, so the
+    /// next worker (another console user, after a switch) cannot report on
+    /// them.
+    #[test]
+    fn revoking_the_worker_forgets_what_it_was_handed() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let host = DelegateHost::new();
+        let _worker = attach_worker(&host);
+        let sid = bson::oid::ObjectId::new();
+        assert!(hand_over(&host, sid, Permissions::RECORD));
+        assert!(host.records_session_of(&activity(sid)));
+        host.revoke();
+        assert!(
+            !host.records_session_of(&activity(sid)),
+            "a replaced worker's sessions must not be reportable by the next one"
+        );
+    }
+
+    /// Review finding — the relay itself, end to end: a handed-over RECORD
+    /// session's activity reaches the control WS; anyone else's does not; and
+    /// a whitelisted message still passes (the positive control of the relay).
+    /// Without this, `relay_upstream` could stop consulting the admission and
+    /// every other test here would stay green.
+    #[test]
+    fn the_relay_puts_only_a_handed_over_sessions_activity_on_the_ws() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let host = DelegateHost::new();
+        let _worker = attach_worker(&host);
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        host.set_outbound(ws_tx);
+        let (recorded, other) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        assert!(hand_over(
+            &host,
+            recorded,
+            Permissions::VIEW | Permissions::RECORD
+        ));
+
+        host.relay_upstream(activity(recorded));
+        match ws_rx.try_recv() {
+            Ok(ClientMsg::RecordingActivity { session_id, .. }) => assert_eq!(session_id, recorded),
+            other => panic!("the handed-over session's activity must reach the WS, got {other:?}"),
+        }
+        host.relay_upstream(activity(other));
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "another session's activity must be dropped"
+        );
+        host.relay_upstream(ClientMsg::Terminate {
+            session_id: recorded,
+            reason: roomler_ai_remote_control::models::EndReason::AgentHangup,
+        });
+        assert!(
+            matches!(ws_rx.try_recv(), Ok(ClientMsg::Terminate { .. })),
+            "the relay still carries the whitelist"
         );
     }
 
