@@ -41,6 +41,33 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The `command` of a record `enable-system-context` wrote.
+pub const ENABLE_COMMAND: &str = "enable-system-context";
+/// The `command` of a record `disable-system-context` wrote.
+pub const DISABLE_COMMAND: &str = "disable-system-context";
+
+/// #1727 — was SystemContext ON after the last recorded switch? What
+/// `keep-system-context` (the perMachine MSI with no
+/// `ENABLE_SYSTEM_CONTEXT` on its command line) restores.
+///
+/// The record is the evidence because nothing else survives an install:
+/// every install deletes and recreates the service (and a major upgrade
+/// runs the old product's `service uninstall` first), taking
+/// `ROOMLERD_ENABLE_SYSTEM_SWAP` with it, while this file is only ever
+/// written by an enable or a disable — every MSI since rc.44 runs one.
+///
+/// ON only for an enable that got past writing the variable: `ok`, or a
+/// restart that failed after the write. A disable, a write that failed,
+/// any other command or no record at all is OFF — what an install with
+/// no property did before #1727.
+pub fn last_switched_on(last: Option<&Attempt>) -> bool {
+    matches!(
+        last,
+        Some(a) if a.command == ENABLE_COMMAND
+            && matches!(a.stage, Stage::Ok | Stage::ServiceRestart)
+    )
+}
+
 /// Where the attempt was when it terminated. `Ok` only on full
 /// success; the other variants name which sub-step the composite
 /// subcommand was inside.
@@ -286,5 +313,63 @@ mod tests {
         let s = p.to_string_lossy().to_lowercase();
         assert!(s.contains("roomler"));
         assert!(s.ends_with("last-system-context-attempt.json"));
+    }
+
+    fn rec(command: &str, stage: Stage) -> Attempt {
+        match stage {
+            Stage::Ok => Attempt::ok(command),
+            s => Attempt::failure(command, s, "e", "h"),
+        }
+    }
+
+    /// #1727 — the whole table `keep-system-context` decides by. ON only
+    /// for an enable that wrote the variable; everything else is what an
+    /// install with no property did before: off.
+    #[test]
+    fn only_an_enable_that_wrote_the_switch_keeps_system_context_on() {
+        let cells = [
+            (Some(rec(ENABLE_COMMAND, Stage::Ok)), true),
+            // The restart failed AFTER the variable was written: it is on.
+            (Some(rec(ENABLE_COMMAND, Stage::ServiceRestart)), true),
+            (Some(rec(ENABLE_COMMAND, Stage::EnvVarWrite)), false),
+            (Some(rec(ENABLE_COMMAND, Stage::Unknown)), false),
+            (Some(rec(DISABLE_COMMAND, Stage::Ok)), false),
+            (Some(rec(DISABLE_COMMAND, Stage::EnvVarWrite)), false),
+            (Some(rec("set-service-env-var", Stage::Ok)), false),
+            (None, false),
+        ];
+        for (last, want) in cells {
+            assert_eq!(
+                last_switched_on(last.as_ref()),
+                want,
+                "{:?}",
+                last.as_ref().map(|a| (&a.command, a.stage))
+            );
+        }
+    }
+
+    /// The record as a field host actually has it (CORPLAP-2 after
+    /// `enable-system-context`, 2026-09-27), read back through the same
+    /// path the subcommand uses. A reader that ever stopped parsing the
+    /// shipped shape would turn every SystemContext host OFF on its next
+    /// hand-run install — the bug this exists to prevent.
+    #[test]
+    fn the_shipped_record_shape_reads_as_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("last-system-context-attempt.json");
+        std::fs::write(
+            &target,
+            br#"{ "version": 1, "ts": "2026-09-27T08:14:58Z", "command": "enable-system-context", "stage": "ok", "exit_code": 0, "stderr": "", "hint": "" }"#,
+        )
+        .unwrap();
+        let last = read_last_at(&target).unwrap();
+        assert!(last_switched_on(last.as_ref()));
+        std::fs::write(
+            &target,
+            br#"{ "version": 1, "ts": "2026-09-26T23:46:52Z", "command": "disable-system-context", "stage": "ok", "exit_code": 0, "stderr": "", "hint": "" }"#,
+        )
+        .unwrap();
+        let last = read_last_at(&target).unwrap();
+        assert!(!last_switched_on(last.as_ref()));
     }
 }
