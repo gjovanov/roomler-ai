@@ -10250,8 +10250,9 @@ async fn handle_files_control(
 /// Spawn a tokio task that pumps an outgoing single-file download.
 /// The task owns the `Arc<RTCDataChannel>` so the DC outlives the
 /// stream even if the original `attach_files_handler` closure has
-/// returned. Cancellation flows via the AtomicBool on
-/// `OutgoingTransfer`; the caller flips it via `cancel_outgoing`.
+/// returned. It stops through the stop token on `OutgoingTransfer`,
+/// which `cancel_outgoing` (the browser) and `end_session` (the session
+/// ending) fire; every await races it (#1730).
 fn spawn_outgoing_pump(
     dc: Arc<RTCDataChannel>,
     handler: crate::files::FilesHandler,
@@ -10280,50 +10281,71 @@ fn spawn_outgoing_pump(
             }
         };
 
-        send_files_json(
-            &dc,
-            &crate::files::FilesOutgoing::Offer {
-                id: &offer.id,
-                name: &offer.name,
-                size: offer.size,
-                mime: offer.mime,
-            },
+        // #1730 — from here every message races the stop token too, and the
+        // transfer's state (with the updater's guard) goes FIRST on every
+        // exit: a last message to a peer that vanished may never be sent.
+        if or_stopped(
+            &offer.cancel,
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Offer {
+                    id: &offer.id,
+                    name: &offer.name,
+                    size: offer.size,
+                    mime: offer.mime,
+                },
+            ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            handler.finish_outgoing(&offer.id).await;
+            return;
+        }
 
         let bytes_sent = match pump_outgoing_file(&dc, &handler, &offer).await {
             Ok(n) => n,
             Err(e) => {
+                handler.finish_outgoing(&offer.id).await;
+                if offer.cancel.is_cancelled() {
+                    info!(%session_id, id = %offer.id, "files: download stopped (cancelled, or the session ended)");
+                    return;
+                }
                 warn!(%session_id, id = %offer.id, %e, "files: pump_outgoing failed");
                 let msg = format!("{e}");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Error {
-                        id: &offer.id,
-                        message: &msg,
-                    },
+                let _ = or_stopped(
+                    &offer.cancel,
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &offer.id,
+                            message: &msg,
+                        },
+                    ),
                 )
                 .await;
-                handler.finish_outgoing(&offer.id).await;
                 return;
             }
         };
 
-        // Successful end-of-stream: send Eof so browser closes
-        // the writable cleanly, then clear state.
+        // Successful end-of-stream: clear state, then send Eof so the
+        // browser closes the writable cleanly.
         info!(
             %session_id, id = %offer.id, bytes_sent, path = %offer.path.display(),
             "files: outgoing complete"
         );
-        send_files_json(
-            &dc,
-            &crate::files::FilesOutgoing::Eof {
-                id: &offer.id,
-                bytes: bytes_sent,
-            },
+        handler.finish_outgoing(&offer.id).await;
+        let _ = or_stopped(
+            &offer.cancel,
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Eof {
+                    id: &offer.id,
+                    bytes: bytes_sent,
+                },
+            ),
         )
         .await;
-        handler.finish_outgoing(&offer.id).await;
     });
 }
 
@@ -10362,16 +10384,26 @@ fn spawn_outgoing_zip_pump(
             }
         };
 
-        send_files_json(
-            &dc,
-            &crate::files::FilesOutgoing::Offer {
-                id: &offer.id,
-                name: &offer.name,
-                size: None, // streaming — total unknown
-                mime: offer.mime,
-            },
+        // #1730 — as the single-file download: every message races the stop
+        // token, and the transfer's state goes first on every exit.
+        if or_stopped(
+            &offer.cancel,
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Offer {
+                    id: &offer.id,
+                    name: &offer.name,
+                    size: None, // streaming — total unknown
+                    mime: offer.mime,
+                },
+            ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            handler.finish_outgoing(&offer.id).await;
+            return;
+        }
 
         // Bounded duplex pipe: write side fed by async_zip; read
         // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
@@ -10402,30 +10434,40 @@ fn spawn_outgoing_zip_pump(
         let total_bytes = match (walk_res, pump_res) {
             (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
             (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
+                handler.finish_outgoing(&offer.id).await;
+                if offer.cancel.is_cancelled() {
+                    info!(%session_id, id = %offer.id, "files: zip download stopped (cancelled, or the session ended)");
+                    return;
+                }
                 warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
                 let msg = format!("{e}");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Error {
-                        id: &offer.id,
-                        message: &msg,
-                    },
+                let _ = or_stopped(
+                    &offer.cancel,
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &offer.id,
+                            message: &msg,
+                        },
+                    ),
                 )
                 .await;
-                handler.finish_outgoing(&offer.id).await;
                 return;
             }
             (Err(je), _) | (_, Err(je)) => {
+                handler.finish_outgoing(&offer.id).await;
                 warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Error {
-                        id: &offer.id,
-                        message: "zip pump task panicked",
-                    },
+                let _ = or_stopped(
+                    &offer.cancel,
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &offer.id,
+                            message: "zip pump task panicked",
+                        },
+                    ),
                 )
                 .await;
-                handler.finish_outgoing(&offer.id).await;
                 return;
             }
         };
@@ -10435,25 +10477,30 @@ fn spawn_outgoing_zip_pump(
             path = %offer.path.display(),
             "files: outgoing zip complete"
         );
-        send_files_json(
-            &dc,
-            &crate::files::FilesOutgoing::Eof {
-                id: &offer.id,
-                bytes: total_bytes,
-            },
+        handler.finish_outgoing(&offer.id).await;
+        let _ = or_stopped(
+            &offer.cancel,
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Eof {
+                    id: &offer.id,
+                    bytes: total_bytes,
+                },
+            ),
         )
         .await;
-        handler.finish_outgoing(&offer.id).await;
     });
 }
 
 /// Pump bytes from the duplex reader to the DC, applying SCTP
-/// backpressure. Returns total bytes sent. Exits on EOF, cancel,
-/// or DC failure.
-async fn zip_pump_loop(
-    dc: Arc<RTCDataChannel>,
+/// backpressure. Returns total bytes sent. Exits on EOF, the stop
+/// token (a cancel, or the session's end: every await races it,
+/// #1730), or DC failure. Returning drops the reader, which fails the
+/// zip writer's next write, so the walk ends too.
+async fn zip_pump_loop<S: DownloadSink>(
+    dc: S,
     mut reader: tokio::io::DuplexStream,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: tokio_util::sync::CancellationToken,
     id: String,
 ) -> anyhow::Result<u64> {
     use tokio::io::AsyncReadExt;
@@ -10464,41 +10511,34 @@ async fn zip_pump_loop(
     let mut total: u64 = 0;
     let mut last_progress: u64 = 0;
     loop {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(anyhow::anyhow!("cancelled by browser"));
-        }
-        let n = match reader.read(&mut buf).await {
+        let n = match or_stopped(&stop, reader.read(&mut buf)).await? {
             Ok(0) => break, // EOF — zip writer closed
             Ok(n) => n,
             Err(e) => return Err(anyhow::anyhow!("duplex read: {e}")),
         };
         // Backpressure on SCTP send buffer. ⚠️ After a drop the buffer
         // never drains (only a SACK lowers it), so the channel's state ends
-        // the wait too — not only a cancel the browser can no longer send.
-        while dc.buffered_amount().await > BACKPRESSURE_HIGH {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(anyhow::anyhow!("cancelled by browser"));
-            }
-            if channel_gone(dc.ready_state()) {
+        // the wait too, and the stop token ends it even when the channel
+        // never says it closed.
+        while or_stopped(&stop, dc.buffered()).await? > BACKPRESSURE_HIGH {
+            or_stopped(&stop, tokio::time::sleep(Duration::from_millis(20))).await?;
+            if dc.gone() {
                 return Err(anyhow::anyhow!("the channel closed"));
             }
         }
         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
-        if let Err(e) = dc.send(&chunk).await {
-            return Err(anyhow::anyhow!("dc.send failed: {e}"));
-        }
+        or_stopped(&stop, dc.send_chunk(&chunk)).await??;
         total += n as u64;
         if total - last_progress >= 256 * 1024 {
             last_progress = total;
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Progress {
+            or_stopped(
+                &stop,
+                dc.send_json(&crate::files::FilesOutgoing::Progress {
                     id: &id,
                     bytes: total,
-                },
+                }),
             )
-            .await;
+            .await?;
         }
     }
     Ok(total)
@@ -10506,59 +10546,53 @@ async fn zip_pump_loop(
 
 /// Pump a single open file through the DC in 64 KiB chunks. Backs
 /// off when the SCTP send buffer is over 4 MiB to avoid OOMing on
-/// large files. Checks the cancel flag between chunks. Returns the
-/// total bytes sent on clean stream exit.
-async fn pump_outgoing_file(
-    dc: &Arc<RTCDataChannel>,
+/// large files. Every await races the offer's stop token (#1730), so
+/// a cancel or the session's end stops it wherever it waits. Returns
+/// the total bytes sent on clean stream exit.
+async fn pump_outgoing_file<S: DownloadSink>(
+    dc: &S,
     handler: &crate::files::FilesHandler,
     offer: &crate::files::OutgoingOffer,
 ) -> anyhow::Result<u64> {
     use tokio::io::AsyncReadExt;
     const CHUNK: usize = 64 * 1024;
-    const BACKPRESSURE_HIGH: u64 = 4 * 1024 * 1024;
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    let stop = &offer.cancel;
 
-    let mut file = handler.open_outgoing(&offer.id).await?;
+    let mut file = or_stopped(stop, handler.open_outgoing(&offer.id)).await??;
     let mut buf = vec![0u8; CHUNK];
     let mut total: u64 = 0;
     let mut last_progress: u64 = 0;
     loop {
-        if offer.cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(anyhow::anyhow!("cancelled by browser"));
-        }
         // Backpressure: poll buffered_amount and yield until it
-        // drops below the high-watermark. webrtc-rs's DC reports
-        // bufferedAmount synchronously.
+        // drops below the high-watermark.
         // ⚠️ After a drop the buffer never drains (only a SACK lowers it):
-        // the channel's state ends the wait too (see `zip_pump_loop`).
-        while dc.buffered_amount().await > BACKPRESSURE_HIGH as usize {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if offer.cancel.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(anyhow::anyhow!("cancelled by browser"));
-            }
-            if channel_gone(dc.ready_state()) {
+        // the channel's state ends the wait too, and the stop token ends
+        // it even when the channel never says it closed.
+        while or_stopped(stop, dc.buffered()).await? > BACKPRESSURE_HIGH {
+            or_stopped(stop, tokio::time::sleep(Duration::from_millis(20))).await?;
+            if dc.gone() {
                 return Err(anyhow::anyhow!("the channel closed"));
             }
         }
-        let n = file.read(&mut buf).await?;
+        let n = or_stopped(stop, file.read(&mut buf)).await??;
         if n == 0 {
             break;
         }
         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
-        if let Err(e) = dc.send(&chunk).await {
-            return Err(anyhow::anyhow!("dc.send failed: {e}"));
-        }
+        or_stopped(stop, dc.send_chunk(&chunk)).await??;
         total += n as u64;
         // Progress reports every 256 KiB
         if total - last_progress >= 256 * 1024 {
             last_progress = total;
-            send_files_json(
-                dc,
-                &crate::files::FilesOutgoing::Progress {
+            or_stopped(
+                stop,
+                dc.send_json(&crate::files::FilesOutgoing::Progress {
                     id: &offer.id,
                     bytes: total,
-                },
+                }),
             )
-            .await;
+            .await?;
         }
     }
     Ok(total)
@@ -10610,6 +10644,60 @@ async fn handle_files_chunk(
 async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutgoing<'_>) {
     if let Ok(s) = serde_json::to_string(msg) {
         let _ = dc.send_text(s).await;
+    }
+}
+
+/// #1730 — what a download pump needs of its data channel: the channel
+/// itself in production; in the tests, one whose send never returns, which
+/// is how a channel whose peer vanished looks from inside the pump.
+trait DownloadSink: Send + Sync {
+    fn buffered(&self) -> impl std::future::Future<Output = usize> + Send;
+    fn send_chunk(
+        &self,
+        chunk: &bytes::Bytes,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn send_json(
+        &self,
+        msg: &crate::files::FilesOutgoing<'_>,
+    ) -> impl std::future::Future<Output = ()> + Send;
+    /// Closed, or begun to ([`channel_gone`]).
+    fn gone(&self) -> bool;
+}
+
+impl DownloadSink for Arc<RTCDataChannel> {
+    async fn buffered(&self) -> usize {
+        self.buffered_amount().await
+    }
+    async fn send_chunk(&self, chunk: &bytes::Bytes) -> anyhow::Result<()> {
+        self.send(chunk)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("dc.send failed: {e}"))
+    }
+    async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
+        send_files_json(self, msg).await
+    }
+    fn gone(&self) -> bool {
+        channel_gone(self.ready_state())
+    }
+}
+
+/// #1730 — `fut`, unless `stop` fires first. Every await a download makes
+/// goes through this: a stop flag read BETWEEN awaits is never read by a pump
+/// parked INSIDE one, and after a network drop the channel's send, its
+/// `buffered_amount` and a progress message can each park for good. That
+/// pump held its file, its channel and the transfer guard the updater defers
+/// for, and made the peer's close wait out its whole budget (field, 0.4.107:
+/// the file held at +4 m 43 s, `terminated` → `Closed` 5.0 s). Dropping the
+/// parked future is what lets go: a lock it waited on is released with it.
+async fn or_stopped<T>(
+    stop: &tokio_util::sync::CancellationToken,
+    fut: impl std::future::Future<Output = T>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => Err(anyhow::anyhow!("stopped: cancelled, or the session ended")),
+        v = fut => Ok(v),
     }
 }
 
@@ -12039,5 +12127,183 @@ mod session_end_tests {
             "the channel is still held: {} of {attached}",
             Arc::strong_count(&dc)
         );
+    }
+}
+
+/// #1730 — a download must end where it is PARKED when it is stopped, not
+/// at its next check. A dead channel is simulated by a sink whose send (or
+/// `buffered_amount`) never returns, the shape a network-dropped session had
+/// in the field (0.4.107: the file held at +4 m 43 s).
+#[cfg(test)]
+mod download_stop_tests {
+    use super::*;
+
+    /// A channel whose peer vanished: the send parks for good.
+    struct StuckSend {
+        parked: Arc<tokio::sync::Notify>,
+    }
+    impl DownloadSink for StuckSend {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// One whose `buffered_amount` parks (its lock held by a close that
+    /// never finishes).
+    struct StuckBuffered {
+        parked: Arc<tokio::sync::Notify>,
+    }
+    impl DownloadSink for StuckBuffered {
+        async fn buffered(&self) -> usize {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A healthy channel: keeps what it was sent.
+    struct Collect {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl DownloadSink for Collect {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            self.bytes.lock().unwrap().extend_from_slice(chunk);
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A file in the test's own folder, never the real Downloads (#1724).
+    fn a_file(len: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("download.bin");
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, body).expect("write the file");
+        (dir, path)
+    }
+
+    async fn ends_within_2s(
+        pump: tokio::task::JoinHandle<anyhow::Result<u64>>,
+        what: &str,
+    ) -> anyhow::Result<u64> {
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .unwrap_or_else(|_| panic!("#1730: {what}"))
+            .expect("the pump task")
+    }
+
+    #[tokio::test]
+    async fn a_download_parked_in_a_send_ends_with_the_session() {
+        let (_dir, path) = a_file(512 * 1024);
+        let handler = crate::files::FilesHandler::new();
+        let offer = handler
+            .begin_outgoing("stuck-send".into(), &path.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let sink = StuckSend {
+            parked: parked.clone(),
+        };
+        let h = handler.clone();
+        let pump = tokio::spawn(async move { pump_outgoing_file(&sink, &h, &offer).await });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the pump reached its send");
+        handler.end_session().await;
+        let done = ends_within_2s(
+            pump,
+            "the download must end with the session, not stay parked in a send that never returns",
+        )
+        .await;
+        assert!(done.is_err(), "a stopped download says so: {done:?}");
+    }
+
+    #[tokio::test]
+    async fn a_download_parked_on_the_send_buffer_ends_with_a_browser_cancel() {
+        let (_dir, path) = a_file(64 * 1024);
+        let handler = crate::files::FilesHandler::new();
+        let offer = handler
+            .begin_outgoing("stuck-buffer".into(), &path.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let sink = StuckBuffered {
+            parked: parked.clone(),
+        };
+        let h = handler.clone();
+        let pump = tokio::spawn(async move { pump_outgoing_file(&sink, &h, &offer).await });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the pump reached the send buffer");
+        assert!(handler.cancel_outgoing("stuck-buffer").await);
+        let done = ends_within_2s(pump, "a cancel must end a download parked on the buffer").await;
+        assert!(done.is_err(), "{done:?}");
+    }
+
+    #[tokio::test]
+    async fn a_zip_download_parked_in_a_send_ends_with_its_stop() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(256 * 1024);
+        writer
+            .write_all(&[7u8; 128 * 1024])
+            .await
+            .expect("feed the pipe");
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let pump = tokio::spawn(zip_pump_loop(
+            StuckSend {
+                parked: parked.clone(),
+            },
+            reader,
+            stop.clone(),
+            "zip".into(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .expect("the zip pump reached its send");
+        stop.cancel();
+        let done = ends_within_2s(pump, "the zip pump must end with its stop").await;
+        assert!(done.is_err(), "{done:?}");
+        drop(writer);
+    }
+
+    /// The positive control: a healthy channel gets the whole file, byte for
+    /// byte, so the races above never cut a download that is not stopped.
+    #[tokio::test]
+    async fn a_download_to_a_healthy_channel_sends_the_whole_file() {
+        let (_dir, path) = a_file(300 * 1024 + 7);
+        let handler = crate::files::FilesHandler::new();
+        let offer = handler
+            .begin_outgoing("whole".into(), &path.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Collect { bytes: got.clone() };
+        let sent = pump_outgoing_file(&sink, &handler, &offer)
+            .await
+            .expect("the download completes");
+        let want = std::fs::read(&path).expect("read the file back");
+        assert_eq!(sent, want.len() as u64);
+        assert!(*got.lock().unwrap() == want, "the bytes arrived intact");
     }
 }
