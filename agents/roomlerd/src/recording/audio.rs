@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-85 P1c — a recording's audio: computer audio and/or the microphone,
-//! mixed on the RECORDER's clock and encoded to Opus.
+//! mixed on the RECORDER's clock. The encoder (Opus, or AAC from P4) is
+//! [`super::audio_codec`]'s, fed by the recorder once its video has begun.
 //!
 //! **The clock is the recorder's, not the devices'.** WASAPI loopback
 //! delivers nothing while nothing plays, and every device clock drifts from
@@ -36,11 +37,11 @@ use audiopus::{Application, Bitrate, Channels, SampleRate};
 
 use crate::audio::{AudioCapture, AudioFrame};
 
-/// The recording's audio rate — the only rate Opus-in-MP4 carries here.
+/// The recording's audio rate — the only rate its tracks carry.
 pub const RATE: u32 = 48_000;
 /// Stereo.
 pub const CHANNELS: usize = 2;
-/// One Opus frame: 20 ms at 48 kHz, per channel.
+/// One mixer frame (and one Opus packet): 20 ms at 48 kHz, per channel.
 pub const FRAME: usize = 960;
 /// How far behind the recording clock the mixer runs (see the module doc).
 pub const MIX_LAG: Duration = Duration::from_millis(60);
@@ -314,10 +315,9 @@ pub struct SourceStats {
 }
 
 /// A recording's audio, running: a task per source feeding its buffer, and
-/// the mixer + encoder driven by the recorder's loop.
+/// the mixer driven by the recorder's loop.
 pub struct RecordingAudio {
     mixer: Mixer,
-    opus: RecordingOpus,
     buffers: Vec<Arc<Mutex<SourceBuffer>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub system: bool,
@@ -328,7 +328,6 @@ impl RecordingAudio {
     /// Start pulling every source. Their pre-roll (whatever the devices
     /// buffered before the clock started) is cut by the backlog trim.
     pub fn start(sources: AudioSources) -> Result<Self> {
-        let opus = RecordingOpus::new()?;
         let system = sources.system.is_some();
         let microphone = sources.microphone.is_some();
         let mut buffers = Vec::new();
@@ -363,7 +362,6 @@ impl RecordingAudio {
         }
         Ok(Self {
             mixer: Mixer::new(buffers.clone()),
-            opus,
             buffers,
             tasks,
             system,
@@ -371,18 +369,12 @@ impl RecordingAudio {
         })
     }
 
-    /// The Opus pre-skip for the track header.
-    pub fn pre_skip(&self) -> u16 {
-        self.opus.pre_skip
-    }
-
-    /// Encode every frame that ends at or before `until` (frames per channel
-    /// since the clock started), handing `(frame start, packet)` to `sink`.
-    pub fn produce_until(&mut self, until: u64, sink: &mut dyn FnMut(u64, Vec<u8>)) -> Result<()> {
-        let opus = &mut self.opus;
+    /// Mix every frame that ends at or before `until` (frames per channel
+    /// since the clock started), handing `(frame start, interleaved stereo)`
+    /// to `sink`.
+    pub fn produce_until(&mut self, until: u64, sink: &mut dyn FnMut(u64, &[i16])) -> Result<()> {
         self.mixer.mix_until(until, |start, frame| {
-            let packet = opus.encode(frame)?;
-            sink(start, packet);
+            sink(start, frame);
             Ok(())
         })
     }

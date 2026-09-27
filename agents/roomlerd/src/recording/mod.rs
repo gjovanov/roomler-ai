@@ -13,9 +13,10 @@
 //! in [`sidecar`].
 //!
 //! Not here yet (later FR-85 phases): the microphone and computer audio on
-//! macOS (P1c-mac), delivery out of the recorder's data folder (P2c),
-//! re-attaching after a dropped session (P3b-3), and FFmpeg's decoders and
-//! AAC (P4).
+//! macOS (P1c-mac), re-attaching after a dropped session (P3b-3), and
+//! FFmpeg's H.264 decoder for hardware-encoded recordings (P4b-2). AAC (P4)
+//! is [`audio_codec`]'s, and waits only for the vendored FFmpeg that carries
+//! its encoder.
 //!
 //! Design and gates: `docs/fr/FR-85-hq-screen-recording.md`.
 
@@ -24,6 +25,10 @@ pub mod annexb;
 /// clock (the `audio` feature: cpal + audiopus).
 #[cfg(feature = "audio")]
 pub mod audio;
+/// FR-85 P4 — the audio encoder: AAC where this build's FFmpeg has it, Opus
+/// everywhere else.
+#[cfg(feature = "audio")]
+pub mod audio_codec;
 pub mod child;
 /// FR-85 P5 — the edit list and its exact time map.
 pub mod edit;

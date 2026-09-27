@@ -11,7 +11,8 @@
 //!
 //! - **The sound (P5b)** is [`super::export_audio`]'s: the recording's own
 //!   audio through the same plan (muted under a speed-up) and music under it,
-//!   one Opus track interleaved with the video. A build without `audio`
+//!   one track interleaved with the video — AAC where this build's FFmpeg
+//!   has the encoder, Opus otherwise (P4). A build without `audio`
 //!   carries none and says so (`not_carried`), and refuses music
 //!   (`audio_unavailable`): a caller never presents a silent file as complete.
 //! - **openh264 decodes what the software encoder writes** (Constrained
@@ -317,13 +318,7 @@ pub async fn export(
                 encoder_name = e.name().to_string();
                 encoder = Some(e);
                 #[cfg(feature = "audio")]
-                let audio_track = audio.as_ref().map(|a| mp4::AudioTrack {
-                    sample_rate: super::audio::RATE,
-                    channels: super::audio::CHANNELS as u8,
-                    codec: mp4::AudioCodec::Opus {
-                        pre_skip: a.pre_skip(),
-                    },
-                });
+                let audio_track = audio.as_ref().map(|a| a.track());
                 #[cfg(not(feature = "audio"))]
                 let audio_track = None;
                 writer = Some(
@@ -362,8 +357,8 @@ pub async fn export(
             if let Some(a) = audio.as_mut() {
                 let frame_end = cadence.pts(n as u64 + 1) * u64::from(super::audio::RATE)
                     / u64::from(mp4::VIDEO_TIMESCALE);
-                a.produce_until(frame_end, &mut |packet| {
-                    w.push_audio(&packet, super::audio::FRAME as u32)
+                a.produce_until(frame_end, &mut |packet, duration| {
+                    w.push_audio(&packet, duration)
                 })
                 .map_err(audio_failed)?;
             }
@@ -379,7 +374,7 @@ pub async fn export(
     #[cfg(feature = "audio")]
     let result = match (result, audio.as_mut(), writer.as_mut()) {
         (Ok(()), Some(a), Some(w)) => a
-            .finish(&mut |packet| w.push_audio(&packet, super::audio::FRAME as u32))
+            .finish(&mut |packet, duration| w.push_audio(&packet, duration))
             .map_err(audio_failed),
         (r, _, _) => r,
     };
