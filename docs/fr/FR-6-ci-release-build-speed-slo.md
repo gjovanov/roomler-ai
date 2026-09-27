@@ -139,3 +139,13 @@ itself on the affected run's page. Baseline when the program started: releases t
   warm run, test execution was ~3.5 of the 20 minutes; the rest was `roomlerd` and
   friends compiled in ~12 feature configurations, one after another. Wave 14 plan and
   numbers: #773.
+- 2026-09-27: **Wave 14 (#1743) cold numbers.** Its own PR runs are cold by
+  construction, since the `ci.yml` edit rotates every key: the `Rust checks` critical
+  path fell from 36.8 to ~17 min cold and the whole CI from 36.9 to 18.2 min (run
+  36345672545). Cold runner variance is ~30%: identical lint steps took 316 s and
+  426 s on two runners. The first master run after the merge seeded every lane
+  (36346857140, 21.8 min cold), and the janitor fired from its new `workflow_run`
+  trigger 2 s after it finished. The pool then held one generation per family, all
+  on master. A wrong turn, recorded: the first layout put the integration type-check
+  in the unit lane, where it re-checked ~800 dependencies from scratch (369 s against
+  31 s beside the clippy whose check-mode artifacts it reuses).
