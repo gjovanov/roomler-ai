@@ -122,7 +122,17 @@ carries no digest.
   one past it: re-enabling `auto_update` on the canary host must carry it to
   the very next fleet release. A canary numbered above a fleet release cut
   later from a newer master strands the host (the updater only moves up), and
-  the version order stops matching source age.
+  the version order stops matching source age. The macOS canary PASSED on
+  2026-09-27 and stays installed on the supervised MacBook. Its update helper
+  was left intact, so `0.4.110` replaces it when it publishes.
+- 📜 **The LGPL offer must describe what the tag ships.** release-agent's
+  FR-24 gate refuses a tag while the `…corresponding-source.inputs.txt` on
+  `vendored-ffmpeg-9.0.1` disagrees with the checkout's FFmpeg patches, vcpkg
+  baseline, or vendor recipe (`vendor-ffmpeg-windows.yml`,
+  `vendor-ffmpeg-macos.yml`, which carry the configure options; checked since
+  FR-85 P4c). After any change to one of them, dispatch `lgpl-source-offer.yml`
+  on master **before** tagging. `0.4.110` is the first tag that needs it: P4c
+  changed the recipe and brought the recorder into `full`.
 
 ## 4 · Break-glass: the build-host path
 

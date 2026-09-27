@@ -82,11 +82,11 @@ one line and the next rung is tried. Locked by tests
 (`hw_frame_names_close_every_cascade`,
 `videotoolbox_and_the_hw_frame_rungs_are_appended_never_prepended`).
 
-| Platform | The vendored FFmpeg 9.0.1 (LGPL, `--disable-everything` + exactly the encoders the tables name) | Linkage |
+| Platform | The vendored FFmpeg 9.0.1 (LGPL, `--disable-everything` + exactly the encoders the tables name; since FR-85 P4c also the software `h264` decoder and the `aac` encoder the screen recorder needs, and never an `hevc` decoder) | Linkage |
 |---|---|---|
-| Windows x86_64 | the ten vendor encoders (`h264/hevc/av1 × nvenc/qsv/amf` + `vp9_qsv`) + `h264/hevc/av1_d3d12va` + `h264/hevc/av1_vulkan` (sixteen), an overlay port over the pinned vcpkg baseline; D3D12 and Vulkan are dlopen'd by FFmpeg (`d3d12.dll`, `vulkan-1.dll`), so the static tree carries no import for either | static (`x64-windows-static-md`) — see [`lgpl-relink.md`](lgpl-relink.md) |
-| Linux x86_64 | the same ten + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (seventeen), from source; **libva + libdrm built into the tree** and bundled with the libav* in the `.deb` (no `Depends` on the system's libva — why is under *Hardware frames*); `libvulkan.so.1` is dlopen'd, never a DT_NEEDED | shared, the agent's private lib dir via RPATH; the VA driver and the Vulkan ICD are the host's |
-| macOS arm64 | `h264/hevc/av1_videotoolbox` only (~1.8 MB of dylibs), built with `--disable-autodetect` so nothing Homebrew is baked in | shared dylibs in the app bundle |
+| Windows x86_64 | the ten vendor encoders (`h264/hevc/av1 × nvenc/qsv/amf` + `vp9_qsv`) + `h264/hevc/av1_d3d12va` + `h264/hevc/av1_vulkan` (sixteen), plus the `h264` decoder and the `aac` encoder, an overlay port over the pinned vcpkg baseline; D3D12 and Vulkan are dlopen'd by FFmpeg (`d3d12.dll`, `vulkan-1.dll`), so the static tree carries no import for either | static (`x64-windows-static-md`) — see [`lgpl-relink.md`](lgpl-relink.md) |
+| Linux x86_64 | the same ten + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (seventeen), plus the `h264` decoder and the `aac` encoder, from source; **libva + libdrm built into the tree** and bundled with the libav* in the `.deb` (no `Depends` on the system's libva — why is under *Hardware frames*); `libvulkan.so.1` is dlopen'd, never a DT_NEEDED | shared, the agent's private lib dir via RPATH; the VA driver and the Vulkan ICD are the host's |
+| macOS arm64 | `h264/hevc/av1_videotoolbox`, plus the `h264` decoder and the `aac` encoder (~3.0 MB of dylibs), built with `--disable-autodetect` so nothing Homebrew is baked in | shared dylibs in the app bundle |
 | Linux arm64 | no FFmpeg — OpenH264 + libvpx | — |
 
 ## The cell matrix a host advertises (FR-77 P1)
@@ -583,7 +583,7 @@ line** for experiments is a different thing: `winget install Gyan.FFmpeg` (a GPL
 build, never shipped) gives `ffmpeg -encoders` for a quick look at what a box's
 drivers expose.
 
-On Linux the same recipe is the release lane's: extract the `-minimal-vaapi-vulkan`
+On Linux the same recipe is the release lane's: extract the `-minimal-vaapi-vulkan-h264dec-aac`
 asset, rewrite the `.pc` prefixes, set `FFMPEG_DIR` / `PKG_CONFIG_PATH` /
 `LD_LIBRARY_PATH` at the tree, and build with `--features ffmpeg-encoder,vp9-444`.
 To drive one backend past the cascade on any host — a cell the vendor SDK

@@ -23,9 +23,10 @@ name: LGPL corresponding source
 # completeness it does not have is the failure this job exists to prevent.
 #
 # Re-run it (workflow_dispatch) whenever the pinned FFmpeg version, the vcpkg
-# baseline or anything in `.github/ffmpeg-patches/` changes. release-agent.yml
-# enforces that: it refuses to tag while the `…inputs.txt` asset published
-# here disagrees with the checkout.
+# baseline, anything in `.github/ffmpeg-patches/`, or either vendor recipe
+# (`vendor-ffmpeg-windows.yml`, `vendor-ffmpeg-macos.yml`: the configure
+# options) changes. release-agent.yml enforces that: it refuses to tag while
+# the `…inputs.txt` asset published here disagrees with the checkout.
 
 on:
   workflow_dispatch:
@@ -114,10 +115,17 @@ jobs:
           # 3. What this bundle was built FROM, as its own small asset, so
           #    release-agent can check the offer against a checkout without
           #    downloading the 17 MB tarball. Same `<hash> <name>` shape as the
-          #    patch manifest: every patch, plus the vcpkg baseline.
+          #    patch manifest: every patch, the vcpkg baseline, and (FR-85 P4c)
+          #    the two recipe files the next step ships. The configure options
+          #    live in the recipe, not in a patch: before this, a build whose
+          #    options changed (P4a added the h264 decoder and the aac encoder)
+          #    passed the release gate against an offer describing the old one.
           {
             cat bundle/patches/ROOMLER-PATCHES.txt
             echo "$BASELINE  vcpkg-baseline"
+            for r in vendor-ffmpeg-windows.yml vendor-ffmpeg-macos.yml; do
+              printf '%s  recipe/%s\n' "$(sha256sum ".github/workflows/$r" | cut -d' ' -f1)" "$r"
+            done
           } | sort > "$RUNNER_TEMP/inputs.txt"
           echo "inputs:"; cat "$RUNNER_TEMP/inputs.txt"
 

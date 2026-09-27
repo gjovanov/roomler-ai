@@ -308,9 +308,9 @@ jobs:
       # tree — a large cost to silence findings that are not defects. Every
       # other class still bites.
       - name: Clippy agent --features full (the capture + encode + input path)
-        # `recording` (FR-85) rides here too: it is held out of `full` (and so
-        # out of every release) until canary hosts prove it in the field, so
-        # without naming it no lane would lint it.
+        # `recording` (FR-85) is in `full` again (P4c, after the canaries). It
+        # stays named so this lane keeps linting it if it is ever held out
+        # of `full` again, as it was from 2026-09-26 to 09-27.
         run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
@@ -830,13 +830,12 @@ jobs:
         run: cargo check -p roomlerd --bins --features scrap-capture
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
-      # and libvpx), plus `recording`, which is held out of `full` until
-      # canary hosts prove it in the field. Named, so the recorder's macOS
-      # arms (the unix identity rule, the Movies folder, the microphone
-      # refusal, the `record` subcommand in main.rs) never compile for the
-      # first time at TAG time, the class this job exists for, on the day it
-      # rejoins.
-      - name: cargo check agent with the release feature set (FR-85 — `full`, plus `recording`)
+      # and libvpx), which carries `recording` again (P4c, after the
+      # canaries). Still named, so the recorder's macOS arms (the unix
+      # identity rule, the Movies folder, the microphone refusal, the
+      # `record` subcommand in main.rs) keep compiling here, and never for
+      # the first time at TAG time, even if it is held out of `full` again.
+      - name: cargo check agent with the release feature set (FR-85 — `full`, recording included)
         # `full` carries `audio`, and audiopus_sys builds its bundled libopus
         # with CMake, whose CMakeLists declares a minimum below 3.5 that
         # current CMake refuses. The release builds set the same variable on
@@ -1094,10 +1093,10 @@ jobs:
           # dispatches, whole lib dir ~2.5 MB.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz' \
             --dir /tmp/ffdl
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # The .pc files hardcode the vendor machine's prefix.
           sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" \

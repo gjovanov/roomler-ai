@@ -11,7 +11,10 @@ in [deny.toml](deny.toml)) or `cargo license`.
 
 The Roomler agent uses FFmpeg for hardware video encoding (NVENC, Intel QSV,
 AMD AMF, VAAPI and Vulkan video encode on Linux, D3D12 and Vulkan video encode
-on Windows, Apple VideoToolbox on macOS). We build it ourselves
+on Windows, Apple VideoToolbox on macOS). Since the screen recorder shipped
+(FR-85 P4c), the same builds also carry FFmpeg's software **H.264 decoder**,
+which the recorder's editor needs to decode a hardware encoder's High-profile
+recordings, and its native **AAC encoder**, for a recording's sound. We build it ourselves
 from upstream source with a reduced component set and the source patches
 recorded in `.github/ffmpeg-patches/` (each shipped tree carries its
 `ROOMLER-PATCHES.txt` manifest); we do **not** build with `--enable-gpl` or
@@ -69,8 +72,9 @@ If a step there does not work, the compliance claim is wrong — tell us.
 > [`.github/ffmpeg-patches/`](.github/ffmpeg-patches/) (since 2026-09-02), and the
 > Windows build also applies the patches of the vcpkg `ffmpeg` port it is built
 > from. The macOS build applies none. All of them ship in the bundle above, and a
-> release cannot be tagged while the published bundle disagrees with the patches
-> and vcpkg baseline in this repository.
+> release cannot be tagged while the published bundle disagrees with the patches,
+> the vcpkg baseline or the build recipe (the configure options, since FR-85 P4c)
+> in this repository.
 > Until 2026-09-24 the bundle omitted both sets: the vcpkg port's patches since
 > it was first published, and our own since they were introduced on 2026-09-02.
 > This notice said we applied none. The bundle was republished complete on
@@ -97,6 +101,13 @@ exposure on commercial distribution, which is a business matter and not
 something this file can resolve. Recorded so it is a decision rather than an
 oversight.
 
+The same question now covers two more software codecs, both in the vendored
+FFmpeg since the screen recorder shipped (FR-85 P4c). FFmpeg's H.264 **decoder**
+opens a recording that a hardware encoder wrote in High profile, for the
+recorder's editor, since openh264 decodes only Constrained Baseline. Its native
+AAC-LC **encoder** writes a recording's sound. Linux arm64 carries no FFmpeg and
+stays on openh264 and Opus. Neither is an HEVC component: see below.
+
 ---
 
 ## HEVC / H.265
@@ -120,7 +131,10 @@ Three things keep it that way, and each is load-bearing:
    change this analysis completely and must not be done casually.
 2. **FFmpeg is built `--disable-everything`** plus exactly those hardware
    encoders, with no `--enable-gpl` and no `--enable-nonfree`; CI fails the build
-   if an x264/x265 library appears.
+   if an x264/x265 library appears. The two software components added for the
+   screen recorder (FR-85 P4c) are the H.264 decoder and the AAC encoder. **No
+   HEVC decoder is built**: nothing records HEVC, and each vendor build fails if
+   `hevc` is present.
 3. **Advertisement is probe-gated.** A host whose hardware cannot actually open
    an HEVC encoder never advertises `h265`, and falls back to H.264.
 

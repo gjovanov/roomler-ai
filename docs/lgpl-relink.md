@@ -46,7 +46,10 @@ So "the Library as used in that binary" is reproducible from what is published.
 Two checks keep it that way. Every shipped tree carries a `ROOMLER-PATCHES.txt`
 manifest that the release lane compares with the committed patches. And the
 release lane refuses to tag while the published tarball was built from a
-different patch set or vcpkg baseline than the release's own checkout.
+different patch set, vcpkg baseline or build recipe than the release's own
+checkout. The recipe has been checked since FR-85 P4c: the configure options
+live there, not in a patch, and P4c changed them (the software H.264 decoder
+and the AAC encoder the screen recorder needs).
 
 ⚠️ Until 2026-09-24 the tarball carried neither set, although this page said its
 `recipe/` applied them. The recipe *referenced* the patch directory without
@@ -132,11 +135,14 @@ cargo build -p roomlerd --release \
 The result is `target/release/roomlerd(.exe)`, linked against **your** FFmpeg.
 
 ⚠️ Use the feature list for the platform you are reproducing — they differ. macOS
-ships FFmpeg again since 2026-08-25 (a `--disable-everything` tree with only the
-three `*_videotoolbox` encoders, as shared dylibs built with `--disable-autodetect`
-so nothing Homebrew is baked in), and Linux x86_64's tree carries libva + libdrm
-built into it since FR-77 P4. The authoritative lists are the `cargo build` lines
-in `.github/workflows/release-agent.yml`.
+ships FFmpeg again since 2026-08-25 (a `--disable-everything` tree with the three
+`*_videotoolbox` encoders, as shared dylibs built with `--disable-autodetect` so
+nothing Homebrew is baked in), and Linux x86_64's tree carries libva + libdrm
+built into it since FR-77 P4. Since FR-85 P4c every platform's tree also carries
+the software `h264` decoder and the `aac` encoder, for the screen recorder's
+editor and sound (the `-h264dec-aac` assets; never an `hevc` decoder). The
+authoritative lists are the `cargo build` lines in
+`.github/workflows/release-agent.yml`, and the `recording` feature is in `full`.
 
 ⚠️ Windows also needs libvpx for the VP9-4:4:4 path; the workflow vendors it the
 same way (`vendor-libvpx-windows.yml`) and appends it to `PKG_CONFIG_PATH`. If
