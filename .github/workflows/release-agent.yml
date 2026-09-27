@@ -1707,16 +1707,29 @@ jobs:
           # re-pin from the first measured release run, never from an
           # estimate, or the baseline swallows exactly the regression it
           # exists to catch.
-          $p4bBaseline = 13.13
+          # FR-85 P4c re-baseline (AC9): the screen recorder and its FFmpeg
+          # (the h264 decoder + the aac encoder) are DELIBERATE scope. The
+          # unpublished rehearsal of that branch (run 36346825023, 2026-09-27)
+          # measured both flavours at 17.67 MB: 0.4.105 (no recorder) was 15.89,
+          # the canary with `recording` 17.04, and P4c + everything merged
+          # since then +0.63. The old 13.13 baseline had fired the warning on
+          # every release since ssh-server, which is noise, not a signal.
+          # The ceiling moves 18 -> 22 with it. Against a 17.67 baseline, an 18
+          # ceiling sat INSIDE the +2 warn band, so any growth hard-failed a
+          # tag with no warning a release earlier, the opposite of this guard's
+          # design. 22 restores warn (19.67) before fail, with ~4.3 MB of
+          # headroom (the guard has kept ~5 over its baseline since P4b).
+          $p4bBaseline = 17.67
+          $ceilingMB = 22
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
           Write-Host "::notice::baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 18) {
-            Write-Host "::error::MSI exceeds the 18 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
+          if ($maxMsi -gt $ceilingMB) {
+            Write-Host "::error::MSI exceeds the $ceilingMB MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
             exit 1
           } elseif ($deltaMB -gt 2) {
-            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 18 MB ceiling). Re-baseline deliberately or investigate."
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the $ceilingMB MB ceiling). Re-baseline deliberately or investigate."
           } else {
             Write-Host "::notice::MSI within the P4b size budget."
           }

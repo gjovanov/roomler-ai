@@ -284,6 +284,24 @@ already has.
   from this estimate** — the guard's own rule — and says what grew.
 - Linux x64 .deb ≈ +0.8–1.1 MB (6–8 %) · macOS .pkg ≈ +0.8–1.3 MB (4–6 %) · **Linux arm64 .deb ≈ +0.3–0.5 MB** (no
   FFmpeg: it records openh264 + Opus and edits H.264 through the openh264 decoder) · roomler-desktop < 0.1 MB.
+- **Measured (AC9)** by the unpublished P4c rehearsal ([36346825023](https://github.com/gjovanov/roomler-ai/actions/runs/36346825023),
+  2026-09-27), with `recording` in `full` and the `-h264dec-aac` FFmpeg. The deltas below include everything merged
+  between 0.4.101 and 0.4.108, not only this FR. The recorder's own share of the MSI is **+1.78 MiB** (0.4.105 had no
+  recorder: 15.89): the canary measured `recording` at +1.15, and P4c plus the code merged since adds +0.63. The estimate
+  of ≈ 17.0 was low by 0.67.
+
+  | installer | 0.4.101 | P4c rehearsal |
+  |---|---|---|
+  | Windows MSI (both flavours) | 15.36 MiB | **17.67 MiB** |
+  | macOS `.pkg` | 21,765,134 B | 24,497,327 B |
+  | Linux x64 `.deb` | 13,830,684 B | 15,730,204 B |
+  | Linux arm64 `.deb` | 11,410,760 B | 12,761,332 B |
+  | roomler-desktop `.deb` | 4,422,496 B | 4,810,440 B |
+
+  The guard is re-pinned to 17.67, and its **ceiling moves 18 → 22 MiB** (`release-agent.yml`, with the reason there).
+  Against a 17.67 baseline, an 18 ceiling sat inside the +2 warn band. Any growth would then hard-fail a tag without the
+  warning a release earlier, which is the opposite of the guard's design. 22 puts the warning (19.67) before the fail,
+  with ~4.3 MiB of headroom, close to the ~5 the guard has kept over its baseline since P4b.
 - The P0 FFmpeg numbers came from a branch that is never merged (`fr84-p0-measure`, named before the renumber): the
   three vendor builds with the P4 flags, uploaded as Actions artifacts only, and — for Windows, where FFmpeg links
   statically and archive size means nothing — the same registry-pulling probe linked with MSVC against both trees.
@@ -354,8 +372,11 @@ already has.
 - [ ] **AC8 — editor.** An export with a cut, a ×4 speed-up and background music (MP3 and M4A, looped, with fades) has
       the expected duration ± 1 frame, the music at the chosen level, and plays in the OS default player; the
       `export.rs` oracle and its negative control both behave in CI.
-- [ ] **AC9 — size.** The P4 release run's measured installer sizes are recorded in the field log; the MSI stays under
+- [x] **AC9 — size.** The P4 release run's measured installer sizes are recorded in the field log; the MSI stays under
       the 18 MiB ceiling, or the ceiling moves in a PR that says why; the MSI baseline is re-pinned from that run.
+      *(2026-09-27, rehearsal 36346825023: both MSIs measure 17.67 MiB, under 18. The baseline is re-pinned to 17.67, and
+      the ceiling moves to 22 in the same PR with the reason written beside it: an 18 ceiling sat inside the +2 warn
+      band. `.pkg`, `.deb` and the companion's `.deb` are in "Installation size — the evaluation" and the field log.)*
 - [ ] **AC10 — the server never carries a recording.** No code path uploads recording bytes; `recording_url` stays
       `None`; the server stores only `recording_activity` claims, and a test asserts the claim payload has no content
       field.
@@ -455,3 +476,4 @@ ScreenCaptureKit and macOS 13) · importing arbitrary videos into the editor.
 | 2026-09-27 | vendor workflows on `fr85-p4` ([Windows + Linux](https://github.com/gjovanov/roomler-ai/actions/runs/36323053988), [macOS](https://github.com/gjovanov/roomler-ai/actions/runs/36323055472)) | P4a | All three built with `--enable-decoder=h264 --enable-encoder=aac` (H.264 only, open decision 2). The probes found the h264 decoder and the aac encoder present, and hevc and prores absent; on Windows `ff_mov_muxer` is absent too (positive control `avformat_alloc_context`). Windows `avcodec.lib` 21.8 → **29.8 MB** (P0's h264 + hevc tree: 38.0); zip 16,820,196 → 19,575,016 B. Linux `libavcodec.so.63.1.101` 2,777,744 B; tar.xz 1,843,492 → 2,162,924 B (+319 KB). macOS tar.xz 790,316 → 1,071,108 B (+281 KB; dylib set 3.0 MB). Uploaded as `-h264dec-aac` beside the production assets, which stay pinned until P4c |
 | 2026-09-27 | dev box (Windows) + WSL Ubuntu 24.04 against the `-h264dec-aac` Linux tree | P4b-1 | Windows (the Opus path; `CMAKE_POLICY_VERSION_MINIMUM=3.5` for this box's CMake 4 and libopus): `--lib recording::` 116/116, `--test recorder` 21/21, `--test export` 10/10. WSL (the AAC path, `ROOMLER_EXPECT_FFMPEG_AAC=1`, `vp9-444` as in CI): clippy `-D warnings --all-targets` clean, `--lib recording::` 124/124, `--test recorder` 19/19, `--test export` 11/11 including an AAC recording read back through keep / cut / 4× / keep. Two controls were RED before trusting them. With the sample-exact cut removed, a click made 30 000 samples after the first frame decodes at 30 240. With AAC's priming unpaid, it lands at 31 024, in the recorder and in the export's reader alike. FFmpeg's AudioSpecificConfig is five bytes (`11 90 56 E5 00`: AAC-LC 48 kHz stereo and an explicit "no SBR"), not the two the first test expected; the file carries the encoder's own |
 | 2026-09-27 | the supervised MacBook (macOS 26.6.2, arm64: a root daemon + a `run --supervised` GUI worker + the companion), canary `0.4.109` (run 36332040195) | macOS canary | **PASSED** (#1634 comment). Install: the signed, notarized and stapled `.pkg` was pushed over the overlay and run by a one-shot launchd job outside the daemon's tree. `installer`: *The upgrade was successful*, exit 0. Daemon, worker and companion came back on 0.4.109, and the server showed the device online ~10 s after the start. **TCC:** the designated requirement is unchanged (`com.roomler.agent`, Developer ID, `leaf[subject.OU] = "4TG7586MY5"`). Right after the upgrade: `macOS permissions: Screen Recording + Accessibility both granted`, and no `permission MISSING` anywhere. **Local** (`roomler record` as the console user): `h264_videotoolbox` cq 19, 3024×1964 @ 30, 246 frames / 8.2 s, 0 late ticks, no events, the pointer in frame. **Remote** (prod viewer, owner, an auto-grant host): the record channel attached; the recorder's encoder is separate from the live `hevc_videotoolbox` @ 60; 781 frames / 26.0 s, 0 late ticks. The viewer's download read *"5.5 MB of 5.5 MB · saved, checksum verified"*, and the device logged `download sent … offset=0 sent=5759995`; the final browser save was suppressed. The viewer listed only its own recording. Both files probe as H.264 profile 100, `editable: false` with P4b-2's reason, until P4c. **The gate:** `record_remote_enabled` persisted in the worker's (console user's) config; the worker re-announced `["available","remote"]` at once, and the daemon forwarded it on the next heartbeat. **Not verified:** the banner's on-screen appearance (the start was not refused `no_indicator_surface`), the microphone (P1c-mac), system audio. Restored: the gate off, the test recordings deleted, the update helper left intact |
+| 2026-09-27 | [rehearsal 36346825023](https://github.com/gjovanov/roomler-ai/actions/runs/36346825023) of `fr85-p4c-recorder-release` (unpublished; `recording` in `full`, the `-h264dec-aac` FFmpeg on all three platforms, signed) | P4c / AC9 | **All five builds green.** MSI 17.67 MiB (both flavours) against 0.4.105's 15.89 and the Windows canary's 17.04 (`recording` alone). `.pkg` 24,497,327 B, x64 `.deb` 15,730,204 B, arm64 `.deb` 12,761,332 B, roomler-desktop `.deb` 4,810,440 B. The guard warned (+4.54 over the stale 13.13) and passed under 18. Re-pinned to 17.67, with the ceiling moved to 22 (see "Installation size") |
