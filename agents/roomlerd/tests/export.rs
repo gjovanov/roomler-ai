@@ -371,8 +371,9 @@ async fn the_media_process_probes_and_exports() {
 #[cfg(feature = "audio")]
 mod sound {
     use super::*;
+    use roomlerd::recording::audio_codec::AudioEncoder;
     use roomlerd::recording::edit::Music;
-    use roomlerd::recording::mp4::{AUDIO_TRACK_ID, AudioCodec, AudioTrack};
+    use roomlerd::recording::mp4::{AUDIO_TRACK_ID, AudioCodec};
 
     const RATE: usize = 48_000;
     const FRAME: usize = 960;
@@ -385,11 +386,14 @@ mod sound {
 
     /// Like `make_source`, with an Opus track of the stepped tone.
     async fn make_source_with_sound(path: &Path, frames: u16) {
-        use audiopus::coder::Encoder;
-        use audiopus::{Application, Channels, SampleRate};
+        make_source_with_sound_as(path, frames, AudioEncoder::opus().unwrap()).await;
+    }
+
+    /// FR-85 P4 — the same recording with its sound in `enc`'s codec, fed
+    /// the way the recorder feeds it: from the encoder's priming delay past
+    /// time zero, so decoded sample k is time k.
+    async fn make_source_with_sound_as(path: &Path, frames: u16, mut audio: AudioEncoder) {
         let partial = path.with_extension("partial");
-        let opus = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
-        let pre_skip = opus.lookahead().unwrap() as u16;
         let mut enc = Openh264Encoder::new_recording(W, H, FPS, FPS * 2).unwrap();
         let mut w = FragmentedWriter::create(
             &partial,
@@ -399,26 +403,19 @@ mod sound {
                 fps: FPS,
                 color: ColorInfo::BT601_LIMITED,
             },
-            Some(AudioTrack {
-                sample_rate: RATE as u32,
-                channels: 2,
-                codec: AudioCodec::Opus { pre_skip },
-            }),
+            Some(audio.track()),
         )
         .unwrap();
         let total = frames as usize * PER_VIDEO_FRAME;
-        // The encoder's lookahead is paid up front, so decoded sample 0 (after
-        // pre_skip) is time 0.
         let mut phase = 0.0f64;
-        let mut pcm: Vec<i16> = vec![0; usize::from(pre_skip) * 2];
+        let mut pcm: Vec<i16> = Vec::with_capacity((total + FRAME) * 2);
         for s in 0..total + FRAME {
             let hz = stepped_hz(s as f64 / RATE as f64);
             let v = (phase.sin() * 8000.0) as i16;
             phase += 2.0 * std::f64::consts::PI * hz / RATE as f64;
             pcm.extend_from_slice(&[v, v]);
         }
-        let mut sent = 0usize;
-        let mut out = vec![0u8; 4000];
+        let mut sent = audio.unsignalled_delay() as usize;
         for i in 0..frames {
             let f = Arc::new(Frame {
                 width: W,
@@ -436,37 +433,86 @@ mod sound {
             let au: Vec<u8> = packets.into_iter().flat_map(|p| p.data).collect();
             w.push_video(u64::from(i) * TICK, &au, key).unwrap();
             let until = (usize::from(i) + 1) * PER_VIDEO_FRAME;
-            while sent < until {
-                let chunk = &pcm[sent * 2..(sent + FRAME) * 2];
-                let n = opus.encode(chunk, &mut out).unwrap();
-                w.push_audio(&out[..n], FRAME as u32).unwrap();
-                sent += FRAME;
+            if until > sent {
+                audio
+                    .push(&pcm[sent * 2..until * 2], &mut |p, d| w.push_audio(&p, d))
+                    .unwrap();
+                sent = until;
             }
         }
+        audio.finish(&mut |p, d| w.push_audio(&p, d)).unwrap();
         w.finish().unwrap();
         mp4::finalize(&partial, path).unwrap();
         std::fs::remove_file(&partial).unwrap();
     }
 
-    /// The whole audio track, decoded, interleaved stereo, `pre_skip` dropped.
-    /// `None` = no audio track.
+    /// The whole audio track, decoded, interleaved stereo, time zero first:
+    /// Opus's `pre_skip` dropped; AAC's priming was paid by the writer (FR-85
+    /// P4 — an export is AAC wherever the build's FFmpeg has the encoder).
+    /// The test's own decoders, never the engine's reader. `None` = no audio
+    /// track.
     fn decode_sound(path: &Path) -> Option<Vec<i16>> {
-        use audiopus::coder::Decoder;
-        use audiopus::{Channels, SampleRate};
         let pf = ProgressiveFile::open(path).unwrap();
         let format = pf.audio_format().unwrap()?;
-        let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
         let mut f = std::fs::File::open(path).unwrap();
         let mut out = Vec::new();
-        let mut buf = vec![0i16; 5760 * 2];
-        for s in pf.samples(AUDIO_TRACK_ID).unwrap() {
-            let data = pf.read_sample(&mut f, &s).unwrap();
-            let packet: audiopus::packet::Packet<'_> = (&data[..]).try_into().unwrap();
-            let signals: audiopus::MutSignals<'_, i16> = (&mut buf[..]).try_into().unwrap();
-            let n = dec.decode(Some(packet), signals, false).unwrap();
-            out.extend_from_slice(&buf[..n * 2]);
+        match format.codec {
+            AudioCodec::Opus { pre_skip } => {
+                use audiopus::coder::Decoder;
+                use audiopus::{Channels, SampleRate};
+                let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
+                let mut buf = vec![0i16; 5760 * 2];
+                for s in pf.samples(AUDIO_TRACK_ID).unwrap() {
+                    let data = pf.read_sample(&mut f, &s).unwrap();
+                    let packet: audiopus::packet::Packet<'_> = (&data[..]).try_into().unwrap();
+                    let signals: audiopus::MutSignals<'_, i16> = (&mut buf[..]).try_into().unwrap();
+                    let n = dec.decode(Some(packet), signals, false).unwrap();
+                    out.extend_from_slice(&buf[..n * 2]);
+                }
+                Some(out.split_off(usize::from(pre_skip) * 2))
+            }
+            AudioCodec::Aac { asc, .. } => {
+                use symphonia::core::audio::SampleBuffer;
+                use symphonia::core::codecs::{CODEC_TYPE_AAC, CodecParameters, DecoderOptions};
+                let mut params = CodecParameters::new();
+                params
+                    .for_codec(CODEC_TYPE_AAC)
+                    .with_sample_rate(RATE as u32)
+                    .with_extra_data(asc.into_boxed_slice());
+                let mut dec = symphonia::default::get_codecs()
+                    .make(&params, &DecoderOptions::default())
+                    .unwrap();
+                for s in pf.samples(AUDIO_TRACK_ID).unwrap() {
+                    let data = pf.read_sample(&mut f, &s).unwrap();
+                    let packet = symphonia::core::formats::Packet::new_from_slice(0, 0, 0, &data);
+                    let decoded = dec.decode(&packet).unwrap();
+                    let spec = *decoded.spec();
+                    assert_eq!(spec.channels.count(), 2, "a stereo track");
+                    let mut buf = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
+                    buf.copy_interleaved_ref(decoded);
+                    out.extend_from_slice(buf.samples());
+                }
+                Some(out)
+            }
         }
-        Some(out.split_off(usize::from(format.pre_skip) * 2))
+    }
+
+    /// FR-85 P4 — whether this build writes AAC (its FFmpeg has the encoder).
+    /// A lane that declares AAC (`ROOMLER_EXPECT_FFMPEG_AAC=1`) fails here if
+    /// it fell back to Opus.
+    fn aac_here() -> bool {
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            use roomlerd::recording::audio_codec::{AudioEncoder, aac_expected};
+            match AudioEncoder::aac() {
+                Ok(_) => return true,
+                Err(e) => assert!(
+                    !aac_expected(),
+                    "ROOMLER_EXPECT_FFMPEG_AAC=1 but AAC did not open: {e:#}"
+                ),
+            }
+        }
+        false
     }
 
     /// The left channel between two times, in seconds.
@@ -555,9 +601,26 @@ mod sound {
     /// not just "some sound".
     #[tokio::test]
     async fn the_recordings_own_sound_follows_the_edit() {
+        sound_follows_the_edit(AudioEncoder::opus().unwrap()).await;
+    }
+
+    /// FR-85 P4 — the same, for a recording whose own track is AAC: the
+    /// engine reads it (symphonia), from time zero — the recorder paid the
+    /// priming, so nothing may be skipped.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[tokio::test]
+    async fn an_aac_recordings_sound_follows_the_edit_too() {
+        if !aac_here() {
+            eprintln!("skipped: this FFmpeg has no AAC encoder");
+            return;
+        }
+        sound_follows_the_edit(AudioEncoder::aac().unwrap()).await;
+    }
+
+    async fn sound_follows_the_edit(source_audio: AudioEncoder) {
         let d = dir();
         let source = d.path().join("source.mp4");
-        make_source_with_sound(&source, 300).await;
+        make_source_with_sound_as(&source, 300, source_audio).await;
         // The oracle discriminates: the recording itself, second 3, is 600 Hz.
         let original = decode_sound(&source).unwrap();
         assert!((hz(&span(&original, 3.2, 3.8)) - 600.0).abs() < 15.0);
@@ -574,6 +637,19 @@ mod sound {
         .await
         .unwrap();
         assert_eq!(s.audio, "original");
+        // FR-85 P4 — the export writes the build's best codec whatever the
+        // recording carried (this one is Opus): AAC where FFmpeg has it.
+        let format = ProgressiveFile::open(&s.path)
+            .unwrap()
+            .audio_format()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            matches!(format.codec, AudioCodec::Aac { .. }),
+            aac_here(),
+            "the export's track is {:?}",
+            format.codec
+        );
         let pcm = decode_sound(&s.path).expect("an audio track");
         let secs = pcm.len() as f64 / 2.0 / RATE as f64;
         assert!(

@@ -558,31 +558,82 @@ async fn no_frame_refuses_the_start() {
 
 // ── audio (FR-85 P1c) ────────────────────────────────────────────────────────
 
-/// Decode a recording's audio track back to 48 kHz stereo PCM.
+/// Decode a recording's audio track back to 48 kHz stereo PCM, in the codec
+/// its sample entry names — FR-85 P4: AAC where the build's FFmpeg carries
+/// the encoder, Opus otherwise — through the test's OWN decoders, never the
+/// export engine's reader. Opus's `pre_skip` is dropped; AAC's priming was
+/// paid by the recorder, so decoded sample 0 is time zero either way.
 #[cfg(feature = "audio")]
 fn decode_audio(path: &Path) -> Vec<i16> {
-    use audiopus::coder::Decoder;
-    use audiopus::packet::Packet;
-    use audiopus::{Channels, MutSignals, SampleRate};
-    use roomlerd::recording::mp4::AUDIO_TRACK_ID;
+    use roomlerd::recording::mp4::{AUDIO_TRACK_ID, AudioCodec};
     let pf = ProgressiveFile::open(path).expect("open the recording");
+    let format = pf.audio_format().unwrap().expect("an audio track");
     let samples = pf.samples(AUDIO_TRACK_ID).expect("an audio track");
     let mut f = std::fs::File::open(path).unwrap();
-    let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
     let mut pcm = Vec::new();
-    let mut out = vec![0i16; 960 * 2];
-    for s in &samples {
-        let pkt = pf.read_sample(&mut f, s).unwrap();
-        let n = dec
-            .decode(
-                Some(Packet::try_from(&pkt[..]).unwrap()),
-                MutSignals::try_from(&mut out[..]).unwrap(),
-                false,
-            )
-            .unwrap();
-        pcm.extend_from_slice(&out[..n * 2]);
+    match format.codec {
+        AudioCodec::Opus { pre_skip } => {
+            use audiopus::coder::Decoder;
+            use audiopus::packet::Packet;
+            use audiopus::{Channels, MutSignals, SampleRate};
+            let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
+            let mut out = vec![0i16; 5760 * 2];
+            for s in &samples {
+                let pkt = pf.read_sample(&mut f, s).unwrap();
+                let n = dec
+                    .decode(
+                        Some(Packet::try_from(&pkt[..]).unwrap()),
+                        MutSignals::try_from(&mut out[..]).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                pcm.extend_from_slice(&out[..n * 2]);
+            }
+            pcm.split_off(usize::from(pre_skip) * 2)
+        }
+        AudioCodec::Aac { asc, .. } => {
+            use symphonia::core::audio::SampleBuffer;
+            use symphonia::core::codecs::{CODEC_TYPE_AAC, CodecParameters, DecoderOptions};
+            use symphonia::core::formats::Packet;
+            let mut params = CodecParameters::new();
+            params
+                .for_codec(CODEC_TYPE_AAC)
+                .with_sample_rate(48_000)
+                .with_extra_data(asc.into_boxed_slice());
+            let mut dec = symphonia::default::get_codecs()
+                .make(&params, &DecoderOptions::default())
+                .unwrap();
+            for s in &samples {
+                let pkt = pf.read_sample(&mut f, s).unwrap();
+                let decoded = dec.decode(&Packet::new_from_slice(0, 0, 0, &pkt)).unwrap();
+                let spec = *decoded.spec();
+                assert_eq!(spec.channels.count(), 2, "a stereo track");
+                let mut buf = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
+                buf.copy_interleaved_ref(decoded);
+                pcm.extend_from_slice(buf.samples());
+            }
+            pcm
+        }
     }
-    pcm
+}
+
+/// FR-85 P4 — the audio codec this build records: AAC when its FFmpeg has
+/// the encoder, Opus otherwise. A lane that declares AAC
+/// (`ROOMLER_EXPECT_FFMPEG_AAC=1`) fails here if it fell back.
+#[cfg(feature = "audio")]
+fn expected_audio_codec() -> &'static str {
+    #[cfg(feature = "ffmpeg-encoder")]
+    {
+        use roomlerd::recording::audio_codec::{AudioEncoder, aac_expected};
+        match AudioEncoder::aac() {
+            Ok(_) => return "aac",
+            Err(e) => assert!(
+                !aac_expected(),
+                "ROOMLER_EXPECT_FFMPEG_AAC=1 but AAC did not open: {e:#}"
+            ),
+        }
+    }
+    "opus"
 }
 
 /// Zero crossings per second of the left channel over `pcm[from..to)`
@@ -629,9 +680,11 @@ async fn a_recording_with_audio_is_in_step_with_its_video() {
 
     let pf = ProgressiveFile::open(&path).unwrap();
     let video = pf.samples(VIDEO_TRACK_ID).unwrap().len() as u64;
-    let audio = pf.samples(AUDIO_TRACK_ID).unwrap().len() as u64;
+    let packets = pf.samples(AUDIO_TRACK_ID).unwrap();
+    let audio = packets.len() as u64;
     let video_ms = video * 1000 / u64::from(fps);
-    let audio_ms = audio * 20;
+    // Summed from the packets' own durations: 20 ms Opus, 1024-sample AAC.
+    let audio_ms = packets.iter().map(|s| u64::from(s.duration)).sum::<u64>() * 1000 / 48_000;
     assert!(audio > 100, "{audio} audio frames");
     assert!(
         audio_ms.abs_diff(video_ms) <= 80,
@@ -657,7 +710,15 @@ async fn a_recording_with_audio_is_in_step_with_its_video() {
 
     let sc = summary.sidecar.expect("sidecar");
     assert!(sc.audio.system && sc.audio.microphone, "{:?}", sc.audio);
-    assert_eq!(sc.audio.codec.as_deref(), Some("opus"));
+    // FR-85 P4 — the sidecar names the codec the track actually carries.
+    let codec = expected_audio_codec();
+    assert_eq!(sc.audio.codec.as_deref(), Some(codec));
+    let track = pf.audio_format().unwrap().expect("an audio track").codec;
+    assert_eq!(
+        matches!(track, roomlerd::recording::mp4::AudioCodec::Aac { .. }),
+        codec == "aac",
+        "the track is {track:?}, the sidecar says {codec}"
+    );
 }
 
 /// The negative control for the test above: the same recording WITHOUT audio

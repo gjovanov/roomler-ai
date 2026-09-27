@@ -429,14 +429,22 @@ pub async fn run_with_audio(
         .unwrap_or((false, false));
     #[cfg(not(feature = "audio"))]
     let (audio_system, audio_microphone) = (false, false);
+    // FR-85 P4 — the track's codec: AAC where this build's FFmpeg has it,
+    // Opus otherwise (`audio_codec::AudioEncoder::best`).
     #[cfg(feature = "audio")]
-    let audio_track = audio_rt.as_ref().map(|a| mp4::AudioTrack {
-        sample_rate: super::audio::RATE,
-        channels: super::audio::CHANNELS as u8,
-        codec: mp4::AudioCodec::Opus {
-            pre_skip: a.pre_skip(),
-        },
-    });
+    let mut audio_enc = match audio_rt {
+        Some(_) => Some(
+            super::audio_codec::AudioEncoder::best()
+                .map_err(|e| refuse(StartRefusal::AudioUnavailable, format!("{e:#}")))?,
+        ),
+        None => None,
+    };
+    #[cfg(feature = "audio")]
+    let audio_codec_name = audio_enc.as_ref().map(|e| e.name());
+    #[cfg(not(feature = "audio"))]
+    let audio_codec_name: Option<&'static str> = None;
+    #[cfg(feature = "audio")]
+    let audio_track = audio_enc.as_ref().map(|e| e.track());
     #[cfg(not(feature = "audio"))]
     let audio_track: Option<mp4::AudioTrack> = None;
 
@@ -531,11 +539,13 @@ pub async fn run_with_audio(
     let mut last_progress = Instant::now();
     let mut last_disk_check = Instant::now();
     let mut events_log: Vec<Event> = Vec::new();
-    // FR-85 P1c — encoded audio waits here until the first video frame is
+    // FR-85 P1c — mixed audio waits here until the first video frame is
     // written: that frame's time is audio time zero (`audio_origin`, in
     // 48 kHz samples), and audio before it is dropped rather than shifted.
+    // P4 — it waits as PCM, not packets, so the cut is sample-exact and a
+    // codec with its own frame size (AAC's 1024) starts where it should.
     #[cfg(feature = "audio")]
-    let mut audio_queue: std::collections::VecDeque<(u64, Vec<u8>)> =
+    let mut audio_queue: std::collections::VecDeque<(u64, Vec<i16>)> =
         std::collections::VecDeque::new();
     #[cfg(feature = "audio")]
     let mut audio_origin: Option<u64> = None;
@@ -641,9 +651,11 @@ pub async fn run_with_audio(
         {
             let until = super::audio::samples_for(start.elapsed())
                 .saturating_sub(super::audio::samples_for(super::audio::MIX_LAG));
-            let failed = match audio_rt.as_mut() {
-                Some(a) => pump_audio(a, until, &mut audio_queue, audio_origin, &mut writer).err(),
-                None => None,
+            let failed = match (audio_rt.as_mut(), audio_enc.as_mut()) {
+                (Some(a), Some(enc)) => {
+                    pump_audio(a, enc, until, &mut audio_queue, audio_origin, &mut writer).err()
+                }
+                _ => None,
             };
             if let Some(e) = failed {
                 // The video goes on: a recording without its audio is still
@@ -657,6 +669,8 @@ pub async fn run_with_audio(
                 if let Some(a) = audio_rt.take() {
                     let _ = a.stop();
                 }
+                audio_enc = None;
+                audio_queue.clear();
             }
         }
 
@@ -688,8 +702,26 @@ pub async fn run_with_audio(
     #[cfg(feature = "audio")]
     if let Some(mut a) = audio_rt.take() {
         let until = super::audio::samples_for(start.elapsed());
-        if let Err(e) = pump_audio(&mut a, until, &mut audio_queue, audio_origin, &mut writer) {
-            tracing::warn!(%e, "recording: the last audio could not be written");
+        if let Some(enc) = audio_enc.as_mut() {
+            // Then the encoder's last partial frame and whatever it still
+            // holds — AAC keeps a frame back until it is flushed.
+            let written = pump_audio(
+                &mut a,
+                enc,
+                until,
+                &mut audio_queue,
+                audio_origin,
+                &mut writer,
+            )
+            .and_then(|()| match audio_origin {
+                Some(_) => tokio::task::block_in_place(|| {
+                    enc.finish(&mut |packet, duration| writer.push_audio(&packet, duration))
+                }),
+                None => Ok(()),
+            });
+            if let Err(e) = written {
+                tracing::warn!(%e, "recording: the last audio could not be written");
+            }
         }
         for s in a.stop() {
             tracing::info!(
@@ -766,7 +798,7 @@ pub async fn run_with_audio(
         audio: AudioInfo {
             system: audio_system,
             microphone: audio_microphone,
-            codec: (audio_system || audio_microphone).then(|| "opus".to_string()),
+            codec: audio_codec_name.map(str::to_string),
         },
         frames,
         late_ticks,
@@ -795,33 +827,70 @@ pub async fn run_with_audio(
     })
 }
 
-/// FR-85 P1c — encode the audio up to `until` (48 kHz samples since the
-/// clock started) and write whatever is at or after `origin`, the first
-/// written video frame's time. Before the first frame nothing is written:
-/// the packets wait in `queue`, so audio time zero is video time zero.
+/// FR-85 P1c — mix the audio up to `until` (48 kHz samples since the clock
+/// started) and encode whatever is at or after `origin`, the first written
+/// video frame's time. Before the first frame nothing is encoded: the mixed
+/// frames wait in `queue`, so audio time zero is video time zero, to the
+/// sample (P4).
 #[cfg(feature = "audio")]
 fn pump_audio(
     a: &mut super::audio::RecordingAudio,
+    enc: &mut super::audio_codec::AudioEncoder,
     until: u64,
-    queue: &mut std::collections::VecDeque<(u64, Vec<u8>)>,
+    queue: &mut std::collections::VecDeque<(u64, Vec<i16>)>,
     origin: Option<u64>,
     writer: &mut FragmentedWriter,
 ) -> Result<()> {
-    a.produce_until(until, &mut |start, packet| queue.push_back((start, packet)))?;
+    a.produce_until(until, &mut |start, pcm| {
+        queue.push_back((start, pcm.to_vec()))
+    })?;
     let Some(origin) = origin else {
+        // No video frame yet. Everything before the first one is dropped
+        // anyway; the bound only keeps a recorder whose encoder never answers
+        // from holding its whole audio in memory.
+        while queue.len() > MAX_AUDIO_BEFORE_VIDEO {
+            queue.pop_front();
+        }
         return Ok(());
     };
-    while let Some((start, packet)) = queue.pop_front() {
-        // Whole 20 ms frames only: a frame mostly before the origin is before
-        // the video began. The first one kept starts within ±10 ms of the
-        // first frame — never an audible offset.
-        if start + (super::audio::FRAME as u64) / 2 <= origin {
+    tokio::task::block_in_place(|| {
+        encode_from_origin(queue, origin, enc, &mut |packet, duration| {
+            writer.push_audio(&packet, duration)
+        })
+    })
+}
+
+/// FR-85 P4 — hand the encoder every queued frame from the first video
+/// frame's time (`origin`, 48 kHz samples on the recorder's clock) on, cut
+/// to the sample.
+///
+/// The encoder's input sample 0 is recording time `origin + delay`: a codec
+/// whose decoder puts out a priming delay ahead of its input (AAC) starts
+/// that far past the first frame, so what a player decodes at time k is what
+/// was heard at time k (`audio_codec` module docs).
+#[cfg(feature = "audio")]
+fn encode_from_origin(
+    queue: &mut std::collections::VecDeque<(u64, Vec<i16>)>,
+    origin: u64,
+    enc: &mut super::audio_codec::AudioEncoder,
+    sink: &mut super::audio_codec::PacketSink<'_>,
+) -> Result<()> {
+    let first = origin + enc.unsignalled_delay();
+    let ch = super::audio::CHANNELS;
+    while let Some((start, pcm)) = queue.pop_front() {
+        let len = (pcm.len() / ch) as u64;
+        if start + len <= first {
             continue;
         }
-        tokio::task::block_in_place(|| writer.push_audio(&packet, super::audio::FRAME as u32))?;
+        let skip = first.saturating_sub(start) as usize * ch;
+        enc.push(&pcm[skip..], sink)?;
     }
     Ok(())
 }
+
+/// Mixed 20 ms frames kept while no video frame has been written (a minute).
+#[cfg(feature = "audio")]
+const MAX_AUDIO_BEFORE_VIDEO: usize = 3000;
 
 /// The liveness lock beside a partial, `<name>.partial.lock`: an OS file lock
 /// held for as long as a recorder owns the partial, and released by the
@@ -1037,5 +1106,139 @@ mod tests {
             serde_json::to_string(&StartRefusal::EncoderUnavailable).unwrap(),
             "\"encoder_unavailable\""
         );
+    }
+
+    /// FR-85 P4 — audio time zero is the first video frame, TO THE SAMPLE,
+    /// in either codec: a click the mixer made `offset` samples after the
+    /// first frame is decoded `offset` samples into the track. AAC's priming
+    /// (1024 samples) is exactly what this would miss if the recorder
+    /// signalled it instead of paying it.
+    #[cfg(feature = "audio")]
+    mod alignment {
+        use super::*;
+        use crate::recording::audio_codec::AudioEncoder;
+        use crate::recording::mp4::AudioCodec;
+        use std::collections::VecDeque;
+
+        const ORIGIN: u64 = 30_000;
+        const CLICK: u64 = 60_000;
+
+        /// Mixed 20 ms frames on the recorder's clock, silent but for a 1 ms
+        /// click at clock sample `CLICK`.
+        fn mixed() -> VecDeque<(u64, Vec<i16>)> {
+            (0..100u64)
+                .map(|k| {
+                    let start = k * 960;
+                    let pcm = (start..start + 960)
+                        .flat_map(|s| {
+                            let v = if (CLICK..CLICK + 48).contains(&s) {
+                                20_000
+                            } else {
+                                0
+                            };
+                            [v, v]
+                        })
+                        .collect();
+                    (start, pcm)
+                })
+                .collect()
+        }
+
+        fn decode(codec: &AudioCodec, packets: &[Vec<u8>]) -> Vec<i16> {
+            let mut pcm = Vec::new();
+            match codec {
+                AudioCodec::Opus { pre_skip } => {
+                    let mut dec = audiopus::coder::Decoder::new(
+                        audiopus::SampleRate::Hz48000,
+                        audiopus::Channels::Stereo,
+                    )
+                    .unwrap();
+                    let mut out = vec![0i16; 5760 * 2];
+                    for p in packets {
+                        let packet: audiopus::packet::Packet<'_> = (&p[..]).try_into().unwrap();
+                        let signals: audiopus::MutSignals<'_, i16> =
+                            (&mut out[..]).try_into().unwrap();
+                        let n = dec.decode(Some(packet), signals, false).unwrap();
+                        pcm.extend_from_slice(&out[..n * 2]);
+                    }
+                    pcm.split_off(usize::from(*pre_skip) * 2)
+                }
+                AudioCodec::Aac { asc, .. } => {
+                    use symphonia::core::audio::SampleBuffer;
+                    use symphonia::core::codecs::{
+                        CODEC_TYPE_AAC, CodecParameters, DecoderOptions,
+                    };
+                    let mut params = CodecParameters::new();
+                    params
+                        .for_codec(CODEC_TYPE_AAC)
+                        .with_sample_rate(48_000)
+                        .with_extra_data(asc.clone().into_boxed_slice());
+                    let mut dec = symphonia::default::get_codecs()
+                        .make(&params, &DecoderOptions::default())
+                        .unwrap();
+                    for p in packets {
+                        let packet = symphonia::core::formats::Packet::new_from_slice(0, 0, 0, p);
+                        let decoded = dec.decode(&packet).unwrap();
+                        let spec = *decoded.spec();
+                        let mut buf = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
+                        buf.copy_interleaved_ref(decoded);
+                        pcm.extend_from_slice(buf.samples());
+                    }
+                    pcm
+                }
+            }
+        }
+
+        /// Where the click is in the decoded track (the first loud sample).
+        fn click_in_track(mut enc: AudioEncoder) -> usize {
+            let codec = enc.track_codec();
+            let mut packets = Vec::new();
+            let mut queue = mixed();
+            encode_from_origin(&mut queue, ORIGIN, &mut enc, &mut |p, _| {
+                packets.push(p);
+                Ok(())
+            })
+            .unwrap();
+            enc.finish(&mut |p, _| {
+                packets.push(p);
+                Ok(())
+            })
+            .unwrap();
+            let pcm = decode(&codec, &packets);
+            pcm.iter()
+                .step_by(2)
+                .position(|s| s.unsigned_abs() > 5_000)
+                .expect("the click survives the codec")
+        }
+
+        fn assert_on_time(at: usize, codec: &str) {
+            let want = (CLICK - ORIGIN) as usize;
+            assert!(
+                at.abs_diff(want) <= 64,
+                "{codec}: the click is at track sample {at}, it was {want} samples after the first frame"
+            );
+        }
+
+        #[test]
+        fn opus_audio_starts_at_the_first_video_frame_to_the_sample() {
+            assert_on_time(click_in_track(AudioEncoder::opus().unwrap()), "opus");
+        }
+
+        #[cfg(feature = "ffmpeg-encoder")]
+        #[test]
+        fn aac_audio_starts_at_the_first_video_frame_despite_its_priming() {
+            let enc = match AudioEncoder::aac() {
+                Ok(e) => e,
+                Err(e) => {
+                    assert!(
+                        !crate::recording::audio_codec::aac_expected(),
+                        "ROOMLER_EXPECT_FFMPEG_AAC=1 but AAC did not open: {e:#}"
+                    );
+                    eprintln!("skipped: this FFmpeg has no AAC encoder ({e:#})");
+                    return;
+                }
+            };
+            assert_on_time(click_in_track(enc), "aac");
+        }
     }
 }
