@@ -36,6 +36,12 @@
 //! Failure is always safe: on timeout / no-answer the candidate is added
 //! unmodified (status quo — prflx discovery still applies). Resolution is
 //! spawned by the caller so signaling never blocks on the ~750 ms timeout.
+//!
+//! ⚠️ An unmodified `.local` candidate goes on to webrtc-ice's own resolver,
+//! which asks once a second until answered, and a browser off this LAN never
+//! answers. Until #1740 that resolution outlived its session and held the
+//! closed ICE agent with every socket it owned; the vendored webrtc-ice now
+//! ends it with the agent, locked by `ice_lifetime_tests`.
 
 use std::net::IpAddr;
 use std::time::Duration;

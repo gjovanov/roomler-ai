@@ -8121,10 +8121,12 @@ fn attach_control_handler(
     // rc.199 — per-session Priority dial; the `rc:priority` match arm writes it.
     priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
-    // Clone the Arc so the on_message closure can send replies
-    // (e.g. rc:logs-fetch.reply) back over the same DC. Original
-    // `dc` parameter is kept for the on_message registration below.
-    let dc_for_reply = dc.clone();
+    // A handle the on_message closure sends replies through (e.g.
+    // rc:logs-fetch.reply) over the same DC. #1740 — WEAK: the closure is
+    // stored INSIDE this channel, so a strong clone made the channel own
+    // itself, and a session's control channel (with everything its handlers
+    // hold) was never freed.
+    let dc_for_reply = Arc::downgrade(&dc);
     // rc.130 — min-gap clamp for browser-requested keyframes (rc:keyframe).
     // The atomic itself coalesces (the pump forces at most one IDR per encode
     // regardless of how often it's set) and the browser debounces, but this
@@ -8396,7 +8398,10 @@ fn attach_control_handler(
                                 continue;
                             }
                         };
-                        if let Err(e) = dc_for_reply.send_text(text).await {
+                        let Some(dc) = dc_for_reply.upgrade() else {
+                            break;
+                        };
+                        if let Err(e) = dc.send_text(text).await {
                             debug!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
                             // Stop sending the rest of the stream —
                             // browser will get a partial response and
@@ -8526,7 +8531,9 @@ fn attach_control_handler(
                     // timestamp into a true end-to-end age in its HUD.
                     let t0 = val.get("t0").cloned().unwrap_or(serde_json::Value::Null);
                     let reply = clock_echo_json(&t0, agent_epoch_us());
-                    if let Err(e) = dc_for_reply.send_text(reply).await {
+                    if let Some(dc) = dc_for_reply.upgrade()
+                        && let Err(e) = dc.send_text(reply).await
+                    {
                         debug!(%session_id, %e, "control: rc:clock echo send failed");
                     }
                 }
@@ -8573,7 +8580,9 @@ fn attach_control_handler(
                     });
                     match serde_json::to_string(&reply) {
                         Ok(text) => {
-                            if let Err(e) = dc_for_reply.send_text(text).await {
+                            if let Some(dc) = dc_for_reply.upgrade()
+                                && let Err(e) = dc.send_text(text).await
+                            {
                                 debug!(%session_id, %e, "control: rc:apps.* reply send failed");
                             }
                         }
