@@ -13,10 +13,10 @@
 //! in [`sidecar`].
 //!
 //! Not here yet (later FR-85 phases): the microphone and computer audio on
-//! macOS (P1c-mac), re-attaching after a dropped session (P3b-3), and
-//! FFmpeg's H.264 decoder for hardware-encoded recordings (P4b-2). AAC (P4)
-//! is [`audio_codec`]'s, and waits only for the vendored FFmpeg that carries
-//! its encoder.
+//! macOS (P1c-mac), and re-attaching after a dropped session (P3b-3). AAC
+//! ([`audio_codec`]) and FFmpeg's H.264 decoder for hardware-encoded
+//! recordings ([`decode`]) are built (P4) and wait only for the vendored
+//! FFmpeg that carries them.
 //!
 //! Design and gates: `docs/fr/FR-85-hq-screen-recording.md`.
 
@@ -30,6 +30,10 @@ pub mod audio;
 #[cfg(feature = "audio")]
 pub mod audio_codec;
 pub mod child;
+/// FR-85 P4 — the decoder an export reads a recording's video with:
+/// openh264 for Baseline, FFmpeg's `h264` for the rest where it is linked.
+#[cfg(feature = "openh264-encoder")]
+pub mod decode;
 /// FR-85 P5 — the edit list and its exact time map.
 pub mod edit;
 /// FR-85 P5a — the export engine (it decodes with openh264, so it comes with

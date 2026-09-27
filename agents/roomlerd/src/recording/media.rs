@@ -45,7 +45,8 @@ pub fn probe(file: &Path) -> Result<()> {
             .samples(mp4::AUDIO_TRACK_ID)
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        let editable = format.profile == 66;
+        // P4 — High profile is editable where FFmpeg's decoder is linked in.
+        let editable = super::decode::can_decode(format.profile);
         Ok(json!({
             "ev": "probe",
             "duration_ms": duration_ms,
