@@ -964,6 +964,11 @@ impl AgentPeer {
         // open, so each session used to leave the pair polling for the
         // life of the daemon.
         let session_end = tokio_util::sync::CancellationToken::new();
+        // Until `Ok(Self)` owns the token, nothing else would cancel it: a
+        // `?` or a panic added below this line would leak the monitor and
+        // every task that races the token. The guard makes that leak
+        // impossible, not merely absent (found in review); disarmed at the end.
+        let construction_guard = session_end.clone().drop_guard();
         let (lock_state_rx, _lock_state_monitor) = lock_state::spawn_monitor(session_end.clone());
 
         // Route data channels by label. `input` goes to the OS injector;
@@ -1258,7 +1263,10 @@ impl AgentPeer {
             viewer_report: viewer_report.clone(),
             #[cfg(feature = "recording")]
             record_ctx,
-            session_end,
+            session_end: {
+                construction_guard.disarm();
+                session_end
+            },
         })
     }
 
@@ -4681,6 +4689,10 @@ fn spawn_capture_unavailable_notice(
 ) {
     const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    // #1738 — each send is bounded: one on a channel a network drop left
+    // `Closing` can park for good (#1730), and the deadline below is only a
+    // deadline if the loop gets back to it (found in review).
+    const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     let payload = capture_unavailable_payload(&reason);
     warn!(
         %session_id,
@@ -4693,7 +4705,10 @@ fn spawn_capture_unavailable_notice(
         while started.elapsed() < DEADLINE {
             let cdc = control_dc.lock().await.clone();
             if let Some(cdc) = cdc
-                && cdc.send_text(payload.clone()).await.is_ok()
+                && matches!(
+                    tokio::time::timeout(SEND_BUDGET, cdc.send_text(payload.clone())).await,
+                    Ok(Ok(_))
+                )
             {
                 return;
             }
