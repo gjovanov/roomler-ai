@@ -204,7 +204,7 @@ ac_scan() {
             if (tolower(t) ~ /docs\/readme\.md|docs[- ]before[- ]close|close[- ]requires[- ]docs/) docs = 1
         }
         function subject(l) {
-            sub(/^[[:space:]]*-[[:space:]]*\[[ xX]\][[:space:]]*/, "", l)
+            sub(/^[[:space:]]*-[[:space:]]*\[[^]]\][[:space:]]*/, "", l)
             gsub(/\*/, "", l)
             sub(/^(AC|P)[0-9]+[a-z]?[^A-Za-z`]*/, "", l)
             if (tolower(l) ~ /^docs?([^a-z\/]|$)/) docs = 1
@@ -213,8 +213,8 @@ ac_scan() {
         /^## /  { if (cur != "") chk(cur); cur = ""; in_ac = 0 }
         !in_ac  { next }
         /^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]/         { ticked++ }
-        /^[[:space:]]*-[[:space:]]*\[[[:space:]]\][[:space:]]/ { untick++ }
-        /^[[:space:]]*-[[:space:]]*\[[ xX]\]/ { if (cur != "") chk(cur); cur = $0; subject($0); next }
+        /^[[:space:]]*-[[:space:]]*\[[^]xX]\][[:space:]]/ { untick++ }
+        /^[[:space:]]*-[[:space:]]*\[[^]]\]/ { if (cur != "") chk(cur); cur = $0; subject($0); next }
         /^[[:space:]]+[^[:space:]]/ && cur != "" { cur = cur " " $0; next }
         { if (cur != "") chk(cur); cur = "" }
         END { if (cur != "") chk(cur); printf "%d %d %d\n", ticked + 0, untick + 0, docs + 0 }
