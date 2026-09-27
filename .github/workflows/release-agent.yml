@@ -411,7 +411,11 @@ jobs:
           #    .github/ffmpeg-patches/ AND the vcpkg port at the recipe's
           #    $baseline. lgpl-source-offer.yml publishes what it was built from
           #    as `…corresponding-source.inputs.txt` (`<hash> <name>` per patch,
-          #    plus `<sha> vcpkg-baseline`); compare it with this checkout.
+          #    `<sha> vcpkg-baseline`, and the sha256 of each recipe file it
+          #    ships); compare it with this checkout. The recipe counts since
+          #    FR-85 P4c: the configure options live there, not in a patch, so
+          #    a build whose options changed passed this gate against an offer
+          #    that described the old ones.
           #    ⚠️ From #1249 (2026-09-02) to 2026-09-24 every release shipped a
           #    patched FFmpeg while the offered source omitted the patch and
           #    said "we apply no patches", and nothing checked. Fail closed:
@@ -426,7 +430,10 @@ jobs:
             echo "::error::no \$baseline in vendor-ffmpeg-windows.yml — re-derive this gate's parse"; exit 1
           fi
           want=$( { for f in "${committed[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done
-                    printf '%s %s\n' "$baseline" vcpkg-baseline; } | sort )
+                    printf '%s %s\n' "$baseline" vcpkg-baseline
+                    for r in vendor-ffmpeg-windows.yml vendor-ffmpeg-macos.yml; do
+                      printf '%s %s\n' "$(sha256sum "$GITHUB_WORKSPACE/.github/workflows/$r" | cut -d' ' -f1)" "recipe/$r"
+                    done; } | sort )
           mkdir -p /tmp/offer
           if ! gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" \
                --pattern 'ffmpeg-n9.0.1-corresponding-source.inputs.txt' --dir /tmp/offer --clobber; then
@@ -434,10 +441,10 @@ jobs:
           fi
           got=$(awk 'NF{print tolower($1), $NF}' /tmp/offer/ffmpeg-n9.0.1-corresponding-source.inputs.txt | sort)
           if [ "$want" != "$got" ]; then
-            echo "::error::the published LGPL corresponding source was not built from this checkout's FFmpeg patches and vcpkg baseline — dispatch lgpl-source-offer.yml before tagging"
+            echo "::error::the published LGPL corresponding source was not built from this checkout's FFmpeg patches, vcpkg baseline and build recipe — dispatch lgpl-source-offer.yml before tagging"
             echo "--- this checkout ---"; echo "$want"; echo "--- in the offer ---"; echo "$got"; exit 1
           fi
-          echo "FR-24 gate OK: the LGPL offer carries ${#committed[@]} patch(es) + vcpkg baseline ${baseline:0:8}"
+          echo "FR-24 gate OK: the LGPL offer carries ${#committed[@]} patch(es) + vcpkg baseline ${baseline:0:8} + this checkout's recipe"
 
       - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
         # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
