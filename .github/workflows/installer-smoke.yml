@@ -75,11 +75,13 @@ on:
       - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
 
-# actions:write for the "Refresh the cache seed" step's `gh cache delete`
-# (the default token is read-only for actions otherwise).
+# actions:write was for a "Refresh the cache seed (delete BEFORE restore)"
+# step, removed in FR-6 wave 14 (#773): it ran on PRs too, and a PR deleting
+# a master cache it may not re-save (see `save-if` below) is eviction by
+# another name. Nothing else here needs it — artifact uploads use the
+# runner's own token.
 permissions:
   contents: read
-  actions: write
 
 jobs:
   windows-msi-install-uninstall:
@@ -96,32 +98,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
+        # FR-6 wave 14 (#773): only a master push saves. A PR-ref cache can be
+        # restored only by later runs of the same PR, and every one evicts
+        # master entries that all PRs restore from. (A "delete BEFORE
+        # restore" step used to precede this one; its exact key never matched
+        # the hashed key this block writes, so it deleted nothing — and on a
+        # PR it would have deleted master's cache had it ever matched.)
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
           shared-key: installer-smoke-windows
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
@@ -742,6 +731,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-pkg-smoke
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install system deps
         run: brew install cmake libvpx pkg-config

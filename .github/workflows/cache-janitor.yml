@@ -28,6 +28,18 @@ name: Cache janitor
 #
 # Master-ref seeds otherwise survive indefinitely: every tag build
 # restores them (access refresh keeps them out of the idle sweeps).
+#
+# FR-6 wave 14 (#773, 2026-09-27) — two rules for the CI cargo caches:
+#   - a `v0-rust-*` cache on a PR ref → delete at once. Every workflow now
+#     saves those only from master (`save-if`), so one on a PR ref is a
+#     leftover — and each hour it stands it pushes master's entries toward
+#     LRU. That is exactly how 13.1 of a 15.0 GB pool came to sit on PR refs
+#     and evict master's `ci-linux`, turning a 20 min run into 36.8.
+#   - master keeps ONE generation per Swatinem family. A key is
+#     `v0-rust-<family>-<env hash>-<lockfile hash>`, and a new generation
+#     lands whenever ci.yml or Cargo.lock changes — every release bump — so
+#     superseded ones would otherwise sit out their 96 h. Restores never
+#     need them: an exact miss falls back to the NEWEST prefix match.
 
 on:
   schedule:
@@ -37,7 +49,19 @@ on:
     # cadence let the pool sit over budget for hours (2026-08-18:
     # generations hit 9.5 GB and LRU evicted the CI cargo caches).
     - cron: '43 */6 * * *'
+  # And after every CI run on master: that is the run that SAVES, so it is
+  # also the moment an older generation becomes superseded.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
   workflow_dispatch: {}
+
+# One sweep at a time; a second trigger waits rather than racing the first
+# over the same entries.
+concurrency:
+  group: cache-janitor
+  cancel-in-progress: false
 
 permissions:
   actions: write
@@ -67,13 +91,31 @@ jobs:
           # previous one). The old age-based seed deletion + re-dispatch
           # is gone — superseded generations simply go idle and fall to
           # the 96 h sweep below.
+          #
+          # FR-6 wave 14: the superseded CI cargo generations on master —
+          # every entry of a Swatinem family except its newest by creation.
+          # The family is the key less its two trailing hashes (gh's jq is
+          # gojq: RE2 regexes, so `{8}` needs no awk support).
+          gh api --paginate 'repos/${{ github.repository }}/actions/caches?per_page=100' \
+            --jq '.actions_caches[]
+                  | select(.ref == "refs/heads/master")
+                  | select(.key | test("^v0-rust-.+-[0-9a-f]{8}-[0-9a-f]{8}$"))
+                  | [.created_at, (.id | tostring), (.key | sub("-[0-9a-f]{8}-[0-9a-f]{8}$"; ""))]
+                  | @tsv' \
+            | sort -r | awk -F'\t' 'seen[$3]++ { print $2 }' > /tmp/superseded.ids
+          echo "superseded master generations: $(wc -l < /tmp/superseded.ids)"
           while IFS=$'\t' read -r id ref last size key created; do
             last_s=$(date -d "$last" +%s)
             idle=$(( now - last_s ))
             del=""
             case "$ref" in
-              refs/pull/*) [ "$idle" -gt 172800 ] && del="pr-idle" ;;
+              refs/pull/*)
+                case "$key" in
+                  v0-rust-*) del="pr-cargo" ;;
+                  *) [ "$idle" -gt 172800 ] && del="pr-idle" ;;
+                esac ;;
               refs/tags/*|refs/heads/refs/tags/*) del="tag-ref" ;;
+              refs/heads/master) grep -qx "$id" /tmp/superseded.ids && del="superseded" ;;
             esac
             [ -z "$del" ] && [ "$idle" -gt 345600 ] && del="idle-96h"
             if [ -n "$del" ]; then
