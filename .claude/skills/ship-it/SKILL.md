@@ -115,6 +115,14 @@ carries no digest.
   canary that share a version cannot upgrade into each other: the MSI's
   `MajorUpgrade` refuses the same version, and the updater calls it
   "up to date".
+- 🔒 **`0.4.109` is RESERVED** for the FR-85 **macOS** canary (branch
+  `fr85-canary-0.4.109`, never merged; `recording` in the macOS build line
+  only; reserved 2026-09-27, after 0.4.108). **Never tag `agent-v0.4.109`:
+  the next fleet release is `0.4.110`.** A canary takes the NEXT number, never
+  one past it: re-enabling `auto_update` on the canary host must carry it to
+  the very next fleet release. A canary numbered above a fleet release cut
+  later from a newer master strands the host (the updater only moves up), and
+  the version order stops matching source age.
 
 ## 4 · Break-glass: the build-host path
 
