@@ -93,6 +93,31 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// Run a session's peer close (a remote-control or a tunnel peer) within
+/// [`PEER_CLOSE_BUDGET`], and SAY so when the budget runs out (#1738). The
+/// session-scoped teardown still runs in Drop, but a close dropped at its
+/// budget never reaches `RTCPeerConnection::close`'s ICE step, and the
+/// webrtc internals it did not reach (the ICE agent's connectivity checker, a
+/// 200 ms tick) stay alive for the life of the process. Every close site goes
+/// through here so that it never happens without a line.
+async fn close_within_budget(
+    close: impl std::future::Future<Output = ()>,
+    session: bson::oid::ObjectId,
+    why: &'static str,
+) {
+    if tokio::time::timeout(PEER_CLOSE_BUDGET, close)
+        .await
+        .is_err()
+    {
+        warn!(
+            session = %session,
+            why,
+            budget_ms = PEER_CLOSE_BUDGET.as_millis() as u64,
+            "peer close overran its budget — dropping it (webrtc internals it did not reach stay alive)"
+        );
+    }
+}
+
 /// FR-27 — how long to wait for `companion::ensure_running` before deciding
 /// this host has no on-screen prompt surface.
 ///
@@ -1761,7 +1786,7 @@ async fn connect_once(
                 #[cfg(feature = "recording")]
                 crate::recording::remote::host_ended(sid);
                 if let Some(peer) = peers.remove(&sid) {
-                    let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                    close_within_budget(peer.close(), sid, "host_disconnect").await;
                 }
                 pending_codecs.remove(&sid);
                 pending_transports.remove(&sid);
@@ -2714,7 +2739,7 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
-                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, old.close()).await;
+                close_within_budget(old.close(), session_id, "replaced_by_offer").await;
             }
 
             // Read back the codec picked by `rc:session.request`. If
@@ -2831,7 +2856,7 @@ async fn handle_server_msg(
                 Ok(s) => s,
                 Err(e) => {
                     warn!(%session_id, chain = ?e, "handle_offer failed; terminating");
-                    let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                    close_within_budget(peer.close(), session_id, "offer_failed").await;
                     let _ = reply_for_session(
                         ws,
                         delegated,
@@ -2873,7 +2898,7 @@ async fn handle_server_msg(
                 // (dropping a WebRTC peer frees none of its sockets) and take
                 // down the banner just raised for it (found in review).
                 indicator.hide_session(session_id.to_hex());
-                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                close_within_budget(peer.close(), session_id, "answer_send_failed").await;
                 return Err(ConnectError::Transient(e.context("sending answer")));
             }
             peers.insert(session_id, peer);
@@ -2931,7 +2956,7 @@ async fn handle_server_msg(
             #[cfg(feature = "recording")]
             crate::recording::remote::session_ended(session_id);
             if let Some(peer) = peers.remove(&session_id) {
-                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                close_within_budget(peer.close(), session_id, "terminate").await;
             }
             // 2026-07-27 — last session gone → release the GPU-clock pin
             // (Drop resets the locked clocks).
@@ -3382,7 +3407,7 @@ async fn handle_server_msg(
         ServerMsg::TunnelTerminate { session_id, reason } => {
             info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
             if let Some(peer) = tunnel_peers.remove(&session_id) {
-                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                close_within_budget(peer.close(), session_id, "tunnel_terminate").await;
             }
             // The session may instead be on the QUIC data plane.
             // `AgentQuicPeer::close` is synchronous (aborts the accept
@@ -4112,15 +4137,7 @@ async fn close_all_peers(
         // internals when the network was captured mid-session — the
         // stalled=signaling suicide class. Dropping `peer` right after
         // runs the P6 Drop teardown either way.
-        if tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close())
-            .await
-            .is_err()
-        {
-            warn!(
-                session = %session_id,
-                "peer close timed out — dropping it (P6 Drop teardown still runs)"
-            );
-        }
+        close_within_budget(peer.close(), session_id, "ws_disconnect").await;
     }
     info!(
         count,
@@ -4138,10 +4155,10 @@ async fn close_all_tunnel_peers(
         return;
     }
     let count = tunnel_peers.len();
-    for (_, peer) in tunnel_peers.drain() {
+    for (session_id, peer) in tunnel_peers.drain() {
         // Same bound as `close_all_peers` — a webrtc close on a captured
         // network must not stall the signaling loop into the watchdog.
-        let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+        close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
     }
     info!(count, "torn down agent tunnel peers on ws disconnect");
 }
