@@ -44,6 +44,10 @@ pub mod exec;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;
+/// #1740 — a closed ICE agent (the vendored `webrtc-ice`) leaves nothing
+/// running behind it; black-box over the agent this daemon's sessions use.
+#[cfg(test)]
+mod ice_lifetime_tests;
 pub mod indicator;
 pub mod input;
 pub mod install_cleanup;

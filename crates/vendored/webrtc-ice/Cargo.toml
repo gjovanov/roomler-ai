@@ -8,6 +8,11 @@
 #   - src/agent/agent_selector.rs: per-attempt STUN build failures
 #     downgraded log::error!→debug! with greppable targets (2026-05-18
 #     field log-flood fix; not session-fatal — ICE keeps trying pairs).
+#   - src/agent/mod.rs + src/agent/agent_internal.rs (#1740): the mDNS
+#     resolution of a remote `.local` candidate ends with the agent (upstream
+#     never ended one nobody answered, and it held the closed agent and every
+#     socket it owned forever), and a candidate gathered after close() is
+#     closed instead of kept.
 #   - this Cargo.toml: the `tcp-turn-conn` path dependency below.
 
 [package]

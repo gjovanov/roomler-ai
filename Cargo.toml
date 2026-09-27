@@ -77,6 +77,18 @@ exclude = [
 # networks that block UDP entirely. See agent_gather.rs and the new
 # tcp_turn_conn.rs module for the patch notes.
 #
+# webrtc-ice-0.12.0, second delta (#1740): a browser hides its LAN host
+# candidates behind `<uuid>.local` names, and upstream resolves each one
+# over raw multicast with a query that ends only when answered — no
+# deadline, and it never notices the agent closing. A browser off the
+# agent's LAN never answers, so a session whose names the OS resolver
+# could not answer either (`roomlerd`'s `mdns_resolve`) left that query
+# asking once a second FOREVER, holding the closed ICE agent and every
+# socket its candidates owned. Field 2026-09-27 on a vmtest guest: +17 UDP
+# sockets and +2 mDNS queries/s per ended session, cumulative. Our vendored
+# copy ends the resolution with the agent, and closes a candidate gathered
+# after the close (the same leak by a narrower door).
+#
 # webrtc-0.12.0: upstream SettingEngine has no way to set SCTP
 # `max_receive_buffer_size` — `RTCSctpTransport::start` hardcodes 0
 # which falls back to the 1 MiB INITIAL_RECV_BUF_SIZE constant in
