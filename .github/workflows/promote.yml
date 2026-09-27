@@ -152,14 +152,23 @@ jobs:
 
       - name: Summary
         if: always()
+        # Values reach bash through env, never spliced into the script: a
+        # backtick an expression produced inside a double-quoted echo is a
+        # command substitution (it ran the old tag as a command).
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          BUMPED: ${{ steps.bump.outputs.bumped || 'no' }}
+          OLD: ${{ steps.bump.outputs.old }}
         run: |
+          was=""
+          if [ -n "$OLD" ]; then was=" (was \`$OLD\`)"; fi
           {
             echo "## promote"
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| tag | \`${{ steps.tag.outputs.tag }}\` |"
-            echo "| bumped | ${{ steps.bump.outputs.bumped || 'no' }} ${{ steps.bump.outputs.old && format('(was `{0}`)', steps.bump.outputs.old) || '' }} |"
+            echo "| tag | \`$TAG\` |"
+            echo "| bumped | $BUMPED$was |"
             echo
             echo "Field-verify from the fleet now: pods on the new image, online-agent count, an RC session, an overlay pair, a tunnel forward."
           } >> "$GITHUB_STEP_SUMMARY"
