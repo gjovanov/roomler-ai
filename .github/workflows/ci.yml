@@ -887,6 +887,14 @@ jobs:
         run: cargo clippy -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --tests -- -D warnings
       - name: The identity rule — unit tests (the table, argv, env, impersonation)
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- recording::launch --nocapture
+      # #1727 — not the recorder, but this is the one lane that builds
+      # roomlerd's lib tests on Windows, and `win_service` is Windows-only:
+      # its units ran in NO lane before. The same test binary as the step
+      # above, so it costs seconds. What an MSI install with no
+      # ENABLE_SYSTEM_CONTEXT does is decided here.
+      - name: The installer's SystemContext record — unit tests (#1727)
+        if: ${{ !cancelled() }}
+        run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.

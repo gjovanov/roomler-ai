@@ -1296,6 +1296,13 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<Install
 /// REG_MULTI_SZ via the rc.27 helper — robust whether the
 /// SystemContext was enabled via the wizard, the
 /// `enable-system-context` CLI subcommand, or a prior MSI run.
+///
+/// #1727: the MSI itself no longer defaults the property to `'0'`. With
+/// nothing passed it keeps the mode the machine was last switched to
+/// (`roomlerd keep-system-context`, from the product's record of the last
+/// enable/disable), which is what saves a person running `msiexec` by
+/// hand. This branch stays: the live Environment it reads is better
+/// evidence than that record.
 #[cfg(target_os = "windows")]
 pub fn spawn_installer_as_flavour(
     installer_path: &std::path::Path,

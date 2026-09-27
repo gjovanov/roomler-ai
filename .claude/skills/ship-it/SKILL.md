@@ -103,6 +103,12 @@ carries no digest.
   whole fleet. A canary is a `workflow_dispatch` with `publish_release=false`
   from a branch that changes the feature line. Its signed artifact is
   installed by hand, with auto-update off on that host.
+  ⚠️ By hand on a **SystemContext** host (every corporate laptop in the fleet),
+  an MSI built before #1727 needs `ENABLE_SYSTEM_CONTEXT=1` on the command line.
+  Without it, the install switches SystemContext off and the device goes
+  offline; CORPLAP-2 did on 2026-09-26. To rescue it, run
+  `roomlerd enable-system-context`. From #1727 on, leaving the property out
+  keeps the host's mode.
 - 🔒 **`0.4.106` is RESERVED** for the FR-85 Windows canary (branch
   `fr85-canary-0.4.106`, never merged; the operator, 2026-09-26). **Never tag
   `agent-v0.4.106`: the next fleet release is `0.4.107`.** A fleet build and a
