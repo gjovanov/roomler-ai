@@ -111,6 +111,18 @@ Details worth knowing:
 
 - **Two MSI flavours** exist (`peruser`, `permachine`) — the wizard maps roles
   onto them and flips SystemContext separately (`roomlerd enable-system-context`).
+- **Running the perMachine MSI by hand** (`msiexec /i roomlerd-<v>-perMachine-….msi /qn`):
+  `ENABLE_SYSTEM_CONTEXT=1` turns SystemContext on, `=0` turns it off, and
+  **leaving it out keeps the mode the machine was last switched to** (#1727).
+  The installer runs `roomlerd keep-system-context`, which follows the product's
+  own record of the last `enable-system-context` / `disable-system-context`
+  (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). Every install
+  recreates the service, so the switch itself never survives one.
+  ⚠️ Before #1727, leaving it out switched SystemContext **off**: the service
+  kept running, the worker could no longer find its enrollment and exited in a
+  loop, and the device went offline. To rescue a host in that state, run
+  `roomlerd enable-system-context` from an elevated shell. Start `msiexec` with
+  `Start-Process -Wait -PassThru` so the exit code you read is the installer's.
 - **The private network is on by default for the two machine roles** (FR-84 S2):
   the Advanced **overlay** box follows the role — checked for *Daemon — system* and
   *Daemon — machine*, unchecked for *Daemon — per user* (the WireGuard adapter
