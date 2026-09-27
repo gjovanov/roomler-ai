@@ -196,31 +196,40 @@ sequenceDiagram
     HB->>WD: stamps an atomic
     Note over HB: the runtime stops making progress
     WD->>WD: stamp older than 10 s
-    WD->>F: stall-<unix ms>.txt: every thread's syscall + stack
+    WD->>F: stall-<unix ms>.txt, in stages: header → every thread's /proc line → stacks
     WD->>F: + a fresh sample every 20 s (up to 4)
     K->>K: 5 failed probes → SIGTERM → SIGKILL
     K->>F: new container, same emptyDir
-    F-->>K: the new process logs the dump at boot (kubectl logs)
+    F-->>K: the new process logs a summary at boot (kubectl logs)
 ```
 
 | A dump holds | Why |
 |---|---|
 | per thread: name, run state, kernel `wchan`, and the syscall **with its arguments** from `/proc/self/task/<tid>/syscall` | `write#1 0x1 …` on a thread in `pipe_write` means it is blocked writing stdout |
-| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`), `crates/api/src/stall_watchdog.rs:367` |
+| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`, `crates/api/src/stall_watchdog.rs:499`), claimed per request so a late walk can't corrupt the next (`stack_of`, `:576`) |
 | fd 1 and fd 2: what they are, `unread_bytes`, `pipe_capacity` | `unread == capacity`: the log reader stopped reading |
-| tokio `workers` / `alive_tasks` / `global_queue_depth` | work queued behind stuck workers |
+| tokio `workers` / `alive_tasks` / `global_queue_depth` | `global_queue_depth` counts tasks woken from OUTSIDE the runtime (timers, I/O, other threads) that no worker has picked up |
 | `VmRSS`, cgroup `memory.current/max/events`, memory/cpu/io **PSI**, `cpu.stat` | rules reclaim thrash and CPU throttling in or out |
+
+A sample is written in **stages**, each synced before the next (`sample_process`, `:794`): the
+header, then every thread's `/proc` line, then stacks one thread at a time. A sample cut short by
+the kill still keeps every earlier stage. Threads in `D`/`T`/`Z` cannot run a handler, so they are
+not asked; their `/proc` line is the evidence. A sample's stack walks share a 5 s budget. At most
+one stall is dumped per 10 min, and the watchdog retires when its runtime shuts down.
 
 ⚠️ **The dump never goes through stdout or `tracing`.** The fmt layer writes synchronously to
 stdout under the process-wide stdout lock (`crates/api/src/main.rs:58`). If the log pipe stops
 draining, every logging worker blocks on it. The server has only as many tokio workers as its CPU
 limit (**2**), so that is the leading suspect for #1731, and anything written that way would stall
-too. The dump is written to a file (`write_dump`, `stall_watchdog.rs:228`). A copy goes to stderr
-from a throwaway thread (`:257`), so a blocked pipe blocks only that thread.
+too. The dump is written to a file (`DumpOut`, `stall_watchdog.rs:237`). A copy goes to stderr
+from a throwaway thread (`:280`), so a blocked pipe blocks only that thread.
 
-**Reading one.** The next container logs it at boot as an ERROR,
-"`stall watchdog: a previous process on this pod stalled`" (`report_previous_dumps`, `:281`), and
-marks it `.reported`. The file stays until the pod goes:
+**Reading one.** At boot, the next container marks each unreported dump `.reported` and then logs
+a bounded **summary** of it as an ERROR (`report_previous_dumps`, `:371`):
+"`stall watchdog: a previous process on this pod stalled`". The summary has the sample headers,
+the fd lines, and every thread in `write` or in state `D`/`T` (`summarize`, `:346`). It runs on
+its own thread after the watchdog is armed, so a log pipe that is still wedged can't hold the
+boot. The whole dump stays in the file until the pod goes:
 
 ```bash
 kubectl -n roomler-ai logs <pod> | grep -n 'stall watchdog'
@@ -231,9 +240,14 @@ kubectl -n roomler-ai exec <pod> -- cat /var/lib/roomler/diag/stall-<ms>.txt
 ⚠️ An `emptyDir` survives a container **restart**, not a pod **delete**, and a roll deletes pods.
 Before promoting, read any dump, and save `kubectl logs <pod> --previous` of any restarted pod.
 
+⚠️ **A liveness kill with NO dump means the runtime was not frozen.** The heartbeat kept beating,
+so the answer lies elsewhere: nginx, the HTTP path, or a probe timing out on something other than
+the runtime. That rules the leading suspect out as surely as a dump would rule it in. A dump that
+fell back to the temp dir dies with the container and is never reported.
+
 | Setting (env) | Default | |
 |---|---|---|
-| `ROOMLER__DIAG__STALL_WATCHDOG` | `true` | `false` = no heartbeat, no handler, nothing |
+| `ROOMLER__DIAG__STALL_WATCHDOG` | unset: **on** when `app.environment=production`, off elsewhere | a debugger pause over the threshold would otherwise signal every thread of a dev server (and gdb stops on `SIG39` once per thread) |
 | `ROOMLER__DIAG__STALL_THRESHOLD_SECS` | `10` | floor 2; well inside the ~105 s kill budget |
 | `ROOMLER__DIAG__STALL_DUMP_DIR` | `/var/lib/roomler/diag` | the `diag` emptyDir in `roomler-ai-deploy`'s base deployment. Falls back to the temp dir |
 

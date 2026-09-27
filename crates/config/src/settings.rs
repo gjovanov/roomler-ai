@@ -60,19 +60,17 @@ pub struct Settings {
 /// deployment) or the dump dies with the container it describes.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiagSettings {
-    /// `false` turns the watchdog off entirely (no heartbeat, no handler).
-    #[serde(default = "diag_default_on")]
-    pub stall_watchdog: bool,
+    /// On or off. Unset follows `app.environment`: on in `production`, off
+    /// elsewhere, because on a developer's box a debugger pause longer than the
+    /// threshold would read as a stall and signal every thread.
+    #[serde(default)]
+    pub stall_watchdog: Option<bool>,
     /// How long the runtime's heartbeat may go unseen before it counts as a
     /// stall. Well inside the liveness budget (5 × 15 s probes + grace).
     #[serde(default = "diag_default_threshold_secs")]
     pub stall_threshold_secs: u64,
     #[serde(default = "diag_default_dump_dir")]
     pub stall_dump_dir: String,
-}
-
-fn diag_default_on() -> bool {
-    true
 }
 
 fn diag_default_threshold_secs() -> u64 {
@@ -86,7 +84,7 @@ fn diag_default_dump_dir() -> String {
 impl Default for DiagSettings {
     fn default() -> Self {
         Self {
-            stall_watchdog: diag_default_on(),
+            stall_watchdog: None,
             stall_threshold_secs: diag_default_threshold_secs(),
             stall_dump_dir: diag_default_dump_dir(),
         }
