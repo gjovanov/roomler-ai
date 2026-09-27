@@ -109,3 +109,14 @@ infer = "0.19"
 # FR-69 P1b — `object_store`, `maxminddb`, `redis`, `bytes` and `tempfile`
 # left with the storage / analytics / cluster / pub-sub modules that used
 # them; they are `roomler-core`'s now.
+
+# #1731 — the stall watchdog (`src/stall_watchdog.rs`) walks and names every
+# thread's stack while the runtime is frozen. Linux only: it signals threads
+# with `tgkill` and reads `/proc/self/task`, which is the production target;
+# on other hosts the watchdog is inert.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+backtrace = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

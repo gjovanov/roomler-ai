@@ -6,6 +6,7 @@ pub mod core_state;
 pub mod extractors;
 pub mod middleware;
 pub mod routes;
+pub mod stall_watchdog;
 pub mod state;
 pub mod stats_rollup;
 pub mod ws;
