@@ -340,7 +340,7 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 9.0` needs 9.x.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz' \
             --dir /tmp/ffdl
           # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
           # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
@@ -354,9 +354,12 @@ jobs:
           # which the offline `dpkg --install` fallback could not satisfy
           # without leaving a daemon that fails to load). Rollback = drop
           # that suffix. FR-78 P0 added `-vulkan` (three Vulkan encoders,
-          # dlopen'd — no new DT_NEEDED); rollback = drop that one.
+          # dlopen'd — no new DT_NEEDED); rollback = drop that one. FR-85 P4c
+          # added `-h264dec-aac` (the software h264 decoder the recorder's
+          # editor needs and the aac encoder for its sound, inside libavcodec,
+          # no new DT_NEEDED); rollback = drop that one.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -1080,10 +1083,12 @@ jobs:
           # Rollback = drop the `-minimal` suffix here; the full zip stays on
           # the same release untouched. FR-78 P0 added `-d3d12-vulkan` (six
           # more encoders, both backends dlopen'd by FFmpeg — no new import);
-          # rollback = drop that suffix.
+          # rollback = drop that suffix. FR-85 P4c added `-h264dec-aac` (the
+          # software h264 decoder the recorder's editor needs and the aac
+          # encoder for its sound; no new import); rollback = drop that one.
           gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip*' --dir $dl
-          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip"
+            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
@@ -2064,17 +2069,19 @@ jobs:
           # It is also minimal (--disable-everything + the three
           # *_videotoolbox encoders): 775 KB packed, ~1.8 MB of dylibs,
           # against ~20 MB for the untrimmed tree that would have doubled
-          # the .pkg.
+          # the .pkg. FR-85 P4c added `-h264dec-aac` (the software h264
+          # decoder the recorder's editor needs and the aac encoder for its
+          # sound; 1,071,108 B packed, ~3.0 MB of dylibs); rollback = drop it.
           mkdir -p /tmp/ffdl "$RUNNER_TEMP/roomler-ffmpeg"
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-macos-arm64-lgpl-shared-h264dec-aac.tar.xz' \
             --dir /tmp/ffdl --clobber
           # NOTE: no --strip-components. The macOS tarball is packed as
           # `tar cJf … lib include` from the install prefix, so lib/ and
           # include/ are already at the root — unlike the Linux one, which
           # has a wrapping directory and does strip 1.
-          tar xf /tmp/ffdl/ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz \
+          tar xf /tmp/ffdl/ffmpeg-9.0.1-macos-arm64-lgpl-shared-h264dec-aac.tar.xz \
             -C "$RUNNER_TEMP/roomler-ffmpeg"
           # BSD sed needs an explicit (empty) backup suffix; GNU `sed -i`
           # would silently create files named after the next argument.
