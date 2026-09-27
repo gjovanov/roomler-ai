@@ -623,7 +623,10 @@ flowchart LR
     C(("the recorder's clock<br/>(the video pacer's Instant)")) --> X
     BS --> X["mixer: one 20 ms frame<br/>per 20 ms of clock,<br/>silence for what is missing,<br/>soft-clipped sum"]
     BM --> X
-    X --> O["Opus 128 kb/s<br/>(its own encoder)"] --> Q["queue until the first<br/>video frame is written"] --> W["MP4 audio track"]
+    X --> Q["PCM queued until the first<br/>video frame is written"] --> T["cut to the sample:<br/>first frame + the codec's<br/>unsignalled delay"]
+    T --> O{"FFmpeg has<br/>the aac encoder?"}
+    O -- yes --> A["AAC-LC 192 kb/s<br/>1024-sample frames"] --> W["MP4 audio track"]
+    O -- no --> P["Opus 128 kb/s<br/>20 ms frames"] --> W
 ```
 
 | Decision | Why |
@@ -632,10 +635,40 @@ flowchart LR
 | **It runs 60 ms behind** (`MIX_LAG`) | Devices hand over ~10 ms bursts. A mixer level with the clock would pad silence into every frame. |
 | **Drift is corrected by RATE** | Each source's linear resampler is bent by at most ±0.5 % toward keeping its buffer at the lag. Padding alone would click: a device clock 0.1 % slow empties the buffer, and from then on every frame pads a sample. The hard trim (a buffer past 250 ms, cut back to 60 ms, newest kept) is only for backlogs such as the capture pre-roll at start. |
 | **Linear, not nearest-neighbour** | A 44.1 kHz laptop microphone is common, and the live path's nearest-neighbour aliases audibly on speech. The live path keeps its own resampler, untouched. |
-| **Audio waits for the first video frame** | The writer's audio decode time starts at the first packet pushed after its header. Encoded audio queues from the clock's start; when the first video frame is written, frames mostly before its time are dropped, so the tracks start within ±10 ms of each other. |
+| **Audio waits for the first video frame, and is cut to the sample** | The writer's audio decode time starts at the first packet pushed after its header. Mixed audio queues **as PCM** from the clock's start (bounded at a minute); when the first video frame is written, everything before its time is cut, mid-frame if need be, and only then encoded. Before P4 whole encoded 20 ms frames were dropped, which left the tracks up to ±10 ms apart, and a codec with its own frame size could not have been cut that way at all. |
 | **Soft clip, not wrap** | Two loud sources sum past full scale. Up to ¾ of full scale the sum is untouched; above it, a `tanh` knee compresses toward full scale, settling at it only far past it (never beyond, never wrapping). |
 | **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch), `audio_unavailable` (a build without the `audio` feature; macOS today). A recording that silently lacked the audio the person asked for would be worse. |
 | **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
+
+### The codec: AAC where FFmpeg has it, Opus everywhere else (P4)
+
+`recording/audio_codec.rs` picks once per recording (`AudioEncoder::best`),
+and the export picks the same way:
+
+| Build | Track | Sidecar `audio.codec` |
+|---|---|---|
+| `ffmpeg-encoder`, and its FFmpeg carries the native `aac` encoder (the `-h264dec-aac` vendored assets, P4a) | AAC-LC, 48 kHz stereo, 192 kb/s, `mp4a` + `esds` | `aac` |
+| no FFmpeg (Linux arm64), or an FFmpeg without `aac` (every release before P4c flips the assets) | Opus, 48 kHz stereo, 128 kb/s, `Opus` + `dOps` | `opus` |
+
+- **Why AAC.** Opus-in-MP4 plays in browsers and VLC, but not in QuickTime,
+  and not in Movies & TV without an extension. AAC-LC opens wherever a
+  recording is likely to be played or edited.
+- **Why it is chosen at runtime, never refused.** Whether the linked FFmpeg
+  has the encoder is a property of the asset, not of the code. So the same
+  binary records Opus against today's assets and AAC after the flip, and a
+  lookup that fails is logged, not an error.
+- ⚠️ **AAC's priming is paid at the source, never signalled.** An AAC decoder
+  puts out 1024 samples (FFmpeg's `initial_padding`) before input sample 0,
+  and players disagree about the edit list that would tell them to drop
+  those. So the encoder's input starts 1024 samples past the first video
+  frame (`unsignalled_delay`): decoded sample k is recording time k in every
+  player, edit list or not. The cost is the first ~21 ms of sound. Opus
+  declares its own `pre_skip` in `dOps`, which every Opus decoder honours,
+  so its delay is 0. An export feeds its encoder the same way, and reads a
+  recording's AAC track from sample 0, skipping nothing.
+- **The encoder takes any number of samples.** The mixer's frames are 20 ms
+  (960 samples) and AAC codes 1024-sample frames. Samples wait in the
+  encoder until a whole frame is in, and the last one is padded with silence.
 
 ⚠️ **Computer audio never falls back to a microphone.** The live
 remote-control path, on a Linux host without a PulseAudio monitor, falls back
@@ -1175,9 +1208,11 @@ finished file is harmless, and an export started with stdin closed must run.
 
 ### The export's sound (P5b)
 
-`recording/export_audio.rs` makes one Opus track at the recorder's profile
-(48 kHz stereo, 20 ms frames), produced in step with the video so the file
-interleaves as a recording does.
+`recording/export_audio.rs` makes one track at the recorder's profile (48 kHz
+stereo; AAC where the build's FFmpeg has the encoder, Opus otherwise, §9),
+produced in step with the video so the file interleaves as a recording does.
+It reads a recording's own track in either codec: Opus through libopus, AAC
+through symphonia (P4).
 
 | Part of the export | The recording's audio | The music |
 |---|---|---|
@@ -1277,8 +1312,9 @@ sequenceDiagram
 - Deleting a recording deletes its edit list too. An export beside it is a
   recording of its own and stays.
 
-Not yet: FFmpeg's decoder for hardware recordings, and AAC for the sound
-(P4); a thumbnail strip where the webview cannot play a recording; hearing
+Not yet: FFmpeg's decoder for hardware recordings (P4b-2); AAC in shipped
+builds, which waits for the release assets to flip (P4c; the code is in,
+§9); a thumbnail strip where the webview cannot play a recording; hearing
 the music in the preview.
 
 ## 12. Tests
@@ -1304,6 +1340,8 @@ the music in the preview.
 | `recording::edit` and `recording::manager` unit tests (P5c) | the edit list roomler-desktop writes is one roomlerd reads: `agents/roomler-desktop/tests/fixtures/edit-list.json`, the file the page's own test pins its output to, plans to 5 s with its music as written (red when roomlerd reads `looped` for `loop`); deleting a recording takes its edit list with it and leaves an export beside it (red when the list is left behind) | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
+| `recording::audio_codec`, `recording::mp4`, `recording::recorder::tests::alignment`, `recording::export_audio` unit tests (P4) | odd-sized pushes come out as whole codec frames and the tail is padded into one more; an AAC track keeps its AudioSpecificConfig (`11 90`) through the crash-safe file and the remux, and an Opus track reads back as Opus (the control); a click the mixer made 30 000 samples after the first video frame decodes 30 000 samples into the track, in Opus AND in AAC — red with the sample-exact cut removed (the click lands 240 samples late), and an AAC priming left unpaid would put it 1024 late; the export's reader finds the same click at the same sample in either codec | the recorder step (Opus); the AAC halves in "Recording with FFmpeg AAC" |
+| `ci.yml` "Recording with FFmpeg AAC (FR-85 P4)" | the recorder and export suites built WITH `ffmpeg-encoder` against the `-h264dec-aac` vendored FFmpeg: the encoder's 1024-sample frames, declared priming and standard config; a recording's track and sidecar both AAC; an export written as AAC; an AAC recording read back through keep / cut / 4× / keep. ⚠️ `ROOMLER_EXPECT_FFMPEG_AAC=1` makes a missing encoder a FAILURE, never a quiet Opus pass | its own job |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
 | `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`, `record_remote_enabled`, `record_remote_audio`; `recording_dir` validation incl. a real Windows junction | same |
 | `recording::remote` unit tests (P3b) | nothing advertised unless a recorder can run, then `available` (P3c-2), `remote` only when the owner opted in as well, `remote-audio` only on top with an audio build; the prechecks refuse in order and by name; the wire parses (audio off unless asked; a `microphone` field is ignored) and speaks the documented state shape; the controller is told a file name, never a path; `adopt` signals only a change | "Test the recorder (FR-85)" (`--lib recording::`) |
