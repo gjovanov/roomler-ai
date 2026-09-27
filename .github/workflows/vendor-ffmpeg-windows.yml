@@ -108,7 +108,12 @@ jobs:
           # grows no import and the agent no load-time need. av1_d3d12va
           # additionally needs the SDK's AV1 encode structs
           # (`d3d12va_av1_headers`, SDK 10.0.26100 — the runner's).
-          $inject = 'string(APPEND OPTIONS " --disable-everything --disable-network --disable-protocols --disable-devices --disable-filters --disable-bsfs --disable-parsers --disable-demuxers --disable-muxers --disable-decoders --disable-encoders --disable-hwaccels --enable-encoder=h264_nvenc --enable-encoder=hevc_nvenc --enable-encoder=av1_nvenc --enable-encoder=h264_qsv --enable-encoder=hevc_qsv --enable-encoder=av1_qsv --enable-encoder=vp9_qsv --enable-encoder=h264_amf --enable-encoder=hevc_amf --enable-encoder=av1_amf --enable-encoder=h264_d3d12va --enable-encoder=hevc_d3d12va --enable-encoder=av1_d3d12va --enable-encoder=h264_vulkan --enable-encoder=hevc_vulkan --enable-encoder=av1_vulkan --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va --enable-d3d12va --enable-vulkan")' + "`n" + $anchor
+          # FR-85 P4: `--enable-decoder=h264 --enable-encoder=aac` — the
+          # recorder's editor decodes a hardware encoder's H.264 in software,
+          # and its sound is AAC. No hevc decoder: nothing records HEVC, and
+          # a software HEVC implementation is what THIRD-PARTY-NOTICES says we
+          # do not ship. Fed whole access units, so no parser is needed.
+          $inject ='string(APPEND OPTIONS " --disable-everything --disable-network --disable-protocols --disable-devices --disable-filters --disable-bsfs --disable-parsers --disable-demuxers --disable-muxers --disable-decoders --disable-encoders --disable-hwaccels --enable-encoder=h264_nvenc --enable-encoder=hevc_nvenc --enable-encoder=av1_nvenc --enable-encoder=h264_qsv --enable-encoder=hevc_qsv --enable-encoder=av1_qsv --enable-encoder=vp9_qsv --enable-encoder=h264_amf --enable-encoder=hevc_amf --enable-encoder=av1_amf --enable-encoder=h264_d3d12va --enable-encoder=hevc_d3d12va --enable-encoder=av1_d3d12va --enable-encoder=h264_vulkan --enable-encoder=hevc_vulkan --enable-encoder=av1_vulkan --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va --enable-d3d12va --enable-vulkan --enable-decoder=h264 --enable-encoder=aac")' + "`n" + $anchor
           $content = $content.Replace($anchor, $inject)
 
           # ── FR-62 A2: apply the roomler FFmpeg source patches via the port's
@@ -169,7 +174,9 @@ jobs:
           # LGPL-clean, unchanged from the full build.
           $gpl = Get-ChildItem $lib -Filter '*.lib' | Where-Object { $_.Name -match 'x264|x265' }
           if ($gpl) { Write-Host "::error::GPL codec lib present: $($gpl.Name)"; exit 1 }
-          # The sixteen encoder symbols must exist; a famous decoder must NOT.
+          # The sixteen hardware encoders must exist, and (FR-85 P4) the
+          # software h264 decoder and the aac encoder the recorder's editor
+          # and sound need. Everything else the registry would bring must NOT.
           $vsroot = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vsroot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1
           $syms = & $dumpbin.FullName /LINKERMEMBER:1 "$lib\avcodec.lib" | Out-String
@@ -177,8 +184,9 @@ jobs:
                              'ff_h264_qsv_encoder','ff_hevc_qsv_encoder','ff_av1_qsv_encoder','ff_vp9_qsv_encoder',
                              'ff_h264_amf_encoder','ff_hevc_amf_encoder','ff_av1_amf_encoder',
                              'ff_h264_d3d12va_encoder','ff_hevc_d3d12va_encoder','ff_av1_d3d12va_encoder',
-                             'ff_h264_vulkan_encoder','ff_hevc_vulkan_encoder','ff_av1_vulkan_encoder')) {
-            if ($syms -notmatch [regex]::Escape($enc)) { Write-Host "::error::expected encoder symbol missing: $enc"; exit 1 }
+                             'ff_h264_vulkan_encoder','ff_hevc_vulkan_encoder','ff_av1_vulkan_encoder',
+                             'ff_h264_decoder','ff_aac_encoder')) {
+            if ($syms -notmatch [regex]::Escape($enc)) { Write-Host "::error::expected component symbol missing: $enc"; exit 1 }
           }
           # FR-78 P0 — both new backends are dlopen'd by FFmpeg: the static
           # tree must carry NO import of d3d12.dll / vulkan-1.dll, or the
@@ -187,13 +195,22 @@ jobs:
           foreach ($dll in @('vulkan-1.lib','d3d12.lib')) {
             if ($imports -match [regex]::Escape($dll)) { Write-Host "::error::avutil.lib carries a link directive for $dll — the backend must stay dlopen'd"; exit 1 }
           }
-          foreach ($dead in @('ff_prores_decoder','ff_h264_decoder','ff_mov_muxer')) {
+          # FR-85 P4 — the h264 decoder is IN now; the hevc one stays out on
+          # purpose (nothing writes an HEVC recording, and a software HEVC
+          # implementation is what THIRD-PARTY-NOTICES says we do not ship).
+          foreach ($dead in @('ff_prores_decoder','ff_hevc_decoder')) {
             if ($syms -match [regex]::Escape($dead)) { Write-Host "::error::component that should be trimmed is present: $dead"; exit 1 }
           }
+          # The muxers live in avformat, not avcodec: scanned there, or the
+          # assertion could never fire. `avformat_alloc_context` is the
+          # positive control that proves the scan reads the right library.
+          $fsyms = & $dumpbin.FullName /LINKERMEMBER:1 "$lib\avformat.lib" | Out-String
+          if ($fsyms -notmatch 'avformat_alloc_context') { Write-Host "::error::avformat.lib scan found no avformat_alloc_context — the muxer check below would be vacuous"; exit 1 }
+          if ($fsyms -match [regex]::Escape('ff_mov_muxer')) { Write-Host "::error::component that should be trimmed is present: ff_mov_muxer"; exit 1 }
           $mb = [math]::Round((Get-Item "$lib\avcodec.lib").Length / 1MB, 1)
-          Write-Host "avcodec.lib = $mb MB (full build was 139.3)"
+          Write-Host "avcodec.lib = $mb MB (full build was 139.3; FR-85 P0 measured 38.0 with h264+hevc decoders and aac)"
           if ($mb -gt 60) { Write-Host "::error::avcodec.lib is $mb MB — the trim did not take"; exit 1 }
-          Write-Host "trim verified: 16 encoders present, registry payload gone"
+          Write-Host "trim verified: 16 encoders + the h264 decoder + the aac encoder present, registry payload gone"
 
       - name: Package + upload the minimal static-md tree
         shell: pwsh
@@ -207,8 +224,9 @@ jobs:
           # filename, so rollback = flip the pattern back to the non-minimal
           # zip (kept on the release untouched). FR-78 P0 added the
           # `-d3d12-vulkan` suffix (six more encoders, no new import):
-          # rollback = drop that suffix.
-          $zip = "$env:RUNNER_TEMP\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip"
+          # rollback = drop that suffix. FR-85 P4 added `-h264dec-aac` (the
+          # software h264 decoder and the aac encoder): rollback = drop it.
+          $zip = "$env:RUNNER_TEMP\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip"
           # FR-62 A2 — carry the patch manifest inside the asset so
           # release-agent can prove the vendored libs match the committed
           # patches (see the build step). Present iff the build applied patches.
@@ -358,6 +376,7 @@ jobs:
             --enable-nvenc --enable-ffnvcodec --enable-cuda --enable-libvpl --enable-amf --enable-vaapi --enable-vulkan \
             --extra-cflags=-I/opt/ffout/include \
             --enable-parser=h264,hevc,av1 \
+            --enable-decoder=h264 --enable-encoder=aac \
             || { echo "=== configure failed; last errors in config.log ==="; grep -n -B 25 "^ERROR:" ffbuild/config.log | tail -80; grep -nE "error:" ffbuild/config.log | tail -10; exit 1; }
           make -j"$(nproc)"
           sudo make install
@@ -379,9 +398,14 @@ jobs:
             for (unsigned i = 0; i < sizeof(want)/sizeof(*want); i++) {
               if (!avcodec_find_encoder_by_name(want[i])) { fprintf(stderr, "MISSING encoder %s\n", want[i]); return 1; }
             }
-            if (avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1; }
+            /* FR-85 P4 — the recorder's editor decodes H.264 in software and its
+               sound is AAC: both must be IN. HEVC decoding stays OUT on purpose
+               (nothing records HEVC; THIRD-PARTY-NOTICES ships no software HEVC). */
+            if (!avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "MISSING decoder h264\n"); return 1; }
+            if (!avcodec_find_encoder_by_name("aac")) { fprintf(stderr, "MISSING encoder aac\n"); return 1; }
+            if (avcodec_find_decoder_by_name("hevc")) { fprintf(stderr, "hevc DECODER present — trim did not take\n"); return 1; }
             if (avcodec_find_encoder_by_name("libkvazaar")) { fprintf(stderr, "libkvazaar present — trim did not take\n"); return 1; }
-            printf("probe OK: 17 encoders present, registry trimmed\n");
+            printf("probe OK: 17 encoders + the h264 decoder + the aac encoder present, registry trimmed\n");
             return 0;
           }
           EOC
@@ -440,10 +464,12 @@ jobs:
           # patches before it ships them.
           cp /tmp/ROOMLER-PATCHES.txt "$staging/ROOMLER-PATCHES.txt"
           # FR-78 P0: `-vulkan` suffix (three more encoders, no new DT_NEEDED);
+          # rollback = drop it. FR-85 P4: `-h264dec-aac` (the software h264
+          # decoder and the aac encoder, inside libavcodec, no new DT_NEEDED);
           # rollback = drop it.
-          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz -C /tmp/stage ffmpeg-minimal
-          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz | tee /tmp/min.sha256
-          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz
+          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz -C /tmp/stage ffmpeg-minimal
+          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz | tee /tmp/min.sha256
+          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz
           gh release upload vendored-ffmpeg-9.0.1 \
-            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
+            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz \
             --repo "${{ github.repository }}" --clobber
