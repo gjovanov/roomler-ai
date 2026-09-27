@@ -27,8 +27,9 @@
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
-> person hands it. Still to come: the microphone on macOS and editing a
-> hardware encoder's recording (P4).
+> person hands it. Still to come: the microphone on macOS, and the release
+> assets that carry AAC and the H.264 decoder (P4c; the code is in, §9 and
+> §11).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -1177,10 +1178,24 @@ flowchart LR
   a k× speed-up shows every k-th frame with no drift (over an hour at 1.5×, the
   last frame is exactly the one integer arithmetic says). A float map slips a
   frame here and there, which the oracle reads as the wrong frame.
-- ⚠️ **openh264 decodes only Constrained Baseline**, which is what the
-  software encoder writes. A hardware encoder's recording (High profile) is
-  refused `decoder_unavailable`, by name and before a frame is decoded, until
-  FR-85 P4 vendors FFmpeg's H.264 decoder. Never a garbled export.
+- **Two decoders, chosen by the recording's profile** (`recording/decode.rs`,
+  P4):
+
+  | The recording's H.264 profile | Decoder | Where |
+  |---|---|---|
+  | 66, Constrained Baseline (the software encoder) | openh264 | every build, Linux arm64 included |
+  | 100 High, 244 High 4:4:4 (the hardware encoders) | FFmpeg's `h264` | builds whose linked FFmpeg carries it: the `-h264dec-aac` vendored assets (P4a), from the release where P4c flips the pins |
+  | any other, or High on a build without that decoder | none | refused `decoder_unavailable`, by name and before a frame is decoded — never a garbled export |
+
+  Whether FFmpeg has the decoder is a property of the library, so it is asked
+  at runtime (`decode::can_decode`), and `media probe` answers `editable`
+  from the same function. ⚠️ **FFmpeg runs with `LOW_DELAY` and slice threads
+  only**: the recorder writes no B-frames, and frame threads would hold each
+  picture back behind the next packets. Every packet carries its sample index
+  as its pts, and a picture that comes back with another index is refused, never
+  shown in the wrong place. Pictures become BGRA through `dcv-color-primitives`
+  with the matrix and range the stream signals (BT.601 limited, as the
+  recorder writes it, unless it says otherwise).
 - **It decodes forward**, jumping to the keyframe before the next frame it
   needs when that keyframe lies ahead: a cut costs at most one GOP (2 s) of
   decoding. A speed-up still decodes every frame it passes over (H.264 needs
@@ -1312,9 +1327,9 @@ sequenceDiagram
 - Deleting a recording deletes its edit list too. An export beside it is a
   recording of its own and stays.
 
-Not yet: FFmpeg's decoder for hardware recordings (P4b-2); AAC in shipped
-builds, which waits for the release assets to flip (P4c; the code is in,
-§9); a thumbnail strip where the webview cannot play a recording; hearing
+Not yet: AAC and editing a hardware encoder's recording in shipped builds,
+which wait for the release assets to flip (P4c; the code is in, §9 and
+above); a thumbnail strip where the webview cannot play a recording; hearing
 the music in the preview.
 
 ## 12. Tests
@@ -1340,8 +1355,9 @@ the music in the preview.
 | `recording::edit` and `recording::manager` unit tests (P5c) | the edit list roomler-desktop writes is one roomlerd reads: `agents/roomler-desktop/tests/fixtures/edit-list.json`, the file the page's own test pins its output to, plans to 5 s with its music as written (red when roomlerd reads `looped` for `loop`); deleting a recording takes its edit list with it and leaves an export beside it (red when the list is left behind) | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
-| `recording::audio_codec`, `recording::mp4`, `recording::recorder::tests::alignment`, `recording::export_audio` unit tests (P4) | odd-sized pushes come out as whole codec frames and the tail is padded into one more; an AAC track keeps its AudioSpecificConfig (`11 90`) through the crash-safe file and the remux, and an Opus track reads back as Opus (the control); a click the mixer made 30 000 samples after the first video frame decodes 30 000 samples into the track, in Opus AND in AAC — red with the sample-exact cut removed (the click lands 240 samples late), and an AAC priming left unpaid would put it 1024 late; the export's reader finds the same click at the same sample in either codec | the recorder step (Opus); the AAC halves in "Recording with FFmpeg AAC" |
-| `ci.yml` "Recording with FFmpeg AAC (FR-85 P4)" | the recorder and export suites built WITH `ffmpeg-encoder` against the `-h264dec-aac` vendored FFmpeg: the encoder's 1024-sample frames, declared priming and standard config; a recording's track and sidecar both AAC; an export written as AAC; an AAC recording read back through keep / cut / 4× / keep. ⚠️ `ROOMLER_EXPECT_FFMPEG_AAC=1` makes a missing encoder a FAILURE, never a quiet Opus pass | its own job |
+| `recording::audio_codec`, `recording::mp4`, `recording::recorder::tests::alignment`, `recording::export_audio` unit tests (P4) | odd-sized pushes come out as whole codec frames and the tail is padded into one more; an AAC track keeps its AudioSpecificConfig (`11 90`) through the crash-safe file and the remux, and an Opus track reads back as Opus (the control); a click the mixer made 30 000 samples after the first video frame decodes 30 000 samples into the track, in Opus AND in AAC — red with the sample-exact cut removed (the click lands 240 samples late), and an AAC priming left unpaid would put it 1024 late; the export's reader finds the same click at the same sample in either codec | the recorder step (Opus); the AAC halves in "Recording with FFmpeg" |
+| `recording::decode` unit tests and `tests/export.rs`, hardware recordings (P4b-2) | two COMMITTED recordings that `h264_nvenc` made of the counter pattern (`tests/fixtures/export-high-profile.mp4`, High; `export-high444-profile.mp4`, High 4:4:4; regenerated by the ignored `make_the_hardware_fixtures`), proven to be what they claim; where FFmpeg's decoder is linked, keep 0–1 s · cut 1–2 s · keep 2–3 s decodes to exactly `0..30, 60..90` in both, and `media probe` says `editable`; where it is not, the same export is refused `decoder_unavailable` with nothing written, and the probe gives the reason | the recorder step (the refusals); "Recording with FFmpeg" (the exports) |
+| `ci.yml` "Recording with FFmpeg — AAC and H.264 decode (FR-85 P4)" | the recorder and export suites built WITH `ffmpeg-encoder` against the `-h264dec-aac` vendored FFmpeg: the encoder's 1024-sample frames, declared priming and standard config; a recording's track and sidecar both AAC; an export written as AAC; an AAC recording read back through keep / cut / 4× / keep; the hardware fixtures exported frame for frame. ⚠️ `ROOMLER_EXPECT_FFMPEG_AAC=1` and `ROOMLER_EXPECT_FFMPEG_H264_DECODER=1` make a missing encoder or decoder a FAILURE, never a quiet pass on the fallback | its own job |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
 | `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`, `record_remote_enabled`, `record_remote_audio`; `recording_dir` validation incl. a real Windows junction | same |
 | `recording::remote` unit tests (P3b) | nothing advertised unless a recorder can run, then `available` (P3c-2), `remote` only when the owner opted in as well, `remote-audio` only on top with an audio build; the prechecks refuse in order and by name; the wire parses (audio off unless asked; a `microphone` field is ignored) and speaks the documented state shape; the controller is told a file name, never a path; `adopt` signals only a change | "Test the recorder (FR-85)" (`--lib recording::`) |
