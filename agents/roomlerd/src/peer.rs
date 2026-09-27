@@ -956,7 +956,15 @@ impl AgentPeer {
         // them in user-space avoids polluting `enigo` logs and lets
         // a future browser-side hint surface "input suppressed" to
         // the operator.
-        let (lock_state_rx, _lock_state_handle) = lock_state::spawn_monitor();
+        //
+        // #1738 — the session's end token is made here, first, so the
+        // monitor and its emitter end WITH the session: dropping the
+        // monitor's handle only detaches it (tokio never aborts on drop),
+        // and the emitter's `changed()` wait kept the monitor's channel
+        // open, so each session used to leave the pair polling for the
+        // life of the daemon.
+        let session_end = tokio_util::sync::CancellationToken::new();
+        let (lock_state_rx, _lock_state_monitor) = lock_state::spawn_monitor(session_end.clone());
 
         // Route data channels by label. `input` goes to the OS injector;
         // `control` parses rc:* JSON (quality preference, etc.);
@@ -984,7 +992,6 @@ impl AgentPeer {
             Arc::new(std::sync::OnceLock::new());
         #[cfg(feature = "recording")]
         let record_ctx_for_callback = record_ctx.clone();
-        let session_end = tokio_util::sync::CancellationToken::new();
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -1133,25 +1140,36 @@ impl AgentPeer {
         // monitor's transitions and emits `rc:host_locked` over the
         // `control` data channel so the viewer can render an explicit
         // toolbar badge alongside the in-stream padlock overlay.
-        // The task self-terminates when the receiver closes (pump
-        // exit) or when send to the DC fails (peer gone).
+        // #1738 — it ends with the SESSION. Every await in it is raced
+        // against the session's end: `changed()` waits on the monitor's
+        // sender, and a send on a channel a network drop left `Closing`
+        // can park for good (#1730).
         {
             let mut rx = lock_state_rx.clone();
             let stash = control_dc.clone();
+            let until = session_end.clone();
             tokio::spawn(async move {
-                // Send the initial state once the control DC is
-                // available. The first `changed().await` fires only
-                // on subsequent transitions, but the operator's UI
-                // needs to know if the host is *already* locked at
-                // session start.
-                let mut prev = *rx.borrow();
-                emit_host_locked(&stash, prev == lock_state::LockState::Locked).await;
-                while rx.changed().await.is_ok() {
-                    let current = *rx.borrow();
-                    if current != prev {
-                        emit_host_locked(&stash, current == lock_state::LockState::Locked).await;
-                        prev = current;
+                let run = async move {
+                    // Send the initial state once the control DC is
+                    // available. The first `changed().await` fires only
+                    // on subsequent transitions, but the operator's UI
+                    // needs to know if the host is *already* locked at
+                    // session start.
+                    let mut prev = *rx.borrow();
+                    emit_host_locked(&stash, prev == lock_state::LockState::Locked).await;
+                    while rx.changed().await.is_ok() {
+                        let current = *rx.borrow();
+                        if current != prev {
+                            emit_host_locked(&stash, current == lock_state::LockState::Locked)
+                                .await;
+                            prev = current;
+                        }
                     }
+                };
+                tokio::select! {
+                    biased;
+                    _ = until.cancelled() => {}
+                    _ = run => {}
                 }
             });
         }
@@ -1162,28 +1180,38 @@ impl AgentPeer {
         // manual picker. UNLIKE the host-locked emitter above, the
         // layout watch sender is PROCESS-GLOBAL and never closes, so
         // `rx.changed()` alone would keep this task alive forever —
-        // one leaked emitter per session. The send-failure break is
-        // the session-scoped exit.
+        // one leaked emitter per session. #1738 — the session's end is
+        // the session-scoped exit: a send on a channel a network drop
+        // left `Closing` can park instead of failing (#1730), so the
+        // send-failure break alone is not one.
         #[cfg(all(target_os = "windows", feature = "enigo-input"))]
         {
             let mut rx = crate::input::layout::subscribe();
             let stash = control_dc.clone();
+            let until = session_end.clone();
             tokio::spawn(async move {
-                // Warm-start with the last-known snapshot (None until
-                // the first input event of the process).
-                let initial = rx.borrow().clone();
-                if let Some(s) = initial
-                    && !emit_layout(&stash, &s).await
-                {
-                    return;
-                }
-                while rx.changed().await.is_ok() {
-                    let snap = rx.borrow().clone();
-                    if let Some(s) = snap
+                let run = async move {
+                    // Warm-start with the last-known snapshot (None until
+                    // the first input event of the process).
+                    let initial = rx.borrow().clone();
+                    if let Some(s) = initial
                         && !emit_layout(&stash, &s).await
                     {
                         return;
                     }
+                    while rx.changed().await.is_ok() {
+                        let snap = rx.borrow().clone();
+                        if let Some(s) = snap
+                            && !emit_layout(&stash, &s).await
+                        {
+                            return;
+                        }
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = until.cancelled() => {}
+                    _ = run => {}
                 }
             });
         }

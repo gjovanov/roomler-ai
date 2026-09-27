@@ -2931,7 +2931,21 @@ async fn handle_server_msg(
             #[cfg(feature = "recording")]
             crate::recording::remote::session_ended(session_id);
             if let Some(peer) = peers.remove(&session_id) {
-                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
+                // #1738 — said, not swallowed: a close dropped at its
+                // budget never reaches `RTCPeerConnection::close`'s ICE
+                // step, and the ICE agent's connectivity checker then ticks
+                // every 200 ms for the life of the process. Until this line
+                // nothing recorded that it happened.
+                if tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        session = %session_id,
+                        budget_ms = PEER_CLOSE_BUDGET.as_millis() as u64,
+                        "peer close overran its budget — dropping it (webrtc internals it did not reach stay alive)"
+                    );
+                }
             }
             // 2026-07-27 — last session gone → release the GPU-clock pin
             // (Drop resets the locked clocks).
