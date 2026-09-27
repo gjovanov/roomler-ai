@@ -61,6 +61,43 @@ async fn main() -> anyhow::Result<()> {
     // Load config
     let settings = Settings::load()?;
 
+    // #1731 — the stall watchdog: armed before anything that could stall, and
+    // it never writes through stdout, the prime suspect. Unset = on in
+    // production only.
+    let stall_watchdog = settings
+        .diag
+        .stall_watchdog
+        .unwrap_or(settings.app.environment == "production");
+    if stall_watchdog {
+        let dump_dir = std::path::PathBuf::from(&settings.diag.stall_dump_dir);
+        let threshold = std::time::Duration::from_secs(settings.diag.stall_threshold_secs.max(2));
+        match roomler_ai_api::stall_watchdog::start(
+            &tokio::runtime::Handle::current(),
+            roomler_ai_api::stall_watchdog::Config {
+                threshold,
+                dump_dir: dump_dir.clone(),
+                echo_stderr: true,
+            },
+        ) {
+            Ok(_running) => info!(
+                dump_dir = %dump_dir.display(),
+                threshold_secs = threshold.as_secs(),
+                "stall watchdog armed (#1731)"
+            ),
+            Err(e) => warn!(error = %e, "stall watchdog did not start (#1731)"),
+        }
+        // Then whatever a stalled predecessor left behind: a stall normally
+        // ends in a liveness kill, so this container is the first place its
+        // dump can be reported. From a thread of its own and only after the
+        // arming, so a log pipe that is still wedged can neither hold the boot
+        // nor leave this process unwatched.
+        let _ = std::thread::Builder::new()
+            .name("stall-report".into())
+            .spawn(move || {
+                roomler_ai_api::stall_watchdog::report_previous_dumps(&dump_dir);
+            });
+    }
+
     // The built-in JWT secret ("change-me-in-production") lets anyone forge
     // tokens. In development that's a loud warning; with
     // `app.environment=production` (prod configmap sets
