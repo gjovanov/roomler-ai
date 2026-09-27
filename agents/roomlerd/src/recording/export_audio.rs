@@ -11,9 +11,11 @@
 //!   resampled to 48 kHz stereo by the recorder's own resampler, looped or not,
 //!   faded, and mixed under the recording's audio through the recorder's soft
 //!   clip.
-//! - **One Opus track at the recorder's profile** (48 kHz stereo, 20 ms
-//!   frames), produced in step with the video so the file interleaves as a
-//!   recording does.
+//! - **One track at the recorder's profile** (48 kHz stereo): AAC where this
+//!   build's FFmpeg has the encoder, Opus otherwise — the recorder's own
+//!   choice ([`super::audio_codec`]) — produced in step with the video so the
+//!   file interleaves as a recording does. A recording's own track is read
+//!   in either codec (P4): Opus through libopus, AAC through symphonia.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -21,16 +23,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, CodecParameters, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use super::audio::{CHANNELS, FRAME, RATE, RecordingOpus, Resampler, soft_clip};
+use super::audio::{CHANNELS, FRAME, RATE, Resampler, soft_clip};
+use super::audio_codec::{AudioEncoder, PacketSink};
 use super::edit::{AudioSpan, EditList, Plan};
-use super::mp4::{self, ProgressiveFile, ProgressiveSample};
+use super::mp4::{self, AudioCodec, ProgressiveFile, ProgressiveSample};
 use crate::audio::AudioFrame;
 
 /// What an export's audio carries, for the `done` event.
@@ -51,20 +54,73 @@ impl Carries {
     }
 }
 
+/// A recording's own track decoder, in the codec its sample entry names.
+enum TrackDecoder {
+    Opus {
+        dec: audiopus::coder::Decoder,
+        channels: usize,
+        scratch: Vec<i16>,
+    },
+    /// P4 — symphonia's AAC-LC (≤ 2 channels, 1024-sample frames: exactly
+    /// what the recorder writes). Pure Rust, like the music reader.
+    Aac(Box<dyn symphonia::core::codecs::Decoder>),
+}
+
+impl TrackDecoder {
+    /// Decode one packet onto `out` (interleaved); the channel count.
+    fn decode(&mut self, data: &[u8], index: usize, out: &mut Vec<i16>) -> Result<usize> {
+        match self {
+            Self::Opus {
+                dec,
+                channels,
+                scratch,
+            } => {
+                let packet: audiopus::packet::Packet<'_> = data
+                    .try_into()
+                    .map_err(|e| anyhow!("audio packet {index}: {e}"))?;
+                let signals: audiopus::MutSignals<'_, i16> = (&mut scratch[..])
+                    .try_into()
+                    .map_err(|e| anyhow!("audio buffer: {e}"))?;
+                let n = dec
+                    .decode(Some(packet), signals, false)
+                    .map_err(|e| anyhow!("audio packet {index}: {e}"))?;
+                out.extend_from_slice(&scratch[..n * *channels]);
+                Ok(*channels)
+            }
+            Self::Aac(dec) => {
+                // A damaged file can make symphonia panic: that is this
+                // recording's audio being unreadable, said by name.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let packet = symphonia::core::formats::Packet::new_from_slice(0, 0, 0, data);
+                    let decoded = dec
+                        .decode(&packet)
+                        .map_err(|e| anyhow!("audio packet {index}: {e}"))?;
+                    let spec = *decoded.spec();
+                    let mut samples = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
+                    samples.copy_interleaved_ref(decoded);
+                    out.extend_from_slice(samples.samples());
+                    Ok(spec.channels.count().max(1))
+                }))
+                .unwrap_or_else(|_| Err(anyhow!("audio packet {index}: the AAC decoder failed")))
+            }
+        }
+    }
+}
+
 /// The recording's own audio, decoded forward on demand.
 struct Original {
     pf: ProgressiveFile,
     file: File,
     packets: Vec<ProgressiveSample>,
     next: usize,
-    decoder: audiopus::coder::Decoder,
-    channels: usize,
+    decoder: TrackDecoder,
     /// Decoded interleaved stereo; `buf[0]` is source sample `buf_start`.
     buf: VecDeque<i16>,
     buf_start: u64,
-    /// Decoder output still to drop: the encoder's lookahead (`pre_skip`).
+    /// Decoder output still to drop: Opus's `pre_skip`. AAC's priming was
+    /// paid by the recorder (`audio_codec` module docs), so 0 there.
     skip: u64,
-    scratch: Vec<i16>,
+    decoded: Vec<i16>,
 }
 
 impl Original {
@@ -80,14 +136,40 @@ impl Original {
                 format.timescale
             );
         }
-        let (channels, layout) = match format.channels {
-            1 => (1, audiopus::Channels::Mono),
-            2 => (2, audiopus::Channels::Stereo),
+        let channels = match format.channels {
+            1 | 2 => usize::from(format.channels),
             n => bail!("the recording's audio has {n} channels"),
         };
+        let (decoder, skip) = match &format.codec {
+            AudioCodec::Opus { pre_skip } => {
+                let layout = if channels == 1 {
+                    audiopus::Channels::Mono
+                } else {
+                    audiopus::Channels::Stereo
+                };
+                let dec = audiopus::coder::Decoder::new(audiopus::SampleRate::Hz48000, layout)
+                    .context("an Opus decoder")?;
+                let decoder = TrackDecoder::Opus {
+                    dec,
+                    channels,
+                    // The largest Opus frame is 120 ms.
+                    scratch: vec![0; 5760 * channels],
+                };
+                (decoder, u64::from(*pre_skip))
+            }
+            AudioCodec::Aac { asc, .. } => {
+                let mut params = CodecParameters::new();
+                params
+                    .for_codec(CODEC_TYPE_AAC)
+                    .with_sample_rate(RATE)
+                    .with_extra_data(asc.clone().into_boxed_slice());
+                let dec = symphonia::default::get_codecs()
+                    .make(&params, &DecoderOptions::default())
+                    .map_err(|e| anyhow!("an AAC decoder: {e}"))?;
+                (TrackDecoder::Aac(dec), 0)
+            }
+        };
         let packets = pf.samples(mp4::AUDIO_TRACK_ID)?;
-        let decoder = audiopus::coder::Decoder::new(audiopus::SampleRate::Hz48000, layout)
-            .context("an Opus decoder")?;
         let file = File::open(source).with_context(|| format!("{}", source.display()))?;
         Ok(Some(Self {
             pf,
@@ -95,12 +177,10 @@ impl Original {
             packets,
             next: 0,
             decoder,
-            channels,
             buf: VecDeque::new(),
             buf_start: 0,
-            skip: u64::from(format.pre_skip),
-            // The largest Opus frame is 120 ms.
-            scratch: vec![0; 5760 * 2],
+            skip,
+            decoded: Vec::new(),
         }))
     }
 
@@ -115,25 +195,17 @@ impl Original {
         };
         self.next += 1;
         let data = self.pf.read_sample(&mut self.file, &p)?;
-        let packet: audiopus::packet::Packet<'_> = (&data[..])
-            .try_into()
-            .map_err(|e| anyhow!("audio packet {}: {e}", self.next - 1))?;
-        let out: audiopus::MutSignals<'_, i16> = (&mut self.scratch[..])
-            .try_into()
-            .map_err(|e| anyhow!("audio buffer: {e}"))?;
-        let n = self
+        self.decoded.clear();
+        let ch = self
             .decoder
-            .decode(Some(packet), out, false)
-            .map_err(|e| anyhow!("audio packet {}: {e}", self.next - 1))?;
-        for i in 0..n {
+            .decode(&data, self.next - 1, &mut self.decoded)?;
+        for frame in self.decoded.chunks_exact(ch) {
             if self.skip > 0 {
                 self.skip -= 1;
                 continue;
             }
-            let l = self.scratch[i * self.channels];
-            let r = self.scratch[i * self.channels + self.channels - 1];
-            self.buf.push_back(l);
-            self.buf.push_back(r);
+            self.buf.push_back(frame[0]);
+            self.buf.push_back(frame[ch - 1]);
         }
         Ok(true)
     }
@@ -394,7 +466,9 @@ pub struct ExportAudio {
     original: Option<Original>,
     original_gain: f32,
     music: Option<(MusicTrack, Shape)>,
-    opus: RecordingOpus,
+    enc: AudioEncoder,
+    /// The next output sample to mix. It starts at the encoder's priming
+    /// delay, as the recorder's does, so decoded sample k is output time k.
     produced: u64,
     acc: Vec<i32>,
     frame: Vec<i16>,
@@ -409,10 +483,37 @@ pub enum AudioError {
     Music(String),
     /// The recording's own audio does not decode.
     Original(String),
-    /// The Opus encoder refused.
+    /// The audio encoder refused.
     Encode(String),
     /// A packet could not be written.
     Write(String),
+}
+
+/// Encode `pcm` (or, with `finish`, flush), telling a refused WRITE from a
+/// refused encode: both come back through the encoder's one `Result`.
+fn feed(
+    enc: &mut AudioEncoder,
+    pcm: &[i16],
+    finish: bool,
+    sink: &mut PacketSink<'_>,
+) -> Result<(), AudioError> {
+    let mut write_failed: Option<String> = None;
+    let mut wrapped = |packet: Vec<u8>, duration: u32| -> Result<()> {
+        sink(packet, duration).map_err(|e| {
+            let said = format!("{e:#}");
+            write_failed = Some(said.clone());
+            anyhow!(said)
+        })
+    };
+    let r = if finish {
+        enc.finish(&mut wrapped)
+    } else {
+        enc.push(pcm, &mut wrapped)
+    };
+    r.map_err(|e| match write_failed.take() {
+        Some(w) => AudioError::Write(w),
+        None => AudioError::Encode(format!("{e:#}")),
+    })
 }
 
 /// Milliseconds as samples at the export's rate. The music's times are the
@@ -455,15 +556,15 @@ impl ExportAudio {
         if original.is_none() && music.is_none() {
             return Ok(None);
         }
-        let opus = RecordingOpus::new().map_err(|e| AudioError::Encode(format!("{e:#}")))?;
+        let enc = AudioEncoder::best().map_err(|e| AudioError::Encode(format!("{e:#}")))?;
         Ok(Some(Self {
             spans: plan.audio_spans(RATE),
             total,
             original,
             original_gain,
             music,
-            opus,
-            produced: 0,
+            produced: enc.unsignalled_delay().min(total),
+            enc,
             acc: vec![0; FRAME * CHANNELS],
             frame: vec![0; FRAME * CHANNELS],
             music_buf: Vec::with_capacity(FRAME * CHANNELS),
@@ -478,40 +579,38 @@ impl ExportAudio {
         }
     }
 
-    /// What a decoder drops from the start (the encoder's lookahead).
-    pub fn pre_skip(&self) -> u16 {
-        self.opus.pre_skip
+    /// The MP4 track this export's sound is written as.
+    pub fn track(&self) -> mp4::AudioTrack {
+        self.enc.track()
     }
 
-    /// Encode every 20 ms frame that STARTS before `until` output samples
-    /// (capped at the export's end), handing each Opus packet to `sink`.
+    /// Mix every 20 ms frame that STARTS before `until` output samples
+    /// (capped at the export's end) and encode it, handing each packet and
+    /// its duration to `sink`.
     pub fn produce_until(
         &mut self,
         until: u64,
-        sink: &mut dyn FnMut(Vec<u8>) -> Result<()>,
+        sink: &mut PacketSink<'_>,
     ) -> Result<(), AudioError> {
         let until = until.min(self.total);
         while self.produced < until {
-            self.mix_one()?;
-            let packet = self
-                .opus
-                .encode(&self.frame)
-                .map_err(|e| AudioError::Encode(format!("{e:#}")))?;
-            sink(packet).map_err(|e| AudioError::Write(format!("{e:#}")))?;
-            self.produced += FRAME as u64;
+            let n = self.mix_one()?;
+            feed(&mut self.enc, &self.frame[..n * CHANNELS], false, sink)?;
+            self.produced += n as u64;
         }
         Ok(())
     }
 
-    /// Everything to the export's end; the last frame is padded with silence.
-    pub fn finish(
-        &mut self,
-        sink: &mut dyn FnMut(Vec<u8>) -> Result<()>,
-    ) -> Result<(), AudioError> {
-        self.produce_until(self.total, sink)
+    /// Everything to the export's end; the encoder pads its last frame with
+    /// silence and gives up what it still holds.
+    pub fn finish(&mut self, sink: &mut PacketSink<'_>) -> Result<(), AudioError> {
+        self.produce_until(self.total, sink)?;
+        feed(&mut self.enc, &[], true, sink)
     }
 
-    fn mix_one(&mut self) -> Result<(), AudioError> {
+    /// Mix the next frame (20 ms, or what is left to the end) into
+    /// `self.frame`; how many samples per channel it holds.
+    fn mix_one(&mut self) -> Result<usize, AudioError> {
         self.acc.fill(0);
         let s0 = self.produced;
         let end = (s0 + FRAME as u64).min(self.total);
@@ -561,7 +660,7 @@ impl ExportAudio {
         for (o, a) in self.frame.iter_mut().zip(&self.acc) {
             *o = soft_clip(*a);
         }
-        Ok(())
+        Ok((end - s0) as usize)
     }
 }
 
@@ -584,6 +683,112 @@ mod tests {
         assert!((s.gain(5000) - 0.5).abs() < 1e-6, "full volume between");
         assert!((s.gain(9500) - 0.25).abs() < 1e-6);
         assert_eq!(s.gain(10_000), 0.0, "past the end");
+    }
+
+    /// FR-85 P4 — the export reads a recording's own track from time zero,
+    /// in either codec: a click the recorder made `CLICK` samples after the
+    /// first frame is `CLICK` samples into what the mix is handed. Opus drops
+    /// its signalled `pre_skip`; AAC must drop NOTHING (the recorder paid its
+    /// priming), and skipping it as well would put every edit's sound 21 ms
+    /// early.
+    mod reads_from_time_zero {
+        use super::*;
+        use crate::recording::mp4::{ColorInfo, FragmentedWriter, VideoTrack};
+
+        const CLICK: usize = 30_000;
+
+        /// An IDR with SPS + PPS, and a P slice: what the writer needs to
+        /// open a file, with no zero bytes inside a NAL.
+        fn access_unit(idr: bool) -> Vec<u8> {
+            let mut v = Vec::new();
+            if idr {
+                v.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f]);
+                v.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]);
+            }
+            v.extend_from_slice(&[0, 0, 0, 1, if idr { 0x65 } else { 0x41 }, 0x88, 0x84]);
+            v
+        }
+
+        /// One second, silent but for a click at `CLICK`, fed to `enc` the
+        /// way the recorder feeds it: from the encoder's priming delay on.
+        fn record(path: &Path, mut enc: AudioEncoder) {
+            let partial = path.with_extension("partial");
+            let video = VideoTrack {
+                width: 320,
+                height: 240,
+                fps: 30,
+                color: ColorInfo::BT601_LIMITED,
+            };
+            let mut w = FragmentedWriter::create(&partial, video, Some(enc.track())).unwrap();
+            let pcm: Vec<i16> = (0..RATE as usize)
+                .flat_map(|s| {
+                    let v = if (CLICK..CLICK + 48).contains(&s) {
+                        20_000
+                    } else {
+                        0
+                    };
+                    [v, v]
+                })
+                .collect();
+            let per_frame = RATE as usize / 30;
+            let mut sent = enc.unsignalled_delay() as usize;
+            for i in 0..30u32 {
+                w.push_video(u64::from(i) * 3000, &access_unit(i == 0), i == 0)
+                    .unwrap();
+                let until = (i as usize + 1) * per_frame;
+                if until > sent {
+                    enc.push(&pcm[sent * 2..until * 2], &mut |p, d| w.push_audio(&p, d))
+                        .unwrap();
+                    sent = until;
+                }
+            }
+            enc.finish(&mut |p, d| w.push_audio(&p, d)).unwrap();
+            w.finish().unwrap();
+            mp4::finalize(&partial, path).unwrap();
+        }
+
+        /// Where the click is in what `Original` reads from source time 0.
+        fn click_as_read(enc: AudioEncoder) -> usize {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("r.mp4");
+            record(&path, enc);
+            let mut original = Original::open(&path).unwrap().expect("an audio track");
+            let mut out = vec![0i32; RATE as usize * CHANNELS];
+            original.add(0, RATE as usize, 1.0, &mut out).unwrap();
+            out.iter()
+                .step_by(CHANNELS)
+                .position(|s| s.unsigned_abs() > 5_000)
+                .expect("the click survives the codec")
+        }
+
+        fn assert_on_time(at: usize, codec: &str) {
+            assert!(
+                at.abs_diff(CLICK) <= 64,
+                "{codec}: the click reads at {at}, it was recorded at {CLICK}"
+            );
+        }
+
+        #[test]
+        fn an_opus_track_is_read_from_time_zero() {
+            assert_on_time(click_as_read(AudioEncoder::opus().unwrap()), "opus");
+        }
+
+        #[cfg(feature = "ffmpeg-encoder")]
+        #[test]
+        fn an_aac_track_is_read_from_time_zero_skipping_nothing() {
+            let enc = match AudioEncoder::aac() {
+                Ok(e) => e,
+                Err(e) => {
+                    assert!(
+                        !crate::recording::audio_codec::aac_expected(),
+                        "ROOMLER_EXPECT_FFMPEG_AAC=1 but AAC did not open: {e:#}"
+                    );
+                    eprintln!("skipped: this FFmpeg has no AAC encoder ({e:#})");
+                    return;
+                }
+            };
+            assert_on_time(click_as_read(enc), "aac");
+        }
     }
 
     #[test]
