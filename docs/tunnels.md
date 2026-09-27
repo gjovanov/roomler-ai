@@ -261,9 +261,22 @@ passing it vacuously. They also pass natively on Windows, where the mDNS socket 
 too, so Windows hosts had the leak as well.
 
 **Measured** on a vmtest Ubuntu root daemon with the #1730 drop harness (the production
-viewer's container SIGKILLed once it streams). Per ended session:
+viewer's container SIGKILLed once it streams): three ended sessions on each build, same
+guest, same harness. The "before" build is master with #1739, i.e. what the next release
+would have shipped without this fix.
 
-*(field A/B in progress — the table lands before the merge.)*
+| | UDP sockets | on `:5353` | mDNS queries in 10 s | ctx switches/s |
+|---|---|---|---|---|
+| before, no session yet | 3 | 0 | 1 (not the daemon's) | 13.5 |
+| before, after 3 ended sessions | **54**, +17 each | **3**, +1 each | **61**, +20 each | 27.1, ≈ +4.5 each |
+| after, no session yet | 3 | 0 | 1 | 11.3 |
+| after, after 3 ended sessions | **3** | **0** | **1** | 11.4 once idle |
+
+The "before" rows are what every ended session cost, cumulatively, until the daemon
+restarted, which in practice means until the next update. At this guest's 17 sockets a
+session, Windows' default 16,384-port ephemeral range would last about a thousand
+sessions, the same exhaustion as the 08-22 note above. (The per-session count depends on
+the host's interfaces. It was measured on this guest, not on a Windows host.)
 
 The signature, one line on the host: the daemon asking, once a second, for the same
 `<uuid>.local` names, names that belong to sessions which ended long ago.
