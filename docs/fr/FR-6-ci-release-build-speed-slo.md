@@ -54,7 +54,15 @@ itself on the affected run's page. Baseline when the program started: releases t
   strays every 6 h.
 - **PR CI** (`ci.yml`): Swatinem with `key: wf-<hash of ci.yml>` (workflow edits rotate
   the key — new steps can't be locked out), apt packages cached via
-  `cache-apt-pkgs-action` (mirror out of the hot path), `timeout-minutes: 20`.
+  `cache-apt-pkgs-action` (mirror out of the hot path). Since wave 14 the Rust work runs
+  as **five parallel lanes** (`rust-lint`, `rust-unit`, `rust-agent`, `rust-recorder`,
+  `rust-recorder-audio`), each with its own cache family and the same system packages
+  from one composite (`.github/actions/ci-linux-system-deps`); an aggregate job keeps
+  the name "Rust checks". Every Swatinem block that runs on PRs **saves only from
+  master** (`save-if`), `CARGO_PROFILE_DEV_DEBUG=line-tables-only` shrinks compile time
+  and cache size, a `concurrency` group cancels a PR's superseded run, and
+  `cache-janitor.yml` deletes any cargo cache on a PR ref and keeps one generation per
+  family on master, running after every master CI run as well as on its cron.
 - **MSI job**: vendored FFmpeg/libvpx fetched from release assets (sha256-verified, exact
   legacy paths so baked `.pc` prefixes hold); FFmpeg link asserted inside `encoder-smoke`
   on the built EXE (the 5m33s cargo-test step is gone); tray/desktop companion in a
@@ -76,6 +84,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 11 | 08-24 | Hard-bounded macOS GUI probe | #661 |
 | 12 | 08-25 | Run-salted keys (reservation wedge) | #675, #677 |
 | 13 | 08-26 | **Seeds → release assets** (+ shakeout: mktemp for tar paths, dispatcher watches composites, `contents: write` on the OIDC-narrowed Windows jobs) | #722, #725, #726, #728 |
+| 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
 
 ## Acceptance criteria
 
@@ -84,7 +93,12 @@ itself on the affected run's page. Baseline when the program started: releases t
 - [x] All five lanes publish + restore asset pairs (10 assets live on `seed-cache`)
 - [x] A failed/cancelled rehearsal cannot leave the lane silently cold (alert issue +
       run-page warnings, field-proven by #683 and the 403 warning that found #728)
-- [x] PR CI warm ≤10 min with a hard cap (4.9–7 min band since #587; `timeout-minutes: 20`)
+- [ ] PR CI warm ≤10 min with a hard cap — held at 4.9–7 min from #587, then **regressed**:
+      18–21 min warm and 35–45 min cold over 58 runs by 2026-09-27 (the single "Rust
+      checks" job had grown to ~35 serial steps, and PR-ref cache saves were evicting
+      master's). Re-ticked only when wave 14's warm numbers are measured.
+- [ ] PR runs write no cargo caches, and master holds one generation per Swatinem
+      family (wave 14; checked with `gh cache list` after a day of PR traffic)
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
@@ -116,3 +130,12 @@ itself on the affected run's page. Baseline when the program started: releases t
 - 2026-08-26: all 10 assets live; Linux warm-from-assets 5.5 min, macOS 6.1 min; Windows
   warm restore verified (2.0 G target), execution 18.3 min on a dozen-PR delta.
 - Next: first normal-delta tag → check the run's warnings (none expected) and total time.
+- 2026-09-27: **PR CI regression found.** Runs 36331413828 (20.1 min, warm) and
+  36339984289 (36.8 min, cold) computed the SAME key
+  `v0-rust-ci-linux-Linux-x64-2b670344-977c0b24`; the first restored it with a full
+  match at 15:58, the second got `No cache found` at 18:15. The pool read 15.0 GB
+  against its 10 GB limit, 13.1 GB of it on `refs/pull/*/merge`: two concurrent PRs
+  had each saved ~9–10 GB across eight job caches, and LRU evicted master's. On the
+  warm run, test execution was ~3.5 of the 20 minutes; the rest was `roomlerd` and
+  friends compiled in ~12 feature configurations, one after another. Wave 14 plan and
+  numbers: #773.

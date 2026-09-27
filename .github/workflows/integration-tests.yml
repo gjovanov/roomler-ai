@@ -107,6 +107,11 @@ jobs:
           workspaces: '. -> target'
           shared-key: ci-integration
           cache-on-failure: true
+          # FR-6 wave 14 (#773): only a master push saves. On 2026-09-27 a
+          # single PR run left a 1.1 GB `ci-integration` entry on its merge
+          # ref, restorable only by that PR, in a pool where PR-ref entries
+          # had pushed master's caches out by LRU.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Start MongoDB (capped WiredTiger cache)
         # A service container cannot take command arguments, and this one
