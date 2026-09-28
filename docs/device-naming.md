@@ -11,6 +11,31 @@ On top of those, two **display-only** admin fields never propagate anywhere:
 `display_name` (friendly label; empty clears) and `tags` (free-form, trimmed +
 de-duped, ≤16 × ≤40 chars).
 
+## Showing a display name in the web UI
+
+Where a device has a `display_name`, the web UI titles it with that name. It can
+also show the fleet name beside it, so it stays clear which machine is which.
+Whether it does is **one viewer preference**, "Hide device name when a display
+name is set". It is stored per user and per org, and it is ON by default: once
+someone has named a device, the machine-reported name is usually noise.
+
+| Surface | Where the checkbox is | What it hides |
+|---|---|---|
+| Devices grid (`/tenant/{tid}/device`) | the column picker (`AgentsSection.vue:1036`) | the fleet name in the Name cell's caption line (`:340`) |
+| Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1269`) | the fleet name in the header subtitle, before OS · version (`:36`) |
+
+Both surfaces use the same composable (`ui/src/composables/useHideDeviceName.ts:48`),
+so a flip on one shows on the other at once, including a surface open in
+another tab (a `storage` event). The helper that decides whether to show the
+name is `secondaryDeviceName` (`:76`). It shows nothing when there is no
+display name (the fleet name already is the title) or when the two names are
+equal.
+
+> ⚠️ The storage key, `roomler:grid-name-pref:<userId>:<tenantId>:devices`
+> (`:23`), predates the composable. It is the Devices grid's original key, kept
+> byte-identical so every saved choice carries over. Renaming it would silently
+> reset everyone to the default.
+
 ## Renaming a device
 
 `PUT /api/tenant/{tid}/agent/{id} {"name": …}` (agents) and
