@@ -439,6 +439,16 @@ pub struct AgentConfig {
     /// leg is field-proven. Client-side only (the flow supervisor reads it).
     #[serde(default)]
     pub tunnel_derp_fallback: Option<bool>,
+    /// FR-86 P2 — make-before-break tunnel transport RE-UPGRADE: an `auto`
+    /// declared route that fell back to a lower transport probes for the best
+    /// one (`quic-v1`) in the background and, when it comes up, switches to it
+    /// without cutting any established connection (`ROOMLERD_TUNNEL_REUPGRADE`).
+    /// Built-in default: ON. Client-side only (the flow supervisor reads it).
+    /// Set false to keep the P1 behaviour (a route keeps whatever transport it
+    /// happened to land on). Read at each serving epoch, so a config change
+    /// takes effect on the next daemon restart; the env var flips it live.
+    #[serde(default)]
+    pub tunnel_reupgrade: Option<bool>,
     /// R3 — keep established tunnel QUIC peers ALIVE across a control-WS
     /// reattach instead of tearing them down on every transient WS drop
     /// (`ROOMLERD_TUNNEL_PEERS_SURVIVE_REATTACH`). QUIC flows self-signal
@@ -2114,6 +2124,7 @@ pub fn test_fixture() -> AgentConfig {
         relay_server_enabled: None,
         relay_server_port: None,
         tunnel_derp_fallback: None,
+        tunnel_reupgrade: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
@@ -2334,7 +2345,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2383,6 +2394,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81]
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
         ("RELAY_SERVER_ENABLED", cfg.relay_server_enabled),
         ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
+        ("TUNNEL_REUPGRADE", cfg.tunnel_reupgrade),
         (
             "TUNNEL_PEERS_SURVIVE_REATTACH",
             cfg.tunnel_peers_survive_reattach,

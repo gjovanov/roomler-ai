@@ -875,7 +875,7 @@ async fn agent_daemon_originated_forward_reaches_target() {
     // Drive the daemon consumer: open a forward to B over A's own agent WS.
     let local = free_local_port().await;
     let flow_id = hub
-        .create_forward(&b_id, local, "127.0.0.1:9000", "webrtc")
+        .create_forward(&b_id, local, "127.0.0.1:9000", "webrtc", "")
         .await
         .expect("create_forward registers the flow");
 
