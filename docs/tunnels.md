@@ -477,6 +477,103 @@ bound — and must be reported as `pc_failed` no earlier than 20 s in),
 `the_reclaim_drops_a_parked_quic_peer_whose_connection_ended`
 (`agents/roomlerd/src/signaling.rs`).
 
+### ⚠️ The exit never awaits a TURN allocation on its signaling loop (#1761)
+
+An exit agent serves every session of its org from **one** signaling loop
+(`connect_once` in `agents/roomlerd/src/signaling.rs`): the control WS, the
+outbound pump, the reap arm, every `rc:*` message. Until 0.4.112 the
+`ServerMsg::TunnelQuicSetup` arm awaited `allocate_relay_from_ice` **inline** on
+that loop whenever the server had minted coturn credentials (QUIC-over-TURN). On a
+network where the relay ladder is slow — every UDP tier timing out before the
+TLS tier answers — one allocation is ~20 s, and for those 20 s the loop reads
+nothing: pings go unanswered, nothing is sent, no other session's setup runs, no
+ICE, no terminate, no remote-control signaling. N routes opened together were
+N × 20 s of backlog.
+
+**Field, 2026-09-28, both ends 0.4.112.** A Windows client daemon holding four
+declared routes to a corporate-laptop exit whose network blocks UDP (the overlay
+reaches it over DERP/TCP — expected there). Its routes churned every ~90 s. The
+exit's own log:
+
+| Exit time (UTC) | Event |
+|---|---|
+| 18:32:39.9 · 18:33:00.2 · 18:33:20.5 · 18:33:40.8 | `agent QUIC peer ready` (QUIC-over-TURN) for four sessions — **exactly 20.3 s apart, strictly serial** |
+| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:261`) |
+| 18:33:40.77–.80 | the WebRTC fallbacks' SDP answers, in the same burst, also late |
+| 18:32:09 | `torn down agent QUIC tunnel peers on ws disconnect count=4` — the exit's control WS had dropped mid-backlog, its keepalives unanswered |
+
+So the routes cycled QUIC → quic-derp → webrtc-dc → dead → re-open, and the
+first diagnosis — "the quic-derp setup never reaches the exit" — was wrong: it
+arrived, and answered after the client had given up.
+
+**The fix.** The TURN branch spawns its allocation and returns at once; the peer
+comes back to the loop on a per-org channel, and the loop inserts it and sends the
+ready. The direct-bind and quic-derp branches are synchronous and stay inline.
+
+```mermaid
+sequenceDiagram
+    participant S as roomler.ai
+    participant L as exit: signaling loop
+    participant T as setup task (spawned)
+    participant C as client
+
+    S->>L: rc:tunnel.quic.setup (TURN creds)
+    L->>L: pending.begin(session) → attempt id
+    L-->>T: spawn: allocate_relay_from_ice + setup_over_relay
+    Note over L: keeps reading: pings, other setups, ICE, terminates…
+    S->>L: rc:tunnel.quic.candidate (client's relayed addr)
+    L->>L: buffered on the pending entry
+    T-->>L: QuicSetupOutcome { session, attempt, peer } (per-org channel)
+    L->>L: settle: attempt held & not cancelled → Ready
+    L->>L: permit buffered candidates, insert into tunnel_quic_peers
+    L->>S: rc:tunnel.quic.ready
+    S->>C: relayed
+```
+
+The channel (`signaling.rs:605`) has the #1754 reap channel's shape: created in
+`signaling::run` **per org loop** — a process-global sender would land a secondary
+org's peer in the primary's maps — borrowed into every `connect_once`, a sender
+retained for the loop's life so the receiver never closes. The in-flight
+bookkeeping is `PendingQuicSetups` (`agents/roomlerd/src/tunnel/quic_setup.rs`),
+fresh per connection (`signaling.rs:1405`) like the session maps, and free of I/O
+so tests drive it directly:
+
+| While a setup is in flight… | Rule | Where |
+|---|---|---|
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:3609`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:3648`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:1934` |
+| a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
+| more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
+| the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
+
+⚠️ **Closing a discarded peer is an abort, not a drop.** An `AgentQuicPeer` dropped
+without `close()` keeps its accept task, its endpoint socket and its TURN allocation
+until its one connection ends — never, for a client that never dials. And `close()`
+aborts the accept task, so a late attempt's peer can never later report a
+`quic_conn_ended` reap for a session id the maps by then hold a *newer* peer under.
+A result the loop cannot receive at all (the org loop is gone) is closed by the task
+itself (`quic_setup.rs:403`).
+
+⚠️ **The task has its own deadline (120 s, `quic_setup.rs:74`) as a slot-leak guard
+only.** The ladder bounds every step itself (~65 s worst case) and the client gave up
+at 30 s; the deadline exists so a future ladder change that stalls cannot pin an
+in-flight slot forever.
+
+Locked by lib tests (`cargo test -p roomlerd --lib tunnel`, `tunnel::quic_setup`), each
+shown red with a one-line negative control: `a_slow_turn_allocation_never_holds_the_loop`
+(the allocator for session A parks until released; the TURN branch must return within
+1 s regardless, session B's setup completes and is ready while A is parked, A lands
+when released with its buffered candidate — red when the task's work is awaited inline
+instead of spawned), `candidates_buffered_before_completion_are_returned_on_insert`
+(red with the buffer's push removed), `a_cancel_before_completion_closes_never_inserts`
+and `settle_closes_a_cancelled_or_late_peer_and_returns_the_held_one` (red when a
+cancelled attempt inserts instead of closing — the latter watches the peer's accept
+task actually end), `a_completion_with_no_entry_or_a_stale_attempt_is_closed_late`,
+`a_duplicate_setup_is_refused_while_live_and_allowed_after_a_cancel`,
+`the_in_flight_bound_refuses_the_extra_setup_until_one_completes` and
+`a_result_the_loop_cannot_receive_is_closed_by_the_task`.
+
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
