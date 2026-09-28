@@ -29,6 +29,18 @@
 //! in `run_cmd` and shared (it's `Clone` over an `Arc`) between the signaling
 //! loop (publish the live sink + intercept) and `DaemonState` (the LocalAPI
 //! create/kill/flows verbs) — so flows survive WS reconnects.
+//!
+//! ## The flow owns its listener (FR-86 P1)
+//!
+//! A flow binds `127.0.0.1:<local>` **once**, when its supervisor starts, and
+//! keeps it for its whole life ([`tunnel_core::flow_listener::FlowListener`]).
+//! Each session the ladder establishes is a [`Carrier`] installed behind that
+//! listener; when the carrier dies the listener stays bound and holds new
+//! connections (bounded: [`HoldPolicy`]) until the next carrier is ready,
+//! instead of the kernel refusing them for the whole re-establishment. Before
+//! this the session bound the port itself, which also made it impossible to
+//! establish a second session beside the first — P2's make-before-break
+//! re-upgrade needs exactly that.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,8 +56,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use tunnel_core::driver::{
-    SessionOutcome, SessionParams, Target, TransportPref, run_tunnel_session,
+    Carrier, Establishment, SessionParams, Target, TransportPref, establish_tunnel_session,
 };
+use tunnel_core::flow_listener::{FlowListener, HoldPolicy};
 use tunnel_core::forward::SessionThroughput;
 use tunnel_core::localapi::{FlowInfo, FlowKind};
 use tunnel_core::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
@@ -130,15 +143,18 @@ struct FlowHandle {
 }
 
 /// Live per-flow cells, shared between the supervisor (writes `status` +
-/// `nonce`), the per-session Source (writes `transport` + `session_id` when it
-/// sees `TunnelOpened`), the driver's bind hook (`Up`, #1685) and `flows()`
-/// (reads). `kill_flow` reads `nonce` + `session_id` to reap the demux maps
-/// when it aborts the supervisor mid-flight.
+/// `nonce`, and `Up` when a carrier is installed — #1685 / FR-86 P1), the
+/// per-session Source (writes `transport` + `session_id` when it sees
+/// `TunnelOpened`) and `flows()` (reads). `kill_flow` reads `nonce` +
+/// `session_id` to reap the demux maps when it aborts the supervisor
+/// mid-flight.
 #[derive(Default)]
 pub(crate) struct FlowLive {
-    /// `Up` ONLY once the local listener is bound (#1685) — never on
-    /// `rc:tunnel.opened`, which the server also answers for a node whose
-    /// data plane then fails to come up.
+    /// `Up` ONLY once an established carrier is installed behind the flow's
+    /// listener (#1685, FR-86 P1) — never on `rc:tunnel.opened`, which the
+    /// server also answers for a node whose data plane then fails to come up.
+    /// The port itself is bound for the flow's whole life; `Up` is "it
+    /// serves", not "it is bound".
     status: Mutex<FlowStatus>,
     /// Negotiated transport, learned from the pass-through `TunnelOpened`.
     transport: Mutex<Option<String>>,
@@ -159,11 +175,11 @@ pub(crate) struct FlowLive {
     /// `RouteState::Failed` for a declared route.
     fatal: Mutex<Option<String>>,
     /// #1685 — consecutive session attempts that failed (or died on arrival)
-    /// since the flow last served; reset when the listener binds. Read by
+    /// since the flow last served; reset when a carrier comes up. Read by
     /// the route reconciler as `RouteState::Backoff::attempts`.
     failures: std::sync::atomic::AtomicU32,
-    /// #1685 — the last failed attempt's error; cleared when the listener
-    /// binds. Read as `RouteState::Backoff::last_error`.
+    /// #1685 — the last failed attempt's error; cleared when a carrier comes
+    /// up. Read as `RouteState::Backoff::last_error`.
     last_error: Mutex<Option<String>>,
     /// #1685 — when the supervisor's current backoff sleep ends; `None`
     /// while an attempt is in flight. Read as `next_retry_secs`.
@@ -171,9 +187,11 @@ pub(crate) struct FlowLive {
 }
 
 impl FlowLive {
-    /// #1685 — the driver bound the local listener: the flow SERVES. The only
-    /// transition to `Up` (fired by the `on_listening` hook); it forgets the
-    /// failures that preceded it.
+    /// #1685 — an established carrier is installed behind the flow's listener:
+    /// the flow SERVES. The only transition to `Up` (the supervisor calls it
+    /// the moment `FlowListener::install` hands the carrier the held
+    /// connections — FR-86 P1; before that it was the driver's bind hook); it
+    /// forgets the failures that preceded it.
     pub(crate) fn mark_listening(&self) {
         *self.status.lock().unwrap() = FlowStatus::Up;
         self.failures.store(0, Ordering::Relaxed);
@@ -197,7 +215,10 @@ impl FlowLive {
 /// ([`TunnelClientHub::flow_report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowReport {
-    /// The local listener is bound and serving.
+    /// A carrier is ready behind the flow's listener: the port serves. (Since
+    /// FR-86 P1 the port itself stays bound for the flow's whole life and
+    /// connections arriving before a carrier are held; this is still the
+    /// "it serves" bit the reconciler maps to `active`.)
     pub listening: bool,
     /// The supervisor stopped on a permanent failure (terminal).
     pub fatal: Option<String>,
@@ -280,10 +301,10 @@ impl TunnelClientHub {
     /// connection gauge. TCP payload only — SOCKS5 UDP-ASSOCIATE bytes are not
     /// counted (they run on `FlowStats` with no session aggregate). The
     /// `transport` column doubles as a liveness signal: `connecting` / `down`
-    /// until the session's local listener is bound (#1685). A transport the
-    /// server negotiated is not yet a serving flow — setup after
-    /// `rc:tunnel.opened` can still fail — so it shows only once bound;
-    /// [`Self::negotiated_transport`] reads it before that.
+    /// until a carrier is ready behind the flow's listener (#1685, FR-86 P1).
+    /// A transport the server negotiated is not yet a serving flow — setup
+    /// after `rc:tunnel.opened` can still fail — so it shows only once a
+    /// carrier is up; [`Self::negotiated_transport`] reads it before that.
     pub fn flows_snapshot(&self) -> Vec<FlowInfo> {
         let flows = self.inner.flows.lock().unwrap();
         let mut out: Vec<FlowInfo> = flows
@@ -408,9 +429,11 @@ impl TunnelClientHub {
 
     /// #1685 — what the route reconciler needs to tell the truth about a
     /// declared route's flow, read in one lock walk. `None` for an unknown
-    /// id. `listening` is the bound local listener and nothing less: before
-    /// this the reconciler mapped "a flow exists" straight to `active`, and a
-    /// route to an offline node read `active` while every connect was refused.
+    /// id. `listening` is a carrier serving behind the flow's listener and
+    /// nothing less: before this the reconciler mapped "a flow exists"
+    /// straight to `active`, and a route to an offline node read `active`
+    /// while every connect was refused. (Since FR-86 P1 such a connect is
+    /// held rather than refused, and the route still reads `backoff`.)
     pub fn flow_report(&self, id: &str) -> Option<FlowReport> {
         let flows = self.inner.flows.lock().unwrap();
         let live = &flows.get(id)?.live;
@@ -665,10 +688,11 @@ impl TunnelSignalingSink for DaemonSink {
 /// driver. `None` = the session's demux entry was removed (WS drop / kill).
 ///
 /// It does NOT mark the flow `Up` (#1685). `rc:tunnel.opened` is the server
-/// accepting the open; the QUIC / DC-pool setup and the local bind come after
-/// it and can still fail — toward an offline node they did, every cycle, and
-/// the flow read `webrtc-dc-v1` in the Flows table for most of each cycle.
-/// Only the driver's bind hook ([`listening_hook`]) sets `Up`.
+/// accepting the open; the QUIC / DC-pool setup comes after it and can still
+/// fail — toward an offline node it did, every cycle, and the flow read
+/// `webrtc-dc-v1` in the Flows table for most of each cycle. Only the
+/// supervisor sets `Up`, when the established carrier is installed behind the
+/// flow's listener ([`run_flow_cycle`]).
 struct ChannelSource {
     rx: mpsc::Receiver<ServerMsg>,
     live: Arc<FlowLive>,
@@ -691,25 +715,29 @@ impl TunnelSignalingSource for ChannelSource {
     }
 }
 
-/// #1685 — the driver's bind callback for `flow_id`: the ONE event that makes
-/// the flow (and its declared route) `active`. Flips the flow to `Up` and
-/// forgets the failures before it.
-fn listening_hook(flow_id: &str, live: &Arc<FlowLive>) -> tunnel_core::driver::ListeningHook {
-    let flow_id = flow_id.to_string();
-    let live = live.clone();
-    Arc::new(move |addr: std::net::SocketAddr| {
-        info!(flow = %flow_id, local = %addr, "flow listener bound — the route is serving");
-        live.mark_listening();
-    })
-}
-
 // ---------------------------------------------------------------------------
 // The supervised flow loop
 // ---------------------------------------------------------------------------
 
-/// Supervise one flow: (re)establish a tunnel session over the live agent WS
-/// and serve `local` until the session drops, then back off + retry. Owns the
-/// local-port intent across WS reconnects (the CLI's `run_forward` shape,
+/// How one supervisor cycle ended ([`run_flow_cycle`]).
+enum Cycle {
+    /// The hub's sink sender is gone — the daemon is shutting down.
+    Shutdown,
+    /// A carrier was established, served behind the flow's listener, and died.
+    /// `ran` is the whole cycle (establishment + service), the same clock
+    /// `session_ran` always read.
+    Carried {
+        ran: Duration,
+        transport: &'static str,
+    },
+    /// The listener could not be bound, or no carrier came out of the ladder.
+    Failed(anyhow::Error),
+}
+
+/// Supervise one flow: bind its listener once, then (re)establish a tunnel
+/// session over the live agent WS and serve `local` through it until the
+/// session drops, then back off + retry with the listener still bound. Owns
+/// the local-port intent across WS reconnects (the CLI's `run_forward` shape,
 /// relocated + sharing the daemon's ONE WS instead of dialing its own).
 async fn run_flow_supervisor(
     hub: TunnelClientHub,
@@ -741,62 +769,48 @@ async fn run_flow_supervisor(
     // even while carrying no data (2026-08-25). The transport that ran is the
     // honest signal.
     let mut quic_over_turn_failing = false;
+    // FR-86 P1 — the flow's listener: bound on the first cycle (or retried on
+    // the ladder if the bind fails), kept across every session after that.
+    let mut listener: Option<FlowListener<Carrier>> = None;
     loop {
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // #1685 — an attempt is in flight (or waiting for the WS): no countdown.
         *live.retry_at.lock().unwrap() = None;
-        // Wait for a live agent WS.
-        let sink_tx = match wait_for_sink(&mut sink_rx).await {
-            Some(tx) => tx,
-            None => return, // hub dropped — the daemon is shutting down
-        };
 
-        // Resolve the /derp handle whenever the flavor is enabled — the
-        // fallback ladder inside `run_session_with_fallback` uses it on a
-        // quic-over-TURN failure even before we start LEADING with it.
-        let derp = if pref == TransportPref::Auto && derp_fallback_enabled() {
-            let h = super::netwatch::primary_derp_tunnel_handle();
-            if h.is_none() && quic_over_turn_failing {
-                debug!(flow = %flow_id, "quic-derp-v1 wanted but no /derp handle yet (overlay derp starting?)");
-            }
-            h
-        } else {
-            None
-        };
-
-        let started = std::time::Instant::now();
-        let result = run_session_with_fallback(
+        let cycle = run_flow_cycle(
             &hub,
             &flow_id,
-            &mut attempt,
-            &sink_tx,
-            local,
             agent_id,
+            local,
             &target,
             pref,
             &live,
-            derp,
+            &mut listener,
+            &mut sink_rx,
+            &mut attempt,
             quic_over_turn_failing,
         )
         .await;
 
         *live.status.lock().unwrap() = FlowStatus::Down;
-        // Update the derp-lead signal from the transport that actually ran.
-        match live.transport.lock().unwrap().as_deref() {
-            Some(t) if t == tunnel_core::transport::TRANSPORT_QUIC_V1 => {
-                quic_over_turn_failing = false
+        let result = match cycle {
+            Cycle::Shutdown => return, // hub dropped — the daemon is shutting down
+            Cycle::Carried { ran, transport } => {
+                // Update the derp-lead signal from the transport that actually
+                // ran — the carrier's own word for it.
+                if transport == tunnel_core::transport::TRANSPORT_QUIC_V1 {
+                    quic_over_turn_failing = false;
+                } else if transport == TRANSPORT_WEBRTC_DC_V1
+                    || transport == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1
+                {
+                    quic_over_turn_failing = true;
+                }
+                Ok(ran)
             }
-            Some(t)
-                if t == TRANSPORT_WEBRTC_DC_V1
-                    || t == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1 =>
-            {
-                quic_over_turn_failing = true
-            }
-            _ => {}
-        }
+            Cycle::Failed(e) => Err(e),
+        };
         match result {
-            Ok(()) => {
-                let ran = started.elapsed();
+            Ok(ran) => {
                 if session_ran(ran) {
                     info!(flow = %flow_id, ran_s = ran.as_secs(), "tunnel session ended; reconnecting");
                     backoff = RECONNECT_BACKOFF_MIN;
@@ -853,6 +867,106 @@ async fn run_flow_supervisor(
             }
         }
     }
+}
+
+/// One supervisor cycle: make sure the flow's listener is bound (FR-86 P1 —
+/// once; a failed bind is a retryable failure exactly like a failed session
+/// used to be), wait for a live agent WS, run the transport ladder to a
+/// [`Carrier`], install it behind the listener (this is the ONE event that
+/// makes the flow `Up`, #1685 — the held connections are handed over in the
+/// same call), then wait for the carrier to die. The listener stays bound
+/// throughout, so a connection arriving during the next cycle's ladder is
+/// held rather than refused.
+#[allow(clippy::too_many_arguments)]
+async fn run_flow_cycle(
+    hub: &TunnelClientHub,
+    flow_id: &str,
+    agent_id: ObjectId,
+    local: u16,
+    target: &Target,
+    pref: TransportPref,
+    live: &Arc<FlowLive>,
+    listener: &mut Option<FlowListener<Carrier>>,
+    sink_rx: &mut watch::Receiver<Option<mpsc::Sender<ClientMsg>>>,
+    attempt: &mut u64,
+    lead_derp: bool,
+) -> Cycle {
+    if listener.is_none() {
+        match FlowListener::bind(local, HoldPolicy::default()).await {
+            Ok(l) => {
+                info!(
+                    flow = %flow_id, local = %l.local_addr(),
+                    "flow listener bound — connections are held until a carrier is ready"
+                );
+                *listener = Some(l);
+            }
+            // The same error shape a per-session bind failure had, so the
+            // route's `last_error` reads as before (`session_error_summary`).
+            Err(e) => return Cycle::Failed(e.context(format!("tunnel session (flow {flow_id})"))),
+        }
+    }
+    let Some(listener) = listener.as_ref() else {
+        return Cycle::Failed(anyhow::anyhow!("flow listener missing after bind"));
+    };
+
+    // Wait for a live agent WS.
+    let Some(sink_tx) = wait_for_sink(sink_rx).await else {
+        return Cycle::Shutdown;
+    };
+
+    // Resolve the /derp handle whenever the flavor is enabled — the
+    // fallback ladder inside `run_session_with_fallback` uses it on a
+    // quic-over-TURN failure even before we start LEADING with it.
+    let derp = if pref == TransportPref::Auto && derp_fallback_enabled() {
+        let h = super::netwatch::primary_derp_tunnel_handle();
+        if h.is_none() && lead_derp {
+            debug!(flow = %flow_id, "quic-derp-v1 wanted but no /derp handle yet (overlay derp starting?)");
+        }
+        h
+    } else {
+        None
+    };
+
+    let started = std::time::Instant::now();
+    let carrier = match run_session_with_fallback(
+        hub, flow_id, attempt, &sink_tx, agent_id, target, pref, live, derp, lead_derp,
+    )
+    .await
+    {
+        Ok(carrier) => Arc::new(carrier),
+        Err(e) => return Cycle::Failed(e),
+    };
+    let transport = carrier.transport();
+
+    // #1685 / FR-86 P1 — the carrier is behind the listener: the flow SERVES.
+    let handed = listener.install(Arc::clone(&carrier));
+    live.mark_listening();
+    info!(
+        flow = %flow_id, transport, local = %listener.local_addr(), held_handed = handed,
+        "carrier ready behind the flow listener — the route is serving"
+    );
+
+    carrier.dead().await;
+    // No carrier: hold from here until the next cycle installs one.
+    listener.clear();
+    end_session(hub, live);
+    // The old end of the session function — the dispatcher aborted, the peer
+    // closed, the exit told (#1754) — is this drop.
+    drop(carrier);
+    Cycle::Carried {
+        ran: started.elapsed(),
+        transport,
+    }
+}
+
+/// A session is over (its carrier died, or its attempt produced none): reap
+/// its demux entry + the cells the Source filled from `rc:tunnel.opened`, so
+/// nothing leaks across attempts. `kill_flow` does the same from the outside.
+fn end_session(hub: &TunnelClientHub, live: &FlowLive) {
+    if let Some(sid) = live.session_id.lock().unwrap().take() {
+        hub.inner.client_sessions.lock().unwrap().remove(&sid);
+    }
+    *live.transport.lock().unwrap() = None;
 }
 
 /// R4 — the client-side gate for the derp tunnel flavor
@@ -922,16 +1036,17 @@ async fn wait_for_sink(
     }
 }
 
-/// One session with the Auto→WebRTC transport fallback. Mirrors the CLI's
-/// `run_one_session`, but each attempt gets a fresh nonce + Source (the daemon
-/// re-opens over the shared WS rather than dialing a new one).
+/// One session with the Auto→WebRTC transport fallback, up to an established
+/// [`Carrier`] (FR-86 P1: the listener is the flow's, so the ladder ends at
+/// "ready to carry"). Mirrors the CLI's `run_one_session`, but each attempt
+/// gets a fresh nonce + Source (the daemon re-opens over the shared WS rather
+/// than dialing a new one).
 #[allow(clippy::too_many_arguments)]
 async fn run_session_with_fallback(
     hub: &TunnelClientHub,
     flow_id: &str,
     attempt: &mut u64,
     sink_tx: &mpsc::Sender<ClientMsg>,
-    local: u16,
     agent_id: ObjectId,
     target: &Target,
     pref: TransportPref,
@@ -944,15 +1059,14 @@ async fn run_session_with_fallback(
     // once the supervisor has seen quic-over-TURN fail on this path. Ignored
     // when `derp` is `None` or `pref != Auto`.
     lead_derp: bool,
-) -> Result<()> {
+) -> Result<Carrier> {
     // An explicit `--transport` is honored verbatim (no derp, no fallback).
     if pref != TransportPref::Auto {
-        let outcome = drive_one(
+        return match drive_one(
             hub,
             flow_id,
             attempt,
             sink_tx,
-            local,
             agent_id,
             target,
             pref.supported_transports(),
@@ -960,11 +1074,13 @@ async fn run_session_with_fallback(
             live,
             None,
         )
-        .await?;
-        if matches!(outcome, SessionOutcome::QuicSetupFailed) {
-            bail!("QUIC setup failed and transport={pref:?} forbids fallback");
-        }
-        return Ok(());
+        .await?
+        {
+            Establishment::Established(carrier) => Ok(*carrier),
+            Establishment::QuicSetupFailed => {
+                bail!("QUIC setup failed and transport={pref:?} forbids fallback")
+            }
+        };
     }
 
     // Auto. When leading with derp, request quic-derp first (still advertising
@@ -988,13 +1104,12 @@ async fn run_session_with_fallback(
             None,
         )
     };
-    let outcome = drive_one(
-        hub, flow_id, attempt, sink_tx, local, agent_id, target, supported, request, live,
-        first_derp,
+    if let Establishment::Established(carrier) = drive_one(
+        hub, flow_id, attempt, sink_tx, agent_id, target, supported, request, live, first_derp,
     )
-    .await?;
-    if !matches!(outcome, SessionOutcome::QuicSetupFailed) {
-        return Ok(());
+    .await?
+    {
+        return Ok(*carrier);
     }
 
     // QUIC-over-TURN failed. Try quic-derp over the ESTABLISHED /derp WS
@@ -1005,12 +1120,11 @@ async fn run_session_with_fallback(
     if !lead_derp {
         if let Some(handle) = derp {
             info!(flow = %flow_id, "QUIC-over-TURN setup failed; trying quic-derp-v1 over the established /derp WS before webrtc-dc");
-            let derp_outcome = drive_one(
+            if let Establishment::Established(carrier) = drive_one(
                 hub,
                 flow_id,
                 attempt,
                 sink_tx,
-                local,
                 agent_id,
                 target,
                 vec![tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string()],
@@ -1018,9 +1132,9 @@ async fn run_session_with_fallback(
                 live,
                 Some(handle),
             )
-            .await?;
-            if !matches!(derp_outcome, SessionOutcome::QuicSetupFailed) {
-                return Ok(());
+            .await?
+            {
+                return Ok(*carrier);
             }
             warn!(flow = %flow_id, "quic-derp-v1 setup also failed; re-opening over webrtc-dc-v1");
         }
@@ -1028,12 +1142,11 @@ async fn run_session_with_fallback(
         warn!(flow = %flow_id, "quic-derp-v1 lead failed; re-opening over webrtc-dc-v1");
     }
 
-    let fallback = drive_one(
+    match drive_one(
         hub,
         flow_id,
         attempt,
         sink_tx,
-        local,
         agent_id,
         target,
         vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
@@ -1041,29 +1154,32 @@ async fn run_session_with_fallback(
         live,
         None,
     )
-    .await?;
-    if matches!(fallback, SessionOutcome::QuicSetupFailed) {
-        bail!("webrtc-dc-v1 fallback unexpectedly reported QUIC-setup-failed");
+    .await?
+    {
+        Establishment::Established(carrier) => Ok(*carrier),
+        Establishment::QuicSetupFailed => {
+            bail!("webrtc-dc-v1 fallback unexpectedly reported QUIC-setup-failed")
+        }
     }
-    Ok(())
 }
 
 /// Build this attempt's nonce + demux registration + seam, drive one
-/// `run_tunnel_session`, then reap the attempt's demux entries.
+/// `establish_tunnel_session`, then reap the attempt's demux entries — the
+/// pending nonce either way, the session too unless a carrier came out of it
+/// (that session lives on until the supervisor ends it, `end_session`).
 #[allow(clippy::too_many_arguments)]
 async fn drive_one(
     hub: &TunnelClientHub,
     flow_id: &str,
     attempt: &mut u64,
     sink_tx: &mpsc::Sender<ClientMsg>,
-    local: u16,
     agent_id: ObjectId,
     target: &Target,
     supported: Vec<String>,
     request: &str,
     live: &Arc<FlowLive>,
     derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
-) -> Result<SessionOutcome> {
+) -> Result<Establishment> {
     *attempt += 1;
     let nonce = format!("{flow_id}.{attempt}");
     let (src_tx, src_rx) = mpsc::channel::<ServerMsg>(SESSION_SOURCE_DEPTH);
@@ -1086,19 +1202,19 @@ async fn drive_one(
         live: live.clone(),
     });
 
-    info!(flow = %flow_id, %nonce, request, "flow: driving run_tunnel_session (hello+open)");
-    let result = run_tunnel_session(
+    info!(flow = %flow_id, %nonce, request, "flow: driving establish_tunnel_session (hello+open)");
+    let result = establish_tunnel_session(
         sink,
         source,
-        local,
         SessionParams {
             agent_id,
             target: target.clone(),
             client_version: hub.inner.client_version.clone(),
             derp,
-            // #1685 — the bound listener is the ONE event that makes the
-            // flow (and its declared route) `active`.
-            on_listening: Some(listening_hook(flow_id, live)),
+            // FR-86 P1 — the flow owns the listener, so there is no per-session
+            // bind to be told about: the supervisor flips `Up` itself when it
+            // installs the carrier (#1685's ONE event, one step later).
+            on_listening: None,
         },
         supported,
         request,
@@ -1107,14 +1223,16 @@ async fn drive_one(
     )
     .await;
 
-    // Reap this attempt's demux entries (the pending nonce if the open never
-    // completed, the session if it did) so nothing leaks across attempts.
+    // The open is answered or abandoned either way: its nonce is spent.
     hub.inner.pending_opens.lock().unwrap().remove(&nonce);
     *live.nonce.lock().unwrap() = None;
-    if let Some(sid) = live.session_id.lock().unwrap().take() {
-        hub.inner.client_sessions.lock().unwrap().remove(&sid);
+    // No carrier out of this attempt ⇒ whatever session it opened is already
+    // over (the driver's guard told the exit): reap its demux entry + cells
+    // now so nothing leaks across attempts. A carrier's session stays
+    // registered until the supervisor ends it (`end_session`).
+    if !matches!(result, Ok(Establishment::Established(_))) {
+        end_session(hub, live);
     }
-    *live.transport.lock().unwrap() = None;
 
     result.with_context(|| format!("tunnel session (flow {flow_id})"))
 }
@@ -1223,9 +1341,9 @@ pub(crate) fn parse_host_port(s: &str) -> Result<(String, u16)> {
 
 /// Fail fast at create time if `local` can't be bound (the common "port already
 /// in use" misconfig), with a clean message. The listener is dropped
-/// immediately; the driver re-binds it per session attempt (it late-binds to
-/// preserve the QUIC→WebRTC fallback), so this is only a validation probe — the
-/// tiny TOCTOU window before the supervisor's first bind is a non-issue for an
+/// immediately; the flow supervisor binds the port for real when it starts
+/// (once, for the flow's life — FR-86 P1), so this is only a validation probe
+/// — the tiny TOCTOU window before the supervisor's bind is a non-issue for an
 /// operator-paced create.
 async fn probe_local_port(local: u16) -> std::result::Result<(), String> {
     if local == 0 {
@@ -1559,8 +1677,9 @@ mod tests {
         );
         assert_eq!(hub.negotiated_transport("ghost"), None);
 
-        // The node came back: the driver bound the listener.
-        listening_hook("fl-7", &live)("127.0.0.1:1081".parse().unwrap());
+        // The node came back: the supervisor installed a carrier behind the
+        // flow's listener (FR-86 P1 — the port itself was bound all along).
+        live.mark_listening();
         let serving = hub.flow_report("fl-7").unwrap();
         assert_eq!(
             serving,
@@ -1577,6 +1696,80 @@ mod tests {
             hub.active_flow_agent_ids()
                 .contains("0123456789abcdef01234567")
         );
+    }
+
+    /// FR-86 P1 (AC3, the daemon path): the flow's listener is bound by the
+    /// supervisor BEFORE any session exists, so a client that connects while
+    /// no carrier is ready is accepted and held — never refused — while the
+    /// flow still reads `connecting` (a held connection is not a serving
+    /// route). `kill_flow` during that gap releases the held connection (the
+    /// client sees EOF) and unbinds the port. With no agent WS published the
+    /// supervisor parks in `wait_for_sink`, which is exactly the gap. NC86B
+    /// (no hold: closed on arrival) turns the first half red; NC86E (the
+    /// accept task outlives the listener) the second.
+    #[tokio::test]
+    async fn a_client_connecting_before_any_carrier_is_held_and_released_by_kill_flow() {
+        use tokio::io::AsyncReadExt;
+        let hub = TunnelClientHub::new("test".into());
+        let port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let id = hub
+            .create_forward("0123456789abcdef01234567", port, "db:5432", "webrtc")
+            .await
+            .expect("create_forward");
+
+        // The supervisor binds asynchronously; a client connecting right after
+        // create must be ACCEPTED (held), not refused — poll the bind briefly.
+        let mut client = None;
+        for _ in 0..40 {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => {
+                    client = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let mut client =
+            client.expect("the flow's listener must be bound before any carrier exists");
+        // Held: open and quiet, and the flow does NOT claim to serve.
+        let mut buf = [0u8; 4];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.read(&mut buf))
+                .await
+                .is_err(),
+            "a connection arriving before a carrier must be held open, not closed"
+        );
+        let report = hub.flow_report(&id).expect("registered");
+        assert!(
+            !report.listening,
+            "a held connection is not a serving route"
+        );
+        assert_eq!(hub.flows_snapshot()[0].transport, "connecting");
+
+        // kill_flow in the gap: the held client is released, the port freed.
+        assert!(hub.kill_flow(&id));
+        match tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("expected the held connection to close, read {n} bytes"),
+            Err(_) => panic!("the held connection must be released when the flow is killed"),
+        }
+        let mut rebound = false;
+        for _ in 0..40 {
+            if tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(rebound, "kill_flow must unbind the flow's port");
     }
 
     /// #1685 — the route row already names the flow, so the supervisor's

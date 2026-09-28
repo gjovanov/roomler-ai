@@ -35,6 +35,10 @@ pub mod driver;
 /// Node env-var reads: `ROOMLERD_*`, then the older `ROOMLER_NODE_*`.
 pub mod env;
 pub mod evidence;
+/// FR-86 P1 — the flow-owned listener: one loopback port bound for the life of
+/// a flow, served through whichever `driver::Carrier` is current, holding
+/// connections (bounded) while none is.
+pub mod flow_listener;
 pub mod forward;
 /// LocalAPI — the daemon's local control surface (P1: read-only protocol).
 ///

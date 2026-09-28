@@ -13,10 +13,22 @@
 //! [`TunnelSignalingSource`](crate::signaling_link::TunnelSignalingSource)
 //! instead of owning a WebSocket, so the SAME engine serves the CLI (WS-backed)
 //! and — at P3b-2 — the `roomlerd` daemon (agent-WS-multiplexer-backed).
+//!
+//! FR-86 P1 split a session into **establishment** and **carrying**:
+//! [`establish_tunnel_session`] does the hello/open, the transport handshake
+//! and brings the data plane to ready — everything a session used to do up to
+//! (not including) binding its loopback listener — and returns a [`Carrier`],
+//! which runs the per-connection code the session's accept loop used to run.
+//! Who owns the port is the caller's choice: [`run_tunnel_session`] (the
+//! standalone CLI) binds one per session as before; the daemon's flow binds
+//! once for its whole life ([`crate::flow_listener`]) and installs each
+//! carrier behind it, so a reconnect no longer refuses connections and — the
+//! reason for the split — a second carrier can be established beside the
+//! first (P2's make-before-break re-upgrade).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,11 +38,12 @@ use roomler_ai_remote_control::signaling::{
     REJECT_REASON_SESSION_GONE, REJECT_REASON_SESSION_MISMATCH, RejectKind, ServerMsg, TunnelRole,
 };
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot, watch};
 use tracing::{debug, error, info, warn};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
+use crate::flow_listener::Carry;
 use crate::forward::{FlowDemux, HalfCloseSink, SessionThroughput, run_flow, run_flow_quic};
 use crate::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use crate::transport::quic::{self, QuicConnection, QuicPeer};
@@ -54,7 +67,16 @@ use crate::transport::{TRANSPORT_QUIC_DERP_V1, TRANSPORT_QUIC_V1, TRANSPORT_WEBR
 /// `WSAENOBUFS`. The bug was not the missing abort *call* — one was already
 /// there and correct — it was that the rule lived in a call site instead of in
 /// the type. Wrapping the handle makes "aborted on every path" structural.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+///
+/// `pub(crate)` since FR-86 P1: the flow listener's accept task
+/// (`crate::flow_listener`) must die with the listener for the same reason.
+pub(crate) struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -320,6 +342,20 @@ pub enum SessionOutcome {
     QuicSetupFailed,
 }
 
+/// Outcome of one [`establish_tunnel_session`] attempt — [`SessionOutcome`]'s
+/// shape, one step earlier: the session is up and ready to carry, or QUIC
+/// setup soft-failed and the caller may re-open over WebRTC. Every other
+/// failure is an `Err`, exactly as before the split.
+pub enum Establishment {
+    /// The data plane is ready; connections can be carried. Boxed: a
+    /// `Carrier` is a few hundred bytes next to the unit variant (clippy
+    /// `large_enum_variant`), and it is built once per attempt.
+    Established(Box<Carrier>),
+    /// A QUIC flavor couldn't be established during setup. The session it
+    /// opened is already over (its terminate went out with the guard).
+    QuicSetupFailed,
+}
+
 /// What each accepted local connection forwards to.
 #[derive(Debug, Clone)]
 pub enum Target {
@@ -333,13 +369,15 @@ pub enum Target {
     Socks5,
 }
 
-/// #1685 — called by the driver the moment the session's local listener is
-/// bound, with the address it serves on. That bind is the ONLY point at which
-/// "this route is active" becomes true: `rc:tunnel.opened` is the server
-/// accepting the open, and the QUIC / DC-pool setup after it can still fail —
-/// toward an offline node it does, every cycle. An owner that publishes a
-/// liveness state (the daemon's route reconciler) flips it from here; the
-/// standalone CLI passes `None`.
+/// #1685 — called by [`run_tunnel_session`] the moment the session's local
+/// listener is bound, with the address it serves on. That bind is the ONLY
+/// point at which "this route is active" becomes true: `rc:tunnel.opened` is
+/// the server accepting the open, and the QUIC / DC-pool setup after it can
+/// still fail — toward an offline node it does, every cycle. The standalone
+/// CLI passes `None`. Since FR-86 P1 the daemon binds its own listener
+/// (`crate::flow_listener`) and flips its liveness itself when a carrier is
+/// installed behind it, so it passes `None` too; [`establish_tunnel_session`]
+/// binds nothing and never calls this.
 pub type ListeningHook = Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>;
 
 /// Everything the caller must supply to identify + version a tunnel session,
@@ -358,8 +396,9 @@ pub struct SessionParams {
     /// `Some` only in the daemon (an overlay node with an established `/derp`
     /// WS); the standalone CLI passes `None` and keeps the classic ladder.
     pub derp: Option<crate::transport::derp::DerpTunnelHandle>,
-    /// #1685 — told when the local listener is bound (see [`ListeningHook`]).
-    /// `None` when the caller has no liveness state to publish.
+    /// #1685 — told when [`run_tunnel_session`]'s local listener is bound (see
+    /// [`ListeningHook`]). `None` when the caller has no liveness state to
+    /// publish, or owns the listener itself (the daemon, FR-86 P1).
     pub on_listening: Option<ListeningHook>,
 }
 
@@ -379,26 +418,465 @@ async fn bind_local_listener(
     Ok(listener)
 }
 
+/// FR-86 P1 — an established tunnel session as a **connection carrier**: the
+/// data plane is up (the DC pool open, or the QUIC connection authenticated),
+/// the dispatcher task runs, the keepalive is armed and the #1754 terminate
+/// guard is held. It carries local TCP connections through the session
+/// exactly as the session's own accept loop did; who accepts them — a
+/// per-session listener ([`run_tunnel_session`]) or the flow's
+/// ([`crate::flow_listener::FlowListener`]) — is the caller's business.
+///
+/// One type for both transports rather than a trait with two impls: a carrier
+/// is the same object either way — sink, session id, target, reply registry,
+/// the P7 backstop, the dispatcher, the guard — and only the plane it pumps
+/// bytes on differs ([`Plane`]). The per-connection code keeps its two
+/// transport-specific bodies inside [`Carrier::carry`], verbatim, and the
+/// listener side needs one method of it ([`Carry`]), which is what lets the
+/// flow listener be tested with a fake.
+///
+/// **Dropping the carrier ends the session** the way the end of the session
+/// function used to: the dispatcher is aborted (it holds the peer and a sink
+/// clone), the plane drops (the last `TunnelPeer` reference spawns `close()`;
+/// the last QUIC connection reference closes it), and the terminate guard
+/// tells the exit. Connections already in flight keep pumping on the old plane
+/// until it dies, as before.
+pub struct Carrier {
+    transport: &'static str,
+    session_id: ObjectId,
+    sink: Arc<dyn TunnelSignalingSink>,
+    target: Target,
+    session: Arc<SessionThroughput>,
+    reply_registry: ReplyRegistry,
+    active_flows: ActiveFlows,
+    flow_counter: Arc<AtomicU32>,
+    /// P7 backstop — shared across this session's connections: reset on any
+    /// reply, incremented on a timeout; `session_dead` fires when it trips.
+    flow_timeout_streak: Arc<AtomicU32>,
+    session_dead: Arc<Notify>,
+    /// Connections in flight on this carrier ([`Carrier::active`]).
+    in_flight: Arc<AtomicU64>,
+    /// Closed (its sender dropped) when the dispatcher task ends — by
+    /// returning or by being aborted — which is how [`Carrier::dead`] sees
+    /// "the control channel is gone" through a shared reference.
+    dispatcher_done: watch::Receiver<()>,
+    // Declaration order is drop order: abort the dispatcher first (it holds a
+    // peer clone and a sink clone), then the plane (the last peer reference
+    // spawns the close), then tell the exit.
+    _dispatcher: AbortOnDrop<()>,
+    plane: Plane,
+    _terminate: TerminateOnDrop,
+}
+
+/// The data plane a [`Carrier`] pumps bytes on.
+enum Plane {
+    /// `webrtc-dc-v1`: the DC pool, one [`FlowDemux`] per channel, flows
+    /// spread round-robin.
+    Dc {
+        /// Kept so the peer lives exactly as long as the carrier.
+        _peer: Arc<TunnelPeer>,
+        demuxes: Arc<Vec<FlowDemux>>,
+        rr_counter: Arc<AtomicUsize>,
+    },
+    /// `quic-v1` / `quic-derp-v1`: one bidirectional stream per flow on the
+    /// session's connection.
+    Quic {
+        conn: Arc<QuicConnection>,
+        /// The endpoint — dropping it closes quinn.
+        _peer: Arc<QuicPeer>,
+    },
+}
+
+/// RAII count of one connection in flight on a carrier: decrements when the
+/// connection's task returns OR is aborted.
+struct InFlight(Arc<AtomicU64>);
+
+impl InFlight {
+    fn new(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Carrier {
+    /// The negotiated transport this carrier runs (`quic-v1`, `quic-derp-v1`
+    /// or `webrtc-dc-v1`).
+    pub fn transport(&self) -> &'static str {
+        self.transport
+    }
+
+    /// The server-side session id.
+    pub fn session_id(&self) -> ObjectId {
+        self.session_id
+    }
+
+    /// Connections currently in flight on this carrier.
+    pub fn active(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Forward one accepted local connection through this session — the
+    /// per-connection task the session's accept loop used to spawn, unchanged:
+    /// socket tuning, SOCKS5 / static target resolution, UDP ASSOCIATE, the
+    /// forward request and the pump. Never blocks the caller.
+    pub fn carry(&self, mut tcp: tokio::net::TcpStream, peer_addr: std::net::SocketAddr) {
+        tune_local_socket(&tcp, peer_addr);
+        debug!(%peer_addr, transport = self.transport, "accepted local TCP connection");
+
+        let flow_id = self.flow_counter.fetch_add(1, Ordering::Relaxed);
+        let in_flight = InFlight::new(&self.in_flight);
+        let session_id = self.session_id;
+        let reply_registry = Arc::clone(&self.reply_registry);
+        let active_flows = Arc::clone(&self.active_flows);
+        let sink = self.sink.clone();
+        let target = self.target.clone();
+        let flow_counter_for_udp = Arc::clone(&self.flow_counter);
+        let session = Arc::clone(&self.session);
+        let flow_timeout_streak = Arc::clone(&self.flow_timeout_streak);
+        let session_dead = Arc::clone(&self.session_dead);
+        match &self.plane {
+            Plane::Dc {
+                demuxes,
+                rr_counter,
+                ..
+            } => {
+                let dc_index_chosen =
+                    (rr_counter.fetch_add(1, Ordering::Relaxed) % demuxes.len()) as u8;
+                let demuxes = Arc::clone(demuxes);
+                tokio::spawn(async move {
+                    let _in_flight = in_flight;
+                    // Resolve the destination: the static `--remote`, or the
+                    // per-connection SOCKS5 request (userspace mode). A SOCKS5
+                    // UDP ASSOCIATE forks off the UDP relay and never uses the
+                    // pre-allocated TCP flow_id.
+                    let (host, port, socks) = match &target {
+                        Target::Static { host, port } => (host.clone(), *port, false),
+                        Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
+                            Ok(crate::socks5::Socks5Request::Connect { host, port }) => {
+                                (host, port, true)
+                            }
+                            Ok(crate::socks5::Socks5Request::UdpAssociate) => {
+                                if let Err(e) = crate::udp::handle_associate(
+                                    tcp,
+                                    session_id,
+                                    crate::udp::AssocCarrier::Dc { demuxes },
+                                    reply_registry,
+                                    sink,
+                                    flow_counter_for_udp,
+                                    session,
+                                )
+                                .await
+                                {
+                                    warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
+                                return;
+                            }
+                        },
+                    };
+                    // Register the reply mailbox now that we're proceeding — before the
+                    // request is sent, so the dispatcher can route the accept/reject.
+                    let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+                    reply_registry.lock().await.insert(flow_id, reply_tx);
+                    if let Err(e) = handle_local_connection(
+                        tcp,
+                        peer_addr,
+                        flow_id,
+                        dc_index_chosen,
+                        session_id,
+                        &host,
+                        port,
+                        sink,
+                        reply_rx,
+                        reply_registry,
+                        active_flows,
+                        demuxes,
+                        socks,
+                        flow_timeout_streak,
+                        session_dead,
+                    )
+                    .await
+                    {
+                        warn!(flow_id, %e, "flow ended with error");
+                    }
+                });
+            }
+            Plane::Quic { conn, .. } => {
+                let conn = Arc::clone(conn);
+                tokio::spawn(async move {
+                    let _in_flight = in_flight;
+                    // Resolve the destination: static `--remote`, or the per-connection
+                    // SOCKS5 request (userspace mode). UDP ASSOCIATE forks off the UDP
+                    // relay over this session's QUIC connection.
+                    let (host, port, socks) = match &target {
+                        Target::Static { host, port } => (host.clone(), *port, false),
+                        Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
+                            Ok(crate::socks5::Socks5Request::Connect { host, port }) => {
+                                (host, port, true)
+                            }
+                            Ok(crate::socks5::Socks5Request::UdpAssociate) => {
+                                if let Err(e) = crate::udp::handle_associate(
+                                    tcp,
+                                    session_id,
+                                    crate::udp::AssocCarrier::Quic { conn },
+                                    reply_registry,
+                                    sink,
+                                    flow_counter_for_udp,
+                                    session,
+                                )
+                                .await
+                                {
+                                    warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
+                                return;
+                            }
+                        },
+                    };
+                    let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+                    reply_registry.lock().await.insert(flow_id, reply_tx);
+                    if let Err(e) = handle_local_connection_quic(
+                        tcp,
+                        peer_addr,
+                        flow_id,
+                        session_id,
+                        conn,
+                        &host,
+                        port,
+                        sink,
+                        reply_rx,
+                        reply_registry,
+                        active_flows,
+                        socks,
+                        session,
+                        flow_timeout_streak,
+                        session_dead,
+                    )
+                    .await
+                    {
+                        warn!(flow_id, %e, "quic flow ended with error");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Resolves when this carrier can carry no more — the session accept
+    /// loop's own exit arms, unchanged: the dispatcher task ended (the control
+    /// channel is gone, so no new flow can be requested); the P7 backstop
+    /// tripped (forward opens timing out repeatedly with no reply of any kind
+    /// — the far side went silent; the stale-permit re-check is kept); or the
+    /// QUIC connection itself died (quinn's keepalive/idle-timeout noticed the
+    /// peer is gone while the WS control plane outlived it — without this the
+    /// session would keep taking connections whose flows can never open). The
+    /// latter two send the `rc:tunnel.terminate { io_error }` the loops sent,
+    /// a best-effort server-side reap so an old server doesn't carry a zombie
+    /// entry until the WS drops. Cancel-safe: nothing is consumed before it
+    /// resolves, so a `select!` may drop and re-create it freely.
+    pub async fn dead(&self) {
+        let mut dispatcher_done = self.dispatcher_done.clone();
+        tokio::select! {
+            _ = dispatcher_done.changed() => {
+                warn!(transport = self.transport, "control channel closed; ending session to reconnect");
+            }
+            _ = self.wedged() => {
+                warn!(
+                    transport = self.transport,
+                    "forward opens timing out repeatedly (far side silent) — ending session to re-open"
+                );
+                let _ = self
+                    .sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id: self.session_id,
+                        reason: CloseReason::IoError,
+                    })
+                    .await;
+            }
+            err = self.plane_lost() => {
+                warn!(%err, "QUIC connection lost; ending quic session to reconnect");
+                let _ = self
+                    .sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id: self.session_id,
+                        reason: CloseReason::IoError,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// The P7 backstop, with its stale-permit re-check: `notify_one` may have
+    /// stored a permit that a later reply's streak-reset made stale, and the
+    /// `AtomicU32` is authoritative, so a stale wakeup is ignored rather than
+    /// killing a now-healthy session.
+    async fn wedged(&self) {
+        loop {
+            self.session_dead.notified().await;
+            if self.flow_timeout_streak.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_FLOW_TIMEOUTS {
+                return;
+            }
+        }
+    }
+
+    /// The plane's own death signal: QUIC has one (`conn.closed()`); the DC
+    /// pool has none (its death surfaces through the dispatcher — the exit's
+    /// #1754 reap terminates the session — or the P7 backstop).
+    async fn plane_lost(&self) -> quinn::ConnectionError {
+        match &self.plane {
+            Plane::Quic { conn, .. } => conn.closed().await,
+            Plane::Dc { .. } => std::future::pending().await,
+        }
+    }
+}
+
+impl Carry for Carrier {
+    fn carry(&self, tcp: tokio::net::TcpStream, peer_addr: std::net::SocketAddr) {
+        Carrier::carry(self, tcp, peer_addr);
+    }
+}
+
+/// Per-accepted-socket tuning, identical for both transports.
+fn tune_local_socket(tcp: &tokio::net::TcpStream, peer_addr: std::net::SocketAddr) {
+    // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
+    // Nagle on the local listener's accepted TCP socket. The agent
+    // side already sets TCP_NODELAY on its outbound (corp-side)
+    // dialer (see agents/roomlerd/src/tunnel/dialer.rs); the
+    // asymmetry meant TDS row tokens flowing FROM the server,
+    // through the DC, OUT to the local SSMS/psql/JDBC client got
+    // Nagle-coalesced on this socket. Under MSSQL TDS the small
+    // row tokens batch up waiting for ACKs that don't come until
+    // ~40 ms later (delayed ACK + Nagle interaction), collapsing
+    // sustained throughput to tens of KB/s and triggering server-
+    // side ASYNC_NETWORK_IO suspensions. Setting nodelay is
+    // canonical for tunnels; no downside.
+    if let Err(e) = tcp.set_nodelay(true) {
+        warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
+    }
+    // rc.66 throughput follow-on: bump SO_SNDBUF on the accepted
+    // loopback socket from the OS default (Windows: 64 KiB-ish,
+    // can be as low as 8 KiB on some kernels) to 4 MiB. Windows
+    // loopback under TDS bulk-read fills the default send buffer
+    // in milliseconds; once full, every `write_all` in
+    // `pump_dc_to_tcp` blocks waiting for the local app to read,
+    // and that backpressures all the way up the chain. A 4 MiB
+    // ceiling absorbs the burst so the producer can keep pumping
+    // while the consumer drains. Best-effort: Windows may cap
+    // below 4 MiB silently (autotune); the actual ceiling is
+    // observable via `getsockopt` if needed, but the request
+    // alone is enough to lift the floor. socket2 on the raw
+    // fd/socket is the portable path.
+    const LOCAL_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
+    #[cfg(any(unix, windows))]
+    {
+        use socket2::SockRef;
+        let sock = SockRef::from(tcp);
+        if let Err(e) = sock.set_send_buffer_size(LOCAL_SNDBUF_BYTES) {
+            warn!(%peer_addr, %e, "set_send_buffer_size(4MiB) on local TCP failed");
+        }
+    }
+}
+
 /// One session attempt over a caller-supplied signaling link: handshake, open
 /// the tunnel requesting `request_transport`, then run whichever data plane the
-/// server negotiated. Returns [`SessionOutcome::QuicSetupFailed`] (not an
-/// `Err`) when a QUIC session can't be established, so the caller can fall back
-/// to WebRTC.
+/// server negotiated behind a listener bound **per session** on `local`.
+/// Returns [`SessionOutcome::QuicSetupFailed`] (not an `Err`) when a QUIC
+/// session can't be established, so the caller can fall back to WebRTC.
+///
+/// This is the standalone CLI's contract (`roomler forward` / `socks5`),
+/// unchanged by FR-86 P1: it composes [`establish_tunnel_session`] with a
+/// private accept loop that binds after the data plane is ready (so a QUIC
+/// soft-fall never held the port) and runs until the carrier is [`dead`]
+/// (`Carrier::dead`). The daemon binds once per flow instead and does not
+/// come through here.
 ///
 /// The caller owns the transport: `sink` funnels every outbound `ClientMsg`
 /// (the CLI's `WsSink` puts them through one mpsc + one WS writer task so FIFO
 /// order matches the pre-seam behaviour), and `source` yields typed
 /// `ServerMsg`s (the CLI's `WsSource` absorbs the WS Ping/Close/parse layer).
+///
+/// [`dead`]: Carrier::dead
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel_session(
     sink: Arc<dyn TunnelSignalingSink>,
-    mut source: Box<dyn TunnelSignalingSource>,
+    source: Box<dyn TunnelSignalingSource>,
     local: u16,
     params: SessionParams,
     supported_transports: Vec<String>,
     request_transport: &str,
     session: Arc<SessionThroughput>,
 ) -> Result<SessionOutcome> {
+    let on_listening = params.on_listening.clone();
+    let carrier = match establish_tunnel_session(
+        sink,
+        source,
+        params,
+        supported_transports,
+        request_transport,
+        session,
+    )
+    .await?
+    {
+        Establishment::Established(carrier) => *carrier,
+        Establishment::QuicSetupFailed => return Ok(SessionOutcome::QuicSetupFailed),
+    };
+
+    // ────────────── Local TCP listener ─────────────────────────────
+    // A failed bind is an `Err` with the carrier dropped on the way out —
+    // the terminate guard tells the exit, exactly as the `?` did before.
+    let listener = bind_local_listener(local, on_listening.as_ref()).await?;
+    info!(
+        local = %listener.local_addr()?,
+        transport = carrier.transport(),
+        "listening for local TCP connections"
+    );
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((tcp, peer_addr)) => carrier.carry(tcp, peer_addr),
+                Err(e) => error!(%e, "accept failed"),
+            },
+            _ = carrier.dead() => break,
+        }
+    }
+    // Dropping the carrier is the old end of the session function: the
+    // dispatcher is aborted so it releases its `sink` clone (else the
+    // standalone CLI's WS keepalive pins the old WS + peer + TURN allocation
+    // open per re-open, F1), the peer closes, the exit is told.
+    drop(carrier);
+    Ok(SessionOutcome::Completed)
+}
+
+/// FR-86 P1 — one session attempt up to **ready to carry**: the hello/open
+/// handshake, then whichever data plane the server negotiated brought up to
+/// the point where connections can be forwarded — the DC pool open with its
+/// demuxes and keepalive, or the QUIC connection authenticated — with the
+/// dispatcher task running and the #1754 terminate guard armed. Everything a
+/// session did before binding its listener, and nothing after: the returned
+/// [`Carrier`] takes the connections, whoever accepts them.
+///
+/// Returns [`Establishment::QuicSetupFailed`] (not an `Err`) when a QUIC
+/// flavor can't be established, so the caller can re-open over WebRTC — the
+/// soft-fall [`run_tunnel_session`] always had. Every `?` after
+/// `rc:tunnel.opened` drops the guard on the way out, so the exit is told.
+pub async fn establish_tunnel_session(
+    sink: Arc<dyn TunnelSignalingSink>,
+    mut source: Box<dyn TunnelSignalingSource>,
+    params: SessionParams,
+    supported_transports: Vec<String>,
+    request_transport: &str,
+    session: Arc<SessionThroughput>,
+) -> Result<Establishment> {
     // P3b-3: zero the per-session `active_flows` gauge at the start of each
     // attempt so a prior session's leaked count (unclean WS teardown) can't
     // carry over. Cumulative `bytes_*` are untouched — they accumulate for
@@ -480,15 +958,16 @@ pub async fn run_tunnel_session(
 
     // #1754 — from here we hold a server-side session id, and the exit agent
     // builds its per-session `AgentTunnelPeer` as soon as it sees our offer /
-    // QUIC setup. It frees that peer ONLY when told, so EVERY way this fn can
-    // now end — the transport dispatch below returning `Ok`, an early `?`
-    // (`PEER_READY_TIMEOUT`, a failed local bind, an `accept_answer` error), a
-    // `QuicSetupFailed` soft-fall before the WebRTC re-open, or the whole future
-    // being ABORTED by `kill_flow` — must tell the server so it relays
+    // QUIC setup. It frees that peer ONLY when told, so EVERY way the session
+    // can now end — an early `?` (`PEER_READY_TIMEOUT`, an `accept_answer`
+    // error), a `QuicSetupFailed` soft-fall before the WebRTC re-open, the
+    // carrier being dropped by its owner (the end of `run_tunnel_session`, the
+    // flow supervisor ending a dead session), or the whole future being
+    // ABORTED by `kill_flow` — must tell the server so it relays
     // `rc:tunnel.terminate` on to the agent. The guard makes that structural;
-    // its `Drop` survives the abort by spawning the send. Held across the whole
-    // transport dispatch below (bound with a name so it is not dropped early).
-    let _terminate_guard = TerminateOnDrop::new(sink.clone(), session_id);
+    // its `Drop` survives the abort by spawning the send. It moves INTO the
+    // carrier on success (FR-86 P1), so the carrier's drop is the session's end.
+    let terminate_guard = TerminateOnDrop::new(sink.clone(), session_id);
 
     // ────────────── Dispatch on the negotiated transport ───────────
     if negotiated_transport == TRANSPORT_QUIC_DERP_V1 {
@@ -498,65 +977,61 @@ pub async fn run_tunnel_session(
             // soft-fail like every other QUIC setup problem so the session
             // re-opens over webrtc-dc instead of erroring the supervisor.
             warn!("server negotiated quic-derp-v1 but this client has no derp handle");
-            return Ok(SessionOutcome::QuicSetupFailed);
+            return Ok(Establishment::QuicSetupFailed);
         };
-        return run_quic_session(
+        return establish_quic(
             source,
-            sink.clone(),
+            sink,
             session_id,
             quic_auth_token,
             ice_servers,
-            local,
-            &params.target,
+            params.target,
             session,
             Some(derp),
-            params.on_listening.clone(),
+            terminate_guard,
         )
         .await;
     }
     if negotiated_transport == TRANSPORT_QUIC_V1 {
-        return run_quic_session(
+        return establish_quic(
             source,
-            sink.clone(),
+            sink,
             session_id,
             quic_auth_token,
             ice_servers,
-            local,
-            &params.target,
+            params.target,
             session,
             None,
-            params.on_listening.clone(),
+            terminate_guard,
         )
         .await;
     }
-    run_webrtc_session(
+    let carrier = establish_webrtc(
         source,
-        sink.clone(),
+        sink,
         session_id,
         ice_servers,
-        local,
-        &params.target,
+        params.target,
         session,
-        params.on_listening.clone(),
+        terminate_guard,
     )
     .await?;
-    Ok(SessionOutcome::Completed)
+    Ok(Establishment::Established(Box::new(carrier)))
 }
 
 /// The proven WebRTC SCTP DataChannel data plane (`webrtc-dc-v1`):
-/// build the peer, run the SDP/ICE handshake, open the DC pool, then
-/// serve local TCP connections over round-robin flows.
-#[allow(clippy::too_many_arguments)]
-async fn run_webrtc_session(
+/// build the peer, run the SDP/ICE handshake, open the DC pool and install
+/// its demuxes + keepalive, then hand back a [`Carrier`] that serves local
+/// TCP connections over round-robin flows.
+async fn establish_webrtc(
     source: Box<dyn TunnelSignalingSource>,
     sink: Arc<dyn TunnelSignalingSink>,
     session_id: ObjectId,
     ice_servers: Vec<IceServer>,
-    local: u16,
-    target: &Target,
+    target: Target,
     session: Arc<SessionThroughput>,
-    on_listening: Option<ListeningHook>,
-) -> Result<()> {
+    terminate: TerminateOnDrop,
+) -> Result<Carrier> {
     // ────────────── Build TunnelPeer + SDP/ICE handshake ───────────
     let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
         .into_iter()
@@ -625,13 +1100,18 @@ async fn run_webrtc_session(
     let peer_for_dispatch = Arc::new(peer);
     let pool_ready = Arc::new(tokio::sync::Notify::new());
 
-    let mut dispatcher_task = AbortOnDrop({
+    let (dispatcher_done_tx, dispatcher_done) = watch::channel(());
+    let dispatcher_task = AbortOnDrop({
         let peer = Arc::clone(&peer_for_dispatch);
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let pool_ready = Arc::clone(&pool_ready);
         let sink = sink.clone();
         tokio::spawn(async move {
+            // Held for the task's life: dropped when the loop returns OR the
+            // task is aborted, which closes `dispatcher_done` for
+            // `Carrier::dead`.
+            let _done = dispatcher_done_tx;
             dispatch_loop(
                 source,
                 &peer,
@@ -678,178 +1158,34 @@ async fn run_webrtc_session(
         crate::forward::spawn_dc_keepalive(dc0);
     }
 
-    // ────────────── Local TCP listener ─────────────────────────────
-    let listener = bind_local_listener(local, on_listening.as_ref()).await?;
-    info!(local = %listener.local_addr()?, "listening for local TCP connections");
-
-    let flow_counter = Arc::new(AtomicU32::new(1));
-    let rr_counter = Arc::new(AtomicUsize::new(0));
-    // P7 backstop — see the identical block + rationale in `run_quic_session`.
-    let flow_timeout_streak = Arc::new(AtomicU32::new(0));
-    let session_dead = Arc::new(Notify::new());
-
-    loop {
-        let (mut tcp, peer_addr) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(x) => x,
-                Err(e) => {
-                    error!(%e, "accept failed");
-                    continue;
-                }
-            },
-            // The WS dispatcher exited — the control channel is gone, so new
-            // flows can't be requested. End the session so `run_forward`
-            // reconnects instead of accepting into a dead socket.
-            _ = &mut *dispatcher_task => {
-                warn!("control channel closed; ending session to reconnect");
-                break;
-            }
-            // P7 backstop: repeated forward-open timeouts with no reply — the
-            // far side went silent. End + re-open (see `run_quic_session`,
-            // incl. the stale-permit re-check).
-            _ = session_dead.notified() => {
-                if flow_timeout_streak.load(Ordering::Relaxed) < MAX_CONSECUTIVE_FLOW_TIMEOUTS {
-                    continue;
-                }
-                warn!("forward opens timing out repeatedly (far side silent) — ending session to re-open");
-                let _ = sink
-                    .send(ClientMsg::TunnelTerminate {
-                        session_id,
-                        reason: CloseReason::IoError,
-                    })
-                    .await;
-                break;
-            }
-        };
-        // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
-        // Nagle on the local listener's accepted TCP socket. The agent
-        // side already sets TCP_NODELAY on its outbound (corp-side)
-        // dialer (see agents/roomlerd/src/tunnel/dialer.rs); the
-        // asymmetry meant TDS row tokens flowing FROM the server,
-        // through the DC, OUT to the local SSMS/psql/JDBC client got
-        // Nagle-coalesced on this socket. Under MSSQL TDS the small
-        // row tokens batch up waiting for ACKs that don't come until
-        // ~40 ms later (delayed ACK + Nagle interaction), collapsing
-        // sustained throughput to tens of KB/s and triggering server-
-        // side ASYNC_NETWORK_IO suspensions. Setting nodelay is
-        // canonical for tunnels; no downside.
-        if let Err(e) = tcp.set_nodelay(true) {
-            warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
-        }
-        // rc.66 throughput follow-on: bump SO_SNDBUF on the accepted
-        // loopback socket from the OS default (Windows: 64 KiB-ish,
-        // can be as low as 8 KiB on some kernels) to 4 MiB. Windows
-        // loopback under TDS bulk-read fills the default send buffer
-        // in milliseconds; once full, every `write_all` in
-        // `pump_dc_to_tcp` blocks waiting for the local app to read,
-        // and that backpressures all the way up the chain. A 4 MiB
-        // ceiling absorbs the burst so the producer can keep pumping
-        // while the consumer drains. Best-effort: Windows may cap
-        // below 4 MiB silently (autotune); the actual ceiling is
-        // observable via `getsockopt` if needed, but the request
-        // alone is enough to lift the floor.
-        //
-        // Uses `socket2` indirectly via `tokio::net::TcpStream::set_send_buffer_size`
-        // when available; pre-1.41 tokio paths fall back through
-        // `as_raw_socket` / `WSAIoctl` on Windows. We're on tokio 1.x
-        // recent enough that `set_send_buffer_size` is exposed.
-        const LOCAL_SNDBUF_BYTES: u32 = 4 * 1024 * 1024;
-        // tokio 1.41+ has TcpStream::set_send_buffer_size returning
-        // io::Result; older versions don't. Use a feature-detected
-        // import path: socket2 on the raw fd/socket is portable.
-        #[cfg(any(unix, windows))]
-        {
-            use socket2::SockRef;
-            let sock = SockRef::from(&tcp);
-            if let Err(e) = sock.set_send_buffer_size(LOCAL_SNDBUF_BYTES as usize) {
-                warn!(%peer_addr, %e, "set_send_buffer_size(4MiB) on local TCP failed");
-            }
-        }
-        debug!(%peer_addr, "accepted local TCP connection");
-
-        let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
-        let dc_index_chosen = (rr_counter.fetch_add(1, Ordering::Relaxed) % demuxes.len()) as u8;
-
-        let demuxes = Arc::clone(&demuxes);
-        let reply_registry = Arc::clone(&reply_registry);
-        let active_flows = Arc::clone(&active_flows);
-        let sink = sink.clone();
-        let target = target.clone();
-        let flow_counter_for_udp = Arc::clone(&flow_counter);
-        let session = Arc::clone(&session);
-        let flow_timeout_streak = Arc::clone(&flow_timeout_streak);
-        let session_dead = Arc::clone(&session_dead);
-        tokio::spawn(async move {
-            // Resolve the destination: the static `--remote`, or the
-            // per-connection SOCKS5 request (userspace mode). A SOCKS5
-            // UDP ASSOCIATE forks off the UDP relay and never uses the
-            // pre-allocated TCP flow_id.
-            let (host, port, socks) = match &target {
-                Target::Static { host, port } => (host.clone(), *port, false),
-                Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
-                    Ok(crate::socks5::Socks5Request::Connect { host, port }) => (host, port, true),
-                    Ok(crate::socks5::Socks5Request::UdpAssociate) => {
-                        if let Err(e) = crate::udp::handle_associate(
-                            tcp,
-                            session_id,
-                            crate::udp::AssocCarrier::Dc { demuxes },
-                            reply_registry,
-                            sink,
-                            flow_counter_for_udp,
-                            session,
-                        )
-                        .await
-                        {
-                            warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
-                        return;
-                    }
-                },
-            };
-            // Register the reply mailbox now that we're proceeding — before the
-            // request is sent, so the dispatcher can route the accept/reject.
-            let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
-            reply_registry.lock().await.insert(flow_id, reply_tx);
-            if let Err(e) = handle_local_connection(
-                tcp,
-                peer_addr,
-                flow_id,
-                dc_index_chosen,
-                session_id,
-                &host,
-                port,
-                sink,
-                reply_rx,
-                reply_registry,
-                active_flows,
-                demuxes,
-                socks,
-                flow_timeout_streak,
-                session_dead,
-            )
-            .await
-            {
-                warn!(flow_id, %e, "flow ended with error");
-            }
-        });
-    }
-
-    // The loop broke on one of the non-accept arms. If it was a
-    // `session_dead` / (elsewhere) `conn.closed()` break the dispatcher is
-    // STILL running — abort it so it drops its `sink` clone. On the standalone
-    // CLI that sink clone keeps `outbound_tx` (and thus the WS keepalive)
-    // alive, so an un-aborted dispatcher would pin the old WS + peer + TURN
-    // allocation open forever, leaking one set per re-open (F1). A no-op when
-    // the dispatcher already exited (the control-channel-closed arm).
-    // Redundant since the handle became an `AbortOnDrop` (it would fire a
-    // few lines later anyway), but kept: it aborts at the exact point the
-    // comment above describes, rather than at end of scope.
-    dispatcher_task.abort();
-    Ok(())
+    // Ready to carry. The listener is the caller's (FR-86 P1): the standalone
+    // CLI binds one per session in `run_tunnel_session`, the daemon's flow owns
+    // one for its whole life. The dispatcher abort that used to sit at the end
+    // of the accept loop (F1 — drop the `sink` clone so the standalone CLI's
+    // WS keepalive can't pin the old WS + peer + TURN allocation open per
+    // re-open) is the carrier's drop now, via `AbortOnDrop`.
+    Ok(Carrier {
+        transport: TRANSPORT_WEBRTC_DC_V1,
+        session_id,
+        sink,
+        target,
+        session,
+        reply_registry,
+        active_flows,
+        flow_counter: Arc::new(AtomicU32::new(1)),
+        // P7 backstop — see the identical block + rationale in `establish_quic`.
+        flow_timeout_streak: Arc::new(AtomicU32::new(0)),
+        session_dead: Arc::new(Notify::new()),
+        in_flight: Arc::new(AtomicU64::new(0)),
+        dispatcher_done,
+        _dispatcher: dispatcher_task,
+        plane: Plane::Dc {
+            _peer: peer_for_dispatch,
+            demuxes,
+            rr_counter: Arc::new(AtomicUsize::new(0)),
+        },
+        _terminate: terminate,
+    })
 }
 
 /// Send `TcpForwardRequest`, await accept/reject, and on accept drive
@@ -993,7 +1329,7 @@ async fn handle_local_connection(
 }
 
 /// WS read loop. Owns every inbound `ServerMsg` after the
-/// `TunnelOpened` was consumed by [`run_tunnel_session`]. Forwards SDP/ICE
+/// `TunnelOpened` was consumed by [`establish_tunnel_session`]. Forwards SDP/ICE
 /// into the [`TunnelPeer`], routes per-flow accept/reject into the
 /// `reply_registry`, and logs the audit-side TcpHalfClose / TcpClosed.
 #[allow(clippy::too_many_arguments)]
@@ -1172,35 +1508,34 @@ async fn dispatch_loop(
     debug!("WS source ended; dispatch loop exiting");
 }
 
-/// The QUIC data plane (`quic-v1`). Awaits the agent's
+/// The QUIC data plane (`quic-v1` / `quic-derp-v1`). Awaits the agent's
 /// `rc:tunnel.quic.ready` (relayed by the server), connects to the
 /// agent's quinn endpoint (cert pinned from that message, authed with
-/// the server-minted token), then serves local TCP connections — one
-/// QUIC bidirectional stream per flow. Returns
-/// [`SessionOutcome::QuicSetupFailed`] (not an `Err`) if the QUIC link
-/// can't be established during setup, so the caller can fall back to
-/// WebRTC. Once flows can start it's committed (the listener loop runs
-/// until process teardown, like the WebRTC path).
+/// the server-minted token), then hands back a [`Carrier`] that serves
+/// local TCP connections — one QUIC bidirectional stream per flow.
+/// Returns [`Establishment::QuicSetupFailed`] (not an `Err`) if the QUIC
+/// link can't be established during setup, so the caller can fall back to
+/// WebRTC. Once flows can start it's committed (no WebRTC fallback; the
+/// carrier runs until it is dead or dropped, like the WebRTC path).
 #[allow(clippy::too_many_arguments)]
-async fn run_quic_session(
+async fn establish_quic(
     mut source: Box<dyn TunnelSignalingSource>,
     sink: Arc<dyn TunnelSignalingSink>,
     session_id: ObjectId,
     quic_auth_token: Option<String>,
     ice_servers: Vec<IceServer>,
-    local: u16,
-    target: &Target,
+    target: Target,
     session: Arc<SessionThroughput>,
     // R4 — `Some` iff the server negotiated `quic-derp-v1`: QUIC rides the
     // established `/derp` WS toward the agent's pubkey instead of a TURN
     // relay. Everything after the connection (auth, dispatcher, flows) is
     // transport-agnostic and shared.
     derp: Option<crate::transport::derp::DerpTunnelHandle>,
-    on_listening: Option<ListeningHook>,
-) -> Result<SessionOutcome> {
+    terminate: TerminateOnDrop,
+) -> Result<Establishment> {
     let Some(token) = quic_auth_token else {
         warn!("server negotiated a quic flavor but sent no quic_auth_token — cannot authenticate");
-        return Ok(SessionOutcome::QuicSetupFailed);
+        return Ok(Establishment::QuicSetupFailed);
     };
 
     // Await `rc:tunnel.quic.ready`: the agent's ephemeral cert
@@ -1234,11 +1569,11 @@ async fn run_quic_session(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             warn!(%e, "error awaiting rc:tunnel.quic.ready");
-            return Ok(SessionOutcome::QuicSetupFailed);
+            return Ok(Establishment::QuicSetupFailed);
         }
         Err(_) => {
             warn!("timed out waiting for rc:tunnel.quic.ready");
-            return Ok(SessionOutcome::QuicSetupFailed);
+            return Ok(Establishment::QuicSetupFailed);
         }
     };
     info!(
@@ -1271,7 +1606,7 @@ async fn run_quic_session(
             .and_then(crate::transport::derp::parse_pubkey_hex)
         else {
             warn!("quic-derp-v1 negotiated but the agent sent no parseable derp_pubkey");
-            return Ok(SessionOutcome::QuicSetupFailed);
+            return Ok(Establishment::QuicSetupFailed);
         };
         let derp_conn = handle.mux.tunnel_conn_for(agent_pk);
         let dial = derp_conn.synth_peer();
@@ -1280,21 +1615,21 @@ async fn run_quic_session(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 warn!(%e, "quic-derp: relay socket bridge");
-                return Ok(SessionOutcome::QuicSetupFailed);
+                return Ok(Establishment::QuicSetupFailed);
             }
         };
         let peer = match QuicPeer::client_over_derp(sock, &cert_fingerprint) {
             Ok(p) => p,
             Err(e) => {
                 warn!(%e, "quic-derp: endpoint over derp conn");
-                return Ok(SessionOutcome::QuicSetupFailed);
+                return Ok(Establishment::QuicSetupFailed);
             }
         };
         match peer.connect(dial).await {
             Ok(conn) => (peer, conn, "derp"),
             Err(e) => {
                 warn!(%e, "quic-derp: handshake over the derp leg failed");
-                return Ok(SessionOutcome::QuicSetupFailed);
+                return Ok(Establishment::QuicSetupFailed);
             }
         }
     } else if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
@@ -1314,7 +1649,7 @@ async fn run_quic_session(
             // logged by the allocation itself ("TURN allocation established"
             // vs "TURNS/TCP …"); at the QUIC level both are the relay path.
             Some((peer, conn)) => (peer, conn, "relay"),
-            None => return Ok(SessionOutcome::QuicSetupFailed),
+            None => return Ok(Establishment::QuicSetupFailed),
         }
     } else {
         let bind: std::net::SocketAddr =
@@ -1323,20 +1658,20 @@ async fn run_quic_session(
             Ok(p) => p,
             Err(e) => {
                 warn!(%e, "QuicPeer::client failed");
-                return Ok(SessionOutcome::QuicSetupFailed);
+                return Ok(Establishment::QuicSetupFailed);
             }
         };
         // Dial the advertised addrs in priority order (direct host /
         // srflx candidates).
         let Some(conn) = connect_first(&peer, &addrs).await else {
             warn!(addrs = ?addrs, "could not connect QUIC to any advertised addr");
-            return Ok(SessionOutcome::QuicSetupFailed);
+            return Ok(Establishment::QuicSetupFailed);
         };
         (peer, conn, "direct")
     };
     if let Err(e) = quic::client_authenticate(&conn, &token).await {
         warn!(%e, "QUIC client_authenticate failed");
-        return Ok(SessionOutcome::QuicSetupFailed);
+        return Ok(Establishment::QuicSetupFailed);
     }
     // Per-tier connection summary — one greppable line for field
     // diagnosis: transport + path (relay vs direct hole-punch) + the
@@ -1355,178 +1690,48 @@ async fn run_quic_session(
     // per-flow accept/reject + teardown signals.
     let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
     let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
-    let mut dispatcher_task = AbortOnDrop({
+    let (dispatcher_done_tx, dispatcher_done) = watch::channel(());
+    let dispatcher_task = AbortOnDrop({
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let sink = sink.clone();
         tokio::spawn(async move {
+            // Held for the task's life: dropped when the loop returns OR the
+            // task is aborted, which closes `dispatcher_done` for
+            // `Carrier::dead`.
+            let _done = dispatcher_done_tx;
             quic_dispatch_loop(source, session_id, reply_registry, active_flows, sink).await
         })
     });
 
     // Keep the endpoint + connection alive for the session lifetime
     // (dropping the endpoint closes quinn; dropping the last `conn`
-    // Arc closes the connection).
+    // Arc closes the connection). Both live in the carrier's plane.
     let conn = Arc::new(conn);
     let _peer = Arc::new(peer);
 
-    // ────────────── Local TCP listener ─────────────────────────────
-    let listener = bind_local_listener(local, on_listening.as_ref()).await?;
-    info!(local = %listener.local_addr()?, "listening for local TCP connections (quic-v1)");
-    let flow_counter = Arc::new(AtomicU32::new(1));
-    // P7 backstop: shared consecutive-forward-timeout streak + a "session is
-    // wedged" signal the per-connection tasks fire when it trips.
-    let flow_timeout_streak = Arc::new(AtomicU32::new(0));
-    let session_dead = Arc::new(Notify::new());
-
-    loop {
-        let (mut tcp, peer_addr) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(x) => x,
-                Err(e) => {
-                    error!(%e, "accept failed");
-                    continue;
-                }
-            },
-            // WS dispatcher exited (control channel gone) — end the session so
-            // `run_forward` reconnects instead of accepting into a dead socket.
-            _ = &mut *dispatcher_task => {
-                warn!("control channel closed; ending quic session to reconnect");
-                break;
-            }
-            // P7 backstop: forwards have timed out MAX_CONSECUTIVE_FLOW_TIMEOUTS
-            // times with no reply of any kind — the far side went silent (lost
-            // reply, or an agent that forgot us without sending a reject, which
-            // the reply-driven session-gone signal can't catch). End + re-open.
-            // The AtomicU32 is authoritative: `notify_one` may have stored a
-            // permit that a later reply's streak-reset made stale, so re-check
-            // and ignore a stale wakeup rather than kill a now-healthy session.
-            _ = session_dead.notified() => {
-                if flow_timeout_streak.load(Ordering::Relaxed) < MAX_CONSECUTIVE_FLOW_TIMEOUTS {
-                    continue;
-                }
-                warn!("forward opens timing out repeatedly (far side silent) — ending quic session to re-open");
-                let _ = sink
-                    .send(ClientMsg::TunnelTerminate {
-                        session_id,
-                        reason: CloseReason::IoError,
-                    })
-                    .await;
-                break;
-            }
-            // P7 flap resilience: the QUIC connection itself died (quinn's
-            // keepalive/idle-timeout noticed the peer is gone — agent-side
-            // network flap, silent carrier death). The WS control plane can
-            // outlive it, so without this arm the session would keep
-            // accepting local connections whose flows can never open. End
-            // the session; the flow supervisor re-opens with a fresh
-            // transport.
-            err = conn.closed() => {
-                warn!(%err, "QUIC connection lost; ending quic session to reconnect");
-                // Best-effort server-side reap (see the dispatch loops'
-                // session-gone exit) — without it an old server carries a
-                // zombie session entry until our WS drops, and the
-                // standalone CLI's zombie WS would idle until then.
-                let _ = sink
-                    .send(ClientMsg::TunnelTerminate {
-                        session_id,
-                        reason: CloseReason::IoError,
-                    })
-                    .await;
-                break;
-            }
-        };
-        // Same Nagle + SO_SNDBUF tuning as the WebRTC path — see the
-        // long-form rationale in `run_webrtc_session`'s listener loop.
-        if let Err(e) = tcp.set_nodelay(true) {
-            warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
-        }
-        #[cfg(any(unix, windows))]
-        {
-            use socket2::SockRef;
-            const LOCAL_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
-            let sock = SockRef::from(&tcp);
-            if let Err(e) = sock.set_send_buffer_size(LOCAL_SNDBUF_BYTES) {
-                warn!(%peer_addr, %e, "set_send_buffer_size(4MiB) on local TCP failed");
-            }
-        }
-        debug!(%peer_addr, "accepted local TCP connection (quic-v1)");
-
-        let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
-
-        let reply_registry = Arc::clone(&reply_registry);
-        let active_flows = Arc::clone(&active_flows);
-        let sink = sink.clone();
-        let target = target.clone();
-        let conn = Arc::clone(&conn);
-        let flow_counter_for_udp = Arc::clone(&flow_counter);
-        let session = Arc::clone(&session);
-        let flow_timeout_streak = Arc::clone(&flow_timeout_streak);
-        let session_dead = Arc::clone(&session_dead);
-        tokio::spawn(async move {
-            // Resolve the destination: static `--remote`, or the per-connection
-            // SOCKS5 request (userspace mode). UDP ASSOCIATE forks off the UDP
-            // relay over this session's QUIC connection.
-            let (host, port, socks) = match &target {
-                Target::Static { host, port } => (host.clone(), *port, false),
-                Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
-                    Ok(crate::socks5::Socks5Request::Connect { host, port }) => (host, port, true),
-                    Ok(crate::socks5::Socks5Request::UdpAssociate) => {
-                        if let Err(e) = crate::udp::handle_associate(
-                            tcp,
-                            session_id,
-                            crate::udp::AssocCarrier::Quic { conn },
-                            reply_registry,
-                            sink,
-                            flow_counter_for_udp,
-                            session,
-                        )
-                        .await
-                        {
-                            warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
-                        return;
-                    }
-                },
-            };
-            let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
-            reply_registry.lock().await.insert(flow_id, reply_tx);
-            if let Err(e) = handle_local_connection_quic(
-                tcp,
-                peer_addr,
-                flow_id,
-                session_id,
-                conn,
-                &host,
-                port,
-                sink,
-                reply_rx,
-                reply_registry,
-                active_flows,
-                socks,
-                session,
-                flow_timeout_streak,
-                session_dead,
-            )
-            .await
-            {
-                warn!(flow_id, %e, "quic flow ended with error");
-            }
-        });
-    }
-
-    // Abort the dispatcher if a non-accept arm broke the loop while it was
-    // still running (`session_dead` / `conn.closed()`) so it releases its
-    // `sink` clone — else the standalone CLI's WS keepalive pins the old WS +
-    // peer + TURN allocation open per re-open (F1). No-op when the
-    // control-channel-closed arm already ended it.
-    // As above: `AbortOnDrop` guarantees it; this pins the timing.
-    dispatcher_task.abort();
-    Ok(SessionOutcome::Completed)
+    // Ready to carry — the listener is the caller's (FR-86 P1, see
+    // `establish_webrtc`). The `conn.closed()` / `session_dead` /
+    // dispatcher-exit arms of the old accept loop are `Carrier::dead`.
+    Ok(Establishment::Established(Box::new(Carrier {
+        transport: flavor,
+        session_id,
+        sink,
+        target,
+        session,
+        reply_registry,
+        active_flows,
+        flow_counter: Arc::new(AtomicU32::new(1)),
+        // P7 backstop: shared consecutive-forward-timeout streak + a "session is
+        // wedged" signal the per-connection tasks fire when it trips.
+        flow_timeout_streak: Arc::new(AtomicU32::new(0)),
+        session_dead: Arc::new(Notify::new()),
+        in_flight: Arc::new(AtomicU64::new(0)),
+        dispatcher_done,
+        _dispatcher: dispatcher_task,
+        plane: Plane::Quic { conn, _peer },
+        _terminate: terminate,
+    })))
 }
 
 /// Try each advertised addr in order; return the first QUIC connection
@@ -2524,6 +2729,287 @@ mod tests {
         assert!(
             record_flow_timeout(&streak),
             "the {MAX_CONSECUTIVE_FLOW_TIMEOUTS}th consecutive timeout must be fatal"
+        );
+    }
+
+    /// A loopback "exit": a QUIC server endpoint that authenticates one
+    /// client, then serves every flow it opens by dialing the loopback echo
+    /// `dst_port` and pumping — until `stop` fires or the connection ends.
+    /// Returns the cert fingerprint to pin and the dial address.
+    fn spawn_quic_exit(
+        token: &str,
+        dst_port: u16,
+        stop: oneshot::Receiver<()>,
+    ) -> (String, std::net::SocketAddr) {
+        let (agent, fp) = QuicPeer::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let agent_addr = agent.local_addr().unwrap();
+        let token = token.to_string();
+        tokio::spawn(async move {
+            let conn = agent.accept().await.unwrap().unwrap();
+            quic::server_authenticate(&conn, &token).await.unwrap();
+            let serve = async {
+                while let Ok((flow_id, send, recv)) = quic::accept_flow(&conn).await {
+                    let dst_tcp = tokio::net::TcpStream::connect(("127.0.0.1", dst_port))
+                        .await
+                        .unwrap();
+                    tokio::spawn(async move {
+                        let stats = Arc::new(crate::forward::FlowStats::default());
+                        run_flow_quic(dst_tcp, send, recv, flow_id, stats).await;
+                    });
+                }
+            };
+            tokio::select! {
+                _ = serve => {}
+                _ = stop => {}
+            }
+            // An explicit close so the client's `conn.closed()` fires at once
+            // rather than at quinn's idle timeout.
+            conn.close(0u32.into(), b"exit stopped");
+            drop(agent);
+        });
+        (fp, agent_addr)
+    }
+
+    /// A loopback TCP echo the exit dials.
+    async fn spawn_echo_dst() -> u16 {
+        let dst = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dst.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = dst.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// The control plane a test drives: the sink it reads, the source it feeds.
+    struct TestControl {
+        sink_rx: mpsc::UnboundedReceiver<ClientMsg>,
+        src_tx: mpsc::Sender<ServerMsg>,
+    }
+
+    /// Build a real QUIC [`Carrier`] the way `establish_quic` does — the real
+    /// `quic_dispatch_loop` over a channel source, the real guard — over a
+    /// connection the test already authenticated.
+    fn quic_carrier_for_test(
+        conn: QuicConnection,
+        client: QuicPeer,
+        session_id: ObjectId,
+        dst_port: u16,
+    ) -> (Carrier, TestControl) {
+        let (sink_tx, sink_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx: sink_tx });
+        let (src_tx, src_rx) = mpsc::channel::<ServerMsg>(8);
+        let source: Box<dyn TunnelSignalingSource> = Box::new(MockSource { rx: src_rx });
+        let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
+        let (done_tx, dispatcher_done) = watch::channel(());
+        let dispatcher = AbortOnDrop({
+            let reply_registry = Arc::clone(&reply_registry);
+            let active_flows = Arc::clone(&active_flows);
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let _done = done_tx;
+                quic_dispatch_loop(source, session_id, reply_registry, active_flows, sink).await
+            })
+        });
+        let carrier = Carrier {
+            transport: TRANSPORT_QUIC_V1,
+            session_id,
+            sink: sink.clone(),
+            target: Target::Static {
+                host: "echo.intranet".into(),
+                port: dst_port,
+            },
+            session: Arc::new(SessionThroughput::default()),
+            reply_registry,
+            active_flows,
+            flow_counter: Arc::new(AtomicU32::new(1)),
+            flow_timeout_streak: Arc::new(AtomicU32::new(0)),
+            session_dead: Arc::new(Notify::new()),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            dispatcher_done,
+            _dispatcher: dispatcher,
+            plane: Plane::Quic {
+                conn: Arc::new(conn),
+                _peer: Arc::new(client),
+            },
+            _terminate: TerminateOnDrop::new(sink, session_id),
+        };
+        (carrier, TestControl { sink_rx, src_tx })
+    }
+
+    async fn next_client_msg(rx: &mut mpsc::UnboundedReceiver<ClientMsg>, what: &str) -> ClientMsg {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("expected {what} within 2 s"))
+            .expect("sink open")
+    }
+
+    /// FR-86 P1 — a real [`Carrier`] over a loopback QUIC pair: `carry`
+    /// forwards an accepted connection through the session end to end (the
+    /// forward request → the real dispatcher's accept → a QUIC flow → the
+    /// pump, bytes round-tripping through the exit's echo), `active()` counts
+    /// it while it runs and drops back when it ends, `dead()` stays pending on
+    /// a healthy session and resolves when the control channel ends (the WS
+    /// dropped), and dropping the carrier sends the session's terminate — the
+    /// #1754 guard that moved into it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quic_carrier_carries_counts_dies_and_terminates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dst_port = spawn_echo_dst().await;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let (fp, agent_addr) = spawn_quic_exit("carrier-token", dst_port, stop_rx);
+        let client = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp).unwrap();
+        let conn = client.connect(agent_addr).await.unwrap();
+        quic::client_authenticate(&conn, "carrier-token")
+            .await
+            .unwrap();
+        let session_id = ObjectId::new();
+        let (carrier, mut ctl) = quic_carrier_for_test(conn, client, session_id, dst_port);
+        assert_eq!(carrier.transport(), TRANSPORT_QUIC_V1);
+        assert_eq!(carrier.session_id(), session_id);
+        assert_eq!(carrier.active(), 0);
+
+        // A local app connects to "the flow's listener" — a bare listener the
+        // test accepts on — and the accepted side is carried.
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = tokio::net::TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (tcp, peer_addr) = local.accept().await.unwrap();
+        carrier.carry(tcp, peer_addr);
+        assert_eq!(carrier.active(), 1, "a carried connection is in flight");
+
+        // The carrier asked for the forward; answer through the real dispatcher.
+        let flow_id = match next_client_msg(&mut ctl.sink_rx, "TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest {
+                session_id: sid,
+                flow_id,
+                dst_host,
+                dst_port: p,
+            } => {
+                assert_eq!(sid, session_id);
+                assert_eq!(dst_host, "echo.intranet");
+                assert_eq!(p, dst_port);
+                flow_id
+            }
+            other => panic!("expected TcpForwardRequest, got {other:?}"),
+        };
+        ctl.src_tx
+            .send(ServerMsg::TcpForwardAccept {
+                session_id,
+                flow_id,
+                dc_index: 0,
+            })
+            .await
+            .unwrap();
+
+        // Bytes round-trip: app → carrier → QUIC → exit → echo → back.
+        let (mut app_r, mut app_w) = app.into_split();
+        app_w.write_all(b"ping through a carrier").await.unwrap();
+        app_w.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        app_r.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping through a carrier");
+        match next_client_msg(&mut ctl.sink_rx, "TcpClosed").await {
+            ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
+            other => panic!("expected TcpClosed, got {other:?}"),
+        }
+        for _ in 0..40 {
+            if carrier.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            carrier.active(),
+            0,
+            "the in-flight count drops when the connection's task ends"
+        );
+
+        // Healthy: `dead()` stays pending (and is cancel-safe — this drops it).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), carrier.dead())
+                .await
+                .is_err(),
+            "a healthy carrier is not dead"
+        );
+        // The control channel ends (the WS dropped): the dispatcher exits and
+        // `dead()` resolves — the old "control channel closed" arm.
+        drop(ctl.src_tx);
+        tokio::time::timeout(Duration::from_secs(2), carrier.dead())
+            .await
+            .expect("dead() resolves when the control channel closes");
+        assert!(
+            ctl.sink_rx.try_recv().is_err(),
+            "a control-channel close sends no terminate of its own (the guard does, on drop)"
+        );
+
+        // Dropping the carrier ends the session: the guard's terminate goes out.
+        drop(carrier);
+        let msg = next_client_msg(&mut ctl.sink_rx, "the guard's TunnelTerminate").await;
+        assert!(
+            matches!(
+                msg,
+                ClientMsg::TunnelTerminate { session_id: sid, reason: CloseReason::ClientShutdown }
+                    if sid == session_id
+            ),
+            "dropping the carrier must terminate its session: {msg:?}"
+        );
+        let _ = stop_tx.send(());
+    }
+
+    /// FR-86 P1 — the QUIC connection dying is the carrier's death (the P7
+    /// flap-resilience arm, unchanged): `dead()` resolves, the `io_error`
+    /// terminate the accept loop used to send goes out, and the guard's own
+    /// follows on drop — the harmless duplicate the server absorbs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quic_carrier_is_dead_when_its_connection_closes() {
+        let dst_port = spawn_echo_dst().await;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let (fp, agent_addr) = spawn_quic_exit("carrier-token-2", dst_port, stop_rx);
+        let client = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp).unwrap();
+        let conn = client.connect(agent_addr).await.unwrap();
+        quic::client_authenticate(&conn, "carrier-token-2")
+            .await
+            .unwrap();
+        let session_id = ObjectId::new();
+        let (carrier, mut ctl) = quic_carrier_for_test(conn, client, session_id, dst_port);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), carrier.dead())
+                .await
+                .is_err(),
+            "a healthy carrier is not dead"
+        );
+        // The exit closes the connection under us.
+        let _ = stop_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), carrier.dead())
+            .await
+            .expect("dead() resolves when the QUIC connection closes");
+        let msg = next_client_msg(&mut ctl.sink_rx, "the io_error TunnelTerminate").await;
+        assert!(
+            matches!(
+                msg,
+                ClientMsg::TunnelTerminate { session_id: sid, reason: CloseReason::IoError }
+                    if sid == session_id
+            ),
+            "a lost QUIC connection must terminate the session as io_error: {msg:?}"
+        );
+        drop(carrier);
+        let msg = next_client_msg(&mut ctl.sink_rx, "the guard's TunnelTerminate").await;
+        assert!(
+            matches!(
+                msg,
+                ClientMsg::TunnelTerminate { session_id: sid, reason: CloseReason::ClientShutdown }
+                    if sid == session_id
+            ),
+            "the guard still fires on drop: {msg:?}"
         );
     }
 }
