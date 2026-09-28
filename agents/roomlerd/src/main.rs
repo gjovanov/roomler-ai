@@ -3197,7 +3197,7 @@ async fn run_cmd(
                     return Ok(None);
                 }
             }
-            updater::CheckOutcome::Skipped(reason) => {
+            updater::CheckOutcome::Skipped(reason) | updater::CheckOutcome::Unreachable(reason) => {
                 tracing::error!(%reason, "rollback fetch skipped — operator action required");
                 let _ = notify::raise_attention_with_reason_for_version(
                     notify::REASON_ROLLBACK,
@@ -4805,6 +4805,10 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
         }
         updater::CheckOutcome::Skipped(reason) => {
             println!("Update check skipped: {reason}");
+            Ok(())
+        }
+        updater::CheckOutcome::Unreachable(reason) => {
+            println!("Update check could not reach the release server: {reason}");
             Ok(())
         }
     }
