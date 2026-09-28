@@ -306,6 +306,107 @@ The same investigation found the control channel owning itself: its `on_message`
 closure held a strong clone of the channel it is stored in, so a session's control
 channel, and everything its handler captures, was never freed. It now holds a `Weak`.
 
+### ⚠️ The exit agent reaps a peer whose client is gone (#1754)
+
+The `close()` rule above has a precondition nobody had written down: **something has
+to decide to call it.** On the exit agent, only two things ever removed a tunnel peer
+from the signaling loop's session maps — a `rc:tunnel.terminate` from the server
+(`agents/roomlerd/src/signaling.rs`, the `ServerMsg::TunnelTerminate` arm) and the
+control WS ending (`close_all_tunnel_peers`). Nothing observed the data plane. A client
+that never sent its terminate left its peer in the map, `close()`d by nobody, for the
+life of the connection.
+
+**Field, 0.4.110, a macOS exit agent**: a daemon-run WebRTC forward, used once, then
+`roomler kill fl-N` on the client. The agent never received a terminate. Its UDP
+sockets went **5 → 11 → 16 over five kills** and were still held minutes later — each
+kill stranded the ICE sockets and the 8-channel DC pool of one `AgentTunnelPeer`. On
+the relayed QUIC flavours the stranded object is the TURN allocation too.
+
+Two layers fix it. Layer A makes the client always send its terminate. This section is
+**layer B**: the agent reaps a peer whose client is gone **whether or not a terminate
+ever arrives** — older clients stay in the field, clients crash, networks vanish.
+
+```mermaid
+sequenceDiagram
+    participant C as client (CLI / daemon)
+    participant A as exit agent: AgentTunnelPeer
+    participant L as signaling loop (reap arm)
+    participant S as roomler.ai
+
+    alt clean close (Ctrl-C, roomler kill)
+        C->>A: pc.close(): SCTP stream reset, DTLS close_notify
+        A->>L: TunnelReap { dc_closed } — every pool DC's read loop hit EOF (ms)
+    else client vanished (crash, cable, sleep)
+        Note over A: no STUN answer to the 2 s binding requests
+        Note over A: ICE Disconnected at 5 s — NOT reported, a live client crosses this
+        A->>L: TunnelReap { pc_failed } at ~30 s — terminal, frees nothing by itself
+    end
+    L->>L: remove from BOTH maps; neither held it → nothing (a peer's own close reports too)
+    L->>A: close_within_budget(peer.close(), "tunnel_remote_gone") — the sockets go here
+    L->>S: rc:tunnel.terminate { io_error } (relayed to a client still registered)
+```
+
+The peer's own report travels a per-org channel (`agents/roomlerd/src/tunnel/reap.rs`),
+created beside the overlay "Disconnect" channel in `signaling::run` and borrowed into
+every connection, so a report that lands during a reconnect gap is drained by the next
+connection rather than lost. Per org, not per process: a process-global sender would
+land a secondary org's reap in the primary's maps.
+
+| Signal | Where it is armed | Latency | What it means |
+|---|---|---|---|
+| `dc_closed` | `on_close` on all eight pool DCs, `AgentTunnelPeer::accept_offer` (`agents/roomlerd/src/tunnel/peer.rs`) | milliseconds | the client closed its peer cleanly; a DC read loop only starts when the channel opens, so arming before the handshake leaves no window |
+| `pc_failed` | `on_peer_connection_state_change`, same place | ~30 s of silence | ICE gave the remote up: `disconnected_timeout` 5 s + `failed_timeout` 25 s in the vendored `webrtc-ice` (`crates/vendored/webrtc-ice/src/agent/agent_config.rs`) with binding requests every 2 s. **Terminal** — tunnel-core has no ICE restart — and it **frees nothing**: only `close()` does |
+| `pc_closed` | same handler | — | reachable only through a local `close()`; the net under any close that skipped the map |
+| `quic_conn_ended` | the accept task's end, `spawn_accept_loop` (`agents/roomlerd/src/tunnel/quic_peer.rs`) | ms after a close; ≤ 30 s after silence | the ONE connection the peer serves is over — closed by the client, or idle-timed out by quinn once the client's 8 s keepalives stopped |
+
+⚠️ **Not `Disconnected`.** That is five seconds without a packet — a relay hiccup, a
+laptop's Wi-Fi roam, a CGNAT rebind — and ICE recovers from it on its own. Reaping there
+would tear down healthy tunnels, which is the one thing this pillar must never do. The
+remote-control watchdog gives a *disconnected* RC session 20 s of grace for the same
+reason (`agents/roomlerd/src/peer.rs`, `DISCONNECTED_GRACE`); a tunnel gets ICE's full
+30 s and the certainty of `Failed`.
+
+⚠️ **Idle is not gone.** A declared SOCKS5 route with no traffic for hours still
+exchanges ICE binding requests every 2 s, DC keepalive frames every 20 s
+(`crates/tunnel-core/src/forward.rs`, `DC_KEEPALIVE_INTERVAL`) and, on QUIC, quinn
+keepalives every 8 s under a 30 s idle timeout (`crates/tunnel-core/src/transport/quic.rs`).
+None of the four signals can fire while the client lives. The positive control
+`an_idle_but_live_client_is_never_reaped` idles a pair for 35 s — past the whole
+`Failed` horizon — asserts silence, then closes the client and asserts the same channel
+reports it at once, so the silence was the design and not a harness that cannot hear.
+
+Three details that matter:
+
+- **Handlers hold a sender, the session id and a latch — never the peer.** A closure
+  stored inside the peer connection that holds an `Arc` of it is the cycle #1740 found in
+  the RC control channel. The latch makes a peer report **once**, however many of its
+  nine handlers fire.
+- **The arm removes from BOTH maps and does nothing for a session neither held**
+  (`take_reaped_tunnel_peer`). That is the ordinary case, not an error: a peer closed by
+  the terminate arm reports its own close (the DCs' EOF, then `Closed`), and a parked QUIC
+  peer's report can arrive after the R3 reclaim already dropped it. Removing, not reading,
+  is what makes the second report a no-op rather than a second close and terminate.
+- **R3 parking reclaims no corpses.** `reclaim_survived_quic_peers` drops a parked QUIC
+  peer whose accept task ended while it was parked (`AgentQuicPeer::accept_ended`) — the
+  client gave up during the outage, and re-adopting its endpoint and TURN allocation would
+  keep them until a terminate that never comes.
+
+⚠️ **What changes for a live session:** a relay outage longer than ~30 s now ends a
+WebRTC tunnel session at the agent, and the client's flow supervisor re-opens it — the
+same path it already takes when the agent's control WS drops. Nothing that used to work
+is lost: such a session was `Failed` forever anyway (no ICE restart), only now its sockets
+are freed and the client is told.
+
+Locked by lib tests (`cargo test -p roomlerd --lib tunnel`), each shown red with its
+fix commented out: `a_client_that_closes_cleanly_is_reaped_at_once` (2 s budget),
+`a_client_that_vanishes_is_reaped_when_ice_fails` (the client runs on a runtime of its
+own whose only thread is parked — no keepalive answers, no clean close, sockets still
+bound — and must be reported as `pc_failed` no earlier than 20 s in),
+`a_client_that_drops_its_connection_is_reaped` (QUIC),
+`a_reap_for_an_unknown_or_already_reaped_session_takes_nothing` and
+`the_reclaim_drops_a_parked_quic_peer_whose_connection_ended`
+(`agents/roomlerd/src/signaling.rs`).
+
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
