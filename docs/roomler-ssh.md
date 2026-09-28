@@ -113,6 +113,17 @@ can be pinned out of band.
   process-tree kill. An SSH transport is not a reason to reimplement any of
   that. The cost: output arrives when the command finishes rather than
   streaming, because the engine buffers to enforce its ceiling.
+  **The client's stdin reaches the command** ([#1747](https://github.com/gjovanov/roomler-ai/issues/1747)):
+  `ssh <node> 'cat > f' < file`, `tar c . | ssh <node> 'tar x'` and
+  `ssh <node> 'sh -s' < script` work, and the client's EOF ends the input.
+  ⚠️ Until #1747 the command read NUL and the bytes were dropped without a
+  word, so the first of those wrote an empty file and exited 0.
+  ⚠️ Because the output is buffered, a command that **prompts** waits for an
+  answer to a question you cannot see. Pass `-n` (stdin from `/dev/null`) to
+  a command that must not read stdin, or use a terminal session.
+  ⚠️ `ssh -vv` prints `read failed … Broken pipe` at the end of piped stdin.
+  That is this OpenSSH client's normal EOF, not a fault: it shows up just the
+  same against a stock `sshd`, and it sent #1747's diagnosis the wrong way once.
 - **`ssh <node>` — a real interactive shell on a real terminal**, on both
   platforms (P4a Unix, P4b Windows ConPTY). See below.
 - **`sftp` and `scp`** (P7a) — see below.

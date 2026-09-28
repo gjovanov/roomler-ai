@@ -1484,9 +1484,19 @@ mod sshd {
                 .activity
                 .clone()
                 .map(|s| (s, policy.grant_id.clone()));
+            // The client's stdin, to the command. Without this `data()` had
+            // nowhere to put it and dropped every byte, so the command read
+            // NUL and `ssh node 'cat > f' < file` wrote an empty file with
+            // exit 0. Bounded like the pty's and sftp's queues: a client
+            // streaming into a command that is not reading is held back by
+            // SSH flow control rather than by the daemon's memory. Bytes that
+            // arrive while consent is pending wait here; a refusal drops them.
+            let (tx, stdin) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            self.channel_input = Some(tx);
             tokio::spawn(async move {
                 run_exec(
                     handle, channel, command, caller, run_as, consent, broker, indicator, activity,
+                    stdin,
                 )
                 .await;
             });
@@ -1548,9 +1558,10 @@ mod sshd {
             Ok(())
         }
 
-        /// Client keystrokes. Only meaningful once a terminal exists; before
-        /// that there is nothing to type into, and after the session ends the
-        /// send simply fails and the data is dropped.
+        /// Client bytes for the channel's process: keystrokes for a terminal,
+        /// the client's stdin for an exec'd command, the protocol for
+        /// `sftp-server`. With nothing to deliver to (no process yet, or the
+        /// session has ended) the send fails and the data is dropped.
         async fn data(
             &mut self,
             _channel: ChannelId,
@@ -1862,10 +1873,16 @@ mod sshd {
     /// The cost is that output is delivered when the command finishes rather
     /// than as it is produced — the engine buffers to enforce its ceiling.
     /// P4's PTY path is what makes long-running output live.
-    // 8 params: each is a distinct decision resolved at authentication
-    // (identity, consent, bound, reporting) and bundling them into a struct
-    // would only move the same fields behind a name that hides which of them
-    // a reader must check.
+    ///
+    /// `stdin` is the client's stdin, fed to the command in order and closed
+    /// at the client's EOF. So a command that reads stdin waits for it, as
+    /// under OpenSSH. Because the output is buffered, a command that PROMPTS
+    /// waits for an answer to a question the caller cannot see: `ssh -n` is
+    /// the answer for commands that must not read stdin.
+    // 9 params: each is a distinct decision resolved at authentication
+    // (identity, consent, bound, reporting, the client's input) and bundling
+    // them into a struct would only move the same fields behind a name that
+    // hides which of them a reader must check.
     #[allow(clippy::too_many_arguments)]
     async fn run_exec(
         handle: russh::server::Handle,
@@ -1877,6 +1894,7 @@ mod sshd {
         broker: crate::consent::ConsentBroker,
         indicator: crate::indicator::ViewerIndicator,
         activity: Option<(ActivitySink, Option<String>)>,
+        stdin: crate::exec::StdinFeed,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
 
@@ -1920,7 +1938,7 @@ mod sshd {
         };
 
         let outcome = crate::exec::shared()
-            .run(req, &crate::exec::redactor())
+            .run_fed(req, &crate::exec::redactor(), Some(stdin))
             .await;
 
         if !outcome.stdout.is_empty() {
@@ -2647,6 +2665,46 @@ mod tests {
             "expected the command's output, got {stdout:?}"
         );
         assert_eq!(exit, Some(0), "a successful command reports exit 0");
+    }
+
+    /// The client's stdin reaches an exec'd command, and the client's EOF
+    /// ends it: `ssh node 'cat > f' < file`, `tar c . | ssh node 'tar x'`.
+    /// Before, `data()` had nowhere to put the bytes and dropped them. The
+    /// command read NUL and succeeded with nothing, so the client saw exit 0
+    /// and an empty file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_clients_stdin_reaches_an_execd_command() {
+        let (key, line) = client_key(44);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        let echo_stdin = if cfg!(windows) {
+            "[Console]::In.ReadToEnd()"
+        } else {
+            "cat"
+        };
+        channel.exec(true, echo_stdin).await.unwrap();
+        channel.data(&b"piped-into-"[..]).await.unwrap();
+        channel.data(&b"roomler-ssh"[..]).await.unwrap();
+        channel.eof().await.unwrap();
+
+        let mut stdout = Vec::new();
+        let mut exit = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(
+            stdout.contains("piped-into-roomler-ssh"),
+            "the client's stdin never reached the command: stdout {stdout:?}"
+        );
+        assert_eq!(exit, Some(0));
     }
 
     /// A refused request must say why. `scp` turning into a silent hang is the
