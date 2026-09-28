@@ -25,13 +25,15 @@
         </v-icon>
         <!-- FR-26 — the admin-set display name wins, as it does on /devices
              and the dashboard mesh; the machine name rides the subtitle so
-             the mapping stays visible. -->
+             the mapping stays visible, unless the viewer hides it with "Hide
+             device name when a display name is set" — ONE preference, shared
+             with the Devices grid (Settings › Display carries it here). -->
         <span class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
              push Connect/Disconnect off the right edge. -->
         <span v-if="agent" class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">
-          <template v-if="agent.display_name && agent.display_name !== agent.name">
+          <template v-if="secondaryDeviceName(agent, hideDeviceName)">
             {{ agent.name }} ·
           </template>
           {{ agent.os }} · {{ agent.agent_version || '—' }}
@@ -1259,6 +1261,14 @@
             <v-btn value="off" size="small" class="flex-grow-1">Off</v-btn>
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ sharpenHint }}</div>
+          <v-checkbox
+            v-model="hideDeviceName"
+            density="compact"
+            hide-details="auto"
+            class="mt-2"
+            label="Hide device name when a display name is set"
+            messages="The same setting as on the Devices page"
+          />
 
           </v-tabs-window-item>
 
@@ -1866,6 +1876,7 @@ import {
 } from '@/composables/useRemoteRecording'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
+import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
@@ -1874,6 +1885,9 @@ const agentId = computed(() => route.params.agentId as string)
 const agentStore = useAgentStore()
 const authStore = useAuthStore()
 const agent = ref<Agent | null>(null)
+// The header's machine-name subtitle — the Devices grid's preference, per
+// user + org, so hiding it there hides it here too.
+const hideDeviceName = useHideDeviceName(() => `${authStore.user?.id ?? 'anon'}:${tenantId.value}`)
 // rc.19: pass the agent ref so useRemoteControl can read
 // `capabilities.files.includes("resume")` and opt into the
 // resumable upload pump. Agent doc is populated on mount;
