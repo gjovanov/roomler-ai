@@ -93,6 +93,11 @@ export const RECORD_REASONS: Record<string, string> = {
   unavailable: "this device can't record right now",
   login_screen: 'the device is at its sign-in screen; it can record once someone signs in',
   audio_not_allowed: "this device's owner hasn't allowed computer audio in a remote recording",
+  // #1760 — a fact about the device (a Mac, until ScreenCaptureKit; a build
+  // without audio), named ahead of the owner's gate because no setting fixes
+  // it. Also what greys the box out before any start (`audioUnavailable`).
+  audio_unsupported:
+    "this device can't record what the computer plays (Windows and Linux devices only, for now)",
   busy: 'a recording is already running on this device',
   already_starting: 'a recording is already starting',
   consent_denied: 'the person at the device said no',
@@ -215,6 +220,13 @@ export function useRemoteRecording(
   const bytes = ref(0)
   const durationMs = ref(0)
   const audio = ref(false)
+  /** #1760 — why a recording here could not include what the computer plays
+   *  (`audio_unsupported` | `audio_not_allowed`), from the device's every
+   *  `rc:record.state`; `null` where it could, and from a device older than
+   *  the field (which then refuses by name, as before). The view greys the
+   *  box out with the sentence, and `start` never asks for what the device
+   *  said it cannot give. */
+  const audioUnavailable = ref<string | null>(null)
   const items = ref<RemoteRecordingItem[]>([])
   const download = ref<RecordDownload | null>(null)
 
@@ -256,6 +268,9 @@ export function useRemoteRecording(
     bytes.value = Number(m.bytes ?? 0)
     durationMs.value = Number(m.duration_ms ?? 0)
     audio.value = m.audio === true
+    // #1760 — absent means available (the device omits it then), and an
+    // older device never sends it: both read as the box offered.
+    audioUnavailable.value = typeof m.audio_unavailable === 'string' ? m.audio_unavailable : null
     // A finished recording is one more to list.
     if (s === 'stopped') list()
   }
@@ -401,7 +416,11 @@ export function useRemoteRecording(
     currentId = newId('rec')
     reason.value = null
     detail.value = null
-    if (!send({ t: 'rc:record.start', id: currentId, audio: withAudio })) {
+    // #1760 — never ask for what the device said it cannot give: the box is
+    // greyed out and unticked, and a stale tick must not become a start that
+    // can only fail.
+    const audio = withAudio && !audioUnavailable.value
+    if (!send({ t: 'rc:record.start', id: currentId, audio })) {
       state.value = 'failed'
       reason.value = 'session_ended'
     }
@@ -475,6 +494,7 @@ export function useRemoteRecording(
     bytes,
     durationMs,
     audio,
+    audioUnavailable,
     items,
     download,
     attach,
