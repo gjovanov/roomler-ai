@@ -861,7 +861,7 @@ async fn agent_daemon_originated_forward_reaches_target() {
     // the target is online at open time). We assert on A's flow state, not B's
     // frames, so B is a keep-alive only.
     let (b_id, b_tok) = enroll_agent(&app, &seeded, "mach-p3b2c-B", "target-B").await;
-    let _b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
+    let mut b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
     wait_agent_online(&app, &seeded, &b_id).await;
 
     // Origin A: its REAL signaling loop + the hub we drive.
@@ -924,6 +924,22 @@ async fn agent_daemon_originated_forward_reaches_target() {
         "kill_flow removes the registered flow"
     );
     assert!(hub.flows_snapshot().is_empty(), "flows() empty after kill");
+
+    // #1754 — killing the flow must TELL THE EXIT AGENT, so it drops its
+    // per-session peer (ICE sockets + the DC pool) instead of leaking it. B is a
+    // raw agent WS here, so we assert the wire contract end to end: kill_flow →
+    // `rc:tunnel.terminate` on A's WS → server
+    // (`relay_tunnel_client_msg_from_agent`) → `rc:tunnel.terminate` relayed to
+    // target B. Before the fix, kill_flow only aborted the supervisor and no
+    // terminate was ever sent — field-measured on 0.4.110, a macOS root exit
+    // agent's UDP sockets climbed 5 → 11 → 16 across five kills. (A client that
+    // never sends one is layer B's job: the agent reaps on its own signals,
+    // `agents/roomlerd/src/tunnel/reap.rs`.)
+    let terminated = read_until(&mut b_ws, "rc:tunnel.terminate").await;
+    assert!(
+        terminated.is_some(),
+        "after kill_flow the exit agent (B) must receive rc:tunnel.terminate (#1754)"
+    );
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), sig).await;
