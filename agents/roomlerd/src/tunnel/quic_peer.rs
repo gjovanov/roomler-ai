@@ -22,7 +22,13 @@
 //! Lifecycle: `ServerMsg::TunnelQuicSetup` → [`setup`] → reply
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
-//! → `run_flow_quic`. `TunnelTerminate` → [`close`].
+//! → `run_flow_quic`. `TunnelTerminate` → [`close`]. Or no terminate at all
+//! (#1754): the accept loop serves exactly ONE connection, so when it ends —
+//! the client closed, or quinn idle-timed the connection out 30 s after the
+//! client's 8 s keepalives stopped — the session is over, and the loop
+//! reports that on the org loop's [`super::reap`] channel so the signaling
+//! loop drops the peer, and with it the endpoint's socket and, on the
+//! relayed flavours, the TURN allocation.
 //!
 //! **Rendezvous** uses two maps so it's order-independent: a stream may
 //! arrive before OR after the acceptor registers interest (the client
@@ -41,6 +47,8 @@ use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 use tunnel_core::transport::quic::{self, QuicPeer, RecvStream, SendStream};
 use tunnel_core::transport::relay::{RelayConn, RelayUdpSocket};
+
+use super::reap::{ReapSender, ReapSignal, TunnelReap};
 
 /// The two stream halves of one QUIC flow.
 pub type FlowStreams = (SendStream, RecvStream);
@@ -78,59 +86,92 @@ pub struct AgentQuicPeer {
     derp_pubkey_hex: Option<String>,
 }
 
-/// Spawn the accept loop shared by [`AgentQuicPeer::setup`] and
-/// [`AgentQuicPeer::setup_over_relay`]: accept ONE client connection,
-/// validate `quic_auth_token`, then rendezvous each inbound flow stream
-/// to whichever [`AgentQuicPeer::take_flow`] waiter wants it (stashing
-/// streams that arrive before their waiter registers).
+/// Spawn the accept loop shared by [`AgentQuicPeer::setup`],
+/// [`AgentQuicPeer::setup_over_relay`] and [`AgentQuicPeer::setup_over_derp`]:
+/// accept ONE client connection, validate `quic_auth_token`, then
+/// rendezvous each inbound flow stream to whichever
+/// [`AgentQuicPeer::take_flow`] waiter wants it (stashing streams that
+/// arrive before their waiter registers).
+///
+/// #1754 — when the loop ends, for any reason, it reports the session on
+/// `reap_tx`. It serves exactly one connection, so its end is unambiguous:
+/// the client closed, quinn idle-timed the connection out (30 s, with the
+/// client's 8 s keepalives gone), the client failed auth, or the endpoint
+/// closed under it. An idle but live client never ends it — quinn's
+/// keepalive is below its idle timeout by design. Our own `close()` ABORTS
+/// the task, so it never reports a close the loop already did.
 fn spawn_accept_loop(
     peer: Arc<QuicPeer>,
     session_id: ObjectId,
     quic_auth_token: String,
     rendezvous: Arc<Mutex<Rendezvous>>,
+    reap_tx: ReapSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let conn = match peer.accept().await {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => {
-                warn!(%session_id, %e, "agent quic: accept failed");
-                return;
-            }
-            None => {
-                debug!(%session_id, "agent quic: endpoint closed before connect");
-                return;
-            }
-        };
-        // The server is no longer in the byte path — this token is what
-        // authorizes the dialing client (cert-pinning already
-        // authenticated US to them).
-        if let Err(e) = quic::server_authenticate(&conn, &quic_auth_token).await {
-            warn!(%session_id, %e, "agent quic: client auth FAILED — dropping connection");
-            conn.close(1u32.into(), b"auth failed");
-            return;
-        }
-        info!(%session_id, "agent quic: client authenticated; serving flow streams");
-        loop {
-            match quic::accept_flow(&conn).await {
-                Ok((flow_id, send, recv)) => {
-                    let mut rdv = rendezvous.lock().await;
-                    if let Some(tx) = rdv.waiters.remove(&flow_id) {
-                        // A forward is already waiting — hand it over.
-                        if tx.send((send, recv)).is_err() {
-                            debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
-                        }
-                    } else {
-                        // Stream beat the forward — stash it.
-                        rdv.ready.insert(flow_id, (send, recv));
-                    }
-                }
-                Err(e) => {
-                    debug!(%session_id, %e, "agent quic: accept_flow loop ended");
-                    break;
-                }
-            }
+        serve_one_connection(peer, session_id, quic_auth_token, rendezvous).await;
+        // Already on a task of our own, so the send can simply be awaited;
+        // it fails only when the org loop itself is gone.
+        if reap_tx
+            .send(TunnelReap {
+                session_id,
+                signal: ReapSignal::QuicConnEnded,
+            })
+            .await
+            .is_err()
+        {
+            debug!(%session_id, "agent quic: connection ended but the org loop is gone");
         }
     })
+}
+
+/// The body of the accept task: one connection, authenticated, served
+/// until it ends.
+async fn serve_one_connection(
+    peer: Arc<QuicPeer>,
+    session_id: ObjectId,
+    quic_auth_token: String,
+    rendezvous: Arc<Mutex<Rendezvous>>,
+) {
+    let conn = match peer.accept().await {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
+            warn!(%session_id, %e, "agent quic: accept failed");
+            return;
+        }
+        None => {
+            debug!(%session_id, "agent quic: endpoint closed before connect");
+            return;
+        }
+    };
+    // The server is no longer in the byte path — this token is what
+    // authorizes the dialing client (cert-pinning already
+    // authenticated US to them).
+    if let Err(e) = quic::server_authenticate(&conn, &quic_auth_token).await {
+        warn!(%session_id, %e, "agent quic: client auth FAILED — dropping connection");
+        conn.close(1u32.into(), b"auth failed");
+        return;
+    }
+    info!(%session_id, "agent quic: client authenticated; serving flow streams");
+    loop {
+        match quic::accept_flow(&conn).await {
+            Ok((flow_id, send, recv)) => {
+                let mut rdv = rendezvous.lock().await;
+                if let Some(tx) = rdv.waiters.remove(&flow_id) {
+                    // A forward is already waiting — hand it over.
+                    if tx.send((send, recv)).is_err() {
+                        debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
+                    }
+                } else {
+                    // Stream beat the forward — stash it.
+                    rdv.ready.insert(flow_id, (send, recv));
+                }
+            }
+            Err(e) => {
+                debug!(%session_id, %e, "agent quic: accept_flow loop ended");
+                break;
+            }
+        }
+    }
 }
 
 impl AgentQuicPeer {
@@ -140,8 +181,15 @@ impl AgentQuicPeer {
     /// `127.0.0.1:0`). The loop accepts ONE client connection,
     /// validates `quic_auth_token`, then rendezvouses inbound flow
     /// streams. Ship [`cert_fingerprint`] + [`addrs`] to the client in
-    /// `ClientMsg::TunnelQuicReady`.
-    pub fn setup(session_id: ObjectId, quic_auth_token: String, bind: SocketAddr) -> Result<Self> {
+    /// `ClientMsg::TunnelQuicReady`. `reap_tx` is the org loop's
+    /// [`super::reap`] channel, reported on when the connection ends
+    /// (#1754).
+    pub fn setup(
+        session_id: ObjectId,
+        quic_auth_token: String,
+        bind: SocketAddr,
+        reap_tx: ReapSender,
+    ) -> Result<Self> {
         let (peer, cert_fingerprint) =
             QuicPeer::server(bind).context("agent quic: server endpoint")?;
         let local_addr = peer.local_addr().context("agent quic: local_addr")?;
@@ -152,6 +200,7 @@ impl AgentQuicPeer {
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
+            reap_tx,
         );
 
         Ok(Self {
@@ -181,6 +230,7 @@ impl AgentQuicPeer {
         session_id: ObjectId,
         quic_auth_token: String,
         relay: Arc<dyn RelayConn>,
+        reap_tx: ReapSender,
     ) -> Result<Self> {
         let local_addr = relay
             .local_addr()
@@ -197,6 +247,7 @@ impl AgentQuicPeer {
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
+            reap_tx,
         );
 
         Ok(Self {
@@ -223,6 +274,7 @@ impl AgentQuicPeer {
         quic_auth_token: String,
         relay: Arc<dyn RelayConn>,
         self_pubkey_hex: String,
+        reap_tx: ReapSender,
     ) -> Result<Self> {
         let local_addr = relay
             .local_addr()
@@ -239,6 +291,7 @@ impl AgentQuicPeer {
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
+            reap_tx,
         );
 
         Ok(Self {
@@ -350,15 +403,34 @@ impl AgentQuicPeer {
         self.accept_task.abort();
         debug!(session_id = %self.session_id, "agent quic peer closed");
     }
+
+    /// #1754 — has the one connection this peer serves already ended?
+    /// The accept task's end IS that event (see [`spawn_accept_loop`]);
+    /// the task reports on the reap channel as its last act, so this
+    /// reads true a poll after the report lands. Read by the R3 reclaim —
+    /// a whole reconnect later — so a peer whose client went away while
+    /// it was parked across a control-WS reattach is dropped rather than
+    /// re-adopted; its report on the reap channel is answered by an
+    /// empty map either way.
+    pub fn accept_ended(&self) -> bool {
+        self.accept_task.is_finished()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
     use tunnel_core::transport::quic::QuicPeer as ClientQuicPeer;
 
     fn loopback() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A reap channel for tests that only need to hand a sender over.
+    fn reap_channel() -> (ReapSender, mpsc::Receiver<TunnelReap>) {
+        mpsc::channel(super::super::reap::TUNNEL_REAP_CAP)
     }
 
     /// Full in-process exercise of the agent QUIC session machinery (no
@@ -370,7 +442,9 @@ mod tests {
     async fn agent_quic_rendezvous_delivers_authed_flow() {
         let session_id = ObjectId::new();
         let token = "session-token-xyz";
-        let agent = AgentQuicPeer::setup(session_id, token.to_string(), loopback()).unwrap();
+        let (reap_tx, _reap_rx) = reap_channel();
+        let agent =
+            AgentQuicPeer::setup(session_id, token.to_string(), loopback(), reap_tx).unwrap();
         let fingerprint = agent.cert_fingerprint().to_string();
         let addr: SocketAddr = agent.addrs()[0].parse().unwrap();
 
@@ -399,14 +473,83 @@ mod tests {
         agent.close();
     }
 
+    /// #1754 — a client that drops its connection and endpoint (a crash,
+    /// a `roomler kill` on a CLI too old to send `rc:tunnel.terminate`)
+    /// ends the accept loop, and the loop reports the session on the
+    /// reap channel so the signaling loop drops the peer — endpoint socket
+    /// and all. Nothing is reported while the client lives, and
+    /// `accept_ended` flips with the report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_drops_its_connection_is_reaped() {
+        let session_id = ObjectId::new();
+        let token = "session-token-gone";
+        let (reap_tx, mut reap_rx) = reap_channel();
+        let agent =
+            AgentQuicPeer::setup(session_id, token.to_string(), loopback(), reap_tx).unwrap();
+        let fingerprint = agent.cert_fingerprint().to_string();
+        let addr: SocketAddr = agent.addrs()[0].parse().unwrap();
+
+        let client = ClientQuicPeer::client(loopback(), &fingerprint).unwrap();
+        let conn = client.connect(addr).await.unwrap();
+        quic::client_authenticate(&conn, token).await.unwrap();
+        // One flow, so the connection is unmistakably in service.
+        let (taken, _opened) = tokio::join!(agent.take_flow(3, Duration::from_secs(10)), async {
+            let (mut send, _recv) = quic::open_flow(&conn, 3).await.unwrap();
+            send.write_all(b"one flow").await.unwrap();
+            send.finish().unwrap();
+        });
+        taken.expect("agent must receive flow 3's stream");
+        assert!(
+            matches!(reap_rx.try_recv(), Err(TryRecvError::Empty)),
+            "nothing is reaped while the client lives"
+        );
+        assert!(
+            !agent.accept_ended(),
+            "the accept loop serves a live client"
+        );
+
+        // The client goes away: its last connection handle and its
+        // endpoint drop, with no terminate sent to anyone.
+        drop(conn);
+        drop(client);
+
+        let reap = tokio::time::timeout(Duration::from_secs(10), reap_rx.recv())
+            .await
+            .expect("a dropped client is reported within 10 s")
+            .expect("reap channel open");
+        assert_eq!(reap.session_id, session_id);
+        assert_eq!(reap.signal, ReapSignal::QuicConnEnded);
+        // The task sends its report as its last act, so `accept_ended`
+        // trails the message by the task's final poll — the reclaim reads
+        // it a whole reconnect later, but here give it a moment.
+        for _ in 0..100 {
+            if agent.accept_ended() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            agent.accept_ended(),
+            "the accept task ends with (just after) its report"
+        );
+
+        agent.close();
+    }
+
     /// A client presenting the WRONG token must NOT get its flow served:
     /// the accept loop closes the connection after auth fails, so
     /// `take_flow` times out (no stream is ever rendezvoused).
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_quic_rejects_bad_token_so_no_flow() {
         let session_id = ObjectId::new();
-        let agent =
-            AgentQuicPeer::setup(session_id, "the-real-token".to_string(), loopback()).unwrap();
+        let (reap_tx, _reap_rx) = reap_channel();
+        let agent = AgentQuicPeer::setup(
+            session_id,
+            "the-real-token".to_string(),
+            loopback(),
+            reap_tx,
+        )
+        .unwrap();
         let addr: SocketAddr = agent.addrs()[0].parse().unwrap();
         let client = ClientQuicPeer::client(loopback(), agent.cert_fingerprint()).unwrap();
         let conn = client.connect(addr).await.unwrap();
@@ -443,10 +586,12 @@ mod tests {
 
         let session_id = ObjectId::new();
         let token = "relay-session-token";
+        let (reap_tx, _reap_rx) = reap_channel();
         let agent = AgentQuicPeer::setup_over_relay(
             session_id,
             token.to_string(),
             Arc::clone(&agent_relay),
+            reap_tx,
         )
         .unwrap();
         assert_eq!(

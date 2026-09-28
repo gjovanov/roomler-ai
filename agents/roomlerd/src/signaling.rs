@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
-    signaling::{AgentCloseReason, ClientMsg, ServerMsg},
+    signaling::{AgentCloseReason, ClientMsg, CloseReason, ServerMsg},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -583,6 +583,17 @@ pub async fn run(
     // so the channel never fully closes — a closed receiver would busy-
     // spin the select! — even when the overlay is disabled.
     let (kill_tx, mut kill_rx) = mpsc::channel::<bson::oid::ObjectId>(4);
+    // #1754 — where a tunnel peer reports that its client is gone, so the
+    // loop reaps it without waiting for a `rc:tunnel.terminate` that an
+    // older client, a crashed one or a dead network never sends. Same
+    // shape as `kill_tx`: created once per ORG loop (a process-global
+    // sender would land a secondary org's reap in the primary's maps),
+    // the receiver borrowed into every connection so a report that lands
+    // during a reconnect gap is drained by the next connection, and this
+    // sender retained for the loop's life so the receiver never closes.
+    // Each connection's peers get a clone via `handle_server_msg`.
+    let (tunnel_reap_tx, mut tunnel_reap_rx) =
+        mpsc::channel::<crate::tunnel::reap::TunnelReap>(crate::tunnel::reap::TUNNEL_REAP_CAP);
     // rc.307 (B) — multi-region DERP admission-ticket cache, hoisted from
     // connect_once scope: the PERSISTENT overlay runtime's regional-DERP
     // factory captures this slot ONCE, so a per-connection slot went stale
@@ -674,6 +685,8 @@ pub async fn run(
             &mut delegation,
             &mut kill_rx,
             &mut consent_rx,
+            &tunnel_reap_tx,
+            &mut tunnel_reap_rx,
         )
         .await
         {
@@ -1085,6 +1098,11 @@ async fn connect_once(
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
     // FR-27 — Approve/Deny from a NATIVE consent panel.
     consent_rx: &mut mpsc::Receiver<(String, bool)>,
+    // #1754 — the tunnel-peer reap channel: the sender every new tunnel
+    // peer gets a clone of, and the receiver the reap arm drains. Both
+    // borrowed from `run` so they span reconnects (see the channel's doc).
+    tunnel_reap_tx: &crate::tunnel::reap::ReapSender,
+    tunnel_reap_rx: &mut mpsc::Receiver<crate::tunnel::reap::TunnelReap>,
 ) -> Result<(), ConnectError> {
     // S6 — `tid` is the tenant-affinity key the server-front LB hashes
     // on, co-locating this agent's WS with its tenant's controllers on
@@ -1840,6 +1858,54 @@ async fn connect_once(
                 indicator.hide_session(sid.to_hex());
                 watchdog::tick(ctx.pump);
             }
+            Some(reap) = tunnel_reap_rx.recv() => {
+                // #1754 — a tunnel peer reports its client gone (a pool DC
+                // closed, the peer connection Failed, the QUIC connection
+                // ended). Until now only `rc:tunnel.terminate` and the WS
+                // ending removed a peer, so a client that never sent its
+                // terminate left its sockets in these maps for the life of
+                // the connection.
+                //
+                // Both maps at once: a session is on exactly one data plane,
+                // and the helper says which. A report for a session neither
+                // map holds is the ordinary case, not an error — a peer
+                // closed by the terminate arm reports its OWN close (the
+                // DCs' EOF, then `Closed`), and a parked QUIC peer's report
+                // can arrive after the reclaim already dropped it.
+                let sid = reap.session_id;
+                let Some(held) = take_reaped_tunnel_peer(sid, &mut tunnel_peers, &mut tunnel_quic_peers) else {
+                    debug!(session_id = %sid, signal = %reap.signal, "tunnel reap for a session no map holds — already gone");
+                    continue;
+                };
+                info!(
+                    session_id = %sid,
+                    signal = %reap.signal,
+                    transport = held.transport(),
+                    "tunnel peer's client is gone — reaping the session (#1754)"
+                );
+                match held {
+                    ReapedTunnelPeer::WebRtc(peer) => {
+                        // Same bound as every other close site: a webrtc
+                        // close on a captured network must not stall this
+                        // loop into the watchdog.
+                        close_within_budget(peer.close(), sid, "tunnel_remote_gone").await;
+                    }
+                    ReapedTunnelPeer::Quic(peer) => peer.close(),
+                }
+                // Tell the server, which relays it to the client if one is
+                // somehow still registered (the server does not clean the
+                // session up on our word — the client's own terminate does
+                // that, and its echo back to us finds an empty map).
+                let _ = send_msg(
+                    &mut ws,
+                    &ClientMsg::TunnelTerminate {
+                        session_id: sid,
+                        reason: CloseReason::IoError,
+                    },
+                )
+                .await;
+                watchdog::tick(ctx.pump);
+            }
             // FR-43 P2b-2 — an rc message the root daemon delegated to us.
             //
             // It runs through the SAME `handle_server_msg` with the SAME
@@ -1917,6 +1983,7 @@ async fn connect_once(
                     &mut tunnel_peers,
                     &mut tunnel_quic_peers,
                     &outbound_tx,
+                    tunnel_reap_tx,
                     encoder_preference,
                     &indicator,
                     &consent_broker,
@@ -1974,6 +2041,7 @@ async fn connect_once(
                                 &mut tunnel_peers,
                                 &mut tunnel_quic_peers,
                                 &outbound_tx,
+                                tunnel_reap_tx,
                                 encoder_preference,
                                 &indicator,
                                 &consent_broker,
@@ -2274,6 +2342,9 @@ async fn handle_server_msg(
         Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
     >,
     outbound_tx: &mpsc::Sender<ClientMsg>,
+    // #1754 — handed (cloned) to every tunnel peer built here, so it can
+    // report its client gone to the reap arm.
+    tunnel_reap_tx: &crate::tunnel::reap::ReapSender,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
     consent_broker: &crate::consent::ConsentBroker,
@@ -3273,6 +3344,7 @@ async fn handle_server_msg(
                 &sdp,
                 Vec::new(),
                 outbound_tx.clone(),
+                tunnel_reap_tx.clone(),
             )
             .await
             {
@@ -3329,6 +3401,7 @@ async fn handle_server_msg(
                     quic_auth_token,
                     relay_conn,
                     handle.self_pubkey_hex.clone(),
+                    tunnel_reap_tx.clone(),
                 ) {
                     Ok(peer) => {
                         let ready = ClientMsg::TunnelQuicReady {
@@ -3373,6 +3446,7 @@ async fn handle_server_msg(
                             session_id,
                             quic_auth_token,
                             relay_conn,
+                            tunnel_reap_tx.clone(),
                         )
                     }
                     Err(e) => {
@@ -3388,7 +3462,12 @@ async fn handle_server_msg(
                         return Ok(());
                     }
                 };
-                crate::tunnel::quic_peer::AgentQuicPeer::setup(session_id, quic_auth_token, bind)
+                crate::tunnel::quic_peer::AgentQuicPeer::setup(
+                    session_id,
+                    quic_auth_token,
+                    bind,
+                    tunnel_reap_tx.clone(),
+                )
             };
 
             match peer_result {
@@ -4211,6 +4290,44 @@ async fn close_all_tunnel_peers(
     info!(count, "torn down agent tunnel peers on ws disconnect");
 }
 
+/// #1754 — what the reap arm took out of the session maps for a session
+/// whose client is gone.
+enum ReapedTunnelPeer {
+    WebRtc(Arc<crate::tunnel::peer::AgentTunnelPeer>),
+    Quic(Arc<crate::tunnel::quic_peer::AgentQuicPeer>),
+}
+
+impl ReapedTunnelPeer {
+    fn transport(&self) -> &'static str {
+        match self {
+            ReapedTunnelPeer::WebRtc(_) => "webrtc-dc",
+            ReapedTunnelPeer::Quic(_) => "quic",
+        }
+    }
+}
+
+/// #1754 — the reap arm's decision, kept pure so it can be locked by a test:
+/// remove `session_id` from BOTH maps and hand back what was held, or `None`
+/// when neither held it — in which case the arm does nothing at all, and in
+/// particular sends no `rc:tunnel.terminate`. A session lives on one data
+/// plane, but both maps are cleared regardless so a stale entry can never
+/// survive its twin. Removing (not reading) is what makes a second report
+/// for the same session — a peer's own close fires the same handlers — a
+/// no-op rather than a second close and a second terminate.
+fn take_reaped_tunnel_peer(
+    session_id: bson::oid::ObjectId,
+    tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
+    tunnel_quic_peers: &mut TunnelQuicPeers,
+) -> Option<ReapedTunnelPeer> {
+    let webrtc = tunnel_peers.remove(&session_id);
+    let quic = tunnel_quic_peers.remove(&session_id);
+    match (webrtc, quic) {
+        (Some(peer), _) => Some(ReapedTunnelPeer::WebRtc(peer)),
+        (None, Some(peer)) => Some(ReapedTunnelPeer::Quic(peer)),
+        (None, None) => None,
+    }
+}
+
 /// Phase 1d (quic-v1): tear down every QUIC tunnel peer on WS
 /// disconnect. `AgentQuicPeer::close` is synchronous (aborts the
 /// accept task; the quinn endpoint drops with the last `Arc`), so
@@ -4259,11 +4376,12 @@ fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
     if !tunnel_peers_survive_enabled() {
         return HashMap::new();
     }
-    let map = TUNNEL_QUIC_SURVIVAL
+    let mut map = TUNNEL_QUIC_SURVIVAL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(tenant)
         .unwrap_or_default();
+    drop_parked_quic_corpses(&mut map);
     if !map.is_empty() {
         info!(
             count = map.len(),
@@ -4271,6 +4389,27 @@ fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
         );
     }
     map
+}
+
+/// #1754 — drop from a reclaimed R3 stash every peer whose one connection
+/// already ended while it was parked (the client gave up during the
+/// outage). Such a peer is a corpse: re-adopted into the new session's map,
+/// its endpoint socket and, on the relayed flavours, its TURN allocation
+/// would live until a terminate that a client already gone never sends.
+/// Its own report on the reap channel is answered by an empty map. Returns
+/// how many were dropped.
+fn drop_parked_quic_corpses(map: &mut TunnelQuicPeers) -> usize {
+    let before = map.len();
+    map.retain(|sid, peer| {
+        if peer.accept_ended() {
+            info!(session_id = %sid, "R3: dropping a parked QUIC tunnel peer whose client left during the reattach (#1754)");
+            peer.close();
+            false
+        } else {
+            true
+        }
+    });
+    before - map.len()
 }
 
 /// On a TRANSIENT control-WS exit (RX deadline, resume-skew, netstate probe,
@@ -4517,6 +4656,86 @@ mod tests {
         assert!(!is_secondary_goodbye(&anyhow::anyhow!(
             "duplicate-instance duel: displaced 3× in the window"
         )));
+    }
+
+    /// A QUIC tunnel peer on loopback, as the `TunnelQuicSetup` arm builds
+    /// one, for the map helpers below.
+    fn quic_peer_for(
+        sid: bson::oid::ObjectId,
+        reap_tx: &crate::tunnel::reap::ReapSender,
+    ) -> Arc<crate::tunnel::quic_peer::AgentQuicPeer> {
+        Arc::new(
+            crate::tunnel::quic_peer::AgentQuicPeer::setup(
+                sid,
+                "tok".to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+                reap_tx.clone(),
+            )
+            .expect("quic peer on loopback"),
+        )
+    }
+
+    /// #1754 — the reap arm's decision. A report for a session no map holds
+    /// is `None`, so the arm sends nothing; a held session comes back once
+    /// and is gone from BOTH maps, so its own close's echo (the same
+    /// handlers fire again) is `None` too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reap_for_an_unknown_or_already_reaped_session_takes_nothing() {
+        let mut tunnel_peers = HashMap::new();
+        let mut quic_peers: TunnelQuicPeers = HashMap::new();
+        let (reap_tx, _reap_rx) = mpsc::channel(8);
+
+        let unknown = bson::oid::ObjectId::new();
+        assert!(
+            take_reaped_tunnel_peer(unknown, &mut tunnel_peers, &mut quic_peers).is_none(),
+            "a session no map holds takes nothing"
+        );
+
+        let sid = bson::oid::ObjectId::new();
+        quic_peers.insert(sid, quic_peer_for(sid, &reap_tx));
+        let first = take_reaped_tunnel_peer(sid, &mut tunnel_peers, &mut quic_peers)
+            .expect("the held session is taken");
+        assert_eq!(first.transport(), "quic");
+        assert!(
+            tunnel_peers.is_empty() && quic_peers.is_empty(),
+            "taken out of both maps"
+        );
+        assert!(
+            take_reaped_tunnel_peer(sid, &mut tunnel_peers, &mut quic_peers).is_none(),
+            "a second report for the same session is a no-op"
+        );
+        if let ReapedTunnelPeer::Quic(peer) = first {
+            peer.close();
+        }
+    }
+
+    /// #1754 — the R3 reclaim re-adopts only parked peers whose connection
+    /// is still open; one whose accept task ended while parked is closed and
+    /// dropped instead of living on until a terminate that never comes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reclaim_drops_a_parked_quic_peer_whose_connection_ended() {
+        let (reap_tx, _reap_rx) = mpsc::channel(8);
+        let live_sid = bson::oid::ObjectId::new();
+        let dead_sid = bson::oid::ObjectId::new();
+        let live = quic_peer_for(live_sid, &reap_tx);
+        let dead = quic_peer_for(dead_sid, &reap_tx);
+        // End the dead one's accept task the way a client's departure
+        // does from the task's point of view: it is over.
+        dead.close();
+        for _ in 0..100 {
+            if dead.accept_ended() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead.accept_ended(), "the aborted accept task has ended");
+        assert!(!live.accept_ended(), "the live one has not");
+
+        let mut map: TunnelQuicPeers = HashMap::from([(live_sid, live), (dead_sid, dead)]);
+        assert_eq!(drop_parked_quic_corpses(&mut map), 1, "one corpse dropped");
+        assert!(map.contains_key(&live_sid), "the live peer is re-adopted");
+        assert!(!map.contains_key(&dead_sid), "the corpse is not");
+        map[&live_sid].close();
     }
 
     /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:

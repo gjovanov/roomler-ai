@@ -37,4 +37,7 @@ pub mod peer;
 /// FR-84 D6 / #1035 — name who holds a port a declared route cannot bind.
 pub mod port_holder;
 pub mod quic_peer;
+/// #1754 — a peer's own report that its client is gone, for the exit agent
+/// to reap it without a `rc:tunnel.terminate`.
+pub mod reap;
 pub mod route_reconciler;
