@@ -30,8 +30,14 @@
 //!    `tunnel_core::forward::run_flow` to drive the bytes.
 //! 5. Either side tears down the tunnel via `TunnelTerminate` →
 //!    [`AgentTunnelPeer::close`] drops every flow + DC.
+//! 6. Or the client is simply gone (#1754): the peer reports it on the
+//!    org loop's [`super::reap`] channel — a pool DC's `on_close` within
+//!    milliseconds of a clean remote close, the peer connection's
+//!    `Failed` ~30 s into silence — and the loop's reap arm removes and
+//!    closes it exactly as a terminate would have.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
@@ -41,6 +47,9 @@ use tunnel_core::forward::FlowDemux;
 use tunnel_core::transport::webrtc_dc::{PeerError, TunnelPeer};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+
+use super::reap::{self, ReapSender, ReapSignal, TunnelReap};
 
 /// Per-session answerer state. Cheap to construct (it just wraps the
 /// peer) — heavy work happens inside [`accept_offer`] and the
@@ -63,11 +72,14 @@ impl AgentTunnelPeer {
     /// server's `TunnelOpened` (the server collects them centrally).
     /// `outbound_tx` is the agent's WS outbound channel — the peer
     /// uses it to trickle local ICE candidates back to the server.
+    /// `reap_tx` is the org loop's [`super::reap`] channel — where the
+    /// peer reports that its client is gone (#1754).
     pub async fn accept_offer(
         session_id: ObjectId,
         offer_sdp: &str,
         ice_servers: Vec<IceServer>,
         outbound_tx: mpsc::Sender<ClientMsg>,
+        reap_tx: ReapSender,
     ) -> Result<(Self, String), PeerError> {
         let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
             .into_iter()
@@ -116,6 +128,78 @@ impl AgentTunnelPeer {
                     }
                 })
             });
+        }
+
+        // #1754 — the agent's OWN observation that the client is gone,
+        // independent of any terminate the client or the server sends.
+        // Nothing else removes a peer from the loop's session map, so a
+        // client that never sent its terminate (an older CLI, a crash, a
+        // network that vanished) used to leave the peer — every ICE
+        // socket, the whole DC pool — in the map for the life of the WS.
+        //
+        // Two signals, one fast and one certain:
+        //  * a pool DC's `on_close`: the remote closed its peer cleanly and
+        //    every channel's read loop hit EOF, within milliseconds;
+        //  * the peer connection's `Failed`: ICE has not heard the remote
+        //    for its disconnected + failed timeouts (5 s + 25 s in the
+        //    vendored webrtc-ice) while both ends ping every 2 s. It is
+        //    terminal — tunnel-core has no ICE restart — and it frees
+        //    nothing by itself: only `close()` releases the sockets.
+        // `Closed` is also reported; it only follows a LOCAL close, so it
+        // is the net under any close that skipped the map. NOT
+        // `Disconnected`: that is five seconds of silence, which a relay
+        // hiccup or a laptop's Wi-Fi roam produces and recovers from on
+        // its own, and a healthy tunnel must never be torn down for it.
+        //
+        // Idle is not gone. An open tunnel with no flow traffic for hours
+        // still exchanges ICE binding requests every 2 s and DC keepalives
+        // every 20 s, so neither signal can fire while the client lives.
+        //
+        // The handlers capture the sender, the id and a latch — never the
+        // peer — so no handler keeps its own connection alive (the cycle
+        // #1740 found in the RC control channel), and the latch makes a
+        // peer report ONCE however many of its nine handlers fire. The
+        // channels get their handler here, before the handshake: a
+        // channel's read loop (the only thing that fires `on_close`) only
+        // starts when it opens, so nothing can fire early, and there is no
+        // window between a channel opening and its handler being armed.
+        let reported = Arc::new(AtomicBool::new(false));
+        {
+            let reap = reap_tx.clone();
+            let reported = Arc::clone(&reported);
+            peer.peer_connection()
+                .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+                    let signal = match s {
+                        RTCPeerConnectionState::Failed => Some(ReapSignal::PcFailed),
+                        RTCPeerConnectionState::Closed => Some(ReapSignal::PcClosed),
+                        _ => None,
+                    };
+                    if let Some(signal) = signal
+                        && !reported.swap(true, Ordering::SeqCst)
+                    {
+                        reap::notify(&reap, TunnelReap { session_id, signal });
+                    }
+                    Box::pin(async {})
+                }));
+        }
+        for idx in 0..peer.pool_size() {
+            let Some(dc) = peer.dc(idx) else {
+                continue;
+            };
+            let reap = reap_tx.clone();
+            let reported = Arc::clone(&reported);
+            dc.on_close(Box::new(move || {
+                if !reported.swap(true, Ordering::SeqCst) {
+                    reap::notify(
+                        &reap,
+                        TunnelReap {
+                            session_id,
+                            signal: ReapSignal::DcClosed,
+                        },
+                    );
+                }
+                Box::pin(async {})
+            }));
         }
 
         // Generate the answer. set_local_description happens inside.
@@ -250,37 +334,53 @@ impl AgentTunnelPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::error::TryRecvError;
     use tunnel_core::transport::webrtc_dc::TunnelPeer as CoreTunnelPeer;
 
-    /// Drive the full offerer (= CLI's role) + answerer (= this
-    /// module's role) handshake locally with no signaling server.
-    /// Bridges ICE by draining the answerer's outbound channel and
-    /// installing a closure on the offerer. Verifies the answerer
-    /// reaches `pool_ready` and exposes a non-empty pool.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn answerer_reaches_pool_ready() {
+    /// A local offerer (= the CLI's role) + answerer (= this module's
+    /// role) pair with no signaling server: ICE is bridged by draining the
+    /// answerer's outbound channel into the offerer and by a closure on
+    /// the offerer, and the answerer reports on `reap_rx`.
+    struct Pair {
+        session_id: ObjectId,
+        offerer: CoreTunnelPeer,
+        answerer: AgentTunnelPeer,
+        reap_rx: mpsc::Receiver<TunnelReap>,
+        drain: tokio::task::JoinHandle<()>,
+    }
+
+    /// Headroom for ICE on a loaded runner (the handshake takes <1 s
+    /// locally) — the same figure `webrtc_dc`'s pool tests use.
+    const POOL_READY: Duration = Duration::from_secs(30);
+
+    async fn open_pair() -> Pair {
         let session_id = ObjectId::new();
 
         // Build the offerer locally — same code path as the CLI.
         let offerer = CoreTunnelPeer::new(vec![]).await.unwrap();
         let offer = offerer.create_offer().await.unwrap();
 
-        // Outbound channel the answerer uses to trickle its local
-        // ICE candidates. Drain task below bridges them into the
-        // offerer.
+        // Outbound channel the answerer uses to trickle its local ICE
+        // candidates; the drain task below bridges them into the offerer.
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(64);
+        let (reap_tx, reap_rx) = mpsc::channel::<TunnelReap>(reap::TUNNEL_REAP_CAP);
 
-        let (answerer_peer, answer_sdp) =
-            AgentTunnelPeer::accept_offer(session_id, &offer.sdp, vec![], outbound_tx.clone())
-                .await
-                .unwrap();
+        let (answerer, answer_sdp) = AgentTunnelPeer::accept_offer(
+            session_id,
+            &offer.sdp,
+            vec![],
+            outbound_tx.clone(),
+            reap_tx,
+        )
+        .await
+        .unwrap();
         assert!(!answer_sdp.is_empty(), "answer SDP must be non-empty");
 
         offerer.accept_answer(&answer_sdp).await.unwrap();
 
         // Bridge offerer → answerer ICE candidates.
-        let answerer_pc = answerer_peer.peer.peer_connection();
+        let answerer_pc = answerer.peer.peer_connection();
         offerer.on_local_ice_candidate(move |c| {
             let pc = Arc::clone(&answerer_pc);
             Box::pin(async move {
@@ -306,11 +406,238 @@ mod tests {
             }
         });
 
-        let ready = answerer_peer.wait_pool_ready(Duration::from_secs(15)).await;
-        drain.abort();
+        Pair {
+            session_id,
+            offerer,
+            answerer,
+            reap_rx,
+            drain,
+        }
+    }
 
-        assert!(ready, "answerer pool did not reach ready within 15s");
-        assert!(answerer_peer.pool_size().await > 0);
-        assert!(answerer_peer.demux(0).await.is_some());
+    /// Verifies the answerer reaches `pool_ready` and exposes a non-empty
+    /// pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answerer_reaches_pool_ready() {
+        let p = open_pair().await;
+        let ready = p.answerer.wait_pool_ready(POOL_READY).await;
+        p.drain.abort();
+
+        assert!(
+            ready,
+            "answerer pool did not reach ready within {POOL_READY:?}"
+        );
+        assert!(p.answerer.pool_size().await > 0);
+        assert!(p.answerer.demux(0).await.is_some());
+        p.answerer.close().await;
+        p.offerer.close().await;
+    }
+
+    /// #1754 — the fast path: a client that closes its peer cleanly (the
+    /// CLI's Ctrl-C, `roomler kill` on a daemon-run forward) is reported
+    /// within milliseconds through a pool DC's `on_close`, whether or not
+    /// its `rc:tunnel.terminate` ever reaches us. Also locks the latch:
+    /// nine handlers fire, ONE report arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_closes_cleanly_is_reaped_at_once() {
+        let mut p = open_pair().await;
+        assert!(p.answerer.wait_pool_ready(POOL_READY).await, "pool ready");
+        assert!(
+            matches!(p.reap_rx.try_recv(), Err(TryRecvError::Empty)),
+            "nothing is reaped while the pair is up"
+        );
+
+        p.offerer.close().await;
+
+        let reap = tokio::time::timeout(Duration::from_secs(2), p.reap_rx.recv())
+            .await
+            .expect("the client's clean close is reported within 2 s")
+            .expect("reap channel open");
+        assert_eq!(reap.session_id, p.session_id);
+        assert_eq!(
+            reap.signal,
+            ReapSignal::DcClosed,
+            "a clean remote close arrives as a channel EOF, not as ICE Failed"
+        );
+
+        // The other seven channels closed too; the latch swallowed them.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(p.reap_rx.try_recv(), Err(TryRecvError::Empty)),
+            "one peer reports once"
+        );
+
+        p.drain.abort();
+        p.answerer.close().await;
+    }
+
+    /// #1754 positive control — idle is not gone. Two open peers exchange
+    /// no flow traffic for longer than ICE's whole disconnected + failed
+    /// horizon (5 s + 25 s); the binding requests both ends send every 2 s
+    /// keep the pair `Connected`, so nothing is reaped. Then the client
+    /// closes, and the same channel reports it at once — so the silence
+    /// above was the design, not a harness that cannot hear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_but_live_client_is_never_reaped() {
+        /// Past the 30 s at which a SILENT remote is `Failed`.
+        const IDLE: Duration = Duration::from_secs(35);
+
+        let mut p = open_pair().await;
+        assert!(p.answerer.wait_pool_ready(POOL_READY).await, "pool ready");
+
+        tokio::time::sleep(IDLE).await;
+
+        assert!(
+            matches!(p.reap_rx.try_recv(), Err(TryRecvError::Empty)),
+            "an idle but live client must never be reaped"
+        );
+        assert!(
+            p.answerer.peer.is_connected(),
+            "the idle pair is still Connected after {IDLE:?}"
+        );
+
+        p.offerer.close().await;
+        let reap = tokio::time::timeout(Duration::from_secs(2), p.reap_rx.recv())
+            .await
+            .expect("after the idle stretch a real close is still reported at once")
+            .expect("reap channel open");
+        assert_eq!(reap.signal, ReapSignal::DcClosed);
+
+        p.drain.abort();
+        p.answerer.close().await;
+    }
+
+    /// #1754 — the certain path: a client that VANISHES without closing
+    /// (a crash, a pulled cable, a laptop shut) is reported when ICE gives
+    /// it up as `Failed`, ~30 s in, and not at the 5 s `Disconnected`
+    /// horizon that a live client crosses during an ordinary blip.
+    ///
+    /// The client runs on a current-thread runtime of its own; parking
+    /// that thread freezes every task on it — no keepalive answers, no
+    /// clean close, sockets still bound — which is exactly a dead client
+    /// as the agent sees it. Two runtimes so that freezing one cannot
+    /// touch the agent side.
+    #[test]
+    fn a_client_that_vanishes_is_reaped_when_ice_fails() {
+        let session_id = ObjectId::new();
+        let (offer_tx, offer_rx) = tokio::sync::oneshot::channel::<String>();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<String>();
+        let (to_agent, mut from_client) = mpsc::unbounded_channel::<RTCIceCandidateInit>();
+        let (to_client, mut from_agent) = mpsc::unbounded_channel::<RTCIceCandidateInit>();
+        let (freeze_tx, freeze_rx) = tokio::sync::oneshot::channel::<()>();
+        let thaw = Arc::new(AtomicBool::new(false));
+        let thaw_for_client = Arc::clone(&thaw);
+
+        let client = std::thread::Builder::new()
+            .name("vanishing-client".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("client runtime");
+                rt.block_on(async move {
+                    let offerer = CoreTunnelPeer::new(vec![]).await.expect("offerer");
+                    offerer.on_local_ice_candidate(move |c| {
+                        let tx = to_agent.clone();
+                        Box::pin(async move {
+                            if let Some(c) = c
+                                && let Ok(init) = c.to_json()
+                            {
+                                let _ = tx.send(init);
+                            }
+                        })
+                    });
+                    let offer = offerer.create_offer().await.expect("offer");
+                    offer_tx.send(offer.sdp).expect("offer to the agent side");
+                    let answer = answer_rx.await.expect("answer from the agent side");
+                    offerer.accept_answer(&answer).await.expect("accept_answer");
+                    let pc = offerer.peer_connection();
+                    tokio::spawn(async move {
+                        while let Some(init) = from_agent.recv().await {
+                            let _ = pc.add_ice_candidate(init).await;
+                        }
+                    });
+                    let _ = tokio::time::timeout(POOL_READY, offerer.wait_pool_open()).await;
+
+                    let _ = freeze_rx.await;
+                    // This is the runtime's only thread: parked, nothing on
+                    // it runs again until the agent side is done.
+                    while !thaw_for_client.load(Ordering::SeqCst) {
+                        std::thread::park();
+                    }
+                    // Thawed: let the offerer close on its own runtime so
+                    // the test leaves no sockets behind.
+                    offerer.close().await;
+                });
+            })
+            .expect("client thread");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("agent runtime");
+        rt.block_on(async move {
+            let offer_sdp = offer_rx.await.expect("offer");
+            let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(64);
+            let (reap_tx, mut reap_rx) = mpsc::channel::<TunnelReap>(reap::TUNNEL_REAP_CAP);
+            let (answerer, answer_sdp) =
+                AgentTunnelPeer::accept_offer(session_id, &offer_sdp, vec![], outbound_tx, reap_tx)
+                    .await
+                    .expect("accept_offer");
+            answer_tx.send(answer_sdp).expect("answer to the client");
+
+            // client → agent candidates, on the agent's runtime.
+            let answerer_pc = answerer.peer.peer_connection();
+            tokio::spawn(async move {
+                while let Some(init) = from_client.recv().await {
+                    let _ = answerer_pc.add_ice_candidate(init).await;
+                }
+            });
+            // agent → client candidates (the answerer trickles them as
+            // ClientMsg::TunnelIce), handed to the client's runtime.
+            tokio::spawn(async move {
+                while let Some(msg) = outbound_rx.recv().await {
+                    if let ClientMsg::TunnelIce { candidate, .. } = msg
+                        && let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate)
+                    {
+                        let _ = to_client.send(init);
+                    }
+                }
+            });
+
+            assert!(answerer.wait_pool_ready(POOL_READY).await, "pool ready");
+            assert!(
+                matches!(reap_rx.try_recv(), Err(TryRecvError::Empty)),
+                "nothing is reaped while the pair is up"
+            );
+
+            freeze_tx.send(()).expect("freeze the client");
+            let frozen_at = Instant::now();
+
+            let reap = tokio::time::timeout(Duration::from_secs(45), reap_rx.recv())
+                .await
+                .expect("a vanished client is reaped within 45 s")
+                .expect("reap channel open");
+            let took = frozen_at.elapsed();
+            assert_eq!(reap.session_id, session_id);
+            assert_eq!(
+                reap.signal,
+                ReapSignal::PcFailed,
+                "a silent client is given up by ICE, not seen as a clean close"
+            );
+            // ICE reports `Disconnected` after 5 s of silence and `Failed`
+            // only after 30 s. A reap well before that is a reap on
+            // `Disconnected` — the blip a live client survives.
+            assert!(
+                took >= Duration::from_secs(20),
+                "reaped {took:?} after the client froze — that is the Disconnected horizon, not Failed"
+            );
+
+            answerer.close().await;
+        });
+
+        thaw.store(true, Ordering::SeqCst);
+        client.thread().unpark();
+        client.join().expect("client thread");
     }
 }
