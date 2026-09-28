@@ -484,6 +484,9 @@
             <label><input type="checkbox" id="rec-system-audio" /> Computer audio</label>
             <label><input type="checkbox" id="rec-microphone" /> Microphone</label>
           </div>
+          <!-- #1760 — where the service cannot record what the computer plays
+               (a Mac), the box above is greyed out and this says why. -->
+          <p id="rec-system-audio-unavailable" class="muted small" hidden></p>
           <div class="actions">
             <button type="button" id="rec-start" class="primary">Start recording</button>
             <button type="button" id="rec-stop" class="danger" hidden>Stop recording</button>
@@ -519,6 +522,7 @@
             <label><input type="checkbox" id="rec-remote-enabled" /> Allow remote recording</label>
             <label><input type="checkbox" id="rec-remote-audio" /> Include computer audio</label>
           </div>
+          <p id="rec-remote-audio-unavailable" class="muted small" hidden></p>
           <p id="rec-remote-error" class="error small" hidden></p>
         </div>
 

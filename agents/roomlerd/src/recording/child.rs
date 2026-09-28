@@ -99,6 +99,12 @@ fn open_audio(
 }
 
 /// Computer audio: the loopback / monitor source only — never a microphone.
+///
+/// ⚠️ The platform rule is [`super::system_audio_supported`]'s, not this
+/// function's (#1760): the daemon's gates read that fn, and each arm below
+/// asserts at compile time that it agrees, so the two cannot drift again.
+/// The synthetic tone (a test's `ROOMLERD_SYNTHETIC_AUDIO`) is answered
+/// first, on any platform: it is what the audio tests record with.
 #[cfg(feature = "audio")]
 fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
     #[cfg(feature = "synthetic-frame-source")]
@@ -111,6 +117,10 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
+        const _: () = assert!(
+            super::system_audio_supported(),
+            "a loopback opens here, so `system_audio_supported` must say so"
+        );
         let cap = crate::audio::cpal_backend::CpalLoopbackCapture::open_source(
             crate::audio::cpal_backend::Source::SystemOnly,
         )?;
@@ -118,7 +128,11 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        bail!("computer audio cannot be recorded on this platform (macOS needs ScreenCaptureKit)")
+        const _: () = assert!(
+            !super::system_audio_supported(),
+            "nothing opens here, so `system_audio_supported` must say no"
+        );
+        bail!("{}", super::SYSTEM_AUDIO_UNSUPPORTED)
     }
 }
 

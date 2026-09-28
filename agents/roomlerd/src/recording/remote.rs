@@ -16,13 +16,20 @@
 //! |---|---|---|
 //! | 1 | the owner's `record_remote_enabled`, read NOW | `disabled_on_device` |
 //! | 2 | a recorder can run in this process | `unavailable` |
-//! | 3 | computer audio asked for: `record_remote_audio` and an audio build | `audio_not_allowed` |
-//! | 4 | one recording at a time | `busy` |
-//! | 5 | one start at a time per session | `already_starting` |
-//! | 6 | a session consented ON THE HOST asks the host again (a fresh prompt id, never the session's); a deny is final for [`DENY_COOLDOWN`] | `consent_denied`, `consent_timeout`, `no_prompt_surface`, `rate_limited` |
-//! | 7 | something ON SCREEN says "recording" before the first frame: the daemon's badge (Windows) or the companion's banner | `no_indicator_surface` |
+//! | 3 | computer audio asked for: this build can record it at all ([`super::system_audio_supported`]: the `audio` feature on Windows or Linux — a fact about the device that no setting fixes, so it is named BEFORE the owner's gate; #1760) | `audio_unsupported` |
+//! | 4 | computer audio asked for: `record_remote_audio` | `audio_not_allowed` |
+//! | 5 | one recording at a time | `busy` |
+//! | 6 | one start at a time per session | `already_starting` |
+//! | 7 | a session consented ON THE HOST asks the host again (a fresh prompt id, never the session's); a deny is final for [`DENY_COOLDOWN`] | `consent_denied`, `consent_timeout`, `no_prompt_surface`, `rate_limited` |
+//! | 8 | something ON SCREEN says "recording" before the first frame: the daemon's badge (Windows) or the companion's banner | `no_indicator_surface` |
 //!
-//! P1f — **the unattended exception to gate 7.** A service with nobody signed
+//! Gates 3 and 4 are ONE predicate, [`audio_unavailable`], which also decides
+//! whether `remote-audio` is advertised and is stamped on every
+//! `rc:record.state` (`audio_unavailable`), so the viewer greys its
+//! "Include what the computer plays" box out with the reason instead of
+//! offering a start that can only fail.
+//!
+//! P1f — **the unattended exception to gate 8.** A service with nobody signed
 //! in (SYSTEM or root, no console user) records a remote session with no
 //! banner, because there is nobody to show one to: the owner's gate 1 is
 //! what allows it, the controller is told (`unattended: true` on the state),
@@ -505,7 +512,7 @@ pub fn advertised() -> Vec<String> {
     advertise(
         gates(),
         manager().is_some_and(|m| m.available_remote()),
-        cfg!(feature = "audio"),
+        super::system_audio_supported(),
     )
 }
 
@@ -513,9 +520,11 @@ pub fn advertised() -> Vec<String> {
 /// remote session here: silence is how the hub learns "no recorder", and a
 /// viewer then shows no Record control. Then `available` (P3c-2: the device
 /// HAS the feature — capability, never permission); `remote` only while the
-/// owner's gate is on; `remote-audio` only on top of that, with the audio
-/// gate on and an audio build.
-pub fn advertise(g: Gates, can_record: bool, audio_built: bool) -> Vec<String> {
+/// owner's gate is on; `remote-audio` only on top of that, where computer
+/// audio can be recorded at all (`system_audio`, the caller's
+/// [`super::system_audio_supported`]) AND the audio gate is on — the same
+/// predicate as the start's ([`audio_unavailable`]).
+pub fn advertise(g: Gates, can_record: bool, system_audio: bool) -> Vec<String> {
     let mut out = Vec::new();
     if !can_record {
         return out;
@@ -523,11 +532,33 @@ pub fn advertise(g: Gates, can_record: bool, audio_built: bool) -> Vec<String> {
     out.push(RecordCap::Available.wire().to_string());
     if g.enabled {
         out.push(RecordCap::Remote.wire().to_string());
-        if g.audio && audio_built {
+        if audio_unavailable(g, system_audio).is_none() {
             out.push(RecordCap::RemoteAudio.wire().to_string());
         }
     }
     out
+}
+
+/// Why a remote recording here could not include what the computer plays,
+/// or `None` where it could (#1760). `system_audio` is
+/// [`super::system_audio_supported`], passed in so both answers are testable
+/// on any OS. The platform comes first: a device that cannot record computer
+/// audio is `audio_unsupported` whatever the owner set, because no setting
+/// fixes it; only then is the owner's gate `audio_not_allowed`.
+///
+/// ONE predicate for three entry points — what is advertised
+/// ([`advertise`]), what a start is refused ([`precheck`]) and what every
+/// state tells the viewer ([`StateMsg::audio_unavailable`]) — so they cannot
+/// drift apart again. Before it, a Mac advertised `remote-audio` and let an
+/// audio start through to the recorder, which refused it as `start_failed`.
+pub fn audio_unavailable(g: Gates, system_audio: bool) -> Option<&'static str> {
+    if !system_audio {
+        Some("audio_unsupported")
+    } else if !g.audio {
+        Some("audio_not_allowed")
+    } else {
+        None
+    }
 }
 
 // ── The wire, on the `record` DataChannel ──────────────────────────────────
@@ -602,6 +633,17 @@ pub struct StateMsg {
     /// not know the field reads nothing different.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unattended: bool,
+    /// #1760 — why a remote recording here could not include what the
+    /// computer plays: `audio_unsupported` (this device cannot record it at
+    /// all) or `audio_not_allowed` (the owner has not allowed it). Absent
+    /// where it could. Stamped on EVERY state ([`send`]), so the answer to
+    /// `rc:record.status` reaches the viewer before it offers the box, and
+    /// it greys the box out with the reason instead of offering a start
+    /// that can only fail. A device older than this sends no field, and a
+    /// viewer reads that as today's behaviour: the box offered, the device
+    /// refusing by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_unavailable: Option<&'static str>,
 }
 
 impl StateMsg {
@@ -615,12 +657,15 @@ impl StateMsg {
     }
 }
 
-/// The refusals decided before anything is asked or launched, in order.
+/// The refusals decided before anything is asked or launched, in order
+/// (the module's gate table). `system_audio` is the caller's
+/// [`super::system_audio_supported`]; an audio start where it is false is
+/// `audio_unsupported` ahead of the owner's gate ([`audio_unavailable`]).
 pub fn precheck(
     g: Gates,
     can_record: bool,
     audio: bool,
-    audio_built: bool,
+    system_audio: bool,
     busy: bool,
 ) -> Result<(), &'static str> {
     if !g.enabled {
@@ -629,8 +674,8 @@ pub fn precheck(
     if !can_record {
         return Err("unavailable");
     }
-    if audio && !(g.audio && audio_built) {
-        return Err("audio_not_allowed");
+    if audio && let Some(code) = audio_unavailable(g, system_audio) {
+        return Err(code);
     }
     if busy {
         return Err("busy");
@@ -820,8 +865,15 @@ pub fn attach_refusing(dc: Arc<RTCDataChannel>, session_id: ObjectId, reason: &'
     }));
 }
 
+/// Send a state, stamped with whether a remote recording here could include
+/// what the computer plays (#1760, [`StateMsg::audio_unavailable`]). On
+/// every state, from the one place every state goes through: a viewer that
+/// asks for the status learns it before it offers the box, and one that
+/// reads it off a refusal, a `recording` or a `stopped` is told the same.
 async fn send(dc: &RTCDataChannel, s: &StateMsg) {
-    send_json(dc, s).await
+    let mut s = s.clone();
+    s.audio_unavailable = audio_unavailable(gates(), super::system_audio_supported());
+    send_json(dc, &s).await
 }
 
 async fn send_json<T: Serialize>(dc: &RTCDataChannel, v: &T) {
@@ -989,10 +1041,17 @@ impl Handler {
             gates(),
             m.available_remote(),
             audio,
-            cfg!(feature = "audio"),
+            super::system_audio_supported(),
             m.state().active,
         ) {
-            self.refuse(&id, code, None).await;
+            // The platform's refusal carries the words (a Mac, a build
+            // without audio): the viewer shows them under the code's
+            // sentence, where before it saw only `start_failed`.
+            let detail = match code {
+                "audio_unsupported" => super::system_audio_unsupported_reason().map(String::from),
+                _ => None,
+            };
+            self.refuse(&id, code, detail).await;
             return;
         }
         if self.starting.swap(true, Ordering::AcqRel) {
@@ -1943,7 +2002,8 @@ mod tests {
         assert_eq!(
             advertise(both, true, false),
             vec!["available", "remote"],
-            "no audio build, no audio claim"
+            "where computer audio cannot be recorded (a Mac, a build without audio), \
+             no audio claim — whatever the owner set (#1760)"
         );
         // The audio gate alone opts nothing in.
         let audio_only = Gates {
@@ -1972,14 +2032,91 @@ mod tests {
             enabled: true,
             audio: true,
         };
+        // #1760 — a device that cannot record computer audio at all names
+        // that, ahead of the owner's gate: a fact no setting fixes, where
+        // `audio_not_allowed` would send the controller to ask the owner.
         assert_eq!(
             precheck(both, true, true, false, false),
-            Err("audio_not_allowed"),
-            "an audio gate on a build without audio"
+            Err("audio_unsupported"),
+            "the owner allowed it, but this device cannot record it"
+        );
+        assert_eq!(
+            precheck(on(), true, true, false, false),
+            Err("audio_unsupported"),
+            "with both against it, the platform is the one named"
         );
         assert_eq!(precheck(both, true, true, true, true), Err("busy"));
         assert_eq!(precheck(both, true, true, true, false), Ok(()));
         assert_eq!(precheck(on(), true, false, false, false), Ok(()));
+        assert_eq!(
+            precheck(both, true, false, false, false),
+            Ok(()),
+            "a video-only start on such a device is not the audio gate's business"
+        );
+    }
+
+    /// #1760 — computer audio is ONE answer at every entry point, on both
+    /// kinds of device. `supported` stands in for `system_audio_supported()`
+    /// (the `audio` feature on Windows or Linux), so a Mac's answer is
+    /// checked on a Windows or Linux box and the reverse. What is advertised,
+    /// what a start is refused, and what every state tells the viewer must
+    /// agree: before this, a Mac's gates read only the audio FEATURE, so it
+    /// advertised `remote-audio`, let the start through, and the recorder
+    /// refused it as a bare `start_failed`. Red with the `supported` check
+    /// dropped from `audio_unavailable`.
+    #[test]
+    fn computer_audio_is_one_answer_at_every_entry_point() {
+        let both = Gates {
+            enabled: true,
+            audio: true,
+        };
+        // A device that cannot record it: named as such whatever the owner
+        // set, never offered, never started.
+        assert_eq!(audio_unavailable(both, false), Some("audio_unsupported"));
+        assert_eq!(
+            audio_unavailable(on(), false),
+            Some("audio_unsupported"),
+            "the platform comes before the owner's gate"
+        );
+        assert!(
+            !advertise(both, true, false)
+                .iter()
+                .any(|c| c == "remote-audio")
+        );
+        assert_eq!(
+            precheck(both, true, true, false, false),
+            Err("audio_unsupported")
+        );
+        // A device that can: the owner's gate decides, and says so.
+        assert_eq!(audio_unavailable(both, true), None);
+        assert_eq!(audio_unavailable(on(), true), Some("audio_not_allowed"));
+        assert!(
+            advertise(both, true, true)
+                .iter()
+                .any(|c| c == "remote-audio")
+        );
+        assert_eq!(precheck(both, true, true, true, false), Ok(()));
+        // The three entry points agree on every combination.
+        for enabled in [false, true] {
+            for audio in [false, true] {
+                for supported in [false, true] {
+                    let g = Gates { enabled, audio };
+                    let offered = enabled && audio_unavailable(g, supported).is_none();
+                    assert_eq!(
+                        advertise(g, true, supported)
+                            .iter()
+                            .any(|c| c == "remote-audio"),
+                        offered,
+                        "advertise {g:?} supported={supported}"
+                    );
+                    assert_eq!(
+                        precheck(g, true, true, supported, false).is_ok(),
+                        offered,
+                        "precheck {g:?} supported={supported}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2024,6 +2161,29 @@ mod tests {
         assert_eq!(v["state"], "refused");
         assert_eq!(v["reason"], "no_indicator_surface");
         assert!(v.get("name").is_none() && v.get("detail").is_none());
+        // #1760 — `audio_unavailable` is absent where computer audio is
+        // available (so an old device and an able one read alike), and the
+        // code where it is not.
+        assert!(
+            v.get("audio_unavailable").is_none(),
+            "absent where computer audio is available: {v}"
+        );
+        let mut s = StateMsg::new("", "idle");
+        s.audio_unavailable = audio_unavailable(on(), false);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["audio_unavailable"], "audio_unsupported");
+        s.audio_unavailable = audio_unavailable(on(), true);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["audio_unavailable"], "audio_not_allowed");
+        s.audio_unavailable = audio_unavailable(
+            Gates {
+                enabled: true,
+                audio: true,
+            },
+            true,
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("audio_unavailable").is_none(), "{v}");
     }
 
     #[test]

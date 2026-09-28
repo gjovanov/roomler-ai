@@ -130,6 +130,57 @@ describe('companion Recordings view (FR-85 P2b)', () => {
     ).toBe('The last recording did not start — no video encoder could be opened (no GPU).')
     // A code this page has never heard of reads as itself.
     expect(api.describeLast({ reason: 'from_the_future', path: null })).toContain('from_the_future')
+    // #1760 — the recorder's refusal on a Mac, in plain words, with its own.
+    expect(
+      api.describeLast({
+        reason: 'system_audio_unavailable',
+        path: null,
+        detail: "macOS can't capture what the computer plays yet",
+      }),
+    ).toBe(
+      "The last recording did not start — computer audio could not be captured on this device (macOS can't capture what the computer plays yet).",
+    )
+  })
+
+  it('greys computer audio out, unticked, with the reason, where the service cannot record it (#1760)', async () => {
+    const reason = "macOS can't capture what the computer plays yet"
+    const cannot = () =>
+      view({
+        state: {
+          available: true,
+          active: false,
+          duration_ms: 0,
+          bytes: 0,
+          frames: 0,
+          system_audio_unavailable_reason: reason,
+        },
+      })
+    const invoke = vi.fn(async (name: string) => (name === 'cmd_recordings_view' ? cannot() : {}))
+    const api = mount(invoke)
+    // Ticked before the service answered: the answer unticks it.
+    const sys = $('rec-system-audio') as HTMLInputElement
+    sys.checked = true
+    api.render(cannot())
+    expect(sys.disabled).toBe(true)
+    expect(sys.checked).toBe(false)
+    expect($('rec-system-audio-unavailable').hidden).toBe(false)
+    expect($('rec-system-audio-unavailable').textContent).toBe(
+      'Computer audio is not available here: ' + reason + '.',
+    )
+    // The microphone and Start are still offered, and a start asks for no
+    // computer audio.
+    expect(($('rec-microphone') as HTMLInputElement).disabled).toBe(false)
+    expect(($('rec-start') as HTMLButtonElement).disabled).toBe(false)
+    $('rec-start').click()
+    await settle()
+    expect(invoke).toHaveBeenCalledWith(
+      'cmd_record_start',
+      expect.objectContaining({ systemAudio: false }),
+    )
+    // A service that can, or one older than the field: the box is offered.
+    api.render(view())
+    expect(sys.disabled).toBe(false)
+    expect($('rec-system-audio-unavailable').hidden).toBe(true)
   })
 
   it('renders the idle state, the folder and the recordings, newest first', () => {
@@ -397,6 +448,33 @@ describe('companion Recordings view — remote recording (FR-85 P3b)', () => {
     expect(box('rec-remote-enabled').checked).toBe(true)
     expect(box('rec-remote-audio').checked).toBe(true)
     expect(box('rec-remote-audio').disabled).toBe(false)
+  })
+
+  it("greys the owner's computer-audio toggle out, with the reason, where the service cannot record it (#1760)", () => {
+    const api = mount(vi.fn())
+    const reason = "macOS can't capture what the computer plays yet"
+    api.render(
+      view({
+        state: { available: true, active: false, system_audio_unavailable_reason: reason },
+        remote: { enabled: true, audio: true },
+      }),
+    )
+    // Remote recording itself is still the owner's to allow.
+    expect(box('rec-remote-enabled').checked).toBe(true)
+    expect(box('rec-remote-enabled').disabled).toBe(false)
+    // The key may say true; the effective gate is off (the device never
+    // advertises `remote-audio` there), and the box says so.
+    expect(box('rec-remote-audio').disabled).toBe(true)
+    expect(box('rec-remote-audio').checked).toBe(false)
+    expect($('rec-remote-audio-unavailable').hidden).toBe(false)
+    expect($('rec-remote-audio-unavailable').textContent).toBe(
+      "Computer audio can't be included: " + reason + '.',
+    )
+    // Where it can: as before.
+    api.render(view({ remote: { enabled: true, audio: true } }))
+    expect(box('rec-remote-audio').disabled).toBe(false)
+    expect(box('rec-remote-audio').checked).toBe(true)
+    expect($('rec-remote-audio-unavailable').hidden).toBe(true)
   })
 
   it('saves each toggle through the config surface, as the daemon must accept it', async () => {
