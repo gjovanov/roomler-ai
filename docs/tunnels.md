@@ -665,6 +665,105 @@ Locked by lib tests, each shown red with a one-line negative control (`// NC86A`
 | `tunnel::client_mgr::tests::a_client_connecting_before_any_carrier_is_held_and_released_by_kill_flow` | the daemon path: `create_forward` binds before any session; a client is held while the flow reads `connecting`; `kill_flow` releases it and unbinds | NC86B · NC86E |
 | `tunnel_tests::agent_daemon_originated_forward_reaches_target` (integration) | the real daemon-originated flow accepts a client while its open is in flight, and `kill_flow` releases it | NC86B |
 
+### Re-upgrade: probe → promote → drain (FR-86 P2)
+
+P1 makes a second carrier able to open beside the first. P2 uses that: a **declared
+route** (`[[tunnel_routes]]`) that fell back to a lower transport probes for the best
+one in the background and, when it works, switches to it **make-before-break** — an
+established connection is never cut, and a new connection is never refused during the
+switch. This is the field bug it fixes: after a client-daemon restart during an exit's
+restart, two routes sat on `webrtc-dc-v1` for hours while `quic-v1` through the same
+exit worked ([#1769](https://github.com/gjovanov/roomler-ai/issues/1769)).
+
+Only the daemon's supervised flows re-upgrade (the standalone `roomler forward` CLI is
+unchanged). The transport order is **`quic-v1` > `quic-derp-v1` > `webrtc-dc-v1`**
+(`quic-derp-v1` counts only where `TUNNEL_DERP_FALLBACK` is on), and only an `auto`
+flow probes — a pinned `--transport` is a decision and never probes.
+
+```mermaid
+sequenceDiagram
+    participant L as flow listener
+    participant A as carrier A (webrtc-dc, active)
+    participant S as flow supervisor
+    participant B as carrier B (quic-v1, candidate)
+    participant X as exit agent
+    Note over A: route fell back at open — A is below the best transport
+    S->>S: probe timer fires (first at 60 s, then 2→5→15→60 min on failure)
+    S->>X: open a candidate session requesting quic-v1 (background task)
+    X-->>S: quic-v1 ready — candidate fully established
+    S->>L: install(B) — new connections → B (atomic swap)
+    S->>S: log "flow re-upgraded webrtc-dc-v1 → quic-v1"; FlowLive.transport = quic-v1
+    Note over A: DRAINING — no new connections; established ones keep flowing
+    A-->>S: active() reached 0 (or A died)
+    S->>X: drop A → rc:tunnel.terminate (the #1754 guard) — the exit frees its peer
+```
+
+The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·
+[`client_mgr.rs:774`], mapped to deadlines by [`ProbeTimer`] `:811`), reset on a netwatch
+**Major** and after a **promotion**, at most **one candidate per flow** in flight:
+
+| Failed probes | Next probe after |
+|---|---|
+| 0 (fresh below-best carrier) | 60 s |
+| 1 | 2 min |
+| 2 | 5 min |
+| 3 | 15 min |
+| 4+ | 60 min (cap) |
+
+| Piece | What it is | Where |
+|---|---|---|
+| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:854`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:874` |
+| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1024`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1061` · `CandidateGuard` `:988` |
+| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1313`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer | [`drain_carrier` `:958`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `spawn_drain` `:979` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:551` |
+
+⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
+session that lives for hours keeps its old carrier for hours. The old carrier is dropped
+only when its own `active()` reaches 0 — signalled by a `Notify` the RAII in-flight
+counter fires on the last decrement ([`Carrier::drained`], `driver.rs:551`), not by any
+timer. Cutting it would defeat the whole point.
+
+⚠️ **A pinned `--transport` never probes.** `reupgrade_active` gates on
+`pref == Auto`; `quic`/`webrtc` are decisions the operator made. `better_transports`
+returns empty for an already-best (`quic-v1`) carrier, so a best carrier never probes
+either.
+
+⚠️ **Failure is isolated.** A candidate establishes into its own throwaway `FlowLive`
+and its own `c`-prefixed nonce namespace, so a probe that fails, errors or is aborted
+mid-flight never touches the live carrier, the listener or the flow's demux — its
+`CandidateGuard` reaps its own pending-open / session entries, and its `TerminateOnDrop`
+tells the exit. Only the backoff grows.
+
+⚠️ **The kill switch is `ROOMLERD_TUNNEL_REUPGRADE=0`** (or the `tunnel_reupgrade`
+config key). Off ⇒ no probe is ever opened and the flow behaves exactly as after P1.
+Read once per serving epoch, so the env var flips it on the next cycle; the config key
+applies on the next daemon restart.
+
+⚠️ **The `--start-transport` flag is a TEST PIN, not an operational knob.**
+`roomler forward --daemon --start-transport webrtc` forces the daemon's FIRST session
+onto `webrtc-dc-v1` so the probe has a below-best carrier to upgrade, without restarting
+daemons (later sessions and the probe behave as `auto`). It exists for the field
+verification of AC7/AC8; normal routes omit it and start on the ladder.
+
+⚠️ **After a promotion, the Flows table's byte/active counters are approximate for that
+flow** until it next reconnects: the promoted (candidate) carrier keeps its own
+throughput aggregate, deliberately, so a probe never disturbs the live route's counters
+during the frequent probe-and-fail case. The **transport** column — the re-upgrade's
+actual signal — updates immediately on promotion.
+
+Locked by lib tests, each shown red with a one-line negative control:
+
+| Test | What it locks | Red with |
+|---|---|---|
+| `client_mgr::tests::reupgrade_backoff_ladder_and_reset` | 60 s → 2/5/15/60 min cap, reset to 60 s | NC86P2N: `on_failure` a no-op |
+| `…probe_timer_deadlines_follow_the_ladder` | the ladder mapped onto injected-time deadlines | — |
+| `…transport_ranking_and_better_set` | the order, and "below best" only for webrtc-dc / quic-derp | — |
+| `…reupgrade_gate_respects_pinned_and_kill_switch` | pinned never probes; kill switch off disables it | NC86P2K: gate ignores `pref` · NC86P2S: gate ignores the switch |
+| `…kill_switch_reads_the_env` | `ROOMLERD_TUNNEL_REUPGRADE=0` turns probing off | NC86P2E: `reupgrade_enabled` hardcoded true |
+| `…drain_carrier_keeps_the_old_carrier_until_active_reaches_zero` | the old carrier is not dropped while it carries a connection, and IS dropped at 0 | NC86P2P: drop the old carrier at promotion (promote-by-cut) |
+| `driver::tests::make_before_break_a_keeps_flowing_while_b_takes_new_connections` | two real QUIC carriers behind one listener: A keeps flowing bytes after B is promoted; a new connection rides B; A drains | NC86P2A (listener ignores the promotion) |
+| `driver::tests::a_carrier_is_drained_when_idle_and_pends_until_its_last_connection_ends` | `Carrier::drained` resolves only at 0 in-flight | — |
+
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
