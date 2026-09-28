@@ -657,7 +657,26 @@ async fn the_gates_refuse_by_name_before_anything_runs_cell() -> Result<()> {
     r.send(json!({"t": "rc:record.start", "id": "g2", "audio": true}))
         .await?;
     let v = r.state(START).await?;
-    assert_eq!(v["reason"], "audio_not_allowed", "{v}");
+    // #1760 — the audio gate's refusal is `audio_not_allowed` where this
+    // build can record computer audio, and `audio_unsupported` (ahead of the
+    // owner's gate, with the words) where it cannot: the CI lane runs this
+    // without the `audio` feature, a Mac has the feature and no loopback.
+    let audio_refusal = if roomlerd::recording::system_audio_supported() {
+        "audio_not_allowed"
+    } else {
+        "audio_unsupported"
+    };
+    assert_eq!(v["reason"], audio_refusal, "{v}");
+    if audio_refusal == "audio_unsupported" {
+        assert_eq!(
+            v["detail"],
+            roomlerd::recording::SYSTEM_AUDIO_UNSUPPORTED,
+            "{v}"
+        );
+    }
+    // Every state says whether computer audio could be included, so the
+    // viewer can grey its box out before a start.
+    assert_eq!(v["audio_unavailable"], audio_refusal, "{v}");
 
     let reports = r.reports();
     assert_eq!(
@@ -670,10 +689,7 @@ async fn the_gates_refuse_by_name_before_anything_runs_cell() -> Result<()> {
                 RecordingActivityKind::Refused,
                 Some("disabled_on_device".into())
             ),
-            (
-                RecordingActivityKind::Refused,
-                Some("audio_not_allowed".into())
-            ),
+            (RecordingActivityKind::Refused, Some(audio_refusal.into())),
         ]
     );
     assert!(!r.banner_says_recording());

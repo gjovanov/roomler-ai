@@ -52,7 +52,7 @@
     encoder_unavailable: 'no video encoder could be opened',
     folder_unwritable: 'the folder could not be written',
     audio_unavailable: 'this device cannot record audio',
-    system_audio_unavailable: 'computer audio could not be opened',
+    system_audio_unavailable: 'computer audio could not be captured on this device',
     mic_unavailable: 'the microphone could not be opened',
     audio_failed: 'the audio failed, and the rest was recorded without it',
   };
@@ -98,6 +98,15 @@
 
   function isActive(view) {
     return !!(view && view.state && view.state.active);
+  }
+
+  // #1760 — why this device's service cannot record what the computer plays
+  // (a Mac, until ScreenCaptureKit; a service built without audio capture),
+  // said by the service ahead of any start; null where it can, and from a
+  // service older than the field.
+  function systemAudioUnavailable(view) {
+    const st = (view && view.state) || {};
+    return st.system_audio_unavailable_reason ? String(st.system_audio_unavailable_reason) : null;
   }
 
   /* ── render ─────────────────────────────────────────────────────── */
@@ -154,7 +163,21 @@
     // The options apply to the NEXT recording; locked while one runs.
     $('rec-fps').disabled = rec || busy || !can;
     $('rec-encoder').disabled = rec || busy || !can;
-    $('rec-system-audio').disabled = rec || busy || !can;
+    // #1760 — where the service cannot record what the computer plays, the
+    // box is greyed out, unticked, with the words beside it: never a box
+    // that only fails (the recorder would refuse `system_audio_unavailable`
+    // and the person would learn why only from the last-recording line).
+    const noSystemAudio = systemAudioUnavailable(view);
+    const sys = $('rec-system-audio');
+    sys.disabled = rec || busy || !can || !!noSystemAudio;
+    if (noSystemAudio) sys.checked = false;
+    const sysWhy = $('rec-system-audio-unavailable');
+    if (noSystemAudio) {
+      sysWhy.textContent = 'Computer audio is not available here: ' + noSystemAudio + '.';
+      show(sysWhy);
+    } else {
+      hide(sysWhy);
+    }
     $('rec-microphone').disabled = rec || busy || !can;
     const lastEl = $('rec-last');
     if (!rec && st.last) {
@@ -198,14 +221,26 @@
     show(card);
     const en = $('rec-remote-enabled');
     const au = $('rec-remote-audio');
+    // #1760 — where the service cannot record what the computer plays, the
+    // effective gate is OFF whatever the key says (the device never
+    // advertises `remote-audio` there), so the toggle is greyed out,
+    // unticked, with the words: switching it on would change nothing.
+    const noSystemAudio = systemAudioUnavailable(view);
     // Never repaint a box while its change is in flight.
     if (!remoteBusy) {
       en.checked = !!g.enabled;
-      au.checked = !!g.audio;
+      au.checked = !!g.audio && !noSystemAudio;
     }
     en.disabled = remoteBusy;
     // Computer audio means nothing until remote recording is allowed.
-    au.disabled = remoteBusy || !g.enabled;
+    au.disabled = remoteBusy || !g.enabled || !!noSystemAudio;
+    const why = $('rec-remote-audio-unavailable');
+    if (noSystemAudio) {
+      why.textContent = "Computer audio can't be included: " + noSystemAudio + '.';
+      show(why);
+    } else {
+      hide(why);
+    }
   }
 
   async function setRemote(key, on) {
