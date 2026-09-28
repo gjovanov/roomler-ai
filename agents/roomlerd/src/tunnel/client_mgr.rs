@@ -53,7 +53,7 @@ use async_trait::async_trait;
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{ClientMsg, CloseReason, ServerMsg};
 use tokio::sync::{mpsc, watch};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, info, warn};
 use tunnel_core::driver::{
     Carrier, Establishment, SessionParams, Target, TransportPref, establish_tunnel_session,
@@ -62,7 +62,7 @@ use tunnel_core::flow_listener::{FlowListener, HoldPolicy};
 use tunnel_core::forward::SessionThroughput;
 use tunnel_core::localapi::{FlowInfo, FlowKind};
 use tunnel_core::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
-use tunnel_core::transport::TRANSPORT_WEBRTC_DC_V1;
+use tunnel_core::transport::{TRANSPORT_QUIC_DERP_V1, TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 /// Per-session control-channel buffer. Sized to absorb an ICE-trickle burst at
 /// session open without blocking the shared WS-read loop — control-plane only
@@ -368,10 +368,13 @@ impl TunnelClientHub {
         local: u16,
         remote: &str,
         transport: &str,
+        start_transport: &str,
     ) -> std::result::Result<String, String> {
         let agent_id = parse_node(node)?;
         let (host, port) = parse_host_port(remote).map_err(|e| e.to_string())?;
         let pref = parse_transport(transport);
+        // FR-86 P2 test lever — a first-session transport override (a word).
+        let start = start_request_transport(start_transport);
         probe_local_port(local).await?;
         let id = self.spawn_flow(
             FlowKind::Forward,
@@ -381,8 +384,9 @@ impl TunnelClientHub {
             Some(remote.to_string()),
             Target::Static { host, port },
             pref,
+            start,
         );
-        info!(flow = %id, %node, local, %remote, ?pref, "created daemon forward");
+        info!(flow = %id, %node, local, %remote, ?pref, start, "created daemon forward");
         Ok(id)
     }
 
@@ -405,6 +409,9 @@ impl TunnelClientHub {
             None,
             Target::Socks5,
             pref,
+            // SOCKS5 has no start-transport lever (the FR-86 P2 field test drives
+            // a static forward); it always starts on the normal ladder.
+            None,
         );
         info!(flow = %id, %node, local, ?pref, "created daemon socks5 listener");
         Ok(id)
@@ -519,6 +526,9 @@ impl TunnelClientHub {
         target_disp: Option<String>,
         target: Target,
         pref: TransportPref,
+        // FR-86 P2 — force the FIRST session's transport (a below-best carrier
+        // for the field test); `None` = the normal ladder.
+        start_transport: Option<&'static str>,
     ) -> String {
         let id = format!("fl-{}", self.inner.seq.fetch_add(1, Ordering::Relaxed));
         let live = Arc::new(FlowLive::default());
@@ -530,6 +540,7 @@ impl TunnelClientHub {
             target,
             pref,
             live.clone(),
+            start_transport,
         ));
         self.inner.flows.lock().unwrap().insert(
             id.clone(),
@@ -734,11 +745,410 @@ enum Cycle {
     Failed(anyhow::Error),
 }
 
+// ---------------------------------------------------------------------------
+// FR-86 P2 — make-before-break re-upgrade: probe schedule, ranking, candidate
+// establishment, promotion and drain.
+// ---------------------------------------------------------------------------
+
+/// The first re-upgrade probe fires this long after a below-best carrier is
+/// installed. Short enough that a route that fell back at open recovers within
+/// a minute once the better transport works; long enough not to probe a churn.
+const REUPGRADE_FIRST_PROBE: Duration = Duration::from_secs(60);
+
+/// Backoff after each FAILED probe, capped at the last entry. Applied in order:
+/// the 1st failure waits `[0]`, the 2nd `[1]`, … the Nth `[len-1]`. Relentless
+/// (it never gives up — the "never ratchet" rule) but cheap when a path simply
+/// can't do better (a corp net with no QUIC).
+const REUPGRADE_BACKOFFS: [Duration; 4] = [
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+];
+
+/// The re-upgrade probe schedule as a pure value: how long until the next probe,
+/// given how many have failed since the last reset. No clock inside — the caller
+/// turns a [`ReupgradeBackoff::delay`] into a deadline — so it is fully
+/// deterministic to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReupgradeBackoff {
+    /// Failed probes since the last reset. 0 ⇒ the first probe is pending.
+    failures: u32,
+}
+
+impl ReupgradeBackoff {
+    fn new() -> Self {
+        Self { failures: 0 }
+    }
+
+    /// Delay until the next probe: [`REUPGRADE_FIRST_PROBE`] while nothing has
+    /// failed, then the backoff ladder, capped at its last entry.
+    fn delay(&self) -> Duration {
+        match self.failures {
+            0 => REUPGRADE_FIRST_PROBE,
+            n => {
+                let i = ((n - 1) as usize).min(REUPGRADE_BACKOFFS.len() - 1);
+                REUPGRADE_BACKOFFS[i]
+            }
+        }
+    }
+
+    /// A probe failed: the next one waits one rung further down the ladder.
+    fn on_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    /// Back to the first-probe delay — after a promotion (a fresh below-best
+    /// carrier) or a network change (the old path's failures no longer apply).
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// [`ReupgradeBackoff`] plus the concrete deadline it maps to, so the serving
+/// loop can `sleep_until` it. Time is injected via `now`, so the deadline math
+/// is testable without a real clock.
+struct ProbeTimer {
+    backoff: ReupgradeBackoff,
+    deadline: tokio::time::Instant,
+}
+
+impl ProbeTimer {
+    /// Arm the FIRST probe relative to `now`.
+    fn armed(now: tokio::time::Instant) -> Self {
+        let backoff = ReupgradeBackoff::new();
+        Self {
+            deadline: now + backoff.delay(),
+            backoff,
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// A probe failed: back off and recompute the deadline from `now`.
+    fn on_failure(&mut self, now: tokio::time::Instant) {
+        self.backoff.on_failure();
+        self.deadline = now + self.backoff.delay();
+    }
+
+    /// Reset to the first-probe delay from `now` (promotion / network change).
+    fn reset(&mut self, now: tokio::time::Instant) {
+        self.backoff.reset();
+        self.deadline = now + self.backoff.delay();
+    }
+}
+
+/// FR-86 P2 kill switch. `ROOMLERD_TUNNEL_REUPGRADE=0` (or the `tunnel_reupgrade`
+/// config key via the env bridge) turns off all probing — behaviour is exactly
+/// P1. Default ON. Read once per serving epoch, so the env var flips it live on
+/// the next cycle.
+fn reupgrade_enabled() -> bool {
+    tunnel_core::env::flag("TUNNEL_REUPGRADE", true)
+}
+
+/// Whether re-upgrade probing runs for this flow at all: only for `auto` flows
+/// (a pinned `--transport` is a decision — it NEVER probes) and only with the
+/// kill switch on. Pure, so the pinned + kill-switch gates are unit-tested.
+fn reupgrade_active(pref: TransportPref, kill_switch_on: bool) -> bool {
+    pref == TransportPref::Auto && kill_switch_on
+}
+
+/// Rank of a negotiated transport, best highest: `quic-v1` > `quic-derp-v1` >
+/// `webrtc-dc-v1`. Unknown transports rank 0 (never promoted TO, never a reason
+/// to probe FROM — an old/newer server word is left alone).
+fn transport_rank(t: &str) -> u8 {
+    match t {
+        TRANSPORT_QUIC_V1 => 3,
+        TRANSPORT_QUIC_DERP_V1 => 2,
+        TRANSPORT_WEBRTC_DC_V1 => 1,
+        _ => 0,
+    }
+}
+
+/// Transports strictly better than the active one, best first, restricted to
+/// what a re-upgrade may REQUEST: `quic-derp-v1` is offered only where derp
+/// fallback is enabled. Empty ⇒ the active transport is already the best allowed
+/// (no probe). This doubles as the "below best?" test.
+fn better_transports(active: &str, derp_enabled: bool) -> Vec<&'static str> {
+    match active {
+        TRANSPORT_WEBRTC_DC_V1 => {
+            let mut v = vec![TRANSPORT_QUIC_V1];
+            if derp_enabled {
+                v.push(TRANSPORT_QUIC_DERP_V1);
+            }
+            v
+        }
+        TRANSPORT_QUIC_DERP_V1 => vec![TRANSPORT_QUIC_V1],
+        // quic-v1 (the best) or an unrecognised word: nothing better to try.
+        _ => vec![],
+    }
+}
+
+/// Whether the active transport is below the best the flow may use — the gate on
+/// whether a probe is scheduled at all.
+fn below_best(active: &str, derp_enabled: bool) -> bool {
+    !better_transports(active, derp_enabled).is_empty()
+}
+
+/// Map the CLI/LocalAPI start-transport WORD (the FR-86 P2 test lever) to the
+/// concrete transport the daemon's first session requests. `auto`/empty/unknown
+/// ⇒ `None` (the normal ladder).
+fn start_request_transport(word: &str) -> Option<&'static str> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "webrtc" | "webrtc-dc-v1" => Some(TRANSPORT_WEBRTC_DC_V1),
+        "quic" | "quic-v1" => Some(TRANSPORT_QUIC_V1),
+        _ => None,
+    }
+}
+
+/// Outcome of a re-upgrade probe, sent from the spawned candidate task back to
+/// the flow supervisor.
+enum CandidateOutcome {
+    /// A better transport was established and is ready to promote. Its session
+    /// is registered in the hub's demux (`client_sessions[session_id]`), so the
+    /// supervisor keeps it registered and adopts the id as the flow's.
+    Established {
+        carrier: Box<Carrier>,
+        session_id: ObjectId,
+        transport: &'static str,
+    },
+    /// No better transport this round (setup failed / errored). Nothing to clean
+    /// up — the candidate task already reaped its own demux entries.
+    Failed,
+}
+
+/// Aborts a spawned task when dropped (the flow supervisor holds these for its
+/// in-flight probe and its draining carriers, so `kill_flow` — which aborts the
+/// supervisor — tears them ALL down, each carrier's drop telling the exit).
+/// `tunnel_core::driver::AbortOnDrop` is `pub(crate)` to that crate, so the
+/// daemon keeps its own one-liner.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What the drain reaper needs from a carrier — a seam so the promote/drain rule
+/// is testable with a fake, without a live session (`tunnel_core::driver::Carrier`
+/// implements it below; the tests use a fake). Boxed futures keep it object-safe
+/// and trait-method simple; a drain reaper is not a hot path.
+trait DrainableCarrier: Send + Sync + 'static {
+    fn dead(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    fn drained(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+impl DrainableCarrier for Carrier {
+    fn dead(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(Carrier::dead(self))
+    }
+    fn drained(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(Carrier::drained(self))
+    }
+}
+
+/// Drain a carrier the flow re-upgraded away from: keep it carrying its
+/// established connections until its last one ends ([`Carrier::drained`]) — or
+/// until it dies on its own — then drop it, which sends the `rc:tunnel.terminate`
+/// the exit acts on (#1754) and reaps its demux entry. **No maximum drain time:
+/// an established connection is never cut** — the make-before-break guarantee.
+async fn drain_carrier<C: DrainableCarrier + ?Sized>(
+    hub: TunnelClientHub,
+    old_sid: ObjectId,
+    old: Arc<C>,
+) {
+    tokio::select! {
+        _ = old.drained() => {
+            info!(session = %old_sid, "re-upgrade: draining carrier reached 0 connections; closing");
+        }
+        _ = old.dead() => {
+            info!(session = %old_sid, "re-upgrade: draining carrier died before it drained; closing");
+        }
+    }
+    // Dropping the carrier ends its session (TerminateOnDrop → the exit frees
+    // its peer). Then reap the demux entry the promotion left registered for it.
+    drop(old);
+    hub.inner.client_sessions.lock().unwrap().remove(&old_sid);
+}
+
+/// Spawn a [`drain_carrier`] reaper, returning its abort guard (held by the
+/// supervisor so `kill_flow` tears it down).
+fn spawn_drain(hub: &TunnelClientHub, old_sid: ObjectId, old: Arc<Carrier>) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(drain_carrier(hub.clone(), old_sid, old)))
+}
+
+/// A re-upgrade candidate's demux cleanup guard. On the FAILURE and (crucially)
+/// the ABORT paths — where the candidate task's own cleanup did not run — it
+/// removes the pending-open nonce and, if the candidate got as far as
+/// `rc:tunnel.opened`, its `client_sessions` entry. Disarmed on success, because
+/// the promoted carrier needs that entry to keep dispatching.
+struct CandidateGuard {
+    hub: TunnelClientHub,
+    nonce: String,
+    live: Arc<FlowLive>,
+    disarmed: bool,
+}
+
+impl CandidateGuard {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for CandidateGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.hub
+            .inner
+            .pending_opens
+            .lock()
+            .unwrap()
+            .remove(&self.nonce);
+        if let Some(sid) = *self.live.session_id.lock().unwrap() {
+            self.hub.inner.client_sessions.lock().unwrap().remove(&sid);
+        }
+    }
+}
+
+/// Spawn a background probe for a transport better than `active_transport`.
+/// It never touches the flow's live carrier or its `FlowLive` — a private
+/// throwaway `FlowLive` holds the candidate's demux bookkeeping — so a failed or
+/// aborted probe cannot disturb the live route. The outcome is sent on
+/// `result_tx`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_candidate(
+    hub: &TunnelClientHub,
+    flow_id: &str,
+    sink_tx: &mpsc::Sender<ClientMsg>,
+    agent_id: ObjectId,
+    target: &Target,
+    active_transport: &'static str,
+    derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
+    derp_enabled: bool,
+    result_tx: mpsc::Sender<CandidateOutcome>,
+) -> AbortOnDrop {
+    let hub = hub.clone();
+    let flow_id = flow_id.to_string();
+    let sink_tx = sink_tx.clone();
+    let target = target.clone();
+    // A candidate nonce namespace disjoint from the active flow's `{flow}.{n}`.
+    let seq = hub.inner.seq.fetch_add(1, Ordering::Relaxed);
+    AbortOnDrop(tokio::spawn(async move {
+        let outcome = establish_candidate(
+            &hub,
+            &flow_id,
+            seq,
+            &sink_tx,
+            agent_id,
+            &target,
+            active_transport,
+            derp,
+            derp_enabled,
+        )
+        .await;
+        let _ = result_tx.send(outcome).await;
+    }))
+}
+
+/// Run the restricted ladder for a re-upgrade candidate: each transport strictly
+/// better than `active_transport`, best first, until one is established.
+#[allow(clippy::too_many_arguments)]
+async fn establish_candidate(
+    hub: &TunnelClientHub,
+    flow_id: &str,
+    seq: u64,
+    sink_tx: &mpsc::Sender<ClientMsg>,
+    agent_id: ObjectId,
+    target: &Target,
+    active_transport: &'static str,
+    derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
+    derp_enabled: bool,
+) -> CandidateOutcome {
+    let betters = better_transports(active_transport, derp_enabled);
+    // Private bookkeeping — never the flow's own FlowLive, so the live route's
+    // Flows-table cells and demux state are untouched by the probe.
+    let cand_live = Arc::new(FlowLive::default());
+    for (i, &t) in betters.iter().enumerate() {
+        let this_derp = if t == TRANSPORT_QUIC_DERP_V1 {
+            if derp.is_none() {
+                continue; // derp flavor wanted but no /derp handle right now
+            }
+            derp.clone()
+        } else {
+            None
+        };
+        let nonce = format!("{flow_id}.c{seq}.{i}");
+        let guard = CandidateGuard {
+            hub: hub.clone(),
+            nonce: nonce.clone(),
+            live: cand_live.clone(),
+            disarmed: false,
+        };
+        match drive_attempt(
+            hub,
+            flow_id,
+            nonce,
+            sink_tx,
+            agent_id,
+            target,
+            vec![t.to_string()],
+            t,
+            &cand_live,
+            this_derp,
+        )
+        .await
+        {
+            Ok(Establishment::Established(carrier)) => {
+                let carrier = *carrier;
+                let transport = carrier.transport();
+                let session_id = carrier.session_id();
+                if transport_rank(transport) > transport_rank(active_transport) {
+                    // Keep the session registered for the promoted carrier.
+                    guard.disarm();
+                    info!(flow = %flow_id, transport, "re-upgrade candidate established");
+                    return CandidateOutcome::Established {
+                        carrier: Box::new(carrier),
+                        session_id,
+                        transport,
+                    };
+                }
+                // The server negotiated something not actually better than the
+                // active carrier (defensive — we only advertised better ones):
+                // drop it (terminate) and let the guard reap, then try the next.
+                warn!(flow = %flow_id, transport, "re-upgrade candidate came back no better than the active carrier; dropping");
+                drop(carrier);
+            }
+            Ok(Establishment::QuicSetupFailed) => {
+                debug!(flow = %flow_id, transport = t, "re-upgrade candidate: QUIC setup failed");
+            }
+            Err(e) => {
+                debug!(flow = %flow_id, transport = t, %e, "re-upgrade candidate errored");
+            }
+        }
+        // Failure/no-better: the guard drops here and reaps this attempt.
+    }
+    CandidateOutcome::Failed
+}
+
+/// Sleep until `at`, or pend forever when `None` — the disabled-probe-timer arm.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Supervise one flow: bind its listener once, then (re)establish a tunnel
 /// session over the live agent WS and serve `local` through it until the
 /// session drops, then back off + retry with the listener still bound. Owns
 /// the local-port intent across WS reconnects (the CLI's `run_forward` shape,
 /// relocated + sharing the daemon's ONE WS instead of dialing its own).
+#[allow(clippy::too_many_arguments)]
 async fn run_flow_supervisor(
     hub: TunnelClientHub,
     flow_id: String,
@@ -747,11 +1157,25 @@ async fn run_flow_supervisor(
     target: Target,
     pref: TransportPref,
     live: Arc<FlowLive>,
+    // FR-86 P2 — force the FIRST session's transport (the test lever). Applied
+    // on the first cycle only, then cleared so later sessions behave as `pref`.
+    start_transport: Option<&'static str>,
 ) {
     info!(flow = %flow_id, "flow supervisor started");
     let mut sink_rx = hub.inner.sink_tx.subscribe();
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut attempt: u64 = 0;
+    // FR-86 P2 — cross-cycle re-upgrade state, owned here so `kill_flow`
+    // (which aborts this task) tears it ALL down: `drains` holds the reaper of
+    // each carrier a promotion left behind (dropping one terminates its
+    // session), and `cand_task` the one in-flight probe. `cand_rx` carries a
+    // probe's outcome, and — because it survives a cycle — a probe still running
+    // when the active carrier dies is picked up by the NEXT cycle's serving
+    // loop rather than wasted (spec §6).
+    let mut drains: Vec<AbortOnDrop> = Vec::new();
+    let mut cand_task: Option<AbortOnDrop> = None;
+    let (cand_tx, mut cand_rx) = mpsc::channel::<CandidateOutcome>(2);
+    let mut start_override = start_transport;
     // R1: a netstate Major during the backoff sleep invalidates the failures
     // that earned it (the old path is gone; the new one is untested) — cut
     // the wait and retry at the floor, exactly the control-WS reconnect
@@ -776,6 +1200,9 @@ async fn run_flow_supervisor(
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // #1685 — an attempt is in flight (or waiting for the WS): no countdown.
         *live.retry_at.lock().unwrap() = None;
+        // Drop the handles of drain reapers that have finished (their carriers
+        // are already closed) so the Vec can't grow across a long-lived flow.
+        drains.retain(|d| !d.0.is_finished());
 
         let cycle = run_flow_cycle(
             &hub,
@@ -789,6 +1216,12 @@ async fn run_flow_supervisor(
             &mut sink_rx,
             &mut attempt,
             quic_over_turn_failing,
+            &mut drains,
+            &mut cand_task,
+            &cand_tx,
+            &mut cand_rx,
+            &mut net_rx,
+            start_override.take(),
         )
         .await;
 
@@ -890,6 +1323,14 @@ async fn run_flow_cycle(
     sink_rx: &mut watch::Receiver<Option<mpsc::Sender<ClientMsg>>>,
     attempt: &mut u64,
     lead_derp: bool,
+    // FR-86 P2 — cross-cycle re-upgrade state (see `run_flow_supervisor`).
+    drains: &mut Vec<AbortOnDrop>,
+    cand_task: &mut Option<AbortOnDrop>,
+    cand_tx: &mpsc::Sender<CandidateOutcome>,
+    cand_rx: &mut mpsc::Receiver<CandidateOutcome>,
+    net_rx: &mut Option<super::netwatch::NetRx>,
+    // FR-86 P2 — force this (first) session's transport; `None` = normal ladder.
+    start_override: Option<&'static str>,
 ) -> Cycle {
     if listener.is_none() {
         match FlowListener::bind(local, HoldPolicy::default()).await {
@@ -914,10 +1355,11 @@ async fn run_flow_cycle(
         return Cycle::Shutdown;
     };
 
+    let derp_enabled = pref == TransportPref::Auto && derp_fallback_enabled();
     // Resolve the /derp handle whenever the flavor is enabled — the
     // fallback ladder inside `run_session_with_fallback` uses it on a
     // quic-over-TURN failure even before we start LEADING with it.
-    let derp = if pref == TransportPref::Auto && derp_fallback_enabled() {
+    let derp = if derp_enabled {
         let h = super::netwatch::primary_derp_tunnel_handle();
         if h.is_none() && lead_derp {
             debug!(flow = %flow_id, "quic-derp-v1 wanted but no /derp handle yet (overlay derp starting?)");
@@ -928,34 +1370,180 @@ async fn run_flow_cycle(
     };
 
     let started = std::time::Instant::now();
-    let carrier = match run_session_with_fallback(
-        hub, flow_id, attempt, &sink_tx, agent_id, target, pref, live, derp, lead_derp,
-    )
-    .await
-    {
-        Ok(carrier) => Arc::new(carrier),
-        Err(e) => return Cycle::Failed(e),
+    // Establish the active carrier: the FR-86 P2 test lever forces this first
+    // session onto a chosen transport (falling back to the ladder if that
+    // fails so the route still serves); otherwise the normal ladder runs.
+    let mut active = if let Some(t) = start_override {
+        info!(flow = %flow_id, transport = t, "FR-86 P2 test lever: forcing the first session's transport");
+        match drive_one(
+            hub,
+            flow_id,
+            attempt,
+            &sink_tx,
+            agent_id,
+            target,
+            vec![t.to_string()],
+            t,
+            live,
+            None,
+        )
+        .await
+        {
+            Ok(Establishment::Established(c)) => Arc::new(*c),
+            _ => {
+                warn!(flow = %flow_id, "forced first-session transport did not establish; falling back to the ladder");
+                match run_session_with_fallback(
+                    hub, flow_id, attempt, &sink_tx, agent_id, target, pref, live, derp, lead_derp,
+                )
+                .await
+                {
+                    Ok(carrier) => Arc::new(carrier),
+                    Err(e) => return Cycle::Failed(e),
+                }
+            }
+        }
+    } else {
+        match run_session_with_fallback(
+            hub, flow_id, attempt, &sink_tx, agent_id, target, pref, live, derp, lead_derp,
+        )
+        .await
+        {
+            Ok(carrier) => Arc::new(carrier),
+            Err(e) => return Cycle::Failed(e),
+        }
     };
-    let transport = carrier.transport();
 
     // #1685 / FR-86 P1 — the carrier is behind the listener: the flow SERVES.
-    let handed = listener.install(Arc::clone(&carrier));
+    let handed = listener.install(Arc::clone(&active));
     live.mark_listening();
     info!(
-        flow = %flow_id, transport, local = %listener.local_addr(), held_handed = handed,
-        "carrier ready behind the flow listener — the route is serving"
+        flow = %flow_id, transport = active.transport(), local = %listener.local_addr(),
+        held_handed = handed, "carrier ready behind the flow listener — the route is serving"
     );
 
-    carrier.dead().await;
+    // The transport that actually RAN this cycle (updated on each promotion) —
+    // the derp-lead signal the supervisor reads.
+    let mut transport_ran = active.transport();
+
+    // FR-86 P2 serving phase. With the kill switch off (or a pinned transport)
+    // this is exactly P1: wait for the carrier to die. Otherwise probe for a
+    // better transport, promote make-before-break, and drain the old carrier.
+    if !reupgrade_active(pref, reupgrade_enabled()) {
+        // Abort any stale probe (kill switch flipped off mid-flight) and drain
+        // its buffered outcome so nothing lingers.
+        if cand_task.take().is_some() {
+            while cand_rx.try_recv().is_ok() {}
+        }
+        active.dead().await;
+    } else {
+        // Arm the first probe if the active carrier is below the best allowed —
+        // unless a probe is ALREADY in flight (carried over from a previous
+        // cycle whose active carrier died, spec §6): its result will arrive on
+        // `cand_rx` and be promoted if it beats this cycle's active carrier.
+        let mut timer: Option<ProbeTimer> =
+            if cand_task.is_none() && below_best(active.transport(), derp_enabled) {
+                Some(ProbeTimer::armed(tokio::time::Instant::now()))
+            } else {
+                None
+            };
+        loop {
+            drains.retain(|d| !d.0.is_finished());
+            let active_dead = Arc::clone(&active);
+            // Fire a probe only when a timer is armed AND none is in flight.
+            let probe_deadline = if cand_task.is_none() {
+                timer.as_ref().map(|t| t.deadline())
+            } else {
+                None
+            };
+            tokio::select! {
+                _ = active_dead.dead() => {
+                    // The active carrier died. Leave any in-flight probe alone —
+                    // the next cycle's serving loop adopts its result. End here.
+                    break;
+                }
+                _ = sleep_until_opt(probe_deadline), if probe_deadline.is_some() => {
+                    let derp_handle = if derp_enabled {
+                        super::netwatch::primary_derp_tunnel_handle()
+                    } else {
+                        None
+                    };
+                    info!(
+                        flow = %flow_id, from = active.transport(),
+                        "re-upgrade: probing for a better transport"
+                    );
+                    *cand_task = Some(spawn_candidate(
+                        hub, flow_id, &sink_tx, agent_id, target,
+                        active.transport(), derp_handle, derp_enabled, cand_tx.clone(),
+                    ));
+                }
+                res = cand_rx.recv(), if cand_task.is_some() => {
+                    *cand_task = None;
+                    let now = tokio::time::Instant::now();
+                    match res {
+                        Some(CandidateOutcome::Established { carrier, session_id, transport })
+                            if transport_rank(transport) > transport_rank(active.transport()) =>
+                        {
+                            let old_t = active.transport();
+                            let new = Arc::new(*carrier);
+                            // Promote: new connections go to the candidate at once
+                            // (atomic swap); the old carrier keeps its established
+                            // ones and becomes draining.
+                            listener.install(Arc::clone(&new));
+                            *live.transport.lock().unwrap() = Some(transport.to_string());
+                            *live.session_id.lock().unwrap() = Some(session_id);
+                            info!(flow = %flow_id, "flow re-upgraded {old_t} → {transport}");
+                            let old = std::mem::replace(&mut active, new);
+                            let old_sid = old.session_id();
+                            drains.push(spawn_drain(hub, old_sid, old));
+                            transport_ran = transport;
+                            // Reset the schedule after a promotion; keep probing
+                            // only if the new carrier is still below the best.
+                            timer = if below_best(active.transport(), derp_enabled) {
+                                Some(ProbeTimer::armed(now))
+                            } else {
+                                None
+                            };
+                        }
+                        Some(CandidateOutcome::Established { carrier, transport, .. }) => {
+                            // A candidate that is not better than the CURRENT
+                            // active carrier (the active changed under it, or a
+                            // stale carry-over): drop it (terminate) and back off.
+                            debug!(flow = %flow_id, transport, active = active.transport(),
+                                "re-upgrade candidate no better than the current carrier; dropping");
+                            drop(carrier);
+                            if let Some(t) = timer.as_mut() { t.on_failure(now); }
+                        }
+                        _ => {
+                            // Failed probe (or the channel hiccupped): back off.
+                            if let Some(t) = timer.as_mut() {
+                                t.on_failure(now);
+                                debug!(flow = %flow_id, "re-upgrade probe failed; backing off");
+                            }
+                        }
+                    }
+                }
+                summary = super::netwatch::next_major(net_rx) => {
+                    // A network change invalidates the probe schedule: retry from
+                    // the first-probe delay (the old path's failures no longer apply).
+                    if let Some(t) = timer.as_mut() {
+                        t.reset(tokio::time::Instant::now());
+                        debug!(flow = %flow_id, %summary, "network changed — re-upgrade probe schedule reset");
+                    }
+                }
+            }
+        }
+    }
+
     // No carrier: hold from here until the next cycle installs one.
     listener.clear();
     end_session(hub, live);
     // The old end of the session function — the dispatcher aborted, the peer
-    // closed, the exit told (#1754) — is this drop.
-    drop(carrier);
+    // closed, the exit told (#1754) — is this drop. Draining carriers (if any)
+    // persist in `drains`, owned by the supervisor, and close on their own.
+    drop(active);
     Cycle::Carried {
         ran: started.elapsed(),
-        transport,
+        transport: transport_ran,
     }
 }
 
@@ -1163,10 +1751,9 @@ async fn run_session_with_fallback(
     }
 }
 
-/// Build this attempt's nonce + demux registration + seam, drive one
-/// `establish_tunnel_session`, then reap the attempt's demux entries — the
-/// pending nonce either way, the session too unless a carrier came out of it
-/// (that session lives on until the supervisor ends it, `end_session`).
+/// Bump the flow's attempt counter and drive one session on a fresh
+/// `{flow}.{attempt}` nonce. The active-flow path; the re-upgrade candidate
+/// path calls [`drive_attempt`] directly with its own `c`-prefixed nonce.
 #[allow(clippy::too_many_arguments)]
 async fn drive_one(
     hub: &TunnelClientHub,
@@ -1182,6 +1769,31 @@ async fn drive_one(
 ) -> Result<Establishment> {
     *attempt += 1;
     let nonce = format!("{flow_id}.{attempt}");
+    drive_attempt(
+        hub, flow_id, nonce, sink_tx, agent_id, target, supported, request, live, derp,
+    )
+    .await
+}
+
+/// Register this attempt's demux nonce + seam, drive one
+/// `establish_tunnel_session`, then reap the attempt's demux entries — the
+/// pending nonce either way, the session too unless a carrier came out of it
+/// (that session lives on until the supervisor ends it, `end_session`). The
+/// nonce is the caller's, so both the active flow (`{flow}.{n}`) and a
+/// re-upgrade candidate (`{flow}.c{seq}.{i}`) share this one body.
+#[allow(clippy::too_many_arguments)]
+async fn drive_attempt(
+    hub: &TunnelClientHub,
+    flow_id: &str,
+    nonce: String,
+    sink_tx: &mpsc::Sender<ClientMsg>,
+    agent_id: ObjectId,
+    target: &Target,
+    supported: Vec<String>,
+    request: &str,
+    live: &Arc<FlowLive>,
+    derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
+) -> Result<Establishment> {
     let (src_tx, src_rx) = mpsc::channel::<ServerMsg>(SESSION_SOURCE_DEPTH);
 
     // Register the pending open BEFORE the driver sends `TunnelOpen`, so a fast
@@ -1718,7 +2330,7 @@ mod tests {
             p
         };
         let id = hub
-            .create_forward("0123456789abcdef01234567", port, "db:5432", "webrtc")
+            .create_forward("0123456789abcdef01234567", port, "db:5432", "webrtc", "")
             .await
             .expect("create_forward");
 
@@ -1877,5 +2489,243 @@ mod tests {
     fn the_backoff_ladder_is_ordered() {
         assert!(super::RECONNECT_BACKOFF_MIN < super::RECONNECT_BACKOFF_MAX);
         assert!(super::RECONNECT_BACKOFF_MIN < super::SESSION_RAN_THRESHOLD);
+    }
+
+    // ─────────────────────── FR-86 P2 ───────────────────────
+
+    /// The probe schedule: first probe at 60 s, then 2 → 5 → 15 → 60 min, capped,
+    /// and reset returns to the first-probe delay. NC86P2N (on_failure a no-op)
+    /// turns this red.
+    #[test]
+    fn reupgrade_backoff_ladder_and_reset() {
+        let m = 60;
+        let mut b = ReupgradeBackoff::new();
+        assert_eq!(b.delay(), Duration::from_secs(60), "first probe at 60 s");
+        b.on_failure();
+        assert_eq!(b.delay(), Duration::from_secs(2 * m));
+        b.on_failure();
+        assert_eq!(b.delay(), Duration::from_secs(5 * m));
+        b.on_failure();
+        assert_eq!(b.delay(), Duration::from_secs(15 * m));
+        b.on_failure();
+        assert_eq!(b.delay(), Duration::from_secs(60 * m), "capped at 60 min");
+        b.on_failure();
+        assert_eq!(b.delay(), Duration::from_secs(60 * m), "stays capped");
+        b.reset();
+        assert_eq!(
+            b.delay(),
+            Duration::from_secs(60),
+            "reset returns to the first-probe delay"
+        );
+    }
+
+    /// The probe timer maps the ladder onto concrete deadlines relative to an
+    /// injected `now`.
+    #[tokio::test]
+    async fn probe_timer_deadlines_follow_the_ladder() {
+        let base = tokio::time::Instant::now();
+        let mut t = ProbeTimer::armed(base);
+        assert_eq!(t.deadline().duration_since(base), Duration::from_secs(60));
+        t.on_failure(base);
+        assert_eq!(t.deadline().duration_since(base), Duration::from_secs(120));
+        t.on_failure(base);
+        assert_eq!(t.deadline().duration_since(base), Duration::from_secs(300));
+        t.reset(base);
+        assert_eq!(t.deadline().duration_since(base), Duration::from_secs(60));
+    }
+
+    /// Ranking + "below best": webrtc-dc and quic-derp are below quic-v1 (so they
+    /// probe); quic-v1 is the ceiling (no probe). quic-derp is only OFFERED as a
+    /// candidate where derp fallback is enabled.
+    #[test]
+    fn transport_ranking_and_better_set() {
+        assert!(transport_rank(TRANSPORT_QUIC_V1) > transport_rank(TRANSPORT_QUIC_DERP_V1));
+        assert!(transport_rank(TRANSPORT_QUIC_DERP_V1) > transport_rank(TRANSPORT_WEBRTC_DC_V1));
+        assert_eq!(transport_rank("something-newer"), 0);
+
+        // active webrtc-dc, derp off: only quic-v1 is a candidate.
+        assert_eq!(
+            better_transports(TRANSPORT_WEBRTC_DC_V1, false),
+            vec![TRANSPORT_QUIC_V1]
+        );
+        // active webrtc-dc, derp on: quic-v1 then quic-derp-v1.
+        assert_eq!(
+            better_transports(TRANSPORT_WEBRTC_DC_V1, true),
+            vec![TRANSPORT_QUIC_V1, TRANSPORT_QUIC_DERP_V1]
+        );
+        // active quic-derp: only quic-v1 (never webrtc, never itself).
+        assert_eq!(
+            better_transports(TRANSPORT_QUIC_DERP_V1, true),
+            vec![TRANSPORT_QUIC_V1]
+        );
+        // active quic-v1: nothing better → not below best.
+        assert!(better_transports(TRANSPORT_QUIC_V1, true).is_empty());
+
+        assert!(below_best(TRANSPORT_WEBRTC_DC_V1, false));
+        assert!(below_best(TRANSPORT_QUIC_DERP_V1, true));
+        assert!(!below_best(TRANSPORT_QUIC_V1, true));
+    }
+
+    /// A pinned `--transport` never probes, and the kill switch (off) disables
+    /// probing for an `auto` flow. NC86P2K (reupgrade_active ignores `pref`)
+    /// turns the pinned asserts red; NC86P2S (it ignores the kill switch) the
+    /// kill-switch assert.
+    #[test]
+    fn reupgrade_gate_respects_pinned_and_kill_switch() {
+        assert!(
+            reupgrade_active(TransportPref::Auto, true),
+            "auto + on ⇒ probes"
+        );
+        assert!(
+            !reupgrade_active(TransportPref::Auto, false),
+            "kill switch off ⇒ no probe"
+        );
+        assert!(
+            !reupgrade_active(TransportPref::Quic, true),
+            "pinned quic ⇒ never probes"
+        );
+        assert!(
+            !reupgrade_active(TransportPref::Webrtc, true),
+            "pinned webrtc ⇒ never probes"
+        );
+    }
+
+    /// The kill switch is wired to the env flag: default ON, `0` turns it off,
+    /// `1` back on. NC86P2E (`reupgrade_enabled` hardcoded `true`) turns the
+    /// `=0` assert red. Serialised via the env `Saved` guard so it restores
+    /// whatever the host had.
+    #[test]
+    fn kill_switch_reads_the_env() {
+        let _saved = tunnel_core::env::test_env::Saved::cleared("TUNNEL_REUPGRADE");
+        assert!(reupgrade_enabled(), "default is ON");
+        unsafe { tunnel_core::env::test_env::set("TUNNEL_REUPGRADE", "0") };
+        assert!(
+            !reupgrade_enabled(),
+            "ROOMLERD_TUNNEL_REUPGRADE=0 turns it off"
+        );
+        unsafe { tunnel_core::env::test_env::set("TUNNEL_REUPGRADE", "1") };
+        assert!(reupgrade_enabled(), "=1 turns it back on");
+    }
+
+    /// The start-transport test lever maps its word to a concrete first-session
+    /// request; `auto`/empty/unknown ⇒ no override.
+    #[test]
+    fn start_request_transport_maps_the_lever_word() {
+        assert_eq!(
+            start_request_transport("webrtc"),
+            Some(TRANSPORT_WEBRTC_DC_V1)
+        );
+        assert_eq!(start_request_transport("quic"), Some(TRANSPORT_QUIC_V1));
+        assert_eq!(start_request_transport("auto"), None);
+        assert_eq!(start_request_transport(""), None);
+        assert_eq!(start_request_transport("nonsense"), None);
+    }
+
+    /// A fake carrier for the drain reaper: a settable in-flight count, a signal
+    /// to fire when it reaches 0, and a flag set on Drop so the test can see when
+    /// the reaper actually released it.
+    struct FakeDrain {
+        active: Arc<AtomicU64>,
+        idle: Arc<tokio::sync::Notify>,
+        dead: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for FakeDrain {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl DrainableCarrier for FakeDrain {
+        fn dead(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let dead = self.dead.clone();
+            Box::pin(async move { dead.notified().await })
+        }
+        fn drained(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let active = self.active.clone();
+            let idle = self.idle.clone();
+            Box::pin(async move {
+                loop {
+                    let n = idle.notified();
+                    tokio::pin!(n);
+                    n.as_mut().enable();
+                    if active.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                    n.await;
+                }
+            })
+        }
+    }
+
+    /// FR-86 P2 drain (the make-before-break guarantee at the supervisor's drop
+    /// decision): a carrier the flow re-upgraded away from is NOT dropped while
+    /// it still has a connection in flight — its established connections run to
+    /// their natural end — and IS dropped (→ terminate) once its active count
+    /// reaches 0. NC86P2P (drop the old carrier at once instead of draining)
+    /// turns the "not dropped while active" assertion red — the "promote-by-cut".
+    #[tokio::test]
+    async fn drain_carrier_keeps_the_old_carrier_until_active_reaches_zero() {
+        let active = Arc::new(AtomicU64::new(1));
+        let idle = Arc::new(tokio::sync::Notify::new());
+        let dead = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = Arc::new(FakeDrain {
+            active: active.clone(),
+            idle: idle.clone(),
+            dead,
+            dropped: dropped.clone(),
+        });
+        let hub = TunnelClientHub::new("t".into());
+        let sid = oid(9);
+        // Move the ONLY strong ref to the FakeDrain into the reaper.
+        let reaper = tokio::spawn(drain_carrier(hub, sid, fake));
+
+        // While a connection is in flight the reaper holds the carrier open.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a draining carrier is NOT dropped while it still carries a connection"
+        );
+
+        // The last connection ends: the reaper drops the carrier (→ terminate).
+        active.store(0, Ordering::SeqCst);
+        idle.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), reaper)
+            .await
+            .expect("reaper finishes once drained")
+            .unwrap();
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a drained carrier is dropped once its active count reaches 0"
+        );
+    }
+
+    /// The dead-first path: if a draining carrier dies before it drains, the
+    /// reaper drops it at once (no leak).
+    #[tokio::test]
+    async fn drain_carrier_drops_on_death_before_it_drains() {
+        let active = Arc::new(AtomicU64::new(1)); // never reaches 0
+        let idle = Arc::new(tokio::sync::Notify::new());
+        let dead = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = Arc::new(FakeDrain {
+            active,
+            idle,
+            dead: dead.clone(),
+            dropped: dropped.clone(),
+        });
+        let hub = TunnelClientHub::new("t".into());
+        let reaper = tokio::spawn(drain_carrier(hub, oid(10), fake));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        dead.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), reaper)
+            .await
+            .expect("reaper finishes on death")
+            .unwrap();
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

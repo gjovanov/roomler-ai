@@ -889,10 +889,11 @@ impl LocalApiState for DaemonState {
         local: u16,
         remote: &str,
         transport: &str,
+        start_transport: &str,
     ) -> Response {
         match self
             .tunnel_hub
-            .create_forward(node, local, remote, transport)
+            .create_forward(node, local, remote, transport, start_transport)
             .await
         {
             Ok(id) => Response::FlowCreated { id },
