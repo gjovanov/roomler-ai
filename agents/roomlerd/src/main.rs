@@ -3886,7 +3886,13 @@ async fn run_cmd(
                     Ok(()) => tracing::info!("org signaling loop ended (shutdown)"),
                     Err(e) => {
                         let chain = format!("{e:#}");
-                        tracing::error!(error = %chain, "org signaling loop terminated");
+                        // #1750 — the org refuses us: the loop already said
+                        // so, once, as a WARN naming the ways out.
+                        if signaling::is_secondary_goodbye(&e) {
+                            tracing::debug!(error = %chain, "org signaling loop ended: the org refuses this machine");
+                        } else {
+                            tracing::error!(error = %chain, "org signaling loop terminated");
+                        }
                         if let Ok(mut t) = org_terminal.lock() {
                             *t = Some(chain);
                         }
@@ -4057,7 +4063,12 @@ async fn run_cmd(
                             Ok(()) => tracing::info!("joined-org signaling loop ended (shutdown)"),
                             Err(e) => {
                                 let chain = format!("{e:#}");
-                                tracing::error!(error = %chain, "joined-org signaling loop terminated");
+                                // #1750 — see the boot supervisor above.
+                                if signaling::is_secondary_goodbye(&e) {
+                                    tracing::debug!(error = %chain, "joined-org signaling loop ended: the org refuses this machine");
+                                } else {
+                                    tracing::error!(error = %chain, "joined-org signaling loop terminated");
+                                }
                                 if let Ok(mut t) = terminal.lock() {
                                     *t = Some(chain);
                                 }
