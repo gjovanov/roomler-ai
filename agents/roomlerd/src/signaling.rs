@@ -24,6 +24,7 @@ use crate::config::AgentConfig;
 use crate::indicator::ViewerIndicator;
 use crate::notify;
 use crate::peer::AgentPeer;
+use crate::tunnel::quic_setup::{Begin, QuicSetupError, Settled};
 use crate::watchdog;
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::transport::relay;
@@ -594,6 +595,17 @@ pub async fn run(
     // Each connection's peers get a clone via `handle_server_msg`.
     let (tunnel_reap_tx, mut tunnel_reap_rx) =
         mpsc::channel::<crate::tunnel::reap::TunnelReap>(crate::tunnel::reap::TUNNEL_REAP_CAP);
+    // #1761 — where a TURN-relayed QUIC setup, run on its own task, hands
+    // the peer it built back to the loop. Same shape as the reap channel:
+    // per ORG loop (a secondary org's peer must never land in the primary's
+    // maps), the receiver borrowed into every connection so a setup that
+    // finishes during a reconnect gap is drained — and closed, its
+    // connection being gone — by the next one, and this sender retained
+    // for the loop's life so the receiver never closes.
+    let (quic_setup_tx, mut quic_setup_rx) =
+        mpsc::channel::<crate::tunnel::quic_setup::QuicSetupOutcome>(
+            crate::tunnel::quic_setup::QUIC_SETUP_OUTCOME_CAP,
+        );
     // rc.307 (B) — multi-region DERP admission-ticket cache, hoisted from
     // connect_once scope: the PERSISTENT overlay runtime's regional-DERP
     // factory captures this slot ONCE, so a per-connection slot went stale
@@ -687,6 +699,8 @@ pub async fn run(
             &mut consent_rx,
             &tunnel_reap_tx,
             &mut tunnel_reap_rx,
+            &quic_setup_tx,
+            &mut quic_setup_rx,
         )
         .await
         {
@@ -1103,6 +1117,11 @@ async fn connect_once(
     // borrowed from `run` so they span reconnects (see the channel's doc).
     tunnel_reap_tx: &crate::tunnel::reap::ReapSender,
     tunnel_reap_rx: &mut mpsc::Receiver<crate::tunnel::reap::TunnelReap>,
+    // #1761 — the QUIC-setup outcome channel: the sender each spawned
+    // TURN-relayed setup reports on, and the receiver the outcome arm
+    // drains. Both borrowed from `run` so they span reconnects.
+    quic_setup_tx: &crate::tunnel::quic_setup::QuicSetupSender,
+    quic_setup_rx: &mut crate::tunnel::quic_setup::QuicSetupReceiver,
 ) -> Result<(), ConnectError> {
     // S6 — `tid` is the tenant-affinity key the server-front LB hashes
     // on, co-locating this agent's WS with its tenant's controllers on
@@ -1378,6 +1397,12 @@ async fn connect_once(
     // R3 — reclaim any QUIC peers stashed by a prior session's TRANSIENT exit
     // (empty unless `tunnel_peers_survive_reattach` is on ⇒ pre-R3 identical).
     let mut tunnel_quic_peers = reclaim_survived_quic_peers(&cfg.tenant_id);
+    // #1761 — the TURN-relayed QUIC setups this connection has in flight,
+    // each on its own task, with the candidates that arrived meanwhile and
+    // a cancel flag. Fresh per connection like the maps above: a setup
+    // that outlives the connection reports to the next one, which holds no
+    // entry for it and closes what it built.
+    let mut pending_quic_setups = crate::tunnel::quic_setup::PendingQuicSetups::default();
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -1906,6 +1931,49 @@ async fn connect_once(
                 .await;
                 watchdog::tick(ctx.pump);
             }
+            Some(outcome) = quic_setup_rx.recv() => {
+                // #1761 — a TURN-relayed QUIC setup finished on its task.
+                // `settle` decides against this connection's in-flight
+                // entries: the attempt still held and not cancelled is
+                // inserted; a cancelled or late one (a terminate arrived
+                // meanwhile, or the setup outlived the connection that
+                // started it) has been closed inside `settle` — never
+                // inserted, never merely dropped (#1754). The candidates
+                // that arrived while the peer was being built are
+                // permitted BEFORE the ready goes out, so the client's
+                // opening Initials meet their TURN permission.
+                let sid = outcome.session_id;
+                match pending_quic_setups.settle(outcome) {
+                    Settled::Ready { peer, candidates } => {
+                        crate::tunnel::quic_setup::permit_candidates(&peer, sid, &candidates).await;
+                        let ready = ClientMsg::TunnelQuicReady {
+                            session_id: sid,
+                            cert_fingerprint: peer.cert_fingerprint().to_string(),
+                            addrs: peer.addrs(),
+                            derp_pubkey: None,
+                        };
+                        if let Some(displaced) = tunnel_quic_peers.insert(sid, peer) {
+                            // Only an R3-reclaimed peer could already sit
+                            // here. One peer per session: closed, so its
+                            // accept task cannot later reap the new one.
+                            warn!(session_id = %sid, "tunnel quic: a peer already held this session — closing the displaced one");
+                            displaced.close();
+                        }
+                        let _ = outbound_tx.send(ready).await;
+                        info!(session_id = %sid, buffered_candidates = candidates.len(), "agent QUIC peer ready; rc:tunnel.quic.ready sent");
+                    }
+                    Settled::Failed(QuicSetupError::Allocate(e)) => {
+                        warn!(session_id = %sid, %e, "tunnel quic: TURN allocate failed — no QUIC relay this session");
+                    }
+                    Settled::Failed(QuicSetupError::Setup(e)) => {
+                        warn!(session_id = %sid, %e, "tunnel quic: AgentQuicPeer setup failed");
+                    }
+                    Settled::Closed { verdict, had_peer } => {
+                        info!(session_id = %sid, ?verdict, had_peer, "tunnel quic: setup result not inserted — closed (#1761)");
+                    }
+                }
+                watchdog::tick(ctx.pump);
+            }
             // FR-43 P2b-2 — an rc message the root daemon delegated to us.
             //
             // It runs through the SAME `handle_server_msg` with the SAME
@@ -1984,6 +2052,8 @@ async fn connect_once(
                     &mut tunnel_quic_peers,
                     &outbound_tx,
                     tunnel_reap_tx,
+                    &mut pending_quic_setups,
+                    quic_setup_tx,
                     encoder_preference,
                     &indicator,
                     &consent_broker,
@@ -2042,6 +2112,8 @@ async fn connect_once(
                                 &mut tunnel_quic_peers,
                                 &outbound_tx,
                                 tunnel_reap_tx,
+                                &mut pending_quic_setups,
+                                quic_setup_tx,
                                 encoder_preference,
                                 &indicator,
                                 &consent_broker,
@@ -2345,6 +2417,10 @@ async fn handle_server_msg(
     // #1754 — handed (cloned) to every tunnel peer built here, so it can
     // report its client gone to the reap arm.
     tunnel_reap_tx: &crate::tunnel::reap::ReapSender,
+    // #1761 — this connection's TURN-relayed QUIC setups in flight, and the
+    // per-org channel their tasks report on.
+    pending_quic_setups: &mut crate::tunnel::quic_setup::PendingQuicSetups,
+    quic_setup_tx: &crate::tunnel::quic_setup::QuicSetupSender,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
     consent_broker: &crate::consent::ConsentBroker,
@@ -3438,23 +3514,57 @@ async fn handle_server_msg(
                     _ => None,
                 });
 
-            let peer_result = if let Some((urls, user, cred)) = turn_creds {
-                match relay::allocate_relay_from_ice(&urls, &user, &cred).await {
-                    Ok(turn_relay) => {
-                        let relay_conn: Arc<dyn relay::RelayConn> = Arc::new(turn_relay);
-                        crate::tunnel::quic_peer::AgentQuicPeer::setup_over_relay(
-                            session_id,
-                            quic_auth_token,
-                            relay_conn,
-                            tunnel_reap_tx.clone(),
-                        )
+            if let Some((urls, username, credential)) = turn_creds {
+                // #1761 — NOT awaited here. The allocation walks the relay
+                // ladder, ~20 s per setup on a UDP-hostile network, and
+                // awaiting it on this loop stalled everything behind it —
+                // pings, other sessions' setups, ICE, terminates, RC
+                // signaling — for that long, per setup. It runs on its own
+                // task; the outcome arm in `connect_once` inserts the peer
+                // and sends the ready, applying the candidates buffered
+                // meanwhile. A refusal spawns nothing and sends no ready:
+                // the client soft-falls back exactly as after a failed
+                // allocation.
+                let req = crate::tunnel::quic_setup::QuicTurnSetup {
+                    session_id,
+                    quic_auth_token,
+                    urls,
+                    username,
+                    credential,
+                };
+                match crate::tunnel::quic_setup::begin_quic_turn_setup(
+                    pending_quic_setups,
+                    req,
+                    tunnel_reap_tx.clone(),
+                    quic_setup_tx.clone(),
+                    crate::tunnel::quic_setup::allocate_turn_relay,
+                )
+                .await
+                {
+                    Begin::Started { attempt } => {
+                        info!(
+                            %session_id,
+                            attempt,
+                            in_flight = pending_quic_setups.len(),
+                            "tunnel quic: TURN-relayed setup started off the signaling loop (#1761)"
+                        );
                     }
-                    Err(e) => {
-                        warn!(%session_id, %e, "tunnel quic: TURN allocate failed — no QUIC relay this session");
-                        return Ok(());
+                    Begin::AlreadyPending => {
+                        warn!(%session_id, "tunnel quic: a setup for this session is already in flight — ignoring the duplicate (#1761)");
+                    }
+                    Begin::AtCapacity => {
+                        warn!(
+                            %session_id,
+                            cap = crate::tunnel::quic_setup::QUIC_SETUP_IN_FLIGHT_CAP,
+                            "tunnel quic: too many TURN-relayed setups in flight — refusing this one; the client falls back (#1761)"
+                        );
                     }
                 }
-            } else {
+                return Ok(());
+            }
+
+            // Direct bind: synchronous and instant, so it stays inline.
+            let peer_result = {
                 let bind = match "0.0.0.0:0".parse() {
                     Ok(b) => b,
                     Err(e) => {
@@ -3495,19 +3605,19 @@ async fn handle_server_msg(
         // own allocation) — without it coturn drops the client's opening
         // QUIC Initials. No-op for a direct (non-relay) peer. Phase 3d.
         ServerMsg::TunnelQuicCandidate { session_id, addrs } => {
-            if let Some(peer) = tunnel_quic_peers.get(&session_id) {
-                for a in &addrs {
-                    match a.parse::<std::net::SocketAddr>() {
-                        Ok(sa) => {
-                            if let Err(e) = peer.permit(sa).await {
-                                debug!(%session_id, addr = %a, %e, "tunnel quic: permit failed");
-                            }
-                        }
-                        Err(e) => {
-                            debug!(%session_id, addr = %a, %e, "tunnel quic: unparseable candidate addr")
-                        }
-                    }
+            let parsed = crate::tunnel::quic_setup::parse_candidate_addrs(session_id, &addrs);
+            if pending_quic_setups.is_pending(session_id) {
+                // #1761 — the peer is still being built on its task. Hold
+                // the addresses; the outcome arm permits them the moment
+                // the peer lands, before the ready goes out. Dropping them
+                // here would be a session that never connects: the client's
+                // opening Initials meet no TURN permission.
+                for sa in &parsed {
+                    pending_quic_setups.buffer_candidate(session_id, *sa);
                 }
+                debug!(%session_id, count = parsed.len(), "tunnel quic: candidates buffered for a setup in flight (#1761)");
+            } else if let Some(peer) = tunnel_quic_peers.get(&session_id) {
+                crate::tunnel::quic_setup::permit_candidates(peer, session_id, &parsed).await;
             } else {
                 debug!(%session_id, "tunnel quic candidate for unknown session — dropping");
             }
@@ -3533,6 +3643,11 @@ async fn handle_server_msg(
         // client or admin-side teardown). Tear down our peer state.
         ServerMsg::TunnelTerminate { session_id, reason } => {
             info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
+            // #1761 — a setup still in flight for this session: its result,
+            // when it lands, is closed rather than inserted.
+            if pending_quic_setups.cancel(session_id) {
+                info!(%session_id, "rc:tunnel.terminate for a QUIC setup still in flight — its result will be closed (#1761)");
+            }
             if let Some(peer) = tunnel_peers.remove(&session_id) {
                 close_within_budget(peer.close(), session_id, "tunnel_terminate").await;
             }
