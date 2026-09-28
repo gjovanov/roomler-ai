@@ -498,7 +498,7 @@ exit's own log:
 | Exit time (UTC) | Event |
 |---|---|
 | 18:32:39.9 · 18:33:00.2 · 18:33:20.5 · 18:33:40.8 | `agent QUIC peer ready` (QUIC-over-TURN) for four sessions — **exactly 20.3 s apart, strictly serial** |
-| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:261`) |
+| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:283`) |
 | 18:33:40.77–.80 | the WebRTC fallbacks' SDP answers, in the same burst, also late |
 | 18:32:09 | `torn down agent QUIC tunnel peers on ws disconnect count=4` — the exit's control WS had dropped mid-backlog, its keepalives unanswered |
 
@@ -573,6 +573,97 @@ task actually end), `a_completion_with_no_entry_or_a_stale_attempt_is_closed_lat
 `a_duplicate_setup_is_refused_while_live_and_allowed_after_a_cancel`,
 `the_in_flight_bound_refuses_the_extra_setup_until_one_completes` and
 `a_result_the_loop_cannot_receive_is_closed_by_the_task`.
+
+### The flow owns the listener; a session is a carrier (FR-86 P1)
+
+Until 0.4.113 a tunnel session bound the route's loopback port itself and ran its
+own accept loop (`run_webrtc_session` / `run_quic_session` in
+`crates/tunnel-core/src/driver.rs`), spawning one task per accepted connection that
+held `Arc`s to *that* session's DC pool or QUIC connection. Two consequences, both
+field-visible on 2026-09-28 ([FR-86](fr/FR-86-tunnel-transport-reupgrade.md),
+[#1769](https://github.com/gjovanov/roomler-ai/issues/1769)):
+
+| Consequence | Why |
+|---|---|
+| A route that fell back to `webrtc-dc-v1` stayed there for hours while `quic-v1` through the same exit worked | a second session could never be established beside the first — both would bind `127.0.0.1:<port>` — so the only way to try the better transport was to end the session, which cuts every connection it carries |
+| A client got `connection refused` during every reconnect | the port lived and died with the session: unbound from the moment one ended until the next reached its bind, which comes *after* `rc:tunnel.opened` and the 30 s pool-open / QUIC-ready wait — the whole ladder toward a slow or busy exit |
+
+P1 splits the session in two and moves the port to the flow. It changes no wire
+and nothing on the exit; its one visible effect is that a route no longer refuses
+connections while it reconnects. What it enables is P2: a second carrier
+established beside the first, promoted, the first drained.
+
+| Piece | What it is | Where |
+|---|---|---|
+| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:872`](../crates/tunnel-core/src/driver.rs) |
+| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:443`](../crates/tunnel-core/src/driver.rs) · `carry` `:527` · `dead` `:687` |
+| `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one | [`flow_listener.rs:86`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:144` · `offer` `:191` |
+| `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:63`](../crates/tunnel-core/src/flow_listener.rs) |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:742`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:881` `run_flow_cycle` |
+| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:810`](../crates/tunnel-core/src/driver.rs) |
+
+```mermaid
+sequenceDiagram
+    participant C as client app
+    participant L as flow listener (bound once)
+    participant A as carrier A
+    participant S as flow supervisor
+    participant B as carrier B
+
+    A-->>S: dead(): dispatcher exited / P7 backstop / conn.closed()
+    S->>L: clear()
+    Note over L: the port stays bound, no carrier
+    S->>A: drop — dispatcher aborted, peer closed, rc:tunnel.terminate
+    C->>L: connect — the kernel accepts it
+    L->>L: hold (≤ 64 held, ≤ 30 s each)
+    S->>S: backoff, then the ladder: open → handshake → ready
+    S->>L: install(B) — every held connection handed to B, flow = Up
+    B->>C: the connection proceeds (SOCKS5 handshake / forward request)
+```
+
+⚠️ **`Up` still means "it serves", not "it is bound".** The flow's port is bound
+before any session exists, so #1685's rule had to move one step: `FlowLive::mark_listening`
+([`client_mgr.rs:195`](../agents/roomlerd/src/tunnel/client_mgr.rs)) now fires when a
+carrier is **installed** — the same call that hands it the held connections — not from a
+bind hook. A route to an offline node reads `backoff` exactly as before; a held connection
+is not a serving route. (`SessionParams::on_listening` stays for `run_tunnel_session`'s
+own per-session bind; the daemon passes `None`.)
+
+⚠️ **Held is a different failure from refused, and the client sees it.** A connect now
+succeeds at once and the first byte waits — up to 30 s — where before it got
+`ECONNREFUSED` immediately. A client with an application timeout shorter than the
+reconnect sees that timeout instead; one that retried on refusal no longer has to.
+
+⚠️ **The bounds are the design.** 64 is above the burst a desktop app opening its pooled
+connections makes, and small enough that a client hammering a route whose exit never
+comes back cannot pile up sockets on the daemon. 30 s covers a full re-establishment (the
+open's 15 s and the ready's 30 s are caps a healthy exit cuts to 1–5 s) and is under any
+client timeout worth waiting out. Both are constants in P1, not config.
+
+⚠️ **Nothing about #1754 moved.** The terminate guard is created at the same point
+([`driver.rs:970`](../crates/tunnel-core/src/driver.rs), the moment the session id is
+known) and *moves into the carrier*, so an early `?`, a `QuicSetupFailed` soft-fall, the
+carrier's drop and the `kill_flow` abort all still tell the exit, and `kill_flow`'s
+synchronous fast path is unchanged. A killed flow drops its listener — the accept task is
+an `AbortOnDrop` — and every held connection with it.
+
+⚠️ **One dead signal came back.** The R4 derp-lead (`quic_over_turn_failing`, the
+"lead with `quic-derp-v1` once QUIC-over-TURN failed on this path" heuristic) read the
+flow's `transport` cell *after* `drive_one` had already cleared it — since it was written
+(#711) — so it never fired. The supervisor now reads the carrier's own transport. It is
+behind `TUNNEL_DERP_FALLBACK`, default off, so nothing changes on a default fleet.
+
+Locked by lib tests, each shown red with a one-line negative control (`// NC86A`…):
+
+| Test | What it locks | Red with |
+|---|---|---|
+| `flow_listener::tests::a_client_connecting_between_carriers_is_held_then_carried_never_refused` | the port is bound once across a carrier replacement; a client connecting in the gap is accepted and held — never refused, never closed — then carried by the next carrier with its bytes intact | NC86A: the accept task aborted on `clear()` (the listener dies with the session); NC86B: no hold (closed on arrival) |
+| `…a_connection_held_past_the_wait_bound_is_closed` | the time bound: closed after `max_wait`, never handed to a later carrier | NC86D: no expiry |
+| `…a_connection_beyond_the_count_bound_is_closed_and_the_held_ones_are_carried` | the count bound, and hand-off in arrival order | NC86C: no count bound |
+| `…dropping_the_listener_releases_held_connections_and_unbinds_the_port` | a killed flow releases what it held and frees the port | NC86E: the accept task outlives the listener |
+| `driver::tests::a_quic_carrier_carries_counts_dies_and_terminates`, `…is_dead_when_its_connection_closes` | a real QUIC carrier over a loopback pair: `carry` round-trips bytes through the real dispatcher, `active()` counts, `dead()` stays pending while healthy and resolves on the control channel closing / the connection closing (with the `io_error` terminate), the drop sends the guard's terminate | — (the refactor's own safety net: the pre-existing suites, unchanged) |
+| `tunnel::client_mgr::tests::a_client_connecting_before_any_carrier_is_held_and_released_by_kill_flow` | the daemon path: `create_forward` binds before any session; a client is held while the flow reads `connecting`; `kill_flow` releases it and unbinds | NC86B · NC86E |
+| `tunnel_tests::agent_daemon_originated_forward_reaches_target` (integration) | the real daemon-originated flow accepts a client while its open is in flight, and `kill_flow` releases it | NC86B |
 
 ## Policy — two independent gates
 
