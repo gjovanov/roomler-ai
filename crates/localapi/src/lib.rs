@@ -1667,6 +1667,17 @@ pub struct RecordingState {
     pub system_audio: bool,
     #[serde(default)]
     pub microphone: bool,
+    /// #1760 — why a recording here could not include what the computer
+    /// plays (`system_audio` in [`RecordStartOpts`]), in words: the service
+    /// was built without audio capture, or the platform has no loopback to
+    /// open (macOS, until ScreenCaptureKit). `None` where it can. A client
+    /// greys its "Computer audio" box out with the words, and the owner's
+    /// "Include computer audio" remote toggle likewise, instead of offering
+    /// a start that can only fail. Absent from a service older than this,
+    /// which reads as "it can": today's behaviour, the recorder refusing by
+    /// name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_unavailable_reason: Option<String>,
     /// FR-85 P3 — the active recording was started by a REMOTE controller
     /// (this is their display name); `None` for a local one. What the host
     /// sees in the tray and the Recordings view: "recording for Alice".
@@ -5429,6 +5440,42 @@ mod tests {
             !older.available,
             "absent = cannot record, never the reverse"
         );
+    }
+
+    /// #1760 — a state says, ahead of any start, why computer audio cannot
+    /// go into a recording here (a Mac; a service built without audio), so
+    /// a client greys the box out with the words. The field is absent where
+    /// it can, and absent from a service older than the field, which reads
+    /// as "it can": the behaviour of the day, the recorder refusing by name.
+    #[test]
+    fn a_state_says_why_computer_audio_cannot_be_recorded_before_any_start() {
+        let cannot = RecordingState {
+            available: true,
+            system_audio_unavailable_reason: Some(
+                "macOS can't capture what the computer plays yet".into(),
+            ),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&Response::Recording(cannot.clone())).unwrap();
+        assert!(
+            j.contains(r#""system_audio_unavailable_reason":"macOS"#),
+            "{j}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&j).unwrap(),
+            Response::Recording(cannot)
+        );
+        let can = RecordingState {
+            available: true,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&Response::Recording(can)).unwrap();
+        assert!(
+            !j.contains("system_audio_unavailable_reason"),
+            "absent where it can: {j}"
+        );
+        let older: RecordingState = serde_json::from_str(r#"{"active":false}"#).unwrap();
+        assert_eq!(older.system_audio_unavailable_reason, None);
     }
 
     #[tokio::test]
