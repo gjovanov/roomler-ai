@@ -116,7 +116,7 @@ sequenceDiagram
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this PR |
-| P1 | flow-owned listener, `Carrier` split, held connections during reconnect; tests; docs | revert (pure refactor, no wire change) | planned |
+| P1 | flow-owned listener, `Carrier` split, held connections during reconnect; tests; docs | revert (pure refactor, no wire change) | implemented 2026-09-28, in review: `establish_tunnel_session` + `Carrier` (`crates/tunnel-core/src/driver.rs`), `FlowListener` + `HoldPolicy` (`crates/tunnel-core/src/flow_listener.rs`, ≤ 64 held, ≤ 30 s), the daemon flow binds once (`agents/roomlerd/src/tunnel/client_mgr.rs` `run_flow_cycle`); 9 new tests, 5 negative controls shown red; `docs/tunnels.md` §"The flow owns the listener" |
 | P2 | re-upgrade probe, promotion, drain; tests; docs | `ROOMLER_TUNNEL_REUPGRADE=0` / `tunnel_reupgrade = false` | planned |
 | P3 | agent release; field verification (AC7, AC8); close | as P2 | planned |
 
