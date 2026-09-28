@@ -52,8 +52,8 @@ jobs:
   #     restore master's caches read-only.
   rust-lint:
     name: Rust lint (fmt, clippy)
-    # History of the single "Rust checks" job these lanes replaced — its
-    # cache-key mechanism still applies to every lane:
+    # History of the single "Rust checks" job these lanes replaced (its
+    # cache-key premise is corrected at the end):
     #
     # FR-69 P5b — 30 minutes, not 20: the job builds clippy for the whole
     # workspace plus the unit tests of five audited crates, and since the
@@ -71,9 +71,14 @@ jobs:
     # 31 min 29 s in `Test tunnel-core --features overlay-l3,overlay-netstack`
     # with every prior step green.
     #
+    # ⚠️ Correction (2026-09-28): the premise above is wrong. rust-cache
+    # ignores `key` when `shared-key` is set, so an edit to this file never
+    # rotated the key, and those cold runs had another cause. The cache step
+    # below says what does rotate it, and what starts a lane cold.
+    #
     # Wave 14: every lane runs well under 10 min warm; 30 leaves a cold lane
-    # (the first run after any edit to this file) room to finish without
-    # letting a hung step idle for most of an hour.
+    # (after an eviction, a toolchain bump or a new cache family) room to
+    # finish without letting a hung step idle for most of an hour.
     timeout-minutes: 30
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
@@ -111,19 +116,32 @@ jobs:
           shared-key: ci-lint
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          # Rotate the cache key whenever THIS WORKFLOW changes. Without
-          # this, a step that adds compile surface without touching
-          # Cargo.lock (2026-08-21: `Run API unit tests` pulled the whole
-          # api/services dep universe into the test profile) computes the
-          # SAME key as the pre-step cache — Swatinem's exact-hit restore
-          # then skip-saves every run, the new artifacts can never enter
-          # the immutable cache, and every run re-pays the compile
-          # (~7 min/run, runs 32509253726/32509577955/32512705127).
-          # A ci.yml edit → new key → one cold save → warm thereafter.
-          # (The release lane needs no equivalent: every release bumps the
-          # workspace version, so its lockfile-keyed generations rotate
-          # naturally within one cycle.)
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
+          # ⚠️ What rotates this key (corrected 2026-09-28, FR-6 #773). It is
+          # `v0-rust-<shared-key>-<os>-<arch>-<env hash>-<lockfile hash>`:
+          #   * the lockfile hash moves when a member crate's Cargo.toml
+          #     changes (a dependency, a feature), when Cargo.lock's
+          #     third-party entries change, or with rust-toolchain.toml or a
+          #     .cargo/config.toml. A version bump does NOT move it:
+          #     rust-cache blanks member versions and skips the workspace's
+          #     own Cargo.lock entries. On master on 09-27/28, four bumps
+          #     (0.4.108 → 0.4.113) kept one key, while three member-manifest
+          #     edits each rotated it (#1741 and #1752 added a dependency,
+          #     #1744 changed a feature);
+          #   * the env hash moves on the rustc version or any CARGO*, RUST*,
+          #     CC*, CFLAGS*, CXX* or CMAKE* env var (the job's environment,
+          #     not the workflow file's text).
+          # A new lockfile hash restores the newest older generation (the
+          # prefix match) and compiles only the delta. A new env hash,
+          # shared-key or prefix-key starts the lane cold.
+          # An edit to THIS FILE does NOT rotate it. A `key:` input used to sit
+          # here with `hashFiles(ci.yml)` claiming it did, but rust-cache reads
+          # `key` only when `shared-key` is unset (its src/config.ts, v2.9.2),
+          # so it was ignored. #1728, #1735 (+95 lines) and #1736 each edited
+          # this file on 09-27, and each master run then restored the same key
+          # with a full match and saved nothing. So a new step's dependency
+          # artifacts enter the cache only at the next rotation (or after an
+          # eviction). To force one sooner, change `prefix-key` (one cold
+          # master run); FR-6's open decisions carry the gap and a fix.
 
       - name: Check formatting
         run: cargo fmt --check --all
@@ -350,7 +368,7 @@ jobs:
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on this file.
+        # saved only from a master push, keyed on Cargo.lock + the env.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
@@ -358,7 +376,6 @@ jobs:
           shared-key: ci-unit
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -445,7 +462,7 @@ jobs:
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on this file.
+        # saved only from a master push, keyed on Cargo.lock + the env.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
@@ -453,7 +470,6 @@ jobs:
           shared-key: ci-agent
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -549,7 +565,7 @@ jobs:
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on this file.
+        # saved only from a master push, keyed on Cargo.lock + the env.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
@@ -557,7 +573,6 @@ jobs:
           shared-key: ci-recorder
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -693,7 +708,7 @@ jobs:
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on this file.
+        # saved only from a master push, keyed on Cargo.lock + the env.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
@@ -701,7 +716,6 @@ jobs:
           shared-key: ci-recorder-audio
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -1585,7 +1599,6 @@ jobs:
           shared-key: ci-profiles
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Configure apt retries
         run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
