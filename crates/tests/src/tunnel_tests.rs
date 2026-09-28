@@ -886,6 +886,35 @@ async fn agent_daemon_originated_forward_reaches_target() {
     assert_eq!(snap[0].target.as_deref(), Some("127.0.0.1:9000"));
     assert_eq!(snap[0].node.as_deref(), Some(b_id.as_str()));
 
+    // FR-86 P1 (AC3) — the flow owns its listener: it is bound when the
+    // supervisor starts, before any session exists, so a client that connects
+    // while the open is still in flight is ACCEPTED and held — not refused as
+    // it was when the session bound the port only after its data plane came
+    // up (which this test never reaches). The supervisor binds asynchronously,
+    // so the connect is polled briefly.
+    let mut early_client = None;
+    for _ in 0..40 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", local)).await {
+            Ok(s) => {
+                early_client = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let mut early_client =
+        early_client.expect("the flow's listener must accept a client before any carrier is ready");
+    {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 4];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), early_client.read(&mut buf))
+                .await
+                .is_err(),
+            "a connection arriving before a carrier is held open, not closed"
+        );
+    }
+
     // Poll until the flow records its NEGOTIATED transport — proving the open
     // handshake completed AND the hub demuxed `rc:tunnel.opened` BACK BY NONCE
     // (the per-session `ChannelSource` records the negotiated transport only
@@ -924,6 +953,30 @@ async fn agent_daemon_originated_forward_reaches_target() {
         "kill_flow removes the registered flow"
     );
     assert!(hub.flows_snapshot().is_empty(), "flows() empty after kill");
+
+    // FR-86 P1 — the kill releases the held connection (the client sees EOF)
+    // and unbinds the flow's port.
+    {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(2), early_client.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("expected the held connection to close on kill, read {n} bytes"),
+            Err(_) => panic!("kill_flow must release a connection the flow was holding"),
+        }
+    }
+    let mut rebound = false;
+    for _ in 0..40 {
+        if tokio::net::TcpListener::bind(("127.0.0.1", local))
+            .await
+            .is_ok()
+        {
+            rebound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(rebound, "kill_flow must unbind the flow's port");
 
     // #1754 — killing the flow must TELL THE EXIT AGENT, so it drops its
     // per-session peer (ICE sockets + the DC pool) instead of leaking it. B is a
