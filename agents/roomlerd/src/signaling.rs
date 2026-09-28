@@ -739,16 +739,18 @@ pub async fn run(
                 // the supervisor in `run_cmd` records the terminal error
                 // for the LocalAPI `OrgStatus`.
                 if !ctx.is_primary {
+                    // #1750 — the ONE line this org gets per start; the
+                    // goodbye arm and the supervisor stay at DEBUG for it.
+                    let gone = SecondaryGoodbye {
+                        label: ctx.label.clone(),
+                        reason,
+                        message,
+                    };
                     warn!(
                         org = %ctx.label,
-                        ?reason,
-                        %message,
-                        "server-side close for this org — stopping its loop (other orgs unaffected)"
+                        "{gone} — stopping this org's loop (other orgs unaffected)"
                     );
-                    return Err(anyhow::anyhow!(
-                        "server goodbye ({reason:?}): {message} — re-enroll this org \
-                         with `roomlerd enroll --server <url> --token <new-jwt>`"
-                    ));
+                    return Err(gone.into());
                 }
                 // rc.53: server told us to stop reconnecting. The
                 // teardown of in-flight peers already ran in the
@@ -978,6 +980,40 @@ fn write_replaced_sentinel(message: &str, displacements: usize) {
             "failed to write needs-attention sentinel for ReplacedByNewer escalation"
         ),
     }
+}
+
+/// #1750 — a SECONDARY org's loop ended because that org's server refuses this
+/// enrollment for good (`AgentDeleted` / `PolicyRejected`).
+///
+/// Typed so the supervisors in `run_cmd` can tell it from a fault by
+/// [`is_secondary_goodbye`] — never by the text — and log it ONCE: before, a
+/// dead secondary org cost two ERRORs and a WARN on every daemon start, for a
+/// machine whose primary was perfectly healthy (field: a MacBook carried three
+/// such enrollments for a month). The text is also what `roomler status`
+/// shows for the org, so it names every way out.
+///
+/// Nothing here removes the enrollment: `AgentDeleted` also covers a
+/// QUARANTINED row (`auth_agent::refusal_reason`), which an admin can lift, so
+/// dropping the org is the owner's call.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "server goodbye ({reason:?}): {message} — org {label:?} refuses this machine \
+     (removed, quarantined or refused by policy there). Re-enroll it with \
+     `roomlerd re-enroll --org {label} --token <new-jwt>`, or stop serving it: \
+     `roomlerd org disable {label}` (kept; `roomlerd org enable {label}` restores it) \
+     or `roomlerd org rm {label}`. Restart the daemon to apply"
+)]
+pub struct SecondaryGoodbye {
+    pub label: String,
+    pub reason: AgentCloseReason,
+    pub message: String,
+}
+
+/// Whether an org loop ended on a [`SecondaryGoodbye`] — an outcome the loop
+/// has already reported as its one WARN, not a fault. Sees through
+/// `anyhow::Context` layers.
+pub fn is_secondary_goodbye(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SecondaryGoodbye>().is_some()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2997,11 +3033,23 @@ async fn handle_server_msg(
         // (delete-agent-with-active-session) checks this invariant
         // explicitly.
         ServerMsg::Goodbye { reason, message } => {
-            tracing::error!(
-                ?reason,
-                %message,
-                "server-side rc:goodbye received — stopping current session loop"
-            );
+            // #1750 — a secondary org's `run()` arm reports every goodbye
+            // reason itself (one WARN), so here it is DEBUG; the primary is
+            // unchanged.
+            if ctx.is_primary {
+                tracing::error!(
+                    ?reason,
+                    %message,
+                    "server-side rc:goodbye received — stopping current session loop"
+                );
+            } else {
+                tracing::debug!(
+                    org = %ctx.label,
+                    ?reason,
+                    %message,
+                    "server-side rc:goodbye received — stopping this org's session loop"
+                );
+            }
             close_all_peers(peers, indicator).await;
             close_all_tunnel_peers(tunnel_peers).await;
             close_all_tunnel_quic_peers(tunnel_quic_peers).await;
@@ -4425,6 +4473,51 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gone(label: &str, reason: AgentCloseReason) -> SecondaryGoodbye {
+        SecondaryGoodbye {
+            label: label.into(),
+            reason,
+            message: "agent has been deleted".into(),
+        }
+    }
+
+    /// #1750 — what `roomler status` shows for a refused secondary org names
+    /// every way out, with THAT org's label, and keeps the `server goodbye
+    /// (<reason>)` prefix operators and docs already search for.
+    #[test]
+    fn a_secondary_goodbye_names_every_way_out() {
+        let text = gone("demo", AgentCloseReason::AgentDeleted).to_string();
+        for want in [
+            "server goodbye (AgentDeleted): agent has been deleted",
+            "roomlerd re-enroll --org demo --token <new-jwt>",
+            "roomlerd org disable demo",
+            "roomlerd org enable demo",
+            "roomlerd org rm demo",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from: {text}");
+        }
+    }
+
+    /// The supervisors choose the log level by TYPE, which must survive
+    /// `anyhow` and a `.context()` layer. The same words without the type — the
+    /// pre-#1750 error, or any other text — must not pass for one: a fault
+    /// quietly demoted to DEBUG is the one outcome worse than the noise.
+    #[test]
+    fn a_secondary_goodbye_is_recognised_by_type_not_text() {
+        let e = anyhow::Error::from(gone("demo", AgentCloseReason::PolicyRejected));
+        assert!(is_secondary_goodbye(&e));
+        assert!(is_secondary_goodbye(&e.context("org loop")));
+
+        let lookalike = anyhow::anyhow!("{}", gone("demo", AgentCloseReason::AgentDeleted));
+        assert!(
+            !is_secondary_goodbye(&lookalike),
+            "text alone never classifies"
+        );
+        assert!(!is_secondary_goodbye(&anyhow::anyhow!(
+            "duplicate-instance duel: displaced 3× in the window"
+        )));
+    }
 
     /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:
     /// the session was terminated while the prompt stood, so no verdict is

@@ -98,7 +98,13 @@ CLI: `roomler org ls | rm | enable | disable | set-primary`, `enroll --label`,
 
 - per-org watchdog pumps and per-org `DOWN_SINCE` outage stamps (this was a
   process-global static — org B reconnecting would erase org A's outage);
-- a secondary's goodbye or duplicate-duel terminates **only its own loop**;
+- a secondary's goodbye or duplicate-duel terminates **only its own loop**. A
+  goodbye (`AgentDeleted` / `PolicyRejected`: the device was removed,
+  quarantined or refused there) costs **one WARN per start**, naming the ways
+  out: `re-enroll --org <label>`, `org disable <label>` (kept and reversible)
+  or `org rm <label>`. The same text is the org's terminal status in
+  `roomler status`. ⚠️ The daemon never drops the enrollment itself, because
+  `AgentDeleted` also covers a quarantine that an admin can lift (#1750);
 - invalid entries are skipped with a surfaced reason, never fatal.
 
 **Primary-only, deliberately:** `rc:agent.update` (a secondary org's admin
