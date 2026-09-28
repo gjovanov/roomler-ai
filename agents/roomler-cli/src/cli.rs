@@ -121,6 +121,13 @@ enum Command {
         /// with `flows` / `kill`. (Becomes the default at the P3d rename.)
         #[arg(long)]
         daemon: bool,
+        /// FR-86 P2 TEST LEVER (`--daemon` only) — force the daemon's FIRST
+        /// session onto this transport (e.g. `webrtc`) so an `auto` flow starts
+        /// on a below-best carrier the make-before-break re-upgrade probe then
+        /// upgrades, without restarting any daemon. Later sessions and the probe
+        /// behave as `auto`. Omit for normal operation.
+        #[arg(long, value_enum)]
+        start_transport: Option<CliTransport>,
     },
     /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
     /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
@@ -709,12 +716,26 @@ where
             remote,
             transport,
             daemon,
+            start_transport,
         } => {
             if daemon {
                 // Thin-client path: hand it to the local daemon over the
                 // LocalAPI (no config/token — the pipe ACL is the boundary).
-                localclient::create_forward(&agent, local, &remote, transport.as_word()).await
+                // FR-86 P2 — the start-transport lever is a word ("" = none).
+                localclient::create_forward(
+                    &agent,
+                    local,
+                    &remote,
+                    transport.as_word(),
+                    start_transport.map(CliTransport::as_word).unwrap_or(""),
+                )
+                .await
             } else {
+                if start_transport.is_some() {
+                    anyhow::bail!(
+                        "--start-transport requires --daemon (it is a daemon re-upgrade test lever)"
+                    );
+                }
                 let cfg = config::load(cli.config).context("loading tunnel config")?;
                 forward::run(cfg, &agent, local, &remote, transport.into()).await
             }
@@ -1030,6 +1051,7 @@ mod tests {
                 remote,
                 transport,
                 daemon,
+                start_transport,
             } => {
                 assert_eq!(agent, "507f1f77bcf86cd799439011");
                 assert_eq!(local, 5432);
@@ -1039,6 +1061,8 @@ mod tests {
                 assert_eq!(transport, CliTransport::Auto);
                 // No --daemon → in-process standalone (the current default).
                 assert!(!daemon);
+                // No --start-transport → no FR-86 P2 first-session override.
+                assert_eq!(start_transport, None);
             }
             other => panic!("expected Forward, got {other:?}"),
         }

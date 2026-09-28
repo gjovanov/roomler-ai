@@ -1080,6 +1080,15 @@ pub enum Request {
         /// `auto` (default) | `quic` | `webrtc`. Empty ⇒ `auto`.
         #[serde(default)]
         transport: String,
+        /// FR-86 P2 test lever — a word (`auto` | `quic` | `webrtc`) forcing the
+        /// daemon's FIRST session's transport, so an `auto` flow can be started
+        /// on a below-best carrier (`webrtc`) the make-before-break re-upgrade
+        /// probe then upgrades, without restarting daemons. Empty ⇒ no override
+        /// (the ladder picks). Later sessions and the probe behave as `auto`.
+        /// Additive + `skip` when empty, so the wire is unchanged for every
+        /// client that doesn't set it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        start_transport: String,
     },
     /// Create a daemon-driven SOCKS5 listener toward `node` (userspace mode —
     /// per-connection CONNECT target, no OS routing). Returns
@@ -1950,6 +1959,7 @@ pub trait LocalApiState: Send + Sync {
         _local: u16,
         _remote: &str,
         _transport: &str,
+        _start_transport: &str,
     ) -> Response {
         Response::Error {
             message: "forward origination is not supported on this node".into(),
@@ -2249,9 +2259,10 @@ where
                 local,
                 remote,
                 transport,
+                start_transport,
             }) => {
                 state
-                    .create_forward(&node, local, &remote, &transport)
+                    .create_forward(&node, local, &remote, &transport, &start_transport)
                     .await
             }
             Ok(Request::CreateSocks5 {
@@ -3173,12 +3184,14 @@ impl Client {
         local: u16,
         remote: &str,
         transport: &str,
+        start_transport: &str,
     ) -> std::io::Result<String> {
         let req = Request::CreateForward {
             node: node.to_string(),
             local,
             remote: remote.to_string(),
             transport: transport.to_string(),
+            start_transport: start_transport.to_string(),
         };
         match self.request(&req).await? {
             Response::FlowCreated { id } => Ok(id),
@@ -3967,6 +3980,7 @@ mod tests {
             local: u16,
             _remote: &str,
             _transport: &str,
+            _start_transport: &str,
         ) -> Response {
             // Echo the args back as the flow id so the test proves they crossed.
             Response::FlowCreated {
@@ -4072,7 +4086,7 @@ mod tests {
         ));
         // CreateForward / CreateSocks5 are async — awaited on the trait (the
         // `handle` sync arm returns the async-path Error, also asserted).
-        match s.create_forward("aid", 5432, "db:5432", "auto").await {
+        match s.create_forward("aid", 5432, "db:5432", "auto", "").await {
             Response::FlowCreated { id } => assert_eq!(id, "aid:5432"),
             other => panic!("expected FlowCreated, got {other:?}"),
         }
@@ -4086,23 +4100,53 @@ mod tests {
                     node: "a".into(),
                     local: 1,
                     remote: "h:2".into(),
-                    transport: String::new()
+                    transport: String::new(),
+                    start_transport: String::new()
                 },
                 &s
             ),
             Response::Error { .. }
         ));
 
-        // Wire shape — locks the discriminators the CLI depends on.
+        // Wire shape — locks the discriminators the CLI depends on. An empty
+        // `start_transport` (FR-86 P2) is `skip`ped, so the wire is unchanged
+        // for a client that doesn't use the lever.
         assert_eq!(
             serde_json::to_string(&Request::CreateForward {
                 node: "aid".into(),
                 local: 5432,
                 remote: "db:5432".into(),
                 transport: "auto".into(),
+                start_transport: String::new(),
             })
             .unwrap(),
             r#"{"t":"create_forward","d":{"node":"aid","local":5432,"remote":"db:5432","transport":"auto"}}"#
+        );
+        // A non-empty `start_transport` DOES ride the wire (the test lever).
+        assert_eq!(
+            serde_json::to_string(&Request::CreateForward {
+                node: "aid".into(),
+                local: 5432,
+                remote: "db:5432".into(),
+                transport: "auto".into(),
+                start_transport: "webrtc".into(),
+            })
+            .unwrap(),
+            r#"{"t":"create_forward","d":{"node":"aid","local":5432,"remote":"db:5432","transport":"auto","start_transport":"webrtc"}}"#
+        );
+        // An old client's payload (no `start_transport`) still deserialises.
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"t":"create_forward","d":{"node":"aid","local":5432,"remote":"db:5432","transport":"auto"}}"#
+            )
+            .unwrap(),
+            Request::CreateForward {
+                node: "aid".into(),
+                local: 5432,
+                remote: "db:5432".into(),
+                transport: "auto".into(),
+                start_transport: String::new(),
+            }
         );
         assert_eq!(
             serde_json::to_string(&Request::KillFlow { id: "f1".into() }).unwrap(),

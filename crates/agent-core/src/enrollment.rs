@@ -138,6 +138,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         relay_server_enabled: None,
         relay_server_port: None,
         tunnel_derp_fallback: None,
+        tunnel_reupgrade: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
