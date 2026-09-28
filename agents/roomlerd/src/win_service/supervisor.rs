@@ -48,7 +48,7 @@ use windows_sys::Win32::Security::{
     TokenElevationTypeLimited, TokenLinkedToken, TokenPrimary,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -1787,6 +1787,10 @@ pub struct CapturedChild {
     pub process: OwnedProcess,
     pub stdout: OwnedHandle,
     pub stderr: OwnedHandle,
+    /// The WRITE end of the child's stdin, when one was asked for (roomler
+    /// SSH feeding a client's stdin); write with [`write_all_to_pipe`], and
+    /// drop it for end-of-input. `None` = the child reads NUL.
+    pub stdin: Option<OwnedHandle>,
 }
 
 /// Output-capturing twin of [`spawn_in_session`], for running a SHELL COMMAND
@@ -1808,6 +1812,11 @@ pub struct CapturedChild {
 /// * The parent must close ITS copies of the write ends immediately after the
 ///   spawn. Same failure: as long as this process holds a writer, `ReadFile`
 ///   on the read end never returns 0.
+/// * `with_stdin` inverts both rules for that one pipe. The child inherits the
+///   READ end and the parent keeps the de-inherited WRITE end, returned in
+///   [`CapturedChild::stdin`]. The child sees end-of-input only once that
+///   handle drops, so a caller that keeps it past the child's life leaks
+///   nothing, but one that never drops it leaves a reader waiting.
 ///
 /// # Safety
 ///
@@ -1818,6 +1827,7 @@ pub unsafe fn spawn_in_session_captured(
     token: HANDLE,
     cmdline: &str,
     cwd: Option<&Path>,
+    with_stdin: bool,
 ) -> Result<CapturedChild> {
     let env = EnvBlock::for_token(token).context("CreateEnvironmentBlock")?;
 
@@ -1830,28 +1840,35 @@ pub unsafe fn spawn_in_session_captured(
     let (out_r, out_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stdout)")?;
     let (err_r, err_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stderr)")?;
 
-    // stdin from NUL rather than a null handle: with STARTF_USESTDHANDLES the
-    // child gets exactly these three, and a shell handed an invalid stdin can
-    // fail in ways that look like the command misbehaving.
-    let nul_w = encode_wide(OsStr::new("NUL"));
-    // SAFETY: documented CreateFileW call; the wide string outlives it.
-    let nul = unsafe {
-        CreateFileW(
-            nul_w.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &sa,
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
+    // stdin: the caller's pipe when asked for (roomler SSH feeding a client's
+    // stdin), else NUL rather than a null handle: with STARTF_USESTDHANDLES
+    // the child gets exactly these three, and a shell handed an invalid stdin
+    // can fail in ways that look like the command misbehaving.
+    let (child_in, parent_in) = if with_stdin {
+        let (r, w) = unsafe { make_stdin_pipe(&mut sa) }.context("CreatePipe (stdin)")?;
+        (r, Some(w))
+    } else {
+        let nul_w = encode_wide(OsStr::new("NUL"));
+        // SAFETY: documented CreateFileW call; the wide string outlives it.
+        let nul = unsafe {
+            CreateFileW(
+                nul_w.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &sa,
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        let nul = OwnedHandle::new(nul).ok_or_else(|| anyhow!("opening NUL for stdin failed"))?;
+        (nul, None)
     };
-    let nul = OwnedHandle::new(nul).ok_or_else(|| anyhow!("opening NUL for stdin failed"))?;
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = nul.raw();
+    si.hStdInput = child_in.raw();
     si.hStdOutput = out_w.raw();
     si.hStdError = err_w.raw();
     // Same interactive-desktop attachment as `spawn_in_session`: without it the
@@ -1893,18 +1910,80 @@ pub unsafe fn spawn_in_session_captured(
         bail!("CreateProcessAsUserW failed (err {err})");
     }
 
-    // Drop OUR write ends and the NUL handle NOW. While this process holds a
-    // writer, the corresponding read end never sees EOF and the drain threads
-    // below would block until the timeout regardless of the child exiting.
+    // Drop OUR write ends and our copy of the child's stdin (NUL, or the
+    // stdin pipe's read end) NOW. While this process holds a writer, the
+    // corresponding read end never sees EOF and the drain threads below would
+    // block until the timeout regardless of the child exiting.
     drop(out_w);
     drop(err_w);
-    drop(nul);
+    drop(child_in);
 
     Ok(CapturedChild {
         process: OwnedProcess::from_raw_parts(pi.hProcess, pi.hThread, pi.dwProcessId),
         stdout: out_r,
         stderr: err_r,
+        stdin: parent_in,
     })
+}
+
+/// The pipe for a child's stdin: `(read, write)`, the WRITE end de-inherited
+/// ([`make_pipe`]'s rule, inverted). The child reads; the parent writes, and
+/// dropping the write end is the child's end-of-input.
+///
+/// # Safety
+/// `sa` must be a valid, initialised `SECURITY_ATTRIBUTES`.
+unsafe fn make_stdin_pipe(sa: &mut SECURITY_ATTRIBUTES) -> Result<(OwnedHandle, OwnedHandle)> {
+    let mut r: HANDLE = std::ptr::null_mut();
+    let mut w: HANDLE = std::ptr::null_mut();
+    // SAFETY: out-params are valid; `sa` is caller-validated.
+    let ok = unsafe { CreatePipe(&mut r, &mut w, sa, 0) };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreatePipe failed (err {err})");
+    }
+    let r = OwnedHandle::new(r).ok_or_else(|| anyhow!("CreatePipe returned a null read handle"))?;
+    let w =
+        OwnedHandle::new(w).ok_or_else(|| anyhow!("CreatePipe returned a null write handle"))?;
+    // A write end leaked into the child would keep its own stdin open: it
+    // would never see end-of-input, however the parent closes its copy.
+    // SAFETY: `w` is a live handle we own.
+    let ok = unsafe { SetHandleInformation(w.raw(), HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("SetHandleInformation on the stdin pipe's write end failed (err {err})");
+    }
+    Ok((r, w))
+}
+
+/// Write all of `data` to a pipe from [`CapturedChild::stdin`]. Blocking (an
+/// anonymous pipe is synchronous): call it from a blocking context. An error
+/// means the reader is gone (the child exited or closed its stdin).
+pub fn write_all_to_pipe(pipe: &OwnedHandle, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let chunk = data.len().min(u32::MAX as usize) as u32;
+        let mut written: u32 = 0;
+        // SAFETY: `pipe` is a live handle we own; the buffer and the
+        // out-param are valid for the call; no OVERLAPPED (synchronous pipe).
+        let ok = unsafe {
+            WriteFile(
+                pipe.raw(),
+                data.as_ptr(),
+                chunk,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        data = &data[written as usize..];
+    }
+    Ok(())
 }
 
 /// One anonymous pipe: `(read, write)`, with the read end de-inherited.
