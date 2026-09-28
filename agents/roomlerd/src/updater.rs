@@ -97,6 +97,72 @@ pub const NET_TRANSITION_WINDOW: Duration = Duration::from_secs(600);
 /// ~14 min before the update forces through.
 pub const NET_DEFER_RECHECK: Duration = Duration::from_secs(120);
 
+/// #1755 — how soon a check that failed on the TRANSPORT runs again, by
+/// consecutive failure; past the end of the table, the periodic interval.
+/// Field: a machine used a few hours a day checks at boot, before its network
+/// is up (a DNS failure one day, an asset download timing out the next). Each
+/// failure cost the full interval, and it fell three releases behind while
+/// online every day. A VERDICT (up to date, a draft, no installer for this
+/// platform, a digest/signature/version refusal, an HTTP status such as
+/// GitHub's 403 rate limit) keeps the full interval, so a bad release or a
+/// spent quota is never hammered.
+pub const TRANSPORT_RETRY: [Duration; 3] = [
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+];
+
+/// The wait after `consecutive` transport failures in a row (1-based), never
+/// longer than the periodic `interval`. Pure — tested directly.
+pub fn transport_retry_after(consecutive: u32, interval: Duration) -> Duration {
+    let step = TRANSPORT_RETRY
+        .get(consecutive.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(interval);
+    step.min(interval)
+}
+
+/// #1755 — whether a fetch/download error is the transport failing (DNS,
+/// connect, a timeout, a body cut off mid-download) rather than a verdict.
+/// Typed: every HTTP call here fails with a `reqwest::Error` under `anyhow`
+/// context, so this walks the chain for one — never the message text. An HTTP
+/// STATUS is a verdict (`bail!`ed, not a `reqwest::Error`).
+pub fn is_transport_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request() || r.is_body())
+    })
+}
+
+/// A failed fetch/download as its outcome: [`CheckOutcome::Unreachable`] when
+/// the transport failed, else [`CheckOutcome::Skipped`].
+fn failed(what: &str, e: anyhow::Error) -> CheckOutcome {
+    let reason = format!("{what}: {e:#}");
+    if is_transport_failure(&e) {
+        CheckOutcome::Unreachable(reason)
+    } else {
+        CheckOutcome::Skipped(reason)
+    }
+}
+
+/// #1755 — the periodic loop's bookkeeping after a check: a transport failure
+/// extends the streak and returns the early recheck; any other outcome ends
+/// the streak and leaves the normal cadence. Pure — tested directly.
+pub fn recheck_after(
+    outcome: &CheckOutcome,
+    transport_failures: &mut u32,
+    interval: Duration,
+) -> Option<Duration> {
+    if matches!(outcome, CheckOutcome::Unreachable(_)) {
+        *transport_failures = transport_failures.saturating_add(1);
+        Some(transport_retry_after(*transport_failures, interval))
+    } else {
+        *transport_failures = 0;
+        None
+    }
+}
+
 /// rc.19: gating decision for the periodic loop given the current
 /// active-transfer count and consecutive-defer counter. Pure helper
 /// so the gating logic is unit-testable without spinning the full
@@ -293,9 +359,14 @@ pub enum CheckOutcome {
         latest: String,
         installer_path: PathBuf,
     },
-    /// Check failed for an expected reason (network, GitHub 403, no
-    /// matching asset for this platform). Logged but non-fatal.
+    /// Check ended without an install for a reason that will not change by
+    /// asking again soon (GitHub 403, no matching asset for this platform, a
+    /// digest/signature/version refusal). Logged but non-fatal.
     Skipped(String),
+    /// #1755 — the check could not reach the release server or finish the
+    /// download (DNS, connect, timeout). Transient: the periodic loop
+    /// rechecks on [`TRANSPORT_RETRY`] instead of the full interval.
+    Unreachable(String),
 }
 
 /// Parse a git tag like `agent-v0.1.36`, `v0.1.36`, or
@@ -999,7 +1070,7 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_release_by_tag(tag).await {
         Ok(r) => r,
-        Err(e) => return CheckOutcome::Skipped(format!("pin fetch {tag}: {e:#}")),
+        Err(e) => return failed(&format!("pin fetch {tag}"), e),
     };
     let asset = match pick_asset_for_platform(&release.assets) {
         Some(a) => a,
@@ -1016,19 +1087,20 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
             latest: release.tag_name,
             installer_path: path,
         },
-        Err(e) => CheckOutcome::Skipped(format!("pin download {tag}: {e:#}")),
+        Err(e) => failed(&format!("pin download {tag}"), e),
     }
 }
 
 /// Run one check cycle: GET releases → compare → download if needed.
 /// Returns the outcome so the caller can log + decide whether to
 /// spawn the installer. Never panics; network errors fold into
-/// `Skipped(...)` so a flaky link doesn't crash the agent.
+/// `Unreachable(...)` (#1755) and verdicts into `Skipped(...)`, so a flaky
+/// link doesn't crash the agent.
 pub async fn check_once() -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_latest_release().await {
         Ok(r) => r,
-        Err(e) => return CheckOutcome::Skipped(format!("fetch: {e:#}")),
+        Err(e) => return failed("fetch", e),
     };
     // Drafts are always skipped; prereleases are tolerated because
     // our 0.x release history marked them all `prerelease: true` and
@@ -1063,7 +1135,7 @@ pub async fn check_once() -> CheckOutcome {
             latest: latest_parsed,
             installer_path: path,
         },
-        Err(e) => CheckOutcome::Skipped(format!("download: {e:#}")),
+        Err(e) => failed("download", e),
     }
 }
 
@@ -2081,7 +2153,7 @@ fn stage_watcher_exe(
 ///    integer count of hours; non-positive or non-numeric is ignored
 ///    so a typo can't accidentally disable updates).
 /// 2. `update_check_interval_h` field on `AgentConfig`, if set.
-/// 3. Built-in [`CHECK_INTERVAL`] (24 h).
+/// 3. Built-in [`CHECK_INTERVAL`] (4 h).
 ///
 /// Logged at startup for operator transparency. Pure resolver lives
 /// in [`resolve_check_interval_with`] so tests don't have to mutate
@@ -2194,6 +2266,13 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
             tracing::info!(reason = %reason, "update check skipped");
             false
         }
+        CheckOutcome::Unreachable(reason) => {
+            tracing::info!(
+                reason = %reason,
+                "update check could not reach the release server"
+            );
+            false
+        }
     }
 }
 
@@ -2222,8 +2301,11 @@ pub async fn run_periodic(
     }
     let mut first = true;
     let mut consecutive_defers: u32 = 0;
+    // #1755 — checks in a row that failed on the transport.
+    let mut transport_failures: u32 = 0;
     // The recheck the LAST defer chose (fast for a net transition, the
-    // hour for transfers); `None` = full periodic interval.
+    // hour for transfers) or a transport failure's early retry (#1755);
+    // `None` = full periodic interval.
     let mut defer_recheck: Option<Duration> = None;
     loop {
         if *shutdown.borrow() {
@@ -2296,9 +2378,11 @@ pub async fn run_periodic(
                 Some(tag) => pin_version(&tag).await,
                 None => check_once().await,
             };
+            let retry = recheck_after(&outcome, &mut transport_failures, interval);
             if act_on_outcome(outcome, &shutdown_tx) {
                 return;
             }
+            schedule_transport_retry(&mut defer_recheck, retry, transport_failures);
             continue;
         }
 
@@ -2347,9 +2431,27 @@ pub async fn run_periodic(
         }
 
         let outcome = check_once().await;
+        let retry = recheck_after(&outcome, &mut transport_failures, interval);
         if act_on_outcome(outcome, &shutdown_tx) {
             return;
         }
+        schedule_transport_retry(&mut defer_recheck, retry, transport_failures);
+    }
+}
+
+/// #1755 — arm the loop's next sleep for a transport failure's early retry.
+fn schedule_transport_retry(
+    defer_recheck: &mut Option<Duration>,
+    retry: Option<Duration>,
+    transport_failures: u32,
+) {
+    if let Some(after) = retry {
+        tracing::info!(
+            consecutive = transport_failures,
+            next_check_secs = after.as_secs(),
+            "auto-updater: rechecking early — the last check failed on the network"
+        );
+        *defer_recheck = Some(after);
     }
 }
 
@@ -2508,7 +2610,8 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
             tracing::info!(%current, %latest, "update-helper: up to date");
             Ok(())
         }
-        CheckOutcome::Skipped(reason) => {
+        // #1755 — no early retry here: launchd owns this helper's cadence.
+        CheckOutcome::Skipped(reason) | CheckOutcome::Unreachable(reason) => {
             tracing::info!(%reason, "update-helper: check skipped");
             Ok(())
         }
@@ -3882,6 +3985,97 @@ mod tests {
         // most ~31h between successful update fires for a
         // chronically-busy host. Bounded.
         assert!(MAX_CONSECUTIVE_DEFERS >= 3 && MAX_CONSECUTIVE_DEFERS <= 24);
+    }
+
+    // ---- #1755 — a check that failed on the transport retries early ----
+
+    /// The schedule climbs 5 → 15 → 60 min and then falls back to the
+    /// periodic interval, and is never longer than the interval.
+    #[test]
+    fn transport_retry_climbs_then_falls_back_to_the_interval() {
+        let four_h = Duration::from_secs(4 * 3600);
+        assert_eq!(transport_retry_after(1, four_h), Duration::from_secs(300));
+        assert_eq!(transport_retry_after(2, four_h), Duration::from_secs(900));
+        assert_eq!(transport_retry_after(3, four_h), Duration::from_secs(3600));
+        assert_eq!(transport_retry_after(4, four_h), four_h);
+        assert_eq!(transport_retry_after(40, four_h), four_h);
+        let ten_min = Duration::from_secs(600);
+        assert_eq!(
+            transport_retry_after(2, ten_min),
+            ten_min,
+            "never longer than the interval"
+        );
+    }
+
+    /// The field bug: a failure at boot cost the full interval. Only a
+    /// transport failure rechecks early; a verdict or a success keeps the
+    /// cadence and ends the streak, so a bad release is never hammered.
+    #[test]
+    fn only_a_transport_failure_rechecks_early() {
+        let four_h = Duration::from_secs(4 * 3600);
+        let mut streak = 0;
+        let unreachable = CheckOutcome::Unreachable("download: operation timed out".into());
+        assert_eq!(
+            recheck_after(&unreachable, &mut streak, four_h),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            recheck_after(&unreachable, &mut streak, four_h),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(streak, 2);
+
+        let verdict = CheckOutcome::Skipped("no installer asset for this platform".into());
+        assert_eq!(recheck_after(&verdict, &mut streak, four_h), None);
+        assert_eq!(streak, 0, "a verdict ends the streak");
+        assert_eq!(
+            recheck_after(&unreachable, &mut streak, four_h),
+            Some(Duration::from_secs(300)),
+            "a new streak starts over"
+        );
+        let up = CheckOutcome::UpToDate {
+            current: "0.4.110".into(),
+            latest: "agent-v0.4.110".into(),
+        };
+        assert_eq!(recheck_after(&up, &mut streak, four_h), None);
+        assert_eq!(streak, 0);
+    }
+
+    /// Classified by TYPE: a real `reqwest` connect failure, under `anyhow`
+    /// context the way the updater wraps it, is a transport failure. The same
+    /// words without the type are not, and neither is a verdict.
+    #[tokio::test]
+    async fn a_real_connect_failure_is_transport_and_its_text_is_not() {
+        // A port that was just free: bind, read it, release it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        let e = anyhow::Error::new(err).context("GET releases");
+        assert!(is_transport_failure(&e), "{e:#}");
+        assert!(matches!(failed("fetch", e), CheckOutcome::Unreachable(_)));
+
+        let lookalike = anyhow::anyhow!(
+            "GET releases: error sending request for url (http://127.0.0.1:{port}/): \
+             client error (Connect): dns error"
+        );
+        assert!(!is_transport_failure(&lookalike), "text never classifies");
+        assert!(matches!(
+            failed("fetch", lookalike),
+            CheckOutcome::Skipped(_)
+        ));
+        let rate_limited = anyhow::anyhow!("GitHub API returned 403 Forbidden — rate-limited");
+        assert!(matches!(
+            failed("fetch", rate_limited),
+            CheckOutcome::Skipped(_)
+        ));
     }
 }
 // RETIRED-NAME-ANCHOR-END
