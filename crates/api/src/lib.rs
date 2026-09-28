@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
+pub mod logging;
 pub mod middleware;
 pub mod routes;
 pub mod stall_watchdog;

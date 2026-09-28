@@ -11,7 +11,16 @@ async fn main() -> anyhow::Result<()> {
     // Load .env file (silently ignore if missing)
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
+    // Initialize tracing.
+    //
+    // #1731 — through a non-blocking, lossy writer (`logging::nonblocking`):
+    // a log call enqueues and returns, and one thread owns stdout. Writing
+    // stdout synchronously under its process-wide lock let a log pipe that
+    // stopped draining freeze every tokio worker at once (two, under the pod's
+    // CPU limit), so `/health` died with the log. Now an overflow drops lines,
+    // counted and reported below. The guard lives as long as `main`.
+    let (log_writer, _log_guard) = roomler_ai_api::logging::nonblocking(std::io::stdout());
+    let dropped_log_lines = log_writer.error_counter();
     tracing_subscriber::registry()
         // ⚠️ The bare `warn` at the front is load-bearing, and it is the whole
         // point of this list's shape. Without it an `EnvFilter` built only from
@@ -55,8 +64,9 @@ async fn main() -> anyhow::Result<()> {
                 .into()
             }),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(log_writer))
         .init();
+    roomler_ai_api::logging::report_dropped_lines(dropped_log_lines);
 
     // Load config
     let settings = Settings::load()?;

@@ -217,12 +217,36 @@ the kill still keeps every earlier stage. Threads in `D`/`T`/`Z` cannot run a ha
 not asked; their `/proc` line is the evidence. A sample's stack walks share a 5 s budget. At most
 one stall is dumped per 10 min, and the watchdog retires when its runtime shuts down.
 
-⚠️ **The dump never goes through stdout or `tracing`.** The fmt layer writes synchronously to
-stdout under the process-wide stdout lock (`crates/api/src/main.rs:58`). If the log pipe stops
-draining, every logging worker blocks on it. The server has only as many tokio workers as its CPU
-limit (**2**), so that is the leading suspect for #1731, and anything written that way would stall
-too. The dump is written to a file (`DumpOut`, `stall_watchdog.rs:237`). A copy goes to stderr
-from a throwaway thread (`:280`), so a blocked pipe blocks only that thread.
+⚠️ **The dump never goes through stdout or `tracing`.** The dump is written to a file (`DumpOut`,
+`stall_watchdog.rs:237`). A copy goes to stderr from a throwaway thread (`:280`), so a blocked
+pipe blocks only that thread.
+
+### A log pipe that stops draining must not stop the server (#1731)
+
+The server logs through a **non-blocking, lossy writer** (`crates/api/src/logging.rs`). A log call
+enqueues its line (up to 16,384 lines queued) and returns. One `log-writer` thread owns stdout. If
+the container's log pipe stops draining, that thread waits alone, the queue fills, and further
+lines are **dropped and counted**. Once a minute, and once the pipe drains again, the log says so:
+`log output was not draining: lines were dropped so the server kept serving (#1731) … total=N`.
+
+Before this, the fmt layer wrote stdout **synchronously under the process-wide stdout lock**. The
+server runs as many tokio workers as its CPU limit, **two** in production, so a stopped pipe froze
+the whole runtime:
+- one worker blocked in `write(1, …)` (on `tower_http`'s per-request DEBUG line) while holding the lock;
+- the other waited on the lock;
+- `/health` died with the log, at the same instant.
+
+That's #1731's signature, reproduced on the real release binary with the log reader paused, and
+captured by the watchdog:
+
+| same lab, reader paused | synchronous stdout (before) | lossy writer (after) |
+|---|---|---|
+| `/health` | froze after 128 requests | 9,000 / 9,000 answered |
+| watchdog dump | worker in `write#1 0x1`, `fd 1 unread 64256 / 65536`, the other in `Mutex::lock_contended` | none: the runtime never stalled |
+| after the reader resumes | recovered (~11.6 s frozen) | `total=1360` dropped lines reported |
+
+⚠️ The trade is deliberate: a stopped log pipe now costs log lines, never the pod. A crash can
+lose the lines still queued. Panics are unaffected; they go straight to stderr.
 
 **Reading one.** At boot, the next container marks each unreported dump `.reported` and then logs
 a bounded **summary** of it as an ERROR (`report_previous_dumps`, `:371`):
@@ -242,8 +266,7 @@ Before promoting, read any dump, and save `kubectl logs <pod> --previous` of any
 
 ⚠️ **A liveness kill with NO dump means the runtime was not frozen.** The heartbeat kept beating,
 so the answer lies elsewhere: nginx, the HTTP path, or a probe timing out on something other than
-the runtime. That rules the leading suspect out as surely as a dump would rule it in. A dump that
-fell back to the temp dir dies with the container and is never reported.
+the runtime. A dump that fell back to the temp dir dies with the container and is never reported.
 
 | Setting (env) | Default | |
 |---|---|---|
