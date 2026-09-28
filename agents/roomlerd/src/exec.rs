@@ -53,6 +53,11 @@ use tracing::{info, warn};
 
 use roomler_ai_remote_control::models::exec_limits;
 
+/// Bytes for a command's stdin, in order; dropping the sender is end-of-input.
+/// Roomler SSH feeds a client's stdin through this. Fleet RPC passes none, so
+/// its commands keep reading NUL / `/dev/null` exactly as before.
+pub type StdinFeed = tokio::sync::mpsc::Receiver<Vec<u8>>;
+
 /// One execution request, already clamped by the server and re-clamped here.
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -883,8 +888,29 @@ impl ExecEngine {
         }
     }
 
-    /// Run one command to completion (or timeout / cancel).
+    /// Run one command to completion (or timeout / cancel). Its stdin is
+    /// empty (NUL / `/dev/null`), which is what Fleet RPC has always given.
     pub async fn run(&self, req: ExecRequest, redactor: &Redactor) -> ExecOutcome {
+        self.run_fed(req, redactor, None).await
+    }
+
+    /// [`run`](Self::run), with the command's stdin fed from `stdin` when it
+    /// is `Some`: every chunk in order, then end-of-input when the sender is
+    /// dropped. Roomler SSH passes the client's stdin here, so
+    /// `ssh node 'cat > f' < file` and `tar c . | ssh node 'tar x'` work.
+    /// Before, the command read NUL and the client's bytes were dropped
+    /// without a word.
+    ///
+    /// Everything else is unchanged: the same timeout, output ceiling,
+    /// redaction and tree-kill. Output is still buffered, so a command that
+    /// PROMPTS waits for input the caller cannot see; `ssh -n` is the answer
+    /// for commands that must not read stdin.
+    pub async fn run_fed(
+        &self,
+        req: ExecRequest,
+        redactor: &Redactor,
+        stdin: Option<StdinFeed>,
+    ) -> ExecOutcome {
         // FR-55 — hold the machine awake for as long as this command runs.
         // Dropped on EVERY return below (timeout, refusal, spawn failure, a
         // clean exit), which is why it is a guard and not a pair of calls.
@@ -925,7 +951,9 @@ impl ExecEngine {
 
         let started = std::time::Instant::now();
         let mut outcome = self
-            .spawn_and_wait(&req, program, &args, timeout_ms, max_output, cancel_rx)
+            .spawn_and_wait(
+                &req, program, &args, timeout_ms, max_output, cancel_rx, stdin,
+            )
             .await;
         outcome.duration_ms = started.elapsed().as_millis() as u64;
 
@@ -954,6 +982,9 @@ impl ExecEngine {
         outcome
     }
 
+    // 8 params: the resolved shell, the three bounds, the cancel and the stdin
+    // feed are each decided by `run_fed`; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_and_wait(
         &self,
         req: &ExecRequest,
@@ -962,6 +993,7 @@ impl ExecEngine {
         timeout_ms: u64,
         max_output: u64,
         cancel_rx: oneshot::Receiver<()>,
+        stdin: Option<StdinFeed>,
     ) -> ExecOutcome {
         #[cfg(windows)]
         let command = utf8_wrapped(program, &req.command);
@@ -984,6 +1016,7 @@ impl ExecEngine {
                 timeout_ms,
                 max_output,
                 cancel_rx,
+                stdin,
             )
             .await;
         }
@@ -993,7 +1026,13 @@ impl ExecEngine {
             // The caller's command is ONE argv element. Nothing in it can
             // escape into our own argv.
             .arg(&command)
-            .stdin(Stdio::null())
+            // A pipe only when someone feeds it; otherwise NUL, as ever, so a
+            // command that reads stdin sees end-of-input at once.
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1036,6 +1075,8 @@ impl ExecEngine {
         };
         let pid = child.id();
 
+        let feeder = stdin.map(|feed| tokio::spawn(feed_child_stdin(child.stdin.take(), feed)));
+
         // One shared budget across both streams — "combined ceiling" is what
         // the wire promises, so per-stream caps would silently double it.
         let budget = Arc::new(AtomicU64::new(max_output));
@@ -1061,6 +1102,12 @@ impl ExecEngine {
                 (None, Some("cancelled by the caller".to_string()))
             }
         };
+        // The command is gone. A feeder still waiting on a client that has
+        // not sent EOF has nothing left to write to: end it here rather than
+        // leaving it parked until the session drops its sender.
+        if let Some(feeder) = feeder {
+            feeder.abort();
+        }
 
         let (stdout, out_trunc) = out_task.await.unwrap_or_default();
         let (stderr, err_trunc) = err_task.await.unwrap_or_default();
@@ -1074,6 +1121,26 @@ impl ExecEngine {
             error,
         }
     }
+}
+
+/// Copy `feed` into the command's stdin, then close it (end-of-input).
+///
+/// A failed write means the command stopped reading (it exited, or closed its
+/// stdin): the rest of the caller's bytes have nowhere to go, and are dropped
+/// with the pipe. The caller aborts this task once the command is gone, so it
+/// never waits on a client that never sends EOF.
+async fn feed_child_stdin(sin: Option<tokio::process::ChildStdin>, mut feed: StdinFeed) {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut sin) = sin else {
+        return;
+    };
+    while let Some(chunk) = feed.recv().await {
+        if sin.write_all(&chunk).await.is_err() {
+            return;
+        }
+    }
+    let _ = sin.flush().await;
+    drop(sin);
 }
 
 /// Drain one pipe into a String, stopping once the shared budget is spent.
@@ -1314,6 +1381,61 @@ mod tests {
         } else {
             "echo hello"
         }
+    }
+
+    /// A command that prints its whole stdin, on either platform's auto shell.
+    fn cat_stdin() -> &'static str {
+        if cfg!(windows) {
+            "[Console]::In.ReadToEnd()"
+        } else {
+            "cat"
+        }
+    }
+
+    /// The caller's stdin reaches the command in order, and the caller's
+    /// end-of-input ends it (roomler SSH's `ssh node 'cat > f' < file`).
+    #[tokio::test]
+    async fn a_fed_stdin_reaches_the_command_in_order() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(b"roomler-".to_vec()).await.unwrap();
+        tx.send(b"stdin-ok".to_vec()).await.unwrap();
+        drop(tx); // end-of-input
+        let out = engine()
+            .run_fed(req(cat_stdin()), &Redactor::default(), Some(rx))
+            .await;
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert!(
+            out.stdout.contains("roomler-stdin-ok"),
+            "the fed bytes never reached the command: stdout {:?}",
+            out.stdout
+        );
+    }
+
+    /// The control, and Fleet RPC's contract: with no feed the command reads
+    /// NUL, sees end-of-input at once and prints nothing.
+    #[tokio::test]
+    async fn without_a_feed_the_command_reads_nothing() {
+        let out = engine().run(req(cat_stdin()), &Redactor::default()).await;
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "", "stdout was: {:?}", out.stdout);
+    }
+
+    /// A feed whose sender stays open must not hold up a command that never
+    /// reads it: the command exits and the engine returns.
+    #[tokio::test]
+    async fn an_open_feed_does_not_hold_up_a_command_that_ignores_it() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let started = std::time::Instant::now();
+        let out = engine()
+            .run_fed(req(echo_hello()), &Redactor::default(), Some(rx))
+            .await;
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert!(out.stdout.contains("hello"), "stdout was: {:?}", out.stdout);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the engine waited on the feed: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1661,6 +1783,8 @@ mod win_console {
     }
 
     /// Spawn as the console user, drain both pipes, enforce the bounds.
+    // 8 params: the same set `spawn_and_wait` hands over, one for one.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         program: &str,
         args: &[&str],
@@ -1669,8 +1793,10 @@ mod win_console {
         timeout_ms: u64,
         max_output: u64,
         cancel_rx: oneshot::Receiver<()>,
+        stdin: Option<super::StdinFeed>,
     ) -> ExecOutcome {
         let cmdline = build_cmdline(program, args, command);
+        let with_stdin = stdin.is_some();
 
         let Some(session) = supervisor::active_console_session_id() else {
             return ExecOutcome::failed(
@@ -1713,12 +1839,14 @@ mod win_console {
                     token.raw(),
                     &cmdline,
                     cwd.as_deref().map(std::path::Path::new),
+                    with_stdin,
                 )
             }?;
             let supervisor::CapturedChild {
                 process,
                 stdout,
                 stderr,
+                stdin: stdin_pipe,
             } = child;
             let pid = process.pid;
 
@@ -1730,14 +1858,22 @@ mod win_console {
             let err_t =
                 std::thread::spawn(move || supervisor::read_pipe_to_end(&stderr, &budget_err));
 
-            Ok::<_, anyhow::Error>((process, pid, out_t, err_t))
+            Ok::<_, anyhow::Error>((process, pid, out_t, err_t, stdin_pipe))
         })
         .await;
 
-        let (process, pid, out_t, err_t) = match spawned {
+        let (process, pid, out_t, err_t, stdin_pipe) = match spawned {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return ExecOutcome::failed(format!("spawn as console user failed: {e}")),
             Err(e) => return ExecOutcome::failed(format!("spawn task panicked: {e}")),
+        };
+
+        // The caller's stdin, into the pipe the child reads. Anonymous pipes
+        // are synchronous, so each write is a short blocking call; the
+        // forwarder itself stays async so it can be aborted below.
+        let feeder = match (stdin, stdin_pipe) {
+            (Some(feed), Some(pipe)) => Some(tokio::spawn(feed_pipe(Arc::new(pipe), feed))),
+            _ => None,
         };
 
         let process = Arc::new(process);
@@ -1767,6 +1903,12 @@ mod win_console {
                 Some("cancelled by the caller".to_string())
             }
         };
+        // As on the other path: the command is gone, so a feeder still
+        // waiting for the client's EOF ends here. A write in flight fails on
+        // its own (the reader died) and drops the last copy of the pipe.
+        if let Some(feeder) = feeder {
+            feeder.abort();
+        }
 
         // The drain threads end when the pipes hit EOF, which the kill above
         // guarantees even in the timeout path — the child's handles close when
@@ -1792,6 +1934,22 @@ mod win_console {
             truncated: out_trunc || err_trunc,
             duration_ms: 0,
             error,
+        }
+    }
+
+    /// Copy `feed` into the child's stdin pipe, then let the pipe close
+    /// (end-of-input) when the last reference drops. Each write is its own
+    /// short blocking call, so this task stays abortable.
+    async fn feed_pipe(pipe: Arc<supervisor::OwnedHandle>, mut feed: super::StdinFeed) {
+        while let Some(chunk) = feed.recv().await {
+            let p = pipe.clone();
+            let wrote =
+                tokio::task::spawn_blocking(move || supervisor::write_all_to_pipe(&p, &chunk))
+                    .await;
+            if !matches!(wrote, Ok(Ok(()))) {
+                // The child stopped reading (exited, or closed its stdin).
+                return;
+            }
         }
     }
 
