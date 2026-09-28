@@ -37,6 +37,9 @@ pub mod peer;
 /// FR-84 D6 / #1035 — name who holds a port a declared route cannot bind.
 pub mod port_holder;
 pub mod quic_peer;
+/// #1761 — the TURN-relayed QUIC setup runs on its own task, off the
+/// signaling loop; the in-flight bookkeeping and the per-org outcome channel.
+pub mod quic_setup;
 /// #1754 — a peer's own report that its client is gone, for the exit agent
 /// to reap it without a `rc:tunnel.terminate`.
 pub mod reap;
