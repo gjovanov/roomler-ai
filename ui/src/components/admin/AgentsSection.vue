@@ -335,8 +335,9 @@
             </div>
             <div class="text-caption text-medium-emphasis d-flex align-center flex-nowrap">
               <!-- The machine-reported title collapses away by default once a
-                   display name is set (column-picker checkbox). -->
-              <span v-if="item.display_name && !hideNameWhenDisplay" class="mr-1">{{ item.name }} ·</span>
+                   display name is set (column-picker checkbox; the remote
+                   page reads the same preference). -->
+              <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)" class="mr-1">{{ item.name }} ·</span>
               <span class="agent-id-preview" :title="`Device ID: ${item.id}`">
                 id: {{ shortId(item.id) }}
               </span>
@@ -1496,6 +1497,7 @@ import {
 import { useDeviceStore, type DeviceRow } from '@/stores/devices'
 import { useAuthStore } from '@/stores/auth'
 import { useGridColumns } from '@/composables/useGridColumns'
+import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
 import DeviceEditDialog, { type EditableDevice } from '@/components/admin/DeviceEditDialog.vue'
 
@@ -1551,31 +1553,9 @@ watch(gridKind, (k) => {
 
 /** Column-picker extra: collapse the Name cell to the display name alone
  *  when one is set (default ON — the machine-reported title is noise once
- *  someone has named the device). Per user+org, like the column prefs. */
-const HIDE_NAME_KEY = () =>
-  `roomler:grid-name-pref:${auth.user?.id ?? 'anon'}:${props.tenantId}:devices`
-function loadHideName(): boolean {
-  try {
-    const v = localStorage.getItem(HIDE_NAME_KEY())
-    return v === null ? true : v === '1'
-  } catch {
-    return true
-  }
-}
-const hideNameWhenDisplay = ref(loadHideName())
-watch(hideNameWhenDisplay, (v) => {
-  try {
-    localStorage.setItem(HIDE_NAME_KEY(), v ? '1' : '0')
-  } catch {
-    /* private browsing */
-  }
-})
-watch(
-  () => props.tenantId,
-  () => {
-    hideNameWhenDisplay.value = loadHideName()
-  },
-)
+ *  someone has named the device). Per user+org, like the column prefs, and
+ *  shared with the remote-control page's header. */
+const hideNameWhenDisplay = useHideDeviceName(() => `${auth.user?.id ?? 'anon'}:${props.tenantId}`)
 
 const deviceHeaders = computed(() => [
   // Leftmost on purpose — see the template comment (field bug 2026-05-01).
