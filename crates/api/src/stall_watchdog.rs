@@ -20,11 +20,13 @@
 //!   only it can walk its own stack without stopping the world. A thread that
 //!   cannot answer (uninterruptible sleep, stopped) is not asked, and the whole
 //!   sample has a stack budget, so a dump is never lost to a slow walk.
-//! - The dump goes to a FILE, never to stdout or through `tracing`. The leading
-//!   suspect is a blocked stdout: the fmt layer writes synchronously under the
-//!   process-wide stdout lock. Whatever blocked the runtime may well block that
-//!   too. The next process reports any unreported dump at boot
-//!   ([`report_previous_dumps`]), which puts it in plain `kubectl logs`.
+//! - The dump goes to a FILE, never to stdout or through `tracing`. A blocked
+//!   stdout was #1731's cause (reproduced: the fmt layer wrote synchronously
+//!   under the process-wide stdout lock). Logging is non-blocking now
+//!   (`crate::logging`), but whatever stalls the runtime next may block the
+//!   log as well, so the watchdog never depends on it. The next process reports
+//!   any unreported dump at boot ([`report_previous_dumps`]), which puts it in
+//!   plain `kubectl logs`.
 //!
 //! Linux only, which is production. Elsewhere [`start`] runs the heartbeat and
 //! the watchdog, but a dump says stacks are not captured there.
@@ -204,9 +206,9 @@ fn watch(
                 "\n=== recovered: the heartbeat resumed ~{lasted_ms} ms after the last beat before the stall ===\n"
             ));
             let _ = out.finish(false);
-            // `tracing` writes stdout under its lock, the prime suspect. So
-            // log from a throwaway thread: if the pipe blocks again, this
-            // watchdog must still be here for the next stall.
+            // Log from a throwaway thread: whatever stalled the runtime may
+            // still hold up the log, and this watchdog must be here for the
+            // next stall either way.
             let dump = s.dump;
             let _ = std::thread::Builder::new()
                 .name("stall-log".into())
@@ -366,8 +368,8 @@ fn summarize(text: &str) -> Vec<&str> {
 /// that replaced it. Returns the dumps it reported.
 ///
 /// The marker is written BEFORE anything is logged, and only a bounded
-/// summary is logged: logging goes through stdout, the prime suspect, and a
-/// report that could wedge would otherwise repeat on every boot.
+/// summary is logged: a report that could wedge on the log would otherwise
+/// repeat on every boot.
 pub fn report_previous_dumps(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
