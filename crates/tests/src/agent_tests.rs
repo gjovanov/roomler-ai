@@ -33,53 +33,63 @@ fn spawn_agent_signaling_as(
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Value type (OverlayView) is inferred from `run`'s Sender param, so
-        // the tests crate needs no direct tunnel-core dep. Keep `_view_rx`
-        // alive for the lifetime of `run` so its sends don't fail.
-        let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-        let broker = roomlerd::consent::ConsentBroker::new(
-            roomlerd::consent::Mode::AutoGrant,
-            std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
-        )
-        .expect("consent broker init");
-        // Read before `cfg` is moved into the call below.
-        let exec_enabled = cfg.exec_enabled;
-        let remote_config_enabled = cfg.remote_config_enabled;
-        let _ = signaling::run(
-            ctx,
-            // FR-43 P2b — no GUI-worker delegation in tests: `Off` is not a
-            // stub but the real production value on every platform except a
-            // macOS daemon supervising a worker, or the worker it supervises.
-            roomlerd::delegate::Delegation::Off,
-            cfg,
-            EncoderPreference::Software,
-            stop_rx,
-            connected,
-            view_tx,
-            // B1 — the RTT-prober bridge slot. Tests never install a hook, so
-            // an empty slot is the correct value, not a stub.
-            Default::default(),
-            broker,
-            roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
-            // Remote config: tests never PUSH one, but the live `exec_enabled`
-            // must still be SEEDED from the config this agent was handed —
-            // which is exactly what `main.rs` does. See agent_exec_tests for
-            // the failure hardcoding `false` produced.
-            roomlerd::remote_config::RemoteConfigServices::new(
-                std::path::PathBuf::from("unused-in-tests.toml"),
-                std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                exec_enabled,
-                remote_config_enabled,
-            ),
-            // FR-27 — the live remote-control session registry. Tests never
-            // read it back, but the signalling loop registers into it, so a
-            // fresh one per harness is the honest value (not a shared global
-            // that would leak sessions between tests).
-            roomlerd::rc_sessions::RcSessionRegistry::new(),
-        )
-        .await;
+        let _ = run_agent_signaling_as(ctx, cfg, stop_rx).await;
     })
+}
+
+/// The loop itself, returning how it ended — what `run_cmd`'s org
+/// supervisors see (#1750 asserts on it).
+async fn run_agent_signaling_as(
+    ctx: signaling::OrgCtx,
+    cfg: AgentConfig,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Value type (OverlayView) is inferred from `run`'s Sender param, so
+    // the tests crate needs no direct tunnel-core dep. Keep `_view_rx`
+    // alive for the lifetime of `run` so its sends don't fail.
+    let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
+    let broker = roomlerd::consent::ConsentBroker::new(
+        roomlerd::consent::Mode::AutoGrant,
+        std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
+    )
+    .expect("consent broker init");
+    // Read before `cfg` is moved into the call below.
+    let exec_enabled = cfg.exec_enabled;
+    let remote_config_enabled = cfg.remote_config_enabled;
+    signaling::run(
+        ctx,
+        // FR-43 P2b — no GUI-worker delegation in tests: `Off` is not a
+        // stub but the real production value on every platform except a
+        // macOS daemon supervising a worker, or the worker it supervises.
+        roomlerd::delegate::Delegation::Off,
+        cfg,
+        EncoderPreference::Software,
+        stop_rx,
+        connected,
+        view_tx,
+        // B1 — the RTT-prober bridge slot. Tests never install a hook, so
+        // an empty slot is the correct value, not a stub.
+        Default::default(),
+        broker,
+        roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+        // Remote config: tests never PUSH one, but the live `exec_enabled`
+        // must still be SEEDED from the config this agent was handed —
+        // which is exactly what `main.rs` does. See agent_exec_tests for
+        // the failure hardcoding `false` produced.
+        roomlerd::remote_config::RemoteConfigServices::new(
+            std::path::PathBuf::from("unused-in-tests.toml"),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            exec_enabled,
+            remote_config_enabled,
+        ),
+        // FR-27 — the live remote-control session registry. Tests never
+        // read it back, but the signalling loop registers into it, so a
+        // fresh one per harness is the honest value (not a shared global
+        // that would leak sessions between tests).
+        roomlerd::rc_sessions::RcSessionRegistry::new(),
+    )
+    .await
 }
 
 /// Helper: issue an enrollment token via the admin REST route, then run the
@@ -269,6 +279,58 @@ async fn same_machine_enrolls_into_two_tenants_and_both_connect() {
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), prim_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), org_task).await;
+}
+
+/// #1750 — a SECONDARY org whose admin removed the device: the server
+/// refuses the org's WS with `rc:goodbye AgentDeleted`, and its loop must END
+/// (not retry) on the TYPED error `run_cmd`'s supervisors log at DEBUG — the
+/// loop's own WARN already said it, once — carrying text that names every way
+/// out with this org's label, since that text is what `roomler status` shows.
+/// Before, it was a plain `anyhow!` naming only re-enrollment, and every
+/// daemon start logged two ERRORs and a WARN per dead org.
+#[tokio::test]
+async fn a_refused_secondary_org_ends_on_a_typed_goodbye_naming_the_ways_out() {
+    let app = TestApp::spawn().await;
+    let t1 = app.seed_tenant("gbye1").await;
+    let t2 = app.seed_tenant("gbye2").await;
+    let fresh1 = enrol_via_agent_lib(&app, &t1, "mach-gbye-1", "Goodbye box").await;
+    let (cfg, _) = enrollment::apply_enrollment(None, fresh1, None, false).unwrap();
+    let fresh2 = enrol_via_agent_lib(&app, &t2, "mach-gbye-1", "Goodbye box").await;
+    let (cfg, _) = enrollment::apply_enrollment(Some(cfg), fresh2, Some("demo"), false).unwrap();
+    let org_cfg = cfg.for_org(&cfg.orgs[0]);
+
+    // The second org's admin removes the device (the admin removal tombstones).
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", t2.tenant_id, org_cfg.agent_id),
+            &t2.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_agent_signaling_as(signaling::OrgCtx::secondary("demo"), org_cfg, stop_rx),
+    )
+    .await
+    .expect("a refused org's loop must end, not keep reconnecting");
+    let err = ended.expect_err("a refused org's loop ends in an error");
+    assert!(
+        signaling::is_secondary_goodbye(&err),
+        "typed, so the supervisor logs it once: {err:#}"
+    );
+    let text = format!("{err:#}");
+    for want in [
+        "server goodbye (AgentDeleted)",
+        "roomlerd re-enroll --org demo --token",
+        "roomlerd org disable demo",
+        "roomlerd org rm demo",
+    ] {
+        assert!(text.contains(want), "{want:?} missing from: {text}");
+    }
 }
 
 #[tokio::test]
