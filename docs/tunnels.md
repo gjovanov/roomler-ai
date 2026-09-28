@@ -306,6 +306,76 @@ The same investigation found the control channel owning itself: its `on_message`
 closure held a strong clone of the channel it is stored in, so a session's control
 channel, and everything its handler captures, was never freed. It now holds a `Weak`.
 
+### ⚠️ Every client path that ends a session must tell the exit agent (#1754)
+
+The leaks above are the *client* failing to free its own sockets. This one is the
+mirror image: the client frees itself cleanly, but the **exit agent** never learns
+the session ended, so *its* per-session `AgentTunnelPeer` — the ICE sockets plus
+the DataChannel pool (WebRTC) or the quinn endpoint (QUIC) — lives forever.
+
+The exit agent builds that peer when it sees the client's offer / QUIC setup, and
+drops it **only** when told: the client sends `rc:tunnel.terminate`, the server
+relays it on to the agent
+([`relay_tunnel_client_msg_from_agent`](../crates/modules/network/src/tunnel.rs)
+→ `send_to_agent`). There is **no idle timeout** on the agent side. So a client
+path that ends a session without sending a terminate leaks one agent-side peer,
+and a declared route whose target never comes up does it *once per retry* (every
+1–30 s), unbounded.
+
+⚠️ **Field-measured on `0.4.110`.** A daemon-run WebRTC forward
+(`roomler forward --daemon --agent … --transport webrtc`), used once then stopped
+with `roomler kill fl-N`: the macOS root exit agent's UDP socket count climbed
+**5 → 11 → 16 across five kills** — its `AgentTunnelPeer` map only ever grew.
+
+The audit (against `origin/master` 747bf55dc) found the client ends a session
+**without** `ClientMsg::TunnelTerminate` on:
+
+| Client path | Where | Why it sent nothing |
+|---|---|---|
+| `kill_flow` (LocalAPI `KillFlow`, and every route-reconciler kill) | [`client_mgr.rs`](../agents/roomlerd/src/tunnel/client_mgr.rs) `kill_flow`; [`route_reconciler.rs`](../agents/roomlerd/src/tunnel/route_reconciler.rs) | it only `abort()`ed the supervisor task — an abort frees the client peer via `TunnelPeer::drop`, but sends no wire message |
+| every `?` early return after `rc:tunnel.opened` | [`driver.rs`](../crates/tunnel-core/src/driver.rs) `run_webrtc_session` / `run_quic_session` | `PEER_READY_TIMEOUT` (30 s, DC pool never opens), a failed local bind, an `accept_answer` error, a QUIC-setup soft-fall — all returned straight up |
+
+**The fix (layer A — client side).** A `TerminateOnDrop` guard, created in
+[`run_tunnel_session`](../crates/tunnel-core/src/driver.rs) the moment the session
+id is known, sends `rc:tunnel.terminate { ClientShutdown }` on **every** way the
+driver stops owning the session — the normal return, any early `?`, a
+`QuicSetupFailed` soft-fall, **and the future being aborted by `kill_flow`**. It
+is [`AbortOnDrop`](../crates/tunnel-core/src/driver.rs)'s lesson one layer up: the
+rule lives in a type, not in each call site that kept forgetting it.
+
+```mermaid
+sequenceDiagram
+    participant K as kill_flow / early-?/ abort
+    participant D as run_tunnel_session (client)
+    participant S as server
+    participant A as exit agent
+
+    Note over D: session id known → TerminateOnDrop armed
+    K->>D: end the session (return / abort)
+    Note over D: guard Drop spawns the send (Drop can't await);<br/>the spawned task is independent of an aborted one
+    D->>S: rc:tunnel.terminate { session_id }
+    S->>A: rc:tunnel.terminate (relayed)
+    Note over A: reaps AgentTunnelPeer — sockets + DC pool freed
+```
+
+⚠️ **`Drop` cannot await, and it must work from an aborted task.** It uses
+`tokio::runtime::Handle::try_current()` + `spawn`, never `.await` — the same shape
+as `TunnelPeer::drop`. The spawned task is independent of the aborted supervisor,
+so the abort that ended the session can't kill the delivery.
+
+⚠️ **`kill_flow` also sends the terminate synchronously** (`sink_now().try_send`)
+before it drops the session's demux entry — the guard's abort-driven send is
+best-effort *timing*, this one is deterministic. The two together are at most one
+**harmless** duplicate: the server's terminate handling is idempotent
+(`sessions.remove` is a no-op once reaped; an unknown session's terminate is
+dropped), which is also why the existing explicit sends (the `session_dead`
+backstop and the dispatch loops' session-gone / server-terminate / revoked arms)
+are left as-is rather than re-plumbed.
+
+> A client that never sends its terminate (an older version, a crash, a network
+> that vanished) is covered from the other side: the exit agent reaps a peer
+> whose client is gone, next section.
+
 ### ⚠️ The exit agent reaps a peer whose client is gone (#1754)
 
 The `close()` rule above has a precondition nobody had written down: **something has
