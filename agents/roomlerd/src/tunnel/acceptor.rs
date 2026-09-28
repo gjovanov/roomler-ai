@@ -658,11 +658,13 @@ mod tests {
         // Agent QUIC peer + a pinned, token-authed client connection.
         let session_id = ObjectId::new();
         let token = "tok-quic-accept";
+        let (reap_tx, _reap_rx) = mpsc::channel(8);
         let agent = Arc::new(
             AgentQuicPeer::setup(
                 session_id,
                 token.to_string(),
                 "127.0.0.1:0".parse().unwrap(),
+                reap_tx,
             )
             .unwrap(),
         );
