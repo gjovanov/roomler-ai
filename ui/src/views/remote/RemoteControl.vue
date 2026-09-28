@@ -390,12 +390,26 @@
               Waiting for the person at the device to allow it…
             </div>
             <div v-else>
+              <!-- #1760 — where the device says computer audio cannot go into
+                   a remote recording (a Mac; the owner has not allowed it),
+                   the box is greyed out, unticked, with the sentence beside
+                   it: never a box that only fails. A device older than the
+                   field says nothing, and the box is offered as before. -->
               <v-checkbox
                 v-model="recAudio"
                 label="Include what the computer plays"
                 density="compact"
                 hide-details
+                :disabled="!!rec.audioUnavailable.value"
+                data-testid="rc-record-audio"
               />
+              <p
+                v-if="rec.audioUnavailable.value"
+                class="text-caption text-medium-emphasis mb-1"
+                data-testid="rc-record-audio-unavailable"
+              >
+                {{ describeRecordReason(rec.audioUnavailable.value) }}
+              </p>
               <v-btn
                 size="small"
                 color="primary"
@@ -412,6 +426,14 @@
               data-testid="rc-record-reason"
             >
               {{ rec.state.value === 'stopped' ? 'Stopped: ' : 'Not recording: ' }}{{ describeRecordReason(rec.reason.value) }}
+              <!-- #1760 — the device's own words, when it sent them. The
+                   code's sentence alone read "the recorder could not start"
+                   where the device had said why. -->
+              <span
+                v-if="rec.detail.value"
+                class="d-block text-medium-emphasis rc-record-detail"
+                data-testid="rc-record-detail"
+              >{{ rec.detail.value }}</span>
             </p>
             <v-divider class="my-3" />
             <div class="text-subtitle-2 mb-1">Your recordings on this device</div>
@@ -1873,6 +1895,11 @@ const clipboardBusy = ref(false)
 const rec = rc.recording
 const recAudio = ref(false)
 const recRunning = computed(() => rec.state.value === 'recording')
+// #1760 — a box the device says cannot be ticked is unticked too, so what
+// the start asks for is what the box shows.
+watch(rec.audioUnavailable, (why) => {
+  if (why) recAudio.value = false
+})
 // FR-85 P3b-3 — a deliberate Disconnect ends a recording first: to the device
 // a hang-up and the reconnect ladder's retry look the same, and a retry is
 // what it keeps a recording running for.
@@ -4447,5 +4474,12 @@ onBeforeUnmount(() => {
   overflow-y: auto;
   max-height: 65vh;
   min-height: 200px;
+}
+
+/* #1760 — a refusal's `detail` from the device: under the code's sentence,
+   smaller than it. */
+.rc-record-detail {
+  font-size: 0.7rem;
+  line-height: 1.3;
 }
 </style>

@@ -145,6 +145,47 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     expect(describeRecordReason('login_screen')).not.toBe(describeRecordReason('unavailable'))
   })
 
+  it('greys "Include what the computer plays" out when the device says it cannot, and asks for none (#1760)', () => {
+    const r = useRemoteRecording()
+    const { ch, sent } = fakeChannel()
+    r.attach(ch)
+    // The device's answer to rc:record.status, before any start: a Mac.
+    ch.deliver({ t: 'rc:record.state', id: '', state: 'idle', audio_unavailable: 'audio_unsupported' })
+    expect(r.audioUnavailable.value).toBe('audio_unsupported')
+    expect(describeRecordReason(r.audioUnavailable.value)).toBe(
+      "this device can't record what the computer plays (Windows and Linux devices only, for now)",
+    )
+    // A box that cannot be ticked never asks: even a stale tick sends no audio.
+    r.start(true)
+    expect(sent.filter((m) => m.t === 'rc:record.start').at(-1)!.audio).toBe(false)
+    // The owner's gate reads the same way, with its own sentence.
+    ch.deliver({ t: 'rc:record.state', id: '', state: 'idle', audio_unavailable: 'audio_not_allowed' })
+    expect(describeRecordReason(r.audioUnavailable.value)).toBe(
+      "this device's owner hasn't allowed computer audio in a remote recording",
+    )
+    // The owner allowed it — or the device predates the field: the box is
+    // offered, and a start asks for what was ticked.
+    ch.deliver({ t: 'rc:record.state', id: '', state: 'idle' })
+    expect(r.audioUnavailable.value).toBeNull()
+    r.start(true)
+    expect(sent.filter((m) => m.t === 'rc:record.start').at(-1)!.audio).toBe(true)
+    // A refusal keeps the device's own words, for the line under the sentence.
+    ch.deliver({
+      t: 'rc:record.state',
+      id: 'x',
+      state: 'refused',
+      reason: 'audio_unsupported',
+      detail: "macOS can't capture what the computer plays yet",
+      audio_unavailable: 'audio_unsupported',
+    })
+    expect([r.state.value, r.reason.value, r.detail.value, r.audioUnavailable.value]).toEqual([
+      'refused',
+      'audio_unsupported',
+      "macOS can't capture what the computer plays yet",
+      'audio_unsupported',
+    ])
+  })
+
   it('a device with no recorder gets no Record control; every other strip reason is shown (P3c-2)', () => {
     // Nothing there to allow or refuse: no disabled control on every session
     // to every device that predates recording.

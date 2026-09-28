@@ -438,6 +438,12 @@ impl RecordingManager {
         let identity = self.identity();
         s.available = identity.is_ok();
         s.unavailable_reason = identity.err().map(|r| r.message().to_string());
+        // #1760 — the same capability the remote gates read, told ahead of
+        // any start, so the companion greys its "Computer audio" box out
+        // (and the owner's remote toggle) with the words instead of offering
+        // a start the recorder can only refuse.
+        s.system_audio_unavailable_reason =
+            super::system_audio_unsupported_reason().map(String::from);
         s
     }
 
