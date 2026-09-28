@@ -1006,10 +1006,16 @@ fn split_sections(out: &str) -> Vec<(String, String)> {
 /// flow runs IN the daemon and survives this CLI's exit. `roomler flows` shows
 /// it; `roomler kill <id>` stops it. A daemon-side error (bad node/remote, port
 /// in use) surfaces verbatim; only a *connect* failure maps through [`daemon_err`].
-pub async fn create_forward(node: &str, local: u16, remote: &str, transport: &str) -> Result<()> {
+pub async fn create_forward(
+    node: &str,
+    local: u16,
+    remote: &str,
+    transport: &str,
+    start_transport: &str,
+) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let id = client
-        .create_forward(node, local, remote, transport)
+        .create_forward(node, local, remote, transport, start_transport)
         .await
         .map_err(|e| anyhow!("{e}"))?;
     println!("forward created: {id}");

@@ -117,29 +117,44 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this PR |
 | P1 | flow-owned listener, `Carrier` split, held connections during reconnect; tests; docs | revert (pure refactor, no wire change) | implemented 2026-09-28, in review: `establish_tunnel_session` + `Carrier` (`crates/tunnel-core/src/driver.rs`), `FlowListener` + `HoldPolicy` (`crates/tunnel-core/src/flow_listener.rs`, ≤ 64 held, ≤ 30 s), the daemon flow binds once (`agents/roomlerd/src/tunnel/client_mgr.rs` `run_flow_cycle`); 9 new tests, 5 negative controls shown red; `docs/tunnels.md` §"The flow owns the listener" |
-| P2 | re-upgrade probe, promotion, drain; tests; docs | `ROOMLER_TUNNEL_REUPGRADE=0` / `tunnel_reupgrade = false` | planned |
+| P2 | re-upgrade probe, promotion, drain; tests; docs | `ROOMLERD_TUNNEL_REUPGRADE=0` / `tunnel_reupgrade = false` | implemented 2026-09-28: probe schedule (`ReupgradeBackoff`/`ProbeTimer`), ranking (`better_transports`/`below_best`), `spawn_candidate`/`establish_candidate` (background probe into a throwaway `FlowLive`), promotion + drain (`run_flow_cycle` serving loop, `drain_carrier`), `Carrier::drained` (`crates/tunnel-core/src/driver.rs`), the `ROOMLERD_TUNNEL_REUPGRADE` kill switch + `tunnel_reupgrade` config key, the `--start-transport` test lever (LocalAPI `CreateForward.start_transport`); 11 new tests, 6 negative controls shown red; `docs/tunnels.md` §"Re-upgrade: probe → promote → drain" |
 | P3 | agent release; field verification (AC7, AC8); close | as P2 | planned |
 
 ## Acceptance criteria
 
 - [ ] **AC1** — A declared route that fell back returns to the best allowed transport within the probe bound
-  (first probe 60 s after the fallback) once that transport works.
-- [ ] **AC2** — An established connection through the route survives a switch; connections opened after the
-  switch ride the new transport.
+  (first probe 60 s after the fallback) once that transport works. *(P2 builds the mechanism — schedule,
+  candidate, promotion — but the end-to-end "returns to best once it works" is P3 field, AC7.)*
+- [x] **AC2** — An established connection through the route survives a switch; connections opened after the
+  switch ride the new transport. *(P2: proven end to end over two real loopback QUIC carriers behind one
+  `FlowListener` — `driver::tests::make_before_break_a_keeps_flowing_while_b_takes_new_connections`: A keeps
+  round-tripping bytes after B is installed, a new connection rides B, A then drains.)*
 - [ ] **AC3** — No connection is refused during a switch or a reconnect: the flow's listener never unbinds, and a
-  connection that arrives while no carrier is ready is held (≤ 30 s) and then carried.
-- [ ] **AC4** — A failing candidate never disturbs the live carrier; probes back off (2 → 5 → 15 → 60 min) and
-  reset on a network change.
+  connection that arrives while no carrier is ready is held (≤ 30 s) and then carried. *(P1's property — the
+  listener is bound once and outlives every carrier swap; P2 does not regress it.)*
+- [x] **AC4** — A failing candidate never disturbs the live carrier; probes back off (2 → 5 → 15 → 60 min) and
+  reset on a network change. *(P2: the backoff ladder + reset are unit-proven — `reupgrade_backoff_ladder_and_reset`,
+  `probe_timer_deadlines_follow_the_ladder`; failure isolation is structural — a candidate establishes into its own
+  throwaway `FlowLive` + `c`-prefixed nonce, cleaned by `CandidateGuard`, so it cannot touch the live carrier or
+  listener. The netwatch-Major reset is wired into the serving loop; its live firing is field-observable in P3.)*
 - [ ] **AC5** — A drained carrier is closed when its last connection ends, with a terminate the exit acts on (no
-  #1754-class leak), and a candidate that failed is closed too.
-- [ ] **AC6** — Kill switch: with `ROOMLER_TUNNEL_REUPGRADE=0` no probe is ever opened.
+  #1754-class leak), and a candidate that failed is closed too. *(P2: the client side is proven —
+  `drain_carrier_keeps_the_old_carrier_until_active_reaches_zero` (drop only at `active()==0`) and P1's
+  `a_quic_carrier_*` (drop ⇒ `rc:tunnel.terminate`); that the EXIT acts on the terminate / no leak is P3 field.)*
+- [x] **AC6** — Kill switch: with `ROOMLERD_TUNNEL_REUPGRADE=0` no probe is ever opened. *(P2: `reupgrade_active`
+  + `reupgrade_enabled` gate the whole probe path — `reupgrade_gate_respects_pinned_and_kill_switch`,
+  `kill_switch_reads_the_env`; off ⇒ the serving phase is exactly P1's `active.dead().await`.)*
 - [ ] **AC7** — Field: a client-daemon restart while the exit restarts ⇒ the affected routes end on `quic-v1`
-  within the bound (red first on the current release: they stay on `webrtc-dc-v1`).
-- [ ] **AC8** — Field: an RDP connection through a route stays up across a promotion.
-- [ ] **AC9** — Tests with negative controls shown red for P1 (held connection, single bind) and P2 (promotion,
-  drain, failure isolation, backoff, kill switch).
-- [ ] **AC10** — Docs: `docs/tunnels.md` describes carriers, the probe and the drain (mermaid, tables, `file:line`
-  anchors), and `docs/README.md` indexes it.
+  within the bound (red first on the current release: they stay on `webrtc-dc-v1`). *(P3 — the `--start-transport`
+  test lever ships in P2 to drive it.)*
+- [ ] **AC8** — Field: an RDP connection through a route stays up across a promotion. *(P3.)*
+- [x] **AC9** — Tests with negative controls shown red for P1 (held connection, single bind) and P2 (promotion,
+  drain, failure isolation, backoff, kill switch). *(P1's NCs in #1771; P2's shown red in this PR — NC86P2A
+  (listener ignores the promotion), NC86P2N (no backoff), NC86P2K/NC86P2S (probe while pinned / kill switch
+  ignored), NC86P2E (kill switch hardcoded on), NC86P2P (promote-by-cut).)*
+- [x] **AC10** — Docs: `docs/tunnels.md` describes carriers, the probe and the drain (mermaid, tables, `file:line`
+  anchors), and `docs/README.md` indexes it. *(P1's §"The flow owns the listener" + P2's §"Re-upgrade:
+  probe → promote → drain"; `tunnels.md` is row-indexed in `docs/README.md`.)*
 
 ## Open decisions
 

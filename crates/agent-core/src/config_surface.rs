@@ -514,6 +514,14 @@ const KEYS: &[KeyMeta] = &[
         description: "R4 — tunnel quic-derp-v1 fallback: after repeated quick tunnel session deaths (a corp capture window killing fresh TURN/TLS legs), lead the next attempt with QUIC over the ESTABLISHED /derp WS. Client-side only. Built-in default: off.",
     },
     KeyMeta {
+        key: "tunnel_reupgrade",
+        group: Group::Tunnels,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-86 - make-before-break tunnel transport re-upgrade: an auto declared route that fell back to a lower transport probes for the best one (quic-v1) in the background and switches to it when it comes up, never cutting an established connection. Client-side only. Read at each serving epoch (a config change applies on the next daemon restart; the env var flips it live). Built-in default: ON. Set false for the P1 behaviour.",
+    },
+    KeyMeta {
         key: "tunnel_peers_survive_reattach",
         group: Group::Tunnels,
         tier: Tier::Advanced,
@@ -1616,6 +1624,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "relay_server_enabled" => cfg.relay_server_enabled.map(fmt_bool),
         "relay_server_port" => cfg.relay_server_port.map(|v| v.to_string()),
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback.map(fmt_bool),
+        "tunnel_reupgrade" => cfg.tunnel_reupgrade.map(fmt_bool),
         "tunnel_peers_survive_reattach" => cfg.tunnel_peers_survive_reattach.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
@@ -1942,6 +1951,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
         }
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback = parse_tribool(value)?,
+        "tunnel_reupgrade" => cfg.tunnel_reupgrade = parse_tribool(value)?,
         "tunnel_peers_survive_reattach" => {
             cfg.tunnel_peers_survive_reattach = parse_tribool(value)?
         }
