@@ -39,7 +39,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
+use roomler_ai_remote_control::signaling::{ClientMsg, CloseReason, ServerMsg};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
@@ -463,6 +463,23 @@ impl TunnelClientHub {
             self.inner.pending_opens.lock().unwrap().remove(&nonce);
         }
         if let Some(sid) = handle.live.session_id.lock().unwrap().take() {
+            // #1754 — the abort above fires the driver's `TerminateOnDrop`, but
+            // that runs whenever the aborted future is next dropped, which is
+            // best-effort timing. Tell the server NOW, synchronously, while we
+            // still hold the session id: it relays `rc:tunnel.terminate` on to
+            // the exit agent so the agent reaps its per-session peer (ICE
+            // sockets + DC pool / quinn endpoint) instead of leaking it. A
+            // duplicate with the guard's own send is harmless — the server's
+            // terminate handling is idempotent. `try_send` never blocks the
+            // caller (a LocalAPI verb / the route reconciler); a full or closed
+            // egress just means the server will reap on the WS drop / grace
+            // instead.
+            if let Some(sink) = self.sink_now() {
+                let _ = sink.try_send(ClientMsg::TunnelTerminate {
+                    session_id: sid,
+                    reason: CloseReason::ClientShutdown,
+                });
+            }
             self.inner.client_sessions.lock().unwrap().remove(&sid);
         }
         info!(flow = %id, "killed daemon flow");

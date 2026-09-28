@@ -75,6 +75,94 @@ impl<T> std::ops::DerefMut for AbortOnDrop<T> {
     }
 }
 
+/// Tells the server (and through it the exit agent) that a tunnel session is
+/// over, the moment the session driver stops owning it — **including when the
+/// owning task is aborted**.
+///
+/// **The exit agent keeps its per-session `AgentTunnelPeer` — the ICE sockets
+/// plus the DataChannel pool (WebRTC) or the quinn endpoint (QUIC) — until it is
+/// told to drop it.** The only thing that tells it is a `rc:tunnel.terminate`
+/// the *client* sends: the server relays it on to the agent
+/// (`network::tunnel::relay_tunnel_client_msg_from_agent`), and no idle timeout
+/// reaps it otherwise.
+///
+/// Before this guard, every client path that ended a session *without* sending
+/// one leaked that agent-side peer: `kill_flow` aborted the supervisor task, and
+/// every `?` early return after `rc:tunnel.opened` (the 30 s `PEER_READY_TIMEOUT`
+/// toward a target whose DC pool never opens, a failed local bind, an
+/// `accept_answer` error, a QUIC-setup soft-fall) returned without a word to the
+/// far side. Field-measured on `0.4.110` (#1754): a macOS root exit agent's UDP
+/// socket count climbed 5 → 11 → 16 across five kills of one WebRTC forward, and
+/// a declared route whose target never comes up left one agent-side peer *per
+/// retry*, every 1–30 s, unbounded.
+///
+/// This is [`AbortOnDrop`]'s lesson one layer up: the rule ("tell the far side
+/// on every exit path") belongs in a type, not in each call site that kept
+/// forgetting it. `Drop` cannot await, so it spawns the send — and because the
+/// spawned task is independent of the one being torn down, it still delivers
+/// even when this guard drops *because* its task was aborted. Outside a runtime
+/// (process teardown) there is nothing to reap that will not die with us anyway.
+///
+/// Duplicates are harmless by construction: the server's terminate handling is
+/// idempotent (`sessions.remove` is a no-op for an already-reaped session, and
+/// an unknown session's terminate is dropped), so a path that also sends its own
+/// terminate — the `session_dead` backstop, the dispatch loop's session-gone /
+/// server-terminate / revoked arms, or `kill_flow`'s synchronous fast path —
+/// only ever costs one extra, absorbed frame.
+struct TerminateOnDrop {
+    sink: Arc<dyn TunnelSignalingSink>,
+    session_id: ObjectId,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl TerminateOnDrop {
+    fn new(sink: Arc<dyn TunnelSignalingSink>, session_id: ObjectId) -> Self {
+        Self {
+            sink,
+            session_id,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Mark the terminate as already handled so `Drop` stays silent — for a path
+    /// that has itself sent (or deliberately suppressed) the terminate. Kept
+    /// `cfg(test)` because the live drivers accept the harmless duplicate rather
+    /// than thread this through the spawned dispatch tasks; without the gate it
+    /// would be dead code under `-D warnings` in normal builds.
+    #[cfg(test)]
+    fn disarm(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for TerminateOnDrop {
+    fn drop(&mut self) {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sink = Arc::clone(&self.sink);
+        let session_id = self.session_id;
+        // Drop can't await; spawn the send. `try_current()` succeeds even when
+        // this runs because the owning task is being ABORTED — the spawned task
+        // is independent of the aborted one, so it still delivers.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id,
+                        reason: CloseReason::ClientShutdown,
+                    })
+                    .await
+                {
+                    debug!(%session_id, %e, "terminate-on-drop: link already gone");
+                }
+            });
+        } else {
+            debug!(%session_id, "terminate-on-drop: no runtime to spawn on; skipping");
+        }
+    }
+}
+
 /// Per-flow open round-trip cap: `TcpForwardRequest` / `UdpForwardRequest` →
 /// `Accept` / `Reject`. Server-side ACL eval is local, but the request rides the
 /// agent's dial timeout in the relay case. Shared by the TCP session driver and
@@ -389,6 +477,18 @@ pub async fn run_tunnel_session(
     .await
     .context("waiting for rc:tunnel.opened")??;
     let (session_id, negotiated_transport, ice_servers, quic_auth_token) = opened;
+
+    // #1754 — from here we hold a server-side session id, and the exit agent
+    // builds its per-session `AgentTunnelPeer` as soon as it sees our offer /
+    // QUIC setup. It frees that peer ONLY when told, so EVERY way this fn can
+    // now end — the transport dispatch below returning `Ok`, an early `?`
+    // (`PEER_READY_TIMEOUT`, a failed local bind, an `accept_answer` error), a
+    // `QuicSetupFailed` soft-fall before the WebRTC re-open, or the whole future
+    // being ABORTED by `kill_flow` — must tell the server so it relays
+    // `rc:tunnel.terminate` on to the agent. The guard makes that structural;
+    // its `Drop` survives the abort by spawning the send. Held across the whole
+    // transport dispatch below (bound with a name so it is not dropped early).
+    let _terminate_guard = TerminateOnDrop::new(sink.clone(), session_id);
 
     // ────────────── Dispatch on the negotiated transport ───────────
     if negotiated_transport == TRANSPORT_QUIC_DERP_V1 {
@@ -1943,6 +2043,98 @@ mod tests {
                 .send(msg)
                 .map_err(|e| anyhow::anyhow!("mock sink closed: {e}"))
         }
+    }
+
+    /// #1754 — a live [`TerminateOnDrop`] that is simply dropped sends exactly
+    /// one `rc:tunnel.terminate` (reason `ClientShutdown`) for its session. This
+    /// is the early-`?`-return / normal-completion path: the driver returns and
+    /// the guard tells the far side to reap its per-session peer.
+    #[tokio::test]
+    async fn terminate_guard_sends_one_terminate_on_drop() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx });
+        let sid = ObjectId::new();
+        {
+            let _g = TerminateOnDrop::new(sink.clone(), sid);
+        } // dropped here → Drop spawns the send
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must send a terminate within the deadline")
+            .expect("a message reached the sink");
+        match msg {
+            ClientMsg::TunnelTerminate { session_id, reason } => {
+                assert_eq!(session_id, sid, "the terminate names the guard's session");
+                assert_eq!(
+                    reason,
+                    CloseReason::ClientShutdown,
+                    "a client-abandoned session terminates as ClientShutdown"
+                );
+            }
+            other => panic!("expected TunnelTerminate, got {other:?}"),
+        }
+        // Exactly one — the guard fires once, not per poll.
+        assert!(
+            rx.try_recv().is_err(),
+            "the guard must send exactly one terminate"
+        );
+    }
+
+    /// #1754 — a guard whose terminate was already handled (`disarm`) stays
+    /// silent on drop, so a path that sent its own terminate doesn't force a
+    /// second. (The live drivers instead accept the harmless duplicate; this
+    /// locks the suppression the `fired` flag provides.)
+    #[tokio::test]
+    async fn a_disarmed_terminate_guard_stays_silent() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx });
+        {
+            let g = TerminateOnDrop::new(sink.clone(), ObjectId::new());
+            g.disarm();
+        } // dropped here → Drop must NOT spawn a send
+
+        // Give any (erroneously) spawned send real time to run before asserting,
+        // so this is a genuine check and not a race that passes vacuously.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a disarmed guard must not send a terminate"
+        );
+    }
+
+    /// #1754, the crux: the guard delivers a terminate **even when its owning
+    /// task is aborted** — which is exactly what `kill_flow` does to the flow
+    /// supervisor. `Drop` runs as the aborted future is torn down and spawns an
+    /// INDEPENDENT task for the send, so the abort that killed the owner can't
+    /// kill the delivery. Mirrors `AbortOnDrop`'s own detach test, inverted.
+    #[tokio::test]
+    async fn terminate_guard_fires_even_when_its_task_is_aborted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx });
+        let sid = ObjectId::new();
+
+        let task = tokio::spawn(async move {
+            let _g = TerminateOnDrop::new(sink, sid);
+            // Park with the guard live in scope, the way the driver parks on
+            // `wait_pool_open` / the accept loop when `kill_flow` aborts it.
+            std::future::pending::<()>().await;
+        });
+        // Let the task reach the park with the guard in scope.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+
+        let msg = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must deliver a terminate from the aborted task")
+            .expect("a message reached the sink");
+        assert!(
+            matches!(
+                msg,
+                ClientMsg::TunnelTerminate { session_id, reason }
+                    if session_id == sid && reason == CloseReason::ClientShutdown
+            ),
+            "the aborted task's guard must still send the session's terminate"
+        );
     }
 
     /// Phase 3d: `pick_turn_creds` must select the TURN ICE server (with
