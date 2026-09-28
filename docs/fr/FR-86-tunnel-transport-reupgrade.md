@@ -92,7 +92,7 @@ sequenceDiagram
   `active()` reaches 0 it is closed (terminate → the exit frees its peer). **No maximum drain time** — an RDP
   connection that lives for hours keeps its old carrier for hours; cutting it would break the goal.
 - **Failure:** a candidate that fails is closed (terminate), the backoff grows, the active carrier is untouched.
-- **Kill switch:** `ROOMLER_TUNNEL_REUPGRADE=0` (and the config key `tunnel_reupgrade = false`) — no probes; the
+- **Kill switch:** `ROOMLERD_TUNNEL_REUPGRADE=0` (and the config key `tunnel_reupgrade = false`) — no probes; the
   flow behaves exactly as after P1.
 
 ### Compatibility
