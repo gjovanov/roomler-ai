@@ -23,6 +23,12 @@ name: FR verification debt
 #   in ci.yml would tax every future edit of it with a cold ~20-50 min Rust
 #   rebuild, for nothing.
 #
+#   ⚠️ Correction (2026-09-28, FR-6 #773): that premise is wrong. rust-cache
+#   ignores `key` when `shared-key` is set, so an edit to ci.yml never rotated
+#   its Rust caches; the dead `key:` inputs are gone. ci.yml's `rust-lint`
+#   cache step records what does rotate them. Living here costs nothing, so
+#   the lane stays, but ci.yml would not have taxed it either.
+#
 # WHY IT IS ALSO SCHEDULED, not only triggered by pushes
 #
 #   ⚠️ The debt this measures is NOT created by a commit. It is created by

@@ -52,17 +52,20 @@ itself on the affected run's page. Baseline when the program started: releases t
   `target` drop over `SEED_TARGET_MAX_MB`, never file-level deletes under `target` —
   cargo fingerprints outlive outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref
   strays every 6 h.
-- **PR CI** (`ci.yml`): Swatinem with `key: wf-<hash of ci.yml>` (workflow edits rotate
-  the key — new steps can't be locked out), apt packages cached via
-  `cache-apt-pkgs-action` (mirror out of the hot path). Since wave 14 the Rust work runs
-  as **five parallel lanes** (`rust-lint`, `rust-unit`, `rust-agent`, `rust-recorder`,
-  `rust-recorder-audio`), each with its own cache family and the same system packages
-  from one composite (`.github/actions/ci-linux-system-deps`); an aggregate job keeps
-  the name "Rust checks". Every Swatinem block that runs on PRs **saves only from
-  master** (`save-if`), `CARGO_PROFILE_DEV_DEBUG=line-tables-only` shrinks compile time
-  and cache size, a `concurrency` group cancels a PR's superseded run, and
-  `cache-janitor.yml` deletes any cargo cache on a PR ref and keeps one generation per
-  family on master, running after every master CI run as well as on its cron.
+- **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
+  crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
+  and the next run restores the previous generation as a prefix match. A version bump
+  and an edit to `ci.yml` rotate nothing (wave 15; the open decision on new CI steps
+  says what that costs). apt packages are cached via `cache-apt-pkgs-action` (mirror
+  out of the hot path). Since wave 14 the Rust work runs as **five parallel lanes**
+  (`rust-lint`, `rust-unit`, `rust-agent`, `rust-recorder`, `rust-recorder-audio`),
+  each with its own cache family and the same system packages from one composite
+  (`.github/actions/ci-linux-system-deps`); an aggregate job keeps the name
+  "Rust checks". Every Swatinem block that runs on PRs **saves only from master**
+  (`save-if`), `CARGO_PROFILE_DEV_DEBUG=line-tables-only` shrinks compile time and cache
+  size, a `concurrency` group cancels a PR's superseded run, and `cache-janitor.yml`
+  deletes any cargo cache on a PR ref and keeps one generation per family on master,
+  running after every master CI run as well as on its cron.
 - **MSI job**: vendored FFmpeg/libvpx fetched from release assets (sha256-verified, exact
   legacy paths so baked `.pc` prefixes hold); FFmpeg link asserted inside `encoder-smoke`
   on the built EXE (the 5m33s cargo-test step is gone); tray/desktop companion in a
@@ -80,11 +83,12 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 6 | 08-19 | apt-package caching + 20-min CI timeout | #535 |
 | 7–8 | 08-19/20 | Inline generation retirement; accretion GC (+ the #660-era fingerprint-safety hardening) | #537, #549 |
 | 9 | 08-20 | Rehearsal concurrency (cancel-in-progress) | #556 |
-| 10 | 08-21 | `wf-` hash in the CI cache key | #587 |
+| 10 | 08-21 | `wf-` hash in the CI cache key (a no-op, found in wave 15: rust-cache ignores `key` when `shared-key` is set) | #587 |
 | 11 | 08-24 | Hard-bounded macOS GUI probe | #661 |
 | 12 | 08-25 | Run-salted keys (reservation wedge) | #675, #677 |
 | 13 | 08-26 | **Seeds → release assets** (+ shakeout: mktemp for tar paths, dispatcher watches composites, `contents: write` on the OIDC-narrowed Windows jobs) | #722, #725, #726, #728 |
 | 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
+| 15 | 09-28 | Actions-cache storage limit 10 → 20 GB (the operator, paid); the dead `key: wf-…` inputs removed, and the comments that relied on them corrected | #PR |
 
 ## Acceptance criteria
 
@@ -99,10 +103,12 @@ itself on the affected run's page. Baseline when the program started: releases t
       were evicting master's). Wave 14 restored it (field, run 36348497216 on #1745): the
       **whole CI in 6 min 21 s**, `Rust checks` critical path 5.8 min, every lane
       restoring master's cache with a full match; each lane has `timeout-minutes: 30`.
-- [ ] PR runs write no cargo caches, and master holds one generation per Swatinem
-      family (wave 14; checked with `gh cache list` after a day of PR traffic). First
-      evidence: #1745's run wrote no `v0-rust-*` entry and none exists on any PR ref;
-      after the seeding runs every master family held exactly one generation
+- [x] PR runs write no cargo caches, and master holds one generation per Swatinem
+      family (wave 14; checked after a day of PR traffic). Field, 2026-09-28T21:26Z,
+      25 h after the merge: 20 PR runs, and no `v0-rust-*` entry on any PR ref. None
+      of the janitor's 22 sweeps in that window deleted one as `pr-cargo`, so none was
+      ever written, not merely swept. Each of the 12 master families held exactly one
+      generation; the janitor had retired 7 superseded ones
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
@@ -118,18 +124,36 @@ itself on the affected run's page. Baseline when the program started: releases t
 - Runner-pool queue time is outside repo control (observed 35–70 min during bursts);
   rehearsal concurrency caps our own contribution. A self-hosted Windows runner is the
   reserve option.
-- **The cache pool is at capacity on master alone** (wave 14 finding). With PR-ref saves
-  gone, master's own families add up to ~10–12 GB: the five Rust lanes 5.6 GB (vs the
-  single 4.1 GB `ci-linux` they replaced, since shared deps now sit in several
-  families), `ci-integration` 1.1 GB, and the rest ~0.4–0.8 GB each. The pool read
-  10.2 GB right after seeding, and the first victims were the small, early-saved
-  entries: Windows clippy, recording-ffmpeg, the apt sets. LRU picks the least recently
-  *restored* entry, and every PR restores the lanes, so the critical path stays warm
-  and churn lands on the rarer jobs. Two ways out: raise the repo's cache storage limit
-  (GitHub bills above 10 GB and needs a payment method on the account; the storage-limit
-  API answers 402 without one), or trim families (e.g. `recorder` + `recorder-audio`
-  sharing one). The registry copy each family carries is only ~167 MB for the whole
-  lockfile, so deduplicating it is not the lever.
+- **Resolved 2026-09-28: the cache pool was at capacity on master alone** (wave 14
+  finding). With PR-ref saves gone, master's own families add up to ~11.6 GB: the five
+  Rust lanes 5.6 GB (vs the single 4.1 GB `ci-linux` they replaced, since shared deps
+  now sit in several families), `ci-integration` 1.1 GB, and the rest ~0.4–0.8 GB each.
+  The pool read 10.2 GB right after seeding, and the first victims were the small,
+  early-saved entries: Windows clippy, recording-ffmpeg, the apt sets. The expectation
+  that LRU would keep the lanes warm (every PR restores them) and push the churn onto
+  rarer jobs did not hold: over the next day the lanes themselves were evicted (lint
+  overnight, unit at midday, agent and both recorder lanes in the evening), and each
+  eviction cost the next PR a cold lane (log, 2026-09-28). The operator raised the
+  repo's limit to **20 GB** (paid; `PUT repos/{repo}/actions/cache/storage-limit`
+  answered 402 until the account had a payment method). Trimming families (e.g.
+  `recorder` + `recorder-audio` sharing one) stays in reserve. The registry copy each
+  family carries is only ~167 MB for the whole lockfile, so deduplicating it is not
+  the lever.
+- **A new CI step's dependency builds stay out of the cache until the next key
+  rotation** (wave 15 finding; root cause 4 is open again). Wave 10 meant a `ci.yml`
+  edit to rotate the key, but rust-cache ignores `key` when `shared-key` is set, so the
+  key moves only with a member `Cargo.toml`, a third-party `Cargo.lock` change or the
+  toolchain. Master saw such a change on 11 of the 30 days to 09-28, with one gap of
+  17.3 days (09-08 → 09-25). A step added inside such a gap recompiles its new
+  dependency builds on every run until the gap ends, as `Run API unit tests` did on
+  08-21 (+7 min per run). Levers: bump `prefix-key` by hand (one cold master run per
+  lane), or salt the lockfile part of the key. rust-cache hashes every
+  `.cargo/config.toml` under the workspace byte for byte (`src/config.ts`, v2.9.2), so
+  a CI step that writes a comment-only one outside any directory cargo runs from,
+  holding a hash of `ci.yml`'s non-comment lines, would rotate the key on a real
+  workflow change and still restore the previous generation as a prefix match. That
+  relies on a rust-cache implementation detail; if it changes, the salt is ignored and
+  the lane behaves as it does today.
 
 ## Out of scope
 
@@ -156,7 +180,9 @@ itself on the affected run's page. Baseline when the program started: releases t
   friends compiled in ~12 feature configurations, one after another. Wave 14 plan and
   numbers: #773.
 - 2026-09-27: **Wave 14 (#1743) cold numbers.** Its own PR runs are cold by
-  construction, since the `ci.yml` edit rotates every key: the `Rust checks` critical
+  construction, since every lane is a new cache family and the new
+  `CARGO_PROFILE_DEV_DEBUG` moves the env hash (the edit to `ci.yml` itself rotates
+  nothing; see 2026-09-28): the `Rust checks` critical
   path fell from 36.8 to ~17 min cold and the whole CI from 36.9 to 18.2 min (run
   36345672545). Cold runner variance is ~30%: identical lint steps took 316 s and
   426 s on two runners. The first master run after the merge seeded every lane
@@ -171,3 +197,34 @@ itself on the affected run's page. Baseline when the program started: releases t
   with a full match. Also Windows recorder 6.0 (was 7.3), macOS 3.0 (was 4.6), profiles
   1.6 min. The PR wrote no `v0-rust-*` cache. The pool read 10.2 GB: see the capacity
   item under Open decisions.
+- 2026-09-28: **Wave 14 over a day** (every CI run from the merge to 21:05Z: 20 PR
+  runs, 19 on master; timings are first attempts). PR runs: whole CI ≤10 min in 18 of
+  20, median 7.3 min; `Rust checks` median 5.7 min. Five PR runs had a lane restore
+  nothing, getting `No cache found` on a key master had saved hours earlier: lint at
+  05:44, unit at 12:55 and 13:06, agent and both recorder lanes at 20:04 and 20:18. The
+  two over 10 min were the big lanes cold (lint 17.7 min, unit 15.0 min); the smaller
+  lanes stayed under 10 even cold. Cause: master's own families (~11.6 GB) against the
+  10 GB limit; the janitor measured the pool at 9.6–11.7 GB before its sweeps. No PR
+  run wrote a cargo cache (acceptance criteria). One PR run's first attempt failed in
+  `ffmpeg-encoder` on a flaky test and passed on re-run; unrelated to caching.
+- 2026-09-28: **Limit 10 → 20 GB** at 21:04Z by the operator (paid), read back as
+  `{"max_cache_size_gb":20}`. Pool at 21:26Z: 10.6 GB in 24 entries, every family
+  present except `ci-integration`, which its next master run re-saves. Still owed: a
+  day of PR runs with no `No cache found` on a key master saved.
+- 2026-09-28: **Correction: wave 10's `wf-` key never worked** (#773). rust-cache
+  reads `key` only when `shared-key` is unset (`src/config.ts`, v2.9.2, the release
+  `@v2` resolves to), and every lane's log shows the key it computed with no trace of
+  the `wf-…` input. Field: #1728, #1735 (+95 lines) and #1736 each edited `ci.yml` on
+  09-27, and each master run then restored `v0-rust-ci-linux-…-977c0b24` with a full
+  match and saved nothing. The lockfile hash is narrower than its name: rust-cache
+  blanks member versions and skips the workspace's own `Cargo.lock` entries, so four
+  version bumps (0.4.108 → 0.4.113) kept `ci-lint`'s key, while #1741 and #1752 (a
+  dependency each in `crates/api/Cargo.toml`) and #1744 (a feature in
+  `agents/roomlerd/Cargo.toml`) each rotated it. #587 added its `key` beside an
+  existing `shared-key: ci-linux`, so it was dead from the first run. The likeliest end
+  of the 08-21 lockout is #590, which changed a member manifest 42 min after #587
+  merged (an eviction and re-save would also have refreshed the entry). A
+  wrong turn, recorded: the first correction on #773 cited #1744 as the proof that a
+  `ci.yml` edit rotates nothing, but #1744 also changed a manifest and its key did
+  rotate. The dead inputs are removed (wave 15), and the gap they were meant to close
+  is an open decision again.

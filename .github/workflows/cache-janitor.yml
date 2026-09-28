@@ -1,12 +1,19 @@
 name: Cache janitor
 
-# Keeps the repo's 10 GB Actions-cache pool under budget so LRU eviction
-# never gets to choose a victim — historically it chose the release-lane
-# seeds (2026-07-30: pool at 11.8 GB of PR/CI churn evicted the seeds
-# within days and every agent release ran ~14 min slower until someone
-# noticed). GitHub's own policy (7-day unused expiry + LRU over 10 GB)
-# is too slow for this repo's cadence: several releases and PR merges a
-# day each save 0.5–1.5 GB.
+# Keeps the repo's Actions-cache pool under budget so LRU eviction never
+# gets to choose a victim — historically it chose the release-lane seeds
+# (2026-07-30: pool at 11.8 GB of PR/CI churn evicted the seeds within days
+# and every agent release ran ~14 min slower until someone noticed).
+# GitHub's own policy (7-day unused expiry + LRU over the limit) is too slow
+# for this repo's cadence: several releases and PR merges a day each save
+# 0.5–1.5 GB.
+#
+# The limit is 20 GB since 2026-09-28 (it was the free 10 GB; raised by the
+# operator — paid, `PUT repos/{repo}/actions/cache/storage-limit`). Master's
+# own working set is ~12 GB (FR-6 wave 14), which at 10 GB kept its families
+# evicting each other: one PR run in seven hit a cold lane. The janitor's
+# rules below still matter at 20 GB — they are what keeps a lockfile
+# rotation (a second ~12 GB generation) from filling the headroom.
 #
 # Policy per cache entry:
 #   - PR merge-ref caches idle > 48 h  → delete (the PR run that made
@@ -36,10 +43,12 @@ name: Cache janitor
 #     LRU. That is exactly how 13.1 of a 15.0 GB pool came to sit on PR refs
 #     and evict master's `ci-linux`, turning a 20 min run into 36.8.
 #   - master keeps ONE generation per Swatinem family. A key is
-#     `v0-rust-<family>-<env hash>-<lockfile hash>`, and a new generation
-#     lands whenever ci.yml or Cargo.lock changes — every release bump — so
-#     superseded ones would otherwise sit out their 96 h. Restores never
-#     need them: an exact miss falls back to the NEWEST prefix match.
+#     `v0-rust-<family>-<os>-<arch>-<env hash>-<lockfile hash>`, and a new
+#     generation lands whenever a member crate's Cargo.toml or a third-party
+#     Cargo.lock entry changes (several times on a busy day; a version bump
+#     and a ci.yml edit do not rotate it, see ci.yml's `rust-lint` cache
+#     step), so superseded ones would otherwise sit out their 96 h. Restores
+#     never need them: an exact miss falls back to the NEWEST prefix match.
 
 on:
   schedule:
