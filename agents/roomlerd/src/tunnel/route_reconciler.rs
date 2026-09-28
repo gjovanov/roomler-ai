@@ -293,7 +293,13 @@ impl RouteReconciler {
                             let remote = route.remote.clone().unwrap_or_default();
                             self.inner
                                 .hub
-                                .create_forward(&route.node, route.local, &remote, &route.transport)
+                                .create_forward(
+                                    &route.node,
+                                    route.local,
+                                    &remote,
+                                    &route.transport,
+                                    "",
+                                )
                                 .await
                         }
                         FlowKind::Socks5 => {

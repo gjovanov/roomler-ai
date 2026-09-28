@@ -540,4 +540,38 @@ mod tests {
         assert_eq!(p.max_held, 64);
         assert_eq!(p.max_wait, Duration::from_secs(30));
     }
+
+    /// FR-86 P2 — a re-upgrade PROMOTION is `install(new)`: after it, a NEW
+    /// connection goes to the new carrier and never to the old one. (The old
+    /// carrier's already-carried connections are untouched — proven end to end
+    /// with real transports in `driver::tests::make_before_break_*`.) NC86P2A
+    /// (install ignores the new carrier / keeps the old) turns this red.
+    #[tokio::test]
+    async fn install_promotes_so_new_connections_go_to_the_new_carrier() {
+        let port = free_port().await;
+        let listener = FlowListener::bind(port, HoldPolicy::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr();
+        let (a, mut a_rx) = fake("A");
+        let (b, mut b_rx) = fake("B");
+
+        // A is current: a connection is carried by A.
+        listener.install(Arc::clone(&a));
+        let _c1 = TcpStream::connect(addr)
+            .await
+            .expect("connect while A serves");
+        let _ = carried(&mut a_rx, "A").await;
+
+        // Promote to B. From now on new connections ride B, not A.
+        listener.install(Arc::clone(&b));
+        let _c2 = TcpStream::connect(addr)
+            .await
+            .expect("connect while B serves");
+        let _ = carried(&mut b_rx, "B").await;
+        assert!(
+            a_rx.try_recv().is_err(),
+            "a connection after promotion must not reach the old carrier A"
+        );
+    }
 }

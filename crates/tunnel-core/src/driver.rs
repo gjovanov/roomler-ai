@@ -455,6 +455,12 @@ pub struct Carrier {
     session_dead: Arc<Notify>,
     /// Connections in flight on this carrier ([`Carrier::active`]).
     in_flight: Arc<AtomicU64>,
+    /// FR-86 P2 — notified when [`in_flight`](Self::in_flight) falls to 0, so a
+    /// draining carrier can be closed the instant its last connection ends
+    /// without a tight poll ([`Carrier::drained`]). `notify_waiters` (not
+    /// `notify_one`): it wakes only current waiters and stores no permit, so
+    /// `drained` arms the wait BEFORE it re-reads the count.
+    idle: Arc<Notify>,
     /// Closed (its sender dropped) when the dispatcher task ends — by
     /// returning or by being aborted — which is how [`Carrier::dead`] sees
     /// "the control channel is gone" through a shared reference.
@@ -487,19 +493,31 @@ enum Plane {
 }
 
 /// RAII count of one connection in flight on a carrier: decrements when the
-/// connection's task returns OR is aborted.
-struct InFlight(Arc<AtomicU64>);
+/// connection's task returns OR is aborted. When the decrement brings the count
+/// to 0 it wakes [`Carrier::drained`] (FR-86 P2), so a draining carrier closes
+/// the instant its last connection ends.
+struct InFlight {
+    counter: Arc<AtomicU64>,
+    idle: Arc<Notify>,
+}
 
 impl InFlight {
-    fn new(counter: &Arc<AtomicU64>) -> Self {
+    fn new(counter: &Arc<AtomicU64>, idle: &Arc<Notify>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
-        Self(Arc::clone(counter))
+        Self {
+            counter: Arc::clone(counter),
+            idle: Arc::clone(idle),
+        }
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        // `fetch_sub` returns the PREVIOUS value, so `== 1` means this was the
+        // last connection and the count is now 0.
+        if self.counter.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.idle.notify_waiters();
+        }
     }
 }
 
@@ -520,6 +538,31 @@ impl Carrier {
         self.in_flight.load(Ordering::Relaxed)
     }
 
+    /// FR-86 P2 — resolves once this carrier has **no connections in flight**.
+    /// A draining carrier (one the flow re-upgraded away from) is closed the
+    /// moment this fires, so its established connections run to their natural
+    /// end and none is ever cut. Returns at once if the carrier is already idle.
+    ///
+    /// Race-free against a concurrent last-connection close: the `Notified`
+    /// future is armed with `enable()` BEFORE the count is re-read, so a
+    /// `notify_waiters` that fires between the read and the await is not lost.
+    /// Cancel-safe — nothing is consumed before it resolves, so a `select!` may
+    /// drop and re-create it freely.
+    pub async fn drained(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Arm the waiter first, then check: if the last connection ends now,
+            // either the check sees 0 (we return) or the armed waiter catches
+            // the wake (we loop and then see 0).
+            notified.as_mut().enable();
+            if self.active() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Forward one accepted local connection through this session — the
     /// per-connection task the session's accept loop used to spawn, unchanged:
     /// socket tuning, SOCKS5 / static target resolution, UDP ASSOCIATE, the
@@ -529,7 +572,7 @@ impl Carrier {
         debug!(%peer_addr, transport = self.transport, "accepted local TCP connection");
 
         let flow_id = self.flow_counter.fetch_add(1, Ordering::Relaxed);
-        let in_flight = InFlight::new(&self.in_flight);
+        let in_flight = InFlight::new(&self.in_flight, &self.idle);
         let session_id = self.session_id;
         let reply_registry = Arc::clone(&self.reply_registry);
         let active_flows = Arc::clone(&self.active_flows);
@@ -1177,6 +1220,7 @@ async fn establish_webrtc(
         flow_timeout_streak: Arc::new(AtomicU32::new(0)),
         session_dead: Arc::new(Notify::new()),
         in_flight: Arc::new(AtomicU64::new(0)),
+        idle: Arc::new(Notify::new()),
         dispatcher_done,
         _dispatcher: dispatcher_task,
         plane: Plane::Dc {
@@ -1727,6 +1771,7 @@ async fn establish_quic(
         flow_timeout_streak: Arc::new(AtomicU32::new(0)),
         session_dead: Arc::new(Notify::new()),
         in_flight: Arc::new(AtomicU64::new(0)),
+        idle: Arc::new(Notify::new()),
         dispatcher_done,
         _dispatcher: dispatcher_task,
         plane: Plane::Quic { conn, _peer },
@@ -2831,6 +2876,7 @@ mod tests {
             flow_timeout_streak: Arc::new(AtomicU32::new(0)),
             session_dead: Arc::new(Notify::new()),
             in_flight: Arc::new(AtomicU64::new(0)),
+            idle: Arc::new(Notify::new()),
             dispatcher_done,
             _dispatcher: dispatcher,
             plane: Plane::Quic {
@@ -3011,5 +3057,208 @@ mod tests {
             ),
             "the guard still fires on drop: {msg:?}"
         );
+    }
+
+    /// FR-86 P2 — [`Carrier::drained`]: an idle carrier is already drained; a
+    /// carrier with a connection in flight is NOT drained until that connection
+    /// ends, at which point `drained()` resolves (the signal a draining carrier
+    /// is closed on). Real QUIC loopback so the count is driven by a real flow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carrier_is_drained_when_idle_and_pends_until_its_last_connection_ends() {
+        let dst_port = spawn_echo_dst().await;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let (fp, agent_addr) = spawn_quic_exit("drain-token", dst_port, stop_rx);
+        let client = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp).unwrap();
+        let conn = client.connect(agent_addr).await.unwrap();
+        quic::client_authenticate(&conn, "drain-token")
+            .await
+            .unwrap();
+        let session_id = ObjectId::new();
+        let (carrier, mut ctl) = quic_carrier_for_test(conn, client, session_id, dst_port);
+
+        // Idle at construction: drained() resolves at once.
+        tokio::time::timeout(Duration::from_millis(500), carrier.drained())
+            .await
+            .expect("an idle carrier is already drained");
+
+        // Carry one connection: now busy.
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = tokio::net::TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (tcp, peer_addr) = local.accept().await.unwrap();
+        carrier.carry(tcp, peer_addr);
+        assert_eq!(carrier.active(), 1);
+        let flow_id = match next_client_msg(&mut ctl.sink_rx, "TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest { flow_id, .. } => flow_id,
+            other => panic!("expected TcpForwardRequest, got {other:?}"),
+        };
+        ctl.src_tx
+            .send(ServerMsg::TcpForwardAccept {
+                session_id,
+                flow_id,
+                dc_index: 0,
+            })
+            .await
+            .unwrap();
+        // Busy: drained() must NOT resolve.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), carrier.drained())
+                .await
+                .is_err(),
+            "a carrier with a connection in flight is not drained"
+        );
+
+        // The app closes: the flow ends, active → 0, drained() resolves.
+        drop(app);
+        tokio::time::timeout(Duration::from_secs(5), carrier.drained())
+            .await
+            .expect("drained() resolves once the last connection ends");
+        assert_eq!(carrier.active(), 0);
+        let _ = stop_tx.send(());
+    }
+
+    /// FR-86 P2, the make-before-break core (AC2), end to end over TWO real
+    /// QUIC carriers behind one [`FlowListener`]: a connection established on
+    /// carrier A keeps flowing bytes AFTER carrier B is installed (promoted),
+    /// while a NEW connection rides B — and A drains only when its own
+    /// connection ends. The promotion is `listener.install(B)`; A is never
+    /// touched by it. (The supervisor's decision to DROP a drained carrier is
+    /// covered, with its promote-by-cut negative control, in
+    /// `client_mgr`'s `drain_carrier` test.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn make_before_break_a_keeps_flowing_while_b_takes_new_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+
+        let dst_port = spawn_echo_dst().await;
+
+        // ── Carrier A + its exit ──────────────────────────────────────
+        let (stop_a, stop_a_rx) = oneshot::channel::<()>();
+        let (fp_a, addr_a) = spawn_quic_exit("mbb-a", dst_port, stop_a_rx);
+        let client_a = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp_a).unwrap();
+        let conn_a = client_a.connect(addr_a).await.unwrap();
+        quic::client_authenticate(&conn_a, "mbb-a").await.unwrap();
+        let sid_a = ObjectId::new();
+        let (carrier_a, mut ctl_a) = quic_carrier_for_test(conn_a, client_a, sid_a, dst_port);
+        let carrier_a = Arc::new(carrier_a);
+
+        // ── The flow's listener, A installed ──────────────────────────
+        let listener = crate::flow_listener::FlowListener::bind(
+            0,
+            crate::flow_listener::HoldPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let laddr = listener.local_addr();
+        listener.install(Arc::clone(&carrier_a));
+
+        // A local app connects → carried by A; drive its forward accept.
+        let app1 = tokio::net::TcpStream::connect(laddr).await.unwrap();
+        let fid1 = match next_client_msg(&mut ctl_a.sink_rx, "A TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest {
+                session_id,
+                flow_id,
+                ..
+            } => {
+                assert_eq!(session_id, sid_a);
+                flow_id
+            }
+            other => panic!("expected TcpForwardRequest on A, got {other:?}"),
+        };
+        ctl_a
+            .src_tx
+            .send(ServerMsg::TcpForwardAccept {
+                session_id: sid_a,
+                flow_id: fid1,
+                dc_index: 0,
+            })
+            .await
+            .unwrap();
+        let (mut r1, mut w1) = app1.into_split();
+        let mut buf = [0u8; 2];
+        w1.write_all(b"a1").await.unwrap();
+        timeout(Duration::from_secs(5), r1.read_exact(&mut buf))
+            .await
+            .expect("A echo timely")
+            .unwrap();
+        assert_eq!(&buf, b"a1");
+        assert_eq!(carrier_a.active(), 1);
+
+        // ── PROMOTE: build carrier B + its exit, install it ───────────
+        let (stop_b, stop_b_rx) = oneshot::channel::<()>();
+        let (fp_b, addr_b) = spawn_quic_exit("mbb-b", dst_port, stop_b_rx);
+        let client_b = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp_b).unwrap();
+        let conn_b = client_b.connect(addr_b).await.unwrap();
+        quic::client_authenticate(&conn_b, "mbb-b").await.unwrap();
+        let sid_b = ObjectId::new();
+        let (carrier_b, mut ctl_b) = quic_carrier_for_test(conn_b, client_b, sid_b, dst_port);
+        let carrier_b = Arc::new(carrier_b);
+        listener.install(Arc::clone(&carrier_b)); // new connections → B; A untouched
+
+        // A's established connection KEEPS FLOWING after the swap.
+        w1.write_all(b"a2").await.unwrap();
+        timeout(Duration::from_secs(5), r1.read_exact(&mut buf))
+            .await
+            .expect("A still echoes after B is promoted")
+            .unwrap();
+        assert_eq!(
+            &buf, b"a2",
+            "an established connection keeps flowing on carrier A after B is promoted"
+        );
+        assert_eq!(
+            carrier_a.active(),
+            1,
+            "A still carries its established connection"
+        );
+
+        // A NEW connection rides B.
+        let app2 = tokio::net::TcpStream::connect(laddr).await.unwrap();
+        let fid2 = match next_client_msg(&mut ctl_b.sink_rx, "B TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest {
+                session_id,
+                flow_id,
+                ..
+            } => {
+                assert_eq!(session_id, sid_b);
+                flow_id
+            }
+            other => panic!("expected TcpForwardRequest on B, got {other:?}"),
+        };
+        ctl_b
+            .src_tx
+            .send(ServerMsg::TcpForwardAccept {
+                session_id: sid_b,
+                flow_id: fid2,
+                dc_index: 0,
+            })
+            .await
+            .unwrap();
+        let (mut r2, mut w2) = app2.into_split();
+        w2.write_all(b"b1").await.unwrap();
+        timeout(Duration::from_secs(5), r2.read_exact(&mut buf))
+            .await
+            .expect("B echo timely")
+            .unwrap();
+        assert_eq!(&buf, b"b1", "a new connection rides carrier B");
+        assert_eq!(carrier_b.active(), 1);
+        assert!(
+            ctl_a.sink_rx.try_recv().is_err(),
+            "the new connection must not touch the draining carrier A"
+        );
+
+        // ── DRAIN A: close its connection; drained() resolves ─────────
+        w1.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        let _ = timeout(Duration::from_secs(5), r1.read_to_end(&mut rest)).await;
+        timeout(Duration::from_secs(5), carrier_a.drained())
+            .await
+            .expect("A drains once its established connection ends");
+        assert_eq!(carrier_a.active(), 0);
+        // B is still serving its connection.
+        assert_eq!(carrier_b.active(), 1);
+
+        let _ = stop_a.send(());
+        let _ = stop_b.send(());
     }
 }
