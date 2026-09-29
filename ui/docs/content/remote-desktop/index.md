@@ -1,6 +1,7 @@
 ---
 title: Remote desktop
-description: Open any enrolled machine as a live screen in a browser tab — hardware-encoded, end-to-end encrypted and consent-gated, with no viewer to install.
+seoTitle: Remote desktop from any browser, no install — Roomler
+description: Remote desktop from any browser — open an enrolled machine as a live screen in a tab, hardware-encoded, end-to-end encrypted and consent-gated.
 tags: [remote-desktop, overview, sessions]
 hero: remote-desktop.svg
 heroAlt: A browser tab showing the live screen of a remote machine, connected directly and encrypted end to end
