@@ -51,11 +51,12 @@ export interface DocPage {
   plain: string
   /** Emit FAQPage structured data from this page's h2s. */
   faq: boolean
-  /** When the content last changed (`YYYY-MM-DD`): front-matter `updated`,
-   *  else git, else the dates manifest. UNDEFINED when none of them knows,
-   *  and then no date is published at all — never the build date (FR-87). */
+  /** When the content last changed — an ISO 8601 timestamp from git, or the
+   *  front-matter `updated` (a date or a timestamp) — else the dates
+   *  manifest. UNDEFINED when none of them knows, and then no date is
+   *  published at all — never the build date (FR-87). */
   lastmod?: string
-  /** When the source file first appeared in git, when known. */
+  /** When the source file first appeared in git, when known (a timestamp). */
   created?: string
   /** The 404 page: no canonical, no structured data, never indexed. */
   notFound?: boolean
@@ -246,7 +247,7 @@ function structuredData(page: DocPage, canonical: string, crumbs: Crumb[]): Reco
  *  date when none is known, no edit link on a page no file produces. */
 function pageMeta(page: DocPage): string {
   const parts: string[] = []
-  if (page.lastmod) parts.push(`Last updated <time datetime="${page.lastmod}">${page.lastmod}</time>`)
+  if (page.lastmod) parts.push(`Last updated <time datetime="${page.lastmod}">${page.lastmod.slice(0, 10)}</time>`)
   if (page.sourceFile) {
     parts.push(
       `<a href="https://github.com/gjovanov/roomler-ai/edit/master/ui/docs/content/${page.sourceFile}.md" target="_blank" rel="noopener noreferrer">Edit this page</a>`,

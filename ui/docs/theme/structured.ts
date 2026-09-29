@@ -52,7 +52,8 @@ export interface ArticleInput {
   url: string
   headline: string
   description: string
-  /** `YYYY-MM-DD`; omitted when unknown, never guessed. */
+  /** ISO 8601, ideally with time and zone (Google flags a bare date as an
+   *  invalid datetime); omitted when unknown, never guessed. */
   datePublished?: string
   dateModified?: string
   /** Absolute URL of a raster image (social platforms and Google do not take SVG). */
