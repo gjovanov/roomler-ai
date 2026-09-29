@@ -155,6 +155,22 @@ for pair in "/landing /" "/pricing /#pricing"; do
   fi
 done
 
+# 5c. The IndexNow key (P7): an engine verifies a submission by fetching
+#     /<key>.txt, so the file must be served exactly as committed. A missing
+#     one would not 404: `location /` answers it with the SPA shell. Needs the
+#     repo, where the key file is named.
+if [ -n "$REPO" ]; then
+  for f in $(git -C "$REPO" ls-tree --name-only "$REV" ui/public/ 2>/dev/null | grep -E '/[0-9a-f]{32}\.txt$'); do
+    key="$(basename "$f" .txt)"
+    got="$(curl -ksS -m 15 "$BASE/$key.txt" 2>/dev/null)"
+    if [ "$got" = "$key" ]; then
+      ok "/$key.txt serves the IndexNow key"
+    else
+      bad "/$key.txt does not serve the IndexNow key (engines would reject every submission)"
+    fi
+  done
+fi
+
 # 6. Every asset a page names is content-hashed — the only kind of name for
 #    which nginx's one-year `immutable` is true — and actually loads. Every
 #    image reserves its box (width + height). The og:image is absolute and
