@@ -77,6 +77,29 @@ jobs:
             || { echo "::error::${IMAGE}:${TAG} does not exist in the package"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      # FR-87 P7 (#1776) — IndexNow: Bing, Yandex, Seznam, Naver and the other
+      # engines that share api.indexnow.org (not Google: Search Console covers
+      # it) learn which public pages a roll changed. The served sitemaps are
+      # read BEFORE the bump and again after the roll; their lastmods come
+      # from git, never the build clock, so the diff is exactly the pages
+      # whose content changed. Off unless the repository variable
+      # INDEXNOW_ENABLED is 'true'. Warn-only: a missed hint to a crawler never
+      # fails a promote. The key is public by design: an engine verifies a
+      # submission by fetching https://roomler.ai/<key>.txt (`ui/public/`).
+      - name: IndexNow — check out the script and the key
+        if: vars.INDEXNOW_ENABLED == 'true'
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/indexnow.sh
+            ui/public/*.txt
+          sparse-checkout-cone-mode: false
+
+      - name: IndexNow — snapshot the served sitemaps before the bump
+        if: vars.INDEXNOW_ENABLED == 'true'
+        continue-on-error: true
+        run: bash scripts/indexnow.sh snapshot https://roomler.ai "$RUNNER_TEMP/sitemaps-before.tsv"
+
       - name: Bump the deploy repo
         id: bump
         env:
@@ -149,6 +172,23 @@ jobs:
           done
           echo "10 min after the bump: $BAD of 60 health probes were not 200 (a roll under maxUnavailable 1 should show 0)"
           [ "$BAD" -eq 0 ] || echo "::warning::the public /health was not 200 on $BAD probes during the roll — check the pods"
+
+      # After the watch, so both pods serve the new image: its sitemaps, and
+      # the key file the engines fetch to verify the submission.
+      - name: IndexNow — submit the pages the roll changed
+        if: steps.bump.outputs.bumped == 'yes' && vars.INDEXNOW_ENABLED == 'true'
+        continue-on-error: true
+        run: |
+          set -u
+          KEY="$(ls ui/public | sed -nE 's/^([0-9a-f]{32})\.txt$/\1/p' | head -1)"
+          [ -n "$KEY" ] || { echo "::warning title=IndexNow::no ui/public/<key>.txt in the checkout — nothing submitted"; exit 1; }
+          bash scripts/indexnow.sh snapshot https://roomler.ai "$RUNNER_TEMP/sitemaps-after.tsv" || exit 1
+          bash scripts/indexnow.sh changed "$RUNNER_TEMP/sitemaps-before.tsv" "$RUNNER_TEMP/sitemaps-after.tsv" > "$RUNNER_TEMP/changed.txt"
+          bash scripts/indexnow.sh submit https://roomler.ai "$KEY" < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/indexnow.txt" 2>&1
+          RC=$?
+          cat "$RUNNER_TEMP/indexnow.txt"
+          { echo '### IndexNow'; echo '```'; cat "$RUNNER_TEMP/indexnow.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$RC"
 
       - name: Summary
         if: always()

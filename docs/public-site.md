@@ -228,6 +228,7 @@ bash scripts/public-site-smoke.sh https://roomler.ai . <deployed-sha>
 | `/home/` → 404; `/landing` → 301 `/`; `/pricing` → 301 `/#pricing` | a second URL for the homepage; the SPA's old routes |
 | every `/docs/assets/` file `/`, `/docs/` and a leaf name is hashed and loads; every `<img>` has a size | stale caches; layout shift |
 | given a full-history repo, every docs `<lastmod>` equals git's | dates from the build clock |
+| given the repo, `/<key>.txt` serves the IndexNow key exactly as committed (§8) | a key file that stopped shipping: `location /` would answer with the SPA shell, and every engine would reject every submission |
 
 Each check was shown failing before it passed. Against production before FR-87 it failed on
 all of them, and an image built with no manifest fails the `lastmod` check. Production before
@@ -261,10 +262,51 @@ from both branches (FR-87 §9).
   over the fallback table the page ships. With JavaScript off, the page is complete and the
   form's place links to sign-up.
 
-## 8. Next
+## 8. Telling search engines
 
-FR-87 P7 (Search Console, Bing, IndexNow) is the remaining phase. This page is updated when it
-ships.
+Crawlers find the site through `/sitemap.xml` (named in `robots.txt`) at their own pace. Two
+things shorten that, and neither needs server code.
+
+**IndexNow, on every promote.** Bing, Yandex, Seznam, Naver and the other engines that share
+`api.indexnow.org` accept a list of changed URLs, and recrawl them within minutes. Google does
+not take part. `promote.yml` does it around the roll, with
+[`scripts/indexnow.sh`](../scripts/indexnow.sh):
+
+```mermaid
+sequenceDiagram
+    participant P as promote.yml
+    participant S as roomler.ai
+    participant I as api.indexnow.org
+    P->>S: snapshot: every child of /sitemap.xml → loc⇥lastmod
+    P->>P: bump the deploy repo · watch /health for 10 min (the roll)
+    P->>S: snapshot again, now served by the new image
+    P->>P: changed = new URLs + re-dated URLs
+    P->>S: GET /<key>.txt: exactly the key? (else: warn, submit nothing)
+    P->>I: POST {host, key, keyLocation, urlList}
+    I-->>P: 200 / 202 accepted (403 · 422 · 429 → a warning)
+    I->>S: an engine fetches /<key>.txt to verify
+```
+
+- **What counts as changed:** a URL that is new, or whose `lastmod` differs. The lastmods come
+  from git (§2), so a release that only touches the theme submits nothing. An undated URL
+  (`/`, generated listings) is submitted once, when it first appears. With no before-snapshot,
+  nothing is submitted, never everything.
+- **The key is public by design.** Engines verify a submission by fetching
+  `https://roomler.ai/<key>.txt`, so the file in `ui/public/` is its only source: the promote
+  job checks out just `scripts/indexnow.sh` and `ui/public/*.txt`, and the smoke (§6) checks
+  the file is served as committed.
+- **Off unless the repository variable `INDEXNOW_ENABLED` is `true`**, and warn-only: a missed
+  hint to a crawler never fails a promote.
+
+**Search Console and Bing Webmaster Tools** are the operator's: they need the Google account
+that owns the `roomler.ai` domain property (verified by the domain's existing
+`google-site-verification` TXT record), and Bing imports from it. The runbook is FR-87 §4h:
+submit `https://roomler.ai/sitemap.xml`, request indexing for the pages that matter, and review
+coverage at +3, +14 and +28 days.
+
+> ⚠️ **Not used, on purpose:** the sitemap "ping" endpoints (retired by Google in 2023), the
+> Indexing API (Google limits it to job postings and livestreams), and a `SoftwareApplication`
+> rich result, which requires ratings.
 
 ## Code map
 
@@ -285,3 +327,4 @@ ships.
 | [`ui/docs/theme/assets.ts`](../ui/docs/theme/assets.ts) · [`images.ts`](../ui/docs/theme/images.ts) · [`links.ts`](../ui/docs/theme/links.ts) | hashing · image sizes · the link gate |
 | [`files/nginx-pod.conf`](../files/nginx-pod.conf) | how it is served |
 | [`scripts/public-site-smoke.sh`](../scripts/public-site-smoke.sh) | how it is proven |
+| [`scripts/indexnow.sh`](../scripts/indexnow.sh) · `ui/public/<key>.txt` · [`promote.yml`](../.github/workflows/promote.yml) | telling search engines what a roll changed |
