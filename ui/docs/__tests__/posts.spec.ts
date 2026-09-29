@@ -46,8 +46,28 @@ describe('readPostMeta', () => {
     expect(r.meta).toMatchObject({ slug: 'self-hosted-teamviewer-alternative', author: { name: 'Goran Jovanov' }, tags: ['teamviewer', 'remote-desktop'] })
   })
 
-  it.each(['title', 'description', 'date', 'author', 'tags', 'hero', 'heroAlt'])('requires `%s`', (key) => {
+  it.each(['title', 'description', 'date', 'author', 'tags'])('requires `%s`', (key) => {
     expect(meta(without(key)).errors.join('\n')).toContain(`\`${key}\` is required`)
+  })
+
+  it('requires alt text for a hero', () => {
+    expect(meta(without('heroAlt')).errors.join('\n')).toContain('`heroAlt` is required')
+  })
+
+  it('always needs a RASTER share image', () => {
+    // An SVG hero is not one…
+    expect(meta(without('ogImage')).errors.join('\n')).toMatch(/not a raster image.*ogImage/)
+    // …a PNG hero is…
+    expect(meta([...without('ogImage').filter((l) => !l.startsWith('hero:')), 'hero: hero.png']).errors).toEqual([])
+    // …and ogImage cannot be an SVG either.
+    expect(meta(replace('ogImage', 'card.svg')).errors.join('\n')).toMatch(/must be a PNG, JPEG, WebP or GIF/)
+  })
+
+  it('takes a post with no hero — its first image stays in the text — given a share image and its alt', () => {
+    const noHero = VALID.filter((l) => !l.startsWith('hero:') && !l.startsWith('heroAlt:'))
+    expect(meta(noHero).errors.join('\n')).toMatch(/`ogImageAlt` is required/)
+    expect(meta([...noHero, 'ogImageAlt: A browser tab showing a remote desktop']).errors).toEqual([])
+    expect(meta(noHero.filter((l) => !l.startsWith('ogImage:'))).errors.join('\n')).toMatch(/no hero needs `ogImage:`/)
   })
 
   it('has no drafts: `draft` is refused with the reason', () => {
@@ -86,7 +106,8 @@ describe('readPostMeta', () => {
   })
 
   it('reports every problem in one pass', () => {
-    expect(meta(['title: T', 'draft: true', 'date: 2026-09-25']).errors.length).toBeGreaterThanOrEqual(7)
+    // draft, description, author, tags, the bare date, the missing share image
+    expect(meta(['title: T', 'draft: true', 'date: 2026-09-25']).errors.length).toBeGreaterThanOrEqual(6)
   })
 })
 

@@ -24,8 +24,9 @@ link, no feed, no sitemap entry.
 | `updated` | | a timestamp, not before `date`; bump it only for a substantive edit |
 | `author` | required | a key in `AUTHORS` (`ui/docs/site.ts`) |
 | `tags` | required | lowercase, hyphenated |
-| `hero`, `heroAlt` | required | the image at the top, and what it shows |
-| `ogImage` | if the hero is SVG | the share image: PNG, JPEG or WebP, at least 1200 px wide |
+| `hero`, `heroAlt` | | the image above the text, and what it shows. Leave it out when the first image belongs inside the text |
+| `ogImage` | unless the hero is raster | the share image: PNG, JPEG or WebP, at least 1200 px wide |
+| `ogImageAlt` | with `ogImage` and no hero | what the share image shows |
 | `related` | | site-absolute URLs, shown as cards; each must exist |
 | `syndication` | | where else it is published, e.g. the Medium copy |
 | `canonical` | | only for a post whose original lives on another site |

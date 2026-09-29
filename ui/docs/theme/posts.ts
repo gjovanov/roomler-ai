@@ -39,11 +39,16 @@ export interface PostMeta {
   authorKey: string
   author: Author
   tags: string[]
-  /** A file in the blog's assets (or the shared docs assets). */
-  hero: string
-  heroAlt: string
-  /** A raster share image; required when the hero is not one (an SVG). */
+  /** The image above the text, from the blog's assets (or the shared docs
+   *  assets). Optional: a post whose first image belongs INSIDE the text
+   *  keeps it there, rather than moving it or showing it twice. */
+  hero?: string
+  heroAlt?: string
+  /** A raster share image; required unless the hero is one (an SVG hero is
+   *  crisp on the page, but no social platform renders an SVG card). */
   ogImage?: string
+  /** What the share image shows; defaults to `heroAlt`. */
+  ogImageAlt?: string
   /** Site-absolute URLs of pages this post leans on; link-checked. */
   related: string[]
   /** Where else the post is published, e.g. the Medium copy. */
@@ -57,7 +62,7 @@ export interface Post extends PostMeta {
   outFile: string
   /** Repo-relative path of the source, for errors and "Edit this page". */
   sourceFile: string
-  heroImage: ResolvedImage
+  heroImage?: ResolvedImage
   og: OgImage
   html: string
   headings: Heading[]
@@ -67,6 +72,7 @@ export interface Post extends PostMeta {
 
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const TAG = /^[a-z0-9-]+$/
+export const RASTER = /\.(png|jpe?g|webp|gif)$/i
 
 /**
  * Reads and checks a post's front-matter. Returns every problem at once, so
@@ -124,9 +130,22 @@ export function readPostMeta(
   const updated = str('updated', false)
   const authorKey = str('author', true)
   const tags = list('tags', true)
-  const hero = str('hero', true)
-  const heroAlt = str('heroAlt', true)
+  const hero = str('hero', false)
+  const heroAlt = str('heroAlt', hero !== undefined)
   const ogImage = str('ogImage', false)
+  const ogImageAlt = str('ogImageAlt', false)
+
+  // Every post needs a share image, and it has to be raster.
+  const heroIsRaster = hero !== undefined && RASTER.test(hero)
+  if (!ogImage && !heroIsRaster) {
+    err(
+      hero
+        ? `the hero "${hero}" is not a raster image, and social platforms cannot show it: add \`ogImage:\` (PNG, JPEG or WebP, at least 1200 px wide)`
+        : 'a post with no hero needs `ogImage:` (PNG, JPEG or WebP, at least 1200 px wide): it is the picture shared links show',
+    )
+  }
+  if (ogImage && !RASTER.test(ogImage)) err(`\`ogImage: ${ogImage}\` must be a PNG, JPEG, WebP or GIF`)
+  if (ogImage && !ogImageAlt && !heroAlt) err('`ogImageAlt` is required: say what the share image shows')
   const related = list('related', false)
   const syndication = str('syndication', false)
   const canonical = str('canonical', false)
@@ -182,9 +201,10 @@ export function readPostMeta(
       authorKey: authorKey!,
       author: author!,
       tags,
-      hero: hero!,
-      heroAlt: heroAlt!,
+      hero,
+      heroAlt,
       ogImage,
+      ogImageAlt,
       related,
       syndication,
       canonical,
