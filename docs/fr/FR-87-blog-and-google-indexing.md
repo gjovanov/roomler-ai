@@ -1,8 +1,9 @@
 # FR-87: A blog at roomler.ai/blog, a crawlable homepage, and a site Google can index
 
-**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** in progress:
-P1–P5 live since 2026-09-29; P6 and P7 merged, live once promoted; Search Console and Bing owed
-by the operator (§4h) · **Owner:** web / public site · **Builds on:**
+**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** P1–P7 live
+since 2026-09-29 (P6/P7 promoted 20:25Z); Search Console verified and the sitemap read; owed:
+Bing and the purestat read (AC13), `LEGACY_UNHASHED_ASSETS` off from 2026-10-03, the +3/+14/+28
+day reviews · **Owner:** web / public site · **Builds on:**
 [FR-60](FR-60-public-docs-site.md) (the static docs generator)
 
 ## 1. Goal
@@ -352,10 +353,15 @@ the build.
 - [x] **AC4:** production `<lastmod>` equals `git log -1 --format=%cs` for 5 sampled docs files
   (baseline: 70/70 show the build date). *(All 65, not 5: the smoke at the deployed commit,
   §9.)*
-- [ ] **AC5:** the Rich Results Test reports 0 errors on the post (Article + Breadcrumbs), one
-  docs page, and `/`.
-- [ ] **AC6:** the security headers are identical on `/` (SPA), the static homepage, a docs
-  page and a blog page, and HTML is `no-cache`.
+- [x] **AC5:** the Rich Results Test reports 0 errors on the post (Article + Breadcrumbs), one
+  docs page, and `/`. *(The post and `/docs/compare/teamviewer/`: Article + Breadcrumbs, no
+  issues. `/`, after the P6 roll: crawled, 0 errors, "No items detected", because WebSite and
+  Organization are not rich-result types; the Schema Markup Validator reads them with 0 errors
+  and 0 warnings. §9.)*
+- [x] **AC6:** the security headers are identical on `/` (SPA), the static homepage, a docs
+  page and a blog page, and HTML is `no-cache`. *(Production at `c6c2934d7`: 9 headers on
+  `/docs/`, a leaf and `/blog/` equal to `/`'s; `/` identical with and without the session
+  cookie; `no-cache` on `/`, `/docs/` and the post.)*
 - [x] **AC7:** `/blog/nonexistent/` and `/docs/nonexistent/` return 404; `/docs`, `/blog` and a
   slashless docs path return 301 with a relative Location (baseline: `http://` downgrade and
   soft 404s). *(Production, §9.)*
@@ -364,18 +370,27 @@ the build.
 - [x] **AC9:** every `/docs/assets` and `/blog/assets` URL in production HTML is content-hashed,
   and every image carries `width`/`height`. *(Production: `/docs/`, a quickstart page and the
   post — 11 asset URLs on the post, all hashed and loading, 5 of 5 images sized.)*
-- [ ] **AC10:** Lighthouse SEO scores 100 on `/`, `/blog/`, the post and two docs pages; other
-  scores are recorded as measured.
-- [ ] **AC11:** `curl /` without a cookie returns the static homepage (its H1 and JSON-LD); with
+- [x] **AC10:** Lighthouse SEO scores 100 on `/`, `/blog/`, the post and two docs pages; other
+  scores are recorded as measured. *(All five at 100 in every category; `/` measured on
+  production after the P6 roll: LCP 1.7 s, CLS 0.)*
+- [x] **AC11:** `curl /` without a cookie returns the static homepage (its H1 and JSON-LD); with
   `Cookie: access_token=x` it returns the SPA shell. `/landing` 301s to `/`. A signed-in user
-  still lands on the dashboard (Playwright e2e green).
-- [ ] **AC12:** Search Console shows the sitemap as "Success"; the post reports "URL is on
+  still lands on the dashboard (Playwright e2e green). *(The production smoke at `c6c2934d7`;
+  a signed-in browser loads the app straight from `/`, no redirect, and renders the dashboard;
+  `auth.spec.ts` 10/10 on the P6 image and on production's, and exactly the two hand-off
+  specs fail with the hand-off removed. §9.)*
+- [x] **AC12:** Search Console shows the sitemap as "Success"; the post reports "URL is on
   Google" within 14 days of the request; Medium's page source carries a canonical link to the
-  blog.
+  blog. *(All on day 0: the sitemap index reads Success; the post was indexed before any
+  request, with the Google-selected canonical the blog URL itself, not Medium's.)*
 - [ ] **AC13:** Bing Webmaster Tools is verified, the first IndexNow POST returns 200/202, and
-  purestat records `/blog/` visits.
-- [ ] **AC14:** docs updated or created with mermaid diagrams (`docs/public-site.md`) and indexed
-  in `docs/README.md`.
+  purestat records `/blog/` visits. *(IndexNow: the first live POST, from the P6/P7 promote,
+  returned **202** for `https://roomler.ai/`. Bing's import needs the operator to consent in
+  Bing's sign-in; the purestat read needs the operator's dashboard.)*
+- [x] **AC14:** docs updated or created with mermaid diagrams (`docs/public-site.md`) and indexed
+  in `docs/README.md`. *(`docs/public-site.md` covers P1–P7: the build, dates, nginx routing
+  with the cookie branch, the smoke, and the promote-time IndexNow flow, all diagrammed; its
+  `docs/README.md` row lists them.)*
 
 ## 7. Open decisions
 
@@ -420,6 +435,12 @@ the build.
 | 2026-09-29 | the smoke's key-file check (P7) | served · removed · production | the P6 build with the key file: ✓; without it: ✗ ("engines would reject every submission"); **production: ✗**, together with P6's six. (A first production run also failed `/docs`'s Location once, on a slow link from this host, the only such failure in six runs; the rerun, 49 s, passed it, and no promote had run in between) |
 | 2026-09-29 | `ui/e2e/auth.spec.ts` against the hosted images on this box: each image's own nginx + API, a throwaway Mongo and Redis, and the e2e overlay's settings (`AUTH__AUTO_VERIFY`, rate limit 1000/s, burst 5000) | AC11's e2e half, before the roll | P6 (`hosted-20260929-db55edd`): **10/10, and 30/30 with `--repeat-each=3`**. Production's image (`69fcf0a`): 10/10, so no regression; there the unauthenticated-visitor spec takes its `/landing` branch. The P6 image with the hand-off removed from its served `home.<hash>.js` (the marker verified in the served file): **exactly the two hand-off specs fail** |
 | 2026-09-29 | the same, first runs | two wrong turns, recorded | (1) Without the lane's limits, the fifth spec met a general `/api` bucket (burst 60, 1/s) that the four specs before it had spent. The refresh returned 200, its retries got 429, and the app ended the session anyway. (2) With the limits, the new spec still failed, **on both images**. `loginViaUi` returns while the dashboard still has requests in flight; one sent after the test changed the cookies got a 401 and started a refresh, and the test's own `goto` aborted it. The app counts an aborted refresh as a rejection, so it cleared its hint. The spec now parks on `about:blank` before touching cookies. It also waits for a fresh cookie that `/api/auth/me` accepts, instead of dashboard text, which renders from the hint alone. Both app behaviours predate P6 and are filed as #1788 |
+| 2026-09-29 | **the P6/P7 roll**: `hosted-20260929-69fcf0a` → `hosted-20260929-c6c2934` ([promote run 36626148679](https://github.com/gjovanov/roomler-ai/actions/runs/36626148679)); `INDEXNOW_ENABLED` set first (operator's go-ahead) | the roll and AC13's IndexNow half | 0 of 60 health probes failed. IndexNow: 67 URLs before the bump, 68 after, `changed` = exactly `https://roomler.ai/`, **HTTP 202**, the first live submission |
+| 2026-09-29 | **production, `c6c2934d7`** | `scripts/public-site-smoke.sh https://roomler.ai . c6c2934d7` | **all 21 pass**: the same run failed P6's six checks and the key-file check before the roll. The first post-roll run failed `/landing`'s Location once, as `/docs`'s had that afternoon. The check read the status and the Location from two requests, and the second one blipped; six direct probes all answered 301 `Location: /`. The script now reads both from one response, and the eight nginx negative controls still turn red with it |
+| 2026-09-29 | production `/` | AC5 and AC10, the homepage | Rich Results Test: crawled, 0 errors, "No items detected" (WebSite and Organization aren't rich-result types). Schema Markup Validator: WebSite, with its Organization publisher, **0 errors, 0 warnings**. Lighthouse 12.8.2 (mobile): **100 / 100 / 100 / 100**, LCP 1.7 s, CLS 0 |
+| 2026-09-29 | production, a signed-in browser | AC11's signed-in half | `/` loads the app straight from `/` (navigation entry `/`, no redirect: the session cookie branch), and the dashboard renders; checked by DOM, not screenshot, and the tab closed at once |
+| 2026-09-29 | **Search Console**, the Workspace account (the operator signed in; the agent never saw a credential) | AC12 | Domain property `sc-domain:roomler.ai` **auto-verified** by the existing DNS record. Sitemap index submitted: "Couldn't fetch" at first, **Success** minutes later (every sitemap answers 200 to a Googlebot user agent). The post: **"URL is on Google"**, indexed, last crawl 20:24Z, referred from `/blog/`, **Google-selected canonical = the blog URL**, not Medium's. `/`, `/blog/`, `/docs/` and the three compare pages were also on Google. Indexing requested for `/` (the static page is new), `/docs/` (last crawled 09-27) and the three compare pages (titles changed in P5): 5 of the ~10 a day |
+| 2026-09-29 | the fleet, after the roll | counts only | devices 17 / 12 online / 5 not, identical to before the roll; peers 14 direct, 1 relay, 5 offline; this host's 7 tunnel flows all on `quic-v1` |
 
 ## 10. Related
 
