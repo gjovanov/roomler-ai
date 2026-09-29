@@ -158,17 +158,39 @@ describe('useAuthStore', () => {
 
     it('logs out when the server disagrees with the hint', async () => {
       // The hint is only a hint. The server is the authority, and a stale hint
-      // must not leave the app rendering a signed-in shell.
+      // must not leave the app rendering a signed-in shell. The mock plays the
+      // real api client: a refused session is a 401 whose refresh was refused,
+      // and the client clears the hint before it throws (#1788).
       localStorage.setItem(SIGNED_IN, '1')
-      mockApi.get.mockRejectedValueOnce(new Error('Unauthorized'))
+      mockApi.get.mockImplementationOnce(async () => {
+        localStorage.removeItem(SIGNED_IN)
+        throw new Error('Unauthorized')
+      })
       mockApi.post.mockResolvedValueOnce({})
 
       const store = useAuthStore()
       await store.fetchMe()
 
+      expect(mockApi.post).toHaveBeenCalledWith('/auth/logout', {})
       expect(store.user).toBeNull()
       expect(store.isAuthenticated).toBe(false)
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+    })
+
+    // #1788, part 2 — measured: with the rate limit spent, `/auth/me` answered
+    // 429 and fetchMe signed the user out FOR REAL (`POST /auth/logout` 200).
+    // A throttled, failed or unreachable server has not refused anything.
+    it('keeps the session when /auth/me fails without a refusal (429, 5xx, unreachable): the client left the hint alone', async () => {
+      localStorage.setItem(SIGNED_IN, '1')
+      mockApi.get.mockRejectedValueOnce(new Error('no verdict'))
+
+      const store = useAuthStore()
+      await store.fetchMe()
+
+      expect(mockApi.post).not.toHaveBeenCalledWith('/auth/logout', {})
+      expect(store.isAuthenticated).toBe(true)
+      expect(localStorage.getItem(SIGNED_IN)).toBe('1')
+      expect(mockRouter.push).not.toHaveBeenCalled()
     })
   })
 
