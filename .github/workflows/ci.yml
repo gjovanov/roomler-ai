@@ -1570,6 +1570,11 @@ jobs:
           grep -q '<sitemapindex' dist/sitemap.xml || { echo "::error::docs: dist/sitemap.xml is not a sitemap index"; exit 1; }
           test -f dist/sitemap-docs.xml || { echo "::error::docs: dist/sitemap-docs.xml missing"; exit 1; }
           test -f dist/docs/404.html || { echo "::error::docs: dist/docs/404.html missing (nginx's error_page for /docs/ and /blog/)"; exit 1; }
+          # FR-87 P6: nginx answers `/` without a session cookie with this
+          # file, via `try_files $root_doc =404` — missing, every guest and
+          # every crawler would get a 404 at the site root.
+          test -f dist/home/index.html || { echo "::error::docs: dist/home/index.html missing (nginx serves it at / to guests and crawlers)"; exit 1; }
+          grep -q '<loc>https://roomler.ai/</loc>' dist/sitemap-docs.xml || { echo "::error::docs: / is missing from dist/sitemap-docs.xml"; exit 1; }
           exit "$docs_rc"
 
       - name: Run unit tests

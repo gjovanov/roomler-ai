@@ -25,6 +25,9 @@ export interface SiteAssets {
   /** `blog.css`; empty until a post exists, and then linked by every page
    *  that shows blog furniture. */
   blogCss?: string
+  /** The static homepage's own stylesheet and script (P6). */
+  homeCss?: string
+  homeJs?: string
 }
 
 export interface OgImage {
@@ -44,7 +47,7 @@ export const DEFAULT_OG_IMAGE: OgImage = { url: `${SITE_ORIGIN}${OG_IMAGE}`, ...
  * exactly as it was (FR-87 P4's kill switch).
  */
 export interface ShellNav {
-  current: 'docs' | 'blog'
+  current: 'docs' | 'blog' | 'home'
   hasBlog: boolean
 }
 
@@ -68,6 +71,13 @@ export interface HeadInput {
   /** Advertise the blog's Atom feed and load `blog.css` (every page, once a
    *  post exists). */
   feed?: boolean
+  /** Load `blog.css` even where `feed` is set; the homepage has no blog
+   *  furniture and opts out. Defaults to `feed`. */
+  blogStyles?: boolean
+  /** Further stylesheets, after the theme's. */
+  styles?: string[]
+  /** Scripts that must run before the body renders (not `defer`). */
+  headScripts?: string[]
   /** `rel="prev"` / `rel="next"` on a paginated listing. */
   prevUrl?: string
   nextUrl?: string
@@ -114,8 +124,10 @@ export function renderHead(h: HeadInput): string {
     h.prevUrl ? `<link rel="prev" href="${h.prevUrl}">` : '',
     h.nextUrl ? `<link rel="next" href="${h.nextUrl}">` : '',
     `<link rel="stylesheet" href="${h.assets.css}">`,
-    h.feed && h.assets.blogCss ? `<link rel="stylesheet" href="${h.assets.blogCss}">` : '',
+    (h.blogStyles ?? h.feed) && h.assets.blogCss ? `<link rel="stylesheet" href="${h.assets.blogCss}">` : '',
+    ...(h.styles ?? []).map((s) => `<link rel="stylesheet" href="${s}">`),
     `<script src="${h.assets.osPreference}"></script>`,
+    ...(h.headScripts ?? []).map((s) => `<script src="${s}"></script>`),
     // The same first-party script the SPA loads; `defer`, so it never holds
     // up the page. `ANALYTICS = null` in site.ts turns it off.
     ANALYTICS ? `<script defer data-domain="${ANALYTICS.domain}" src="${ANALYTICS.src}"></script>` : '',
@@ -126,22 +138,34 @@ export function renderHead(h: HeadInput): string {
 }
 
 export function renderTopbar(nav: ShellNav = DOCS_NAV): string {
-  const blog = nav.current === 'blog'
+  const { current } = nav
   const here = (on: boolean) => (on ? ' aria-current="page"' : '')
-  // The burger opens the docs sidebar; a blog page has none to open.
-  const burger = blog
-    ? ''
-    : `<button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>`
+  // The burger opens the docs sidebar; no other page has one to open.
+  const burger =
+    current === 'docs'
+      ? `<button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>`
+      : ''
+  const brand =
+    current === 'home'
+      ? `<a class="brand" href="/"><span class="brand__mark">Roomler</span></a>`
+      : `<a class="brand" href="${current === 'blog' ? BLOG_BASE : BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">${current === 'blog' ? 'Blog' : 'Docs'}</span></a>`
+  const docsLink = `<a href="${BASE}/"${here(current === 'docs')}>Docs</a>\n      `
+  const blogLink = nav.hasBlog ? `<a href="${BLOG_BASE}/"${here(current === 'blog')}>Blog</a>\n      ` : ''
+  // FR-87 P6: the product page IS `/` now (`/landing` and `/pricing` 301 there),
+  // so the links go straight to it instead of through a redirect.
+  const links =
+    current === 'home'
+      ? `<a href="#features">Features</a>\n      <a href="#pricing">Pricing</a>\n      ${docsLink}${blogLink}<a href="/login">Log in</a>`
+      : `${nav.hasBlog ? `${docsLink}${blogLink}` : ''}<a href="/">Product</a>\n      <a href="/#pricing">Pricing</a>`
   return `<header class="topbar">
   <div class="topbar__inner">
-    <a class="brand" href="${blog ? BLOG_BASE : BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">${blog ? 'Blog' : 'Docs'}</span></a>
+    ${brand}
     ${burger}
     <button class="search-open" type="button" data-search-open aria-label="${searchLabel(nav)}">
       ${icon('search', { size: 17 })}<span>Search</span><kbd>/</kbd>
     </button>
     <nav class="topbar__links" aria-label="Site">
-      ${nav.hasBlog ? `<a href="${BASE}/"${here(!blog)}>Docs</a>\n      <a href="${BLOG_BASE}/"${here(blog)}>Blog</a>\n      ` : ''}<a href="/landing">Product</a>
-      <a href="/pricing">Pricing</a>
+      ${links}
       <a href="https://github.com/gjovanov/roomler-ai" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a class="btn btn--primary" href="/register">Get started free</a>
     </nav>
@@ -170,8 +194,8 @@ export function renderFooter(nav: ShellNav = DOCS_NAV): string {
     </div>
     <div>
       <p class="site-footer__head">Product</p>
-      <a href="/landing">Overview</a>
-      <a href="/pricing">Pricing</a>
+      <a href="/">Overview</a>
+      <a href="/#pricing">Pricing</a>
       <a href="${BASE}/start/self-hosting/">Self-hosting</a>${blogLinks}
     </div>
     <div>

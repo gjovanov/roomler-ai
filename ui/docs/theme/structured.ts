@@ -93,6 +93,24 @@ export function collectionPage(p: { url: string; name: string; description: stri
   }
 }
 
+/**
+ * The site itself, on the homepage (P6): what Google reads for the site
+ * name in results. No `SearchAction` (Google retired the sitelinks search
+ * box in 2024) and no `SoftwareApplication`: that rich result requires
+ * ratings or reviews, and a page with none reports it as an error — the
+ * ratings are never invented to make it pass.
+ */
+export function website(): Record<string, unknown> {
+  return {
+    '@type': 'WebSite',
+    '@id': `${SITE_ORIGIN}/#website`,
+    url: `${SITE_ORIGIN}/`,
+    name: ORG.name,
+    inLanguage: 'en',
+    publisher: orgRef,
+  }
+}
+
 // ── the blog (P4) ────────────────────────────────────────────────────────
 
 export const BLOG_ID = `${SITE_ORIGIN}${BLOG_BASE}/#blog`
