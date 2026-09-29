@@ -1,9 +1,9 @@
 # FR-87: A blog at roomler.ai/blog, a crawlable homepage, and a site Google can index
 
-**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** P1–P7 live
-since 2026-09-29 (P6/P7 promoted 20:25Z); Search Console verified and the sitemap read; owed:
-Bing and the purestat read (AC13), `LEGACY_UNHASHED_ASSETS` off from 2026-10-03, the +3/+14/+28
-day reviews · **Owner:** web / public site · **Builds on:**
+**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** **closed
+2026-09-30**, all 14 criteria field-verified. P1–P7 live since 2026-09-29. Scheduled follow-ups,
+none blocking: `LEGACY_UNHASHED_ASSETS` off in a release from 2026-10-03, and Search Console
+reviews at +3/+14/+28 days · **Owner:** web / public site · **Builds on:**
 [FR-60](FR-60-public-docs-site.md) (the static docs generator)
 
 ## 1. Goal
@@ -383,10 +383,12 @@ the build.
   Google" within 14 days of the request; Medium's page source carries a canonical link to the
   blog. *(All on day 0: the sitemap index reads Success; the post was indexed before any
   request, with the Google-selected canonical the blog URL itself, not Medium's.)*
-- [ ] **AC13:** Bing Webmaster Tools is verified, the first IndexNow POST returns 200/202, and
+- [x] **AC13:** Bing Webmaster Tools is verified, the first IndexNow POST returns 200/202, and
   purestat records `/blog/` visits. *(IndexNow: the first live POST, from the P6/P7 promote,
-  returned **202** for `https://roomler.ai/`. Bing's import needs the operator to consent in
-  Bing's sign-in; the purestat read needs the operator's dashboard.)*
+  returned **202** for `https://roomler.ai/`. Bing: the site was imported from Search Console,
+  so its verification carried over, and the sitemap index was submitted ("successfully
+  submitted for processing"). purestat, today: `/blog/` 3 and the post 3, among the top ten
+  pages. §9.)*
 - [x] **AC14:** docs updated or created with mermaid diagrams (`docs/public-site.md`) and indexed
   in `docs/README.md`. *(`docs/public-site.md` covers P1–P7: the build, dates, nginx routing
   with the cookie branch, the smoke, and the promote-time IndexNow flow, all diagrammed; its
@@ -441,6 +443,8 @@ the build.
 | 2026-09-29 | production, a signed-in browser | AC11's signed-in half | `/` loads the app straight from `/` (navigation entry `/`, no redirect: the session cookie branch), and the dashboard renders; checked by DOM, not screenshot, and the tab closed at once |
 | 2026-09-29 | **Search Console**, the Workspace account (the operator signed in; the agent never saw a credential) | AC12 | Domain property `sc-domain:roomler.ai` **auto-verified** by the existing DNS record. Sitemap index submitted: "Couldn't fetch" at first, **Success** minutes later (every sitemap answers 200 to a Googlebot user agent). The post: **"URL is on Google"**, indexed, last crawl 20:24Z, referred from `/blog/`, **Google-selected canonical = the blog URL**, not Medium's. `/`, `/blog/`, `/docs/` and the three compare pages were also on Google. Indexing requested for `/` (the static page is new), `/docs/` (last crawled 09-27) and the three compare pages (titles changed in P5): 5 of the ~10 a day |
 | 2026-09-29 | the fleet, after the roll | counts only | devices 17 / 12 online / 5 not, identical to before the roll; peers 14 direct, 1 relay, 5 offline; this host's 7 tunnel flows all on `quic-v1` |
+| 2026-09-30 | **Bing Webmaster Tools**, signed in by the operator | AC13's Bing half | "Import from Google Search Console" with the operator's go-ahead: Google's consent screen asked for exactly "View Search Console data for your verified sites" (`webmasters.readonly`). 1 site found, imported with the Administrator role, so verification carried over. Sitemap index submitted: "successfully submitted for processing", 1 known sitemap. Bing's IndexNow page for the new site stays at its introduction until the import's data lands (up to 48 h) |
+| 2026-09-30 | **purestat**, the operator's dashboard | AC13's purestat half | Today: `/blog/` 3 and `/blog/self-hosted-teamviewer-alternative/` 3, plus `/docs/reference/ports-and-firewall/` 3 and `/docs/compare/teamviewer/` 2, all among the top ten pages. The static pages' analytics (P3) work. Three findings for purestat itself: the pages list stops at ten; `localhost` shows as a source (local test runs of pages that load the script get counted); and app paths carry tenant and device ids. Planned in the purestat repository, not here |
 
 ## 10. Related
 
