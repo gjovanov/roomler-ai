@@ -11,7 +11,7 @@
  * ⚠️ `application/ld+json` is a DATA block, not a script, so the pod CSP's
  * `script-src` does not apply to it; that is why this can be inline.
  */
-import { ORG, SITE_ORIGIN } from '../site.ts'
+import { BLOG_BASE, BLOG_TITLE, ORG, SITE_ORIGIN, type Author } from '../site.ts'
 
 export interface Crumb {
   name: string
@@ -90,6 +90,67 @@ export function collectionPage(p: { url: string; name: string; description: stri
     description: p.description,
     inLanguage: 'en',
     publisher: orgRef,
+  }
+}
+
+// ── the blog (P4) ────────────────────────────────────────────────────────
+
+export const BLOG_ID = `${SITE_ORIGIN}${BLOG_BASE}/#blog`
+
+export function person(a: Author): Record<string, unknown> {
+  return { '@type': 'Person', name: a.name, url: a.url, sameAs: [...a.sameAs] }
+}
+
+export interface BlogPostingInput {
+  /** Absolute canonical URL. */
+  url: string
+  headline: string
+  description: string
+  /** ISO 8601 timestamps with offsets. */
+  datePublished: string
+  dateModified: string
+  /** The share image: raster, absolute, at least 1200 px wide. */
+  image: { url: string; width: number; height: number }
+  author: Author
+  keywords: string[]
+  /** Other copies of the same post, e.g. on Medium. */
+  sameAs?: string[]
+}
+
+export function blogPosting(p: BlogPostingInput): Record<string, unknown> {
+  return {
+    '@type': 'BlogPosting',
+    '@id': `${p.url}#article`,
+    headline: p.headline,
+    description: p.description,
+    url: p.url,
+    mainEntityOfPage: p.url,
+    datePublished: p.datePublished,
+    dateModified: p.dateModified,
+    image: { '@type': 'ImageObject', url: p.image.url, width: p.image.width, height: p.image.height },
+    inLanguage: 'en',
+    keywords: p.keywords.join(', '),
+    author: person(p.author),
+    publisher: orgRef,
+    isPartOf: { '@type': 'Blog', '@id': BLOG_ID, name: BLOG_TITLE },
+    ...(p.sameAs?.length ? { sameAs: p.sameAs } : {}),
+  }
+}
+
+export function blog(p: {
+  url: string
+  description: string
+  posts: Array<{ url: string; headline: string; datePublished: string }>
+}): Record<string, unknown> {
+  return {
+    '@type': 'Blog',
+    '@id': BLOG_ID,
+    url: p.url,
+    name: BLOG_TITLE,
+    description: p.description,
+    inLanguage: 'en',
+    publisher: orgRef,
+    blogPost: p.posts.map((x) => ({ '@type': 'BlogPosting', headline: x.headline, url: x.url, datePublished: x.datePublished })),
   }
 }
 
