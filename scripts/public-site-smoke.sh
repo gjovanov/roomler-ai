@@ -46,6 +46,17 @@ bad()  { printf '  \342\234\227 %s\n' "$1"; FAIL=1; }
 headers() { curl -ksS -m 15 -I "$1" 2>/dev/null | tr -d '\r' | sed -E 's/^([A-Za-z0-9-]+):/\L\1:/'; }
 status()  { curl -ksS -m 15 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null; }
 header()  { headers "$1" | grep -i "^$2:" | head -1 | sed -E 's/^[^:]+:[[:space:]]*//'; }
+# A redirect's status and its Location, from ONE response: "<code> <location>".
+# Read by two requests, a blip on the second reported "301 with no Location"
+# against production, twice on 2026-09-29: the check failing, not the site.
+# A failed request is "000", which says what happened.
+redirect() {
+  local h code loc
+  h="$(headers "$1")"
+  code="$(printf '%s\n' "$h" | awk '$1 ~ /^HTTP\// { c = $2 } END { print c }')"
+  loc="$(printf '%s\n' "$h" | grep -i '^location:' | head -1 | sed -E 's/^[^:]+:[[:space:]]*//')"
+  printf '%s %s\n' "${code:-000}" "$loc"
+}
 
 # The security headers every HTML page must carry exactly as `/` does. Sorted
 # so the comparison is order-independent; values compared verbatim.
@@ -56,8 +67,7 @@ echo "public-site smoke against $BASE"
 
 # 1. Relative redirects, one URL per page.
 for path in /docs /docs/start; do
-  code="$(status "$BASE$path")"
-  loc="$(header "$BASE$path" location)"
+  read -r code loc <<< "$(redirect "$BASE$path")"
   if [ "$code" = "301" ] && [ "${loc#/}" != "$loc" ] && [ "$loc" = "$path/" ]; then
     ok "$path -> 301 Location: $loc (relative, slash form)"
   else
@@ -146,8 +156,7 @@ code="$(status "$BASE/home/")"
 [ "$code" = "404" ] && ok "/home/ -> 404 (the homepage has one URL, /)" || bad "/home/ -> $code (a second URL for the homepage)"
 for pair in "/landing /" "/pricing /#pricing"; do
   set -- $pair
-  code="$(status "$BASE$1")"
-  loc="$(header "$BASE$1" location)"
+  read -r code loc <<< "$(redirect "$BASE$1")"
   if [ "$code" = "301" ] && [ "$loc" = "$2" ]; then
     ok "$1 -> 301 Location: $loc"
   else
