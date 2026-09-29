@@ -26,8 +26,8 @@
       <v-container>
         <v-row align="center" justify="center">
           <v-col cols="12" md="6" lg="5" class="text-center text-md-left hero-copy">
-            <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">Every device you own,<br/><span class="text-primary">one secure network</span></h1>
-            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Remote desktop from any browser and a private WireGuard-style mesh between your machines — with team chat and video included.</p>
+            <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">{{ HERO.titleLead }}<br/><span class="text-primary">{{ HERO.titleAccent }}</span></h1>
+            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">{{ HERO.lead }}</p>
             <div class="d-flex flex-wrap justify-center justify-md-start ga-3">
               <v-btn color="primary" size="large" :to="{ name: 'register' }" class="px-6">Start Free</v-btn>
               <v-btn variant="outlined" size="large" href="#download" class="px-6">Download</v-btn>
@@ -71,8 +71,8 @@
     <!-- Download / install -->
     <section id="download" class="download-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Set up a device in minutes</h2>
-        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Run the graphical installer or paste one command. Enrollment tokens come from your workspace (Devices → Enroll device).</p>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">{{ DOWNLOAD.title }}</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">{{ DOWNLOAD.lead }}</p>
         <v-row justify="center">
           <v-col v-for="os in downloads" :key="os.os" cols="12" md="4">
             <v-card variant="outlined" class="pa-4 pa-md-6 h-100 d-flex flex-column" rounded="lg">
@@ -100,8 +100,8 @@
     <!-- Pricing -->
     <section id="pricing" class="pricing-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Simple, per-user pricing</h2>
-        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Every plan includes the private network and remote desktop. Start free, upgrade for more devices.</p>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">{{ PRICING.title }}</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">{{ PRICING.lead }}</p>
         <v-row justify="center">
           <v-col v-for="plan in plans" :key="plan.id" cols="12" sm="6" md="4">
             <v-card
@@ -143,9 +143,9 @@
       <v-container>
         <v-row justify="center">
           <v-col cols="12" md="8" class="text-center">
-            <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">Take your devices with you</h2>
-            <p class="text-body-1 cta-subtitle mb-6 mb-md-8">Free for up to 3 devices — remote desktop, private mesh, tunnels, chat and calls.</p>
-            <v-btn color="white" size="large" :to="{ name: 'register' }" class="px-6 text-primary">Create Your Workspace — Free</v-btn>
+            <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">{{ CTA.title }}</h2>
+            <p class="text-body-1 cta-subtitle mb-6 mb-md-8">{{ CTA.lead }}</p>
+            <v-btn color="white" size="large" :to="{ name: 'register' }" class="px-6 text-primary">{{ CTA.button }}</v-btn>
 
             <v-divider class="my-8 cta-divider" />
             <StayInTouch source="landing" />
@@ -208,125 +208,32 @@ import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { enrollCommands } from '@/utils/enrollCommands'
+import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, type Plan } from '@/utils/landing'
 
 const route = useRoute()
 
-const capabilities = [
-  'Remote desktop',
-  'Private mesh network',
-  'Tunnels & SOCKS5',
-  'Exit nodes',
-  'MagicDNS',
-  'Chat & video included',
-]
-
-// Pivot order: remote access first, the private network second,
-// collaboration as the included bonus.
-const pillars = [
-  {
-    title: 'Reach any of your devices',
-    subtitle: 'A TeamViewer-style remote desktop that lives in your browser',
-    features: [
-      {
-        icon: 'mdi-monitor-eye',
-        title: 'Remote desktop in the browser',
-        description: 'Hardware-encoded H.264/HEVC/VP9 with sub-100 ms input latency. No viewer install — any Chromium browser is the controller.',
-        color: '#009688',
-      },
-      {
-        icon: 'mdi-shield-lock-outline',
-        title: 'Works behind strict networks',
-        description: 'Direct peer-to-peer when possible; TURN relays and WebSocket fallbacks punch through corporate firewalls and full-tunnel VPNs.',
-        color: '#ef5350',
-      },
-      {
-        icon: 'mdi-monitor-multiple',
-        title: 'Fleet management built in',
-        description: 'Enroll unattended machines, push updates from the web, transfer files and clipboard, and audit every session.',
-        color: '#009688',
-      },
-    ],
-  },
-  {
-    title: 'Your own private network',
-    subtitle: 'A Tailscale-style overlay mesh between everything you enroll',
-    features: [
-      {
-        icon: 'mdi-lan',
-        title: 'WireGuard-style mesh',
-        description: 'Every device gets a stable private address. Traffic flows directly between machines with NAT hole-punching and encrypted end to end.',
-        color: '#ef5350',
-      },
-      {
-        icon: 'mdi-router-network',
-        title: 'Subnet routers & exit nodes',
-        description: 'Expose a whole LAN through one machine, or route all your traffic through a trusted exit node when you travel.',
-        color: '#009688',
-      },
-      {
-        icon: 'mdi-dns-outline',
-        title: 'MagicDNS & tunnels',
-        description: 'Reach machines by name, forward ports, and run SOCKS5 tunnels into networks only one of your devices can see.',
-        color: '#ef5350',
-      },
-    ],
-  },
-  {
-    title: 'Collaboration included',
-    subtitle: 'The team layer is part of every plan — not an add-on',
-    features: [
-      {
-        icon: 'mdi-pound',
-        title: 'Rooms, chat & threads',
-        description: 'Organized rooms with threaded messaging, reactions, mentions and file attachments.',
-        color: '#009688',
-      },
-      {
-        icon: 'mdi-video-outline',
-        title: 'HD video conferencing',
-        description: 'Built-in SFU for crystal-clear meetings with screen sharing and recordings.',
-        color: '#ef5350',
-      },
-      {
-        icon: 'mdi-file-document-outline',
-        title: 'Files, cloud & AI',
-        description: 'File sharing with versioned uploads, per-room libraries and search.',
-        color: '#009688',
-      },
-    ],
-  },
-]
+// FR-87: the copy and the plan table live in `@/utils/landing`, shared with
+// the static homepage the docs generator writes for `/`.
+const capabilities = CAPABILITIES
+const pillars = PILLARS
 
 // One-line installs — same vitest-locked template source the in-app
 // enrollment dialog uses (token placeholder until they have one).
-const osMeta: Record<string, { icon: string; wizard: string }> = {
-  windows: { icon: 'mdi-microsoft-windows', wizard: '/api/setup/windows' },
-  linux: { icon: 'mdi-linux', wizard: '/api/setup/linux' },
-  macos: { icon: 'mdi-apple', wizard: '/api/setup/macos' },
+const osIcon: Record<string, string> = {
+  windows: 'mdi-microsoft-windows',
+  linux: 'mdi-linux',
+  macos: 'mdi-apple',
 }
 const downloads = enrollCommands('agent', window.location.origin, null).map((os) => ({
   os: os.os,
   title: os.title,
-  icon: osMeta[os.os]!.icon,
-  wizardUrl: osMeta[os.os]!.wizard,
+  icon: osIcon[os.os]!,
+  wizardUrl: DOWNLOAD.wizard[os.os]!,
   command: os.blocks[0]!.command,
 }))
 
-interface LandingPlan {
-  id: string
-  name: string
-  price_cents: number
-  features: string[]
-}
-
-// Static fallback mirrors the server matrix so the page renders even if
-// the API is briefly unreachable; replaced by /api/stripe/plans (the
-// single source of truth) as soon as the fetch lands.
-const plans = ref<LandingPlan[]>([
-  { id: 'free', name: 'Free', price_cents: 0, features: ['3 devices', 'Private network (overlay mesh)', 'Chat: 10 members'] },
-  { id: 'pro', name: 'Pro', price_cents: 800, features: ['30 devices', 'Exit nodes + MagicDNS', 'Unlimited members'] },
-  { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
-])
+// The fallback until /api/stripe/plans (the single source of truth) answers.
+const plans = ref<Plan[]>(FALLBACK_PLANS.map((p) => ({ ...p, features: [...p.features] })))
 
 // FR-58: the old `?subscribe=<outcome>` snackbar that lived here was dead
 // code — the API's redirect target (`/?subscribe=…`) is auth-gated, so this
@@ -337,7 +244,7 @@ onMounted(async () => {
   try {
     const resp = await fetch('/api/stripe/plans')
     if (resp.ok) {
-      const live = (await resp.json()) as LandingPlan[]
+      const live = (await resp.json()) as Plan[]
       if (Array.isArray(live) && live.length > 0) plans.value = live
     }
   } catch {

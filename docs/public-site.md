@@ -1,15 +1,15 @@
-# The public site: `/docs`, `/blog` and what a crawler reads
+# The public site: `/`, `/docs`, `/blog` and what a crawler reads
 
-**Audience:** whoever changes `ui/docs/`, `ui/blog/`, the pod's nginx config, or anything a
-search engine sees. Built by [FR-60](fr/FR-60-public-docs-site.md) (#1165, the docs generator)
-and [FR-87](fr/FR-87-blog-and-google-indexing.md) (#1776, the blog, honest dates, hashed
-assets and the head).
+**Audience:** whoever changes `ui/docs/`, `ui/blog/`, the landing copy, the pod's nginx config,
+or anything a search engine sees. Built by [FR-60](fr/FR-60-public-docs-site.md) (#1165, the
+docs generator) and [FR-87](fr/FR-87-blog-and-google-indexing.md) (#1776, the blog, honest
+dates, hashed assets, the head and the static homepage).
 
 The product is a single-page app that a crawler reads as one empty `<div id="app">`.
-Everything a search engine should find (the user documentation, the blog) is **static HTML**
-built by one in-repo generator into `ui/dist/`, next to the SPA, and served by the same pod
-nginx. No dependency was added for any of it: the generator is `markdown-it` (already a UI
-dependency) plus hand-written TypeScript.
+Everything a search engine should find (the homepage, the user documentation, the blog) is
+**static HTML** built by one in-repo generator into `ui/dist/`, next to the SPA, and served by
+the same pod nginx. No dependency was added for any of it: the generator is `markdown-it`
+(already a UI dependency) plus hand-written TypeScript.
 
 > ⚠️ **CI green is not "Google can read it".** Every defect FR-87 fixed was invisible from
 > inside the build: dates that changed on every deploy, a redirect that downgraded to
@@ -17,24 +17,26 @@ dependency) plus hand-written TypeScript.
 > by [`scripts/public-site-smoke.sh`](../scripts/public-site-smoke.sh) against the image in CI
 > **and** against production after a promote (§6).
 
-## 1. One generator, two collections
+## 1. One generator, two collections and a homepage
 
 ```mermaid
 flowchart LR
     subgraph src["ui/ (all the Docker UI stage sees: COPY ui/ .)"]
         C["docs/content/**/*.md<br/>65 pages, 10 sections"]
         P["blog/posts/*.md<br/>published posts only"]
+        L["src/utils/landing.ts<br/>src/utils/enrollCommands.ts<br/>(shared with the SPA)"]
         A["docs/assets · blog/assets<br/>src/assets/tutorial"]
         M["docs/content-dates.json<br/>(generated, gitignored)"]
     end
     B["ui/docs/build.ts<br/>load → gates → emit"]
     subgraph dist["ui/dist/ (next to the SPA)"]
+        H["home/index.html<br/>(served at /, §5)"]
         D["docs/**/index.html<br/>docs/404.html"]
         BL["blog/**/index.html<br/>blog/feed.xml"]
         AS["docs/assets/name.&lt;hash&gt;.ext"]
         X["sitemap.xml (index)<br/>sitemap-docs.xml · sitemap-blog.xml<br/>robots.txt"]
     end
-    C & P & A & M --> B --> D & BL & AS & X
+    C & P & L & A & M --> B --> H & D & BL & AS & X
 ```
 
 `bun run build` is `vue-tsc && vite build && bun docs/build.ts`. **The generator must run
@@ -45,6 +47,7 @@ its own annotation ([`ci.yml:1538`](../.github/workflows/ci.yml)).
 |---|---|---|---|
 | Docs | `ui/docs/content/<section>/<page>.md` | `/docs/<section>/<page>/` | git (§2) |
 | Blog | `ui/blog/posts/<slug>.md` | `/blog/<slug>/` | front-matter only: editorial dates, because a typo fix is not a new post |
+| Homepage | `ui/src/utils/landing.ts` (the SPA's `LandingView.vue` imports the same module) | `/`, for requests without a session cookie (§5) | undated |
 
 Both share the page shell ([`theme/shell.ts`](../ui/docs/theme/shell.ts)), the link checker,
 the search index, the asset pipeline and the sitemaps. A second builder was rejected in the
@@ -52,12 +55,13 @@ FR-87 plan: two writers of `sitemap.xml`, and a link checker that could not see 
 link.
 
 **Every gate fails the build**, with every problem listed in one run
-(`build.ts:main`, [`build.ts:496`](../ui/docs/build.ts)):
+(`build.ts:main`, [`build.ts:498`](../ui/docs/build.ts)):
 
 | Gate | Where |
 |---|---|
 | a link to a page nobody generates, or to a heading a page does not have (same-page `#anchor`s included) | [`theme/links.ts:31`](../ui/docs/theme/links.ts) |
-| front-matter: a missing key, an unknown key (strict), a description over 160, a `<title>` that does not fit 60 | `build.ts:loadPage` ([`:257`](../ui/docs/build.ts)) |
+| front-matter: a missing key, an unknown key (strict), a description over 160, a `<title>` that does not fit 60 | `build.ts:loadPage` ([`:259`](../ui/docs/build.ts)) |
+| the homepage: a link to a page nobody generates; an SPA icon with no inline SVG mapped | `build.ts:main`, [`theme/home-layout.ts:63`](../ui/docs/theme/home-layout.ts) |
 | images: no alt text, a remote or `data:` src, a raw `<img>`, over 3 MB, a format nobody can size | [`render.ts:475`](../ui/docs/theme/render.ts), [`theme/images.ts:139`](../ui/docs/theme/images.ts) |
 | posts: no `draft` (a file there IS published), no future date, `updated` before `date`, a share image under 1200 px or not raster | [`theme/posts.ts:81`](../ui/docs/theme/posts.ts) |
 | the search index over 150 KB gzipped | `build.ts:main` |
@@ -107,8 +111,9 @@ revalidated on every load (`expires -1`, §5), and it is what moves a reader to 
 - The search index is hashed too; its URL reaches `search.js` through `data-search-index`.
 - `social-preview.png` keeps a stable name: `ui/index.html` names it as the SPA's `og:image`.
 - `LEGACY_UNHASHED_ASSETS` ([`site.ts:38`](../ui/docs/site.ts)) also publishes each file under
-  its old plain name, for HTML a browser cached before revalidation began. It is for one
-  release; turn it off after the first promote that carries hashed names.
+  its old plain name, for HTML a browser cached before revalidation began. Pre-FR-87 HTML
+  carried no `Cache-Control` at all, so a browser may hold it under heuristic caching. Turn
+  the flag off in the first release on or after **2026-10-03** (FR-87 §4c).
 - **Images carry their real size**, read from the file's own header (PNG, GIF, JPEG, WebP, SVG
   parsed by hand), so the browser reserves the right box. FR-60 hard-coded 960×420 on heroes
   that are 760×400 or 600×540. An image alone in its paragraph becomes a `<figure>`, its
@@ -116,14 +121,18 @@ revalidated on every load (`expires -1`, §5), and it is what moves a reader to 
 
 ## 4. What the `<head>` says
 
-Built once, in [`theme/shell.ts:81`](../ui/docs/theme/shell.ts), for every collection.
+Built once, in [`theme/shell.ts:91`](../ui/docs/theme/shell.ts), for every collection.
 
-| | Docs page | Docs listing (home, section, tag) | Post | Blog index |
-|---|---|---|---|---|
-| `<title>` | ≤60: the author's `seoTitle`, else the first default that fits (with the section, without it, bare) — [`layout.ts:114`](../ui/docs/theme/layout.ts) | same | `seoTitle`, else `title — Roomler blog` if it fits | fixed, ≤60 |
-| `og:type` | `article` | `website` | `article` | `website` |
-| JSON-LD (one `@graph`) | Organization + `TechArticle` + BreadcrumbList (+ FAQPage) | Organization + `CollectionPage` | Organization + `BlogPosting` (a **Person** author) + BreadcrumbList | Organization + `Blog` |
-| share image | the social card | the social card | the post's own, raster, ≥1200 px | the social card |
+| | Docs page | Docs listing (home, section, tag) | Post | Blog index | Homepage `/` |
+|---|---|---|---|---|---|
+| `<title>` | ≤60: the author's `seoTitle`, else the first default that fits (with the section, without it, bare) — [`layout.ts:114`](../ui/docs/theme/layout.ts) | same | `seoTitle`, else `title — Roomler blog` if it fits | fixed, ≤60 | fixed, ≤60 (a unit test) |
+| `og:type` | `article` | `website` | `article` | `website` | `website` |
+| JSON-LD (one `@graph`) | Organization + `TechArticle` + BreadcrumbList (+ FAQPage) | Organization + `CollectionPage` | Organization + `BlogPosting` (a **Person** author) + BreadcrumbList | Organization + `Blog` | Organization + `WebSite` |
+| share image | the social card | the social card | the post's own, raster, ≥1200 px | the social card | the social card |
+
+> ⚠️ **No `SoftwareApplication` on the homepage.** Its rich result requires `aggregateRating`
+> or `review`, and a page without them reports the markup as an error. Ratings are never
+> invented to make it pass; `home.spec.ts` fails if the type appears.
 
 - **One Organization** (`@id https://roomler.ai/#organization`, legalName **G ROX EOOD**) is a
   node of every graph, and every author and publisher points at it. FR-60 wrote "G ROX LTD".
@@ -140,6 +149,11 @@ Built once, in [`theme/shell.ts:81`](../ui/docs/theme/shell.ts), for every colle
 ```mermaid
 flowchart TD
     R["request"] --> L1{"path"}
+    L1 -->|"/ (exactly)"| CK{"access_token<br/>cookie?"}
+    CK -->|"none: guests, every crawler"| HOME["home/index.html<br/>expires -1"]
+    CK -->|present| APP["the SPA (index.html)<br/>expires -1"]
+    L1 -->|"/home/…"| INT["internal: 404<br/>(one URL for the homepage)"]
+    L1 -->|"/landing, /pricing"| MV["301 → /, /#pricing"]
     L1 -->|"/docs/…, /blog/…"| S["static handler<br/>expires -1 (no-cache HTML)"]
     S -->|file exists| OK["200 + the server's security headers"]
     S -->|"a slashless directory"| RD["301 Location: /docs/x/<br/>(relative: absolute_redirect off)"]
@@ -149,8 +163,37 @@ flowchart TD
     L1 -->|"anything else"| SPA["the SPA (index.html)"]
 ```
 
-Config: [`files/nginx-pod.conf:113`](../files/nginx-pod.conf) onward, with `absolute_redirect
-off` at [`:16`](../files/nginx-pod.conf).
+Config: the cookie `map` at [`files/nginx-pod.conf:12`](../files/nginx-pod.conf) (it must
+live at `http` level, which is where `conf.d/` files land), `absolute_redirect off` at
+[`:32`](../files/nginx-pod.conf), and the locations from [`:129`](../files/nginx-pod.conf)
+(`/docs/`) to [`:165`](../files/nginx-pod.conf) (`/landing`).
+
+**The homepage is chosen by the session cookie.** `map $cookie_access_token $root_doc` picks
+`/home/index.html` when the HttpOnly session cookie is absent and the SPA's `index.html` when
+it is present, and `location = / { expires -1; try_files $root_doc =404; }` serves it.
+`try_files` serves the chosen file *inside* that location, so both branches get `no-cache` and
+the server's security headers, and `internal` on `/home/` does not block it.
+
+> ⚠️ **The access cookie is not the whole session.** It lives 7 days. The refresh cookie lives
+> 30, but it is scoped to `Path=/api/auth/refresh`, so nginx never sees it at `/`: a returning
+> user on day 8 would get the sign-up page from a site that could still sign them in.
+> [`home.js`](../ui/docs/theme/home.js) closes the gap. It loads in `<head>`, without
+> `defer`, and when the SPA's localStorage hint (`roomler-signed-in`, from
+> `ui/src/api/session.ts`) says signed in, it replaces the page with `/login`. The SPA's
+> guest guard sends a signed-in visitor on to the dashboard, whose first 401 refreshes the
+> session.
+> - **Never `/`:** without the cookie, nginx would serve the static page again.
+> - **A stale hint cannot loop:** a failed refresh clears it and shows the login page.
+> - **A crawler has no localStorage**, so it stays on the page.
+>
+> `home.spec.ts` locks the key to the one the SPA writes by *running* `home.js` after the
+> SPA's own `markSignedIn()`.
+
+> ⚠️ **Never navigate the SPA fully to `/` to "show the homepage".** The SPA only runs at `/`
+> when the request carried a cookie, so for a cookie the server refuses, a full navigation to
+> `/` returns the SPA, which navigates to `/` again, and so on. The router keeps its
+> client-side push to `/landing` (`LandingView`, the same copy), which cannot loop. Logout
+> already expires both cookies on the server.
 
 > ⚠️ **`expires` in these locations, never `add_header`.** nginx inherits the server-level
 > `add_header` list only when a location declares none, so one `add_header` would silently drop
@@ -180,11 +223,17 @@ bash scripts/public-site-smoke.sh https://roomler.ai . <deployed-sha>
 | docs HTML `Cache-Control: no-cache` | HTML cached against hashed assets |
 | security headers on `/docs/`, a leaf, `/blog/` == `/` | the `add_header` trap |
 | with posts: the feed is `application/atom+xml`; without: `/blog/` is a real 404 | the Atom type; the kill switch |
-| every `/docs/assets/` file a page names is hashed and loads; every `<img>` has a size | stale caches; layout shift |
+| `/` without a cookie is the static homepage (its H1 + `WebSite` JSON-LD); with `access_token` it is the SPA | a crawler reading the SPA shell; signed-in users losing the app |
+| `/`'s security headers are the same with and without the cookie, and it is `no-cache` | the `add_header` trap at `/` |
+| `/home/` → 404; `/landing` → 301 `/`; `/pricing` → 301 `/#pricing` | a second URL for the homepage; the SPA's old routes |
+| every `/docs/assets/` file `/`, `/docs/` and a leaf name is hashed and loads; every `<img>` has a size | stale caches; layout shift |
 | given a full-history repo, every docs `<lastmod>` equals git's | dates from the build clock |
 
-Each check was shown failing before it passed: against production before FR-87 it failed on
-all of them, and an image built with no manifest fails the `lastmod` check.
+Each check was shown failing before it passed. Against production before FR-87 it failed on
+all of them, and an image built with no manifest fails the `lastmod` check. Production before
+P6 fails the six homepage checks. Eight mutations of the P6 nginx lines each turn their
+check red, among them one `add_header` in `location = /`, which strips every security header
+from both branches (FR-87 §9).
 
 ## 7. Writing for it
 
@@ -202,12 +251,20 @@ all of them, and an image built with no manifest fails the `lastmod` check.
 - **With no post, there is no blog:** no `/blog/` output, no Blog link, no feed, no sitemap
   entry. The blog's styles are `blog.css`, published only with a post, so an empty
   `ui/blog/posts/` ships byte-identical docs.
+- **The homepage's copy:** `ui/src/utils/landing.ts`, one zero-import module that the SPA's
+  `LandingView.vue` and [`theme/home-layout.ts`](../ui/docs/theme/home-layout.ts) both render,
+  so the two pages cannot drift. The install commands come from `enrollCommands.ts`, as
+  everywhere else. The static page draws the docs' inline SVG icons: a new SPA icon needs an
+  entry in `home-layout.ts`'s map, or the build fails.
+- **What `home.js` adds:** the signed-in hand-off (§5); the newsletter form, where the server
+  mounts `saas` (failing open, as the SPA does); and live prices from `/api/stripe/plans`,
+  over the fallback table the page ships. With JavaScript off, the page is complete and the
+  form's place links to sign-up.
 
 ## 8. Next
 
-FR-87 P6 (a static, crawlable homepage at `/`, chosen by a cookie map in nginx) and P7
-(Search Console, Bing, IndexNow) are the remaining phases. This page is updated when they
-ship.
+FR-87 P7 (Search Console, Bing, IndexNow) is the remaining phase. This page is updated when it
+ships.
 
 ## Code map
 
@@ -221,6 +278,8 @@ ship.
 | [`ui/docs/theme/layout.ts`](../ui/docs/theme/layout.ts) | a docs page |
 | [`ui/docs/theme/blog-layout.ts`](../ui/docs/theme/blog-layout.ts) | a post, the index, tag pages |
 | [`ui/docs/theme/posts.ts`](../ui/docs/theme/posts.ts) | the post contract, ordering, backlinks |
+| [`ui/docs/theme/home-layout.ts`](../ui/docs/theme/home-layout.ts) · [`home.js`](../ui/docs/theme/home.js) · [`home.css`](../ui/docs/theme/home.css) | the static homepage, its enhancement (the hand-off first), its styles |
+| [`ui/src/utils/landing.ts`](../ui/src/utils/landing.ts) | the homepage's copy and fallback plans, shared with the SPA |
 | [`ui/docs/theme/structured.ts`](../ui/docs/theme/structured.ts) | JSON-LD |
 | [`ui/docs/theme/xml.ts`](../ui/docs/theme/xml.ts) | sitemaps, robots, the Atom feed |
 | [`ui/docs/theme/assets.ts`](../ui/docs/theme/assets.ts) · [`images.ts`](../ui/docs/theme/images.ts) · [`links.ts`](../ui/docs/theme/links.ts) | hashing · image sizes · the link gate |
