@@ -58,16 +58,33 @@ test.describe('Authentication', () => {
     await loginViaUi(page, user.username, user.password)
     const cookies = await context.cookies()
     expect(cookies.find((c) => c.name === 'refresh_token'), 'login set no refresh_token cookie').toBeTruthy()
+    // Park the page first: `loginViaUi` returns while the dashboard still has
+    // requests in flight, and one sent after the cookies change 401s, starts a
+    // refresh, and the `goto` below aborts it. The app counts an aborted
+    // refresh as a rejection and clears its hint, so the test would then
+    // measure its own race rather than the hand-off (seen on both images).
+    await page.goto('about:blank')
     await context.clearCookies()
     await context.addCookies(cookies.filter((c) => c.name !== 'access_token'))
 
     await page.goto('/')
-    // `/` is also the static page's URL, so the URL alone proves nothing:
-    // what proves it is authenticated content and a freshly minted cookie.
-    await expect(page.getByText(/create your first workspace/i)).toBeVisible({ timeout: 15000 })
-    await expect(page.locator('h1.home-hero__title')).toHaveCount(0)
+    // `/` is also the static page's URL, and the dashboard's text is no proof
+    // either: the app renders from the HINT, and an empty tenant list from a
+    // 401 looks exactly like a new user's (measured: the text was up before
+    // the refresh answered). Proof is a freshly minted session cookie that
+    // the server accepts as this user.
+    await expect(page.locator('h1.home-hero__title')).toHaveCount(0, { timeout: 15000 })
+    await expect
+      .poll(async () => (await context.cookies()).some((c) => c.name === 'access_token'), {
+        message: 'the refresh minted no session',
+        timeout: 15000,
+      })
+      .toBe(true)
+    const me = await page.request.get('/api/auth/me')
+    expect(me.status(), 'the new session cookie is not accepted').toBe(200)
+    expect((await me.json()).username).toBe(user.username)
     await expect(page).toHaveURL(/\/$/)
-    expect((await context.cookies()).some((c) => c.name === 'access_token'), 'the refresh minted no session').toBe(true)
+    await expect(page.getByText(/create your first workspace/i)).toBeVisible()
   })
 
   test('a stale signed-in hint cannot loop: it ends on the login page, cleared', async ({ page }) => {
