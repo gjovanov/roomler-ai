@@ -1,6 +1,7 @@
 ---
 title: Unattended access
-description: Reach your own servers and workstations without anyone approving at the far end — including at the Windows lock screen and before any user logs in.
+seoTitle: Unattended remote access, even at the lock screen — Roomler
+description: Unattended remote access to your own servers and workstations — nobody approves at the far end, even at the Windows lock screen or before anyone logs in.
 tags: [remote-desktop, unattended, windows, linux, access-control]
 order: 2
 ---
