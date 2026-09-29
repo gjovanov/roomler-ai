@@ -79,11 +79,18 @@ export function rateLimitMessage(resp: Response, data: unknown): string {
 }
 
 /**
- * 'throttled' is deliberately distinct from 'failed': a rate-limited refresh
- * tells us nothing about whether the session is still valid, so it must not
- * trigger the logout that a genuine rejection does.
+ * Only a REJECTION ends the session. `failed` is the server saying no: the
+ * refresh endpoint answers a missing, expired or invalid refresh cookie with
+ * a 401. `throttled` (a 429) and `unknown` (a network error, a request the
+ * browser cancelled because the page is navigating away, a 5xx) say nothing
+ * about whether the session is still valid, so they keep it. The next request
+ * that needs the session asks again, and a dead one is rejected then.
+ *
+ * #1788: the network error and the cancelled request both used to count as
+ * `failed`. A refresh cut short by a navigation cleared the signed-in hint,
+ * and the next page showed a still-valid session the landing page.
  */
-export type RefreshOutcome = 'ok' | 'failed' | 'throttled'
+export type RefreshOutcome = 'ok' | 'failed' | 'throttled' | 'unknown'
 
 let refreshPromise: Promise<RefreshOutcome> | null = null
 
@@ -106,16 +113,19 @@ async function doRefresh(): Promise<RefreshOutcome> {
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
     })
-    if (resp.status === 429) return 'throttled'
-    if (!resp.ok) return 'failed'
     // The new access token arrives as a Set-Cookie; the body copy is ignored.
-    return 'ok'
+    if (resp.ok) return 'ok'
+    if (resp.status === 401 || resp.status === 403) return 'failed'
+    if (resp.status === 429) return 'throttled'
+    return 'unknown'
   } catch {
-    return 'failed'
+    // A network error, or the fetch the browser aborts when the page unloads.
+    return 'unknown'
   }
 }
 
-async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+/** `retried`: this call is the one retry after a successful refresh. */
+async function request<T>(path: string, options: RequestOptions = {}, retried = false): Promise<T> {
   const { method = 'GET', body, headers = {} } = options
 
   // No Authorization header. `BASE_URL` is `/api`, so every call here is
@@ -153,29 +163,29 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       resp.status === 401 &&
       !AUTH_PATHS.some((p) => path.startsWith(p))
     ) {
-      // Try to refresh the token before giving up
-      const outcome = await tryRefreshToken()
-      if (outcome === 'ok') {
-        // Retry. Nothing to re-attach: the refresh response replaced the
-        // session cookie, so the retry carries the new one automatically.
-        const retryResp = await fetch(`${BASE_URL}${path}`, {
-          method,
-          headers: fetchHeaders,
-          body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
-        })
-        if (retryResp.ok) {
-          const ct = retryResp.headers.get('content-type') || ''
-          if (ct.includes('application/json')) return retryResp.json() as Promise<T>
-          return retryResp.blob() as unknown as Promise<T>
-        }
-      }
-      if (outcome === 'throttled') {
-        // Keep the session: we never learned whether it was still valid.
-        const { showError } = useSnackbar()
-        showError('Too many requests. Please wait a moment and try again.')
-      } else {
-        // Refresh was genuinely rejected, or the retry failed — force logout
+      if (retried) {
+        // The session was refreshed a moment ago and this request is STILL
+        // refused: the credential really is dead.
         endSessionLocally()
+      } else {
+        const outcome = await tryRefreshToken()
+        // Retry through this same function. Nothing to re-attach: the refresh
+        // response replaced the session cookie, so the retry carries the new
+        // one. And the retry's own failure is handled as what it is (a 429
+        // as a 429, a 403 as a 403), not as a failed session. #1788: a retry
+        // throttled right after a SUCCESSFUL refresh used to log the user out.
+        if (outcome === 'ok') return request<T>(path, options, true)
+        if (outcome === 'failed') {
+          endSessionLocally()
+        } else {
+          // Keep the session: we never learned whether it was still valid.
+          const { showError } = useSnackbar()
+          showError(
+            outcome === 'throttled'
+              ? 'Too many requests. Please wait a moment and try again.'
+              : 'Could not reach the server. Please try again.',
+          )
+        }
       }
     }
 
