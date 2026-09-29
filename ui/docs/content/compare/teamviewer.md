@@ -1,6 +1,7 @@
 ---
 title: Roomler vs TeamViewer and AnyDesk
-description: An honest comparison against the commercial remote-support incumbents — what they do better, and where a self-hostable alternative differs.
+seoTitle: "Roomler vs TeamViewer & AnyDesk: open-source alternative"
+description: An honest comparison with TeamViewer and AnyDesk, the commercial incumbents — what they do better, and where an open-source, self-hosted alternative differs.
 tags: [compare, teamviewer, anydesk, remote-desktop, alternatives]
 order: 3
 ---
