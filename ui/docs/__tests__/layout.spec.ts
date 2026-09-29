@@ -46,6 +46,15 @@ describe('dates', () => {
     expect(html).toContain('"dateModified":"2026-09-01"')
     expect(html).toContain('Last updated <time datetime="2026-09-01">2026-09-01</time>')
   })
+
+  it("gives structured data git's full timestamp, and readers its date", () => {
+    // Google's Rich Results Test flags a bare date as "invalid datetime …
+    // missing a timezone" (measured on this page's markup, 2026-09-29).
+    const html = render({ created: '2026-08-30T21:04:10+02:00', lastmod: '2026-09-01T14:02:11+02:00' })
+    expect(html).toContain('"datePublished":"2026-08-30T21:04:10+02:00","dateModified":"2026-09-01T14:02:11+02:00"')
+    expect(html).toContain('<meta property="article:modified_time" content="2026-09-01T14:02:11+02:00">')
+    expect(html).toContain('Last updated <time datetime="2026-09-01T14:02:11+02:00">2026-09-01</time>')
+  })
 })
 
 describe('assets', () => {
