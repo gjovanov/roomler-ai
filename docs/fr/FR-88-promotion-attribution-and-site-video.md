@@ -1,9 +1,8 @@
 # FR-88: Measure what promotion brings — attribution to an activated device, a link hub, and video on the site
 
-**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** P1a (the server half of
-§3a and the §3c view) in a PR, 2026-09-30 — not merged, not promoted; P1b (the site and SPA half, the goals,
-the privacy section) in a parallel PR; P2–P4 not started · **Owner:** web / public site + auth ·
-**Anchors:** master `c6c2934d7` ·
+**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** P1 merged 2026-09-30, not yet
+promoted: P1a, the server half, in #1800 (`fdba707a2`); P1b, the site and SPA half, in #1798. P0 merged
+2026-09-29 (#1791); P2–P4 not started · **Owner:** web / public site + auth · **Anchors:** master `c6c2934d7` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the static site, purestat on every page),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-39](FR-39-launch-readiness.md) (`subscribers.source`)
 
@@ -177,14 +176,14 @@ sequenceDiagram
 
 ## 4. Phases
 
-| P | What | Kill switch |
-|---|---|---|
-| P0 | claim: issue #1790, this spec, the ledger row | docs only |
-| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view. **In a PR (2026-09-30), not merged** | the SPA omits `attribution`; the view is platform-admin only |
-| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section | the SPA omits `attribution`; `ANALYTICS = null` |
-| P2 | `/links/` and the short paths (§3d) | remove the locations and the page |
-| P3 | video on the site (§3e) | empty manifest; revert `frame-src` |
-| P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — |
+| P | What | Kill switch | Status |
+|---|---|---|---|
+| P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `8c0b34a44` |
+| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `fdba707a2`, not promoted |
+| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798, not promoted |
+| P2 | `/links/` and the short paths (§3d) | remove the locations and the page | — |
+| P3 | video on the site (§3e) | empty manifest; revert `frame-src` | — |
+| P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |
 
 **Deploy order:** P1 is promoted before the first video is published, so the first posts are
 measured from their first view. Each phase is its own promote.

@@ -2,7 +2,10 @@
  * Copyright (C) 2026 G ROX EOOD
  *
  * FR-60 (#1165) — page behaviour: OS-tab persistence, copy buttons, the
- * mobile nav, and TOC scroll-spy.
+ * mobile nav, and TOC scroll-spy. Every static page loads it (docs, blog and
+ * the homepage), so it also fires two of FR-88's purestat goals:
+ * `install-copy` from an install/enroll command's copy button, and
+ * `github-outbound` from a link to the repository.
  *
  * Every one of these is a PROGRESSIVE ENHANCEMENT. With JavaScript off:
  * the OS tabs still switch (CSS `:checked`), code is still selectable, the
@@ -30,6 +33,16 @@
       localStorage.setItem(OS_KEY, os)
     } catch (e) {
       /* private window / site data blocked — the choice just does not persist */
+    }
+  }
+
+  // A purestat goal (FR-88 §3b). A no-op without the script (`ANALYTICS =
+  // null`, blocked, not loaded yet), and it never throws.
+  function goal(name) {
+    try {
+      if (typeof window.purestat === 'function') window.purestat(name)
+    } catch (e) {
+      /* analytics must never break the page */
     }
   }
 
@@ -80,6 +93,9 @@
       if (!code) return
 
       var done = function () {
+        // `data-install`: the build recognised an agent install or enroll
+        // command (`isInstallCommand` in render.ts).
+        if (block.hasAttribute('data-install')) goal('install-copy')
         btn.classList.add('is-copied')
         btn.setAttribute('aria-label', 'Copied')
         setTimeout(function () {
@@ -109,6 +125,23 @@
         /* nothing sensible to do; the text is still selectable by hand */
       }
       document.body.removeChild(ta)
+    })
+  }
+
+  // ── the repository goal (FR-88) ───────────────────────────────────────
+  // Any link into the repository: the top bar's GitHub link, the ones in the
+  // prose, "Edit this page". Not the author's profile, not another repo.
+  var REPO = /^https:\/\/github\.com\/gjovanov\/roomler-ai(?:[/?#]|\.git|$)/i
+
+  function initOutbound() {
+    function onClick(ev) {
+      var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null
+      if (a && REPO.test(a.href)) goal('github-outbound')
+    }
+    document.addEventListener('click', onClick)
+    // A middle click opens the link in a new tab without any `click` event.
+    document.addEventListener('auxclick', function (ev) {
+      if (ev.button === 1) onClick(ev)
     })
   }
 
@@ -166,6 +199,7 @@
   function boot() {
     initOsTabs()
     initCopy()
+    initOutbound()
     initNav()
     initScrollSpy()
   }
