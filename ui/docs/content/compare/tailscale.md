@@ -1,6 +1,7 @@
 ---
 title: Roomler vs Tailscale
-description: An honest comparison — what Tailscale does better, where Roomler differs, and which of the two you should actually use.
+seoTitle: "Roomler vs Tailscale: a self-hosted Tailscale alternative"
+description: An honest comparison — what Tailscale does better, where Roomler differs as a self-hosted mesh, and which of the two you should actually use.
 tags: [compare, tailscale, mesh, network, alternatives]
 order: 1
 ---

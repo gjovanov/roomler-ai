@@ -1,6 +1,7 @@
 ---
 title: Roomler vs RustDesk
-description: An honest comparison — what RustDesk does better, where Roomler differs, and which of the two fits your situation.
+seoTitle: "Roomler vs RustDesk: an open-source RustDesk alternative"
+description: An honest comparison of two open-source remote desktop tools — what RustDesk does better, where Roomler differs, and which of the two fits your situation.
 tags: [compare, rustdesk, remote-desktop, alternatives, open-source]
 order: 2
 ---
