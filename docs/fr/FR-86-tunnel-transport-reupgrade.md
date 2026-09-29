@@ -115,39 +115,59 @@ sequenceDiagram
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | this PR |
-| P1 | flow-owned listener, `Carrier` split, held connections during reconnect; tests; docs | revert (pure refactor, no wire change) | implemented 2026-09-28, in review: `establish_tunnel_session` + `Carrier` (`crates/tunnel-core/src/driver.rs`), `FlowListener` + `HoldPolicy` (`crates/tunnel-core/src/flow_listener.rs`, ≤ 64 held, ≤ 30 s), the daemon flow binds once (`agents/roomlerd/src/tunnel/client_mgr.rs` `run_flow_cycle`); 9 new tests, 5 negative controls shown red; `docs/tunnels.md` §"The flow owns the listener" |
-| P2 | re-upgrade probe, promotion, drain; tests; docs | `ROOMLERD_TUNNEL_REUPGRADE=0` / `tunnel_reupgrade = false` | implemented 2026-09-28: probe schedule (`ReupgradeBackoff`/`ProbeTimer`), ranking (`better_transports`/`below_best`), `spawn_candidate`/`establish_candidate` (background probe into a throwaway `FlowLive`), promotion + drain (`run_flow_cycle` serving loop, `drain_carrier`), `Carrier::drained` (`crates/tunnel-core/src/driver.rs`), the `ROOMLERD_TUNNEL_REUPGRADE` kill switch + `tunnel_reupgrade` config key, the `--start-transport` test lever (LocalAPI `CreateForward.start_transport`); 11 new tests, 6 negative controls shown red; `docs/tunnels.md` §"Re-upgrade: probe → promote → drain" |
-| P3 | agent release; field verification (AC7, AC8); close | as P2 | planned |
+| P0 | spec + ledger row + issue | — | **merged** #1770 `69fb66bba` |
+| P1 | flow-owned listener, `Carrier` split, held connections during reconnect; tests; docs | revert (pure refactor, no wire change) | **merged** #1771 `1ffc7bd94`: `establish_tunnel_session` + `Carrier` (`crates/tunnel-core/src/driver.rs`), `FlowListener` + `HoldPolicy` (`crates/tunnel-core/src/flow_listener.rs`, ≤ 64 held, ≤ 30 s), the daemon flow binds once (`agents/roomlerd/src/tunnel/client_mgr.rs` `run_flow_cycle`); 9 new tests, 5 negative controls shown red; `docs/tunnels.md` §"The flow owns the listener" |
+| P2 | re-upgrade probe, promotion, drain; tests; docs | `ROOMLERD_TUNNEL_REUPGRADE=0` / `tunnel_reupgrade = false` (the key applies on the next daemon restart) | **merged** #1773 `813231f44`: probe schedule (`ReupgradeBackoff`/`ProbeTimer`), ranking (`better_transports`/`below_best`), `spawn_candidate`/`establish_candidate` (background probe into a throwaway `FlowLive`), promotion + drain (`run_flow_cycle` serving loop, `drain_carrier`), `Carrier::drained` (`crates/tunnel-core/src/driver.rs`), the `ROOMLERD_TUNNEL_REUPGRADE` kill switch + `tunnel_reupgrade` config key, the `--start-transport` test lever (LocalAPI `CreateForward.start_transport`); 11 new tests, 6 negative controls shown red; `docs/tunnels.md` §"Re-upgrade: probe → promote → drain" |
+| P3 | agent release; field verification (AC7, AC8); close | as P2 | **shipped** `agent-v0.4.114` → `037e2c703` (#1774), published 2026-09-28 22:58:55Z; **field-verified** 2026-09-28/29, see the log |
 
 ## Acceptance criteria
 
-- [ ] **AC1** — A declared route that fell back returns to the best allowed transport within the probe bound
-  (first probe 60 s after the fallback) once that transport works. *(P2 builds the mechanism — schedule,
-  candidate, promotion — but the end-to-end "returns to best once it works" is P3 field, AC7.)*
+- [x] **AC1** — A declared route that fell back returns to the best allowed transport within the probe bound
+  (first probe 60 s after the fallback) once that transport works. *(Field, 0.4.114: three of the operator's
+  declared routes that came up on `webrtc-dc-v1` after a client restart probed at +60 s and were on `quic-v1`
+  21 s later (the exit's slow TURN allocation); the lever flow probed at +60 s and was on `quic-v1` 0.66 s later.)*
 - [x] **AC2** — An established connection through the route survives a switch; connections opened after the
   switch ride the new transport. *(P2: proven end to end over two real loopback QUIC carriers behind one
   `FlowListener` — `driver::tests::make_before_break_a_keeps_flowing_while_b_takes_new_connections`: A keeps
-  round-tripping bytes after B is installed, a new connection rides B, A then drains.)*
-- [ ] **AC3** — No connection is refused during a switch or a reconnect: the flow's listener never unbinds, and a
-  connection that arrives while no carrier is ready is held (≤ 30 s) and then carried. *(P1's property — the
-  listener is bound once and outlives every carrier swap; P2 does not regress it.)*
+  round-tripping bytes after B is installed, a new connection rides B, A then drains. Field, 0.4.114: connection
+  A, opened on `webrtc-dc-v1` before the promotion, carried the SSH client banner out and 1,120 bytes of KEXINIT back
+  after it; connection B, opened after, rode `quic-v1`.)*
+- [x] **AC3** — No connection is refused during a switch or a reconnect: the flow's listener never unbinds, and a
+  connection that arrives while no carrier is ready is held (≤ 30 s) and then carried. *(P1's property. Field,
+  0.4.114: a connection to a brand-new forward's port 9 ms after creation, before any carrier existed, was
+  ACCEPTED and held; `held connections handed to the new carrier handed=1` followed, and the SSH banner arrived
+  at 1,736 ms. On 0.4.113 the port bound only after establishment, so that connect was refused: the red half is
+  structural and NC86A-proven, not field-measured. No connection was refused during any of the four promotions.)*
 - [x] **AC4** — A failing candidate never disturbs the live carrier; probes back off (2 → 5 → 15 → 60 min) and
   reset on a network change. *(P2: the backoff ladder + reset are unit-proven — `reupgrade_backoff_ladder_and_reset`,
   `probe_timer_deadlines_follow_the_ladder`; failure isolation is structural — a candidate establishes into its own
   throwaway `FlowLive` + `c`-prefixed nonce, cleaned by `CandidateGuard`, so it cannot touch the live carrier or
-  listener. The netwatch-Major reset is wired into the serving loop; its live firing is field-observable in P3.)*
-- [ ] **AC5** — A drained carrier is closed when its last connection ends, with a terminate the exit acts on (no
-  #1754-class leak), and a candidate that failed is closed too. *(P2: the client side is proven —
-  `drain_carrier_keeps_the_old_carrier_until_active_reaches_zero` (drop only at `active()==0`) and P1's
-  `a_quic_carrier_*` (drop ⇒ `rc:tunnel.terminate`); that the EXIT acts on the terminate / no leak is P3 field.)*
+  listener. The netwatch-Major reset is wired into the serving loop. ⚠️ **Verified by tests + NCs only:** no
+  probe has failed in the field yet, since every one so far succeeded; a failing probe needs an exit that refuses
+  the better transport. Re-open with evidence if one ever disturbs a live route.)*
+- [x] **AC5** — A drained carrier is closed when its last connection ends, with a terminate the exit acts on (no
+  #1754-class leak), and a candidate that failed is closed too. *(P2 proves the client side:
+  `drain_carrier_keeps_the_old_carrier_until_active_reaches_zero`, and P1's `a_quic_carrier_*` for drop ⇒
+  terminate. Field, 0.4.114: closing A logged `draining carrier reached 0 connections; closing`, and the EXIT's
+  log shows `agent flow ended`, then `tunnel peer's client is gone — reaping the session (#1754)` ~60 ms later,
+  then `rc:tunnel.terminate — closing peer` for the same session. The three idle routes' old carriers closed the
+  moment they were promoted, since they had 0 connections.)*
 - [x] **AC6** — Kill switch: with `ROOMLERD_TUNNEL_REUPGRADE=0` no probe is ever opened. *(P2: `reupgrade_active`
   + `reupgrade_enabled` gate the whole probe path — `reupgrade_gate_respects_pinned_and_kill_switch`,
-  `kill_switch_reads_the_env`; off ⇒ the serving phase is exactly P1's `active.dead().await`.)*
-- [ ] **AC7** — Field: a client-daemon restart while the exit restarts ⇒ the affected routes end on `quic-v1`
-  within the bound (red first on the current release: they stay on `webrtc-dc-v1`). *(P3 — the `--start-transport`
-  test lever ships in P2 to drive it.)*
-- [ ] **AC8** — Field: an RDP connection through a route stays up across a promotion. *(P3.)*
+  `kill_switch_reads_the_env`; off ⇒ the serving phase is exactly P1's `active.dead().await`. ⚠️ **Verified by
+  tests + NCs only:** the `tunnel_reupgrade` config key applies on the next daemon **restart** (not live; an
+  earlier note here said live), and the field check was not run because it would have restarted the
+  operator's daemon under live routes.)*
+- [x] **AC7** — Field: a client-daemon restart while the exit restarts ⇒ the affected routes end on `quic-v1`
+  within the bound (red first on the current release: they stay on `webrtc-dc-v1`). *(Red, 0.4.111–0.4.113 on
+  2026-09-28: two routes sat on `webrtc-dc-v1` for hours after a restart. Green, 0.4.114: the client's own update
+  restart (23:56Z) brought three routes up on `webrtc-dc-v1`; they re-upgraded to `quic-v1` at 23:59:29Z, and all
+  seven of the operator's routes were then on `quic-v1`. The fallback's trigger was the client restart racing a
+  slow exit, not a simultaneous exit restart; the mechanism, a fallback at open, is the same.)*
+- [x] **AC8** — Field: an RDP connection through a route stays up across a promotion. *(Verified with a
+  long-lived SSH TCP connection, not RDP: a carrier forwards bytes regardless of protocol. A was opened before
+  the promotion and exchanged the SSH banner/KEXINIT after it, see AC2. No RDP session happened to be open on a
+  route during its promotion.)*
 - [x] **AC9** — Tests with negative controls shown red for P1 (held connection, single bind) and P2 (promotion,
   drain, failure isolation, backoff, kill switch). *(P1's NCs in #1771; P2's shown red in this PR — NC86P2A
   (listener ignores the promotion), NC86P2N (no backoff), NC86P2K/NC86P2S (probe while pinned / kill switch
@@ -169,6 +189,10 @@ migrating a live connection between transports.
 
 ## Field-verification log
 
-| Date | Build | Cell | Result |
+| Date (UTC) | Build | Cell | Result |
 |---|---|---|---|
-| — | — | — | — |
+| 2026-09-28 12:26 → evening | 0.4.111–0.4.113 | **red**: routes after a client restart | two routes to a UDP-capable exit sat on `webrtc-dc-v1` for hours; a forced `--transport quic` through the same exit worked |
+| 2026-09-28 23:56–23:59 | 0.4.114 (client) | the operator's declared routes after the client's own update restart | `rdg-go2`, `rdp-as10832` and `pcon-mssql` (exit: the UDP-hostile corp laptop) came up on `webrtc-dc-v1`, probed at 23:59:08, and were promoted to `quic-v1` at 23:59:29; old carriers (0 connections) closed at once; all seven routes then on `quic-v1` |
+| 2026-09-28 23:58–23:59 | 0.4.114 (client), 0.4.113 (exit: a Linux server) | the lever (`--start-transport webrtc`) + a connection held across the promotion | probe at +60 s, `quic-v1` established in 0.66 s; A (pre-promotion) exchanged banner/KEXINIT after the promotion; B rode `quic-v1`; closing A drained and closed the old carrier; the exit reaped (layer B) and received the terminate (layer A) |
+| 2026-09-29 00:01 | 0.4.114 | AC3: connect before the first carrier exists | accepted after 9 ms; `held connections handed to the new carrier handed=1`; banner at 1,736 ms |
+| 2026-09-29 00:01 | 0.4.114 | AC6: the kill switch's config key | `tunnel_reupgrade` is a RESTART key; not field-exercised (it needs a daemon restart under live routes); the key was set and immediately `clear`ed |
