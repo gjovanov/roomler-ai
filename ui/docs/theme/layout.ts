@@ -15,12 +15,14 @@ import { icon } from './icons.ts'
 import { escapeHtml, type Heading, type ResolvedImage } from './render.ts'
 import {
   DEFAULT_OG_IMAGE,
+  DOCS_NAV,
   fitTitle,
   renderBodyScripts,
   renderFooter,
   renderHead,
   renderSearchDialog,
   renderTopbar,
+  type ShellNav,
   type SiteAssets,
 } from './shell.ts'
 import { breadcrumbList, collectionPage, graph, organization, techArticle, type Crumb } from './structured.ts'
@@ -76,8 +78,21 @@ export interface LayoutCtx {
   nav: NavSection[]
   page: DocPage
   assets: SiteAssets
+  /** The site-wide chrome; defaults to docs with no blog. */
+  site?: ShellNav
+  /** Posts that link to this page (FR-87): shown as "On the blog". */
+  onTheBlog?: Array<{ url: string; title: string }>
   prev?: DocPage
   next?: DocPage
+}
+
+function onTheBlogHtml(posts: Array<{ url: string; title: string }> | undefined): string {
+  if (!posts?.length) return ''
+  return (
+    `<aside class="on-the-blog" aria-label="On the blog"><p class="on-the-blog__head">On the blog</p><ul>` +
+    posts.map((p) => `<li><a href="${p.url}">${escapeHtml(p.title)}</a></li>`).join('') +
+    `</ul></aside>`
+  )
 }
 
 /** A page whose content is a list of other pages: it is a `website`, not an
@@ -258,6 +273,7 @@ function pageMeta(page: DocPage): string {
 
 export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
   const { page, nav, prev, next, assets } = ctx
+  const site = ctx.site ?? DOCS_NAV
   const crumbs = trail(page)
   const canonical = `${SITE_ORIGIN}${page.url}`
   const listing = isListing(page)
@@ -272,6 +288,7 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
     article: listing || page.notFound ? undefined : { published: page.created, modified: page.lastmod, tags: page.tags },
     jsonLd: page.notFound ? undefined : structuredData(page, canonical, crumbs),
     assets,
+    feed: site.hasBlog,
   })
 
   // The hero's REAL size (FR-87), read from the file: FR-60 hard-coded
@@ -291,7 +308,7 @@ ${head}
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-${renderTopbar()}
+${renderTopbar(site)}
 
 <div class="layout">
   <aside class="sidebar" data-nav>
@@ -307,16 +324,16 @@ ${renderTopbar()}
     <div class="prose">
 ${page.html}
     </div>
-    ${pager(prev, next)}
+    ${onTheBlogHtml(ctx.onTheBlog)}${pager(prev, next)}
     ${pageMeta(page)}
   </main>
 
   ${toc ? `<aside class="toc-rail">${toc}</aside>` : '<aside class="toc-rail"></aside>'}
 </div>
 
-${renderFooter()}
+${renderFooter(site)}
 
-${renderSearchDialog(assets)}
+${renderSearchDialog(assets, site)}
 
 ${renderBodyScripts(assets)}
 </body>
