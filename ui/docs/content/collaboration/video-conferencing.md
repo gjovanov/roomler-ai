@@ -18,7 +18,6 @@ participant out to focus on them.
 
 :::cards
 - **Screen sharing** icon:monitor — Share a window, a screen or a tab.
-- **Recording** icon:video — Record a call for people who could not attend.
 - **In-call chat** icon:copy — The room's chat stays available during the call.
 - **Camera and mic state** icon:info — Everyone can see who has muted or turned their camera off, rather than staring at a frozen frame.
 :::
