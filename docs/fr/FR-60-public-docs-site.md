@@ -253,16 +253,20 @@ Every phase is additive static output; nothing outside `dist/docs` reads it.
 
 ## 4. Acceptance criteria
 
-- [ ] **AC1** — `cd ui && bun run build` emits `dist/docs/**`, `dist/sitemap.xml`, `dist/robots.txt`; `Dockerfile` is unchanged.
-- [ ] **AC2** — The link checker is shown to **FAIL** on a deliberately broken internal link and to pass when restored; likewise a missing frontmatter `description`.
-- [ ] **AC3** — Every page emits a unique `<title>`, `<meta name="description">`, absolute canonical, OG/Twitter tags, and valid `TechArticle` + `BreadcrumbList` JSON-LD; `/docs/faq` emits valid `FAQPage`.
-- [ ] **AC4** — Search returns results and keyboard-navigates; tags filter; index <=150 KB gzipped, with the build failing above it.
-- [ ] **AC5** — OS tabs work **with JavaScript disabled**, and persist across pages with JS on.
-- [ ] **AC6** — `curl -sI https://roomler.ai/docs/start/install/windows/` returns the **same** CSP, HSTS and X-Frame-Options headers as `curl -sI https://roomler.ai/`.
-- [ ] **AC7** — Each of Windows, macOS and Linux has a complete install path, verified against the served installers rather than against memory.
-- [ ] **AC8** — All three pillars plus architecture, security & access control, troubleshooting and FAQ are present and non-stub.
-- [ ] **AC9** — Field: `/docs/`, `/robots.txt` and `/sitemap.xml` all 200 on production; Google Rich Results validates the FAQ page and one doc page.
-- [ ] **AC10** — Lighthouse SEO **and** Performance recorded for three sampled pages — **including any number that misses its bar**, recorded rather than reworded.
+Evidence for AC1–AC8 and AC10 is the field result on #1165 (2026-09-01/02, three deploys);
+the boxes were never walked back to until FR-87's close-out.
+
+- [x] **AC1** — `cd ui && bun run build` emits `dist/docs/**`, `dist/sitemap.xml`, `dist/robots.txt`; `Dockerfile` is unchanged. *(#1165 result: 70 sitemap URLs.)*
+- [x] **AC2** — The link checker is shown to **FAIL** on a deliberately broken internal link and to pass when restored; likewise a missing frontmatter `description`. *(#1165 result, plus the OG-image gate.)*
+- [x] **AC3** — Every page emits a unique `<title>`, `<meta name="description">`, absolute canonical, OG/Twitter tags, and valid `TechArticle` + `BreadcrumbList` JSON-LD; `/docs/faq` emits valid `FAQPage`. *(#1165 result: FAQPage with 21 Q&A pairs.)*
+- [x] **AC4** — Search returns results and keyboard-navigates; tags filter; index <=150 KB gzipped, with the build failing above it. *(#1165 result: 59.4 KB gz.)*
+- [x] **AC5** — OS tabs work **with JavaScript disabled**, and persist across pages with JS on. *(#1165 result: CSS `:checked` baseline.)*
+- [x] **AC6** — `curl -sI https://roomler.ai/docs/start/install/windows/` returns the **same** CSP, HSTS and X-Frame-Options headers as `curl -sI https://roomler.ai/`. *(#1165 result; and since FR-87 P1 on every image, by `scripts/public-site-smoke.sh`.)*
+- [x] **AC7** — Each of Windows, macOS and Linux has a complete install path, verified against the served installers rather than against memory. *(#1165 result.)*
+- [x] **AC8** — All three pillars plus architecture, security & access control, troubleshooting and FAQ are present and non-stub. *(#1165 result: 65 authored pages across 10 sections.)*
+- [x] **AC9** — Field: `/docs/`, `/robots.txt` and `/sitemap.xml` all 200 on production; Google Rich Results validates the FAQ page and one doc page. *(200s: #1165 result. Validation, run at FR-87's close-out on 2026-09-29 against production: `/docs/compare/teamviewer/` Article + Breadcrumbs, 2 valid, no issues; `/docs/faq/` Breadcrumbs valid, and its FAQPage 0 errors / 0 warnings in the Schema Markup Validator. The Rich Results Test does not list FAQPage for this site: Google has limited FAQ rich results to government and health sites since 2023.)*
+- [x] **AC10** — Lighthouse SEO **and** Performance recorded for three sampled pages — **including any number that misses its bar**, recorded rather than reworded. *(#1165 result: seven page shapes, SEO/A11y/BP 100, Performance 100 on six and 98 on `/docs/compare/tailscale/`.)*
+- [x] **AC11** — Docs: [`docs/public-site.md`](../public-site.md) describes the generator in the house style (mermaid, tables, `file:line` anchors) with a row in `docs/README.md`. *(Added at close-out: the docs-before-close rule of 2026-09-05 postdates this spec. Landed with FR-87's close-out PR.)*
 
 ## 5. Open decisions
 
@@ -335,4 +339,11 @@ alongside the implementation.
 
 ## 8. Field-verification log
 
-*(empty — filled as phases land)*
+The full record is the result comment on #1165 (2026-09-01/02, three deploys, seven page
+shapes in Lighthouse). The close-out on 2026-09-29, after FR-87 P1–P5 reached production:
+
+| Date | What | Result |
+|---|---|---|
+| 2026-09-29 | Rich Results Test, `/docs/compare/teamviewer/` | Article + Breadcrumbs, 2 valid, no issues |
+| 2026-09-29 | Rich Results Test + Schema Markup Validator, `/docs/faq/` | Breadcrumbs valid; FAQPage 0 errors, 0 warnings (not listed by the Rich Results Test: FAQ rich results are government/health only since 2023) |
+| 2026-09-29 | `scripts/public-site-smoke.sh` (FR-87) against production | all 12 checks pass, incl. header equality (AC6) on every page family |

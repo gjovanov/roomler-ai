@@ -294,23 +294,27 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 - [ ] **AC1:** the build emits `dist/blog/{index.html,<slug>/,feed.xml}`, `dist/home/index.html`
   and `sitemap{,-docs,-blog}.xml`, with no change to `package.json`, `bun.lock` or the
   Dockerfile.
-- [ ] **AC2:** every new gate is shown failing, then passing: missing alt, unknown key, `draft`,
+- [x] **AC2:** every new gate is shown failing, then passing: missing alt, unknown key, `draft`,
   future `date`, `updated` < `date`, hero narrower than 1200 px, `seoTitle` over 60, a dead
-  blog→docs link.
-- [ ] **AC3:** with no posts there is no `/blog` output and no Blog link.
-- [ ] **AC4:** production `<lastmod>` equals `git log -1 --format=%cs` for 5 sampled docs files
-  (baseline: 70/70 show the build date).
+  blog→docs link. *(Real builds on throwaway pages, #1780 and #1781: all eight, plus a remote
+  image, a raw `<img>`, a missing file, a future `updated`, dead anchors and a dead `related`.)*
+- [x] **AC3:** with no posts there is no `/blog` output and no Blog link. *(#1781: `dist/docs`,
+  both sitemaps and robots.txt byte-identical to P3's, `diff -r`.)*
+- [x] **AC4:** production `<lastmod>` equals `git log -1 --format=%cs` for 5 sampled docs files
+  (baseline: 70/70 show the build date). *(All 65, not 5: the smoke at the deployed commit,
+  §9.)*
 - [ ] **AC5:** the Rich Results Test reports 0 errors on the post (Article + Breadcrumbs), one
   docs page, and `/`.
 - [ ] **AC6:** the security headers are identical on `/` (SPA), the static homepage, a docs
   page and a blog page, and HTML is `no-cache`.
-- [ ] **AC7:** `/blog/nonexistent/` and `/docs/nonexistent/` return 404; `/docs`, `/blog` and a
+- [x] **AC7:** `/blog/nonexistent/` and `/docs/nonexistent/` return 404; `/docs`, `/blog` and a
   slashless docs path return 301 with a relative Location (baseline: `http://` downgrade and
-  soft 404s).
-- [ ] **AC8:** `/blog/feed.xml` is served as `application/atom+xml` and the W3C validator
-  accepts it.
-- [ ] **AC9:** every `/docs/assets` and `/blog/assets` URL in production HTML is content-hashed,
-  and every image carries `width`/`height`.
+  soft 404s). *(Production, §9.)*
+- [x] **AC8:** `/blog/feed.xml` is served as `application/atom+xml` and the W3C validator
+  accepts it. *("This is a valid Atom 1.0 feed", no recommendations.)*
+- [x] **AC9:** every `/docs/assets` and `/blog/assets` URL in production HTML is content-hashed,
+  and every image carries `width`/`height`. *(Production: `/docs/`, a quickstart page and the
+  post — 11 asset URLs on the post, all hashed and loading, 5 of 5 images sized.)*
 - [ ] **AC10:** Lighthouse SEO scores 100 on `/`, `/blog/`, the post and two docs pages; other
   scores are recorded as measured.
 - [ ] **AC11:** `curl /` without a cookie returns the static homepage (its H1 and JSON-LD); with
@@ -351,7 +355,14 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 | 2026-09-29 | P1 image, CI ([run 36558431414](https://github.com/gjovanov/roomler-ai/actions/runs/36558431414)) | the P1 checks | pass, 7 security headers compared on `/docs/` and `/docs/start/` |
 | 2026-09-29 | P2 build in `nginx:stable` + `files/nginx-pod.conf` | the smoke with `.`, three builds | **no git, no manifest**: `lastmod` check FAILS (every entry undated), as it must. **With dates**: all 11 pass, 65 of 65 `lastmod` = git |
 | 2026-09-29 | P2 image, CI ([run 36561581485](https://github.com/gjovanov/roomler-ai/actions/runs/36561581485)) | the real image path | runner `[dates] 65 files`; Docker (no `.git`) `dates: manifest, 65 of 65 pages`; smoke all 11 pass, `lastmod == git` for 65 pages |
-| 2026-09-29 | P3 markup, Rich Results Test (code mode, the TeamViewer compare page) | AC5, before deploy | first run: Article + Breadcrumbs valid, **4 non-critical issues** (bare dates: "invalid datetime", "missing a timezone"); after the `%cI` fix: valid, **no issues**. The production run is still owed |
+| 2026-09-29 | P3 markup, Rich Results Test (code mode, the TeamViewer compare page) | AC5, before deploy | first run: Article + Breadcrumbs valid, **4 non-critical issues** (bare dates: "invalid datetime", "missing a timezone"); after the `%cI` fix: valid, **no issues** |
+| 2026-09-29 | **production, `hosted-20260929-69fcf0a`** (P1–P5; promoted from `hosted-20260928-9834060`; 0 of 60 health probes failed during the roll) | `scripts/public-site-smoke.sh https://roomler.ai . 69fcf0a35` | **all 12 pass**, the same script that failed 10 that morning: relative 301s; the site's 404 page on `/docs/…` and `/blog/…`; no-cache HTML; 9 security headers == `/` on `/docs/`, a leaf and `/blog/`; feed `application/atom+xml`; hashed, loading assets and sized images; **`lastmod` == git for all 65 docs pages** |
+| 2026-09-29 | production | the rest of AC6/AC7/AC9 | the post: 9 security headers == `/`, `no-cache`; `/blog` and a slashless post → 301, relative; 11 asset URLs hashed and loading, 5 of 5 images sized, the share image 200 `image/png`; `/sitemap.xml` indexes `sitemap-docs.xml` + `sitemap-blog.xml` |
+| 2026-09-29 | production | AC5, Rich Results Test (URL mode) | the post: **Article + Breadcrumbs, 2 valid, no issues**; `/docs/compare/teamviewer/`: **Article + Breadcrumbs, 2 valid, no issues**. `/` is owed (P6) |
+| 2026-09-29 | production | AC8, W3C Feed Validator | "This is a valid Atom 1.0 feed", no recommendations |
+| 2026-09-29 | production | AC10, Lighthouse 12.8.2 (mobile) | `/blog/`, the post, `/docs/compare/teamviewer/`, `/docs/remote-desktop/unattended-access/`: **Performance, Accessibility, Best Practices, SEO all 100**; LCP 0.9 / 1.7 / 1.0 / 0.9 s; CLS 0.000 on all four. `/` is owed (P6). (The PageSpeed Insights API was not usable: its keyless daily quota is shared and exhausted) |
+| 2026-09-29 | Medium | AC12 (the Medium half) | the three approved typo fixes live on the public story (verified on the page, after a first "Save and publish" that silently did nothing); the story's `<link rel="canonical">` → `https://roomler.ai/blog/self-hosted-teamviewer-alternative/`. Search Console is owed (P7) |
+| 2026-09-29 | the fleet, after the roll | counts only | devices 18 / 12 online / 5 offline, identical to before; peers 13 direct, 5 offline, 1 DERP, 1 upgrading (before: 13 / 5 / 2 DERP); this host's 7 tunnel flows all on `quic-v1`. No remote-desktop session was run: nothing in this roll touches that path |
 
 ## 10. Related
 
