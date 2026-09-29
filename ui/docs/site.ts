@@ -122,6 +122,7 @@ export const BLOG_FRONTMATTER_KEYS = [
   'hero',
   'heroAlt',
   'ogImage',
+  'ogImageAlt',
   'related',
   'syndication',
   'canonical',
