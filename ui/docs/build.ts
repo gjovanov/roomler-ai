@@ -112,19 +112,22 @@ function walk(dir: string, out: string[] = []): string[] {
 // never had git, so every page claimed to change on every deploy.
 
 const dates = resolveDates()
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
+/** `2026-09-01`, or a full ISO 8601 timestamp with its offset. */
+const FRONT_MATTER_DATE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2}))?$/
 /** Only for refusing a future date; never published. */
 const NOW_DAY = new Date().toISOString().slice(0, 10)
 
-/** A front-matter date: `YYYY-MM-DD`, real, and not in the future. */
+/** A front-matter date: `YYYY-MM-DD` or an ISO timestamp, real, and not in
+ *  the future. A bare date is valid schema.org, but Google prefers a time
+ *  with a zone, so a git date (always a full timestamp) is the better one. */
 function frontMatterDate(data: Frontmatter, key: string, rel: string): string | undefined {
   const v = optionalString(data, key)
   if (v === undefined) return undefined
-  if (!ISO_DAY.test(v) || Number.isNaN(Date.parse(v))) {
-    fail(`${rel} — \`${key}: ${v}\` is not a YYYY-MM-DD date`)
+  if (!FRONT_MATTER_DATE.test(v) || Number.isNaN(Date.parse(v))) {
+    fail(`${rel} — \`${key}: ${v}\` is neither YYYY-MM-DD nor an ISO 8601 timestamp with its offset`)
     return undefined
   }
-  if (v > NOW_DAY) {
+  if (v.slice(0, 10) > NOW_DAY) {
     fail(`${rel} — \`${key}: ${v}\` is in the future`)
     return undefined
   }
@@ -415,7 +418,9 @@ function write(file: string, contents: string | Buffer): void {
 /** The docs pages a crawler is asked to index: not the noindexed, not the
  *  tag listings (see the note where this is written). */
 function docsUrlEntries(pages: DocPage[]): UrlEntry[] {
-  return pages.filter((p) => !p.noindex).map((p) => ({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: p.lastmod }))
+  // The date part: what `git log -1 --format=%cs` prints for the file, which
+  // is what the public-site smoke compares the sitemap against.
+  return pages.filter((p) => !p.noindex).map((p) => ({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: p.lastmod?.slice(0, 10) }))
 }
 
 // ── main ────────────────────────────────────────────────────────────────
