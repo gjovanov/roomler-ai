@@ -298,11 +298,19 @@ sequenceDiagram
 - **Off unless the repository variable `INDEXNOW_ENABLED` is `true`**, and warn-only: a missed
   hint to a crawler never fails a promote.
 
-**Search Console and Bing Webmaster Tools** are the operator's: they need the Google account
-that owns the `roomler.ai` domain property (verified by the domain's existing
-`google-site-verification` TXT record), and Bing imports from it. The runbook is FR-87 §4h:
-submit `https://roomler.ai/sitemap.xml`, request indexing for the pages that matter, and review
-coverage at +3, +14 and +28 days.
+**Search Console** holds the Domain property `sc-domain:roomler.ai`. It sits under the
+Workspace account that owns the domain, and it verified itself from the domain's existing
+`google-site-verification` TXT record (2026-09-29). Two things live there:
+- **the sitemap index** `https://roomler.ai/sitemap.xml`, read as "Success";
+- **per-page reindexing**: URL Inspection → *Request indexing*, about 10 a day. Use it after a
+  page's content changes in a way that matters for search: a new page, or a new title.
+
+It takes that account's sign-in, so it is the operator's. **Bing Webmaster Tools** imports the
+property from it. Review the coverage at +3, +14 and +28 days after a launch (FR-87 §4h).
+
+> ⚠️ A sitemap just submitted can read **"Couldn't fetch"** for a few minutes before Google has
+> read it. Check what a crawler gets (`curl -A Googlebot …` → 200, `text/xml`) before chasing
+> it: on 2026-09-29 it turned to Success on its own.
 
 > ⚠️ **Not used, on purpose:** the sitemap "ping" endpoints (retired by Google in 2023), the
 > Indexing API (Google limits it to job postings and livestreams), and a `SoftwareApplication`
