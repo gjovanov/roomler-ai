@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-60 (#1165) — the page shell.
+ * FR-60 (#1165) — the documentation page: sidebar, content, table of
+ * contents, on the shared shell (`shell.ts`, FR-87).
  *
- * Everything a crawler reads is emitted here, statically, per page: a
- * unique <title>, a real <meta name="description">, an ABSOLUTE canonical,
- * OG/Twitter tags and JSON-LD. The SPA next door has none of these — one
- * `<title>Roomler</title>` for every public route — which is the gap this
- * FR exists to close.
- *
- * ⚠️ `application/ld+json` is a DATA block, not an executable script, so
- * the pod CSP's `script-src 'self'` does not apply to it. That is why the
- * structured data can be inline while `search.js` cannot be.
+ * Everything a crawler reads is emitted statically, per page: a unique
+ * <title> that fits, a real <meta name="description">, an ABSOLUTE
+ * canonical, OG/Twitter tags and JSON-LD. The SPA next door has none of these
+ * — one `<title>Roomler</title>` for every public route — which is the gap
+ * FR-60 exists to close.
  */
-import { BASE, OG_IMAGE, SITE_NAME, SITE_ORIGIN, SITE_TITLE_SUFFIX, type SectionDef } from '../site.ts'
+import { BASE, SITE_ORIGIN, SITE_TITLE_SUFFIX, type SectionDef } from '../site.ts'
 import { icon } from './icons.ts'
 import { escapeHtml, type Heading, type ResolvedImage } from './render.ts'
+import {
+  DEFAULT_OG_IMAGE,
+  fitTitle,
+  renderBodyScripts,
+  renderFooter,
+  renderHead,
+  renderSearchDialog,
+  renderTopbar,
+  type SiteAssets,
+} from './shell.ts'
+import { breadcrumbList, collectionPage, graph, organization, techArticle, type Crumb } from './structured.ts'
 
-/** The theme's own files, published under content-hashed names (FR-87). */
-export interface SiteAssets {
-  css: string
-  js: string
-  search: string
-  osPreference: string
-  searchIndex: string
-}
+export type { SiteAssets } from './shell.ts'
 
 export interface DocPage {
   /** Path under content/, without extension: `start/install/windows`. */
@@ -35,6 +36,8 @@ export interface DocPage {
   outFile: string
   section?: SectionDef
   title: string
+  /** The whole `<title>`, when the author set one (≤ MAX_TITLE_CHARS). */
+  seoTitle?: string
   description: string
   tags: string[]
   order: number
@@ -74,51 +77,52 @@ export interface LayoutCtx {
   assets: SiteAssets
   prev?: DocPage
   next?: DocPage
-  /** Extra JSON-LD objects beyond the per-page defaults. */
-  extraJsonLd?: unknown[]
 }
 
-function jsonLdBlock(objects: unknown[]): string {
-  if (objects.length === 0) return ''
-  const payload = objects.length === 1 ? objects[0] : objects
-  // `</script>` inside a JSON string would close the block early; `<` is
-  // escaped to its unicode form, which is valid JSON and inert in HTML.
-  const json = JSON.stringify(payload).replace(/</g, '\\u003c')
-  return `<script type="application/ld+json">${json}</script>`
+/** A page whose content is a list of other pages: it is a `website`, not an
+ *  `article`, to Open Graph, and a CollectionPage to schema.org. */
+export function isListing(page: DocPage): boolean {
+  return (
+    page.slug === 'index' ||
+    page.slug.startsWith('tags/') ||
+    (page.section !== undefined && page.url === `${BASE}/${page.section.dir}/`)
+  )
 }
 
-function breadcrumbs(page: DocPage): { html: string; jsonLd: unknown } {
-  const trail: Array<{ name: string; url: string }> = [{ name: 'Docs', url: `${BASE}/` }]
-  if (page.section) {
-    trail.push({ name: page.section.title, url: `${BASE}/${page.section.dir}/` })
-  }
+/**
+ * The `<title>`: the author's `seoTitle` verbatim, else the first default
+ * that fits — with the section, without it, then the bare title. Null when
+ * even the bare title is too long; the build turns that into an error that
+ * asks for a `seoTitle` (FR-87: 8 of 65 titles ran 62–71 chars before).
+ */
+export function docsTitle(page: DocPage): string | null {
+  if (page.seoTitle) return page.seoTitle
+  if (page.slug === 'index') return fitTitle([`${SITE_TITLE_SUFFIX} — remote desktop, private network, chat & video`])
+  const leafOfSection = page.section && !isListing(page)
+  return fitTitle([
+    ...(leafOfSection ? [`${page.title} · ${page.section!.title} — ${SITE_TITLE_SUFFIX}`] : []),
+    `${page.title} — ${SITE_TITLE_SUFFIX}`,
+    page.title,
+  ])
+}
+
+function trail(page: DocPage): Crumb[] {
+  const crumbs: Crumb[] = [{ name: 'Docs', url: `${BASE}/` }]
+  if (page.section) crumbs.push({ name: page.section.title, url: `${BASE}/${page.section.dir}/` })
   const isSectionIndex = page.section && page.url === `${BASE}/${page.section.dir}/`
-  if (!isSectionIndex && page.slug !== 'index') {
-    trail.push({ name: page.title, url: page.url })
-  }
+  if (!isSectionIndex && page.slug !== 'index') crumbs.push({ name: page.title, url: page.url })
+  return crumbs
+}
 
-  const html =
-    trail.length <= 1
-      ? ''
-      : `<nav class="crumbs" aria-label="Breadcrumb"><ol>${trail
-          .map((t, i) =>
-            i === trail.length - 1
-              ? `<li aria-current="page">${escapeHtml(t.name)}</li>`
-              : `<li><a href="${t.url}">${escapeHtml(t.name)}</a>${icon('chevronRight', { size: 14, cls: 'crumbs__sep' })}</li>`,
-          )
-          .join('')}</ol></nav>`
-
-  const jsonLd = {
-    '@context': 'https://schema.org',
-    '@type': 'BreadcrumbList',
-    itemListElement: trail.map((t, i) => ({
-      '@type': 'ListItem',
-      position: i + 1,
-      name: t.name,
-      item: `${SITE_ORIGIN}${t.url}`,
-    })),
-  }
-  return { html, jsonLd }
+function breadcrumbHtml(crumbs: Crumb[]): string {
+  if (crumbs.length <= 1) return ''
+  return `<nav class="crumbs" aria-label="Breadcrumb"><ol>${crumbs
+    .map((t, i) =>
+      i === crumbs.length - 1
+        ? `<li aria-current="page">${escapeHtml(t.name)}</li>`
+        : `<li><a href="${t.url}">${escapeHtml(t.name)}</a>${icon('chevronRight', { size: 14, cls: 'crumbs__sep' })}</li>`,
+    )
+    .join('')}</ol></nav>`
 }
 
 function sidebar(nav: NavSection[], current: DocPage): string {
@@ -186,7 +190,7 @@ function pager(prev?: DocPage, next?: DocPage): string {
   return `<nav class="pager" aria-label="Pagination">${left}${right}</nav>`
 }
 
-function faqJsonLd(page: DocPage): unknown | null {
+function faqJsonLd(page: DocPage): Record<string, unknown> | null {
   if (!page.faq) return null
   // Questions are the h2s; the answer is the plain text that follows one,
   // up to the next h2. Built from the SAME heading list the TOC uses, so
@@ -210,7 +214,32 @@ function faqJsonLd(page: DocPage): unknown | null {
     })
   }
   if (entries.length === 0) return null
-  return { '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: entries }
+  return { '@type': 'FAQPage', mainEntity: entries }
+}
+
+/** One graph per page: the Organization, what the page is, where it sits. */
+function structuredData(page: DocPage, canonical: string, crumbs: Crumb[]): Record<string, unknown> {
+  const nodes: Array<Record<string, unknown>> = [organization()]
+  if (isListing(page)) {
+    nodes.push(collectionPage({ url: canonical, name: page.title, description: page.description }))
+  } else {
+    nodes.push(
+      techArticle({
+        url: canonical,
+        headline: page.title,
+        description: page.description,
+        datePublished: page.created,
+        dateModified: page.lastmod,
+        image: DEFAULT_OG_IMAGE.url,
+        keywords: page.tags,
+      }),
+    )
+  }
+  // A one-item trail (the docs home) is not a breadcrumb.
+  if (crumbs.length > 1) nodes.push(breadcrumbList(crumbs))
+  const faq = faqJsonLd(page)
+  if (faq) nodes.push(faq)
+  return graph(nodes)
 }
 
 /** "Last updated … · Edit this page", each part only when it is true: no
@@ -228,46 +257,21 @@ function pageMeta(page: DocPage): string {
 
 export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
   const { page, nav, prev, next, assets } = ctx
-  const crumb = breadcrumbs(page)
+  const crumbs = trail(page)
   const canonical = `${SITE_ORIGIN}${page.url}`
+  const listing = isListing(page)
   // The 404 page answers for every missing URL, so it has no address of its
   // own to declare, and nothing in it is a thing to describe to a crawler.
-  const urlMeta = page.notFound
-    ? ''
-    : `<link rel="canonical" href="${canonical}">\n<meta property="og:url" content="${canonical}">\n`
-  const fullTitle =
-    page.slug === 'index'
-      ? `${SITE_TITLE_SUFFIX} — remote desktop, private mesh network, chat & video`
-      : page.section && page.url !== `${BASE}/${page.section.dir}/`
-        ? `${page.title} · ${page.section.title} — ${SITE_TITLE_SUFFIX}`
-        : `${page.title} — ${SITE_TITLE_SUFFIX}`
-
-  const structured: unknown[] = [
-    {
-      '@context': 'https://schema.org',
-      '@type': 'TechArticle',
-      headline: page.title,
-      description: page.description,
-      url: canonical,
-      // Omitted, not guessed, when unknown (FR-87): a wrong dateModified is
-      // worse than none, because it teaches a crawler to ignore ours.
-      ...(page.lastmod ? { dateModified: page.lastmod } : {}),
-      inLanguage: 'en',
-      keywords: page.tags.join(', '),
-      author: { '@type': 'Organization', name: 'G ROX LTD' },
-      publisher: {
-        '@type': 'Organization',
-        name: SITE_NAME,
-        url: SITE_ORIGIN,
-        logo: { '@type': 'ImageObject', url: `${SITE_ORIGIN}/logo.svg` },
-      },
-    },
-    crumb.jsonLd,
-  ]
-  const faq = faqJsonLd(page)
-  if (faq) structured.push(faq)
-  if (ctx.extraJsonLd) structured.push(...ctx.extraJsonLd)
-  const jsonLd = page.notFound ? '' : jsonLdBlock(structured)
+  const head = renderHead({
+    title: docsTitle(page) ?? page.title,
+    description: page.description,
+    canonical: page.notFound ? undefined : canonical,
+    noindex: page.noindex,
+    og: { type: listing || page.notFound ? 'website' : 'article', title: page.title },
+    article: listing || page.notFound ? undefined : { published: page.created, modified: page.lastmod, tags: page.tags },
+    jsonLd: page.notFound ? undefined : structuredData(page, canonical, crumbs),
+    assets,
+  })
 
   // The hero's REAL size (FR-87), read from the file: FR-60 hard-coded
   // 960×420 for heroes that are 760×400 or 600×540, reserving the wrong box.
@@ -281,43 +285,12 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(fullTitle)}</title>
-<meta name="description" content="${escapeHtml(page.description)}">
-${urlMeta}${page.noindex ? '<meta name="robots" content="noindex, follow">\n' : ''}<meta property="og:type" content="article">
-<meta property="og:site_name" content="${SITE_NAME}">
-<meta property="og:title" content="${escapeHtml(page.title)}">
-<meta property="og:description" content="${escapeHtml(page.description)}">
-<meta property="og:image" content="${SITE_ORIGIN}${OG_IMAGE}">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${escapeHtml(page.title)}">
-<meta name="twitter:description" content="${escapeHtml(page.description)}">
-<meta name="twitter:image" content="${SITE_ORIGIN}${OG_IMAGE}">
-<meta name="theme-color" content="#009688">
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="${assets.css}">
-<script src="${assets.osPreference}"></script>
-${jsonLd}
+${head}
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-<header class="topbar">
-  <div class="topbar__inner">
-    <a class="brand" href="${BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">Docs</span></a>
-    <button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>
-    <button class="search-open" type="button" data-search-open aria-label="Search the documentation">
-      ${icon('search', { size: 17 })}<span>Search</span><kbd>/</kbd>
-    </button>
-    <nav class="topbar__links" aria-label="Site">
-      <a href="/landing">Product</a>
-      <a href="/pricing">Pricing</a>
-      <a href="https://github.com/gjovanov/roomler-ai" target="_blank" rel="noopener noreferrer">GitHub</a>
-      <a class="btn btn--primary" href="/register">Get started free</a>
-    </nav>
-  </div>
-</header>
+${renderTopbar()}
 
 <div class="layout">
   <aside class="sidebar" data-nav>
@@ -325,7 +298,7 @@ ${jsonLd}
   </aside>
 
   <main id="main" class="content">
-    ${crumb.html}
+    ${breadcrumbHtml(crumbs)}
     <h1 class="page-title">${escapeHtml(page.title)}</h1>
     <p class="page-lead">${escapeHtml(page.description)}</p>
     ${tagChips(page, page.tags, tagIndexed)}
@@ -340,46 +313,11 @@ ${page.html}
   ${toc ? `<aside class="toc-rail">${toc}</aside>` : '<aside class="toc-rail"></aside>'}
 </div>
 
-<footer class="site-footer">
-  <div class="site-footer__inner">
-    <div>
-      <p class="site-footer__brand">Roomler</p>
-      <p class="site-footer__blurb">Remote desktop in a browser tab, a private WireGuard-style mesh, and team chat and video — on one agent you can self-host.</p>
-    </div>
-    <div>
-      <p class="site-footer__head">Docs</p>
-      <a href="${BASE}/start/">Get started</a>
-      <a href="${BASE}/network/">Private network</a>
-      <a href="${BASE}/remote-desktop/">Remote desktop</a>
-      <a href="${BASE}/faq/">FAQ</a>
-    </div>
-    <div>
-      <p class="site-footer__head">Product</p>
-      <a href="/landing">Overview</a>
-      <a href="/pricing">Pricing</a>
-      <a href="${BASE}/start/self-hosting/">Self-hosting</a>
-    </div>
-    <div>
-      <p class="site-footer__head">Legal</p>
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
-      <a href="/imprint">Imprint</a>
-    </div>
-  </div>
-</footer>
+${renderFooter()}
 
-<dialog class="search-dialog" data-search-dialog data-search-index="${assets.searchIndex}" aria-label="Search documentation">
-  <form class="search-form" method="dialog" role="search">
-    ${icon('search', { size: 18, cls: 'search-form__icon' })}
-    <input type="search" class="search-input" data-search-input placeholder="Search the docs…" autocomplete="off" spellcheck="false" aria-label="Search query">
-    <button type="button" class="search-close" data-search-close aria-label="Close search">${icon('close', { size: 18 })}</button>
-  </form>
-  <div class="search-results" data-search-results aria-live="polite"></div>
-  <p class="search-hint"><kbd>&uarr;</kbd><kbd>&darr;</kbd> to navigate · <kbd>Enter</kbd> to open · <kbd>Esc</kbd> to close</p>
-</dialog>
+${renderSearchDialog(assets)}
 
-<script src="${assets.js}" defer></script>
-<script src="${assets.search}" defer></script>
+${renderBodyScripts(assets)}
 </body>
 </html>
 `

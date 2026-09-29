@@ -176,4 +176,14 @@ export function optionalBoolean(fm: Frontmatter, key: string): boolean | undefin
   return typeof v === 'boolean' ? v : undefined
 }
 
+/**
+ * FR-87 (#1776): keys this page type does not know. The build turns each into
+ * an error, because an unknown key is almost always a misspelt known one
+ * (`heroalt:`, `seo_title:`), and it otherwise vanishes without a trace while
+ * the page ships without the thing its author asked for.
+ */
+export function unknownKeys(fm: Frontmatter, allowed: readonly string[]): string[] {
+  return Object.keys(fm).filter((k) => !allowed.includes(k))
+}
+
 export { FrontmatterError }

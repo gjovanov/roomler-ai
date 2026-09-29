@@ -45,6 +45,62 @@ export const SEARCH_INDEX_MAX_GZIP_BYTES = 150 * 1024
  *  longer one is a silent defect. Build gate, not a lint. */
 export const MAX_DESCRIPTION_CHARS = 160
 
+/** FR-87 (#1776): a `<title>` past this is cut off in search results. The
+ *  default drops " · section", then " — Roomler Docs", to fit; a title that
+ *  still does not fit must say so with a `seoTitle`, which is a build error
+ *  over this length. Measured before: 8 of 65 docs titles ran 62–71. */
+export const MAX_TITLE_CHARS = 60
+
+/** Every front-matter key a docs page may use. Anything else FAILS the build
+ *  (FR-87): a misspelt `heroalt:` or `seo_title:` otherwise vanishes without
+ *  a trace, and the page ships without the thing its author asked for. */
+export const DOCS_FRONTMATTER_KEYS = [
+  'title',
+  'description',
+  'tags',
+  'order',
+  'hero',
+  'heroAlt',
+  'noindex',
+  'faq',
+  'updated',
+  'seoTitle',
+] as const
+
+/**
+ * The one Organization every page's structured data points at (FR-87). FR-60
+ * wrote `author: "G ROX LTD"` while every other record — the imprint, the
+ * licence headers — says G ROX EOOD: two names for one publisher is how a
+ * knowledge panel ends up split, or wrong.
+ */
+export const ORG = {
+  id: `${SITE_ORIGIN}/#organization`,
+  name: SITE_NAME,
+  legalName: 'G ROX EOOD',
+  url: `${SITE_ORIGIN}/`,
+  logo: `${SITE_ORIGIN}/logo.svg`,
+  sameAs: ['https://github.com/gjovanov/roomler-ai'],
+} as const
+
+/** The social card's real size and alt text, for `og:image:*`. Measured from
+ *  the file (1280×640); `images.spec.ts` locks it. */
+export const OG_IMAGE_META = {
+  width: 1280,
+  height: 640,
+  alt: 'Roomler: remote desktop, a private network and team chat on one agent',
+} as const
+
+/**
+ * First-party analytics on the static pages, the same script the SPA loads
+ * (`ui/index.html`), which the pod CSP already allows (`script-src
+ * https://purestat.ai`). FR-60's pages loaded none, so organic search traffic
+ * — the reason FR-87 exists — was unmeasured. `null` turns it off.
+ */
+export const ANALYTICS: { src: string; domain: string } | null = {
+  src: 'https://purestat.ai/js/purestat.js',
+  domain: 'roomler.ai',
+}
+
 /**
  * A tag index page is only generated at or above this many pages. Below it,
  * a wall of one-link pages reads to a crawler as doorway pages — a penalty,
@@ -151,11 +207,3 @@ export const SECTIONS: SectionDef[] = [
 export function sectionByDir(dir: string): SectionDef | undefined {
   return SECTIONS.find((s) => s.dir === dir)
 }
-
-/**
- * Public SPA routes that belong in the sitemap. The app itself is
- * client-rendered and behind auth from `/` down, so only the guest-visible
- * marketing and legal routes are listed. `/tenant/**` is `Disallow`ed in
- * robots.txt for the same reason.
- */
-export const PUBLIC_SPA_ROUTES = ['/landing', '/pricing', '/privacy', '/terms', '/imprint']
