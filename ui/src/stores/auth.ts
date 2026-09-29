@@ -128,8 +128,14 @@ export const useAuthStore = defineStore('auth', () => {
       adoptSession(await api.get<User>('/auth/me'))
       subscribePush().catch(() => {})
     } catch {
-      // The hint said signed in and the server disagreed. It is the authority.
-      await logout()
+      // Sign out only if the server REFUSED the session (#1788). The api
+      // client makes that call, and clears the signed-in hint when it does:
+      // a 401 whose refresh was refused. A 429, a 5xx or a network error
+      // leaves the hint alone, because it says nothing about the session.
+      // Logging out on one would ask the server to expire a perfectly valid
+      // session: measured with a spent rate limit, `/auth/me` answered 429
+      // and this line signed the user out for real.
+      if (!looksSignedIn()) await logout()
     }
   }
 
