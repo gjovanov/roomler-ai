@@ -98,6 +98,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
+
       - name: Cache cargo
         # FR-6 wave 14 (#773): only a master push saves. A PR-ref cache can be
         # restored only by later runs of the same PR, and every one evicts
@@ -727,6 +732,11 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-apple-darwin
+
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
 
       - uses: Swatinem/rust-cache@v2
         with:

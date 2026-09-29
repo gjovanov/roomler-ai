@@ -100,6 +100,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
+
       - name: Rust cache
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
