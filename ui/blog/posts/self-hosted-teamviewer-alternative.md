@@ -4,7 +4,7 @@ seoTitle: "Self-hosted TeamViewer alternative: why I built Roomler"
 subtitle: An open-source, self-hosted TeamViewer alternative that runs in any browser tab
 description: "Why I built Roomler: an open-source, self-hosted TeamViewer alternative with unattended access and remote desktop from any browser tab."
 date: 2026-09-25T22:45:13Z
-updated: 2026-09-28T20:52:50Z
+updated: 2026-09-29T22:20:00Z
 author: goran
 tags: [teamviewer, remote-desktop, self-hosting, open-source, unattended-access]
 ogImage: self-hosted-teamviewer-alternative-og.png
@@ -157,6 +157,12 @@ Development is heavily AI-assisteted with Claude Code and covered with automated
 The same agent is also the remote desktop. It’s young and has few dozens users. The access-control policies are built and tested, but I haven’t yet run a real network with them fully enforced, and that’s the next thing I want to prove.
 
 I would love to hear what your experience with Roomler and what can be improved.
+
+## 🥂 The Happy End
+
+> “There must be a better way” — she said that night.
+
+Now there is one, and she is happily using it. If a session ever drops again, it will be a bug report for me instead of a lost weekend for her :)
 
 If you liked what you have read and seen, then as they say:
 
