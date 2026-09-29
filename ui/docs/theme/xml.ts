@@ -55,6 +55,81 @@ export function sitemapIndex(children: UrlEntry[]): string {
   return `${HEADER}<sitemapindex xmlns="${NS}">\n${children.map((c) => entry('sitemap', c)).join('\n')}\n</sitemapindex>\n`
 }
 
+// ── the Atom feed (FR-87 P4) ─────────────────────────────────────────────
+
+export interface FeedEntry {
+  /** Permanent: the post's absolute URL, which never changes once published. */
+  id: string
+  url: string
+  title: string
+  summary: string
+  /** Full post HTML, already made feed-safe by `feedHtml`. */
+  contentHtml: string
+  /** RFC 3339 timestamps. */
+  published: string
+  updated: string
+  author: { name: string; uri?: string }
+  tags: string[]
+}
+
+export interface FeedInput {
+  id: string
+  /** The feed's own URL (`rel="self"`). */
+  selfUrl: string
+  /** The HTML page it mirrors (`rel="alternate"`). */
+  htmlUrl: string
+  title: string
+  subtitle: string
+  updated: string
+  entries: FeedEntry[]
+}
+
+/** Atom 1.0 with full content. Every entry names its author, so the feed
+ *  itself need not (RFC 4287 §4.1.1). */
+export function atomFeed(f: FeedInput): string {
+  const e = xmlEscape
+  const entries = f.entries.map(
+    (x) =>
+      `  <entry>\n` +
+      `    <id>${e(x.id)}</id>\n` +
+      `    <title>${e(x.title)}</title>\n` +
+      `    <link rel="alternate" type="text/html" href="${e(x.url)}"/>\n` +
+      `    <published>${x.published}</published>\n` +
+      `    <updated>${x.updated}</updated>\n` +
+      `    <author><name>${e(x.author.name)}</name>${x.author.uri ? `<uri>${e(x.author.uri)}</uri>` : ''}</author>\n` +
+      x.tags.map((t) => `    <category term="${e(t)}"/>\n`).join('') +
+      `    <summary>${e(x.summary)}</summary>\n` +
+      `    <content type="html">${e(x.contentHtml)}</content>\n` +
+      `  </entry>`,
+  )
+  return (
+    `<?xml version="1.0" encoding="utf-8"?>\n` +
+    `<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">\n` +
+    `  <id>${e(f.id)}</id>\n` +
+    `  <title>${e(f.title)}</title>\n` +
+    `  <subtitle>${e(f.subtitle)}</subtitle>\n` +
+    `  <link rel="self" type="application/atom+xml" href="${e(f.selfUrl)}"/>\n` +
+    `  <link rel="alternate" type="text/html" href="${e(f.htmlUrl)}"/>\n` +
+    `  <updated>${f.updated}</updated>\n` +
+    entries.map((x) => `${x}\n`).join('') +
+    `</feed>\n`
+  )
+}
+
+/**
+ * A post's HTML as a feed reader should get it: links and images absolute
+ * (a reader resolves nothing against our origin), and the page's own chrome
+ * gone — heading permalinks, copy buttons and inline icons mean nothing
+ * outside the page and render as clutter.
+ */
+export function feedHtml(html: string, origin: string): string {
+  return html
+    .replace(/<a class="heading-anchor"[^>]*>[\s\S]*?<\/a>/g, '')
+    .replace(/<button class="code-copy"[^>]*>[\s\S]*?<\/button>/g, '')
+    .replace(/<svg\b[\s\S]*?<\/svg>/g, '')
+    .replace(/\b(href|src)="\/(?!\/)/g, `$1="${origin}/`)
+}
+
 export function robotsTxt(origin: string): string {
   return (
     `# Roomler — ${origin}\n` +

@@ -33,21 +33,28 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
 import {
   BASE,
+  BLOG_BASE,
+  BLOG_DESCRIPTION,
+  BLOG_TITLE,
   DOCS_FRONTMATTER_KEYS,
   LEGACY_UNHASHED_ASSETS,
   MAX_DESCRIPTION_CHARS,
   MAX_TITLE_CHARS,
+  MIN_OG_IMAGE_WIDTH,
   MIN_PAGES_PER_TAG_INDEX,
+  MIN_POSTS_PER_TAG_INDEX,
+  POSTS_PER_PAGE,
   SEARCH_INDEX_MAX_GZIP_BYTES,
   SECTIONS,
   SITE_ORIGIN,
   sectionByDir,
 } from './site.ts'
 import { AssetEmitter } from './theme/assets.ts'
+import { renderBlogIndex, renderBlogTag, renderPost } from './theme/blog-layout.ts'
 import {
   optionalBoolean,
   optionalNumber,
@@ -62,7 +69,18 @@ import { imageSize, MAX_IMAGE_BYTES } from './theme/images.ts'
 import { checkLinks } from './theme/links.ts'
 import { createRenderer, escapeHtml, renderMarkdown, type ResolvedImage } from './theme/render.ts'
 import { docsTitle, renderPage, type DocPage, type NavSection, type SiteAssets } from './theme/layout.ts'
-import { newest, robotsTxt, sitemapIndex, urlset, type UrlEntry } from './theme/xml.ts'
+import {
+  docsBacklinks,
+  lastTouched,
+  paginate,
+  postUrl,
+  readingMinutes,
+  readPostMeta,
+  sortPosts,
+  type Post,
+} from './theme/posts.ts'
+import { FEED_URL, fitTitle, type ShellNav } from './theme/shell.ts'
+import { atomFeed, feedHtml, newest, robotsTxt, sitemapIndex, urlset, type UrlEntry } from './theme/xml.ts'
 
 const DOCS_ROOT = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const UI_ROOT = resolve(DOCS_ROOT, '..')
@@ -72,6 +90,10 @@ const THEME_DIR = join(DOCS_ROOT, 'theme')
 const DIST = join(UI_ROOT, 'dist')
 const OUT = join(DIST, 'docs')
 const OUT_ASSETS = join(OUT, 'assets')
+// FR-87 P4: the blog. Published posts only; drafts live in the private promo repo.
+const BLOG_DIR = join(UI_ROOT, 'blog')
+const POSTS_DIR = join(BLOG_DIR, 'posts')
+const OUT_BLOG = join(DIST, 'blog')
 
 /**
  * Where a frontmatter `hero:` / inline image name is looked up, in order.
@@ -88,6 +110,8 @@ const ASSET_SEARCH_PATHS = [
   join(DOCS_ROOT, 'assets'),
   join(UI_ROOT, 'src', 'assets', 'tutorial'),
 ]
+/** A post looks in the blog's own assets first, then the shared artwork. */
+const BLOG_ASSET_SEARCH_PATHS = [join(BLOG_DIR, 'assets'), ...ASSET_SEARCH_PATHS]
 
 const errors: string[] = []
 function fail(msg: string): void {
@@ -148,23 +172,23 @@ function slugToUrl(slug: string): string {
 
 const assets = new AssetEmitter(OUT_ASSETS, `${BASE}/assets`, LEGACY_UNHASHED_ASSETS)
 
-function findAsset(name: string, where: string): string | null {
+function findAsset(name: string, where: string, paths: string[]): string | null {
   const bare = name.replace(/^.*\//, '')
-  for (const dir of ASSET_SEARCH_PATHS) {
+  for (const dir of paths) {
     const candidate = join(dir, bare)
     if (existsSync(candidate)) return candidate
   }
   fail(
     `${where} — asset "${name}" not found. Looked in:\n` +
-      ASSET_SEARCH_PATHS.map((d) => `      ${relative(REPO_ROOT, d)}`).join('\n'),
+      paths.map((d) => `      ${relative(REPO_ROOT, d).split(sep).join('/')}`).join('\n'),
   )
   return null
 }
 
 /** A hero or markdown image: found, size-checked, measured, and published
  *  under its hashed name. Null after reporting why it cannot be. */
-function publishImage(name: string, where: string): ResolvedImage | null {
-  const file = findAsset(name, where)
+function publishImage(name: string, where: string, paths = ASSET_SEARCH_PATHS): ResolvedImage | null {
+  const file = findAsset(name, where, paths)
   if (!file) return null
   const bytes = readFileSync(file)
   if (bytes.length > MAX_IMAGE_BYTES) {
@@ -207,7 +231,7 @@ interface IndexRecord {
 
 /** Split rendered HTML at h2 boundaries so search results deep-link to the
  *  right part of a long page instead of dumping the reader at the top. */
-function sectionChunks(page: DocPage): Array<{ heading: string; anchor: string; text: string }> {
+function sectionChunks(page: { html: string; description: string }): Array<{ heading: string; anchor: string; text: string }> {
   const parts: Array<{ heading: string; anchor: string; text: string }> = []
   const re = /<h2[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/h2>/g
   const marks: Array<{ idx: number; end: number; slug: string; text: string }> = []
@@ -408,6 +432,50 @@ function makeNotFoundPage(nav: NavSection[]): DocPage {
   }
 }
 
+// ── the blog (FR-87 P4) ─────────────────────────────────────────────────
+
+/** A post, rendered and checked; null after reporting why it cannot be. */
+function loadPost(file: string, now: Date): Post | null {
+  const rel = relative(REPO_ROOT, file).split(sep).join('/')
+  const { data, body } = parseFrontmatter(readFileSync(file, 'utf8'), rel)
+  const slug = basename(file, '.md')
+  const { meta, errors: metaErrors } = readPostMeta(data, slug, rel, now)
+  for (const e of metaErrors) fail(e)
+  if (!meta) return null
+
+  const { html, headings } = renderMarkdown(md, body, rel, {
+    resolveImage: (src) => publishImage(src, rel, BLOG_ASSET_SEARCH_PATHS),
+    fail,
+  })
+  const heroImage = meta.hero ? publishImage(meta.hero, rel, BLOG_ASSET_SEARCH_PATHS) : undefined
+  if (heroImage === null) return null
+
+  // The share image: `ogImage`, else the hero when it is raster. That one of
+  // them exists and is raster is `readPostMeta`'s contract; its WIDTH needs
+  // the file, so it is checked here.
+  const ogName = meta.ogImage ?? meta.hero!
+  const og = ogName === meta.hero ? heroImage : publishImage(ogName, rel, BLOG_ASSET_SEARCH_PATHS)
+  if (!og) return null
+  if (og.width < MIN_OG_IMAGE_WIDTH) {
+    fail(`${rel} — the share image "${ogName}" is ${og.width} px wide; Google and social platforms want at least ${MIN_OG_IMAGE_WIDTH}`)
+    return null
+  }
+
+  const plain = stripTags(html)
+  return {
+    ...meta,
+    url: postUrl(slug),
+    outFile: `${slug}/index.html`,
+    sourceFile: rel,
+    heroImage,
+    og: { url: `${SITE_ORIGIN}${og.url}`, width: og.width, height: og.height, alt: (meta.ogImageAlt ?? meta.heroAlt)! },
+    html,
+    headings,
+    plain,
+    readingMinutes: readingMinutes(plain),
+  }
+}
+
 // ── output ──────────────────────────────────────────────────────────────
 
 function write(file: string, contents: string | Buffer): void {
@@ -512,18 +580,63 @@ function main(): void {
     }
   }
 
+  // ── the blog (FR-87 P4). No posts ⇒ no /blog output, no Blog links, no
+  // feed, no sitemap entry: the site is exactly what it was without one.
+  const now = new Date()
+  const postFiles = existsSync(POSTS_DIR)
+    ? readdirSync(POSTS_DIR)
+        .filter((f) => f.endsWith('.md'))
+        .sort()
+        .map((f) => join(POSTS_DIR, f))
+    : []
+  const posts = sortPosts(
+    postFiles
+      .map((f) => {
+        try {
+          return loadPost(f, now)
+        } catch (err) {
+          fail(err instanceof Error ? err.message : String(err))
+          return null
+        }
+      })
+      .filter((p): p is Post => p !== null),
+  )
+  const hasBlog = posts.length > 0
+  for (const p of posts) {
+    if (!p.seoTitle && fitTitle([`${p.title} — ${BLOG_TITLE}`, p.title]) === null) {
+      fail(`${p.sourceFile} — title "${p.title}" is ${p.title.length} chars, over ${MAX_TITLE_CHARS}; add a \`seoTitle\` (the H1 keeps the full title)`)
+    }
+  }
+  const postsByTag = new Map<string, Post[]>()
+  for (const p of posts) for (const t of p.tags) postsByTag.set(t, [...(postsByTag.get(t) ?? []), p])
+  const blogTagIndexed = new Set([...postsByTag].filter(([, ps]) => ps.length >= MIN_POSTS_PER_TAG_INDEX).map(([t]) => t))
+
   const linkErrors = checkLinks(
-    renderable.map((p) => ({
-      id: idOf(p),
-      url: p.url,
-      html: p.html,
-      anchors: new Set(p.headings.map((h) => h.slug)),
-    })),
+    [
+      ...renderable.map((p) => ({
+        id: idOf(p),
+        url: p.url,
+        html: p.html,
+        anchors: new Set(p.headings.map((h) => h.slug)),
+      })),
+      ...posts.map((p) => ({ id: p.sourceFile, url: p.url, html: p.html, anchors: new Set(p.headings.map((h) => h.slug)) })),
+    ],
     // Other internal links point at the SPA (/landing, /register …); this
     // generator does not own those routes, so it cannot verify them.
-    (path) => path.startsWith(`${BASE}/`),
+    (path) => path.startsWith(`${BASE}/`) || path.startsWith(`${BLOG_BASE}/`),
   )
   for (const e of linkErrors) fail(e)
+
+  // A post's `related:` pages are listed as cards, so each must exist.
+  const pagesByUrl = new Map<string, { url: string; title: string; description: string }>(
+    [...renderable, ...posts].map((p) => [p.url, { url: p.url, title: p.title, description: p.description }]),
+  )
+  for (const p of posts) {
+    for (const r of p.related) {
+      const url = r.endsWith('/') ? r : `${r}/`
+      if (!pagesByUrl.has(url)) fail(`${p.sourceFile} — related "${r}" is not a page this site generates`)
+    }
+  }
 
   if (errors.length) {
     console.error(`\n[docs] BUILD FAILED — ${errors.length} problem(s):\n`)
@@ -562,6 +675,15 @@ function main(): void {
       })
     }
   }
+  // Posts join the same index, grouped under "Blog" in the results.
+  for (const post of posts) {
+    const pi = idxPages.length
+    idxPages.push({ u: post.url, t: post.title, s: 'Blog' })
+    for (const chunk of sectionChunks(post)) {
+      if (!chunk.text && !chunk.heading) continue
+      records.push({ p: pi, h: chunk.heading, a: chunk.anchor, x: chunk.text.slice(0, 420), g: post.tags })
+    }
+  }
   const indexJson = JSON.stringify({ p: idxPages, r: records })
   const gz = gzipSync(Buffer.from(indexJson)).length
   if (gz > SEARCH_INDEX_MAX_GZIP_BYTES) {
@@ -580,6 +702,8 @@ function main(): void {
     search: assets.publishFile(join(THEME_DIR, 'search.js')),
     osPreference: assets.publishFile(join(THEME_DIR, 'os-preference.js')),
     searchIndex: assets.publishBytes('search-index.json', indexJson),
+    // Published only with a post, so a site without one ships the same bytes.
+    blogCss: hasBlog ? assets.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
   }
 
   // Reading order for prev/next is the sidebar order: sections in declared
@@ -592,6 +716,8 @@ function main(): void {
     }),
   ]
 
+  const site: ShellNav = { current: 'docs', hasBlog }
+  const backlinks = docsBacklinks(posts, BASE)
   for (const page of renderable) {
     const i = flow.indexOf(page)
     const html = renderPage(
@@ -599,6 +725,8 @@ function main(): void {
         nav,
         page,
         assets: siteAssets,
+        site,
+        onTheBlog: backlinks.get(page.url)?.map((p) => ({ url: p.url, title: p.title })),
         prev: i > 0 ? flow[i - 1] : undefined,
         next: i >= 0 && i < flow.length - 1 ? flow[i + 1] : undefined,
       },
@@ -606,7 +734,54 @@ function main(): void {
     )
     write(join(OUT, page.outFile), html)
   }
-  write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets }, tagIndexed))
+  write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets, site }, tagIndexed))
+
+  // The blog. Cleared first, so a post removed since the last build does
+  // not survive as a stale page.
+  rmSync(OUT_BLOG, { recursive: true, force: true })
+  const blogUrls: UrlEntry[] = []
+  if (hasBlog) {
+    const ctx = { assets: siteAssets, nav: { current: 'blog', hasBlog } as ShellNav, tagIndexed: blogTagIndexed }
+    for (const [i, post] of posts.entries()) {
+      const related = post.related.map((r) => pagesByUrl.get(r.endsWith('/') ? r : `${r}/`)!).filter(Boolean)
+      write(join(OUT_BLOG, post.outFile), renderPost({ ...ctx, post, newer: posts[i - 1], older: posts[i + 1], related }))
+    }
+    const pages = paginate(posts, POSTS_PER_PAGE)
+    for (const [i, pagePosts] of pages.entries()) {
+      const out = i === 0 ? join(OUT_BLOG, 'index.html') : join(OUT_BLOG, 'page', String(i + 1), 'index.html')
+      write(out, renderBlogIndex({ ...ctx, posts: pagePosts, pageNo: i + 1, pages: pages.length }))
+    }
+    for (const tag of blogTagIndexed) {
+      write(join(OUT_BLOG, 'tags', tag, 'index.html'), renderBlogTag({ ...ctx, tag, posts: postsByTag.get(tag)! }))
+    }
+
+    const newestPost = posts.map(lastTouched).sort((a, b) => Date.parse(b) - Date.parse(a))[0]!
+    write(
+      join(OUT_BLOG, 'feed.xml'),
+      atomFeed({
+        id: `${SITE_ORIGIN}${BLOG_BASE}/`,
+        selfUrl: `${SITE_ORIGIN}${FEED_URL}`,
+        htmlUrl: `${SITE_ORIGIN}${BLOG_BASE}/`,
+        title: BLOG_TITLE,
+        subtitle: BLOG_DESCRIPTION,
+        updated: newestPost,
+        entries: posts.map((p) => ({
+          id: `${SITE_ORIGIN}${p.url}`,
+          url: `${SITE_ORIGIN}${p.url}`,
+          title: p.title,
+          summary: p.description,
+          contentHtml: feedHtml(p.html, SITE_ORIGIN),
+          published: p.date,
+          updated: lastTouched(p),
+          author: { name: p.author.name, uri: p.author.url },
+          tags: p.tags,
+        })),
+      }),
+    )
+
+    blogUrls.push({ loc: `${SITE_ORIGIN}${BLOG_BASE}/`, lastmod: newestPost.slice(0, 10) })
+    for (const p of posts) blogUrls.push({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: lastTouched(p).slice(0, 10) })
+  }
 
   // Every hashed file planned above — theme, search index, heroes, images.
   assets.flush()
@@ -646,10 +821,13 @@ function main(): void {
   // Console reports each on its own. The blog adds `sitemap-blog.xml`.
   const docsUrls = docsUrlEntries(allPages)
   write(join(DIST, 'sitemap-docs.xml'), urlset(docsUrls))
-  write(
-    join(DIST, 'sitemap.xml'),
-    sitemapIndex([{ loc: `${SITE_ORIGIN}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]),
-  )
+  const children: UrlEntry[] = [{ loc: `${SITE_ORIGIN}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]
+  rmSync(join(DIST, 'sitemap-blog.xml'), { force: true })
+  if (hasBlog) {
+    write(join(DIST, 'sitemap-blog.xml'), urlset(blogUrls))
+    children.push({ loc: `${SITE_ORIGIN}/sitemap-blog.xml`, lastmod: newest(blogUrls) })
+  }
+  write(join(DIST, 'sitemap.xml'), sitemapIndex(children))
   write(join(DIST, 'robots.txt'), robotsTxt(SITE_ORIGIN))
 
   const ms = Date.now() - t0
@@ -661,7 +839,7 @@ function main(): void {
       ? `dates: none (${dates.note})`
       : `dates: ${dates.source}, ${dated} of ${allPages.length} pages`
   console.log(
-    `[docs] ${renderable.length} pages · ${records.length} search records · ` +
+    `[docs] ${renderable.length} pages · ${posts.length} blog post${posts.length === 1 ? '' : 's'} · ${records.length} search records · ` +
       `index ${(gz / 1024).toFixed(1)} KB gz · ${tagPages.length} tag indexes · ` +
       `${assets.names().length} assets · ${dateNote} · ${ms} ms`,
   )

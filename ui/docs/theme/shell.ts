@@ -10,7 +10,7 @@
  * `<title>` that fits, a real description, an ABSOLUTE canonical, OG/Twitter
  * tags, robots directives and one JSON-LD graph.
  */
-import { ANALYTICS, BASE, MAX_TITLE_CHARS, OG_IMAGE, OG_IMAGE_META, SITE_NAME, SITE_ORIGIN } from '../site.ts'
+import { ANALYTICS, BASE, BLOG_BASE, BLOG_TITLE, MAX_TITLE_CHARS, OG_IMAGE, OG_IMAGE_META, SITE_NAME, SITE_ORIGIN } from '../site.ts'
 import { icon } from './icons.ts'
 import { escapeHtml } from './render.ts'
 import { jsonLdScript } from './structured.ts'
@@ -22,6 +22,9 @@ export interface SiteAssets {
   search: string
   osPreference: string
   searchIndex: string
+  /** `blog.css`; empty until a post exists, and then linked by every page
+   *  that shows blog furniture. */
+  blogCss?: string
 }
 
 export interface OgImage {
@@ -34,6 +37,21 @@ export interface OgImage {
 
 export const DEFAULT_OG_IMAGE: OgImage = { url: `${SITE_ORIGIN}${OG_IMAGE}`, ...OG_IMAGE_META }
 
+/**
+ * Where a page sits, for the shared chrome. `hasBlog` is false until the
+ * first post exists, and then NOTHING blog-shaped renders — no Blog link, no
+ * RSS link, no feed `<link>` — so an empty `ui/blog/posts/` leaves the site
+ * exactly as it was (FR-87 P4's kill switch).
+ */
+export interface ShellNav {
+  current: 'docs' | 'blog'
+  hasBlog: boolean
+}
+
+export const DOCS_NAV: ShellNav = { current: 'docs', hasBlog: false }
+
+export const FEED_URL = `${BLOG_BASE}/feed.xml`
+
 export interface HeadInput {
   /** The whole `<title>`, already fitted (see `fitTitle`). */
   title: string
@@ -42,11 +60,17 @@ export interface HeadInput {
   canonical?: string
   noindex: boolean
   og: { type: 'website' | 'article'; title: string; image?: OgImage }
-  /** `article:*` properties, on leaves only. */
-  article?: { published?: string; modified?: string; tags: string[] }
+  /** `article:*` properties, on leaves only. `author` is a profile URL. */
+  article?: { published?: string; modified?: string; tags: string[]; author?: string }
   /** The page's JSON-LD graph; absent on the 404 page. */
   jsonLd?: unknown
   assets: SiteAssets
+  /** Advertise the blog's Atom feed and load `blog.css` (every page, once a
+   *  post exists). */
+  feed?: boolean
+  /** `rel="prev"` / `rel="next"` on a paginated listing. */
+  prevUrl?: string
+  nextUrl?: string
 }
 
 /** The first candidate that fits the title limit, or null when none does. */
@@ -77,6 +101,7 @@ export function renderHead(h: HeadInput): string {
     `<meta property="og:image:alt" content="${escapeHtml(image.alt)}">`,
     a?.published ? `<meta property="article:published_time" content="${a.published}">` : '',
     a?.modified ? `<meta property="article:modified_time" content="${a.modified}">` : '',
+    a?.author ? `<meta property="article:author" content="${escapeHtml(a.author)}">` : '',
     ...(a?.tags ?? []).map((t) => `<meta property="article:tag" content="${escapeHtml(t)}">`),
     '<meta name="twitter:card" content="summary_large_image">',
     `<meta name="twitter:title" content="${escapeHtml(h.og.title)}">`,
@@ -85,7 +110,11 @@ export function renderHead(h: HeadInput): string {
     `<meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">`,
     '<meta name="theme-color" content="#009688">',
     '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
+    h.feed ? `<link rel="alternate" type="application/atom+xml" title="${BLOG_TITLE}" href="${FEED_URL}">` : '',
+    h.prevUrl ? `<link rel="prev" href="${h.prevUrl}">` : '',
+    h.nextUrl ? `<link rel="next" href="${h.nextUrl}">` : '',
     `<link rel="stylesheet" href="${h.assets.css}">`,
+    h.feed && h.assets.blogCss ? `<link rel="stylesheet" href="${h.assets.blogCss}">` : '',
     `<script src="${h.assets.osPreference}"></script>`,
     // The same first-party script the SPA loads; `defer`, so it never holds
     // up the page. `ANALYTICS = null` in site.ts turns it off.
@@ -96,16 +125,22 @@ export function renderHead(h: HeadInput): string {
     .join('\n')
 }
 
-export function renderTopbar(): string {
+export function renderTopbar(nav: ShellNav = DOCS_NAV): string {
+  const blog = nav.current === 'blog'
+  const here = (on: boolean) => (on ? ' aria-current="page"' : '')
+  // The burger opens the docs sidebar; a blog page has none to open.
+  const burger = blog
+    ? ''
+    : `<button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>`
   return `<header class="topbar">
   <div class="topbar__inner">
-    <a class="brand" href="${BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">Docs</span></a>
-    <button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>
-    <button class="search-open" type="button" data-search-open aria-label="Search the documentation">
+    <a class="brand" href="${blog ? BLOG_BASE : BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">${blog ? 'Blog' : 'Docs'}</span></a>
+    ${burger}
+    <button class="search-open" type="button" data-search-open aria-label="${searchLabel(nav)}">
       ${icon('search', { size: 17 })}<span>Search</span><kbd>/</kbd>
     </button>
     <nav class="topbar__links" aria-label="Site">
-      <a href="/landing">Product</a>
+      ${nav.hasBlog ? `<a href="${BASE}/"${here(!blog)}>Docs</a>\n      <a href="${BLOG_BASE}/"${here(blog)}>Blog</a>\n      ` : ''}<a href="/landing">Product</a>
       <a href="/pricing">Pricing</a>
       <a href="https://github.com/gjovanov/roomler-ai" target="_blank" rel="noopener noreferrer">GitHub</a>
       <a class="btn btn--primary" href="/register">Get started free</a>
@@ -114,7 +149,12 @@ export function renderTopbar(): string {
 </header>`
 }
 
-export function renderFooter(): string {
+function searchLabel(nav: ShellNav): string {
+  return nav.hasBlog ? 'Search the documentation and the blog' : 'Search the documentation'
+}
+
+export function renderFooter(nav: ShellNav = DOCS_NAV): string {
+  const blogLinks = nav.hasBlog ? `\n      <a href="${BLOG_BASE}/">Blog</a>\n      <a href="${FEED_URL}">RSS feed</a>` : ''
   return `<footer class="site-footer">
   <div class="site-footer__inner">
     <div>
@@ -132,7 +172,7 @@ export function renderFooter(): string {
       <p class="site-footer__head">Product</p>
       <a href="/landing">Overview</a>
       <a href="/pricing">Pricing</a>
-      <a href="${BASE}/start/self-hosting/">Self-hosting</a>
+      <a href="${BASE}/start/self-hosting/">Self-hosting</a>${blogLinks}
     </div>
     <div>
       <p class="site-footer__head">Legal</p>
@@ -144,11 +184,11 @@ export function renderFooter(): string {
 </footer>`
 }
 
-export function renderSearchDialog(assets: SiteAssets): string {
-  return `<dialog class="search-dialog" data-search-dialog data-search-index="${assets.searchIndex}" aria-label="Search documentation">
+export function renderSearchDialog(assets: SiteAssets, nav: ShellNav = DOCS_NAV): string {
+  return `<dialog class="search-dialog" data-search-dialog data-search-index="${assets.searchIndex}" aria-label="${nav.hasBlog ? searchLabel(nav) : 'Search documentation'}">
   <form class="search-form" method="dialog" role="search">
     ${icon('search', { size: 18, cls: 'search-form__icon' })}
-    <input type="search" class="search-input" data-search-input placeholder="Search the docs…" autocomplete="off" spellcheck="false" aria-label="Search query">
+    <input type="search" class="search-input" data-search-input placeholder="${nav.hasBlog ? 'Search the docs and the blog…' : 'Search the docs…'}" autocomplete="off" spellcheck="false" aria-label="Search query">
     <button type="button" class="search-close" data-search-close aria-label="Close search">${icon('close', { size: 18 })}</button>
   </form>
   <div class="search-results" data-search-results aria-live="polite"></div>
