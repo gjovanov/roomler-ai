@@ -170,9 +170,9 @@ homepage, following the `enrollCommands.ts` pattern.
 
 ```nginx
 absolute_redirect off;                               # Location: /docs/ — never http://
-location /docs/ { expires -1; try_files $uri $uri/ =404; error_page 404 /docs/404.html; }
-location /blog/ { expires -1; try_files $uri $uri/ =404; error_page 404 /docs/404.html; }
-location = /blog/feed.xml { types { } default_type application/atom+xml; expires -1; try_files $uri =404; }
+location /docs/ { expires -1; error_page 404 /docs/404.html; }
+location /blog/ { expires -1; error_page 404 /docs/404.html; }
+location = /blog/feed.xml { types { } default_type application/atom+xml; expires -1; }
 map $cookie_access_token $root_doc { "" /home/index.html; default /index.html; }   # http level
 location = / { expires -1; try_files $root_doc =404; }
 location = /landing { return 301 /; }
@@ -182,8 +182,12 @@ location = /pricing { return 301 /#pricing; }
 - **`expires` only, never `add_header`, in these locations.** `expires` is inherited
   separately from `add_header`, so the server-level CSP, HSTS, XFO, XCTO, Referrer-Policy and
   Permissions-Policy survive. The smoke test proves it with a header diff against `/`.
-- `$uri/` turns a slashless directory into a 301 to the slash form, which `absolute_redirect
-  off` keeps relative.
+- **No `try_files` in `/docs/` or `/blog/`.** nginx's static handler then answers a
+  slashless directory with a 301 to the slash form, which `absolute_redirect off` keeps
+  relative, and a missing file with a real 404. FR-60's `try_files $uri $uri/index.html =404`
+  is what made `/docs/start` a 200 duplicate: its `$uri/index.html` test matches the file, so
+  nothing ever redirects. (This section's first draft, `try_files $uri $uri/ =404`, does 301,
+  measured in `nginx:stable`; it adds nothing, so P1 ships without it.)
 - **The session cookie decides the homepage.** The session is the HttpOnly `access_token`
   cookie (`crates/api/src/routes/auth.rs:247`). No cookie (guests and every crawler) gets the
   static homepage; a cookie gets the SPA, whose router behaves as today. A stale or expired
