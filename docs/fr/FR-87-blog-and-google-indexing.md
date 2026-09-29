@@ -1,7 +1,8 @@
 # FR-87: A blog at roomler.ai/blog, a crawlable homepage, and a site Google can index
 
-**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** proposed
-2026-09-29 (claimed; nothing built) · **Owner:** web / public site · **Builds on:**
+**Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** in progress:
+P1–P5 live since 2026-09-29; P6 and P7 merged, live once promoted; Search Console and Bing owed
+by the operator (§4h) · **Owner:** web / public site · **Builds on:**
 [FR-60](FR-60-public-docs-site.md) (the static docs generator)
 
 ## 1. Goal
@@ -88,8 +89,9 @@ New modules under `ui/docs/`:
 | `theme/home-layout.ts` | the homepage renderer |
 | `theme/home.js` | the homepage's progressive enhancement |
 
-`ui/src/utils/plans.ts` is a zero-import plan table shared by `LandingView.vue` and the
-homepage, following the `enrollCommands.ts` pattern.
+`ui/src/utils/landing.ts` (planned as `plans.ts`; P6 moved all the landing copy into it, not
+only the plan table) is a zero-import module shared by `LandingView.vue` and the homepage,
+following the `enrollCommands.ts` pattern.
 
 ### 4b. Dates: a git manifest, a front-matter override, and no date when unknown
 
@@ -293,7 +295,20 @@ the build.
 **Agent:**
 - **IndexNow:** a key file in `ui/public/`, and a POST of new or changed URLs after the
   health watch in `promote.yml`, gated on `vars.INDEXNOW_ENABLED`. Failure only warns, and no
-  server code is involved.
+  server code is involved. As built (P7), `scripts/indexnow.sh` does three things:
+  - **`snapshot`** reads every child of the *served* `/sitemap.xml` into `loc⇥lastmod`. It
+    runs before the bump and again after the health watch, when both pods serve the new
+    image.
+  - **`changed`** is the difference: the URLs that are new, or carry another `lastmod`. The
+    lastmods come from git (P2), so a theme-only roll re-dates nothing and submits nothing,
+    and an undated URL (`/`, generated listings) is submitted once, when it first appears. No
+    baseline means nothing is submitted, never everything.
+  - **`submit`** first fetches `/<key>.txt` from the site and refuses when it is not exactly
+    the key; a missing file would otherwise answer with the SPA shell, and every engine would
+    reject the POST. It then posts to `api.indexnow.org` (200/202 accepted; 403, 422 and 429
+    named in the warning). The key's single source is the file name: the promote job
+    sparse-checks-out `scripts/indexnow.sh` and `ui/public/*.txt`, nothing else. The smoke
+    also checks the file is served as committed.
 - **Validation:** Rich Results Test and Schema Markup Validator in the browser, the W3C Feed
   Validator, and PageSpeed Insights (mobile and desktop) through its API.
 - **What not to expect or use:**
@@ -401,6 +416,8 @@ the build.
 | 2026-09-29 | P6 build in `nginx:stable` + P6's `files/nginx-pod.conf` | the same smoke | **all 20 pass**: the static homepage without a cookie, the SPA with one, the same security headers on both, `no-cache`, `/home/` 404, `/landing` → `/`, `/pricing` → `/#pricing`, and `/`'s 8 assets hashed and loading |
 | 2026-09-29 | the same, negative controls on a second container (a scratch copy of the conf; each mutation shown applied inside the container and passing `nginx -t`) | 8 mutations | each turns its named checks red, and the unmutated conf passes on the same container: the map's values swapped; the map keyed on `refresh_token`; `internal` dropped (`/home/` 200); `expires` dropped; **`add_header Cache-Control` in place of `expires`, which strips every security header from both branches**; `absolute_redirect on`; `/pricing` without its fragment; the `/landing` block removed |
 | 2026-09-29 | `ui/docs/__tests__/home.spec.ts` (24 tests), negative controls | 6 mutations of `home.js` | each turns exactly its test red: the hint key drifting from `session.ts`'s; no `return` after the hand-off; a hand-off to `/` (the loop); the newsletter failing closed; features written as markup; the subscription dropping `source`. The first run also caught a real defect: the homepage description was 161 characters, one over the limit the build enforces on every docs page, and nothing checked the homepage's |
+| 2026-09-29 | `scripts/indexnow.sh`, locally | `snapshot` · `changed` · `submit` | production's sitemaps (67 URLs) against the P6 build's (68): `changed` is exactly `https://roomler.ai/`; identical snapshots → nothing; no baseline → a warning and nothing. `submit` against a stand-in endpoint: the key file not served (the SPA shell answered) → refused, nothing posted; accepted → 3 URLs (a duplicate and a foreign host dropped; a quote and a backslash JSON-escaped, the body parsed as JSON); 422 and an unreachable endpoint → a warning and a non-zero exit, which the promote step's `continue-on-error` absorbs |
+| 2026-09-29 | the smoke's key-file check (P7) | served · removed · production | the P6 build with the key file: ✓; without it: ✗ ("engines would reject every submission"); **production: ✗**, together with P6's six. (A first production run also failed `/docs`'s Location once, on a slow link from this host, the only such failure in six runs; the rerun, 49 s, passed it, and no promote had run in between) |
 
 ## 10. Related
 
