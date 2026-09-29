@@ -55,9 +55,11 @@ itself on the affected run's page. Baseline when the program started: releases t
 - **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
   crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
   and the next run restores the previous generation as a prefix match. A version bump
-  and an edit to `ci.yml` rotate nothing (wave 15; the open decision on new CI steps
-  says what that costs). apt packages are cached via `cache-apt-pkgs-action` (mirror
-  out of the hot path). Since wave 14 the Rust work runs as **five parallel lanes**
+  rotates nothing (wave 15). Since wave 16 a job's own changed or added steps rotate
+  that job's key too: `.github/actions/cargo-cache-salt` writes a comment-only
+  `.cargo/config.toml` holding a hash of the job's definition, which the lockfile part
+  of the key covers, so the restore still falls back to the previous generation. apt
+  packages are cached via `cache-apt-pkgs-action` (mirror out of the hot path). Since wave 14 the Rust work runs as **five parallel lanes**
   (`rust-lint`, `rust-unit`, `rust-agent`, `rust-recorder`, `rust-recorder-audio`),
   each with its own cache family and the same system packages from one composite
   (`.github/actions/ci-linux-system-deps`); an aggregate job keeps the name
@@ -89,6 +91,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 13 | 08-26 | **Seeds → release assets** (+ shakeout: mktemp for tar paths, dispatcher watches composites, `contents: write` on the OIDC-narrowed Windows jobs) | #722, #725, #726, #728 |
 | 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
 | 15 | 09-28 | Actions-cache storage limit 10 → 20 GB (the operator, paid); the dead `key: wf-…` inputs removed, and the comments that relied on them corrected | #1772 |
+| 16 | 09-29 | `cargo-cache-salt`: each of the 14 PR-facing Swatinem jobs (`ci.yml`, `integration-tests.yml`, `installer-smoke.yml`) salts its key with a hash of its own definition, so a new step's dependency builds reach the cache on the next master run (root cause 4, for real this time) | #PR |
 
 ## Acceptance criteria
 
@@ -109,6 +112,11 @@ itself on the affected run's page. Baseline when the program started: releases t
       of the janitor's 22 sweeps in that window deleted one as `pr-cargo`, so none was
       ever written, not merely swept. Each of the 12 master families held exactly one
       generation; the janitor had retired 7 superseded ones
+- [ ] A changed or added CI step's dependency builds reach its job's cargo cache on the
+      next master run, without a cold run (wave 16). Field: the first master run after
+      the salt lands saves a new generation for every salted job from a prefix restore
+      (`full match: false`, not `No cache found`), and a later edit to one job's steps
+      rotates that job's key alone
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
@@ -139,8 +147,11 @@ itself on the affected run's page. Baseline when the program started: releases t
   `recorder` + `recorder-audio` sharing one) stays in reserve. The registry copy each
   family carries is only ~167 MB for the whole lockfile, so deduplicating it is not
   the lever.
-- **A new CI step's dependency builds stay out of the cache until the next key
-  rotation** (wave 15 finding; root cause 4 is open again). Wave 10 meant a `ci.yml`
+- **Resolved 2026-09-29 by wave 16, field check owed: a new CI step's dependency builds
+  stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
+  open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
+  the calling job's own definition rather than the whole of `ci.yml`, so an edit to
+  one job rotates that job alone. Wave 10 meant a `ci.yml`
   edit to rotate the key, but rust-cache ignores `key` when `shared-key` is set, so the
   key moves only with a member `Cargo.toml`, a third-party `Cargo.lock` change or the
   toolchain. Master saw such a change on 11 of the 30 days to 09-28, with one gap of
@@ -228,3 +239,21 @@ itself on the affected run's page. Baseline when the program started: releases t
   `ci.yml` edit rotates nothing, but #1744 also changed a manifest and its key did
   rotate. The dead inputs are removed (wave 15), and the gap they were meant to close
   is an open decision again.
+- 2026-09-29: **Wave 16, the salt, before the field run.** Mechanism: the lint lane's
+  own log lists `crates/vendored/wintun-bindings/.cargo/config.toml` under "Lockfiles
+  considered", so a nested `.cargo/config.toml` is hashed; one written under
+  `ci-cache-salt/` sits where cargo never runs from. A prefix restore stays warm:
+  rust-cache's pre-clean on a partial match drops at most one week-old entry per
+  directory (`rmExcept` returns inside its loop). The action's real `run:` script,
+  executed under GitHub's `bash --noprofile --norc -eo pipefail` against edited copies
+  of `ci.yml`: all 11 jobs get distinct salts; a comment, blank-line or
+  trailing-space edit, a workflow-level `env:` edit, a new job and a CRLF checkout
+  rotate nothing; an edited step in `rust-recorder` rotates only `rust-recorder`; a
+  step appended to `rust-unit`, or to `profiles` (the last job, which runs to EOF),
+  rotates only that job. An unknown job id warns and salts the whole file; a missing
+  workflow file warns and writes nothing. A wrong turn, recorded: the first "appended
+  step" check targeted `profiles`, inserted before the next job and so changed
+  nothing, and read as a salt failure until the check was made to prove its edit
+  applied. The awk also reads to EOF instead of `exit`ing at the next job, because an
+  early exit can SIGPIPE the upstream `tr`, which `pipefail` turns into a failed step.
+  macOS `macos-mesh-test.yml` (manual dispatch only) is not salted.
