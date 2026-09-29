@@ -134,17 +134,7 @@ pub async fn oauth_callback(
     );
 
     let frontend_url = state.settings.oauth.base_url.replace(":5001", ":5000"); // API → UI port
-
-    // The token goes in the FRAGMENT, not the query. A fragment is never sent
-    // to a server, so it cannot land in an nginx access log or a `Referer` —
-    // whereas `?token=<7-day JWT>` was written verbatim into the log of every
-    // hop that served this redirect. The SPA reads `location.hash` and clears
-    // it immediately; it still accepts the old query form for one deploy so a
-    // cached older bundle keeps working.
-    let redirect_url = format!(
-        "{}/oauth/callback#token={}",
-        frontend_url, tokens.access_token
-    );
+    let redirect_url = callback_redirect(&frontend_url);
 
     let mut headers = HeaderMap::new();
     headers.append(header::SET_COOKIE, cookie.parse().unwrap());
@@ -164,4 +154,31 @@ pub async fn oauth_callback(
     headers.insert(header::LOCATION, redirect_url.parse().unwrap());
 
     Ok((StatusCode::FOUND, headers).into_response())
+}
+
+/// Where the OAuth callback sends the browser once the session cookies are set.
+///
+/// It carries no credential. The access token used to ride in the fragment
+/// (`#token=<JWT>`), on the reasoning that a fragment never reaches a server.
+/// It did reach one: the site's analytics script loads before the SPA and
+/// reports `location.href`, fragment included, and the analytics server stores
+/// the URL as sent, so every OAuth sign-in wrote a 7-day access token into the
+/// analytics database. The session arrives as HttpOnly cookies on this very
+/// redirect, and `OAuthCallbackView` ignores the fragment, so nothing needs it.
+fn callback_redirect(frontend_url: &str) -> String {
+    format!("{frontend_url}/oauth/callback")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::callback_redirect;
+
+    #[test]
+    fn the_callback_redirect_carries_no_credential() {
+        let url = callback_redirect("https://roomler.ai");
+        assert_eq!(url, "https://roomler.ai/oauth/callback");
+        // A fragment is reported by the page's analytics; a query lands in logs and `Referer`.
+        assert!(!url.contains('#'));
+        assert!(!url.contains('?'));
+    }
 }
