@@ -98,6 +98,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
+
       - name: Rust cache
         # Swatinem prunes workspace-member artifacts + stale registry
         # entries before saving — ~1–1.5 GB instead of the ~4 GB
@@ -133,15 +138,17 @@ jobs:
           # A new lockfile hash restores the newest older generation (the
           # prefix match) and compiles only the delta. A new env hash,
           # shared-key or prefix-key starts the lane cold.
-          # An edit to THIS FILE does NOT rotate it. A `key:` input used to sit
-          # here with `hashFiles(ci.yml)` claiming it did, but rust-cache reads
-          # `key` only when `shared-key` is unset (its src/config.ts, v2.9.2),
-          # so it was ignored. #1728, #1735 (+95 lines) and #1736 each edited
-          # this file on 09-27, and each master run then restored the same key
-          # with a full match and saved nothing. So a new step's dependency
-          # artifacts enter the cache only at the next rotation (or after an
-          # eviction). To force one sooner, change `prefix-key` (one cold
-          # master run); FR-6's open decisions carry the gap and a fix.
+          # A `key:` input used to sit here with `hashFiles(ci.yml)`, claiming
+          # an edit to this file rotated the key. rust-cache reads `key` only
+          # when `shared-key` is unset (its src/config.ts, v2.9.2), so it was
+          # ignored: #1728, #1735 (+95 lines) and #1736 each edited this file
+          # on 09-27, and each master run restored the same key with a full
+          # match and saved nothing, so a new step's dependency builds stayed
+          # out of the cache. Since wave 16 the salt step above does what that
+          # input claimed, per job and without going cold: it writes one of
+          # the `.cargo/config.toml` files the lockfile hash covers, holding a
+          # hash of this job's own definition. A changed or added step here
+          # rotates this key; a comment edit or another job's edit does not.
 
       - name: Check formatting
         run: cargo fmt --check --all
@@ -366,6 +373,11 @@ jobs:
         # clippy: this lane runs neither.
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
+
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
         # saved only from a master push, keyed on Cargo.lock + the env.
@@ -459,6 +471,11 @@ jobs:
         # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
         # clippy: this lane runs neither.
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
@@ -562,6 +579,11 @@ jobs:
         # Same pin as rust-lint (and rust-toolchain.toml). No rustfmt or
         # clippy: this lane runs neither.
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
 
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
@@ -706,6 +728,11 @@ jobs:
         # clippy: this lane runs neither.
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
+
       - name: Rust cache
         # rust-lint's cache step carries the notes: this lane's own family,
         # saved only from a master push, keyed on Cargo.lock + the env.
@@ -790,6 +817,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-overlay-check
@@ -944,6 +975,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -990,6 +1025,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -1051,6 +1090,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -1198,6 +1241,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -1599,6 +1646,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Salt the cargo cache key with this job's definition
+        # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
+        # steps change. After checkout, before the cache; see the action.
+        uses: ./.github/actions/cargo-cache-salt
 
       - name: Rust cache
         continue-on-error: true

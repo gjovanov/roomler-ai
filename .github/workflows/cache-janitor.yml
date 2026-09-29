@@ -45,10 +45,11 @@ name: Cache janitor
 #   - master keeps ONE generation per Swatinem family. A key is
 #     `v0-rust-<family>-<os>-<arch>-<env hash>-<lockfile hash>`, and a new
 #     generation lands whenever a member crate's Cargo.toml or a third-party
-#     Cargo.lock entry changes (several times on a busy day; a version bump
-#     and a ci.yml edit do not rotate it, see ci.yml's `rust-lint` cache
-#     step), so superseded ones would otherwise sit out their 96 h. Restores
-#     never need them: an exact miss falls back to the NEWEST prefix match.
+#     Cargo.lock entry changes, and (since wave 16's cargo-cache-salt) when
+#     the job's own steps change; a version bump rotates nothing (see ci.yml's
+#     `rust-lint` cache step). So superseded ones would otherwise sit out
+#     their 96 h. Restores never need them: an exact miss falls back to the
+#     NEWEST prefix match.
 
 on:
   schedule:
