@@ -2,9 +2,13 @@
 #
 # public-site-smoke.sh — assert how the public site is SERVED (FR-87, #1776).
 #
-#   scripts/public-site-smoke.sh <base-url>
-#   scripts/public-site-smoke.sh http://localhost:8080      # the hosted-image smoke
-#   scripts/public-site-smoke.sh https://roomler.ai         # production, after a roll
+#   scripts/public-site-smoke.sh <base-url> [<repo-dir> [<git-rev>]]
+#   scripts/public-site-smoke.sh http://localhost:8080 .           # the hosted-image smoke
+#   scripts/public-site-smoke.sh https://roomler.ai . <deployed-sha> # production, after a roll
+#
+#   With <repo-dir> (a clone with FULL history), every docs page's sitemap
+#   <lastmod> is also compared with `git log -1 --format=%cs` for its file at
+#   <git-rev> (default HEAD) — the deployed commit, when checking production.
 #
 # WHY THIS EXISTS
 #   The static site (docs, blog, the homepage) is where search engines meet
@@ -14,7 +18,11 @@
 #     - `/docs/x` and `/docs/x/` both answered 200 (duplicate URLs);
 #     - a single `add_header` in an nginx location silently drops every
 #       security header for that location — the one mistake that looks like a
-#       harmless cache tweak in review.
+#       harmless cache tweak in review;
+#     - every page's <lastmod> was the build date, because production builds
+#       have no git history (P2);
+#     - docs.css and search.js were served `immutable` for a year under names
+#       that never changed (P2).
 #   This script checks the SERVED behaviour, so it runs against a real nginx:
 #   the image in CI, production after every promote.
 #
@@ -24,8 +32,10 @@
 set -u
 
 BASE="${1:-}"
-[ -n "$BASE" ] || { echo "usage: $0 <base-url>" >&2; exit 2; }
+[ -n "$BASE" ] || { echo "usage: $0 <base-url> [<repo-dir> [<git-rev>]]" >&2; exit 2; }
 BASE="${BASE%/}"
+REPO="${2:-}"
+REV="${3:-HEAD}"
 
 FAIL=0
 ok()   { printf '  \342\234\223 %s\n' "$1"; }
@@ -55,10 +65,17 @@ for path in /docs /docs/start; do
   fi
 done
 
-# 2. Real 404s, never the SPA shell.
+# 2. Real 404s, never the SPA shell — and the site's own 404 page, which
+#    offers search and the sections, not nginx's bare one.
 for path in /docs/fr87-smoke-missing/ /blog/fr87-smoke-missing/; do
   code="$(status "$BASE$path")"
-  [ "$code" = "404" ] && ok "$path -> 404" || bad "$path -> $code (want 404; a 200 here is a soft 404)"
+  if [ "$code" != "404" ]; then
+    bad "$path -> $code (want 404; a 200 here is a soft 404)"
+  elif curl -ksS -m 15 "$BASE$path" 2>/dev/null | grep -q '<h1 class="page-title">Page not found'; then
+    ok "$path -> 404, the site's 404 page"
+  else
+    bad "$path -> 404, but not the site's 404 page (is dist/docs/404.html missing?)"
+  fi
 done
 
 # 3. HTML is revalidated, so it is never the stale half of a hashed-asset pair.
@@ -98,6 +115,80 @@ elif [ "$blog" = "404" ]; then
   ok "/blog/ -> 404 (no posts published yet; not a soft 404)"
 else
   bad "/blog/ -> $blog (want 200 with posts, or 404 without)"
+fi
+
+# 6. Every asset a page names is content-hashed — the only kind of name for
+#    which nginx's one-year `immutable` is true — and actually loads. Every
+#    image reserves its box (width + height). The og:image is absolute and
+#    keeps a stable name on purpose (the SPA's index.html points at it), so
+#    it is not matched here.
+for path in /docs/ /docs/start/quickstart/; do
+  html="$(curl -ksS -m 20 "$BASE$path" 2>/dev/null)"
+  refs="$(printf '%s' "$html" | grep -oE '(href|src|data-search-index)="/docs/assets/[^"]+"' | sed -E 's/^[^"]+"//; s/"$//' | sort -u)"
+  n="$(printf '%s\n' "$refs" | grep -c .)"
+  plain="$(printf '%s\n' "$refs" | grep -vE '\.[0-9a-f]{10}\.[a-z0-9]+$' | grep . | tr '\n' ' ')"
+  missing=""
+  for r in $refs; do [ "$(status "$BASE$r")" = "200" ] || missing="$missing $r"; done
+  imgs="$(printf '%s' "$html" | grep -oE '<img [^>]*>')"
+  unsized="$(printf '%s\n' "$imgs" | grep . | grep -vE ' width="[0-9]+"' ; printf '%s\n' "$imgs" | grep . | grep -vE ' height="[0-9]+"')"
+  if [ "$n" -lt 3 ]; then
+    bad "$path names only $n /docs/assets/ files (want the theme's css + js + search index at least)"
+  elif [ -n "$plain" ]; then
+    bad "$path names unhashed assets: $plain"
+  elif [ -n "$missing" ]; then
+    bad "$path names assets that do not load:$missing"
+  elif [ -n "$unsized" ]; then
+    bad "$path has an <img> without width and height: $(printf '%s' "$unsized" | head -1)"
+  else
+    ok "$path: $n assets, all content-hashed and loading; $(printf '%s\n' "$imgs" | grep -c .) image(s), all sized"
+  fi
+done
+
+# 7. <lastmod> is when the CONTENT changed, from git — never the build date.
+#    Needs a clone with full history; skipped (and said so) without one.
+if [ -z "$REPO" ]; then
+  echo "  - lastmod vs git: skipped (no <repo-dir> given)"
+elif [ "$(git -C "$REPO" rev-parse --is-shallow-repository 2>/dev/null)" != "false" ]; then
+  bad "lastmod vs git: $REPO is not a clone with full history"
+else
+  # "path lastmod" per <url>, following a sitemap index to its children
+  # (fetched from BASE, whatever origin their <loc> names). "-" = undated.
+  sitemap_pairs() {
+    local body; body="$(curl -ksS -m 20 "$1" 2>/dev/null | tr -d '\r')"
+    if printf '%s' "$body" | grep -q '<sitemapindex'; then
+      for p in $(printf '%s' "$body" | grep -oE '<loc>[^<]+</loc>' | sed -E 's#</?loc>##g; s#^https?://[^/]+##'); do
+        sitemap_pairs "$BASE$p"
+      done
+    else
+      printf '%s\n' "$body" | awk '
+        /<loc>/     { l = $0; sub(/.*<loc>https?:\/\/[^\/]+/, "", l); sub(/<\/loc>.*/, "", l) }
+        /<lastmod>/ { m = $0; sub(/.*<lastmod>/, "", m); sub(/<\/lastmod>.*/, "", m) }
+        /<\/url>/   { print l, (m == "" ? "-" : m); l = ""; m = "" }'
+    fi
+  }
+  SITEMAP="$(sitemap_pairs "$BASE/sitemap.xml")"
+  compared=0; wrong=""
+  while read -r file day; do
+    git -C "$REPO" cat-file -e "$REV:$file" 2>/dev/null || continue            # deleted since
+    git -C "$REPO" show "$REV:$file" | sed -n '2,/^---/p' | grep -q '^updated:' && continue  # overridden
+    rel="${file#ui/docs/content/}"; rel="${rel%.md}"
+    case "$rel" in
+      index) url=/docs/ ;;
+      */index) url="/docs/${rel%/index}/" ;;
+      *) url="/docs/$rel/" ;;
+    esac
+    got="$(printf '%s\n' "$SITEMAP" | awk -v u="$url" '$1 == u { print $2; exit }')"
+    compared=$((compared + 1))
+    [ "$got" = "$day" ] || wrong="$wrong\n      $url: sitemap ${got:-absent}, git $day"
+  done < <(git -C "$REPO" -c core.quotePath=false log "$REV" --format=__C__%cs --name-only -- ui/docs/content \
+             | awk '/^__C__/ { d = substr($0, 6); next } NF && !($0 in s) { s[$0] = 1; print $0, d }')
+  if [ "$compared" -lt 10 ]; then
+    bad "lastmod vs git: only $compared docs files compared (want at least 10)"
+  elif [ -n "$wrong" ]; then
+    bad "lastmod vs git at $REV: $(printf '%b' "$wrong" | grep -c .) of $compared pages differ:$(printf '%b' "$wrong" | head -6)"
+  else
+    ok "lastmod == git (at $REV) for all $compared docs pages"
+  fi
 fi
 
 if [ "$FAIL" = "0" ]; then echo "public-site smoke: all checks passed"; else echo "public-site smoke: FAILED"; fi

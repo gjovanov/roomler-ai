@@ -23,8 +23,19 @@ export const SITE_NAME = 'Roomler'
 export const SITE_TITLE_SUFFIX = 'Roomler Docs'
 
 /** Social card. Lives in the repo already (`docs/assets/social-preview.png`)
- *  and is copied into the output by the build. */
+ *  and is copied into the output by the build.
+ *  ⚠️ The ONE asset that keeps a stable, unhashed name (FR-87): the SPA's
+ *  `ui/index.html` names it as its own og:image. */
 export const OG_IMAGE = `${BASE}/assets/social-preview.png`
+
+/**
+ * FR-87 (#1776) P2: also publish every hashed asset under its old, plain
+ * name (`docs.css`, `search.js`, the heroes), so HTML a browser cached
+ * before P1 made pages revalidate keeps loading its styles and scripts.
+ * One release is enough for that HTML to age out; the phase after the first
+ * promote that carries hashed names sets this to `false`.
+ */
+export const LEGACY_UNHASHED_ASSETS = true
 
 /** Hard ceiling on the search index. Above this the build FAILS rather
  *  than shipping a page-load cost nobody decided to spend. */

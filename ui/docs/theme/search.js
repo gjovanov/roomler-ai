@@ -21,7 +21,6 @@
 ;(function () {
   'use strict'
 
-  var INDEX_URL = '/docs/assets/search-index.json'
   var MAX_RESULTS = 24
   var MAX_PER_PAGE = 3
 
@@ -29,6 +28,10 @@
   var input = document.querySelector('[data-search-input]')
   var resultsEl = document.querySelector('[data-search-results]')
   if (!dialog || !input || !resultsEl) return
+
+  // FR-87: the index has a content-hashed name, so the page says where it is.
+  // The fallback is the pre-hash name, for HTML cached before that change.
+  var INDEX_URL = dialog.getAttribute('data-search-index') || '/docs/assets/search-index.json'
 
   var index = null
   var loading = null

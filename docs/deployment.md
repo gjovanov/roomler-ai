@@ -57,7 +57,7 @@ flowchart LR
     subgraph gha["hosted-image.yml — GitHub Actions"]
         B["docker build<br/>PROFILE=full SAAS=1<br/>registry-backed BuildKit cache<br/><i>buildcache-hosted</i>"]
         L["label check<br/>revision = the commit"]
-        S["smoke boot with Mongo + Redis<br/>/health = all six modules · device route 401 · / 200"]
+        S["smoke boot with Mongo + Redis<br/>/health = all six modules · device route 401 · / 200<br/>public-site smoke: redirects · 404s · headers · hashed assets · lastmod = git"]
         P["push hosted-&lt;date&gt;-&lt;sha7&gt;<br/>move <b>hosted</b> · attest provenance"]
         B --> L --> S --> P
     end
@@ -96,6 +96,10 @@ recipe in `CLAUDE.md` still works — build, push to the build host's own regist
 `newName: registry.roomler.ai/roomler-ai` and `newTag` in the deploy repo. `promote` refuses until
 `newName` is switched back to GHCR. Rehearsed after the switch on 2026-09-05: a warm build of
 master in 9 min 38 s, pushed in 9 s, not deployed.
+⚠️ Run `cd ui && bun docs/dates.ts --write` in the build host's clone **before** `docker build`
+([FR-87](fr/FR-87-blog-and-google-indexing.md)). The image has no git history, so the docs' dates
+come from that manifest; without it the image publishes no dates at all. That is honest, but it
+is a regression from the lane, and `scripts/public-site-smoke.sh <url> .` reports it.
 
 ## Development stack
 

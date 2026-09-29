@@ -41,6 +41,32 @@ export interface RenderResult {
   headings: Heading[]
 }
 
+/** What an image resolves to once the build has published it. */
+export interface ResolvedImage {
+  url: string
+  width: number
+  height: number
+}
+
+/**
+ * The markdown-it `env` for one file. The build supplies the hooks; the unit
+ * tests mostly do not, and then a gate THROWS instead of collecting.
+ */
+export interface RenderEnv {
+  filePath: string
+  /** Publishes a markdown image `src` and returns its URL and intrinsic size,
+   *  or null when it has already reported why it cannot. */
+  resolveImage?: (src: string) => ResolvedImage | null
+  /** Collects a build error, so one run reports every problem in a file. */
+  fail?: (msg: string) => void
+}
+
+function report(env: RenderEnv, msg: string): void {
+  const full = `${env.filePath} — ${msg}`
+  if (env.fail) env.fail(full)
+  else throw new Error(full)
+}
+
 const CALLOUTS = {
   note: { icon: 'info', label: 'Note' },
   tip: { icon: 'tip', label: 'Tip' },
@@ -157,6 +183,34 @@ interface PrePassCtx {
   md: MarkdownIt
   filePath: string
   groupSeq: { n: number }
+  env: RenderEnv
+}
+
+/** An opening code fence: three or more backticks or tildes. */
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/
+const ATX_HEADING = /^ {0,3}(#{1,6})(?:\s|$)/
+
+/**
+ * Tracks whether a line is inside a fenced code block, so the pre-pass never
+ * reads a line of CODE as markup: a `# comment` in a bash sample is not a
+ * heading, and a `:::note` in a sample showing the syntax is not a container.
+ */
+function fenceTracker(): (line: string) => boolean {
+  let open: string | null = null
+  return (line) => {
+    if (open) {
+      const close = FENCE_CLOSE.exec(line)
+      if (close && close[1]![0] === open[0] && close[1]!.length >= open.length) open = null
+      return true
+    }
+    const start = FENCE_OPEN.exec(line)
+    if (start) {
+      open = start[1]!
+      return true
+    }
+    return false
+  }
 }
 
 function parseListItems(body: string): string[] {
@@ -182,7 +236,15 @@ function splitLeadIn(item: string): { title: string; rest: string } {
   return { title: m[1]!, rest: m[2]!.trim() }
 }
 
-function renderCards(ctx: PrePassCtx, body: string): string {
+/**
+ * @param level the heading level for each card's title: one below the
+ *   heading the grid sits under, so a grid under `## Read on` titles its
+ *   cards `<h3>` and one directly under the page's `<h1>` titles them `<h2>`.
+ *   (FR-60 opened `<h2>` and closed `</h3>`, which a browser repairs to
+ *   `<h2>` — the wrong level under every `##`.)
+ */
+function renderCards(ctx: PrePassCtx, body: string, level: number): string {
+  const h = `h${level}`
   const cards = parseListItems(body).map((item) => {
     const { title, rest } = splitLeadIn(item)
     // `icon:name` anywhere in the item picks the glyph and is removed from the copy.
@@ -191,8 +253,8 @@ function renderCards(ctx: PrePassCtx, body: string): string {
     const text = rest.replace(/\s*\bicon:[a-zA-Z]+\b\s*/, ' ').trim()
     return (
       `<div class="card"><span class="card__icon">${icon(glyph, { size: 22 })}</span>` +
-      `<h2 class="card__title">${ctx.md.renderInline(title)}</h3>` +
-      `<p class="card__text">${ctx.md.renderInline(text)}</p></div>`
+      `<${h} class="card__title">${ctx.md.renderInline(title, ctx.env)}</${h}>` +
+      `<p class="card__text">${ctx.md.renderInline(text, ctx.env)}</p></div>`
     )
   })
   return `<div class="card-grid">${cards.join('')}</div>`
@@ -206,14 +268,14 @@ function renderBadges(ctx: PrePassCtx, body: string): string {
     const text = rest.replace(/\s*\bicon:[a-zA-Z]+\b\s*/, ' ').trim()
     return (
       `<div class="badge-card"><span class="badge-card__icon">${icon(glyph, { size: 20 })}</span>` +
-      `<div><span class="badge-card__title">${ctx.md.renderInline(title)}</span> ` +
-      `<span class="badge-card__text">${ctx.md.renderInline(text)}</span></div></div>`
+      `<div><span class="badge-card__title">${ctx.md.renderInline(title, ctx.env)}</span> ` +
+      `<span class="badge-card__text">${ctx.md.renderInline(text, ctx.env)}</span></div></div>`
     )
   })
   return `<div class="badge-row">${badges.join('')}</div>`
 }
 
-function renderOsTabs(ctx: PrePassCtx, body: string, groupId: string): string {
+function renderOsTabs(ctx: PrePassCtx, body: string, groupId: string, level: number): string {
   const sections = new Map<string, string[]>()
   let current: string | null = null
   for (const line of body.split('\n')) {
@@ -246,7 +308,7 @@ function renderOsTabs(ctx: PrePassCtx, body: string, groupId: string): string {
       `<label for="${id}" class="os-tab" data-os="${os}">${icon(OS_ICON[os]!, { size: 17 })}<span>${OS_LABEL[os]}</span></label>`,
     )
     panels.push(
-      `<div class="os-panel os-panel--${os}">${ctx.md.render(prePass(ctx, lines.join('\n')))}</div>`,
+      `<div class="os-panel os-panel--${os}">${ctx.md.render(prePass(ctx, lines.join('\n'), level), ctx.env)}</div>`,
     )
     first = false
   }
@@ -271,12 +333,25 @@ function renderOsTabs(ctx: PrePassCtx, body: string, groupId: string): string {
  *
  * An unclosed container is an ERROR: one that silently ran to end of file
  * would swallow the rest of the page into a callout.
+ *
+ * Code fences are skipped (FR-87): a line inside one is code, never a
+ * container marker or a heading.
+ *
+ * @param level the heading level in force where `src` begins; `#` lines move
+ *   it, and a `:::cards` grid titles its cards one level below it.
  */
-function prePass(ctx: PrePassCtx, src: string): string {
+function prePass(ctx: PrePassCtx, src: string, level = 1): string {
   const lines = src.split('\n')
   const out: string[] = []
+  const inCode = fenceTracker()
 
   for (let i = 0; i < lines.length; i++) {
+    if (inCode(lines[i]!)) {
+      out.push(lines[i]!)
+      continue
+    }
+    const heading = ATX_HEADING.exec(lines[i]!)
+    if (heading) level = heading[1]!.length
     const open = /^:::\s*([a-z]+)\s*(.*)$/.exec(lines[i]!.trimEnd())
     if (!open) {
       out.push(lines[i]!)
@@ -287,11 +362,16 @@ function prePass(ctx: PrePassCtx, src: string): string {
 
     // Collect to the *matching* closing `:::`, counting nested opens.
     const bodyLines: string[] = []
+    const bodyInCode = fenceTracker()
     let depth = 1
     let closed = false
     let j = i + 1
     for (; j < lines.length; j++) {
       const line = lines[j]!.trimEnd()
+      if (bodyInCode(lines[j]!)) {
+        bodyLines.push(lines[j]!)
+        continue
+      }
       if (/^:::\s*$/.test(line)) {
         depth -= 1
         if (depth === 0) {
@@ -315,7 +395,7 @@ function prePass(ctx: PrePassCtx, src: string): string {
       out.push(
         htmlBlock(
           `<div class="callout callout--${kind}"><p class="callout__head">${icon(c.icon, { size: 18 })}<span>${escapeHtml(title)}</span></p><div class="callout__body">`,
-          prePass(ctx, body),
+          prePass(ctx, body, level),
           `</div></div>`,
         ),
       )
@@ -325,7 +405,7 @@ function prePass(ctx: PrePassCtx, src: string): string {
     switch (kind) {
       case 'os':
         ctx.groupSeq.n += 1
-        out.push(renderOsTabs(ctx, body, `os-${ctx.groupSeq.n}`))
+        out.push(renderOsTabs(ctx, body, `os-${ctx.groupSeq.n}`, level))
         break
       case 'enroll': {
         ctx.groupSeq.n += 1
@@ -334,13 +414,13 @@ function prePass(ctx: PrePassCtx, src: string): string {
         break
       }
       case 'cards':
-        out.push(renderCards(ctx, body))
+        out.push(renderCards(ctx, body, Math.min(6, level + 1)))
         break
       case 'badges':
         out.push(renderBadges(ctx, body))
         break
       case 'steps':
-        out.push(htmlBlock('<div class="doc-steps">', prePass(ctx, body), '</div>'))
+        out.push(htmlBlock('<div class="doc-steps">', prePass(ctx, body, level), '</div>'))
         break
       default:
         throw new Error(
@@ -388,7 +468,73 @@ export function createRenderer(): MarkdownIt {
     return defaultLinkOpen(tokens, idx, options, env, self)
   }
 
+  // ── images (FR-87) ────────────────────────────────────────────────────
+  // `![alt](name.png "caption")`. The build publishes the file under a
+  // content-hashed name and supplies its real size, so the browser reserves
+  // the right box before the bytes arrive.
+  md.renderer.rules.image = (tokens, idx, options, env: RenderEnv, self) => {
+    const tok = tokens[idx]!
+    const src = tok.attrGet('src') ?? ''
+    const alt = self.renderInlineAsText(tok.children ?? [], options, env).trim()
+    const caption = tok.attrGet('title') ?? ''
+
+    if (!alt) {
+      report(env, `image "${src}" has no alt text. Say what it shows: alt text is what a screen reader reads out and what image search indexes.`)
+    }
+    let resolved: ResolvedImage | null = null
+    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
+      report(env, `image "${src}" is not a local file. Put it in the collection's assets directory: a remote image is a third-party request on every view, and it can change or vanish.`)
+    } else if (env.resolveImage) {
+      resolved = env.resolveImage(src)
+    }
+
+    const size = resolved ? ` width="${resolved.width}" height="${resolved.height}"` : ''
+    const img = `<img src="${escapeHtml(resolved?.url ?? src)}" alt="${escapeHtml(alt)}"${size} loading="lazy" decoding="async">`
+    return tok.meta?.figure && caption ? `${img}<figcaption>${md.renderInline(caption, env)}</figcaption>` : img
+  }
+
+  // An image alone in its paragraph is a figure, and its markdown title is
+  // the caption. An image inside a sentence stays inline.
+  md.core.ruler.push('figure', (state) => {
+    const t = state.tokens
+    for (let i = 0; i + 2 < t.length; i++) {
+      const open = t[i]!
+      const inline = t[i + 1]!
+      if (open.type !== 'paragraph_open' || open.hidden || inline.type !== 'inline' || t[i + 2]!.type !== 'paragraph_close') {
+        continue
+      }
+      const kids = (inline.children ?? []).filter(
+        (c) => c.type !== 'softbreak' && !(c.type === 'text' && c.content.trim() === ''),
+      )
+      if (kids.length !== 1 || kids[0]!.type !== 'image') continue
+      kids[0]!.meta = { ...(kids[0]!.meta ?? {}), figure: true }
+      open.tag = 'figure'
+      open.attrJoin('class', 'figure')
+      t[i + 2]!.tag = 'figure'
+    }
+  })
+
   return md
+}
+
+/**
+ * A raw `<img>` bypasses the image rule: no size, no lazy loading, no hashed
+ * name, and nothing checks its alt text.
+ *
+ * ⚠️ Checked on the AUTHORED source, never the pre-passed one. After the
+ * pre-pass every container is raw HTML — an OS tab holding a perfectly good
+ * markdown image included — so a check there would refuse legal content.
+ * Parsing (not rendering) the source sees raw HTML as html tokens, and code
+ * as code, so a sample showing an `<img>` tag is left alone.
+ */
+function checkRawImages(md: MarkdownIt, source: string, env: RenderEnv): void {
+  for (const tok of md.parse(source, {})) {
+    const html = [tok, ...(tok.children ?? [])].filter((x) => x.type === 'html_block' || x.type === 'html_inline')
+    if (html.some((x) => /<img\b/i.test(x.content))) {
+      report(env, 'a raw <img> tag. Use markdown, ![alt text](file.png "optional caption"), so the image gets its size, lazy loading and a cache-safe name.')
+      return
+    }
+  }
 }
 
 /** Heading ids + permalinks, collected for the on-page TOC and the search
@@ -429,10 +575,16 @@ function anchorHeadings(tokens: Token[]): Heading[] {
   return headings
 }
 
-export function renderMarkdown(md: MarkdownIt, source: string, filePath: string): RenderResult {
-  const ctx: PrePassCtx = { md, filePath, groupSeq: { n: 0 } }
+export function renderMarkdown(
+  md: MarkdownIt,
+  source: string,
+  filePath: string,
+  hooks: Omit<RenderEnv, 'filePath'> = {},
+): RenderResult {
+  const env: RenderEnv = { filePath, ...hooks }
+  checkRawImages(md, source, env)
+  const ctx: PrePassCtx = { md, filePath, groupSeq: { n: 0 }, env }
   const expanded = prePass(ctx, source)
-  const env = {}
   const tokens = md.parse(expanded, env)
   const headings = anchorHeadings(tokens)
   return { html: md.renderer.render(tokens, md.options, env), headings }

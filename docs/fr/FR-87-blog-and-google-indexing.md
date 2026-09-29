@@ -80,7 +80,8 @@ New modules under `ui/docs/`:
 | `theme/shell.ts` | shared `<head>`, topbar (Docs \| Blog), footer |
 | `theme/structured.ts` | JSON-LD builders |
 | `theme/xml.ts` | sitemap index, feed, robots |
-| `theme/images.ts` | dimensions, hashing, the image rule |
+| `theme/assets.ts` | content-hashed names, planned at load and written after the output is cleared |
+| `theme/images.ts` | dimensions (the image rule itself is in `render.ts`) |
 | `theme/links.ts` | the link checker, testable |
 | `theme/posts.ts` | post schema, sorting, pagination |
 | `theme/blog-layout.ts` | blog page renderers |
@@ -95,25 +96,34 @@ homepage, following the `enrollCommands.ts` pattern.
 - **Manifest generation:** `bun ui/docs/dates.ts --write` runs one `git log` over the content
   and writes a deterministic `ui/docs/content-dates.json`, keyed by path with `created` and
   `modified`. It runs on `hosted-image.yml`, which already checks out full history (`:76`),
-  before the Docker build, so `COPY ui/ .` carries the file in. The file is gitignored.
+  before the Docker build, so `COPY ui/ .` carries the file in (the build context is a path, so
+  untracked files are sent). The runner gets bun from `oven-sh/setup-bun`, pinned to 1.3.12 as
+  in `ci.yml`, and `dates.ts` imports `node:*` only, so no install is needed. The CLI **refuses**
+  on a shallow clone, because a depth-1 clone's one commit "touches" every file. The file is
+  gitignored. The break-glass build-host path runs the same command (`ship-it` §4).
 - **Docs resolution order:** front-matter `updated` → live git (only when the clone isn't
   shallow) → manifest → **undefined**.
 - **Blog dates** come only from front-matter (`date`, `updated`), because they are editorial.
 - **An undefined date is omitted** (no `<lastmod>`, no `dateModified`, no "Last updated"
   line), never replaced by the build date. A build path without the manifest, such as a
-  self-host or break-glass build, shows no dates instead of wrong ones.
+  self-host or break-glass build, shows no dates instead of wrong ones. Generated section and
+  tag indexes have no source file, so they are undated too.
 
 ### 4c. Assets
 
 - Every emitted asset gets a **content-hashed name**, `name.<sha256:10>.ext`, so the one-year
-  `immutable` cache is correct. The unhashed theme files are emitted for one more release, so
-  that cached HTML can still load them.
+  `immutable` cache is correct. The unhashed copies (`LEGACY_UNHASHED_ASSETS` in `site.ts`) are
+  emitted for one more release, so that cached HTML can still load them; the first phase that
+  ships after P2's promote turns them off.
 - `social-preview.png` keeps its stable name, because `ui/index.html` points at it.
 - **Inline markdown images** get a markdown-it rule that emits `width`/`height` read from the
   file itself (PNG, GIF, JPEG, WebP and SVG parsed by hand, no dependency),
   `loading="lazy"` and `decoding="async"`. An image alone in a paragraph becomes a
   `<figure>`/`<figcaption>`.
-- **Build errors:** empty alt text, a remote `src`, a raw `<img>`, or a file over 3 MB.
+- **Build errors:** empty alt text, a remote or `data:` `src`, a raw `<img>`, a file over 3 MB,
+  or a format the reader can't size. The raw-`<img>` check reads the **authored** source,
+  because after the pre-pass every container is raw HTML, including an OS tab that holds a
+  legal markdown image.
 - Heroes get their real dimensions, replacing the hard-coded 960×420 at `layout.ts:236`.
 
 ### 4d. `<head>` and structured data
@@ -313,6 +323,9 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 | Date | Build | What | Result |
 |---|---|---|---|
 | 2026-09-28 | production (pre-FR) | the §2 baselines | all failing as listed; recorded as the "shown failing" runs |
+| 2026-09-29 | production (pre-P1) | `scripts/public-site-smoke.sh https://roomler.ai . HEAD` | **FAIL**, 10 checks: `/docs` → `http://`; `/docs/start` 200; nginx's bare 404; `/blog/…` 200 (soft 404); no Cache-Control; feed `text/html`; 5 unhashed theme/hero files on each of two pages; **65 of 65** sitemap `lastmod`s = 2026-09-28 (the build) against git's 2026-09-01 |
+| 2026-09-29 | P1 image, CI ([run 36558431414](https://github.com/gjovanov/roomler-ai/actions/runs/36558431414)) | the P1 checks | pass, 7 security headers compared on `/docs/` and `/docs/start/` |
+| 2026-09-29 | P2 build in `nginx:stable` + `files/nginx-pod.conf` | the smoke with `.`, three builds | **no git, no manifest**: `lastmod` check FAILS (every entry undated), as it must. **With dates**: all 11 pass, 65 of 65 `lastmod` = git |
 
 ## 10. Related
 
