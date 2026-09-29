@@ -203,3 +203,89 @@ describe('tables', () => {
     expect(html).toContain('table-wrap')
   })
 })
+
+// ── FR-87 (#1776) ─────────────────────────────────────────────────────────
+
+describe('card headings follow the outline', () => {
+  const cards = ':::cards\n- **One** — first\n- **Two** — second\n:::'
+
+  it('titles cards h2 directly under the page title, h3 under a section', () => {
+    expect(render(cards)).toContain('<h2 class="card__title">One</h2>')
+    expect(render(`## Read on\n\n${cards}`)).toContain('<h3 class="card__title">One</h3>')
+  })
+
+  it('always closes the tag it opened (FR-60 opened <h2> and closed </h3>)', () => {
+    const html = render(`## Read on\n\n${cards}`)
+    for (const [, open, close] of html.matchAll(/<(h\d) class="card__title">[^]*?<\/(h\d)>/g)) {
+      expect(close).toBe(open)
+    }
+  })
+
+  it('does not read a `# comment` inside a code fence as a heading', () => {
+    const src = ['## Install', '', '```bash', '# not a heading', '```', '', cards].join('\n')
+    expect(render(src)).toContain('<h3 class="card__title">One</h3>')
+  })
+})
+
+describe('code fences are code, never markup', () => {
+  it('renders a container marker inside a fence as text, not as a callout', () => {
+    const html = render('```md\n:::note\nshown, not run\n:::\n```')
+    expect(html).not.toContain('callout--note')
+    expect(html).toContain(':::note')
+  })
+
+  it('does not let a fenced `:::` close the container around it', () => {
+    const html = render([':::warning', '```text', ':::', '```', 'still inside', ':::'].join('\n'))
+    expect(html).toMatch(/callout--warning[^]*still inside[^]*<\/div><\/div>/)
+  })
+})
+
+describe('images', () => {
+  const resolveImage = (src: string) => ({ url: `/docs/assets/${src.replace('.', '.0123456789.')}`, width: 1400, height: 788 })
+
+  it('publishes a markdown image with its real size, lazily', () => {
+    const { html } = renderMarkdown(md, 'Before ![A mesh of machines](mesh.png) after.', 'test.md', { resolveImage })
+    expect(html).toContain('<img src="/docs/assets/mesh.0123456789.png" alt="A mesh of machines" width="1400" height="788" loading="lazy" decoding="async">')
+    // Inside a sentence it stays inline.
+    expect(html).not.toContain('<figure')
+  })
+
+  it('makes an image alone in its paragraph a figure, captioned by its title', () => {
+    const { html } = renderMarkdown(md, '![A mesh](mesh.png "The mesh, *after* the upgrade")', 'test.md', { resolveImage })
+    expect(html).toMatch(/^<figure class="figure"><img [^>]+><figcaption>The mesh, <em>after<\/em> the upgrade<\/figcaption><\/figure>/)
+  })
+
+  it('refuses an image with no alt text', () => {
+    expect(() => render('![](mesh.png)')).toThrow(/no alt text/)
+  })
+
+  it('refuses a remote or inline-data image', () => {
+    expect(() => render('![x](https://example.com/x.png)')).toThrow(/not a local file/)
+    expect(() => render('![x](//example.com/x.png)')).toThrow(/not a local file/)
+    expect(() => render('![x](data:image/png;base64,AAAA)')).toThrow(/not a local file/)
+  })
+
+  it('collects every problem in a file when the build supplies `fail`', () => {
+    const errors: string[] = []
+    renderMarkdown(md, '![](a.png)\n\n![b](https://x.y/b.png)', 'post.md', { fail: (m) => errors.push(m) })
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toMatch(/^post\.md — /)
+  })
+
+  it('refuses a raw <img> tag, block or inline', () => {
+    expect(() => render('<img src="x.png" alt="x">')).toThrow(/raw <img>/)
+    expect(() => render('Text <img src="x.png" alt="x"> text.')).toThrow(/raw <img>/)
+  })
+
+  it('leaves an <img> shown as code alone', () => {
+    expect(() => render('Write `<img>` tags? No.\n\n```html\n<img src="x.png">\n```')).not.toThrow()
+  })
+
+  it('accepts a markdown image inside an OS tab, which the pre-pass turns into raw HTML', () => {
+    // The raw-<img> check reads the AUTHORED source for this reason: after
+    // the pre-pass, the whole tab group is an HTML block.
+    const src = [':::os', '@windows', '![The Windows installer](setup.png)', ':::'].join('\n')
+    const { html } = renderMarkdown(md, src, 'test.md', { resolveImage })
+    expect(html).toContain('src="/docs/assets/setup.0123456789.png"')
+  })
+})

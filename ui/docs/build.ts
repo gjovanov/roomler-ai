@@ -16,8 +16,12 @@
  * snippet), a duplicate slug (two pages competing for one URL), and a
  * search index that outgrew its budget (a page-load cost nobody decided
  * to spend).
+ *
+ * FR-87 (#1776) added honest dates (`dates.ts`: an unknown date is omitted,
+ * never the build date), content-hashed asset names (`theme/assets.ts`),
+ * images with their real size (`theme/images.ts`), and the 404 page nginx
+ * serves for any missing `/docs/` URL.
  */
-import { execFileSync } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
 import {
   cpSync,
@@ -29,9 +33,11 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, join, posix, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
+import { resolveDates } from './dates.ts'
 import {
   BASE,
+  LEGACY_UNHASHED_ASSETS,
   MAX_DESCRIPTION_CHARS,
   MIN_PAGES_PER_TAG_INDEX,
   PUBLIC_SPA_ROUTES,
@@ -40,6 +46,7 @@ import {
   SITE_ORIGIN,
   sectionByDir,
 } from './site.ts'
+import { AssetEmitter } from './theme/assets.ts'
 import {
   optionalBoolean,
   optionalNumber,
@@ -47,10 +54,12 @@ import {
   parseFrontmatter,
   requireString,
   requireStringArray,
+  type Frontmatter,
 } from './theme/frontmatter.ts'
-import { createRenderer, escapeHtml, renderMarkdown, slugify } from './theme/render.ts'
-import { icon } from './theme/icons.ts'
-import { renderPage, type DocPage, type NavSection } from './theme/layout.ts'
+import { imageSize, MAX_IMAGE_BYTES } from './theme/images.ts'
+import { checkLinks } from './theme/links.ts'
+import { createRenderer, escapeHtml, renderMarkdown, type ResolvedImage } from './theme/render.ts'
+import { renderPage, type DocPage, type NavSection, type SiteAssets } from './theme/layout.ts'
 
 const DOCS_ROOT = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const UI_ROOT = resolve(DOCS_ROOT, '..')
@@ -94,34 +103,30 @@ function walk(dir: string, out: string[] = []): string[] {
   return out
 }
 
-/** One `git log` for the whole content tree rather than one per file —
- *  50 subprocesses to stamp 50 dates is a measurable share of the build. */
-function lastModifiedMap(): Map<string, string> {
-  const map = new Map<string, string>()
-  try {
-    const rel = relative(REPO_ROOT, CONTENT_DIR).split(sep).join('/')
-    const log = execFileSync(
-      'git',
-      ['log', '--format=__C__%cs', '--name-only', '--', rel],
-      { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-    )
-    let date = ''
-    for (const line of log.split('\n')) {
-      const t = line.trim()
-      if (t.startsWith('__C__')) {
-        date = t.slice(5)
-      } else if (t && date && !map.has(t)) {
-        map.set(t, date) // first sighting == most recent commit
-      }
-    }
-  } catch {
-    // Not a git checkout (a tarball build, a fresh clone with no history).
-    // Falling back to today is honest: it is when these bytes were made.
-  }
-  return map
-}
+// ── dates (FR-87) ───────────────────────────────────────────────────────
+// FR-60 fell back to the build date here, calling it "when these bytes were
+// made". Crawlers read `lastmod` as when the CONTENT changed, and production
+// never had git, so every page claimed to change on every deploy.
 
-const TODAY = new Date().toISOString().slice(0, 10)
+const dates = resolveDates()
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
+/** Only for refusing a future date; never published. */
+const NOW_DAY = new Date().toISOString().slice(0, 10)
+
+/** A front-matter date: `YYYY-MM-DD`, real, and not in the future. */
+function frontMatterDate(data: Frontmatter, key: string, rel: string): string | undefined {
+  const v = optionalString(data, key)
+  if (v === undefined) return undefined
+  if (!ISO_DAY.test(v) || Number.isNaN(Date.parse(v))) {
+    fail(`${rel} — \`${key}: ${v}\` is not a YYYY-MM-DD date`)
+    return undefined
+  }
+  if (v > NOW_DAY) {
+    fail(`${rel} — \`${key}: ${v}\` is in the future`)
+    return undefined
+  }
+  return v
+}
 
 function toSlug(file: string): string {
   return relative(CONTENT_DIR, file).split(sep).join('/').replace(/\.md$/, '')
@@ -133,24 +138,42 @@ function slugToUrl(slug: string): string {
   return `${BASE}/${trimmed}/`
 }
 
-// ── asset resolution ────────────────────────────────────────────────────
+// ── assets ──────────────────────────────────────────────────────────────
 
-const usedAssets = new Set<string>()
+const assets = new AssetEmitter(OUT_ASSETS, `${BASE}/assets`, LEGACY_UNHASHED_ASSETS)
 
-function resolveAsset(name: string, where: string): string {
+function findAsset(name: string, where: string): string | null {
   const bare = name.replace(/^.*\//, '')
   for (const dir of ASSET_SEARCH_PATHS) {
     const candidate = join(dir, bare)
-    if (existsSync(candidate)) {
-      usedAssets.add(candidate)
-      return `${BASE}/assets/${bare}`
-    }
+    if (existsSync(candidate)) return candidate
   }
   fail(
     `${where} — asset "${name}" not found. Looked in:\n` +
       ASSET_SEARCH_PATHS.map((d) => `      ${relative(REPO_ROOT, d)}`).join('\n'),
   )
-  return `${BASE}/assets/${bare}`
+  return null
+}
+
+/** A hero or markdown image: found, size-checked, measured, and published
+ *  under its hashed name. Null after reporting why it cannot be. */
+function publishImage(name: string, where: string): ResolvedImage | null {
+  const file = findAsset(name, where)
+  if (!file) return null
+  const bytes = readFileSync(file)
+  if (bytes.length > MAX_IMAGE_BYTES) {
+    fail(
+      `${where} — image "${name}" is ${(bytes.length / 1048576).toFixed(1)} MB; the limit is ` +
+        `${MAX_IMAGE_BYTES / 1048576} MB. The site serves images as they are, so resize or recompress it.`,
+    )
+    return null
+  }
+  try {
+    return { url: assets.publishFile(file), ...imageSize(bytes) }
+  } catch (err) {
+    fail(`${where} — image "${name}": ${err instanceof Error ? err.message : String(err)}`)
+    return null
+  }
 }
 
 // ── plain text + per-section excerpts ───────────────────────────────────
@@ -200,7 +223,6 @@ function sectionChunks(page: DocPage): Array<{ heading: string; anchor: string; 
 // ── page loading ────────────────────────────────────────────────────────
 
 const md = createRenderer()
-const lastMod = lastModifiedMap()
 
 function loadPage(file: string): DocPage {
   const rel = relative(REPO_ROOT, file).split(sep).join('/')
@@ -225,8 +247,12 @@ function loadPage(file: string): DocPage {
     fail(`${rel} — directory "${sectionDir}" is not a declared section in ui/docs/site.ts`)
   }
 
-  const { html, headings } = renderMarkdown(md, body, rel)
+  const { html, headings } = renderMarkdown(md, body, rel, {
+    resolveImage: (src) => publishImage(src, rel),
+    fail,
+  })
   const heroName = optionalString(data, 'hero')
+  const git = dates.files.get(rel)
 
   const page: DocPage = {
     slug,
@@ -237,14 +263,17 @@ function loadPage(file: string): DocPage {
     description,
     tags,
     order: optionalNumber(data, 'order') ?? 999,
-    hero: heroName ? resolveAsset(heroName, rel) : undefined,
+    hero: heroName ? (publishImage(heroName, rel) ?? undefined) : undefined,
     heroAlt: optionalString(data, 'heroAlt'),
     noindex: optionalBoolean(data, 'noindex') ?? false,
     html,
     headings,
     plain: '',
     faq: optionalBoolean(data, 'faq') ?? false,
-    lastmod: lastMod.get(rel) ?? TODAY,
+    // front-matter `updated` > git > manifest > nothing. `updated` exists for
+    // the commit that touched every page without changing what one says.
+    lastmod: frontMatterDate(data, 'updated', rel) ?? git?.modified,
+    created: git?.created,
     sourceFile: slug,
   }
   page.plain = stripTags(html)
@@ -253,12 +282,14 @@ function loadPage(file: string): DocPage {
 
 // ── generated pages (section indexes, tag indexes) ──────────────────────
 
-function sectionIndexBody(section: (typeof SECTIONS)[number], pages: DocPage[]): string {
+/** @param level `2` when the grid sits directly under the page's `<h1>`,
+ *  `3` under the "In this section" `<h2>` an authored index gets. */
+function sectionIndexBody(pages: DocPage[], level: 2 | 3): string {
   const cards = pages
     .map(
       (p) =>
         `<a class="section-card" href="${p.url}">` +
-        `<h2 class="section-card__title">${escapeHtml(p.title)}</h2>` +
+        `<h${level} class="section-card__title">${escapeHtml(p.title)}</h${level}>` +
         `<p class="section-card__blurb">${escapeHtml(p.description)}</p></a>`,
     )
     .join('')
@@ -270,10 +301,10 @@ function makeSectionIndex(
   pages: DocPage[],
   authored: DocPage | undefined,
 ): DocPage {
-  const listing = sectionIndexBody(section, pages)
   if (authored) {
     // Authored prose stays first; the generated listing is appended, so a
     // new page in the section shows up without anyone editing an index.
+    const listing = sectionIndexBody(pages, 3)
     authored.html = `${authored.html}\n<h2 id="in-this-section">In this section</h2>\n${listing}`
     authored.headings = [
       ...authored.headings,
@@ -282,6 +313,9 @@ function makeSectionIndex(
     authored.plain = stripTags(authored.html)
     return authored
   }
+  const listing = sectionIndexBody(pages, 2)
+  // No `lastmod`: no file produces this page, so git has no date for it, and
+  // the build date is not one (FR-87).
   return {
     slug: `${section.dir}/index`,
     url: `${BASE}/${section.dir}/`,
@@ -296,7 +330,6 @@ function makeSectionIndex(
     headings: [],
     plain: stripTags(listing),
     faq: false,
-    lastmod: TODAY,
   }
 }
 
@@ -325,51 +358,34 @@ function makeTagIndex(tag: string, pages: DocPage[]): DocPage {
     headings: [],
     plain: stripTags(html),
     faq: false,
-    lastmod: TODAY,
   }
 }
 
-// ── link checking ───────────────────────────────────────────────────────
-
-function checkLinks(pages: DocPage[]): void {
-  const byUrl = new Map(pages.map((p) => [p.url, p]))
-  const anchors = new Map(pages.map((p) => [p.url, new Set(p.headings.map((h) => h.slug))]))
-
-  for (const page of pages) {
-    const re = /href="([^"]+)"/g
-    let m: RegExpExecArray | null
-    while ((m = re.exec(page.html)) !== null) {
-      const href = m[1]!
-      if (/^(https?:|mailto:|tel:|#)/i.test(href)) continue
-
-      // Resolve relative hrefs against this page's URL so authors can write
-      // `../network/exit-nodes/` as well as the site-absolute form.
-      const [rawPath, hash] = href.split('#')
-      const target = rawPath!.startsWith('/')
-        ? rawPath!
-        : posix.normalize(posix.join(page.url, rawPath!))
-      const normalised = target.endsWith('/') || /\.[a-z0-9]+$/i.test(target) ? target : `${target}/`
-
-      // Non-docs internal links point at the SPA (/landing, /register …);
-      // this generator does not own those routes, so it cannot verify them.
-      if (!normalised.startsWith(`${BASE}/`)) continue
-      // A file reference (an asset) is verified by resolveAsset, not here.
-      if (/\.[a-z0-9]+$/i.test(normalised)) continue
-
-      if (!byUrl.has(normalised)) {
-        fail(`${page.slug}.md — link "${href}" points at ${normalised}, which no page generates`)
-        continue
-      }
-      if (hash) {
-        const set = anchors.get(normalised)!
-        if (!set.has(hash)) {
-          fail(
-            `${page.slug}.md — link "${href}" points at #${hash} on ${normalised}, ` +
-              `which has no heading with that id`,
-          )
-        }
-      }
-    }
+/** Served by nginx for any missing `/docs/` (and `/blog/`) URL — FR-87 P1's
+ *  `error_page 404`. Every link in it is site-absolute, because it answers
+ *  at whatever depth the missing URL had. */
+function makeNotFoundPage(nav: NavSection[]): DocPage {
+  const sections = nav
+    .map(({ section }) => `<li><a href="${BASE}/${section.dir}/">${escapeHtml(section.title)}</a></li>`)
+    .join('')
+  const html =
+    `<p>Nothing is published at this address. The page may have moved, or the link that brought you here may be wrong.</p>\n` +
+    `<p><button class="btn btn--primary" type="button" data-search-open>Search the documentation</button></p>\n` +
+    `<p>Or start from a section:</p>\n<ul><li><a href="${BASE}/">Documentation home</a></li>${sections}</ul>`
+  return {
+    slug: '404',
+    url: `${BASE}/404.html`,
+    outFile: '404.html',
+    title: 'Page not found',
+    description: 'This page does not exist. Search the documentation, or start from one of its sections.',
+    tags: [],
+    order: 999,
+    noindex: true,
+    notFound: true,
+    html,
+    headings: [],
+    plain: '',
+    faq: false,
   }
 }
 
@@ -381,15 +397,21 @@ function write(file: string, contents: string | Buffer): void {
 }
 
 function buildSitemap(pages: DocPage[]): string {
-  const urls = [
+  const urls: Array<{ loc: string; lastmod?: string }> = [
     ...pages.filter((p) => !p.noindex).map((p) => ({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: p.lastmod })),
-    ...PUBLIC_SPA_ROUTES.map((r) => ({ loc: `${SITE_ORIGIN}${r}`, lastmod: TODAY })),
+    // Undated: the SPA's pages are not dated from git (FR-87).
+    ...PUBLIC_SPA_ROUTES.map((r) => ({ loc: `${SITE_ORIGIN}${r}` })),
   ]
   return (
     `<?xml version="1.0" encoding="UTF-8"?>\n` +
     `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
     urls
-      .map((u) => `  <url>\n    <loc>${u.loc}</loc>\n    <lastmod>${u.lastmod}</lastmod>\n  </url>`)
+      .map(
+        (u) =>
+          `  <url>\n    <loc>${u.loc}</loc>\n` +
+          (u.lastmod ? `    <lastmod>${u.lastmod}</lastmod>\n` : '') +
+          `  </url>`,
+      )
       .join('\n') +
     `\n</urlset>\n`
   )
@@ -487,7 +509,18 @@ function main(): void {
   }
   const renderable = [...allPages, ...tagPages]
 
-  checkLinks(renderable)
+  const linkErrors = checkLinks(
+    renderable.map((p) => ({
+      id: p.sourceFile ? `${p.sourceFile}.md` : p.url,
+      url: p.url,
+      html: p.html,
+      anchors: new Set(p.headings.map((h) => h.slug)),
+    })),
+    // Other internal links point at the SPA (/landing, /register …); this
+    // generator does not own those routes, so it cannot verify them.
+    (path) => path.startsWith(`${BASE}/`),
+  )
+  for (const e of linkErrors) fail(e)
 
   if (errors.length) {
     console.error(`\n[docs] BUILD FAILED — ${errors.length} problem(s):\n`)
@@ -500,31 +533,8 @@ function main(): void {
   rmSync(OUT, { recursive: true, force: true })
   mkdirSync(OUT_ASSETS, { recursive: true })
 
-  // Reading order for prev/next is the sidebar order: sections in declared
-  // order, pages within them in `order` then title.
-  const flow: DocPage[] = [
-    ...(home ? [home] : []),
-    ...nav.flatMap(({ section, pages }) => {
-      const idx = allPages.find((p) => p.url === `${BASE}/${section.dir}/`)
-      return idx ? [idx, ...pages] : pages
-    }),
-  ]
-
-  for (const page of renderable) {
-    const i = flow.indexOf(page)
-    const html = renderPage(
-      {
-        nav,
-        page,
-        prev: i > 0 ? flow[i - 1] : undefined,
-        next: i >= 0 && i < flow.length - 1 ? flow[i + 1] : undefined,
-      },
-      tagIndexed,
-    )
-    write(join(OUT, page.outFile), html)
-  }
-
-  // Search index.
+  // Search index. Built BEFORE the pages are rendered: its name is
+  // content-hashed, and every page carries that name.
   //
   // ⚠️ Tag indexes are excluded. Their entire content is the titles and
   // descriptions of pages that are already in the index, so including them
@@ -560,15 +570,44 @@ function main(): void {
     )
     process.exit(1)
   }
-  write(join(OUT_ASSETS, 'search-index.json'), indexJson)
 
-  // Theme assets.
-  for (const f of ['docs.css', 'docs.js', 'search.js', 'os-preference.js']) {
-    cpSync(join(THEME_DIR, f), join(OUT_ASSETS, f))
+  const siteAssets: SiteAssets = {
+    css: assets.publishFile(join(THEME_DIR, 'docs.css')),
+    js: assets.publishFile(join(THEME_DIR, 'docs.js')),
+    search: assets.publishFile(join(THEME_DIR, 'search.js')),
+    osPreference: assets.publishFile(join(THEME_DIR, 'os-preference.js')),
+    searchIndex: assets.publishBytes('search-index.json', indexJson),
   }
-  for (const asset of usedAssets) {
-    cpSync(asset, join(OUT_ASSETS, asset.split(sep).pop()!))
+
+  // Reading order for prev/next is the sidebar order: sections in declared
+  // order, pages within them in `order` then title.
+  const flow: DocPage[] = [
+    ...(home ? [home] : []),
+    ...nav.flatMap(({ section, pages }) => {
+      const idx = allPages.find((p) => p.url === `${BASE}/${section.dir}/`)
+      return idx ? [idx, ...pages] : pages
+    }),
+  ]
+
+  for (const page of renderable) {
+    const i = flow.indexOf(page)
+    const html = renderPage(
+      {
+        nav,
+        page,
+        assets: siteAssets,
+        prev: i > 0 ? flow[i - 1] : undefined,
+        next: i >= 0 && i < flow.length - 1 ? flow[i + 1] : undefined,
+      },
+      tagIndexed,
+    )
+    write(join(OUT, page.outFile), html)
   }
+  write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets }, tagIndexed))
+
+  // Every hashed file planned above — theme, search index, heroes, images.
+  assets.flush()
+
   // ⚠️ The OG image must live INSIDE `ui/`. The Docker UI stage is
   // `COPY ui/ .` and nothing else, so a card read from the repo's
   // `docs/assets/` exists on a dev box and is ABSENT in the image — every
@@ -603,9 +642,17 @@ function main(): void {
   write(join(DIST, 'robots.txt'), buildRobots())
 
   const ms = Date.now() - t0
+  // The date source is in the log because its absence is otherwise silent:
+  // an image built without the manifest looks perfect and publishes no dates.
+  const dated = allPages.filter((p) => p.lastmod).length
+  const dateNote =
+    dates.source === 'none'
+      ? `dates: none (${dates.note})`
+      : `dates: ${dates.source}, ${dated} of ${allPages.length} pages`
   console.log(
     `[docs] ${renderable.length} pages · ${records.length} search records · ` +
-      `index ${(gz / 1024).toFixed(1)} KB gz · ${tagPages.length} tag indexes · ${ms} ms`,
+      `index ${(gz / 1024).toFixed(1)} KB gz · ${tagPages.length} tag indexes · ` +
+      `${assets.names().length} assets · ${dateNote} · ${ms} ms`,
   )
 }
 
