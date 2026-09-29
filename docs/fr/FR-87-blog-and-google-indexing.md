@@ -95,7 +95,10 @@ homepage, following the `enrollCommands.ts` pattern.
 
 - **Manifest generation:** `bun ui/docs/dates.ts --write` runs one `git log` over the content
   and writes a deterministic `ui/docs/content-dates.json`, keyed by path with `created` and
-  `modified`. It runs on `hosted-image.yml`, which already checks out full history (`:76`),
+  `modified`: committer **timestamps** with their offset (`%cI`, manifest version 2). P2 stored
+  bare dates (`%cs`); P3 found in the Rich Results Test that Google flags a bare date in
+  `datePublished`/`dateModified` as "invalid datetime … missing a timezone". The sitemap and the
+  "Last updated" line use the date part, which equals `%cs`. It runs on `hosted-image.yml`, which already checks out full history (`:76`),
   before the Docker build, so `COPY ui/ .` carries the file in (the build context is a path, so
   untracked files are sent). The runner gets bun from `oven-sh/setup-bun`, pinned to 1.3.12 as
   in `ci.yml`, and `dates.ts` imports `node:*` only, so no install is needed. The CLI **refuses**
@@ -128,20 +131,28 @@ homepage, following the `enrollCommands.ts` pattern.
 
 ### 4d. `<head>` and structured data
 
+P3 builds this in `theme/shell.ts` (the shared `<head>`, top bar, footer, search dialog and
+scripts), `theme/structured.ts` and `theme/xml.ts`.
+
 - `og:type` is `website` on listings and `article` on leaves.
-- `article:published_time`, `article:modified_time`, `article:author` and `article:tag`.
-- `max-image-preview:large`.
-- Per-post `og:image`: the hero, at least 1200 px wide at ~1.91:1, with its width, height and
-  alt text.
+- `article:published_time`, `article:modified_time`, `article:author` and `article:tag`
+  (docs leaves carry all but `article:author`, which needs a person's profile: the blog's).
+- `max-image-preview:large` on every indexable page; `noindex, follow` on the rest.
+- `og:image` with its width, height and alt text. Per-post `og:image`: the hero, at least
+  1200 px wide at ~1.91:1. Docs keep the social card, because their heroes are SVG, which
+  social platforms don't render.
 - A `seoTitle` front-matter key, capped at 60 chars by a build gate. The default template drops
-  " · section" when the title would exceed 60.
+  " · section", then " — Roomler Docs", to fit 60, and a title too long even bare is a build
+  error asking for a `seoTitle`. Before P3, 8 of 65 titles ran 62–71 chars; after, 0 of 96.
 - One Organization entity (`@id https://roomler.ai/#organization`, name "Roomler", legalName
-  "G ROX EOOD"), referenced from every page.
+  "G ROX EOOD"), a node of every page's single `@graph`, which every author and publisher
+  references.
 - **Types by page:**
   - `BlogPosting` + `BreadcrumbList` on posts;
   - `Blog` on the blog index;
   - `TechArticle` + `BreadcrumbList` on docs pages, now with `datePublished`, `image` and
-    `mainEntityOfPage`;
+    `mainEntityOfPage`; `CollectionPage` on the docs home and on section and tag indexes, which
+    are lists, not articles; a one-item breadcrumb is dropped;
   - `WebSite` + `Organization` + `SoftwareApplication` on the homepage. The sitelinks
     SearchAction is not built: Google retired it in 2024.
 - `/sitemap.xml` becomes a **sitemap index** pointing at `sitemap-docs.xml` (which includes
@@ -326,6 +337,8 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 | 2026-09-29 | production (pre-P1) | `scripts/public-site-smoke.sh https://roomler.ai . HEAD` | **FAIL**, 10 checks: `/docs` → `http://`; `/docs/start` 200; nginx's bare 404; `/blog/…` 200 (soft 404); no Cache-Control; feed `text/html`; 5 unhashed theme/hero files on each of two pages; **65 of 65** sitemap `lastmod`s = 2026-09-28 (the build) against git's 2026-09-01 |
 | 2026-09-29 | P1 image, CI ([run 36558431414](https://github.com/gjovanov/roomler-ai/actions/runs/36558431414)) | the P1 checks | pass, 7 security headers compared on `/docs/` and `/docs/start/` |
 | 2026-09-29 | P2 build in `nginx:stable` + `files/nginx-pod.conf` | the smoke with `.`, three builds | **no git, no manifest**: `lastmod` check FAILS (every entry undated), as it must. **With dates**: all 11 pass, 65 of 65 `lastmod` = git |
+| 2026-09-29 | P2 image, CI ([run 36561581485](https://github.com/gjovanov/roomler-ai/actions/runs/36561581485)) | the real image path | runner `[dates] 65 files`; Docker (no `.git`) `dates: manifest, 65 of 65 pages`; smoke all 11 pass, `lastmod == git` for 65 pages |
+| 2026-09-29 | P3 markup, Rich Results Test (code mode, the TeamViewer compare page) | AC5, before deploy | first run: Article + Breadcrumbs valid, **4 non-critical issues** (bare dates: "invalid datetime", "missing a timezone"); after the `%cI` fix: valid, **no issues**. The production run is still owed |
 
 ## 10. Related
 

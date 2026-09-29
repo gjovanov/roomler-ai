@@ -12,9 +12,9 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { parseFrontmatter, requireString, requireStringArray } from '../theme/frontmatter.ts'
+import { optionalString, parseFrontmatter, requireString, requireStringArray, unknownKeys } from '../theme/frontmatter.ts'
 import { createRenderer, renderMarkdown } from '../theme/render.ts'
-import { MAX_DESCRIPTION_CHARS, SECTIONS, sectionByDir } from '../site.ts'
+import { DOCS_FRONTMATTER_KEYS, MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS, SECTIONS, sectionByDir } from '../site.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CONTENT = join(HERE, '..', 'content')
@@ -54,6 +54,9 @@ describe('documentation content', () => {
     // defect nobody sees until they read their own listing.
     expect(description.length).toBeLessThanOrEqual(MAX_DESCRIPTION_CHARS)
     expect(tags.every((t) => /^[a-z0-9-]+$/.test(t))).toBe(true)
+    // FR-87: strict keys, and a hand-written title that fits a results page.
+    expect(unknownKeys(data, DOCS_FRONTMATTER_KEYS)).toEqual([])
+    expect((optionalString(data, 'seoTitle') ?? '').length).toBeLessThanOrEqual(MAX_TITLE_CHARS)
   })
 
   it('places every page in a declared section', () => {

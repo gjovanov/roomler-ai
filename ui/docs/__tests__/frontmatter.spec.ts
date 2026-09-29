@@ -16,6 +16,7 @@ import {
   optionalBoolean,
   optionalNumber,
   optionalString,
+  unknownKeys,
 } from '../theme/frontmatter.ts'
 
 const F = 'test.md'
@@ -116,5 +117,13 @@ describe('typed accessors fail loudly', () => {
     expect(optionalNumber(data, 'count')).toBe(3)
     expect(optionalBoolean(data, 'flag')).toBe(true)
     expect(optionalBoolean(data, 'nope')).toBeUndefined()
+  })
+})
+
+describe('unknownKeys (FR-87)', () => {
+  it('names every key outside the allowed set, and only those', () => {
+    const { data } = parseFrontmatter('---\ntitle: T\nheroalt: typo\nseo_title: typo\n---\n', 'x.md')
+    expect(unknownKeys(data, ['title', 'heroAlt', 'seoTitle'])).toEqual(['heroalt', 'seo_title'])
+    expect(unknownKeys(data, ['title', 'heroalt', 'seo_title'])).toEqual([])
   })
 })

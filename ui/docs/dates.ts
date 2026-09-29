@@ -33,11 +33,17 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/**
+ * Committer timestamps, ISO 8601 with the committer's offset
+ * (`2026-09-01T14:02:11+02:00`, git's `%cI`). Structured data needs the time
+ * and the zone — Google flags a bare date as an invalid datetime — while the
+ * sitemap and the "Last updated" line use the date part, which is exactly
+ * what `git log -1 --format=%cs` prints (both are in the committer's zone).
+ */
 export interface ContentDates {
-  /** Oldest commit that touched the file (`YYYY-MM-DD`). A rename restarts it. */
+  /** Oldest commit that touched the file. A rename restarts it. */
   created: string
-  /** Newest commit that touched the file (`YYYY-MM-DD`) — what
-   *  `git log -1 --format=%cs -- <file>` prints. */
+  /** Newest commit that touched the file. */
   modified: string
 }
 
@@ -57,12 +63,13 @@ export const MANIFEST_PATH = join(HERE, 'content-dates.json')
 /** What is dated from git, repo-relative. Blog posts are not: their dates are
  *  editorial and live in front-matter, because a typo fix is not a new post. */
 export const DATED_PATHS = ['ui/docs/content']
-const MANIFEST_VERSION = 1
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
+/** 2: ISO timestamps (FR-87 P3). 1 held bare `YYYY-MM-DD` dates. */
+const MANIFEST_VERSION = 2
+export const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/
 const COMMIT = '__C__'
 
 /**
- * Parses `git log --format=__C__%cs --name-only`. The log is newest first, so
+ * Parses `git log --format=__C__%cI --name-only`. The log is newest first, so
  * a file's first sighting is its `modified` date and each later sighting
  * moves `created` back.
  */
@@ -75,7 +82,7 @@ export function parseGitLog(log: string): Map<string, ContentDates> {
       date = line.slice(COMMIT.length)
       continue
     }
-    if (!line || !ISO_DAY.test(date)) continue
+    if (!line || !ISO_TIMESTAMP.test(date)) continue
     const seen = files.get(line)
     if (seen) seen.created = date
     else files.set(line, { created: date, modified: date })
@@ -107,7 +114,7 @@ export function gitDates(): { files?: Map<string, ContentDates>; note?: string }
   if (shallow !== 'false') return { note: 'shallow clone' }
   // `core.quotePath=false`: otherwise a non-ASCII file name comes back
   // octal-escaped inside quotes and would never match the path build.ts asks for.
-  const log = git(['-c', 'core.quotePath=false', 'log', `--format=${COMMIT}%cs`, '--name-only', '--', ...DATED_PATHS])
+  const log = git(['-c', 'core.quotePath=false', 'log', `--format=${COMMIT}%cI`, '--name-only', '--', ...DATED_PATHS])
   return { files: parseGitLog(log) }
 }
 
@@ -134,8 +141,8 @@ export function parseManifest(text: string, where: string): Map<string, ContentD
   const files = new Map<string, ContentDates>()
   for (const [path, v] of Object.entries(obj.files as Record<string, unknown>)) {
     const d = v as Partial<ContentDates> | null
-    if (!d || typeof d.created !== 'string' || typeof d.modified !== 'string' || !ISO_DAY.test(d.created) || !ISO_DAY.test(d.modified)) {
-      throw new Error(`${where} — "${path}" needs YYYY-MM-DD \`created\` and \`modified\``)
+    if (!d || typeof d.created !== 'string' || typeof d.modified !== 'string' || !ISO_TIMESTAMP.test(d.created) || !ISO_TIMESTAMP.test(d.modified)) {
+      throw new Error(`${where} — "${path}" needs ISO 8601 \`created\` and \`modified\` timestamps`)
     }
     files.set(path, { created: d.created, modified: d.modified })
   }
@@ -178,7 +185,7 @@ function main(argv: string[]): number {
     return 1
   }
   writeFileSync(MANIFEST_PATH, manifestJson(files))
-  const newest = [...files.values()].map((d) => d.modified).sort().at(-1)
+  const newest = [...files.values()].map((d) => d.modified.slice(0, 10)).sort().at(-1)
   console.log(
     `[dates] ${files.size} files -> ${relative(REPO_ROOT, MANIFEST_PATH).split('\\').join('/')} (newest change ${newest})`,
   )

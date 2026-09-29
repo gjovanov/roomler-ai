@@ -4,7 +4,7 @@
  * FR-87 (#1776) — what the page shell publishes, and what it must not.
  */
 import { describe, expect, it } from 'vitest'
-import { renderPage, type DocPage, type SiteAssets } from '../theme/layout.ts'
+import { docsTitle, renderPage, type DocPage, type SiteAssets } from '../theme/layout.ts'
 
 const assets: SiteAssets = {
   css: '/docs/assets/docs.0123456789.css',
@@ -46,6 +46,15 @@ describe('dates', () => {
     expect(html).toContain('"dateModified":"2026-09-01"')
     expect(html).toContain('Last updated <time datetime="2026-09-01">2026-09-01</time>')
   })
+
+  it("gives structured data git's full timestamp, and readers its date", () => {
+    // Google's Rich Results Test flags a bare date as "invalid datetime …
+    // missing a timezone" (measured on this page's markup, 2026-09-29).
+    const html = render({ created: '2026-08-30T21:04:10+02:00', lastmod: '2026-09-01T14:02:11+02:00' })
+    expect(html).toContain('"datePublished":"2026-08-30T21:04:10+02:00","dateModified":"2026-09-01T14:02:11+02:00"')
+    expect(html).toContain('<meta property="article:modified_time" content="2026-09-01T14:02:11+02:00">')
+    expect(html).toContain('Last updated <time datetime="2026-09-01T14:02:11+02:00">2026-09-01</time>')
+  })
 })
 
 describe('assets', () => {
@@ -77,5 +86,78 @@ describe('the 404 page', () => {
 
   it('leaves an ordinary page its canonical', () => {
     expect(render({})).toContain('<link rel="canonical" href="https://roomler.ai/docs/start/quickstart/">')
+  })
+})
+
+// ── P3: the head ──────────────────────────────────────────────────────────
+
+describe('the <title>', () => {
+  const section = { dir: 'compare', title: 'How Roomler compares', blurb: '', icon: 'compare', accent: 'coral' } as const
+  const leaf = (title: string, extra: Partial<DocPage> = {}): DocPage => ({ ...base, slug: 'compare/x', url: '/docs/compare/x/', section, title, ...extra })
+
+  it('keeps the section when everything fits', () => {
+    expect(docsTitle(leaf('Roomler vs Tailscale'))).toBe('Roomler vs Tailscale · How Roomler compares — Roomler Docs')
+  })
+
+  it('drops the section, then the site name, to fit 60', () => {
+    // 71 chars with the section — the kind of title FR-60 shipped, cut off in results.
+    expect(docsTitle(leaf('Roomler vs TeamViewer and AnyDesk'))).toBe('Roomler vs TeamViewer and AnyDesk — Roomler Docs')
+    const long = 'A title that is fifty-five characters long, near enough'
+    expect(docsTitle(leaf(long))).toBe(long)
+  })
+
+  it('returns null — a build error — when even the bare title is too long', () => {
+    expect(docsTitle(leaf('x'.repeat(61)))).toBeNull()
+  })
+
+  it("uses the author's seoTitle verbatim", () => {
+    expect(docsTitle(leaf('Anything', { seoTitle: 'TeamViewer alternative, self-hosted' }))).toBe('TeamViewer alternative, self-hosted')
+  })
+
+  it('fits the docs home', () => {
+    expect(docsTitle({ ...base, slug: 'index', url: '/docs/' })!.length).toBeLessThanOrEqual(60)
+  })
+})
+
+describe('the head', () => {
+  it('marks a leaf an article and a listing a website', () => {
+    expect(render({})).toContain('<meta property="og:type" content="article">')
+    expect(render({ slug: 'index', url: '/docs/' })).toContain('<meta property="og:type" content="website">')
+    expect(render({ slug: 'tags/windows', url: '/docs/tags/windows/', sourceFile: undefined })).toContain('content="website"')
+  })
+
+  it('carries article:* only on articles', () => {
+    const leaf = render({ created: '2026-08-01', lastmod: '2026-09-01' })
+    expect(leaf).toContain('<meta property="article:published_time" content="2026-08-01">')
+    expect(leaf).toContain('<meta property="article:modified_time" content="2026-09-01">')
+    expect(leaf).toContain('<meta property="article:tag" content="install">')
+    expect(render({ slug: 'index', url: '/docs/' })).not.toContain('article:')
+  })
+
+  it('asks for large image previews, and describes the image it names', () => {
+    const html = render({})
+    expect(html).toContain('<meta name="robots" content="max-image-preview:large">')
+    expect(html).toContain('<meta property="og:image:width" content="1280">')
+    expect(html).toContain('<meta property="og:image:alt" content="')
+  })
+
+  it('loads the same first-party analytics as the SPA', () => {
+    expect(render({})).toContain('<script defer data-domain="roomler.ai" src="https://purestat.ai/js/purestat.js"></script>')
+  })
+
+  it('emits ONE graph, published by G ROX EOOD, never "G ROX LTD"', () => {
+    const html = render({})
+    expect(html.match(/application\/ld\+json/g)).toHaveLength(1)
+    const json = JSON.parse(html.match(/<script type="application\/ld\+json">(.*?)<\/script>/)![1]!)
+    expect(json['@context']).toBe('https://schema.org')
+    const types = json['@graph'].map((n: { '@type': string }) => n['@type'])
+    expect(types).toEqual(['Organization', 'TechArticle', 'BreadcrumbList'])
+    expect(html).toContain('"legalName":"G ROX EOOD"')
+    expect(html).not.toContain('G ROX LTD')
+  })
+
+  it('describes a listing as a CollectionPage, and drops a one-item breadcrumb', () => {
+    const json = JSON.parse(render({ slug: 'index', url: '/docs/' }).match(/<script type="application\/ld\+json">(.*?)<\/script>/)![1]!)
+    expect(json['@graph'].map((n: { '@type': string }) => n['@type'])).toEqual(['Organization', 'CollectionPage'])
   })
 })

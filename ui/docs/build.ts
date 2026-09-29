@@ -37,10 +37,11 @@ import { dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
 import {
   BASE,
+  DOCS_FRONTMATTER_KEYS,
   LEGACY_UNHASHED_ASSETS,
   MAX_DESCRIPTION_CHARS,
+  MAX_TITLE_CHARS,
   MIN_PAGES_PER_TAG_INDEX,
-  PUBLIC_SPA_ROUTES,
   SEARCH_INDEX_MAX_GZIP_BYTES,
   SECTIONS,
   SITE_ORIGIN,
@@ -54,12 +55,14 @@ import {
   parseFrontmatter,
   requireString,
   requireStringArray,
+  unknownKeys,
   type Frontmatter,
 } from './theme/frontmatter.ts'
 import { imageSize, MAX_IMAGE_BYTES } from './theme/images.ts'
 import { checkLinks } from './theme/links.ts'
 import { createRenderer, escapeHtml, renderMarkdown, type ResolvedImage } from './theme/render.ts'
-import { renderPage, type DocPage, type NavSection, type SiteAssets } from './theme/layout.ts'
+import { docsTitle, renderPage, type DocPage, type NavSection, type SiteAssets } from './theme/layout.ts'
+import { newest, robotsTxt, sitemapIndex, urlset, type UrlEntry } from './theme/xml.ts'
 
 const DOCS_ROOT = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const UI_ROOT = resolve(DOCS_ROOT, '..')
@@ -109,19 +112,22 @@ function walk(dir: string, out: string[] = []): string[] {
 // never had git, so every page claimed to change on every deploy.
 
 const dates = resolveDates()
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
+/** `2026-09-01`, or a full ISO 8601 timestamp with its offset. */
+const FRONT_MATTER_DATE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2}))?$/
 /** Only for refusing a future date; never published. */
 const NOW_DAY = new Date().toISOString().slice(0, 10)
 
-/** A front-matter date: `YYYY-MM-DD`, real, and not in the future. */
+/** A front-matter date: `YYYY-MM-DD` or an ISO timestamp, real, and not in
+ *  the future. A bare date is valid schema.org, but Google prefers a time
+ *  with a zone, so a git date (always a full timestamp) is the better one. */
 function frontMatterDate(data: Frontmatter, key: string, rel: string): string | undefined {
   const v = optionalString(data, key)
   if (v === undefined) return undefined
-  if (!ISO_DAY.test(v) || Number.isNaN(Date.parse(v))) {
-    fail(`${rel} — \`${key}: ${v}\` is not a YYYY-MM-DD date`)
+  if (!FRONT_MATTER_DATE.test(v) || Number.isNaN(Date.parse(v))) {
+    fail(`${rel} — \`${key}: ${v}\` is neither YYYY-MM-DD nor an ISO 8601 timestamp with its offset`)
     return undefined
   }
-  if (v > NOW_DAY) {
+  if (v.slice(0, 10) > NOW_DAY) {
     fail(`${rel} — \`${key}: ${v}\` is in the future`)
     return undefined
   }
@@ -234,10 +240,22 @@ function loadPage(file: string): DocPage {
   const description = requireString(data, 'description', rel)
   const tags = requireStringArray(data, 'tags', rel)
 
+  for (const key of unknownKeys(data, DOCS_FRONTMATTER_KEYS)) {
+    fail(`${rel} — unknown frontmatter key \`${key}\`. Known: ${DOCS_FRONTMATTER_KEYS.join(', ')}`)
+  }
+
   if (description.length > MAX_DESCRIPTION_CHARS) {
     fail(
       `${rel} — frontmatter \`description\` is ${description.length} chars; ` +
         `the limit is ${MAX_DESCRIPTION_CHARS} (longer is silently truncated in search results)`,
+    )
+  }
+
+  const seoTitle = optionalString(data, 'seoTitle')
+  if (seoTitle && seoTitle.length > MAX_TITLE_CHARS) {
+    fail(
+      `${rel} — frontmatter \`seoTitle\` is ${seoTitle.length} chars; the limit is ${MAX_TITLE_CHARS} ` +
+        `(search results cut a longer title off)`,
     )
   }
 
@@ -260,6 +278,7 @@ function loadPage(file: string): DocPage {
     outFile: slug === 'index' ? 'index.html' : `${slug.replace(/\/index$/, '')}/index.html`,
     section,
     title,
+    seoTitle,
     description,
     tags,
     order: optionalNumber(data, 'order') ?? 999,
@@ -396,41 +415,12 @@ function write(file: string, contents: string | Buffer): void {
   writeFileSync(file, contents)
 }
 
-function buildSitemap(pages: DocPage[]): string {
-  const urls: Array<{ loc: string; lastmod?: string }> = [
-    ...pages.filter((p) => !p.noindex).map((p) => ({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: p.lastmod })),
-    // Undated: the SPA's pages are not dated from git (FR-87).
-    ...PUBLIC_SPA_ROUTES.map((r) => ({ loc: `${SITE_ORIGIN}${r}` })),
-  ]
-  return (
-    `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
-    urls
-      .map(
-        (u) =>
-          `  <url>\n    <loc>${u.loc}</loc>\n` +
-          (u.lastmod ? `    <lastmod>${u.lastmod}</lastmod>\n` : '') +
-          `  </url>`,
-      )
-      .join('\n') +
-    `\n</urlset>\n`
-  )
-}
-
-function buildRobots(): string {
-  return (
-    `# Roomler — https://roomler.ai\n` +
-    `User-agent: *\n` +
-    `Allow: /\n` +
-    `# The application itself is behind auth and client-rendered; there is\n` +
-    `# nothing there for a crawler, and tenant ids should not be enumerated.\n` +
-    `Disallow: /tenant/\n` +
-    `Disallow: /oauth/\n` +
-    `Disallow: /consent/\n` +
-    `Disallow: /invite/\n` +
-    `\n` +
-    `Sitemap: ${SITE_ORIGIN}/sitemap.xml\n`
-  )
+/** The docs pages a crawler is asked to index: not the noindexed, not the
+ *  tag listings (see the note where this is written). */
+function docsUrlEntries(pages: DocPage[]): UrlEntry[] {
+  // The date part: what `git log -1 --format=%cs` prints for the file, which
+  // is what the public-site smoke compares the sitemap against.
+  return pages.filter((p) => !p.noindex).map((p) => ({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: p.lastmod?.slice(0, 10) }))
 }
 
 // ── main ────────────────────────────────────────────────────────────────
@@ -509,9 +499,22 @@ function main(): void {
   }
   const renderable = [...allPages, ...tagPages]
 
+  // Errors name the file an author would open; a generated page, its URL.
+  const idOf = (p: DocPage) => (p.sourceFile ? `ui/docs/content/${p.sourceFile}.md` : p.url)
+
+  // A title that does not fit even bare is cut off in every search result.
+  for (const p of renderable) {
+    if (docsTitle(p) === null) {
+      fail(
+        `${idOf(p)} — title "${p.title}" is ${p.title.length} chars, ` +
+          `over ${MAX_TITLE_CHARS} even without the section and site name; add a \`seoTitle\``,
+      )
+    }
+  }
+
   const linkErrors = checkLinks(
     renderable.map((p) => ({
-      id: p.sourceFile ? `${p.sourceFile}.md` : p.url,
+      id: idOf(p),
       url: p.url,
       html: p.html,
       anchors: new Set(p.headings.map((h) => h.slug)),
@@ -638,8 +641,16 @@ function main(): void {
   // what we submit thin listing pages, which is how a tag system reads as
   // doorway pages. They stay crawlable via their links; they are just not
   // advertised.
-  write(join(DIST, 'sitemap.xml'), buildSitemap(allPages))
-  write(join(DIST, 'robots.txt'), buildRobots())
+  //
+  // FR-87: `/sitemap.xml` is an INDEX, one child per collection, so Search
+  // Console reports each on its own. The blog adds `sitemap-blog.xml`.
+  const docsUrls = docsUrlEntries(allPages)
+  write(join(DIST, 'sitemap-docs.xml'), urlset(docsUrls))
+  write(
+    join(DIST, 'sitemap.xml'),
+    sitemapIndex([{ loc: `${SITE_ORIGIN}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]),
+  )
+  write(join(DIST, 'robots.txt'), robotsTxt(SITE_ORIGIN))
 
   const ms = Date.now() - t0
   // The date source is in the log because its absence is otherwise silent:
