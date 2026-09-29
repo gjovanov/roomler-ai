@@ -15,6 +15,9 @@ webrtc-dump
 node_modules
 ui/node_modules
 ui/dist
+# FR-87: generated from git history by `bun docs/dates.ts --write` just before
+# an image build (hosted-image.yml). A committed copy would go stale at once.
+ui/docs/content-dates.json
 /models/
 media/
 ui/test-results/

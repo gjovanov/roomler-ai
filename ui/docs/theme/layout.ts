@@ -15,7 +15,16 @@
  */
 import { BASE, OG_IMAGE, SITE_NAME, SITE_ORIGIN, SITE_TITLE_SUFFIX, type SectionDef } from '../site.ts'
 import { icon } from './icons.ts'
-import { escapeHtml, type Heading } from './render.ts'
+import { escapeHtml, type Heading, type ResolvedImage } from './render.ts'
+
+/** The theme's own files, published under content-hashed names (FR-87). */
+export interface SiteAssets {
+  css: string
+  js: string
+  search: string
+  osPreference: string
+  searchIndex: string
+}
 
 export interface DocPage {
   /** Path under content/, without extension: `start/install/windows`. */
@@ -29,7 +38,7 @@ export interface DocPage {
   description: string
   tags: string[]
   order: number
-  hero?: string
+  hero?: ResolvedImage
   heroAlt?: string
   noindex: boolean
   /** Rendered body HTML. */
@@ -39,8 +48,14 @@ export interface DocPage {
   plain: string
   /** Emit FAQPage structured data from this page's h2s. */
   faq: boolean
-  /** ISO date from git, for the sitemap and the page footer. */
-  lastmod: string
+  /** When the content last changed (`YYYY-MM-DD`): front-matter `updated`,
+   *  else git, else the dates manifest. UNDEFINED when none of them knows,
+   *  and then no date is published at all — never the build date (FR-87). */
+  lastmod?: string
+  /** When the source file first appeared in git, when known. */
+  created?: string
+  /** The 404 page: no canonical, no structured data, never indexed. */
+  notFound?: boolean
   /** Path under `content/` this page was authored from, without extension.
    *  Absent for GENERATED pages — tag indexes, and a section index nobody
    *  wrote. Those must not offer "Edit this page": the link would point at
@@ -56,6 +71,7 @@ export interface NavSection {
 export interface LayoutCtx {
   nav: NavSection[]
   page: DocPage
+  assets: SiteAssets
   prev?: DocPage
   next?: DocPage
   /** Extra JSON-LD objects beyond the per-page defaults. */
@@ -197,10 +213,28 @@ function faqJsonLd(page: DocPage): unknown | null {
   return { '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: entries }
 }
 
+/** "Last updated … · Edit this page", each part only when it is true: no
+ *  date when none is known, no edit link on a page no file produces. */
+function pageMeta(page: DocPage): string {
+  const parts: string[] = []
+  if (page.lastmod) parts.push(`Last updated <time datetime="${page.lastmod}">${page.lastmod}</time>`)
+  if (page.sourceFile) {
+    parts.push(
+      `<a href="https://github.com/gjovanov/roomler-ai/edit/master/ui/docs/content/${page.sourceFile}.md" target="_blank" rel="noopener noreferrer">Edit this page</a>`,
+    )
+  }
+  return parts.length ? `<p class="page-meta">\n      ${parts.join(' ·\n      ')}\n    </p>` : ''
+}
+
 export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
-  const { page, nav, prev, next } = ctx
+  const { page, nav, prev, next, assets } = ctx
   const crumb = breadcrumbs(page)
   const canonical = `${SITE_ORIGIN}${page.url}`
+  // The 404 page answers for every missing URL, so it has no address of its
+  // own to declare, and nothing in it is a thing to describe to a crawler.
+  const urlMeta = page.notFound
+    ? ''
+    : `<link rel="canonical" href="${canonical}">\n<meta property="og:url" content="${canonical}">\n`
   const fullTitle =
     page.slug === 'index'
       ? `${SITE_TITLE_SUFFIX} — remote desktop, private mesh network, chat & video`
@@ -215,7 +249,9 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
       headline: page.title,
       description: page.description,
       url: canonical,
-      dateModified: page.lastmod,
+      // Omitted, not guessed, when unknown (FR-87): a wrong dateModified is
+      // worse than none, because it teaches a crawler to ignore ours.
+      ...(page.lastmod ? { dateModified: page.lastmod } : {}),
       inLanguage: 'en',
       keywords: page.tags.join(', '),
       author: { '@type': 'Organization', name: 'G ROX LTD' },
@@ -231,9 +267,13 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
   const faq = faqJsonLd(page)
   if (faq) structured.push(faq)
   if (ctx.extraJsonLd) structured.push(...ctx.extraJsonLd)
+  const jsonLd = page.notFound ? '' : jsonLdBlock(structured)
 
+  // The hero's REAL size (FR-87), read from the file: FR-60 hard-coded
+  // 960×420 for heroes that are 760×400 or 600×540, reserving the wrong box.
+  // It is the first thing in view, so it loads first rather than lazily.
   const hero = page.hero
-    ? `<figure class="hero"><img src="${escapeHtml(page.hero)}" alt="${escapeHtml(page.heroAlt ?? page.title)}" loading="eager" decoding="async" width="960" height="420"></figure>`
+    ? `<figure class="hero"><img src="${escapeHtml(page.hero.url)}" alt="${escapeHtml(page.heroAlt ?? page.title)}" width="${page.hero.width}" height="${page.hero.height}" loading="eager" fetchpriority="high" decoding="async"></figure>`
     : ''
 
   const toc = tocHtml(page.headings)
@@ -245,12 +285,10 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(fullTitle)}</title>
 <meta name="description" content="${escapeHtml(page.description)}">
-<link rel="canonical" href="${canonical}">
-${page.noindex ? '<meta name="robots" content="noindex, follow">\n' : ''}<meta property="og:type" content="article">
+${urlMeta}${page.noindex ? '<meta name="robots" content="noindex, follow">\n' : ''}<meta property="og:type" content="article">
 <meta property="og:site_name" content="${SITE_NAME}">
 <meta property="og:title" content="${escapeHtml(page.title)}">
 <meta property="og:description" content="${escapeHtml(page.description)}">
-<meta property="og:url" content="${canonical}">
 <meta property="og:image" content="${SITE_ORIGIN}${OG_IMAGE}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${escapeHtml(page.title)}">
@@ -258,9 +296,9 @@ ${page.noindex ? '<meta name="robots" content="noindex, follow">\n' : ''}<meta p
 <meta name="twitter:image" content="${SITE_ORIGIN}${OG_IMAGE}">
 <meta name="theme-color" content="#009688">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="${BASE}/assets/docs.css">
-<script src="${BASE}/assets/os-preference.js"></script>
-${jsonLdBlock(structured)}
+<link rel="stylesheet" href="${assets.css}">
+<script src="${assets.osPreference}"></script>
+${jsonLd}
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -296,13 +334,7 @@ ${jsonLdBlock(structured)}
 ${page.html}
     </div>
     ${pager(prev, next)}
-    <p class="page-meta">
-      Last updated <time datetime="${page.lastmod}">${page.lastmod}</time>${
-        page.sourceFile
-          ? ` ·\n      <a href="https://github.com/gjovanov/roomler-ai/edit/master/ui/docs/content/${page.sourceFile}.md" target="_blank" rel="noopener noreferrer">Edit this page</a>`
-          : ''
-      }
-    </p>
+    ${pageMeta(page)}
   </main>
 
   ${toc ? `<aside class="toc-rail">${toc}</aside>` : '<aside class="toc-rail"></aside>'}
@@ -336,7 +368,7 @@ ${page.html}
   </div>
 </footer>
 
-<dialog class="search-dialog" data-search-dialog aria-label="Search documentation">
+<dialog class="search-dialog" data-search-dialog data-search-index="${assets.searchIndex}" aria-label="Search documentation">
   <form class="search-form" method="dialog" role="search">
     ${icon('search', { size: 18, cls: 'search-form__icon' })}
     <input type="search" class="search-input" data-search-input placeholder="Search the docs…" autocomplete="off" spellcheck="false" aria-label="Search query">
@@ -346,8 +378,8 @@ ${page.html}
   <p class="search-hint"><kbd>&uarr;</kbd><kbd>&darr;</kbd> to navigate · <kbd>Enter</kbd> to open · <kbd>Esc</kbd> to close</p>
 </dialog>
 
-<script src="${BASE}/assets/docs.js" defer></script>
-<script src="${BASE}/assets/search.js" defer></script>
+<script src="${assets.js}" defer></script>
+<script src="${assets.search}" defer></script>
 </body>
 </html>
 `
