@@ -19,6 +19,9 @@
  * 2. The newsletter form, where the server mounts the list (`saas`).
  * 3. Live prices from `/api/stripe/plans`, the single source of truth; the
  *    page ships the fallback table from `ui/src/utils/landing.ts`.
+ * 4. FR-88 (#1790): the `subscribe` goal after the newsletter's 202, and the
+ *    campaign as the form's `source` when `attribution.js` found one on the
+ *    URL (it sets `data-source`; without it the source stays `home`).
  *
  * With JavaScript off the page is complete; only the form is replaced by a
  * pointer to sign-up.
@@ -41,6 +44,16 @@
   function ready(fn) {
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn)
     else fn()
+  }
+
+  // A purestat goal (FR-88 §3b). A no-op without the script (`ANALYTICS =
+  // null`, blocked, not loaded yet), and it never throws.
+  function goal(name) {
+    try {
+      if (typeof window.purestat === 'function') window.purestat(name)
+    } catch (e) {
+      /* analytics must never break the page */
+    }
   }
 
   function initNewsletter() {
@@ -81,13 +94,14 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ email: email, source: 'home' }),
+        body: JSON.stringify({ email: email, source: form.getAttribute('data-source') || 'home' }),
       })
         .then(function (r) {
           if (!r.ok) throw new Error('HTTP ' + r.status)
           form.hidden = true
           status.textContent = 'Thanks — check your inbox for a confirmation link.'
           status.hidden = false
+          goal('subscribe')
         })
         .catch(function () {
           status.textContent = 'Could not reach the server. Please try again.'

@@ -22,6 +22,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { markSignedIn, clearSignedIn } from '@/api/session'
+import { isOAuthSignup, trackGoal } from '@/utils/goals'
 
 const router = useRouter()
 const route = useRoute()
@@ -43,6 +44,10 @@ onMounted(async () => {
   // The server still appends `#token=` for older cached bundles. We ignore the
   // value but still strip the fragment, so it does not linger in history or
   // get copy-pasted out of the address bar.
+  //
+  // FR-88 §3b: the one thing read from the URL first is whether this callback
+  // CREATED the account (`signup=1`, set by the server).
+  const createdAccount = isOAuthSignup(window.location.hash, window.location.search)
   window.history.replaceState({}, '', window.location.pathname)
 
   // Validate with a RAW fetch, outside the api client. Rationale: on a failed
@@ -59,6 +64,10 @@ onMounted(async () => {
     clearSignedIn()
     return
   }
+
+  // ⚠️ Only now, with the URL cleaned above: purestat sends `location.href`
+  // with every event, and the fragment held the access token.
+  if (createdAccount) trackGoal('signup')
 
   try {
     markSignedIn()

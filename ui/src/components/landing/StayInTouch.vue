@@ -65,6 +65,8 @@
 import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { newsletterSource, queryOf } from '@/utils/attribution'
+import { trackGoal } from '@/utils/goals'
 
 const props = withDefaults(
   defineProps<{ source?: string; variant?: 'dark' | 'light'; hideLede?: boolean }>(),
@@ -88,12 +90,16 @@ async function submit() {
     // ⚠️ Path is relative to the client's BASE_URL, which is already '/api' —
     // this line once said '/api/subscribe', the wire request was
     // POST /api/api/subscribe, and every submission 404'd (FR-58 evidence 1).
-    await api.post('/subscribe', { email: email.value.trim(), source: props.source })
+    // FR-88 §3a: a campaign on this page's URL stands in for the form's own
+    // source. Read at submit time from the URL; nothing is stored.
+    const source = newsletterSource(queryOf(window.location.search), props.source)
+    await api.post('/subscribe', { email: email.value.trim(), source })
     // Success is the ONLY branch, by design — see the comment at the top of
     // this file. The server does not tell us which outcome occurred.
     done.value = true
     email.value = ''
     emit('subscribed')
+    trackGoal('subscribe')
   } catch {
     // Only a transport or server failure lands here; a rejected address does
     // not, because the endpoint accepts everything that parses.

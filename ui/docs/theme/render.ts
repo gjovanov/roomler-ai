@@ -160,6 +160,21 @@ function renderEnroll(kind: 'agent' | 'tunnel', groupId: string): string {
 }
 
 /**
+ * FR-88 (#1790) §3b: an agent install or enroll command — the one-line
+ * installers, or `roomlerd`/`roomler … enroll … --server`. Its copy button
+ * counts toward purestat's `install-copy` goal (`docs.js` reads the
+ * `data-install` this puts on the block). Decided from the command itself, so
+ * the `:::enroll` blocks and the install guides' hand-written fences count
+ * alike.
+ */
+export function isInstallCommand(code: string): boolean {
+  return (
+    /\/api\/setup\/install\.(?:sh|ps1)\b/.test(code) ||
+    /\broomlerd?\b[^\n]*\benroll\b[^\n]*--server\b/.test(code)
+  )
+}
+
+/**
  * A code block with its own header row.
  *
  * ⚠️ The language label and the copy button are in a HEADER, not absolutely
@@ -170,7 +185,7 @@ function renderEnroll(kind: 'agent' | 'tunnel', groupId: string): string {
 function codeBlock(code: string, lang: string): string {
   const label = lang ? escapeHtml(lang) : ''
   return (
-    `<div class="code-block" data-code>` +
+    `<div class="code-block" data-code${isInstallCommand(code) ? ' data-install' : ''}>` +
     `<div class="code-head"><span class="code-lang">${label}</span>` +
     `<button class="code-copy" type="button" aria-label="Copy code to clipboard">${icon('copy', { size: 15 })}</button></div>` +
     `<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code)}</code></pre></div>`

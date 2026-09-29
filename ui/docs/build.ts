@@ -35,6 +35,7 @@ import {
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
+import { ATTRIBUTION_ENABLED } from '../src/utils/attribution.ts'
 import {
   BASE,
   BLOG_BASE,
@@ -718,6 +719,8 @@ function main(): void {
     blogCss: hasBlog ? assets.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
     homeCss: assets.publishFile(join(THEME_DIR, 'home.css')),
     homeJs: assets.publishFile(join(THEME_DIR, 'home.js')),
+    // FR-88: the carry script, on every page; the SPA's kill switch drops it.
+    attribution: ATTRIBUTION_ENABLED ? assets.publishFile(join(THEME_DIR, 'attribution.js')) : undefined,
   }
 
   // Reading order for prev/next is the sidebar order: sections in declared
