@@ -1566,6 +1566,10 @@ jobs:
           test -f dist/sitemap.xml || { echo "::error::docs: dist/sitemap.xml missing"; exit 1; }
           test -f dist/robots.txt || { echo "::error::docs: dist/robots.txt missing"; exit 1; }
           test -f dist/docs/index.html || { echo "::error::docs: dist/docs/index.html missing"; exit 1; }
+          # FR-87: /sitemap.xml is an INDEX; the docs' URLs live in its child.
+          grep -q '<sitemapindex' dist/sitemap.xml || { echo "::error::docs: dist/sitemap.xml is not a sitemap index"; exit 1; }
+          test -f dist/sitemap-docs.xml || { echo "::error::docs: dist/sitemap-docs.xml missing"; exit 1; }
+          test -f dist/docs/404.html || { echo "::error::docs: dist/docs/404.html missing (nginx's error_page for /docs/ and /blog/)"; exit 1; }
           exit "$docs_rc"
 
       - name: Run unit tests
