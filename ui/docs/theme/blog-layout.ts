@@ -223,9 +223,10 @@ export function renderPost(ctx: PostCtx): string {
     feed: true,
   })
 
-  const hero =
-    `<figure class="hero"><img src="${escapeHtml(post.heroImage.url)}" alt="${escapeHtml(post.heroAlt)}" ` +
-    `width="${post.heroImage.width}" height="${post.heroImage.height}" loading="eager" fetchpriority="high" decoding="async"></figure>`
+  const hero = post.heroImage
+    ? `<figure class="hero"><img src="${escapeHtml(post.heroImage.url)}" alt="${escapeHtml(post.heroAlt ?? '')}" ` +
+      `width="${post.heroImage.width}" height="${post.heroImage.height}" loading="eager" fetchpriority="high" decoding="async"></figure>`
+    : ''
   const syndication = post.syndication
     ? `<p class="post-syndication">Also published on <a href="${escapeHtml(post.syndication)}">${escapeHtml(siteLabel(post.syndication))}</a>.</p>`
     : ''

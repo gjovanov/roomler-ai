@@ -434,8 +434,6 @@ function makeNotFoundPage(nav: NavSection[]): DocPage {
 
 // ── the blog (FR-87 P4) ─────────────────────────────────────────────────
 
-const RASTER = /\.(png|jpe?g|webp|gif)$/i
-
 /** A post, rendered and checked; null after reporting why it cannot be. */
 function loadPost(file: string, now: Date): Post | null {
   const rel = relative(REPO_ROOT, file).split(sep).join('/')
@@ -449,25 +447,15 @@ function loadPost(file: string, now: Date): Post | null {
     resolveImage: (src) => publishImage(src, rel, BLOG_ASSET_SEARCH_PATHS),
     fail,
   })
-  const heroImage = publishImage(meta.hero, rel, BLOG_ASSET_SEARCH_PATHS)
+  const heroImage = meta.hero ? publishImage(meta.hero, rel, BLOG_ASSET_SEARCH_PATHS) : undefined
+  if (heroImage === null) return null
 
-  // The share image: the hero when it is raster, else `ogImage`, which must
-  // be. An SVG hero is crisp and tiny on the page, but no social platform
-  // renders an SVG card.
-  const ogName = RASTER.test(meta.hero) ? meta.hero : meta.ogImage
-  if (!ogName) {
-    fail(
-      `${rel} — the hero "${meta.hero}" is not a raster image, and social platforms cannot show it: ` +
-        `add \`ogImage:\` (PNG, JPEG or WebP, at least ${MIN_OG_IMAGE_WIDTH} px wide)`,
-    )
-    return null
-  }
-  if (!RASTER.test(ogName)) {
-    fail(`${rel} — \`ogImage: ${ogName}\` must be a PNG, JPEG, WebP or GIF`)
-    return null
-  }
+  // The share image: `ogImage`, else the hero when it is raster. That one of
+  // them exists and is raster is `readPostMeta`'s contract; its WIDTH needs
+  // the file, so it is checked here.
+  const ogName = meta.ogImage ?? meta.hero!
   const og = ogName === meta.hero ? heroImage : publishImage(ogName, rel, BLOG_ASSET_SEARCH_PATHS)
-  if (!heroImage || !og) return null
+  if (!og) return null
   if (og.width < MIN_OG_IMAGE_WIDTH) {
     fail(`${rel} — the share image "${ogName}" is ${og.width} px wide; Google and social platforms want at least ${MIN_OG_IMAGE_WIDTH}`)
     return null
@@ -480,7 +468,7 @@ function loadPost(file: string, now: Date): Post | null {
     outFile: `${slug}/index.html`,
     sourceFile: rel,
     heroImage,
-    og: { url: `${SITE_ORIGIN}${og.url}`, width: og.width, height: og.height, alt: meta.heroAlt },
+    og: { url: `${SITE_ORIGIN}${og.url}`, width: og.width, height: og.height, alt: (meta.ogImageAlt ?? meta.heroAlt)! },
     html,
     headings,
     plain,

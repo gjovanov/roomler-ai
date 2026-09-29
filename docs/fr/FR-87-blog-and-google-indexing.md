@@ -168,13 +168,16 @@ P4 builds this in `theme/posts.ts` (the post contract, pure and tested), `theme/
 `theme/blog.css`, and the feed in `theme/xml.ts`. The author's guide is `ui/blog/README.md`.
 
 - **Posts** live at `/blog/<slug>/`. They require `title`, `description` (≤160), `date`,
-  `author` (a key in `AUTHORS`), `tags`, `hero` and `heroAlt`. `date` and `updated` are full
-  ISO timestamps (the Atom feed needs the time and zone, and Google flags a bare date).
-- **Optional keys:** `seoTitle`, `subtitle`, `updated`, `related` (link-checked internal URLs),
-  `syndication` (the Medium copy), `canonical` (off-site only) and `ogImage`.
-- **The share image** must be raster and at least 1200 px wide. A raster hero is its own share
-  image; an SVG hero (crisp and a few KB on the page, but no social platform renders an SVG
-  card) needs `ogImage`. A post's images are looked up in `ui/blog/assets/` first, then the
+  `author` (a key in `AUTHORS`) and `tags`. `date` and `updated` are full ISO timestamps (the
+  Atom feed needs the time and zone, and Google flags a bare date).
+- **Optional keys:** `seoTitle`, `subtitle`, `updated`, `hero` + `heroAlt`, `ogImage` +
+  `ogImageAlt`, `related` (link-checked internal URLs), `syndication` (the Medium copy) and
+  `canonical` (off-site only). The hero is optional because the first post showed why: its
+  first image sits mid-text after "What it looks like today:", so moving it up would leave that
+  sentence pointing at nothing, and repeating it would show it twice.
+- **The share image** must be raster and at least 1200 px wide, and every post has one. A
+  raster hero is its own share image; an SVG hero (crisp and a few KB on the page, but no
+  social platform renders an SVG card), or no hero, needs `ogImage`. A post's images are looked up in `ui/blog/assets/` first, then the
   shared docs artwork, and published hashed under `/docs/assets/` with everything else.
 - **Drafts:** there is no `draft` key, and a future `date` is a build error. A file in
   `ui/blog/posts/` counts as published, and drafts stay in the private promo repo, per

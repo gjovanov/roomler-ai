@@ -86,6 +86,12 @@ describe('a post page', () => {
   it('loads the hero first', () => {
     expect(render()).toMatch(/<figure class="hero"><img [^>]*width="760" height="400" loading="eager" fetchpriority="high"/)
   })
+
+  it('renders no hero for a post without one, and still shares its image', () => {
+    const html = render({ hero: undefined, heroAlt: undefined, heroImage: undefined })
+    expect(html).not.toContain('class="hero"')
+    expect(html).toContain('<meta property="og:image" content="https://roomler.ai/docs/assets/teamviewer-og.0123456789.png">')
+  })
 })
 
 describe('the index', () => {
