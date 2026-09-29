@@ -4,7 +4,79 @@
  * FR-87 (#1776) — the sitemap index, its urlsets, robots.txt.
  */
 import { describe, expect, it } from 'vitest'
-import { newest, robotsTxt, sitemapIndex, urlset, xmlEscape } from '../theme/xml.ts'
+import { atomFeed, feedHtml, newest, robotsTxt, sitemapIndex, urlset, xmlEscape, type FeedInput } from '../theme/xml.ts'
+
+/** Parsed by a real XML parser (jsdom's), so "well-formed" is checked, not assumed. */
+function parseXml(xml: string): Document {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml')
+  const err = doc.getElementsByTagName('parsererror')[0]
+  if (err) throw new Error(`not well-formed: ${err.textContent}`)
+  return doc
+}
+
+const FEED: FeedInput = {
+  id: 'https://roomler.ai/blog/',
+  selfUrl: 'https://roomler.ai/blog/feed.xml',
+  htmlUrl: 'https://roomler.ai/blog/',
+  title: 'Roomler blog',
+  subtitle: 'Posts & notes',
+  updated: '2026-09-28T20:52:50Z',
+  entries: [
+    {
+      id: 'https://roomler.ai/blog/a/',
+      url: 'https://roomler.ai/blog/a/',
+      title: 'Wife’s swearing & <TeamViewer>',
+      summary: 'Why "Roomler" exists',
+      contentHtml: '<p>A <a href="https://roomler.ai/docs/">link</a> &amp; <code>&lt;tag&gt;</code></p>',
+      published: '2026-09-25T22:45:13Z',
+      updated: '2026-09-28T20:52:50Z',
+      author: { name: 'Goran Jovanov', uri: 'https://github.com/gjovanov' },
+      tags: ['teamviewer', 'remote-desktop'],
+    },
+  ],
+}
+
+describe('atomFeed', () => {
+  it('is well-formed Atom, with the entry and its full content intact', () => {
+    const doc = parseXml(atomFeed(FEED))
+    expect(doc.documentElement.namespaceURI).toBe('http://www.w3.org/2005/Atom')
+    const entry = doc.getElementsByTagName('entry')[0]!
+    expect(entry.getElementsByTagName('title')[0]!.textContent).toBe('Wife’s swearing & <TeamViewer>')
+    const content = entry.getElementsByTagName('content')[0]!
+    expect(content.getAttribute('type')).toBe('html')
+    // The HTML survives the round trip exactly: escaped once, decoded once.
+    expect(content.textContent).toBe(FEED.entries[0]!.contentHtml)
+    expect([...entry.getElementsByTagName('category')].map((c) => c.getAttribute('term'))).toEqual(['teamviewer', 'remote-desktop'])
+  })
+
+  it('names itself and the page it mirrors', () => {
+    const doc = parseXml(atomFeed(FEED))
+    const links = [...doc.documentElement.children].filter((n) => n.tagName === 'link')
+    expect(links.map((l) => `${l.getAttribute('rel')} ${l.getAttribute('href')}`)).toEqual([
+      'self https://roomler.ai/blog/feed.xml',
+      'alternate https://roomler.ai/blog/',
+    ])
+  })
+})
+
+describe('feedHtml', () => {
+  it('makes site links and images absolute, and leaves other URLs alone', () => {
+    const out = feedHtml('<a href="/docs/x/">x</a><img src="/docs/assets/a.png"><a href="//cdn.example/y">y</a><a href="https://e.com/">e</a>', 'https://roomler.ai')
+    expect(out).toContain('href="https://roomler.ai/docs/x/"')
+    expect(out).toContain('src="https://roomler.ai/docs/assets/a.png"')
+    expect(out).toContain('href="//cdn.example/y"')
+    expect(out).toContain('href="https://e.com/"')
+  })
+
+  it("drops the page's own chrome: permalinks, copy buttons, icons", () => {
+    const out = feedHtml(
+      '<h2 id="a">A<a class="heading-anchor" href="#a"><svg viewBox="0 0 1 1"></svg></a></h2>' +
+        '<div class="code-head"><button class="code-copy" type="button"><svg></svg></button></div>',
+      'https://roomler.ai',
+    )
+    expect(out).toBe('<h2 id="a">A</h2><div class="code-head"></div>')
+  })
+})
 
 describe('urlset', () => {
   it('writes lastmod when known and OMITS it when not — never a stand-in date', () => {

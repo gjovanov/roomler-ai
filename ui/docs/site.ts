@@ -90,6 +90,61 @@ export const OG_IMAGE_META = {
   alt: 'Roomler: remote desktop, a private network and team chat on one agent',
 } as const
 
+// ── the blog (FR-87 P4) ─────────────────────────────────────────────────
+
+/** Posts are `ui/blog/posts/<slug>.md`, served under this prefix. */
+export const BLOG_BASE = '/blog'
+export const BLOG_TITLE = 'Roomler blog'
+export const BLOG_DESCRIPTION =
+  'Why Roomler exists and how it is built: remote desktop from a browser tab, a private mesh network and team collaboration on one open-source agent.'
+export const POSTS_PER_PAGE = 10
+/** As with docs tags: a tag page below this is a doorway page, not a page. */
+export const MIN_POSTS_PER_TAG_INDEX = 3
+/** Social platforms and Google want a raster share image at least this wide. */
+export const MIN_OG_IMAGE_WIDTH = 1200
+export const WORDS_PER_MINUTE = 230
+
+/**
+ * Every front-matter key a post may use; anything else fails the build.
+ * There is deliberately no `draft`: a file in `ui/blog/posts/` IS published,
+ * and unpublished copy stays in the private promo repo (FR-39's rule that
+ * post copy does not live in this public repo).
+ */
+export const BLOG_FRONTMATTER_KEYS = [
+  'title',
+  'seoTitle',
+  'subtitle',
+  'description',
+  'date',
+  'updated',
+  'author',
+  'tags',
+  'hero',
+  'heroAlt',
+  'ogImage',
+  'related',
+  'syndication',
+  'canonical',
+] as const
+
+export interface Author {
+  name: string
+  /** A page about the author: what `author.url` in the structured data names. */
+  url: string
+  sameAs: string[]
+  /** Written by the author, never generated. The author box omits it until then. */
+  bio?: string
+}
+
+/** Keyed by a post's `author:`. */
+export const AUTHORS: Record<string, Author> = {
+  goran: {
+    name: 'Goran Jovanov',
+    url: 'https://github.com/gjovanov',
+    sameAs: ['https://github.com/gjovanov', 'https://medium.com/@gjovanov'],
+  },
+}
+
 /**
  * First-party analytics on the static pages, the same script the SPA loads
  * (`ui/index.html`), which the pod CSP already allows (`script-src

@@ -164,10 +164,18 @@ scripts), `theme/structured.ts` and `theme/xml.ts`.
 
 ### 4e. The blog
 
+P4 builds this in `theme/posts.ts` (the post contract, pure and tested), `theme/blog-layout.ts`,
+`theme/blog.css`, and the feed in `theme/xml.ts`. The author's guide is `ui/blog/README.md`.
+
 - **Posts** live at `/blog/<slug>/`. They require `title`, `description` (≤160), `date`,
-  `author` (a key in `AUTHORS`), `tags`, `hero` and `heroAlt`.
+  `author` (a key in `AUTHORS`), `tags`, `hero` and `heroAlt`. `date` and `updated` are full
+  ISO timestamps (the Atom feed needs the time and zone, and Google flags a bare date).
 - **Optional keys:** `seoTitle`, `subtitle`, `updated`, `related` (link-checked internal URLs),
-  `syndication` (the Medium copy) and `canonical` (off-site only).
+  `syndication` (the Medium copy), `canonical` (off-site only) and `ogImage`.
+- **The share image** must be raster and at least 1200 px wide. A raster hero is its own share
+  image; an SVG hero (crisp and a few KB on the page, but no social platform renders an SVG
+  card) needs `ogImage`. A post's images are looked up in `ui/blog/assets/` first, then the
+  shared docs artwork, and published hashed under `/docs/assets/` with everything else.
 - **Drafts:** there is no `draft` key, and a future `date` is a build error. A file in
   `ui/blog/posts/` counts as published, and drafts stay in the private promo repo, per
   FR-39's rule on post copy.
@@ -185,7 +193,9 @@ scripts), `theme/structured.ts` and `theme/xml.ts`.
 - **Search and linking:** posts join the site search. A docs page linked from a post shows an
   "On the blog" backlink. The topbar and footer gain Blog and RSS links.
 - **Kill switch:** an empty `ui/blog/posts/` produces no `/blog` output, links, feed or sitemap
-  entries.
+  entries. Measured: with no posts, P4's `dist/docs`, sitemaps and robots.txt are
+  byte-identical to P3's. The blog's styles live in their own `blog.css`, published and linked
+  only once a post exists, so the docs' stylesheet (and every docs page) is unchanged.
 
 ### 4f. nginx (`files/nginx-pod.conf`)
 
