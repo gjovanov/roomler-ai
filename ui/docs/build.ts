@@ -55,6 +55,7 @@ import {
 } from './site.ts'
 import { AssetEmitter } from './theme/assets.ts'
 import { renderBlogIndex, renderBlogTag, renderPost } from './theme/blog-layout.ts'
+import { renderHome } from './theme/home-layout.ts'
 import {
   optionalBoolean,
   optionalNumber,
@@ -71,6 +72,7 @@ import { createRenderer, escapeHtml, renderMarkdown, type ResolvedImage } from '
 import { docsTitle, renderPage, type DocPage, type NavSection, type SiteAssets } from './theme/layout.ts'
 import {
   docsBacklinks,
+  indexPageUrl,
   lastTouched,
   paginate,
   postUrl,
@@ -611,21 +613,31 @@ function main(): void {
   for (const p of posts) for (const t of p.tags) postsByTag.set(t, [...(postsByTag.get(t) ?? []), p])
   const blogTagIndexed = new Set([...postsByTag].filter(([, ps]) => ps.length >= MIN_POSTS_PER_TAG_INDEX).map(([t]) => t))
 
-  const linkErrors = checkLinks(
-    [
-      ...renderable.map((p) => ({
-        id: idOf(p),
-        url: p.url,
-        html: p.html,
-        anchors: new Set(p.headings.map((h) => h.slug)),
-      })),
-      ...posts.map((p) => ({ id: p.sourceFile, url: p.url, html: p.html, anchors: new Set(p.headings.map((h) => h.slug)) })),
-    ],
-    // Other internal links point at the SPA (/landing, /register …); this
-    // generator does not own those routes, so it cannot verify them.
-    (path) => path.startsWith(`${BASE}/`) || path.startsWith(`${BLOG_BASE}/`),
-  )
+  const linkPages = [
+    ...renderable.map((p) => ({
+      id: idOf(p),
+      url: p.url,
+      html: p.html,
+      anchors: new Set(p.headings.map((h) => h.slug)),
+    })),
+    ...posts.map((p) => ({ id: p.sourceFile, url: p.url, html: p.html, anchors: new Set(p.headings.map((h) => h.slug)) })),
+    // The blog's generated listings are link targets too (no body to check).
+    ...(hasBlog
+      ? [
+          ...paginate(posts, POSTS_PER_PAGE).map((_, i) => indexPageUrl(i + 1)),
+          ...[...blogTagIndexed].map((t) => `${BLOG_BASE}/tags/${encodeURIComponent(t)}/`),
+        ].map((url) => ({ id: url, url, html: '', anchors: new Set<string>() }))
+      : []),
+  ]
+  // Other internal links point at the SPA (/register, /login …); this
+  // generator does not own those routes, so it cannot verify them.
+  const owns = (path: string) => path.startsWith(`${BASE}/`) || path.startsWith(`${BLOG_BASE}/`)
+  const linkErrors = checkLinks(linkPages, owns)
   for (const e of linkErrors) fail(e)
+
+  // The static homepage's art, resolved with every other image so a missing
+  // file is reported with the rest (P6).
+  const homeHero = publishImage('hero-mesh.svg', 'ui/docs/theme/home-layout.ts')
 
   // A post's `related:` pages are listed as cards, so each must exist.
   const pagesByUrl = new Map<string, { url: string; title: string; description: string }>(
@@ -704,6 +716,8 @@ function main(): void {
     searchIndex: assets.publishBytes('search-index.json', indexJson),
     // Published only with a post, so a site without one ships the same bytes.
     blogCss: hasBlog ? assets.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
+    homeCss: assets.publishFile(join(THEME_DIR, 'home.css')),
+    homeJs: assets.publishFile(join(THEME_DIR, 'home.js')),
   }
 
   // Reading order for prev/next is the sidebar order: sections in declared
@@ -735,6 +749,19 @@ function main(): void {
     write(join(OUT, page.outFile), html)
   }
   write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets, site }, tagIndexed))
+
+  // The static homepage (P6): nginx serves it at `/` to a request without the
+  // session cookie, and `/home/` itself is internal (files/nginx-pod.conf).
+  const homeHtml = renderHome({ assets: siteAssets, nav: { current: 'home', hasBlog }, hero: homeHero! })
+  const homeLinks = checkLinks(
+    [...linkPages, { id: 'the static homepage', url: '/', html: homeHtml, anchors: new Set([...homeHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
+    owns,
+  ).filter((e) => e.startsWith('the static homepage'))
+  if (homeLinks.length) {
+    console.error(`\n[docs] BUILD FAILED — the homepage links nowhere:\n${homeLinks.map((e) => `  • ${e}`).join('\n')}\n`)
+    process.exit(1)
+  }
+  write(join(DIST, 'home', 'index.html'), homeHtml)
 
   // The blog. Cleared first, so a post removed since the last build does
   // not survive as a stale page.
@@ -819,7 +846,9 @@ function main(): void {
   //
   // FR-87: `/sitemap.xml` is an INDEX, one child per collection, so Search
   // Console reports each on its own. The blog adds `sitemap-blog.xml`.
-  const docsUrls = docsUrlEntries(allPages)
+  // `/` leads the docs sitemap (P6): it is static HTML now, but undated, as
+  // no single source file is its content.
+  const docsUrls = [{ loc: `${SITE_ORIGIN}/` }, ...docsUrlEntries(allPages)]
   write(join(DIST, 'sitemap-docs.xml'), urlset(docsUrls))
   const children: UrlEntry[] = [{ loc: `${SITE_ORIGIN}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]
   rmSync(join(DIST, 'sitemap-blog.xml'), { force: true })

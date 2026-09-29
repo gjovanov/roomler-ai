@@ -116,8 +116,11 @@ homepage, following the `enrollCommands.ts` pattern.
 
 - Every emitted asset gets a **content-hashed name**, `name.<sha256:10>.ext`, so the one-year
   `immutable` cache is correct. The unhashed copies (`LEGACY_UNHASHED_ASSETS` in `site.ts`) are
-  emitted for one more release, so that cached HTML can still load them; the first phase that
-  ships after P2's promote turns them off.
+  emitted for one more release, so that cached HTML can still load them. They were meant to go
+  in the first phase after P2's promote, but P2 rolled with P1–P5 on 2026-09-29 and P6 is
+  ready the same day. Pre-P1 HTML carried no `Cache-Control`, so a browser may still hold it
+  under heuristic caching (about 2.8 days). The flag is therefore turned off in the first
+  release on or after **2026-10-03**, not in P6.
 - `social-preview.png` keeps its stable name, because `ui/index.html` points at it.
 - **Inline markdown images** get a markdown-it rule that emits `width`/`height` read from the
   file itself (PNG, GIF, JPEG, WebP and SVG parsed by hand, no dependency),
@@ -153,8 +156,11 @@ scripts), `theme/structured.ts` and `theme/xml.ts`.
   - `TechArticle` + `BreadcrumbList` on docs pages, now with `datePublished`, `image` and
     `mainEntityOfPage`; `CollectionPage` on the docs home and on section and tag indexes, which
     are lists, not articles; a one-item breadcrumb is dropped;
-  - `WebSite` + `Organization` + `SoftwareApplication` on the homepage. The sitelinks
-    SearchAction is not built: Google retired it in 2024.
+  - `WebSite` + `Organization` on the homepage (`structured.ts` `website()`). The sitelinks
+    SearchAction is not built: Google retired it in 2024. **Nor is `SoftwareApplication`**,
+    which this spec first listed: its rich result requires `aggregateRating` or `review`, a
+    page without them reports the markup as an error, and ratings are never invented. A unit
+    test (`home.spec.ts`) fails if either type appears.
 - `/sitemap.xml` becomes a **sitemap index** pointing at `sitemap-docs.xml` (which includes
   `/`) and `sitemap-blog.xml`, so Search Console reports each separately. The SPA routes are
   dropped.
@@ -209,6 +215,7 @@ location /blog/ { expires -1; error_page 404 /docs/404.html; }
 location = /blog/feed.xml { types { } default_type application/atom+xml; expires -1; }
 map $cookie_access_token $root_doc { "" /home/index.html; default /index.html; }   # http level
 location = / { expires -1; try_files $root_doc =404; }
+location ^~ /home/ { internal; }                     # one URL for the homepage: /
 location = /landing { return 301 /; }
 location = /pricing { return 301 /#pricing; }
 ```
@@ -224,22 +231,47 @@ location = /pricing { return 301 /#pricing; }
   measured in `nginx:stable`; it adds nothing, so P1 ships without it.)
 - **The session cookie decides the homepage.** The session is the HttpOnly `access_token`
   cookie (`crates/api/src/routes/auth.rs:247`). No cookie (guests and every crawler) gets the
-  static homepage; a cookie gets the SPA, whose router behaves as today. A stale or expired
-  cookie gets the SPA, which sends the visitor to login on its first 401.
+  static homepage; a cookie gets the SPA, whose router behaves as today. A cookie the server
+  refuses gets the SPA, which sends the visitor to login on its first 401.
+- **`try_files` serves the chosen file inside `location = /`**, so `expires -1` applies to both
+  branches, the server's security headers survive on both, and `internal` on `/home/` does not
+  block it. Without `internal`, `/home/` would be a second URL for the homepage.
+- ⚠️ **The access cookie is not the whole session.** It lives 7 days; the refresh cookie lives
+  30, but it is scoped to `Path=/api/auth/refresh` (`auth.rs:427`), so nginx never sees it at
+  `/`. A returning user between day 7 and day 30 has no cookie nginx can read, and is served
+  the static page by a site that could still sign them in silently. §4g's hand-off closes that
+  gap.
 
 ### 4g. The homepage
 
 `home-layout.ts` renders `dist/home/index.html` from `LandingView.vue`'s sections: hero, trust,
-the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
-`ui/src/utils/plans.ts`, and the call to action.
+the three pillars, "Set up a device in minutes", pricing, and the call to action. The copy and
+the fallback plan table live in `ui/src/utils/landing.ts`, a zero-import module (the
+`enrollCommands.ts` pattern) that both `LandingView.vue` and the generator import, so the two
+pages cannot drift. The install commands come from `enrollCommands.ts`, like every other place
+they appear. The SPA's Material icons map to the docs' inline SVGs, and an unmapped icon fails
+the build.
 
-- **Progressive enhancement:** `home.js`, an external script (the CSP forbids inline ones),
-  posts the newsletter form to the saas `…/subscribe` route and refreshes pricing from
-  `/api/stripe/plans`. Without JavaScript, the page stays complete and the form links to
-  sign-up.
-- **Router:** a signed-out visitor at the root, and a logout, both navigate fully to `/`.
-  `LandingView` keeps working for in-app navigation and takes its fallback plans from the
-  shared module, so there is one source for the table.
+- **Progressive enhancement:** `home.js`, an external script (the CSP forbids inline ones).
+  - **The signed-in hand-off** (§4f's gap). `home.js` loads in `<head>` without `defer`, so it
+    runs before the page paints. When the SPA's localStorage hint (`roomler-signed-in`, written
+    by `ui/src/api/session.ts`) says signed in, it replaces the page with `/login`. It must not
+    use `/`, which would serve this page again: still no cookie. The SPA's guest guard sends a
+    signed-in visitor on to the dashboard, whose first 401 refreshes the session. If the
+    refresh fails, the SPA clears the hint and shows its login page, so a stale hint cannot
+    loop. A crawler has no localStorage and stays on the page.
+  - **The newsletter form** shows where the server mounts the list (`saas` in
+    `/api/capabilities`, failing open as the SPA does) and posts to `/api/subscribe` with
+    `source: "home"`.
+  - **Live prices** from `/api/stripe/plans`, written as text, never markup.
+  - Without JavaScript, the page stays complete and the form's place links to sign-up.
+- **The router is unchanged.** This spec first had a signed-out visitor at the root, and a
+  logout, navigate fully to `/`. That was dropped because it can loop. The SPA only runs at `/`
+  when the request carried a cookie, so for a cookie the server refuses (a stale or foreign
+  token), a full navigation to `/` returns the SPA again, every time. The existing client-side
+  push to `/landing` cannot loop. Logout already expires both cookies on the server and pushes
+  `/login`, so the next `/` is the static page anyway. `LandingView` keeps working for in-app
+  navigation.
 
 ### 4h. Indexing
 
@@ -291,9 +323,11 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 
 ## 6. Acceptance criteria
 
-- [ ] **AC1:** the build emits `dist/blog/{index.html,<slug>/,feed.xml}`, `dist/home/index.html`
+- [x] **AC1:** the build emits `dist/blog/{index.html,<slug>/,feed.xml}`, `dist/home/index.html`
   and `sitemap{,-docs,-blog}.xml`, with no change to `package.json`, `bun.lock` or the
-  Dockerfile.
+  Dockerfile. *(P6 build: all seven files. `git diff 1fa7a9d58^ -- ui/package.json ui/bun.lock
+  Dockerfile`, the claim's parent to the P6 tree: empty. CI's docs step now fails without
+  `dist/home/index.html`, or without `/` in `sitemap-docs.xml`.)*
 - [x] **AC2:** every new gate is shown failing, then passing: missing alt, unknown key, `draft`,
   future `date`, `updated` < `date`, hero narrower than 1200 px, `seoTitle` over 60, a dead
   blog→docs link. *(Real builds on throwaway pages, #1780 and #1781: all eight, plus a remote
@@ -363,6 +397,10 @@ the three pillars, "Set up a device in minutes" (with `:::enroll`), pricing from
 | 2026-09-29 | production | AC10, Lighthouse 12.8.2 (mobile) | `/blog/`, the post, `/docs/compare/teamviewer/`, `/docs/remote-desktop/unattended-access/`: **Performance, Accessibility, Best Practices, SEO all 100**; LCP 0.9 / 1.7 / 1.0 / 0.9 s; CLS 0.000 on all four. `/` is owed (P6). (The PageSpeed Insights API was not usable: its keyless daily quota is shared and exhausted) |
 | 2026-09-29 | Medium | AC12 (the Medium half) | the three approved typo fixes live on the public story (verified on the page, after a first "Save and publish" that silently did nothing); the story's `<link rel="canonical">` → `https://roomler.ai/blog/self-hosted-teamviewer-alternative/`. Search Console is owed (P7) |
 | 2026-09-29 | the fleet, after the roll | counts only | devices 18 / 12 online / 5 offline, identical to before; peers 13 direct, 5 offline, 1 DERP, 1 upgrading (before: 13 / 5 / 2 DERP); this host's 7 tunnel flows all on `quic-v1`. No remote-desktop session was run: nothing in this roll touches that path |
+| 2026-09-29 | **production (pre-P6)**, `hosted-20260929-69fcf0a` | `scripts/public-site-smoke.sh https://roomler.ai . 69fcf0a35`, with P6's checks | **FAIL, 6 checks**; the 14 P1–P5 checks still pass. `/` without a cookie is the SPA shell; `/` has no `Cache-Control`; `/home/` is 200; `/landing` and `/pricing` are 200, not 301; `/` names no hashed assets. The cookie branch passes only trivially, because today the SPA answers `/` either way |
+| 2026-09-29 | P6 build in `nginx:stable` + P6's `files/nginx-pod.conf` | the same smoke | **all 20 pass**: the static homepage without a cookie, the SPA with one, the same security headers on both, `no-cache`, `/home/` 404, `/landing` → `/`, `/pricing` → `/#pricing`, and `/`'s 8 assets hashed and loading |
+| 2026-09-29 | the same, negative controls on a second container (a scratch copy of the conf; each mutation shown applied inside the container and passing `nginx -t`) | 8 mutations | each turns its named checks red, and the unmutated conf passes on the same container: the map's values swapped; the map keyed on `refresh_token`; `internal` dropped (`/home/` 200); `expires` dropped; **`add_header Cache-Control` in place of `expires`, which strips every security header from both branches**; `absolute_redirect on`; `/pricing` without its fragment; the `/landing` block removed |
+| 2026-09-29 | `ui/docs/__tests__/home.spec.ts` (24 tests), negative controls | 6 mutations of `home.js` | each turns exactly its test red: the hint key drifting from `session.ts`'s; no `return` after the hand-off; a hand-off to `/` (the loop); the newsletter failing closed; features written as markup; the subscription dropping `source`. The first run also caught a real defect: the homepage description was 161 characters, one over the limit the build enforces on every docs page, and nothing checked the homepage's |
 
 ## 10. Related
 

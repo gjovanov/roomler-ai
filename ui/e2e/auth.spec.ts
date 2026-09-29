@@ -30,11 +30,57 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/\/login/)
   })
 
-  test('unauthenticated user is redirected to login', async ({ page }) => {
+  test('an unauthenticated visitor at / gets the product page, never the app', async ({ page }) => {
+    const resp = await page.goto('/')
+    // FR-87 P6: behind the production nginx, `/` without a session cookie IS
+    // the static homepage (what every crawler reads). The vite dev server has
+    // no nginx, so there the SPA's guard shows its /landing view instead.
+    // Which of the two answered is read from the response, never assumed.
+    const html = (await resp?.text()) ?? ''
+    if (html.includes('class="home-hero__title"')) {
+      await expect(page).toHaveURL(/\/$/)
+      await expect(page.locator('h1.home-hero__title')).toBeVisible()
+      await expect(page.getByRole('link', { name: 'Log in' })).toHaveAttribute('href', '/login')
+    } else {
+      await expect(page).toHaveURL(/\/landing/)
+    }
+    await expect(page.getByText(/create your first workspace/i)).toHaveCount(0)
+  })
+
+  test('a returning user whose session cookie lapsed lands back in the app (FR-87 P6)', async ({ page, context }) => {
+    // The access cookie lives 7 days, the refresh cookie 30 — and the refresh
+    // cookie is scoped to /api/auth/refresh, so nginx never sees it at `/`
+    // and serves such a user the static homepage. Its home.js hands a browser
+    // the SPA marked signed in to /login; the guest guard sends it on to the
+    // dashboard, whose first 401 refreshes the session.
+    const user = uniqueUser()
+    await registerUserViaApi(user)
+    await loginViaUi(page, user.username, user.password)
+    const cookies = await context.cookies()
+    expect(cookies.find((c) => c.name === 'refresh_token'), 'login set no refresh_token cookie').toBeTruthy()
+    await context.clearCookies()
+    await context.addCookies(cookies.filter((c) => c.name !== 'access_token'))
+
     await page.goto('/')
-    // Router beforeEach redirects unauthenticated users to /landing
-    // (the marketing/login-prompt page), not directly to /login.
-    await expect(page).toHaveURL(/\/landing/)
+    // `/` is also the static page's URL, so the URL alone proves nothing:
+    // what proves it is authenticated content and a freshly minted cookie.
+    await expect(page.getByText(/create your first workspace/i)).toBeVisible({ timeout: 15000 })
+    await expect(page.locator('h1.home-hero__title')).toHaveCount(0)
+    await expect(page).toHaveURL(/\/$/)
+    expect((await context.cookies()).some((c) => c.name === 'access_token'), 'the refresh minted no session').toBe(true)
+  })
+
+  test('a stale signed-in hint cannot loop: it ends on the login page, cleared', async ({ page }) => {
+    // No cookies at all, but the SPA's hint says signed in: home.js hands the
+    // browser to the app, the refresh 401s, and the SPA clears the hint and
+    // shows its login page — which is where it must STAY.
+    await page.goto('/login')
+    await page.evaluate(() => localStorage.setItem('roomler-signed-in', '1'))
+    await page.goto('/')
+    await expect(page).toHaveURL(/\/login/, { timeout: 15000 })
+    await expect(page.locator('input[type="password"]')).toBeVisible()
+    expect(await page.evaluate(() => localStorage.getItem('roomler-signed-in'))).toBeNull()
+    await expect(page).toHaveURL(/\/login/)
   })
 
   test('protected deep-link redirects to login, not landing (S2)', async ({ page }) => {

@@ -117,12 +117,50 @@ else
   bad "/blog/ -> $blog (want 200 with posts, or 404 without)"
 fi
 
+# 5b. `/` (P6): the static homepage without a session cookie — what every guest
+#     and crawler gets — and the SPA with one, exactly as before. `/home/` is
+#     internal, and the SPA's old marketing routes 301 to the one page.
+home="$(curl -ksS -m 15 "$BASE/" 2>/dev/null)"
+if printf '%s' "$home" | grep -q '<h1 class="home-hero__title">' && printf '%s' "$home" | grep -q '"@type":"WebSite"'; then
+  ok "/ without a cookie -> the static homepage (H1 + WebSite JSON-LD)"
+else
+  bad "/ without a cookie -> not the static homepage (a crawler would read the SPA shell)"
+fi
+if curl -ksS -m 15 -H 'Cookie: access_token=smoke' "$BASE/" 2>/dev/null | grep -q 'id="app"'; then
+  ok "/ with a session cookie -> the SPA"
+else
+  bad "/ with a session cookie -> not the SPA (signed-in users would lose the app at /)"
+fi
+APP_SET="$(curl -ksS -m 15 -I -H 'Cookie: access_token=smoke' "$BASE/" 2>/dev/null | tr -d '\r' | sed -E 's/^([A-Za-z0-9-]+):/\L\1:/' | grep -Ei "^($SEC):" | sort)"
+if [ -n "$APP_SET" ] && [ "$APP_SET" = "$(secset "$BASE/")" ]; then
+  ok "/ security headers identical with and without the cookie"
+else
+  bad "/ security headers differ between the SPA and the static homepage"
+fi
+cc="$(header "$BASE/" cache-control)"
+case "$cc" in
+  *no-cache*) ok "/ Cache-Control: $cc" ;;
+  *) bad "/ Cache-Control: '${cc:-none}' (want no-cache)" ;;
+esac
+code="$(status "$BASE/home/")"
+[ "$code" = "404" ] && ok "/home/ -> 404 (the homepage has one URL, /)" || bad "/home/ -> $code (a second URL for the homepage)"
+for pair in "/landing /" "/pricing /#pricing"; do
+  set -- $pair
+  code="$(status "$BASE$1")"
+  loc="$(header "$BASE$1" location)"
+  if [ "$code" = "301" ] && [ "$loc" = "$2" ]; then
+    ok "$1 -> 301 Location: $loc"
+  else
+    bad "$1 -> $code Location: '${loc:-none}' (want 301 to '$2')"
+  fi
+done
+
 # 6. Every asset a page names is content-hashed — the only kind of name for
 #    which nginx's one-year `immutable` is true — and actually loads. Every
 #    image reserves its box (width + height). The og:image is absolute and
 #    keeps a stable name on purpose (the SPA's index.html points at it), so
-#    it is not matched here.
-for path in /docs/ /docs/start/quickstart/; do
+#    it is not matched here. `/` (no cookie) is the static homepage (P6).
+for path in / /docs/ /docs/start/quickstart/; do
   html="$(curl -ksS -m 20 "$BASE$path" 2>/dev/null)"
   refs="$(printf '%s' "$html" | grep -oE '(href|src|data-search-index)="/docs/assets/[^"]+"' | sed -E 's/^[^"]+"//; s/"$//' | sort -u)"
   n="$(printf '%s\n' "$refs" | grep -c .)"
