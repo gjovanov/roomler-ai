@@ -79,6 +79,17 @@ impl DamageTracker {
     /// switched off. Never returns an error: the caller's fallback is the
     /// pre-FR-29 behaviour, which is always correct, only slower.
     pub fn open() -> Option<Self> {
+        Self::open_on(None)
+    }
+
+    /// [`Self::open`] against an explicit display; `None` is `$DISPLAY`, as
+    /// `x11rb::connect` reads it.
+    ///
+    /// ⚠️ The seam a test uses instead of rewriting the process-wide
+    /// `DISPLAY`, which every concurrently running test that talks to X would
+    /// see (and the old test removed it outright afterwards, rather than
+    /// restoring it).
+    fn open_on(display: Option<&str>) -> Option<Self> {
         // Kill switch, through the canonical gate helper rather than a raw
         // `std::env::var`: that is what gives it the `ROOMLERD_` prefix, the
         // legacy prefix fallbacks, AND the config-file fallback — so an
@@ -96,7 +107,7 @@ impl DamageTracker {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_MAX_SKIP);
 
-        let (conn, screen_num) = x11rb::connect(None)
+        let (conn, screen_num) = x11rb::connect(display)
             .map_err(|e| tracing::info!(%e, "capture: no X11 connection for damage tracking"))
             .ok()?;
         let root = conn.setup().roots.get(screen_num)?.root;
@@ -316,11 +327,19 @@ mod tests {
         assert_eq!((b.x, b.y, b.w, b.h), (r.x, r.y, r.w, r.h));
     }
 
+    /// Both tests below write `ROOMLERD_X11_DAMAGE`, and libtest runs them on
+    /// parallel threads of one process. Unserialised, the second could clear
+    /// the kill switch between the first's set and its `open()`, which on a
+    /// host WITH an X server hands back a tracker and fails the assertion.
+    static KILL_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The kill switch must win even where an X server is present, because it
     /// is the operator's only lever if damage tracking misbehaves in the field.
     #[test]
     fn kill_switch_refuses_to_open() {
-        // SAFETY: single-threaded test process; no other thread reads env here.
+        let _serial = KILL_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised with the other writer by KILL_SWITCH, and only
+        // `DamageTracker::open` reads this variable.
         unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "X11_DAMAGE", "0") };
         assert!(DamageTracker::open().is_none());
         unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
@@ -329,11 +348,15 @@ mod tests {
     /// `open()` must never panic and never propagate an error, on any host —
     /// including CI containers with no X server at all. Its failure mode is a
     /// `None` that costs performance, never a capture backend that won't start.
+    ///
+    /// The unreachable display is named through `open_on`, not written to the
+    /// process-wide `DISPLAY` (see there).
     #[test]
     fn open_is_infallible_without_a_display() {
+        let _serial = KILL_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: as above. Cleared so `open_on` gets past the kill switch to
+        // the connect this test is here to exercise.
         unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
-        unsafe { std::env::set_var("DISPLAY", ":-1-not-a-display") };
-        let _ = DamageTracker::open();
-        unsafe { std::env::remove_var("DISPLAY") };
+        let _ = DamageTracker::open_on(Some(":-1-not-a-display"));
     }
 }

@@ -207,11 +207,22 @@ impl LinuxWm {
 /// installed" — the case actually measured — and a wrong answer degrades to
 /// today's behaviour, a clear error at click time.
 fn on_path(program: &str) -> bool {
+    on_path_in(program, std::env::var_os("PATH").as_deref())
+}
+
+/// [`on_path`] against an explicit `PATH` value.
+///
+/// ⚠️ The seam the tests use instead of rewriting the process-wide `PATH`.
+/// libtest runs tests on parallel threads of ONE process, so a test that set
+/// `PATH` to a scratch directory made every test spawning at that moment fail
+/// `NotFound`: CI run 36476657197 lost 11 unrelated tests at once, every exec
+/// test reading `shell "bash" is not installed on this device`.
+fn on_path_in(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = path else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| {
+    std::env::split_paths(path).any(|dir| {
         let candidate = dir.join(program);
         std::fs::metadata(&candidate)
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -238,6 +249,32 @@ const HELPERS: &[MissingTool] = &[
     },
 ];
 
+impl LinuxWm {
+    /// [`WindowManager::coverage`], with `present` answering whether a helper
+    /// is installed — [`on_path`] in production. The same seam as
+    /// [`on_path_in`], for the same reason: a test can say "nothing is
+    /// installed" without emptying the `PATH` every other test spawns through.
+    fn coverage_with(&self, present: impl Fn(&str) -> bool) -> Coverage {
+        let wayland = matches!(&self.target, Target::Session { wayland: true, .. });
+        Coverage {
+            sources: vec!["x11"],
+            unlisted: wayland.then(|| {
+                "native Wayland windows: this compositor exposes no protocol to enumerate \
+                 them (X11/Xwayland windows are listed)"
+                    .to_string()
+            }),
+            // FR-56 P5 — probed per call, never cached. A host can gain `tmux`
+            // at any moment, and FR-45 already learned that a cached
+            // capability answers about the wrong start order.
+            missing_tools: HELPERS
+                .iter()
+                .filter(|h| !present(h.tool))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 impl WindowManager for LinuxWm {
     /// FR-56 P2 — what this listing covers.
     ///
@@ -252,23 +289,7 @@ impl WindowManager for LinuxWm {
     /// management_v1` on wlroots) that GNOME/mutter deliberately does not
     /// expose — so on GNOME this gap is permanent, not a TODO.
     fn coverage(&self) -> Coverage {
-        let wayland = matches!(&self.target, Target::Session { wayland: true, .. });
-        Coverage {
-            sources: vec!["x11"],
-            unlisted: wayland.then(|| {
-                "native Wayland windows: this compositor exposes no protocol to enumerate \
-                 them (X11/Xwayland windows are listed)"
-                    .to_string()
-            }),
-            // FR-56 P5 — probed per call, never cached. A host can gain `tmux`
-            // at any moment, and FR-45 already learned that a cached
-            // capability answers about the wrong start order.
-            missing_tools: HELPERS
-                .iter()
-                .filter(|h| !on_path(h.tool))
-                .cloned()
-                .collect(),
-        }
+        self.coverage_with(on_path)
     }
 
     fn list(&self) -> Result<Vec<WindowInfo>> {
@@ -684,8 +705,39 @@ mod tests {
     /// bug being prevented is not "the logic is wrong" but "we asked the wrong
     /// environment": a probe that consults the target user's login `PATH`
     /// would pass every unit test and still disagree with the spawn.
+    ///
+    /// ⚠️ And asserted in a CHILD process: this test binary, re-run with
+    /// `PATH` set for that process alone. This test used to set the parent's
+    /// `PATH` instead, which failed every test that spawned while it held the
+    /// scratch value (see [`on_path_in`]). The logic runs here, through
+    /// `on_path_in`; only "reads the process's own `PATH`" needs the child.
     #[test]
     fn on_path_answers_about_the_daemons_own_path() {
+        const CHILD: &str = "ROOMLERD_TEST_ON_PATH_CHILD";
+        const PROBES: [&str; 3] = [
+            "roomler-p5-probe",
+            "roomler-p5-notexec",
+            "roomler-p5-does-not-exist",
+        ];
+        const EXPECT: [(bool, &str); 3] = [
+            (true, "an executable file on PATH must be found"),
+            (
+                false,
+                "a NON-executable file must not count: `Command::spawn` would fail on it, \
+                 so reporting it as present would restore the very lie this probe removes",
+            ),
+            (false, "an absent binary must not be found"),
+        ];
+        // In the child: answer with the real `on_path`, against the only PATH
+        // this process was given. stderr, because libtest writes its own
+        // progress to stdout.
+        if std::env::var_os(CHILD).is_some() {
+            for p in PROBES {
+                eprintln!("{CHILD} {p}={}", on_path(p));
+            }
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("roomler-p5-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -696,28 +748,43 @@ mod tests {
         std::fs::write(&plain, b"not executable").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let restore = std::env::var_os("PATH");
-        // SAFETY: single-threaded within this test; PATH is restored below.
-        unsafe { std::env::set_var("PATH", &dir) };
-        let exec_hit = on_path("roomler-p5-probe");
-        let noexec_hit = on_path("roomler-p5-notexec");
-        let absent_hit = on_path("roomler-p5-does-not-exist");
-        // SAFETY: as above.
-        unsafe {
-            match restore {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        let here = PROBES.map(|p| on_path_in(p, Some(dir.as_os_str())));
 
-        assert!(exec_hit, "an executable file on PATH must be found");
-        assert!(
-            !noexec_hit,
-            "a NON-executable file must not count: `Command::spawn` would fail on it, \
-             so reporting it as present would restore the very lie this probe removes"
+        let name = format!(
+            "{}::on_path_answers_about_the_daemons_own_path",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest)
         );
-        assert!(!absent_hit, "an absent binary must not be found");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env("PATH", &dir)
+            .env(CHILD, "1")
+            .output()
+            .expect("re-run this test binary as the child");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child failed:\n{stderr}");
+        // `None` = the child never answered: its test name matched nothing, so
+        // it ran nothing and exited 0. That must fail, not pass silently.
+        let child = PROBES.map(|p| {
+            let key = format!("{CHILD} {p}=");
+            stderr
+                .lines()
+                .find_map(|l| l.split_once(key.as_str()))
+                .map(|(_, v)| v.trim() == "true")
+        });
+
+        for (i, (want, why)) in EXPECT.into_iter().enumerate() {
+            assert_eq!(here[i], want, "on_path_in({}): {why}", PROBES[i]);
+            assert_eq!(
+                child[i],
+                Some(want),
+                "on_path({}) in a process whose PATH is the scratch dir: {why}\n\
+                 child stderr:\n{stderr}",
+                PROBES[i]
+            );
+        }
     }
 
     /// FR-56 P5. The reply must name a missing helper, because `supported:
@@ -732,25 +799,17 @@ mod tests {
     /// barely better than the silence it replaced.
     #[test]
     fn coverage_names_helpers_this_host_does_not_have() {
-        let restore = std::env::var_os("PATH");
-        // SAFETY: single-threaded within this test; PATH is restored below.
-        unsafe { std::env::set_var("PATH", "/nonexistent-roomler-p5") };
+        // "Nothing is installed", said through the seam rather than by
+        // emptying the process-wide PATH (see `on_path_in`).
         let cov = LinuxWm::new(Target::Daemon {
             display: ":99".into(),
         })
-        .coverage();
-        // SAFETY: as above.
-        unsafe {
-            match restore {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
+        .coverage_with(|_| false);
 
         assert_eq!(
             cov.missing_tools.len(),
             HELPERS.len(),
-            "with an empty PATH every helper is missing"
+            "with nothing installed every helper is missing"
         );
         for t in &cov.missing_tools {
             assert!(!t.tool.is_empty());
