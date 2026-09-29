@@ -141,6 +141,10 @@ build host's registry, then set **both** `newName: registry.roomler.ai/roomler-a
 **and** `newTag` in the deploy repo (`promote` refuses until `newName` is switched
 back to GHCR). Full recipe: [`docs/deployment.md`](../../../docs/deployment.md).
 
+⚠️ **First `cd ui && bun docs/dates.ts --write`** in a clone with full history (FR-87).
+The image has no `.git`, so the docs' `<lastmod>` and "Last updated" dates come from
+that manifest. Skip it and the image ships with no dates: honest, but a regression.
+
 ⚠️ **Always `docker system prune -af && docker builder prune -f` after a
 build-host deploy.** Every deploy bakes a fresh multi-stage image plus
 intermediate layers and build cache; without pruning they pile up until the build
