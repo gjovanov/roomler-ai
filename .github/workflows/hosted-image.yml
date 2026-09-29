@@ -183,6 +183,12 @@ jobs:
                 exit 1
               fi
               echo "  device listing: 401 ✓"
+              # FR-87 (#1776) — how the public site is SERVED: relative redirects,
+              # real 404s (no soft 404s), no-cache HTML, the Atom feed type, and every
+              # static page keeping `/`'s security headers (one `add_header` in an
+              # nginx location drops them all). The same script runs against
+              # production after a promote.
+              bash scripts/public-site-smoke.sh http://localhost:8080
               exit 0
             fi
             sleep 10
