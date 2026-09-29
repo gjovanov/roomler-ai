@@ -158,7 +158,11 @@ describe('api client', () => {
 
     it('should redirect to login on 401 for non-auth paths', async () => {
       localStorage.setItem('roomler-signed-in', '1')
-      mockFetch.mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+      // The refresh's answer is stated: before #1788 this test left it
+      // unmocked, and the refresh that then THREW counted as a rejection.
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
+        .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // refresh rejected
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
@@ -328,6 +332,85 @@ describe('api client', () => {
 
       expect(localStorage.getItem('roomler-signed-in')).toBeNull()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+    })
+
+    // #1788 — only a REJECTION ends the session. Found by FR-87's e2e on the
+    // hosted images: after a successful refresh, a retry that met a spent rate
+    // limit logged the user out; so did a refresh the next navigation cut short.
+    describe('#1788: not every refresh problem is a rejection', () => {
+      const signedIn = () => localStorage.getItem('roomler-signed-in')
+      beforeEach(() => localStorage.setItem('roomler-signed-in', '1'))
+
+      it('retries once after a successful refresh and returns the answer', async () => {
+        mockFetch
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
+          .mockResolvedValueOnce(mockJsonResponse(200, {})) // refresh
+          .mockResolvedValueOnce(mockJsonResponse(200, { rooms: [] })) // retry
+
+        await expect(api.get('/tenant/123/room')).resolves.toEqual({ rooms: [] })
+        expect(signedIn()).toBe('1')
+      })
+
+      it('a THROTTLED retry after a successful refresh keeps the session, as a 429', async () => {
+        mockFetch
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+          .mockResolvedValueOnce(mockJsonResponse(200, {})) // refresh: the session is fine
+          .mockResolvedValueOnce(mockJsonResponse(429, { message: 'Try again in 3s.' }, false))
+
+        const err = await api.get('/tenant/123/room').catch((e: unknown) => e)
+        expect((err as ApiError).status).toBe(429) // the retry's answer, not the stale 401
+        expect(mockShowError).toHaveBeenCalledWith('Try again in 3s.')
+        expect(signedIn()).toBe('1')
+        expect(mockRouter.push).not.toHaveBeenCalled()
+      })
+
+      it('a retry answered 403 after a successful refresh keeps the session', async () => {
+        mockFetch
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+          .mockResolvedValueOnce(mockJsonResponse(200, {}))
+          .mockResolvedValueOnce(mockJsonResponse(403, { error: 'forbidden' }, false))
+
+        const err = await api.get('/tenant/123/room').catch((e: unknown) => e)
+        expect((err as ApiError).status).toBe(403)
+        expect(signedIn()).toBe('1')
+        expect(mockRouter.push).not.toHaveBeenCalled()
+      })
+
+      it('a retry STILL refused (401) right after a refresh ends the session, without refreshing again', async () => {
+        mockFetch
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+          .mockResolvedValueOnce(mockJsonResponse(200, {}))
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+
+        await expect(api.get('/tenant/123/room')).rejects.toThrow()
+        expect(mockFetch).toHaveBeenCalledTimes(3) // one refresh, one retry: no loop
+        expect(signedIn()).toBeNull()
+        expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+      })
+
+      it.each([
+        ['a network error', () => Promise.reject(new TypeError('Failed to fetch'))],
+        ['a request cancelled by a navigation', () => Promise.reject(new DOMException('The user aborted a request.', 'AbortError'))],
+        ['a 503 from the refresh endpoint', () => Promise.resolve(mockJsonResponse(503, {}, false))],
+      ])('%s during the refresh keeps the session', async (_, refresh) => {
+        mockFetch.mockResolvedValueOnce(mockJsonResponse(401, {}, false)).mockImplementationOnce(refresh)
+
+        const err = await api.get('/tenant/123/room').catch((e: unknown) => e)
+        expect((err as ApiError).status).toBe(401)
+        expect(signedIn()).toBe('1')
+        expect(mockRouter.push).not.toHaveBeenCalled()
+        expect(mockShowError).toHaveBeenCalledWith('Could not reach the server. Please try again.')
+      })
+
+      it('a refresh answered 403 is a rejection too', async () => {
+        mockFetch
+          .mockResolvedValueOnce(mockJsonResponse(401, {}, false))
+          .mockResolvedValueOnce(mockJsonResponse(403, {}, false))
+
+        await expect(api.get('/tenant/123/room')).rejects.toThrow()
+        expect(signedIn()).toBeNull()
+        expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+      })
     })
 
     it('should NOT redirect on 401 for auth paths', async () => {
