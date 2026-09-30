@@ -7,22 +7,26 @@
  * docs page, a blog post), rather than grepped: what matters is which hrefs
  * change on a real page, that nothing else does, and that no storage API is
  * touched on the way. The key list is locked to the register view's by
- * importing it from `ui/src/utils/attribution.ts`.
+ * importing it from `ui/src/utils/attribution.ts`, and the script run is the
+ * one the build publishes: `INSTALL_PAGES` written in (`theme/carry.ts`).
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CARRIED_KEYS } from '../../src/utils/attribution.ts'
-import { AUTHORS } from '../site.ts'
+import { AUTHORS, BASE, INSTALL_PAGES } from '../site.ts'
 import { renderPost } from '../theme/blog-layout.ts'
+import { carryScript, INSTALL_PAGES_PLACEHOLDER, installPageErrors } from '../theme/carry.ts'
 import { renderHome } from '../theme/home-layout.ts'
 import { renderPage, type DocPage } from '../theme/layout.ts'
 import type { Post } from '../theme/posts.ts'
 import { createRenderer, renderMarkdown } from '../theme/render.ts'
 import { renderBodyScripts, type SiteAssets } from '../theme/shell.ts'
 
-const SCRIPT = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'theme', 'attribution.js'), 'utf8')
+const SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'theme', 'attribution.js'), 'utf8')
+/** What the build publishes. */
+const SCRIPT = carryScript(SOURCE, INSTALL_PAGES)
 
 const assets: SiteAssets = {
   css: '/docs/assets/docs.0123456789.css',
@@ -106,10 +110,10 @@ const postHtml = () => renderPost({ assets, nav: { current: 'blog', hasBlog: tru
 
 /** Run attribution.js on `html`, as if it were served at `href` and reached
  *  from `referrer`. The script names `window` and `document`, nothing else. */
-function run(html: string, href: string, referrer = ''): Document {
+function run(html: string, href: string, referrer = '', script = SCRIPT): Document {
   const doc = new DOMParser().parseFromString(html, 'text/html')
   Object.defineProperty(doc, 'referrer', { value: referrer })
-  new Function('window', 'document', SCRIPT)({ location: { href } }, doc)
+  new Function('window', 'document', script)({ location: { href } }, doc)
   return doc
 }
 
@@ -123,18 +127,15 @@ function changed(html: string, doc: Document): Array<[string, string]> {
   return before.map((b, i) => [b, after[i]!] as [string, string]).filter(([b, a]) => b !== a)
 }
 
-/** The allowlist, stated independently of the script: sign-up, the installer
- *  downloads, and the install guides — on this origin, and never the page
- *  itself (an in-page anchor must stay an in-page jump). */
-const ALLOWED = [
-  /^\/register$/,
-  /^\/api\/setup\/(?:windows|linux|macos)$/,
-  /^\/docs\/start\/(?:quickstart|self-hosting|install\/(?:windows|macos|linux))\/$/,
-]
+/** The allowlist, stated independently of the script: sign-up, sign-in, the
+ *  installer downloads, and the install pages — on this origin, and never the
+ *  page itself (an in-page anchor must stay an in-page jump). */
+const ALLOWED = [/^\/register$/, /^\/login$/, /^\/api\/setup\/(?:windows|linux|macos)$/]
 function allowed(href: string, page: string): boolean {
   const here = new URL(page)
   const u = new URL(href, here)
-  return u.origin === here.origin && u.pathname !== here.pathname && ALLOWED.some((re) => re.test(u.pathname))
+  if (u.origin !== here.origin || u.pathname === here.pathname) return false
+  return INSTALL_PAGES.includes(u.pathname) || ALLOWED.some((re) => re.test(u.pathname))
 }
 
 const CAMPAIGN = 'utm_source=youtube&utm_medium=video&utm_campaign=fr88-test'
@@ -318,6 +319,81 @@ describe('attribution.js — with a campaign', () => {
     // stripped first: the header says what the script does NOT use.
     const code = SCRIPT.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     expect(code).not.toMatch(/localStorage|sessionStorage|indexedDB|cookie/i)
+  })
+})
+
+describe('attribution.js — sign-in and the install pages', () => {
+  const carriedTo = (doc: Document, path: string) =>
+    [...doc.querySelectorAll('a[href]')]
+      .map((a) => new URL(a.getAttribute('href')!, 'https://roomler.ai'))
+      .filter((u) => u.pathname === path)
+
+  it('carries onto the sign-in link: a provider "sign-in" creates the account when there is none', () => {
+    const doc = run(homeHtml(), `https://roomler.ai/?${CAMPAIGN}`)
+    const login = carriedTo(doc, '/login')
+    expect(login.length).toBeGreaterThan(0)
+    for (const u of login) expect(u.searchParams.get('utm_campaign')).toBe('fr88-test')
+  })
+
+  it('carries onto every install page a page links to, the docs home included', () => {
+    const doc = run(homeHtml(), `https://roomler.ai/?${CAMPAIGN}`)
+    for (const path of ['/docs/', '/docs/start/quickstart/']) {
+      const links = carriedTo(doc, path)
+      expect(links.length, path).toBeGreaterThan(0)
+      for (const u of links) expect(u.searchParams.get('utm_source'), path).toBe('youtube')
+    }
+  })
+
+  it('needs the build’s list: the unfilled source reaches no install page at all', () => {
+    // The fixed targets still work; the install pages are the build's to write.
+    const doc = run(homeHtml(), `https://roomler.ai/?${CAMPAIGN}`, '', SOURCE)
+    expect(carriedTo(doc, '/register')[0]!.searchParams.get('utm_source')).toBe('youtube')
+    for (const path of ['/docs/', '/docs/start/quickstart/']) {
+      for (const u of carriedTo(doc, path)) expect(u.search, path).toBe('')
+    }
+  })
+})
+
+describe('carryScript — the build writes INSTALL_PAGES into the script', () => {
+  it('replaces the placeholder with the list, and nothing else', () => {
+    expect(SOURCE.split(INSTALL_PAGES_PLACEHOLDER)).toHaveLength(2)
+    const filled = carryScript(SOURCE, ['/docs/', '/docs/x/'])
+    expect(filled).toContain('var INSTALL_PAGES = ["/docs/","/docs/x/"]')
+    expect(filled.replace('["/docs/","/docs/x/"]', INSTALL_PAGES_PLACEHOLDER)).toBe(SOURCE)
+  })
+
+  it('refuses a script without the placeholder, or with two: an empty list must not ship silently', () => {
+    expect(() => carryScript('var INSTALL_PAGES = []', INSTALL_PAGES)).toThrow(/exactly once/)
+    expect(() => carryScript(`${INSTALL_PAGES_PLACEHOLDER} ${INSTALL_PAGES_PLACEHOLDER}`, INSTALL_PAGES)).toThrow(/exactly once/)
+  })
+})
+
+describe('installPageErrors — the build gate that keeps the lists together', () => {
+  const block = (cmd: string) => renderMarkdown(md, ['```bash', cmd, '```'].join('\n'), 'x.md').html
+  const install = block('curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --token <t>')
+  const pages = [
+    { id: 'ui/docs/content/index.md', url: `${BASE}/`, html: install },
+    { id: 'ui/docs/content/faq/index.md', url: `${BASE}/faq/`, html: block('roomler status') },
+  ]
+
+  it('passes when every page with an install command is listed', () => {
+    expect(installPageErrors(pages, [`${BASE}/`])).toEqual([])
+  })
+
+  it('fails for a page that shows an install command but is not listed', () => {
+    const errors = installPageErrors([...pages, { id: 'ui/docs/content/new.md', url: `${BASE}/new/`, html: install }], [`${BASE}/`])
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatch(/^ui\/docs\/content\/new\.md — shows an install command but \/docs\/new\/ is not in INSTALL_PAGES/)
+  })
+
+  it('fails for a listed page this site does not generate', () => {
+    expect(installPageErrors(pages, [`${BASE}/`, `${BASE}/gone/`])).toEqual([
+      'INSTALL_PAGES (ui/docs/site.ts) lists /docs/gone/, which is not a page this site generates',
+    ])
+  })
+
+  it('allows a listed page without a command (the self-hosting guide installs the server)', () => {
+    expect(installPageErrors(pages, [`${BASE}/`, `${BASE}/faq/`])).toEqual([])
   })
 })
 

@@ -63,6 +63,22 @@ afterEach(() => {
   window.history.replaceState({}, '', '/')
 })
 
+describe('OAuthCallbackView — the redirect P1a and #1799 send (no token in the URL)', () => {
+  it('fires once for `#signup=1` alone, the new-account redirect, and leaves a clean URL', async () => {
+    const w = await land('/oauth/callback#signup=1')
+    expect(events.map((e) => e.goal)).toEqual(['signup'])
+    expect(events[0]!.href).toMatch(/\/oauth\/callback$/)
+    expect(window.location.hash).toBe('')
+    expect(w.text()).not.toContain('Failed to complete OAuth login')
+  })
+
+  it('fires nothing for a bare /oauth/callback, the returning user, and still signs in', async () => {
+    const w = await land('/oauth/callback')
+    expect(events).toEqual([])
+    expect(w.text()).not.toContain('Failed to complete OAuth login')
+  })
+})
+
 describe('OAuthCallbackView — the signup goal (FR-88)', () => {
   it('fires once when the server marked a NEW account, after the token left the URL', async () => {
     await land('/oauth/callback#token=secret-jwt&signup=1')

@@ -154,15 +154,22 @@ case "$cc" in
 esac
 code="$(status "$BASE/home/")"
 [ "$code" = "404" ] && ok "/home/ -> 404 (the homepage has one URL, /)" || bad "/home/ -> $code (a second URL for the homepage)"
-for pair in "/landing /" "/pricing /#pricing"; do
-  set -- $pair
-  read -r code loc <<< "$(redirect "$BASE$1")"
-  if [ "$code" = "301" ] && [ "$loc" = "$2" ]; then
-    ok "$1 -> 301 Location: $loc"
+# FR-88: the query string rides along, or a published `/pricing?utm_source=…`
+# link reaches the homepage without its campaign. Read line by line, never
+# word-split: an unquoted `?` is a glob.
+while read -r from to; do
+  read -r code loc <<< "$(redirect "$BASE$from")"
+  if [ "$code" = "301" ] && [ "$loc" = "$to" ]; then
+    ok "$from -> 301 Location: $loc"
   else
-    bad "$1 -> $code Location: '${loc:-none}' (want 301 to '$2')"
+    bad "$from -> $code Location: '${loc:-none}' (want 301 to '$to')"
   fi
-done
+done <<'PAIRS'
+/landing /
+/pricing /#pricing
+/landing?utm_source=smoke&utm_campaign=fr88 /?utm_source=smoke&utm_campaign=fr88
+/pricing?utm_source=smoke /?utm_source=smoke#pricing
+PAIRS
 
 # 5c. The IndexNow key (P7): an engine verifies a submission by fetching
 #     /<key>.txt, so the file must be served exactly as committed. A missing

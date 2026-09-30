@@ -158,6 +158,31 @@ export const ANALYTICS: { src: string; domain: string } | null = {
 }
 
 /**
+ * FR-88 (#1790): the install pages, the ONE list of them.
+ *
+ * - A campaign on a page's URL is carried onto links to these
+ *   (`theme/attribution.js`, which the build fills from this list).
+ * - Their install and enroll commands are the ones whose copy counts toward
+ *   purestat's `install-copy` goal.
+ *
+ * The build FAILS when a page shows an install command (`isInstallCommand` in
+ * `theme/render.ts`) but is not listed here, or when an entry is not a page
+ * this site generates, so the two cannot drift. The self-hosting guide is
+ * listed on purpose: it installs the server, and has no agent command to copy.
+ */
+export const INSTALL_PAGES: readonly string[] = [
+  `${BASE}/`,
+  `${BASE}/start/quickstart/`,
+  `${BASE}/start/install/windows/`,
+  `${BASE}/start/install/macos/`,
+  `${BASE}/start/install/linux/`,
+  `${BASE}/start/tunnel-cli/`,
+  `${BASE}/start/self-hosting/`,
+  `${BASE}/network/ephemeral-nodes/`,
+  `${BASE}/reference/cli/`,
+]
+
+/**
  * A tag index page is only generated at or above this many pages. Below it,
  * a wall of one-link pages reads to a crawler as doorway pages — a penalty,
  * not an optimisation.

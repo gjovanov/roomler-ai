@@ -26,12 +26,20 @@ vi.mock('@/composables/usePush', () => ({
   unsubscribePush: vi.fn(() => Promise.resolve()),
 }))
 vi.mock('@/stores/ws', () => ({ useWsStore: () => ({ connect: vi.fn() }) }))
+// Leaving for the provider is the one thing jsdom cannot do; everything else
+// in the module is the real one.
+vi.mock('@/utils/attribution', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/utils/attribution')>()),
+  startOAuth: vi.fn(),
+}))
 
 import RegisterView from '@/views/auth/RegisterView.vue'
 import { api } from '@/api/client'
+import { oauthStartUrl, startOAuth } from '@/utils/attribution'
 
 const vuetify = createVuetify({ components, directives })
 const mockApi = vi.mocked(api)
+const mockStartOAuth = vi.mocked(startOAuth)
 type W = Window & { purestat?: unknown }
 
 async function mountAt(path: string) {
@@ -70,8 +78,16 @@ function registerBody(): Record<string, unknown> {
   return call![1] as Record<string, unknown>
 }
 
-const oauthHref = (w: Awaited<ReturnType<typeof mountAt>>['w'], provider: string) =>
-  new URL(w.find(`a[href^="/api/oauth/${provider}"]`).attributes('href')!, 'https://roomler.ai')
+/** Click a provider button; the URL the browser would be sent to. */
+async function clickProvider(w: Awaited<ReturnType<typeof mountAt>>['w'], label: string): Promise<URL> {
+  const btn = w.findAll('button').find((b) => b.text().trim() === label)
+  expect(btn, `no ${label} button`).toBeDefined()
+  mockStartOAuth.mockClear()
+  await btn!.trigger('click')
+  expect(mockStartOAuth).toHaveBeenCalledTimes(1)
+  const [provider, attribution] = mockStartOAuth.mock.calls[0]!
+  return new URL(oauthStartUrl(provider, attribution), 'https://roomler.ai')
+}
 
 let setItem: ReturnType<typeof vi.spyOn>
 let cookieSet: ReturnType<typeof vi.spyOn>
@@ -155,12 +171,12 @@ describe('RegisterView — attribution (FR-88)', () => {
     expect(registerBody().attribution).toEqual({ self_reported: 'friend' })
   })
 
-  it('carries the same attribution on every provider link, and nothing without one', async () => {
+  it('sends the same attribution from every provider button, and nothing without one', async () => {
     const tagged = await mountAt('/register?utm_source=youtube&utm_campaign=c1&landing_path=%2F')
     tagged.w.findComponent({ name: 'VSelect' }).vm.$emit('update:modelValue', 'youtube')
     await flushPromises()
-    for (const p of ['google', 'facebook', 'github', 'linkedin', 'microsoft']) {
-      const u = oauthHref(tagged.w, p)
+    for (const [label, p] of [['Google', 'google'], ['Facebook', 'facebook'], ['GitHub', 'github'], ['LinkedIn', 'linkedin'], ['Microsoft', 'microsoft']]) {
+      const u = await clickProvider(tagged.w, label!)
       expect(u.pathname).toBe(`/api/oauth/${p}`)
       expect(Object.fromEntries(u.searchParams)).toEqual({
         utm_source: 'youtube',
@@ -172,14 +188,40 @@ describe('RegisterView — attribution (FR-88)', () => {
     tagged.w.unmount()
 
     const plain = await mountAt('/register')
-    expect(plain.w.find('a[href^="/api/oauth/google"]').attributes('href')).toBe('/api/oauth/google')
+    expect((await clickProvider(plain.w, 'Google')).href).toBe('https://roomler.ai/api/oauth/google')
+  })
+
+  it('keeps the provider controls BUTTONS, as on the sign-in page (e2e finds them by that role)', async () => {
+    const { w } = await mountAt('/register?utm_source=youtube')
+    const labels = w.findAll('button').map((b) => b.text().trim())
+    expect(labels).toEqual(expect.arrayContaining(['Google', 'Facebook', 'GitHub', 'LinkedIn', 'Microsoft']))
+    expect(w.find('a[href^="/api/oauth/"]').exists()).toBe(false)
+  })
+
+  it('carries the keys onto the sign-in link, whose provider buttons create accounts too', async () => {
+    Object.defineProperty(document, 'referrer', { value: 'https://www.youtube.com/', configurable: true })
+    try {
+      const tagged = await mountAt('/register?utm_source=youtube&utm_campaign=c1&invite=abc')
+      const u = new URL(tagged.w.find('a[href^="/login"]').attributes('href')!, 'https://roomler.ai')
+      expect(Object.fromEntries(u.searchParams)).toEqual({
+        utm_source: 'youtube',
+        utm_campaign: 'c1',
+        referrer_host: 'www.youtube.com',
+        landing_path: '/register',
+      })
+      tagged.w.unmount()
+    } finally {
+      delete (document as { referrer?: string }).referrer
+    }
+    const plain = await mountAt('/register')
+    expect(plain.w.find('a[href^="/login"]').attributes('href')).toBe('/login')
   })
 
   it('writes nothing to the device: no localStorage, no sessionStorage, no cookie', async () => {
     const { w } = await mountAt('/register?utm_source=youtube&utm_campaign=c1')
     w.findComponent({ name: 'VSelect' }).vm.$emit('update:modelValue', 'reddit')
     await flushPromises()
-    oauthHref(w, 'google')
+    await clickProvider(w, 'Google')
     await fillAndSubmit(w)
     expect(setItem).not.toHaveBeenCalled()
     expect(cookieSet).not.toHaveBeenCalled()

@@ -110,13 +110,38 @@ export function externalHost(referrer: string | undefined, host: string | undefi
 }
 
 /**
+ * The keys a link onward from this page carries, the same rule as the static
+ * pages' `attribution.js`: the campaign as it came, then where the journey
+ * began. `referrer_host` and `landing_path` come from the URL when an earlier
+ * page of this site carried them, else from `landing`. Empty without a
+ * campaign: without one the link says nothing about where the visitor came
+ * from, and a link with nothing to carry is left as it is.
+ *
+ * ⚠️ Values that ARRIVE on the URL are taken as given, like any `utm_*`: any
+ * link can set them. The server clamps them; nothing checks them. That is a
+ * data-quality limit, not a security one (FR-88 §3a).
+ */
+export function carriedQuery(query: QueryLike, landing: Landing = {}): Record<string, string> {
+  if (!ATTRIBUTION_ENABLED) return {}
+  const out: Record<string, string> = {}
+  for (const k of CAMPAIGN_KEYS) {
+    const v = value(query, k)
+    if (v !== undefined) out[k] = v
+  }
+  if (Object.keys(out).length === 0) return {}
+  const referrer = value(query, 'referrer_host') ?? externalHost(landing.referrer, landing.host)
+  if (referrer) out.referrer_host = referrer
+  const path = value(query, 'landing_path') ?? (landing.path?.trim() || undefined)?.slice(0, MAX_VALUE_CHARS)
+  if (path) out.landing_path = path
+  return out
+}
+
+/**
  * What the register view sends as `attribution`, or `undefined` when there is
  * nothing to send (then the request carries no `attribution` key at all).
  *
+ * - The campaign and where the journey began, by `carriedQuery`'s rule.
  * - `utm_source` is the source; `ref` stands in for it when it is absent.
- * - `referrer_host` and `landing_path` come from the URL when an earlier page
- *   of this site carried them, else from `landing`, and only with a campaign:
- *   without one the link says nothing about where the visitor came from.
  * - `self_reported` is the optional answer, sent with or without a campaign,
  *   and only when it is one of the offered options.
  */
@@ -126,17 +151,15 @@ export function signupAttribution(
   selfReported?: string | null,
 ): SignupAttribution | undefined {
   if (!ATTRIBUTION_ENABLED) return undefined
-  const a: SignupAttribution = {}
-  const hasCampaign = CAMPAIGN_KEYS.some((k) => value(query, k) !== undefined)
-  if (hasCampaign) {
-    a.source = value(query, 'utm_source') ?? value(query, 'ref')
-    a.medium = value(query, 'utm_medium')
-    a.campaign = value(query, 'utm_campaign')
-    a.content = value(query, 'utm_content')
-    a.term = value(query, 'utm_term')
-    a.referrer_host = value(query, 'referrer_host') ?? externalHost(landing.referrer, landing.host)
-    const path = landing.path?.trim()
-    a.landing_path = value(query, 'landing_path') ?? (path ? path.slice(0, MAX_VALUE_CHARS) : undefined)
+  const c = carriedQuery(query, landing)
+  const a: SignupAttribution = {
+    source: c.utm_source ?? c.ref,
+    medium: c.utm_medium,
+    campaign: c.utm_campaign,
+    content: c.utm_content,
+    term: c.utm_term,
+    referrer_host: c.referrer_host,
+    landing_path: c.landing_path,
   }
   if (selfReported && (SELF_REPORTED_OPTIONS as readonly string[]).includes(selfReported)) {
     a.self_reported = selfReported
@@ -173,6 +196,14 @@ export function oauthStartUrl(provider: string, attribution?: SignupAttribution)
   }
   const qs = params.toString()
   return qs ? `${base}?${qs}` : base
+}
+
+/** Start a sign-in or sign-up with a provider, carrying the attribution.
+ *  Both auth views use it: an OAuth "sign-in" from `/login` creates the
+ *  account when there is none, and the server attaches the attribution only
+ *  then. The one place the SPA leaves for the provider (and a seam for tests). */
+export function startOAuth(provider: string, attribution?: SignupAttribution): void {
+  window.location.href = oauthStartUrl(provider, attribution)
 }
 
 /**

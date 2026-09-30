@@ -63,7 +63,7 @@
 
           <v-card-text class="text-center">
             {{ $t('auth.noAccount') }}
-            <router-link to="/register">{{ $t('auth.register') }}</router-link>
+            <router-link :to="{ path: '/register', query: onward }">{{ $t('auth.register') }}</router-link>
           </v-card-text>
         </v-card>
       </v-col>
@@ -72,11 +72,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
+import { carriedQuery, signupAttribution, startOAuth, type Landing } from '@/utils/attribution'
 
 const auth = useAuthStore()
 const ws = useWsStore()
@@ -97,9 +98,18 @@ const oauthProviders = [
   { name: 'microsoft', label: 'Microsoft', icon: 'mdi-microsoft', color: '#00A4EF' },
 ]
 
-function oauthLogin(provider: string) {
-  window.location.href = `/api/oauth/${provider}`
+// FR-88 §3a — a provider "sign-in" creates the account when there is none, so
+// these buttons carry the campaign exactly as the register view's do. The
+// server attaches it only to an account it creates; a returning user's is
+// ignored. Read from this page's URL, never stored.
+function landing(): Landing {
+  return { referrer: document.referrer, host: window.location.host, path: route.path }
 }
+function oauthLogin(provider: string) {
+  startOAuth(provider, signupAttribution(route.query, landing()))
+}
+/** The same keys on the link to the register page. */
+const onward = computed(() => carriedQuery(route.query, landing()))
 
 async function handleLogin() {
   const { valid } = await formRef.value.validate()
