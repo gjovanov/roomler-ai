@@ -40,6 +40,21 @@
               :rules="[rules.required, rules.minLength(6)]"
               @click:append-inner="showPassword = !showPassword"
             />
+            <!-- FR-88: optional, never required, never blocks sign-up. It
+                 covers what a link cannot: a URL said out loud, a screenshot
+                 in a chat, a conversation. -->
+            <v-select
+              v-if="ATTRIBUTION_ENABLED"
+              v-model="heardAbout"
+              :items="heardAboutItems"
+              :label="$t('auth.heardAbout')"
+              :hint="$t('auth.heardAboutHint')"
+              persistent-hint
+              prepend-inner-icon="mdi-bullhorn-outline"
+              clearable
+              class="mb-4"
+              data-testid="heard-about"
+            />
 
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
               {{ auth.error }}
@@ -57,7 +72,7 @@
           </v-form>
 
           <v-divider class="my-4" />
-          <div class="text-center text-body-2 mb-2">Or register with</div>
+          <div class="text-center text-body-2 mb-2">{{ $t('auth.orRegisterWith') }}</div>
           <div class="d-flex flex-wrap justify-center ga-2 mb-4">
             <v-btn
               v-for="p in oauthProviders"
@@ -74,7 +89,7 @@
 
           <v-card-text class="text-center">
             {{ $t('auth.hasAccount') }}
-            <router-link to="/login">{{ $t('auth.login') }}</router-link>
+            <router-link :to="{ path: '/login', query: onward }">{{ $t('auth.login') }}</router-link>
           </v-card-text>
         </v-card>
       </v-col>
@@ -85,15 +100,28 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
+import {
+  ATTRIBUTION_ENABLED,
+  SELF_REPORTED_OPTIONS,
+  carriedQuery,
+  signupAttribution,
+  startOAuth,
+  type Landing,
+  type SelfReported,
+  type SignupAttribution,
+} from '@/utils/attribution'
+import { trackGoal } from '@/utils/goals'
 
 const auth = useAuthStore()
 const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()
 const { rules } = useValidation()
+const { t } = useI18n()
 
 const formRef = ref()
 const email = ref('')
@@ -101,6 +129,28 @@ const username = ref('')
 const displayName = ref('')
 const password = ref('')
 const showPassword = ref(false)
+
+// FR-88 §3a — "How did you hear about Roomler?", sent as `self_reported`.
+const heardAbout = ref<SelfReported | null>(null)
+const heardAboutItems = computed(() =>
+  SELF_REPORTED_OPTIONS.map((value) => ({ value, title: t(`auth.heardAboutOptions.${value}`) })),
+)
+
+/**
+ * FR-88 §3a — carry, don't store: read from this page's URL at the moment of
+ * sending, never kept anywhere. The static pages put the campaign keys on the
+ * link that brought the visitor here; a visitor who landed on this page
+ * directly gets `referrer_host`/`landing_path` from this page load.
+ */
+function landing(): Landing {
+  return { referrer: document.referrer, host: window.location.host, path: route.path }
+}
+function attribution(): SignupAttribution | undefined {
+  return signupAttribution(route.query, landing(), heardAbout.value)
+}
+/** The same keys on the link to the sign-in page, whose provider buttons
+ *  create an account too. */
+const onward = computed(() => carriedQuery(route.query, landing()))
 
 const inviteCode = computed(() => (route.query.invite as string) || sessionStorage.getItem('pending_invite_code') || undefined)
 
@@ -112,15 +162,27 @@ const oauthProviders = [
   { name: 'microsoft', label: 'Microsoft', icon: 'mdi-microsoft', color: '#00A4EF' },
 ]
 
+/** The server parks the attribution under the CSRF state it mints and
+ *  attaches it only if the callback creates the account. */
 function oauthRegister(provider: string) {
-  window.location.href = `/api/oauth/${provider}`
+  startOAuth(provider, attribution())
 }
 
 async function handleRegister() {
   const { valid } = await formRef.value.validate()
   if (!valid) return
   try {
-    const result = await auth.register(email.value, username.value, password.value, displayName.value, inviteCode.value)
+    const result = await auth.register(
+      email.value,
+      username.value,
+      password.value,
+      displayName.value,
+      inviteCode.value,
+      attribution(),
+    )
+    // FR-88 §3b: on the server's yes, and before navigating, so the goal is
+    // recorded on the page the visitor signed up from.
+    trackGoal('signup')
     ws.connect()
     sessionStorage.removeItem('pending_invite_code')
     if (result?.invite_tenant) {
