@@ -31,14 +31,17 @@
   // The server keeps 64 characters of each value (FR-88 §3a).
   var MAX = 64
 
-  // Where a campaign is carried to, and nowhere else: sign-up, the installer
-  // downloads, and the install guides, whose own sign-up links carry it on.
-  // Same origin only.
-  var TARGETS = [
-    /^\/register$/,
-    /^\/api\/setup\/(?:windows|linux|macos)$/,
-    /^\/docs\/start\/(?:quickstart|self-hosting|install\/(?:windows|macos|linux))\/$/,
-  ]
+  // Where a campaign is carried to, and nowhere else, same origin only:
+  // sign-up; sign-in, whose provider buttons create an account when there is
+  // none; the installer downloads; and the install pages, whose own sign-up
+  // links carry it on.
+  var TARGETS = [/^\/register$/, /^\/login$/, /^\/api\/setup\/(?:windows|linux|macos)$/]
+  // The install pages: `INSTALL_PAGES` in ui/docs/site.ts, written in here by
+  // the build (`theme/carry.ts`). The same list is what the build checks
+  // every page that shows an install command against, so the pages where an
+  // install command can be copied and the pages a campaign reaches cannot
+  // drift apart. This source file keeps it empty.
+  var INSTALL_PAGES = [] /* @install-pages */
 
   var here
   try {
@@ -69,6 +72,7 @@
     // permalink, the sidebar's current entry) is not a way onward. Carrying
     // onto it would turn an in-page jump into a reload.
     if (url.pathname === here.pathname) return false
+    if (INSTALL_PAGES.indexOf(url.pathname) !== -1) return true
     for (var i = 0; i < TARGETS.length; i++) {
       if (TARGETS[i].test(url.pathname)) return true
     }

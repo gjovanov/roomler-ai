@@ -13,6 +13,7 @@ import {
   CARRIED_KEYS,
   MAX_VALUE_CHARS,
   SELF_REPORTED_OPTIONS,
+  carriedQuery,
   externalHost,
   newsletterSource,
   oauthStartUrl,
@@ -129,6 +130,37 @@ describe('signupAttribution', () => {
     expect(signupAttribution({ utm_source: 'x' }, landing, 'friend')).toMatchObject({ source: 'x', self_reported: 'friend' })
     expect(signupAttribution({}, landing, null)).toBeUndefined()
     expect(signupAttribution({}, landing, 'something-else')).toBeUndefined()
+  })
+})
+
+describe('carriedQuery — what a link onward from an SPA page carries', () => {
+  it('is empty without a campaign, whatever else the URL holds', () => {
+    expect(carriedQuery({}, landing)).toEqual({})
+    expect(carriedQuery({ invite: 'abc', referrer_host: 'x', landing_path: '/y' }, landing)).toEqual({})
+  })
+
+  it('carries the campaign as it came, then where the journey began, in the static script’s order', () => {
+    const q = carriedQuery({ ref: 'bio', utm_campaign: 'c1', utm_source: 'tiktok', invite: 'abc' }, { ...landing, path: '/login' })
+    expect(q).toEqual({ utm_source: 'tiktok', utm_campaign: 'c1', ref: 'bio', referrer_host: 'www.youtube.com', landing_path: '/login' })
+    expect(Object.keys(q)).toEqual(['utm_source', 'utm_campaign', 'ref', 'referrer_host', 'landing_path'])
+    // Only carried keys: an invite code is not attribution.
+    for (const k of Object.keys(q)) expect(CARRIED_KEYS as readonly string[]).toContain(k)
+  })
+
+  it('passes on what an earlier page carried rather than re-deriving it', () => {
+    const q = carriedQuery(
+      { utm_source: 'youtube', referrer_host: 'www.youtube.com', landing_path: '/blog/x/' },
+      { referrer: 'https://roomler.ai/blog/x/', host: HOST, path: '/register' },
+    )
+    expect(q).toMatchObject({ referrer_host: 'www.youtube.com', landing_path: '/blog/x/' })
+  })
+
+  it('is what signupAttribution is built on, so a link and the request agree', () => {
+    const query = { utm_source: 'youtube', utm_medium: 'video' }
+    const onward = carriedQuery(query, landing)
+    expect(signupAttribution(onward, { referrer: 'https://roomler.ai/register', host: HOST, path: '/login' })).toEqual(
+      signupAttribution(query, landing),
+    )
   })
 })
 

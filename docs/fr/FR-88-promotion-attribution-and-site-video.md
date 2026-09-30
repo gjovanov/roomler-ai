@@ -84,7 +84,11 @@ sequenceDiagram
 - **The shell** (`ui/docs/theme/shell.ts`) gets a small first-party script. It is served from the
   same origin, so `script-src 'self'` already allows it, and inline scripts stay blocked. When the
   page URL carries `utm_*` or `ref`, it copies those keys onto the page's own sign-up, install and
-  download links, found through an allowlist of selectors, and onto nothing else.
+  download links, found through an allowlist of selectors, and onto nothing else. *(P1b: the
+  allowlist is `/register`, `/login`, the installer downloads, and `INSTALL_PAGES` in
+  `ui/docs/site.ts`, which the build writes into the script. The build fails when a page shows an
+  install command but is not listed, so where `install-copy` can fire and where a campaign reaches
+  are one list.)*
 - **The SPA register view** reads the same keys from its own URL and sends them as an optional
   `attribution` object on `POST /api/auth/register` (`crates/api/src/routes/auth.rs:137`).
 - **OAuth:** the register view's provider buttons pass the keys to `GET /api/oauth/{provider}`.
@@ -97,6 +101,10 @@ sequenceDiagram
   `campaign`, `content`, `term`, `referrer_host`, `landing_path` and `self_reported`.
   - Every value is clamped to 64 characters of printable ASCII. Unknown keys are dropped. The
     referrer is a host, never a full URL.
+  - ⚠️ `referrer_host` and `landing_path` that ARRIVE on a URL are taken as given, like any
+    `utm_*` value: any link can set them, the server only clamps them, and nothing checks them.
+    That is a data-quality limit, not a security one. Read the activation view (§3c) with it in
+    mind: a count by source is what the links said, not a measurement.
   - It is set once, at creation, and never updated. It is never returned by a user-facing endpoint
     and never logged at `info`.
   - `#[serde(default, skip_serializing_if = "Option::is_none")]`. ⚠️ If any insert path builds its
@@ -180,7 +188,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `8c0b34a44` |
 | P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `fdba707a2`, not promoted |
-| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798, not promoted |
+| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798, not promoted |
 | P2 | `/links/` and the short paths (§3d) | remove the locations and the page | — |
 | P3 | video on the site (§3e) | empty manifest; revert `frame-src` | — |
 | P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |
@@ -219,6 +227,10 @@ measured from their first view. Each phase is its own promote.
   click-to-load embed.
 - [ ] **AC11:** docs updated with mermaid diagrams (`docs/public-site.md`: the attribution flow, the
   link hub, the video facade) and indexed in `docs/README.md`.
+- [ ] **AC12:** the SPA's old marketing routes keep a campaign: on production,
+  `/pricing?utm_source=x` answers `301` to `/?utm_source=x#pricing` and `/landing?…` to `/?…`,
+  and without a query both answer exactly as before (`/#pricing`, `/`). Checked by
+  `scripts/public-site-smoke.sh`, shown failing on the deploy before P1b (§8).
 
 ## 6. Open decisions
 
@@ -248,6 +260,7 @@ measured from their first view. Each phase is its own promote.
 
 | Date | Build | What was checked | Result |
 |---|---|---|---|
+| 2026-09-30 | production, before P1b (`/health` 0.4.114) | AC12's red run: `curl -sI` on `/pricing?utm_source=smoke` and `/landing?utm_source=smoke&utm_campaign=fr88`; the smoke's new redirect block | **fails as expected**: `Location: /#pricing` and `Location: /`, the query dropped; the smoke block reports 2 of 4 red. The same block against `files/nginx-pod.conf` in `nginx:stable` (Docker): master's file 2 of 4 red, PR #1798's 4 of 4 green, `nginx -t` clean, and no query still gives exactly `/` and `/#pricing` |
 
 ## 9. Related
 

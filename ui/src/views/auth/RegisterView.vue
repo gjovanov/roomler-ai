@@ -77,7 +77,7 @@
             <v-btn
               v-for="p in oauthProviders"
               :key="p.name"
-              :href="oauthHref(p.name)"
+              @click="oauthRegister(p.name)"
               :color="p.color"
               variant="outlined"
               size="small"
@@ -89,7 +89,7 @@
 
           <v-card-text class="text-center">
             {{ $t('auth.hasAccount') }}
-            <router-link to="/login">{{ $t('auth.login') }}</router-link>
+            <router-link :to="{ path: '/login', query: onward }">{{ $t('auth.login') }}</router-link>
           </v-card-text>
         </v-card>
       </v-col>
@@ -107,8 +107,10 @@ import { useValidation } from '@/composables/useValidation'
 import {
   ATTRIBUTION_ENABLED,
   SELF_REPORTED_OPTIONS,
-  oauthStartUrl,
+  carriedQuery,
   signupAttribution,
+  startOAuth,
+  type Landing,
   type SelfReported,
   type SignupAttribution,
 } from '@/utils/attribution'
@@ -140,13 +142,15 @@ const heardAboutItems = computed(() =>
  * link that brought the visitor here; a visitor who landed on this page
  * directly gets `referrer_host`/`landing_path` from this page load.
  */
-function attribution(): SignupAttribution | undefined {
-  return signupAttribution(
-    route.query,
-    { referrer: document.referrer, host: window.location.host, path: route.path },
-    heardAbout.value,
-  )
+function landing(): Landing {
+  return { referrer: document.referrer, host: window.location.host, path: route.path }
 }
+function attribution(): SignupAttribution | undefined {
+  return signupAttribution(route.query, landing(), heardAbout.value)
+}
+/** The same keys on the link to the sign-in page, whose provider buttons
+ *  create an account too. */
+const onward = computed(() => carriedQuery(route.query, landing()))
 
 const inviteCode = computed(() => (route.query.invite as string) || sessionStorage.getItem('pending_invite_code') || undefined)
 
@@ -158,11 +162,10 @@ const oauthProviders = [
   { name: 'microsoft', label: 'Microsoft', icon: 'mdi-microsoft', color: '#00A4EF' },
 ]
 
-/** A provider's link, carrying the same attribution. The server parks it
- *  under the CSRF state it mints and attaches it only if the callback creates
- *  the account. */
-function oauthHref(provider: string): string {
-  return oauthStartUrl(provider, attribution())
+/** The server parks the attribution under the CSRF state it mints and
+ *  attaches it only if the callback creates the account. */
+function oauthRegister(provider: string) {
+  startOAuth(provider, attribution())
 }
 
 async function handleRegister() {
