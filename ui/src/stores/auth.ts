@@ -10,6 +10,7 @@ import { api } from '@/api/client'
 import router from '@/plugins/router'
 import { subscribePush, unsubscribePush } from '@/composables/usePush'
 import { markSignedIn, clearSignedIn, looksSignedIn } from '@/api/session'
+import type { SignupAttribution } from '@/utils/attribution'
 
 interface User {
   id: string
@@ -87,6 +88,7 @@ export const useAuthStore = defineStore('auth', () => {
     password: string,
     displayName: string,
     inviteCode?: string,
+    attribution?: SignupAttribution,
   ) {
     loading.value = true
     error.value = null
@@ -98,6 +100,9 @@ export const useAuthStore = defineStore('auth', () => {
         display_name: displayName,
       }
       if (inviteCode) body.invite_code = inviteCode
+      // FR-88 §3a: where this account came from, sent once, with it. Absent
+      // (not `{}`) when there is nothing to say.
+      if (attribution && Object.keys(attribution).length > 0) body.attribution = attribution
 
       const data = await api.post<{
         access_token?: string

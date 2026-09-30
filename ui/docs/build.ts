@@ -35,12 +35,14 @@ import {
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
+import { ATTRIBUTION_ENABLED } from '../src/utils/attribution.ts'
 import {
   BASE,
   BLOG_BASE,
   BLOG_DESCRIPTION,
   BLOG_TITLE,
   DOCS_FRONTMATTER_KEYS,
+  INSTALL_PAGES,
   LEGACY_UNHASHED_ASSETS,
   MAX_DESCRIPTION_CHARS,
   MAX_TITLE_CHARS,
@@ -55,6 +57,7 @@ import {
 } from './site.ts'
 import { AssetEmitter } from './theme/assets.ts'
 import { renderBlogIndex, renderBlogTag, renderPost } from './theme/blog-layout.ts'
+import { carryScript, installPageErrors } from './theme/carry.ts'
 import { renderHome } from './theme/home-layout.ts'
 import {
   optionalBoolean,
@@ -650,6 +653,15 @@ function main(): void {
     }
   }
 
+  // FR-88: a page that shows an install command is an install page, and a
+  // campaign is carried to every install page. One list (`INSTALL_PAGES`),
+  // checked here against what the pages actually show.
+  const rendered = [
+    ...renderable.map((p) => ({ id: idOf(p), url: p.url, html: p.html })),
+    ...posts.map((p) => ({ id: p.sourceFile, url: p.url, html: p.html })),
+  ]
+  for (const e of installPageErrors(rendered, INSTALL_PAGES)) fail(e)
+
   if (errors.length) {
     console.error(`\n[docs] BUILD FAILED — ${errors.length} problem(s):\n`)
     for (const e of errors) console.error(`  • ${e}`)
@@ -718,6 +730,11 @@ function main(): void {
     blogCss: hasBlog ? assets.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
     homeCss: assets.publishFile(join(THEME_DIR, 'home.css')),
     homeJs: assets.publishFile(join(THEME_DIR, 'home.js')),
+    // FR-88: the carry script, on every page, with the install pages written
+    // in; the SPA's kill switch drops it.
+    attribution: ATTRIBUTION_ENABLED
+      ? assets.publishBytes('attribution.js', carryScript(readFileSync(join(THEME_DIR, 'attribution.js'), 'utf8'), INSTALL_PAGES))
+      : undefined,
   }
 
   // Reading order for prev/next is the sidebar order: sections in declared

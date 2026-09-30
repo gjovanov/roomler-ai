@@ -86,6 +86,10 @@ describe('the static homepage', () => {
     for (const tag of render().match(/<script\b[^>]*>/g)!) {
       expect(tag, tag).toMatch(/\ssrc="|type="application\/ld\+json"/)
     }
+    // FR-88's carry script included, when the build publishes it.
+    for (const tag of renderHome({ assets: { ...assets, attribution: '/docs/assets/attribution.9999999999.js' }, nav, hero }).match(/<script\b[^>]*>/g)!) {
+      expect(tag, tag).toMatch(/\ssrc="|type="application\/ld\+json"/)
+    }
   })
 
   it('renders every section, with in-page links that all resolve', () => {
@@ -171,9 +175,16 @@ interface Run {
 type Answer = { ok: boolean; status?: number; body?: unknown } | Error
 
 /** Run home.js against a freshly rendered homepage. `answers` maps a URL to
- *  what `fetch` gives back for it. */
-function runHomeJs(answers: Record<string, Answer>, storage: Pick<Storage, 'getItem'> = window.localStorage): Run {
+ *  what `fetch` gives back for it; `win` adds to the fake `window` (FR-88:
+ *  `purestat`), `prepare` edits the page first. */
+function runHomeJs(
+  answers: Record<string, Answer>,
+  storage: Pick<Storage, 'getItem'> = window.localStorage,
+  win: Record<string, unknown> = {},
+  prepare: (doc: Document) => void = () => {},
+): Run {
   const doc = new DOMParser().parseFromString(render(), 'text/html')
+  prepare(doc)
   const replace = vi.fn()
   const fetch = vi.fn((url: string) => {
     const a = answers[url]
@@ -181,7 +192,7 @@ function runHomeJs(answers: Record<string, Answer>, storage: Pick<Storage, 'getI
     if (a instanceof Error) return Promise.reject(a)
     return Promise.resolve({ ok: a.ok, status: a.status ?? (a.ok ? 200 : 500), json: () => Promise.resolve(a.body) })
   })
-  const fakeWindow = { localStorage: storage, location: { replace } }
+  const fakeWindow = { localStorage: storage, location: { replace }, ...win }
   // The script names `window`, `document` and `fetch`; nothing else global.
   new Function('window', 'document', 'fetch', HOME_JS)(fakeWindow, doc, fetch)
   return { doc, replace, fetch }
@@ -261,6 +272,47 @@ describe('home.js — the newsletter', () => {
     const status = run.doc.querySelector('[data-subscribe-status]') as HTMLElement
     expect(status.hidden).toBe(false)
     expect(status.textContent).toMatch(/confirmation/)
+  })
+
+  // FR-88 (#1790) — the goal and the campaign source.
+  async function submit(run: Run) {
+    await settle()
+    const form = run.doc.querySelector('[data-subscribe]') as HTMLFormElement
+    ;(form.querySelector('input[type=email]') as HTMLInputElement).value = 'someone@example.com'
+    form.dispatchEvent(new Event('submit', { cancelable: true }))
+    await settle()
+    const call = run.fetch.mock.calls.find(([url]) => url === '/api/subscribe')
+    return call ? JSON.parse(call[1].body) : undefined
+  }
+
+  it('fires the subscribe goal once, after the 202', async () => {
+    const purestat = vi.fn()
+    const run = runHomeJs({ '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404, '/api/subscribe': { ok: true, status: 202 } }, undefined, { purestat })
+    await submit(run)
+    expect(purestat).toHaveBeenCalledTimes(1)
+    expect(purestat).toHaveBeenCalledWith('subscribe')
+  })
+
+  it('fires no goal when the request fails', async () => {
+    const purestat = vi.fn()
+    const run = runHomeJs({ '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404, '/api/subscribe': { ok: false, status: 503 } }, undefined, { purestat })
+    await submit(run)
+    expect(purestat).not.toHaveBeenCalled()
+  })
+
+  it('still confirms the subscription without purestat (the goal is a no-op)', async () => {
+    const run = runHomeJs({ '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404, '/api/subscribe': { ok: true, status: 202 } })
+    await submit(run)
+    const status = run.doc.querySelector('[data-subscribe-status]') as HTMLElement
+    expect(status.hidden).toBe(false)
+    expect(status.textContent).toMatch(/confirmation/)
+  })
+
+  it('posts the campaign attribution.js found as the source, and `home` without one', async () => {
+    const answers = { '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404, '/api/subscribe': { ok: true, status: 202 } }
+    const tagged = runHomeJs(answers, undefined, {}, (doc) => doc.querySelector('[data-subscribe]')!.setAttribute('data-source', 'fr88-test'))
+    expect((await submit(tagged)).source).toBe('fr88-test')
+    expect((await submit(runHomeJs(answers))).source).toBe('home')
   })
 
   it('lets the visitor retry when the request fails', async () => {

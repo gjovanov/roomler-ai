@@ -126,6 +126,7 @@ import {
   type EnrollKind,
   type EnrollOs,
 } from '@/utils/enrollCommands'
+import { trackGoal } from '@/utils/goals'
 
 const props = defineProps<{
   modelValue: boolean
@@ -168,6 +169,8 @@ function copy(id: string, text: string) {
   navigator.clipboard
     .writeText(text)
     .then(() => {
+      // FR-88 §3b: an install/enroll COMMAND was copied — not the bare token.
+      if (id !== 'token') trackGoal('install-copy')
       copiedId.value = id
       setTimeout(() => {
         if (copiedId.value === id) copiedId.value = null
