@@ -150,13 +150,24 @@ sequenceDiagram
 
 ### 3d. The link hub and short paths
 
-- **`/links/`**: a static page built by the same generator (`ui/docs/build.ts`) with the same shell.
-  It lists the featured video, install, docs, the repository and the channel profiles. Its CTA links
-  carry the incoming UTM like every other static page (3a).
-- **nginx** (`files/nginx-pod.conf`): `location = /yt { return 302 /links/?utm_source=youtube&utm_medium=profile; }`,
+- **`/links/`** (`ui/docs/theme/links-layout.ts`): a static page built by the same generator
+  (`ui/docs/build.ts`) with the same shell, and held to the homepage's link gate.
+  - It lists sign-up, install, the docs, the blog, the repository and the channel profiles. P3 adds
+    the featured video, as the facade's first page.
+  - Its sign-up and install links carry the incoming UTM like every other static page (3a).
+  - `noindex, follow`: it repeats the homepage for people who arrive from a profile, so it is not a
+    page to rank, and it is not in the sitemap.
+- **Channels** (`CHANNELS` in `ui/docs/site.ts`): the one list of the profiles. The hub lists them,
+  and `ORG.sameAs` names them to search engines next to the repository.
+- **nginx** (`files/nginx-pod.conf`): `location = /yt { return 302 /links/?utm_source=youtube&utm_medium=bio&utm_campaign=profile; }`,
   and the same for `/tt`, `/ig` and `/fb`. More short paths are added only by a PR.
+  - `utm_medium=bio&utm_campaign=profile` is what every profile link of the program carries, a
+    profile's own website field included. So a visit through a bio is one source, whichever way it
+    came. (This spec first said `utm_medium=profile`; P2 follows the program's convention instead.)
+  - 302, not 301: a browser keeps a 301 for good, and where a short path points may change.
   - The redirect is relative, per FR-87's `absolute_redirect off`.
-  - A short path must not shadow an SPA route; the router's route table is checked for every one.
+  - A short path must not shadow an SPA route. `ui/docs/__tests__/links-page.spec.ts` checks the
+    router's route table for every one, and checks the nginx lines against `CHANNELS` both ways.
   - No `add_header` in these locations (§3e explains why).
 - **Kill switch:** remove the locations.
 
@@ -187,9 +198,9 @@ sequenceDiagram
 | P | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `8c0b34a44` |
-| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `fdba707a2`, not promoted |
-| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798, not promoted |
-| P2 | `/links/` and the short paths (§3d) | remove the locations and the page | — |
+| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `fdba707a2`, promoted `hosted-20260930-60fe7a7` |
+| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `60fe7a75b`, promoted `hosted-20260930-60fe7a7` |
+| P2 | `/links/` and the short paths (§3d) | remove the locations and the page | PR open |
 | P3 | video on the site (§3e) | empty manifest; revert `frame-src` | — |
 | P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |
 
@@ -215,7 +226,10 @@ measured from their first view. Each phase is its own promote.
 - [ ] **AC6:** a scripted pass records exactly one event for each of the four purestat goals, and zero
   with `ANALYTICS = null` (control).
 - [ ] **AC7:** `curl -sI https://roomler.ai/yt` (and `/tt`, `/ig`, `/fb`) returns a 302 whose relative
-  `Location` carries the UTM, and no SPA route answers any of those paths.
+  `Location` is `/links/` with that channel's `utm_source`, `utm_medium=bio` and
+  `utm_campaign=profile`, and no SPA route answers any of those paths. `/links/` answers 200 with the
+  hub and `/links` a 301 to it. Checked by `scripts/public-site-smoke.sh` §5c, shown failing on the
+  deploy before P2 (§8).
 - [ ] **AC8:** a blog post with `video:` makes no request to a YouTube host before the click (network
   log), plays after it, passes the Rich Results Test with a `VideoObject`, and keeps Lighthouse at
   100 in all four categories. A `video:` id missing from the manifest fails the build, shown failing
@@ -261,6 +275,7 @@ measured from their first view. Each phase is its own promote.
 | Date | Build | What was checked | Result |
 |---|---|---|---|
 | 2026-09-30 | production, before P1b (`/health` 0.4.114) | AC12's red run: `curl -sI` on `/pricing?utm_source=smoke` and `/landing?utm_source=smoke&utm_campaign=fr88`; the smoke's new redirect block | **fails as expected**: `Location: /#pricing` and `Location: /`, the query dropped; the smoke block reports 2 of 4 red. The same block against `files/nginx-pod.conf` in `nginx:stable` (Docker): master's file 2 of 4 red, PR #1798's 4 of 4 green, `nginx -t` clean, and no query still gives exactly `/` and `/#pricing` |
+| 2026-09-30 | production, before P2 (`hosted-20260930-e7e7fad`, `/health` 0.4.114) | AC7's red run: `scripts/public-site-smoke.sh https://roomler.ai` with the §5c block P2 adds | **fails as expected**: `/yt`, `/tt`, `/ig` and `/fb` each answer **200 with the SPA shell** (a soft 404), `/links` answers 200 instead of a 301, `/links/` is not the hub, and `/links/fr88-smoke-missing/` answers 200. The same smoke against the P2 build, served by `files/nginx-pod.conf` in `nginx:stable` (Docker): every check green, `nginx -t` clean, and each short path answers `302 Location: /links/?utm_source=<channel>&utm_medium=bio&utm_campaign=profile` |
 
 ## 9. Related
 

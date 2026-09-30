@@ -67,11 +67,44 @@ export const DOCS_FRONTMATTER_KEYS = [
   'seoTitle',
 ] as const
 
+export const REPO_URL = 'https://github.com/gjovanov/roomler-ai'
+
+/**
+ * FR-88 (#1790) P2: Roomler's own channel profiles, the ONE list of them.
+ *
+ * - `/links/` lists them, and `ORG.sameAs` names them to search engines.
+ * - Each has a short path that nginx answers with a 302 to `/links/`
+ *   (`shortPathLocation`, in `files/nginx-pod.conf`). It is for the places a
+ *   link cannot carry a campaign: a profile bio, a URL said out loud.
+ *   `docs/__tests__/links-page.spec.ts` checks the nginx locations against
+ *   this list, both ways, and checks that no SPA route shares a short path.
+ */
+export const CHANNELS = [
+  { id: 'youtube', name: 'YouTube', handle: '@RoomlerAI', url: 'https://www.youtube.com/@RoomlerAI', short: '/yt' },
+  { id: 'tiktok', name: 'TikTok', handle: '@roomler.ai', url: 'https://www.tiktok.com/@roomler.ai', short: '/tt' },
+  { id: 'instagram', name: 'Instagram', handle: '@roomler.ai', url: 'https://www.instagram.com/roomler.ai/', short: '/ig' },
+  // The page has no @username yet, so this is its numeric address.
+  { id: 'facebook', name: 'Facebook', handle: 'Roomler', url: 'https://www.facebook.com/profile.php?id=100044550434196', short: '/fb' },
+] as const
+
+export type Channel = (typeof CHANNELS)[number]
+
+/**
+ * Where a channel's short path sends a visitor: `/links/`, with the channel as
+ * the source and the values every profile link of the program carries
+ * (`utm_medium=bio`, `utm_campaign=profile`, as in a profile's own website
+ * field). A visit through a bio is then one source, whichever way it came.
+ */
+export function shortPathLocation(channel: Pick<Channel, 'id'>): string {
+  return `/links/?utm_source=${channel.id}&utm_medium=bio&utm_campaign=profile`
+}
+
 /**
  * The one Organization every page's structured data points at (FR-87). FR-60
  * wrote `author: "G ROX LTD"` while every other record — the imprint, the
  * licence headers — says G ROX EOOD: two names for one publisher is how a
- * knowledge panel ends up split, or wrong.
+ * knowledge panel ends up split, or wrong. `sameAs` names the repository and
+ * the channel profiles (FR-88 P2), for the same reason.
  */
 export const ORG = {
   id: `${SITE_ORIGIN}/#organization`,
@@ -79,7 +112,7 @@ export const ORG = {
   legalName: 'G ROX EOOD',
   url: `${SITE_ORIGIN}/`,
   logo: `${SITE_ORIGIN}/logo.svg`,
-  sameAs: ['https://github.com/gjovanov/roomler-ai'],
+  sameAs: [REPO_URL, ...CHANNELS.map((c) => c.url)],
 } as const
 
 /** The social card's real size and alt text, for `og:image:*`. Measured from
