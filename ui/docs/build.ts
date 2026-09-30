@@ -59,6 +59,7 @@ import { AssetEmitter } from './theme/assets.ts'
 import { renderBlogIndex, renderBlogTag, renderPost } from './theme/blog-layout.ts'
 import { carryScript, installPageErrors } from './theme/carry.ts'
 import { renderHome } from './theme/home-layout.ts'
+import { LINKS_URL, renderLinks } from './theme/links-layout.ts'
 import {
   optionalBoolean,
   optionalNumber,
@@ -779,6 +780,20 @@ function main(): void {
     process.exit(1)
   }
   write(join(DIST, 'home', 'index.html'), homeHtml)
+
+  // FR-88 P2: the link hub, which nginx serves at `/links/` and each channel's
+  // short path redirects to. Held to the homepage's gate: a hub whose links go
+  // nowhere is the one page a visitor from a profile sees.
+  const linksHtml = renderLinks({ assets: siteAssets, nav: { current: 'links', hasBlog } })
+  const hubLinks = checkLinks(
+    [...linkPages, { id: 'the link hub', url: LINKS_URL, html: linksHtml, anchors: new Set([...linksHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
+    owns,
+  ).filter((e) => e.startsWith('the link hub'))
+  if (hubLinks.length) {
+    console.error(`\n[docs] BUILD FAILED — the link hub links nowhere:\n${hubLinks.map((e) => `  • ${e}`).join('\n')}\n`)
+    process.exit(1)
+  }
+  write(join(DIST, 'links', 'index.html'), linksHtml)
 
   // The blog. Cleared first, so a post removed since the last build does
   // not survive as a stale page.
