@@ -1,7 +1,9 @@
 # FR-88: Measure what promotion brings — attribution to an activated device, a link hub, and video on the site
 
-**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** proposed 2026-09-29 — spec
-and claim; nothing is built · **Owner:** web / public site + auth · **Anchors:** master `c6c2934d7` ·
+**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** P1a (the server half of
+§3a and the §3c view) in a PR, 2026-09-30 — not merged, not promoted; P1b (the site and SPA half, the goals,
+the privacy section) in a parallel PR; P2–P4 not started · **Owner:** web / public site + auth ·
+**Anchors:** master `c6c2934d7` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the static site, purestat on every page),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-39](FR-39-launch-readiness.md) (`subscribers.source`)
 
@@ -125,10 +127,16 @@ sequenceDiagram
   (`crates/api/src/lib.rs:283-297`). It returns counts only, never a user list:
   - signups by `source`/`medium`/`campaign` and by `self_reported`;
   - activated signups, where the user's tenant enrolled at least one agent within 7 days of the
-    user's `created_at`.
+    user's `created_at`;
+  - `pending` signups — no device yet and the 7-day window still open — reported beside
+    `activated`, and `settled` (= `signups − pending`), the only valid denominator for an
+    activation rate: a rate over all signups would count yesterday's as failures.
 - It is the host's view, like its siblings: users are core, agents belong to `fleet`. With `fleet`
-  unmounted it reports `activated: null`, never `0`.
+  unmounted it reports `activated: null`, never `0` (`pending` and `settled` likewise).
 - Same gate as the siblings: 404 to anyone who is not a platform admin.
+- ⚠️ Every bucket `key` is text chosen by whoever built the link — sanitised to ≤ 64 printable
+  ASCII characters, but still attacker-chosen. An admin UI renders it as text (`{{ key }}`),
+  never as markup (`v-html`).
 - The new route changes the composition baseline
   (`crates/tests/fixtures/composition.baseline.json`). Re-record with `COMPOSITION_UPDATE=1` and
   say why in the commit.
@@ -172,7 +180,8 @@ sequenceDiagram
 | P | What | Kill switch |
 |---|---|---|
 | P0 | claim: issue #1790, this spec, the ledger row | docs only |
-| P1 | attribution (§3a), goals (§3b), the activation view (§3c), the privacy-policy section | the SPA omits `attribution`; `ANALYTICS = null` |
+| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view. **In a PR (2026-09-30), not merged** | the SPA omits `attribution`; the view is platform-admin only |
+| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section | the SPA omits `attribution`; `ANALYTICS = null` |
 | P2 | `/links/` and the short paths (§3d) | remove the locations and the page |
 | P3 | video on the site (§3e) | empty manifest; revert `frame-src` |
 | P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — |
@@ -219,6 +228,12 @@ measured from their first view. Each phase is its own promote.
 2. **When the self-reported question is asked:** on the register form, optional (default), or after
    the first login.
 3. **The option list** for the self-reported question (the default is in §3a).
+4. **What "the user's tenant" means for activation** (raised by the P1a review). P1a credits a
+   signup when ANY org the person belongs to at query time enrolled a device within the window —
+   including an org they were invited into, and regardless of when they joined it. The
+   alternatives: only memberships joined within the window, or only the org created at
+   registration. The definition is unchanged until the operator decides; the join is one
+   function (`tally` in `crates/api/src/routes/attribution.rs`).
 
 ## 7. Out of scope
 

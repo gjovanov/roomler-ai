@@ -49,6 +49,7 @@
 //! FR-69.
 
 pub mod agent_socket;
+pub mod attribution;
 pub mod capabilities;
 pub mod cluster;
 pub mod composition;

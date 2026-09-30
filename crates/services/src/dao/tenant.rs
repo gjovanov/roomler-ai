@@ -537,4 +537,24 @@ impl TenantDao {
             .map(|m| m.user_id)
             .collect())
     }
+
+    /// FR-88 P1a — `(user_id, tenant_id)` for every membership any of
+    /// `user_ids` holds, in one query. The activation view's join: a sign-up
+    /// is "activated" through any org the person belongs to (the one their
+    /// registration created, or one they were invited into).
+    pub async fn memberships_for_users(
+        &self,
+        user_ids: &[ObjectId],
+    ) -> DaoResult<Vec<(ObjectId, ObjectId)>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .members
+            .find_many(doc! { "user_id": { "$in": user_ids } }, None)
+            .await?
+            .into_iter()
+            .map(|m| (m.user_id, m.tenant_id))
+            .collect())
+    }
 }
