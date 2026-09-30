@@ -2,7 +2,8 @@
  * Copyright (C) 2026 G ROX EOOD
  *
  * FR-87 (#1776) P6 — the static homepage, on top of docs.css (whose tokens,
- * top bar, footer, chips and buttons it reuses). Loaded by `/` only.
+ * top bar, footer, chips and buttons it reuses). Loaded by `/` and by the
+ * link hub, `/links/` (FR-88), which reuses its buttons and wrap.
  */
 
 .sr-only {
@@ -92,3 +93,21 @@
   border: 1px solid rgba(255, 255, 255, .5); border-radius: var(--radius); background: #fff; color: var(--ink);
 }
 .home-news__fine { font-size: .82rem; }
+
+/* ── the link hub (FR-88 P2, `/links/`) ─────────────────────────────────
+ * One narrow column: most visitors arrive from a profile on a phone. */
+.links-wrap { max-width: 560px; text-align: center; }
+.links-title { font-size: 2.6rem; line-height: 1.1; letter-spacing: -0.02em; margin: 0 0 14px; }
+.links-lead { font-size: 1.1rem; line-height: 1.55; color: var(--ink-muted); margin: 0 0 24px; }
+.links-actions, .links-channels { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.links-btn { width: 100%; justify-content: center; }
+.links-note { color: var(--ink-muted); font-size: .9rem; margin: 16px 0 36px; }
+.links-h2 { font-size: 1.3rem; margin: 0 0 12px; }
+.links-channel {
+  display: flex; align-items: center; gap: 10px; padding: 12px 16px; text-align: left;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--ink);
+}
+.links-channel:hover { border-color: var(--teal); text-decoration: none; }
+.links-channel__name { font-weight: 600; }
+.links-channel__handle { color: var(--ink-muted); flex: 1 1 auto; }
+.links-channel svg { color: var(--teal); }
