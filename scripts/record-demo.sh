@@ -38,7 +38,12 @@
 #   - an unlocked Mac showed the operator's own dashboard, naming the whole
 #     fleet (its window was minimized before the take), then a weather widget
 #     naming a place and the host's "being viewed" banner naming the org (both
-#     blurred).
+#     blurred);
+#   - a laptop's system tray showed its corporate VPN client's icon (blurred:
+#     a product name is a clue to whose network it is).
+# A small region such as a tray icon is not text, so no OCR can confirm its
+# blur: compare crops of the blurred and the unblurred cut, by eye, in both
+# layouts and across the fullscreen switch.
 # The take never visits the device list, the dashboard or the network pages,
 # but only looking at the frames tells you what the DESKTOPS show. Watch the
 # MP4 end to end before publishing either file.
