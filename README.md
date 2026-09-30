@@ -32,10 +32,10 @@ tunnelled bytes.
   <img src="docs/assets/demo-preview.gif" alt="One browser tab reaching four machines in turn — a MacBook and three Windows laptops: press Connect, the screen appears, and the viewer goes full screen" width="800">
 </p>
 <p align="center">
-  <i>A MacBook and three Windows laptops, two of them locked and one reached through a relay, each live in the same browser tab.</i><br>
+  <i>A MacBook and three Windows laptops, one of them behind a corporate VPN and reached through a relay, each live in the same browser tab.</i><br>
   Four machines, two operating systems, one tab —
   <a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-demo.mp4">the full 43-second demo</a>
-  is a 6&nbsp;MB MP4 download.
+  is a 5.5&nbsp;MB MP4 download.
 </p>
 
 ## Run it
