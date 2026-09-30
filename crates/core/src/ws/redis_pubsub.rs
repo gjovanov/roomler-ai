@@ -79,6 +79,15 @@ impl RedisPubSub {
         Ok(())
     }
 
+    /// A key's remaining TTL in seconds — Redis's own answer: `-2` when the
+    /// key is absent, `-1` when it has no expiry. For tests and diagnostics
+    /// that assert a parked value actually expires (FR-88's OAuth parking
+    /// spot), not for application logic.
+    pub async fn ttl_secs(&self, key: &str) -> Result<i64, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("TTL").arg(key).query_async(&mut conn).await
+    }
+
     // ── S6 cross-pod online registry ────────────────────────────────
     //
     // `WsStorage::is_connected` only sees THIS pod's sockets. With two

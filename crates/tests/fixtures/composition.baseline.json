@@ -37,6 +37,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/stats/attribution",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/stats/calls",
       "methods": "GET,HEAD"
     },
