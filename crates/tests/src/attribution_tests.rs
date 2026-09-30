@@ -404,7 +404,7 @@ async fn oauth_redirect_parks_the_attribution_under_the_csrf_state_with_no_new_c
         redis.ttl_secs(&oauth_park_key(&plain_state)).await.unwrap(),
         -2
     );
-    assert!(take_for_oauth(redis, &plain_state).await.is_none());
+    assert!(take_for_oauth(redis.as_ref(), &plain_state).await.is_none());
 
     let resp = app
         .client
@@ -438,7 +438,9 @@ async fn oauth_redirect_parks_the_attribution_under_the_csrf_state_with_no_new_c
     assert!((1..=600).contains(&ttl), "ttl {ttl}");
 
     // Collected once, sanitised, then gone.
-    let taken = take_for_oauth(redis, &state).await.expect("parked");
+    let taken = take_for_oauth(redis.as_ref(), &state)
+        .await
+        .expect("parked");
     assert_eq!(taken.source.as_deref(), Some("youtube"));
     assert_eq!(taken.medium.as_deref(), Some("video"));
     assert_eq!(taken.campaign.as_deref(), Some("c1"));
@@ -449,7 +451,7 @@ async fn oauth_redirect_parks_the_attribution_under_the_csrf_state_with_no_new_c
     assert_eq!(taken.content, None);
     assert!(taken.captured_at.is_some());
     assert!(
-        take_for_oauth(redis, &state).await.is_none(),
+        take_for_oauth(redis.as_ref(), &state).await.is_none(),
         "read-and-delete: a second collect finds nothing"
     );
     assert_eq!(redis.ttl_secs(&oauth_park_key(&state)).await.unwrap(), -2);
@@ -758,6 +760,11 @@ async fn admin_attribution_view_counts_signups_and_activations() {
     assert_eq!(body["signups"], json!(3), "{body}");
     assert_eq!(body["attributed"], json!(2), "{body}");
     assert_eq!(body["activated"], json!(1), "{body}");
+    // B and C signed up seconds ago with no device: their windows are open,
+    // so they are pending, and the denominator for a rate is the one settled
+    // sign-up (A), not three.
+    assert_eq!(body["pending"], json!(2), "{body}");
+    assert_eq!(body["settled"], json!(1), "{body}");
     assert_eq!(body["activation_window_days"], json!(7));
     assert_eq!(body["truncated"], json!(false));
     let find = |dim: &str, key: Value| -> Value {
@@ -771,18 +778,30 @@ async fn admin_attribution_view_counts_signups_and_activations() {
     };
     let yt = find("by_source", json!("youtube"));
     assert_eq!(
-        (yt["signups"].clone(), yt["activated"].clone()),
-        (json!(2), json!(1))
+        (
+            yt["signups"].clone(),
+            yt["activated"].clone(),
+            yt["pending"].clone()
+        ),
+        (json!(2), json!(1), json!(1))
     );
     let none = find("by_source", Value::Null);
     assert_eq!(
-        (none["signups"].clone(), none["activated"].clone()),
-        (json!(1), json!(0))
+        (
+            none["signups"].clone(),
+            none["activated"].clone(),
+            none["pending"].clone()
+        ),
+        (json!(1), json!(0), json!(1))
     );
     let c1 = find("by_campaign", json!("c1"));
     assert_eq!(
-        (c1["signups"].clone(), c1["activated"].clone()),
-        (json!(1), json!(1))
+        (
+            c1["signups"].clone(),
+            c1["activated"].clone(),
+            c1["pending"].clone()
+        ),
+        (json!(1), json!(1), json!(0))
     );
     assert_eq!(find("by_medium", json!("video"))["signups"], json!(2));
     assert_eq!(
@@ -820,6 +839,8 @@ async fn admin_attribution_view_counts_signups_and_activations() {
         json!(0),
         "fleet is mounted: a real zero"
     );
+    assert_eq!(empty["pending"], json!(0));
+    assert_eq!(empty["settled"], json!(0));
     assert_eq!(empty["by_source"], json!([]));
 
     // A malformed window is a 400, an inverted one too.
@@ -888,8 +909,11 @@ async fn admin_attribution_view_reports_null_activation_without_fleet() {
     assert_eq!(body["signups"], json!(1));
     assert_eq!(body["attributed"], json!(1));
     assert!(body["activated"].is_null(), "{body}");
+    assert!(body["pending"].is_null(), "{body}");
+    assert!(body["settled"].is_null(), "{body}");
     let tiktok = &body["by_source"].as_array().unwrap()[0];
     assert_eq!(tiktok["key"], json!("tiktok"));
     assert_eq!(tiktok["signups"], json!(1));
     assert!(tiktok["activated"].is_null(), "{body}");
+    assert!(tiktok["pending"].is_null(), "{body}");
 }
