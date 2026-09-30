@@ -29,13 +29,13 @@ tunnelled bytes.
      web UI (drag it into an issue comment) and embedded by its
      user-attachments URL — a manual step, like the social preview. -->
 <p align="center">
-  <img src="docs/assets/demo-preview.gif" alt="A Windows 11 desktop running inside a browser tab, pinging a MacBook across the encrypted mesh — four replies, no packet loss" width="800">
+  <img src="docs/assets/demo-preview.gif" alt="One browser tab reaching four machines in turn — a MacBook and three Windows laptops: press Connect, the screen appears, and the viewer goes full screen" width="800">
 </p>
 <p align="center">
-  <i>A Windows 11 laptop, live in a browser tab, pinging a MacBook across the mesh.</i><br>
-  Two machines, two operating systems, one tab —
-  <a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-demo.mp4">the full 90-second demo</a>
-  is a 3.8&nbsp;MB MP4 download.
+  <i>A MacBook and three Windows laptops, two of them locked and one reached through a relay, each live in the same browser tab.</i><br>
+  Four machines, two operating systems, one tab —
+  <a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-demo.mp4">the full 43-second demo</a>
+  is a 6&nbsp;MB MP4 download.
 </p>
 
 ## Run it
