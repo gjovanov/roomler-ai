@@ -1,237 +1,159 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-41 (#965) — the product demo: two machines, one browser tab.
+ * The product demo: real machines, one browser tab, each desktop full screen.
  *
- * Windows 11 → macOS, each reached from the same tab, each pinging the OTHER
- * over the overlay so the mesh is shown working rather than asserted, and each
- * terminal dragged around so the recording shows input reaching the far end
- * rather than a still frame.
+ * For each device in `E2E_DEMO_DEVICES` (display names, in order) the take
+ * opens its remote page with the sidebar collapsed, presses Connect, waits for
+ * the desktop to paint, and enters the viewer's fullscreen, so the machine
+ * fills the frame. `scripts/record-demo.sh` cuts the result into the README
+ * MP4 and GIF; captions and the title cards are added there, not here.
  *
- * `SHOTS` is a list — adding Fedora or Ubuntu back is a two-line change, and an
- * earlier take ran all four. Two is the cut that keeps it short and lets each
- * machine breathe.
+ * ⚠️ The capture is the DevTools screencast, NOT Playwright's `video` option.
+ * Playwright encodes its video at a fixed ~1 Mbit/s VP8, which turns a remote
+ * desktop's text into mush at any size worth showing; the screencast hands
+ * over every composited frame as a JPEG at the quality we ask for, with its
+ * timestamp, and the cut is encoded once, at the end, from those.
  *
- * ⚠️ Captions are inline rather than imported from JSON. The sibling
- * `record-intro.spec.ts` uses `import … with { type: 'json' }`, which is
- * bun-only syntax that kills Playwright's collection under plain node — the
- * reason the nightly e2e lane copies `ui/` *minus* this directory.
+ * ⚠️ NOTHING may touch page JS once a stream is painting. The page's main
+ * thread is saturated decoding and painting, so `evaluate`, `boundingBox` and
+ * every locator query hang rather than answer — four takes of the earlier demo
+ * were lost to checks that could never return while the desktop streamed
+ * perfectly. Geometry is taken BEFORE Connect; afterwards it is CDP input only.
+ * That is why "connected" is read from the screencast (a painted desktop is a
+ * far heavier JPEG than the connecting page) rather than asked of the page.
  *
- * ⚠️ NOTHING in a device scene may touch page JS once the stream starts. The
- * page's main thread is saturated decoding and painting, so `evaluate`,
- * `boundingBox` and every locator query hang rather than answer — four takes
- * were lost to checks that could never return while the desktop was streaming
- * perfectly. Captions and geometry are taken BEFORE the click; everything after
- * it is CDP input only.
+ * ⚠️ The fullscreen button exists only once the session is connected, and
+ * until then the SAME spot holds Disconnect. Clicking there on a guess would
+ * end the session it was meant to show, so the click happens only after the
+ * paint is seen; a device that never paints is filmed in the page instead.
  *
- * ⚠️ `roomler peers` is deliberately NOT filmed. These machines are enrolled in
- * a second organization as well, and `peers` prints EVERY org — so the frame
- * would carry the whole real fleet, hostnames and all. `ping <overlay-ip>`
- * makes the same point in one line that leaks nothing.
+ * ⚠️ Nothing filmed may name the org or the fleet. The device list, the
+ * dashboard and the network pages all do (machine names, MagicDNS names, other
+ * people's devices), so the take never visits them: it goes straight to each
+ * device's own page, where the header shows only its name (relabelled, see
+ * LABELS), the OS and the version.
  */
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type CDPSession, type Page } from '@playwright/test'
+import { mkdirSync, writeFile, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
 const USERNAME = process.env.E2E_USERNAME || ''
 const PASSWORD = process.env.E2E_PASSWORD || ''
 const TENANT_ID = process.env.E2E_TENANT_ID || ''
-
+const DEVICES = (process.env.E2E_DEMO_DEVICES || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
 /**
- * Clicking Connect to a painted desktop. Measured at ~9 s across takes; 11 s
- * leaves headroom without paying for it four times.
+ * Where the frames and the manifest go.
  *
- * ⚠️ This is the single biggest lever on runtime. Four connects at 15 s put a
- * third of the take into spinner, which is what pushed it past two minutes.
+ * ⚠️ Keep it OUTSIDE `e2e/video/output`: Playwright empties its outputDir at
+ * the start of every run, so a take kept there is gone the moment anything
+ * else runs. `record-demo.sh` points this at the user's Videos folder.
  */
-const CONNECT_WAIT_MS = 11_000
-
-type Shot = {
-  id: string
-  name: string
-  caption: string
-  /** Title-bar centre, as a FRACTION of the remote surface — resolution-independent. */
-  grab: [number, number]
-  /** Optional click before the drag (fraction): play a video, focus a shell. */
-  poke?: [number, number]
-  /**
-   * Optional line typed after `poke` — kept short, it is read at a glance.
-   * `{PEER}` is substituted with `peer`'s CURRENT overlay address (see
-   * `overlayIp`); write the address literally and it goes stale on the next
-   * renumber with nothing failing.
-   */
-  type?: string
-  /** The node `{PEER}` resolves to, by name. */
-  peer?: string
-  /**
-   * Pause between the focus click and typing.
-   *
-   * WARNING: not cosmetic. On the Mac the remote input pipeline needs a beat
-   * after a click before it accepts keystrokes: at 700 ms it swallowed the
-   * first NINETEEN characters of the ping command, leaving the shell with
-   * `0.65.12.3` and a `command not found`. Filmed clean, reported ok, and
-   * completely wrong - the same class as every other take lost here.
-   */
-  settleMs?: number
-  /**
-   * Per-machine connect wait. ⚠️ Not cosmetic: the Mac answers a CONSENT prompt
-   * before the session starts ("Waiting for the agent to allow the
-   * connection…"), so a take typed into a session that had not begun and the
-   * keystrokes went nowhere — the terminal filmed empty while everything
-   * reported fine. Machines that prompt need the longer wait.
-   */
-  waitMs?: number
-}
-
+const OUT = resolve(process.env.E2E_DEMO_OUT || 'e2e/video/output/take')
 /**
- * The overlay addresses the two machines ping, RESOLVED FROM THE SERVER at
- * record time rather than hardcoded.
+ * The name each device shows ON SCREEN, one per device, `|`-separated.
  *
- * ⚠️ **They change under you, silently.** The first take shot `100.64.0.2` /
- * `100.64.0.3`; FR-47 then carved the demo org its own block and they became
- * `100.65.12.2` / `100.65.12.3`. Nothing failed anywhere — the harness would
- * have typed the old addresses, filmed two *unreachable* pings, and reported
- * every scene `ok`, because a scene is "no exception and no hang", never "the
- * content is right". That is the trap that cost eleven takes the first time.
- *
- * ⚠️ It cannot be checked by pinging from the recording box, which was the
- * first thing tried: this box drives a BROWSER and is not on the demo mesh at
- * all, so that check refuses every valid run. The two machines ping each
- * other, not us.
- *
- * ⚠️ Nor can the spec verify the ping SUCCEEDED — the terminal is pixels
- * inside a remote-desktop video stream, so there is no text to read. Deriving
- * the address is therefore not a nicety; it is the only place correctness can
- * be established at all.
- *
- * The env vars stay as an override for a machine that is not in the mesh yet.
+ * ⚠️ A display name is how the owner tells machines apart, which is exactly
+ * why it does not belong in a public video: "Anna's work laptop" says whose
+ * machine it is and where. The take rewrites the name in the agent API
+ * responses the PAGE receives,
+ * so the app renders the label through its own code, in its own font, on every
+ * re-render; nothing on the server changes, and the harness's own lookup
+ * (`page.request`, which page routes do not touch) still finds the device by
+ * its real name.
  */
-const MAC_NODE = process.env.E2E_MAC_NODE || 'macbook-daemon'
-const WIN_NODE = process.env.E2E_WIN_NODE || 'windows-11'
+const LABELS = (process.env.E2E_DEMO_LABELS || '').split('|').map((s) => s.trim())
 
-/** Resolve a node's current overlay IPv4 by name, or fail loudly. */
-async function overlayIp(page: Page, nodeName: string): Promise<string> {
-  const res = await page.request.get(`/api/tenant/${TENANT_ID}/overlay-node`)
-  expect(res.ok(), `overlay-node list failed: ${res.status()}`).toBeTruthy()
-  const body = await res.json()
-  const items: Array<Record<string, unknown>> = body.items ?? body ?? []
-  const hit = items.find(
-    (n) => String(n.name ?? n.machine_name ?? '').toLowerCase() === nodeName.toLowerCase(),
-  )
-  const ip = String(hit?.overlay_ip ?? hit?.ip ?? '')
-  // A wrong-but-plausible address is the failure this whole function exists to
-  // prevent, so an unresolved name stops the take instead of filming a miss.
-  expect(ip, `no overlay IPv4 for node ${nodeName} — names: ${items
-    .map((n) => n.name ?? n.machine_name)
-    .join(', ')}`).toMatch(/^\d+\.\d+\.\d+\.\d+$/)
-  return ip
-}
+/** The frame the cut is made at. 1080p is what YouTube and the MP4 want. */
+const W = 1920
+const H = 1080
 
-/**
- * Scouted once against each live desktop. Fractions, not pixels, because the
- * remote resolutions differ wildly (2880x1800, 3024x1968, 1920x1080).
- */
-const SHOTS: Shot[] = [
-  {
-    id: process.env.E2E_WINDOWS_ID || '6a9597b83d54d39b773c292f',
-    name: 'windows-11',
-    caption: 'A Windows 11 laptop — in a browser tab',
-    grab: [0.415, 0.307],
-    poke: [0.415, 0.541],
-    // ⚠️ The OS `ping`, not `roomler ping`. Two reasons, both measured:
-    //  · `roomler ping` talks to whichever daemon owns the LocalAPI socket. On
-    //    the Mac that is the per-USER daemon, which has no overlay — the
-    //    privileged one does. The OS ping just uses the TUN, so it works from
-    //    any account with no sudo.
-    //  · The target is the DAEMON node, not the GUI worker. `macbook-pro` is
-    //    the per-user node and reads `offline` in the mesh; `macbook-daemon`
-    //    is the one actually on the overlay. Pinging the worker fails.
-    type: 'clear; ping -n 4 {PEER}', // → the MacBook
-    peer: MAC_NODE,
-  },
-  {
-    id: process.env.E2E_MACOS_ID || '6a95b6a13d54d39b773c5366',
-    name: 'macbook-pro',
-    caption: 'A MacBook — same tab, nothing installed here',
-    grab: [0.641, 0.463],
-    poke: [0.641, 0.667],
-    type: 'clear; ping -c 4 {PEER}', // → the Windows box
-    peer: WIN_NODE,
-    settleMs: 2500,
-    waitMs: 24_000, // consent gate — see waitMs above
-  },
-]
+/** How long each desktop is held full screen. */
+const DWELL_MS = Number(process.env.E2E_DEMO_DWELL_MS || 7000)
+/** Longest wait for a desktop to paint after Connect. */
+const PAINT_BUDGET_MS = Number(process.env.E2E_DEMO_PAINT_BUDGET_MS || 45_000)
 
-const SAY = {
-  devices: 'Two machines. Two operating systems.',
-  network: 'One private encrypted network between them',
-  outro: 'roomler.ai — open source, self-hostable',
-} as const
+test.use({ video: 'off', viewport: { width: W, height: H }, deviceScaleFactor: 1 })
 
-// ---------------------------------------------------------------------------
+type Frame = { file: string; t: number; bytes: number }
+type Mark = { device: string; what: string; t: number }
 
-async function injectOverlay(page: Page) {
-  await page.evaluate(() => {
-    if (document.getElementById('rm-cap')) return
-    const el = document.createElement('div')
-    el.id = 'rm-cap'
-    Object.assign(el.style, {
-      position: 'fixed', bottom: '44px', left: '50%', transform: 'translateX(-50%)',
-      zIndex: '2147483647', background: 'rgba(10,32,29,.93)', color: '#E6F5F2',
-      padding: '15px 34px', borderRadius: '10px', fontSize: '23px',
-      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif",
-      fontWeight: '600', letterSpacing: '-.01em', maxWidth: '80%', textAlign: 'center',
-      border: '1px solid rgba(0,150,136,.45)', boxShadow: '0 10px 40px rgba(0,0,0,.45)',
-      opacity: '0', transition: 'opacity .35s ease', pointerEvents: 'none', whiteSpace: 'nowrap',
+/** Every composited frame, as a JPEG on disk with its swap timestamp. */
+class Capture {
+  readonly frames: Frame[] = []
+  private n = 0
+
+  constructor(
+    private readonly cdp: CDPSession,
+    private readonly dir: string,
+  ) {}
+
+  async start() {
+    this.cdp.on('Page.screencastFrame', (ev) => {
+      const file = `f${String(this.n++).padStart(6, '0')}.jpg`
+      const buf = Buffer.from(ev.data, 'base64')
+      writeFile(join(this.dir, file), buf, () => {})
+      this.frames.push({ file, t: ev.metadata.timestamp ?? Date.now() / 1000, bytes: buf.length })
+      // Unacked, the screencast stops after a few frames.
+      this.cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => {})
     })
-    document.body.appendChild(el)
-  })
-}
+    await this.cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 92,
+      maxWidth: W,
+      maxHeight: H,
+      everyNthFrame: 1,
+    })
+  }
 
-async function say(page: Page, text: string, holdMs = 2600) {
-  await injectOverlay(page)
-  await page.evaluate((t) => {
-    const el = document.getElementById('rm-cap')
-    if (el) { el.textContent = t; el.style.opacity = '1' }
-  }, text)
-  await page.waitForTimeout(holdMs)
-}
+  async stop() {
+    await this.cdp.send('Page.stopScreencast').catch(() => {})
+  }
 
-async function hush(page: Page) {
-  await page.evaluate(() => {
-    const el = document.getElementById('rm-cap')
-    if (el) el.style.opacity = '0'
-  }).catch(() => {})
-  await page.waitForTimeout(300)
-}
+  /** Median JPEG size of the frames since `sinceT` (seconds), or of the last frame. */
+  baseline(sinceT: number): number {
+    const recent = this.frames.filter((f) => f.t >= sinceT).map((f) => f.bytes)
+    const pool = recent.length ? recent : this.frames.slice(-1).map((f) => f.bytes)
+    if (!pool.length) return 0
+    pool.sort((a, b) => a - b)
+    return pool[Math.floor(pool.length / 2)]
+  }
 
-/** Blur anything shaped like a JWT before it is filmed. */
-async function redactSecrets(page: Page) {
-  const n = await page.evaluate(() => {
-    let hit = 0
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>('body *'))) {
-      if (el.children.length) continue
-      const t = el.textContent || ''
-      if (t.includes('eyJ') && t.length > 40) { el.style.filter = 'blur(7px)'; hit++ }
+  /**
+   * Resolve once a desktop has painted: several consecutive frames far heavier
+   * than the page was before Connect. False when the budget runs out.
+   */
+  async waitForPaint(baseline: number, sinceT: number, budgetMs: number): Promise<boolean> {
+    const threshold = baseline * 1.6 + 40_000
+    const deadline = Date.now() + budgetMs
+    while (Date.now() < deadline) {
+      const after = this.frames.filter((f) => f.t > sinceT)
+      let run = 0
+      for (const f of after) {
+        run = f.bytes > threshold ? run + 1 : 0
+        if (run >= 4) return true
+      }
+      await new Promise((r) => setTimeout(r, 150))
     }
-    return hit
-  }).catch(() => 0)
-  console.log(`  redacted ${n} token element(s)`)
+    return false
+  }
 }
 
 /**
- * Suppress transient toasts for the whole recording.
- *
- * ⚠️ Clicking them away does not work, and a take proved it. The notices that
- * matter — "Connected in 9.1 s, slower than usual", the clipboard-permission
- * prompt — appear DURING the stream, which is precisely when the page's main
- * thread is too busy to answer a locator query. So they are suppressed by CSS
- * installed before the app's own JS runs, through an init script that survives
- * every navigation, rather than chased after the fact.
+ * Suppress transient toasts for the whole take. They appear DURING a stream —
+ * "Connected in 9.1 s, slower than usual", the clipboard-permission prompt —
+ * which is exactly when the page cannot be asked to dismiss them, so they are
+ * hidden by CSS installed before the app's own JS runs, on every navigation.
  */
 async function suppressToasts(page: Page) {
   await page.addInitScript(() => {
     const install = () => {
       const s = document.createElement('style')
-      s.textContent = '.v-snackbar,.v-snackbar__wrapper{display:none !important}'
+      s.textContent =
+        '.v-snackbar,.v-snackbar__wrapper,.kb-lock-toast,.kb-lock-pill{display:none !important}'
       ;(document.head || document.documentElement).appendChild(s)
     }
     if (document.head) install()
@@ -239,169 +161,160 @@ async function suppressToasts(page: Page) {
   })
 }
 
-/**
- * A scene that hangs is skipped like one that throws.
- *
- * ⚠️ The catch alone is not enough and a take was lost proving it: a frozen
- * renderer never reaches the catch, so the whole test ran into its ceiling and
- * recorded minutes of a stuck page. Racing the budget bounds the take by
- * construction.
- */
-async function scene(name: string, fn: () => Promise<void>, budgetMs = 60_000): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    await Promise.race([
-      fn(),
-      new Promise<never>((_, rej) => {
-        timer = setTimeout(() => rej(new Error(`budget ${budgetMs}ms exceeded`)), budgetMs)
-      }),
-    ])
-    console.log(`  scene ok      ${name}`)
-    return true
-  } catch (e) {
-    console.log(`  scene SKIPPED ${name}: ${(e as Error).message.split('\n')[0]}`)
-    return false
-  } finally {
-    if (timer) clearTimeout(timer)
+/** Rail mode is not persisted, so every full page load needs it again. */
+async function collapseSidebar(page: Page) {
+  const btn = page.getByRole('button', { name: 'Collapse sidebar' })
+  if (await btn.isVisible().catch(() => false)) await btn.click()
+}
+
+/** A slow, deliberate glide — reads as a hand on a mouse, not a teleport. */
+async function glide(page: Page, points: Array<[number, number]>, stepsPer = 40, pauseMs = 320) {
+  for (const [x, y] of points) {
+    await page.mouse.move(x, y, { steps: stepsPer })
+    await page.waitForTimeout(pauseMs)
   }
 }
 
-// ---------------------------------------------------------------------------
-
 test.describe('Roomler demo recording', () => {
   test('record the product demo', async ({ page }) => {
-    test.setTimeout(420_000)
+    test.setTimeout(900_000)
 
     expect(USERNAME, 'E2E_USERNAME is required').not.toBe('')
     expect(PASSWORD, 'E2E_PASSWORD is required').not.toBe('')
     expect(TENANT_ID, 'E2E_TENANT_ID is required').not.toBe('')
+    expect(DEVICES.length, 'E2E_DEMO_DEVICES is required (display names, comma-separated)').toBeGreaterThan(0)
 
-    const ran: Record<string, boolean> = {}
+    const framesDir = join(OUT, 'frames')
+    mkdirSync(framesDir, { recursive: true })
 
     await suppressToasts(page)
     await page.goto('/login')
     await page.waitForLoadState('networkidle')
     const user = page.locator('input').first()
     await user.click()
-    await user.pressSequentially(USERNAME, { delay: 40 })
+    await user.pressSequentially(USERNAME, { delay: 25 })
     const pass = page.locator('input[type="password"]')
     await pass.click()
-    await pass.pressSequentially(PASSWORD, { delay: 40 })
+    await pass.pressSequentially(PASSWORD, { delay: 25 })
     await page.getByRole('button', { name: /sign in|log in|login/i }).click()
     await page.waitForTimeout(3000)
 
-    // Resolve every ping target NOW, while the page still answers and before
-    // any stream starts. A stale address is the one defect this take cannot
-    // detect for itself — the terminal is pixels in a video, so there is no
-    // text to assert on — which is why it is established here instead.
-    const peerIp: Record<string, string> = {}
-    for (const shot of SHOTS) {
-      if (shot.peer) {
-        peerIp[shot.name] = await overlayIp(page, shot.peer)
-        // eslint-disable-next-line no-console
-        console.log(`  ping target for ${shot.name}: ${shot.peer} = ${peerIp[shot.name]}`)
+    // Resolve each device by display name, and refuse an offline one now: a
+    // take that films a spinner is a wasted run that reports success.
+    const res = await page.request.get(`/api/tenant/${TENANT_ID}/agent?per_page=100`)
+    expect(res.ok(), `agent list failed: ${res.status()}`).toBeTruthy()
+    const body = await res.json()
+    const agents: Array<Record<string, unknown>> = body.items ?? body ?? []
+    const shots = DEVICES.map((name, i) => {
+      const a = agents.find((x) => String(x.display_name ?? x.name ?? '') === name)
+      expect(a, `no device with display name "${name}" in this org`).toBeTruthy()
+      expect(a?.is_online, `"${name}" is offline`).toBeTruthy()
+      // `shown` is what the take and its manifest call the device: the label
+      // when one is given, so the real name never lands in the take folder.
+      return { name, shown: LABELS[i] || name, id: String(a?.id), os: String(a?.os ?? '') }
+    })
+
+    const label = new Map(shots.map((s, i) => [s.id, LABELS[i] || '']).filter(([, l]) => l))
+    if (label.size) {
+      const relabel = (a: Record<string, unknown>) => {
+        const l = label.get(String(a?.id))
+        // Both names: the header shows the machine name beside the display
+        // name whenever the viewer's preference says so.
+        if (l) Object.assign(a, { display_name: l, name: l })
       }
+      await page.route(
+        (url) => url.pathname.startsWith(`/api/tenant/${TENANT_ID}/agent`),
+        async (route) => {
+          const path = new URL(route.request().url()).pathname
+          const list = path === `/api/tenant/${TENANT_ID}/agent`
+          if (route.request().method() !== 'GET' || !(list || /\/agent\/[0-9a-f]{24}$/.test(path))) {
+            return route.continue()
+          }
+          const resp = await route.fetch()
+          const json = await resp.json().catch(() => null)
+          if (!json) return route.fulfill({ response: resp })
+          if (list) for (const a of json.items ?? json ?? []) relabel(a)
+          else relabel(json)
+          await route.fulfill({ response: resp, json })
+        },
+      )
     }
 
-    // --- the fleet ---------------------------------------------------------
-    ran.devices = await scene('devices', async () => {
-      await page.goto(`/tenant/${TENANT_ID}/devices`)
+    const cdp = await page.context().newCDPSession(page)
+    const cap = new Capture(cdp, framesDir)
+    const marks: Mark[] = []
+    const mark = (device: string, what: string) => {
+      marks.push({ device, what, t: Date.now() / 1000 })
+      console.log(`  ${device.padEnd(14)} ${what}`)
+    }
+    await cap.start()
+
+    for (const shot of shots) {
+      await page.goto(`/tenant/${TENANT_ID}/agent/${shot.id}/remote`)
       await page.waitForLoadState('networkidle')
-      await page.waitForTimeout(1000)
-      await redactSecrets(page)          // belt and braces; nothing here should carry one
-      await say(page, SAY.devices, 2400)
-      await hush(page)
-    })
+      await collapseSidebar(page)
+      const connect = page.getByRole('button', { name: /^connect$/i }).first()
+      await connect.waitFor({ state: 'visible', timeout: 15_000 })
+      const box = await connect.boundingBox()
+      expect(box, 'Connect has no box').toBeTruthy()
+      // Park the pointer in the empty stage, away from any hover state.
+      await page.mouse.move(W * 0.55, H * 0.6)
+      await page.waitForTimeout(1500)
+      mark(shot.shown, 'ready')
 
-    // --- one scene per machine --------------------------------------------
-    for (const shot of SHOTS) {
-      ran[shot.name] = await scene(shot.name, async () => {
-        await page.goto(`/tenant/${TENANT_ID}/agent/${shot.id}/remote`)
-        await page.waitForLoadState('networkidle')
-        await page.waitForTimeout(1200)
-        await say(page, shot.caption, 2000)
+      const before = Date.now() / 1000
+      const baseline = cap.baseline(before - 1.5)
+      await connect.click()
+      mark(shot.shown, 'connect')
 
-        // Geometry BEFORE the stream starts, while the page still answers.
-        // Falls back to the known 1280x720 layout if the query is slow.
-        let box = { x: 240, y: 90, width: 1040, height: 630 }
-        try {
-          const b = await page.locator('canvas, .rc-surface, main').first().boundingBox({ timeout: 4000 })
-          if (b && b.width > 400) box = b
-        } catch { /* keep the fallback */ }
+      // ── from here: no page queries, CDP input only ─────────────────────────
+      // ⚠️ A connected session can stream a BLACK screen: a laptop whose
+      // display has gone to sleep sends black frames at a few kbit/s until
+      // something wakes it, and waiting for a paint without touching the
+      // mouse then waits forever (the first take did exactly that, 45 s of
+      // "connected · 12 kbps" over a black stage). So the wait nudges the
+      // pointer a few pixels in the middle of the stage: before the session
+      // is up that goes nowhere, after it the host wakes.
+      let painted = false
+      const deadline = Date.now() + PAINT_BUDGET_MS
+      for (let k = 0; !painted && Date.now() < deadline; k++) {
+        await page.mouse.move(W * 0.55 + (k % 2 ? 8 : -8), H * 0.6, { steps: 4 })
+        painted = await cap.waitForPaint(baseline, before + 0.2, 2500)
+      }
+      mark(shot.shown, painted ? 'painted' : 'no-paint')
+      if (!painted) {
+        await page.waitForTimeout(2000)
+        mark(shot.shown, 'end')
+        continue
+      }
+      await page.waitForTimeout(1800) // the desktop, still inside the page
+      // Fullscreen is the LAST toolbar button once connected; before Connect
+      // that end of the toolbar was Connect's own right edge.
+      await page.mouse.click(box!.x + box!.width - 20, box!.y + box!.height / 2)
+      mark(shot.shown, 'fullscreen')
+      await page.waitForTimeout(1200)
 
-        const at = ([fx, fy]: [number, number]) =>
-          [box.x + box.width * fx, box.y + box.height * fy] as const
-
-        const connect = page.getByRole('button', { name: /^connect$/i }).first()
-        if (await connect.isVisible().catch(() => false)) await connect.click()
-        await hush(page)
-
-        // ── from here: CDP input only, no page queries ──────────────────────
-        await page.waitForTimeout(shot.waitMs ?? CONNECT_WAIT_MS)
-
-        if (shot.poke) {
-          const [px, py] = at(shot.poke)
-          await page.mouse.click(px, py)
-          await page.waitForTimeout(shot.settleMs ?? 700)
-          // A throwaway Enter: harmless at any shell prompt, and it proves
-          // the session is taking input before the line that matters is
-          // typed.
-          await page.keyboard.press('Enter')
-          await page.waitForTimeout(500)
-        }
-        if (shot.type) {
-          // `{PEER}` was resolved before the stream started — nothing may query
-          // the page from here on (see the header note on the saturated main
-          // thread), so the lookup cannot happen at this point.
-          await page.keyboard.type(shot.type.replace('{PEER}', peerIp[shot.name] ?? ''), {
-            delay: 45,
-          })
-          await page.keyboard.press('Enter')
-          await page.waitForTimeout(6500)
-        }
-
-        // Drag the window by its title bar — a short circuit, then back, so the
-        // motion reads as deliberate rather than as a twitch.
-        const [gx, gy] = at(shot.grab)
-        await page.mouse.move(gx, gy, { steps: 18 })
-        await page.mouse.down()
-        for (const [dx, dy] of [[90, 60], [-40, 130], [-140, 20], [30, -90], [0, 0]]) {
-          await page.mouse.move(gx + dx, gy + dy, { steps: 16 })
-          await page.waitForTimeout(260)
-        }
-        await page.mouse.up()
-        await page.waitForTimeout(900)
-      })
+      // A slow pass through the middle of the screen: no clicks, no typing,
+      // nothing near a taskbar, a dock or a hot corner.
+      mark(shot.shown, 'glide')
+      await glide(page, [
+        [W * 0.42, H * 0.42],
+        [W * 0.58, H * 0.36],
+        [W * 0.62, H * 0.55],
+        [W * 0.46, H * 0.6],
+        [W * 0.5, H * 0.48],
+      ])
+      await page.waitForTimeout(Math.max(0, DWELL_MS - 4000))
+      mark(shot.shown, 'end')
     }
 
-    // --- the mesh ----------------------------------------------------------
-    ran.network = await scene('network', async () => {
-      await page.goto(`/tenant/${TENANT_ID}/network/dns`)
-      await page.waitForLoadState('networkidle')
-      await page.waitForTimeout(1200)
-      await say(page, SAY.network, 2200)
-      await hush(page)
-    })
-
-    // ⚠️ NOT `/landing`. A signed-in session redirects it to the Dashboard,
-    // which renders a card per organization — so the closing frame of the first
-    // four-device take showed two unrelated org names. Ending on the demo org's
-    // own device list is both safe and a better last shot: the four machines
-    // the video just visited, sitting there online.
-    await scene('outro', async () => {
-      await page.goto(`/tenant/${TENANT_ID}/devices`)
-      await page.waitForLoadState('networkidle')
-      await page.waitForTimeout(1200)
-      await say(page, SAY.outro, 2800)
-      await page.waitForTimeout(500)
-    })
-
-    const skipped = Object.entries(ran).filter(([, ok]) => !ok).map(([k]) => k)
-    console.log(skipped.length ? `\n  ⚠️  skipped: ${skipped.join(', ')}` : '\n  all scenes recorded')
-
-    // At least three of the four machines must have filmed, or the take does
-    // not make its own argument and is not worth publishing.
-    const machines = SHOTS.filter((s) => ran[s.name]).length
-    expect(machines, `only ${machines}/${SHOTS.length} machines recorded — the take is unusable`).toBe(SHOTS.length)
+    await cap.stop()
+    await page.goto('about:blank')
+    writeFileSync(
+      join(OUT, 'take.json'),
+      JSON.stringify({ viewport: { width: W, height: H }, devices: shots.map((s) => ({ name: s.shown, os: s.os })), marks, frames: cap.frames }, null, 1),
+    )
+    console.log(`\n  ${cap.frames.length} frames → ${framesDir}`)
+    expect(marks.filter((m) => m.what === 'painted').length, 'no device painted').toBeGreaterThan(0)
   })
 })

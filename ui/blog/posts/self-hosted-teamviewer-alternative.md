@@ -106,7 +106,7 @@ If nothing opens, you still get a picture.
 
 Here is a short demo preview.
 
-![A Roomler remote desktop session in a browser tab: a Windows 11 desktop streamed live from one of the enrolled devices](demo-preview.gif "Demo Preview")
+![Roomler remote desktop in one browser tab: a MacBook and three Windows laptops, each connected and shown full screen](demo-preview.gif "Demo Preview")
 
 ## 👀 Try it out — remote desktop from your browser
 
