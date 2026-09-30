@@ -232,6 +232,36 @@ impl AgentDao {
             .await
     }
 
+    /// FR-88 P1a — `(tenant_id, created_at)` of every device ever enrolled
+    /// in any of `tenant_ids`, tombstones included: the activation view asks
+    /// whether an org enrolled a device within a window, and a device that
+    /// was later removed still answers yes. (An ephemeral row is hard-deleted
+    /// by its reaper and is genuinely gone — that under-count is accepted.)
+    /// A projection over the raw document, not the typed row: two fields per
+    /// device is all the join needs.
+    pub async fn enrollments_for_tenants(
+        &self,
+        tenant_ids: &[ObjectId],
+    ) -> DaoResult<Vec<(ObjectId, DateTime)>> {
+        use futures::TryStreamExt;
+        if tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let coll = self.base.collection().clone_with_type::<Document>();
+        let mut cursor = coll
+            .find(doc! { "tenant_id": { "$in": tenant_ids } })
+            .projection(doc! { "_id": 0, "tenant_id": 1, "created_at": 1 })
+            .await?;
+        let mut out = Vec::new();
+        while let Some(d) = cursor.try_next().await? {
+            if let (Ok(tid), Ok(at)) = (d.get_object_id("tenant_id"), d.get_datetime("created_at"))
+            {
+                out.push((tid, *at));
+            }
+        }
+        Ok(out)
+    }
+
     /// S5 — active (non-tombstoned) devices in the tenant, for the plan
     /// device-cap check at enrollment.
     pub async fn count_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {

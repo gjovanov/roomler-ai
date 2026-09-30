@@ -6,7 +6,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
 };
 use nanoid::nanoid;
-use roomler_ai_db::models::TutorialState;
+use roomler_ai_db::models::{TutorialState, User};
+use roomler_core::attribution::{self, AttributionInput};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -21,6 +22,13 @@ pub struct RegisterRequest {
     pub tenant_name: Option<String>,
     pub tenant_slug: Option<String>,
     pub invite_code: Option<String>,
+    /// FR-88 — where the sign-up came from (`source`, `medium`, `campaign`,
+    /// `content`, `term`, `referrer_host`, `landing_path`, `self_reported`),
+    /// as the register view read them off its own URL. Optional, read
+    /// leniently, sanitised server-side; a malformed value never fails the
+    /// registration (`roomler_core::attribution`).
+    #[serde(default)]
+    pub attribution: Option<AttributionInput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +66,28 @@ pub struct UserResponse {
     /// trip. Empty for a brand-new account, by construction.
     #[serde(default)]
     pub tutorial: TutorialResponse,
+}
+
+impl UserResponse {
+    /// The ONE way a `User` row becomes a response body.
+    ///
+    /// Every handler that answers with the caller's account goes through
+    /// here, so what the row holds that the client must never see —
+    /// `password_hash`, `oauth_providers`, and since FR-88
+    /// `signup_attribution` — is kept out by construction rather than by
+    /// each call site remembering. A test below serialises the result of a
+    /// fully-populated row and asserts none of it leaks.
+    pub fn of(user: User, is_platform_admin: bool) -> Self {
+        Self {
+            id: user.id.map(|id| id.to_hex()).unwrap_or_default(),
+            email: user.email,
+            username: user.username,
+            display_name: user.display_name,
+            avatar: user.avatar,
+            is_platform_admin,
+            tutorial: user.tutorial.into(),
+        }
+    }
 }
 
 /// The wire shape of `TutorialState`.
@@ -136,9 +166,14 @@ pub struct RefreshRequest {
 
 pub async fn register(
     State(state): State<Core>,
-    Json(body): Json<RegisterRequest>,
+    Json(mut body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<RegisterResponse>), ApiError> {
     let password_hash = state.auth.hash_password(&body.password)?;
+
+    // FR-88 — sanitised here, stored with the row, never touched again. Not
+    // logged: the values are the person's own answer to "how did you hear
+    // about us", and `info` lines end up in a pod log.
+    let signup_attribution = body.attribution.take().and_then(attribution::sanitize);
 
     let user = state
         .users
@@ -147,6 +182,7 @@ pub async fn register(
             body.username.clone(),
             body.display_name.clone(),
             password_hash,
+            signup_attribution,
         )
         .await?;
 
@@ -258,6 +294,7 @@ pub async fn register(
                 .parse()
                 .unwrap(),
         );
+        let is_platform_admin = state.platform_admins.contains(&user_id);
         return Ok((
             StatusCode::CREATED,
             headers,
@@ -266,15 +303,7 @@ pub async fn register(
                 access_token: Some(tokens.access_token),
                 refresh_token: Some(tokens.refresh_token),
                 expires_in: Some(tokens.expires_in),
-                user: Some(UserResponse {
-                    id: user_id.to_hex(),
-                    email: user.email,
-                    username: user.username,
-                    display_name: user.display_name,
-                    avatar: user.avatar,
-                    is_platform_admin: state.platform_admins.contains(&user_id),
-                    tutorial: user.tutorial.into(),
-                }),
+                user: Some(UserResponse::of(user, is_platform_admin)),
             }),
         ));
     }
@@ -363,19 +392,12 @@ pub async fn login(
             .unwrap(),
     );
 
+    let is_platform_admin = state.platform_admins.contains(&user_id);
     let response = AuthResponse {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_in: tokens.expires_in,
-        user: UserResponse {
-            id: user_id.to_hex(),
-            email: user.email,
-            username: user.username,
-            display_name: user.display_name,
-            avatar: user.avatar,
-            is_platform_admin: state.platform_admins.contains(&user_id),
-            tutorial: user.tutorial.into(),
-        },
+        user: UserResponse::of(user, is_platform_admin),
         invite_tenant: None,
     };
 
@@ -470,16 +492,9 @@ pub async fn logout(State(state): State<Core>) -> Result<HeaderMap, ApiError> {
 
 pub async fn me(State(state): State<Core>, auth: AuthUser) -> Result<Json<UserResponse>, ApiError> {
     let user = state.users.base.find_by_id(auth.user_id).await?;
+    let is_platform_admin = state.platform_admins.contains(&auth.user_id);
 
-    Ok(Json(UserResponse {
-        id: user.id.unwrap().to_hex(),
-        email: user.email,
-        username: user.username,
-        display_name: user.display_name,
-        avatar: user.avatar,
-        is_platform_admin: state.platform_admins.contains(&auth.user_id),
-        tutorial: user.tutorial.into(),
-    }))
+    Ok(Json(UserResponse::of(user, is_platform_admin)))
 }
 
 pub async fn refresh(
@@ -523,19 +538,12 @@ pub async fn refresh(
             .unwrap(),
     );
 
+    let is_platform_admin = state.platform_admins.contains(&user_id);
     let response = AuthResponse {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_in: tokens.expires_in,
-        user: UserResponse {
-            id: user_id.to_hex(),
-            email: user.email,
-            username: user.username,
-            display_name: user.display_name,
-            avatar: user.avatar,
-            is_platform_admin: state.platform_admins.contains(&user_id),
-            tutorial: user.tutorial.into(),
-        },
+        user: UserResponse::of(user, is_platform_admin),
         invite_tenant: None,
     };
 
@@ -649,4 +657,92 @@ async fn auto_accept_invite(
         tenant_name: tenant.name,
         tenant_slug: tenant.slug,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::{DateTime, oid::ObjectId};
+    use roomler_ai_db::models::{
+        NotificationPrefs, OAuthProvider, Presence, SignupAttribution, TutorialState,
+        UserStatusInfo,
+    };
+
+    /// A row carrying everything a client must never see, each with a
+    /// planted marker so the assertion is on the VALUE reaching the wire,
+    /// not on a field name that could be renamed past a substring check.
+    fn a_loaded_row() -> User {
+        let now = DateTime::now();
+        User {
+            id: Some(ObjectId::new()),
+            email: "seam@test.io".into(),
+            unverified_email: Some("PLANTED-unverified@test.io".into()),
+            username: "seam".into(),
+            display_name: "Seam".into(),
+            avatar: None,
+            bio: None,
+            password_hash: Some("PLANTED-argon2-hash".into()),
+            status: UserStatusInfo::default(),
+            presence: Presence::Offline,
+            locale: "en-US".into(),
+            timezone: "UTC".into(),
+            is_verified: true,
+            is_mfa_enabled: false,
+            last_active_at: None,
+            oauth_providers: vec![OAuthProvider {
+                provider: "google".into(),
+                provider_id: "PLANTED-provider-id".into(),
+                access_token: Some("PLANTED-provider-token".into()),
+                refresh_token: None,
+            }],
+            notification_preferences: NotificationPrefs::default(),
+            tutorial: TutorialState::default(),
+            signup_attribution: Some(SignupAttribution {
+                source: Some("PLANTED-source".into()),
+                campaign: Some("PLANTED-campaign".into()),
+                self_reported: Some("PLANTED-self-reported".into()),
+                captured_at: Some(now),
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    /// FR-88 AC2's "absent from every user-facing response", proved at the
+    /// seam every account-bearing response goes through. A new field on
+    /// `User` reaches the client only if someone adds it to `UserResponse`
+    /// on purpose.
+    #[test]
+    fn a_user_response_carries_no_attribution_and_no_secrets() {
+        let row = a_loaded_row();
+        let bodies = [
+            serde_json::to_string(&UserResponse::of(row.clone(), false)).unwrap(),
+            serde_json::to_string(&AuthResponse {
+                access_token: "t".into(),
+                refresh_token: "r".into(),
+                expires_in: 1,
+                user: UserResponse::of(row.clone(), true),
+                invite_tenant: None,
+            })
+            .unwrap(),
+            serde_json::to_string(&RegisterResponse {
+                message: "ok".into(),
+                access_token: None,
+                refresh_token: None,
+                expires_in: None,
+                user: Some(UserResponse::of(row, false)),
+            })
+            .unwrap(),
+        ];
+        for body in &bodies {
+            assert!(!body.contains("PLANTED"), "a hidden value leaked: {body}");
+            assert!(!body.contains("attribution"), "the field leaked: {body}");
+            assert!(
+                body.contains("\"seam@test.io\""),
+                "the public fields are still there"
+            );
+        }
+    }
 }
