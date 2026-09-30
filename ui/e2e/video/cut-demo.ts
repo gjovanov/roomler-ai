@@ -131,9 +131,16 @@ function blurChain(i: number, s: Seg, inLabel: string, outLabel: string): string
     const from = b.phase === 'page' ? 0 : Math.max(0, (s.full ?? 0) - EDGE_S)
     const to = b.phase === 'page' ? (s.full ?? s.dur) + EDGE_S : s.dur
     const next = k === mine.length - 1 ? outLabel : `b${i}_${k}`
+    // ⚠️ boxblur refuses a radius above half the region's shorter side, and the
+    // chroma planes are half size. A 34×30 tray icon with the fixed radius of a
+    // widget failed the filter graph, and ffmpeg reported only that the encoder
+    // "could not open before EOF". On a small region the clamped radius averages
+    // the whole region into one flat colour, which is the point.
+    const luma = Math.max(1, Math.min(24, Math.floor(Math.min(w, h) / 2) - 1))
+    const chroma = Math.max(1, Math.min(12, Math.floor(Math.min(w, h) / 4) - 1))
     chain.push(
       `[${cur}]split[b${i}_${k}m][b${i}_${k}c]`,
-      `[b${i}_${k}c]crop=${w}:${h}:${x}:${y},boxblur=luma_radius=24:luma_power=4:chroma_radius=12:chroma_power=2[b${i}_${k}k]`,
+      `[b${i}_${k}c]crop=${w}:${h}:${x}:${y},boxblur=luma_radius=${luma}:luma_power=4:chroma_radius=${chroma}:chroma_power=2[b${i}_${k}k]`,
       `[b${i}_${k}m][b${i}_${k}k]overlay=${x}:${y}:enable='between(t,${from.toFixed(3)},${to.toFixed(3)})'[${next}]`,
     )
     cur = next
