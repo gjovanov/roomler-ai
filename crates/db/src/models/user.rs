@@ -46,9 +46,76 @@ pub struct User {
     /// every user document predates this field.
     #[serde(default)]
     pub tutorial: TutorialState,
+    /// FR-88 P1a — where this account came from, written ONCE at creation and
+    /// never updated. `None` for every account that predates the field and
+    /// for every sign-up that arrived without a campaign.
+    ///
+    /// ⚠️ Never user-facing: no response DTO carries it, and no handler may
+    /// serialise a `User` wholesale (`routes::auth::UserResponse::of` is the
+    /// seam that proves it). Never logged at `info`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signup_attribution: Option<SignupAttribution>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
+}
+
+/// FR-88 — the campaign a sign-up arrived from, as stored on `users`.
+///
+/// Every field is optional and every value has already been through
+/// `roomler_core::attribution::sanitize` (trimmed, printable ASCII, at most
+/// [`MAX_ATTRIBUTION_VALUE_LEN`] characters; the referrer is a bare host, the
+/// landing path starts with `/`). The struct is only ever built from that
+/// sanitiser or read back from Mongo, so a value here is safe to group on.
+///
+/// `captured_at` is when the server first saw the values — the landing, for
+/// an OAuth sign-up that parked them in Redis; the request, for a password
+/// one. It is NOT the account's `created_at`, which is the join key the
+/// activation view uses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SignupAttribution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
+    /// A host (`youtube.com`), never a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referrer_host: Option<String>,
+    /// The page the visitor landed on, path only (`/blog/x/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_path: Option<String>,
+    /// The answer to "How did you hear about Roomler?" — a slug from the
+    /// register form's select, or whatever the client sent within the same
+    /// character rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_reported: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<DateTime>,
+}
+
+/// The longest value any attribution field keeps. A UTM value is a slug the
+/// operator chose; 64 is generous for one and still obviously a ceiling.
+pub const MAX_ATTRIBUTION_VALUE_LEN: usize = 64;
+
+impl SignupAttribution {
+    /// True when no field carries a value — the shape the sanitiser turns
+    /// into `None` rather than storing an empty subdocument.
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none()
+            && self.medium.is_none()
+            && self.campaign.is_none()
+            && self.content.is_none()
+            && self.term.is_none()
+            && self.referrer_host.is_none()
+            && self.landing_path.is_none()
+            && self.self_reported.is_none()
+    }
 }
 
 /// FR-12 P3 — tutorial progress, server-side.

@@ -141,6 +141,10 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
             index_unique(bson::doc! { "email": 1 }),
             index_unique(bson::doc! { "username": 1 }),
             index_text(bson::doc! { "display_name": "text", "username": "text" }),
+            // FR-88 P1a — the activation view reads sign-ups by creation
+            // window (`UserDao::signups_between`: a range on `created_at`,
+            // sorted by it). Users are core, so the index is the core plan's.
+            index(bson::doc! { "created_at": 1 }),
         ],
     ));
 
