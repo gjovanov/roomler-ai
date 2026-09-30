@@ -37,6 +37,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/stats/attribution",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/admin/stats/calls",
       "methods": "GET,HEAD"
     },
@@ -2140,6 +2144,11 @@
               "display_name": "text",
               "username": "text"
             }
+          },
+          {
+            "key": {
+              "created_at": 1
+            }
           }
         ]
       },
@@ -3564,6 +3573,11 @@
             "key": {
               "display_name": "text",
               "username": "text"
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
             }
           }
         ]

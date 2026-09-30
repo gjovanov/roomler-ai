@@ -138,9 +138,11 @@ async fn oauth_user_dao_find_or_create_new_user() {
             "OAuth User",
             Some("https://example.com/avatar.jpg"),
             true,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
 
     assert_eq!(user.email, "oauth@test.com");
     assert_eq!(user.display_name, "OAuth User");
@@ -191,9 +193,11 @@ async fn oauth_user_dao_links_existing_user() {
             "GitHub User",
             None,
             true,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
 
     // Should be the same user, with OAuth linked
     assert_eq!(user.email, "existing@test.com");
@@ -210,15 +214,32 @@ async fn oauth_user_dao_does_not_duplicate_provider() {
     let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
 
     // Create via OAuth
-    dao.find_or_create_by_oauth("google", "g-789", "nodupe@test.com", "No Dupe", None, true)
-        .await
-        .unwrap();
+    dao.find_or_create_by_oauth(
+        "google",
+        "g-789",
+        "nodupe@test.com",
+        "No Dupe",
+        None,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Call again with same provider/id
     let user = dao
-        .find_or_create_by_oauth("google", "g-789", "nodupe@test.com", "No Dupe", None, true)
+        .find_or_create_by_oauth(
+            "google",
+            "g-789",
+            "nodupe@test.com",
+            "No Dupe",
+            None,
+            true,
+            None,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
 
     // Should still have only 1 oauth provider, not 2
     assert_eq!(user.oauth_providers.len(), 1);
@@ -252,6 +273,7 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
             "victim".to_string(),
             "Victim".to_string(),
             "hash".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -283,6 +305,7 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
             "Not The Victim",
             None,
             false,
+            None,
         )
         .await
         .expect_err("unverified email must not resolve to the existing account");
@@ -318,9 +341,11 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
             "Someone Else",
             None,
             false,
+            None,
         )
         .await
-        .expect("an unverified identity on a free address still signs up");
+        .expect("an unverified identity on a free address still signs up")
+        .user;
     assert_ne!(fresh.id.unwrap(), victim.id.unwrap());
 
     // A VERIFIED provider email still links, as before.
@@ -332,9 +357,11 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
             "Victim",
             None,
             true,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
     assert_eq!(linked.id.unwrap(), victim.id.unwrap());
 }
 
@@ -357,9 +384,11 @@ async fn an_unverified_identity_does_not_reserve_the_asserted_address() {
             "Not The Victim",
             None,
             false,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
 
     assert_ne!(
         attacker.email, "victim@corp.example",
@@ -384,6 +413,7 @@ async fn an_unverified_identity_does_not_reserve_the_asserted_address() {
             "victim".to_string(),
             "Victim".to_string(),
             "hash".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -399,9 +429,11 @@ async fn an_unverified_identity_does_not_reserve_the_asserted_address() {
             "Not The Victim",
             None,
             false,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
     assert_eq!(again.id.unwrap(), attacker.id.unwrap());
 }
 
@@ -425,6 +457,7 @@ async fn an_unactivated_signup_cannot_hold_an_address_against_a_proven_identity(
             "squatter".to_string(),
             "Squatter".to_string(),
             "attacker-known-hash".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -439,9 +472,11 @@ async fn an_unactivated_signup_cannot_hold_an_address_against_a_proven_identity(
             "Victim",
             None,
             true,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .user;
 
     assert_ne!(
         victim.id.unwrap(),

@@ -4,8 +4,9 @@ use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{
     MAX_TUTORIAL_CHAPTER_ID_LEN, MAX_TUTORIAL_CHAPTERS, NotificationPrefs, OAuthProvider, Presence,
-    TutorialState, User, UserStatusInfo,
+    SignupAttribution, TutorialState, User, UserStatusInfo,
 };
+use serde::Deserialize;
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -47,6 +48,48 @@ pub struct UserDao {
     pub base: BaseDao<User>,
 }
 
+/// Six hex characters that differ from one call to the next, for the
+/// username an OAuth sign-up is given (`<display name>_<suffix>`).
+///
+/// ⚠️ This used to be the FIRST six characters of a fresh `ObjectId`, which
+/// are the top three bytes of its timestamp — the same value for 256 seconds.
+/// Two OAuth sign-ups with the same display name inside that window collided
+/// on `username`, and the retry loop below re-rolled the *same* suffix five
+/// times and refused the second person. Found by FR-88's callback test, which
+/// creates two "Callback" accounts seconds apart. The LAST six characters are
+/// the id's counter: it advances on every id this process mints and starts
+/// at a random value per process, so consecutive calls never repeat and two
+/// pods disagree with overwhelming probability.
+fn username_suffix() -> String {
+    ObjectId::new().to_hex()[18..].to_string()
+}
+
+/// What an OAuth sign-in resolved to ([`UserDao::find_or_create_by_oauth`]).
+#[derive(Debug, Clone)]
+pub struct OAuthSignIn {
+    pub user: User,
+    /// True when THIS sign-in created the account (step 3 of the resolution)
+    /// rather than finding or linking one. FR-88 — the callback's redirect
+    /// carries it as `#signup=1` so the SPA can count a sign-up, and it is
+    /// the branch the parked attribution was applied on.
+    pub created: bool,
+}
+
+/// FR-88 — the projection [`UserDao::signups_between`] reads: the join key
+/// and the attribution, nothing that identifies the person.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupRow {
+    #[serde(rename = "_id")]
+    pub id: ObjectId,
+    pub created_at: DateTime,
+    #[serde(default)]
+    pub signup_attribution: Option<SignupAttribution>,
+}
+
+/// The most sign-ups one activation query loads. Far above any window this
+/// deployment has seen; a ceiling, not a page size.
+pub const MAX_SIGNUP_ROWS: i64 = 100_000;
+
 /// FR-11: what the member grid needs per user, batched.
 #[derive(Debug, Clone)]
 pub struct MemberFacts {
@@ -62,12 +105,19 @@ impl UserDao {
         }
     }
 
+    /// Create a password account.
+    ///
+    /// FR-88 — `attribution` is the sanitised campaign the sign-up arrived
+    /// with (`roomler_core::attribution::sanitize`'s output, or `None`). It is
+    /// written HERE, with the row, and by nothing else afterwards: the insert
+    /// serialises the struct, so the field travels with every other one.
     pub async fn create(
         &self,
         email: String,
         username: String,
         display_name: String,
         password_hash: String,
+        attribution: Option<SignupAttribution>,
     ) -> DaoResult<User> {
         let now = DateTime::now();
         let user = User {
@@ -89,6 +139,7 @@ impl UserDao {
             oauth_providers: Vec::new(),
             notification_preferences: NotificationPrefs::default(),
             tutorial: TutorialState::default(),
+            signup_attribution: attribution,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -163,6 +214,16 @@ impl UserDao {
     /// asserted address already belongs to someone — a UX choice rather than a
     /// security control, since the placeholder already makes that case safe.
     /// See the comment there before touching it.
+    ///
+    /// FR-88 — `attribution` is applied ONLY on the create branch (step 3).
+    /// A sign-in that resolves to an existing account, by provider identity
+    /// or by a proven address, keeps whatever that account recorded when it
+    /// was created — including nothing. The callback collects the parked
+    /// value before it knows which branch this takes, so the choice is made
+    /// here, where the branch is — and reported back as
+    /// [`OAuthSignIn::created`], which is also what the redirect's
+    /// `#signup=1` means.
+    #[allow(clippy::too_many_arguments)] // the identity's six facts plus the one FR-88 adds
     pub async fn find_or_create_by_oauth(
         &self,
         provider: &str,
@@ -171,7 +232,12 @@ impl UserDao {
         display_name: &str,
         avatar_url: Option<&str>,
         email_verified: bool,
-    ) -> DaoResult<User> {
+        attribution: Option<SignupAttribution>,
+    ) -> DaoResult<OAuthSignIn> {
+        let found = |user: User| OAuthSignIn {
+            user,
+            created: false,
+        };
         // 1. Try to find user by OAuth provider + provider_id
         if let Some(user) = self
             .base
@@ -182,7 +248,7 @@ impl UserDao {
             })
             .await?
         {
-            return Ok(user);
+            return Ok(found(user));
         }
 
         // 2. Resolve by address — ONLY for one the provider proved.
@@ -210,7 +276,7 @@ impl UserDao {
                             .await?;
                         user.oauth_providers.push(oauth);
                     }
-                    return Ok(user);
+                    return Ok(found(user));
                 }
                 // 2b. Held WITHOUT proof. The arriving identity has proof and
                 //     this one does not, so the claim is evicted rather than
@@ -332,6 +398,7 @@ impl UserDao {
             }],
             notification_preferences: NotificationPrefs::default(),
             tutorial: TutorialState::default(),
+            signup_attribution: attribution.clone(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -350,10 +417,15 @@ impl UserDao {
         // like fixture noise for two sessions (#613).
         let mut last_duplicate: Option<String> = None;
         for _ in 0..5 {
-            let username = format!("{}_{}", base_username, &ObjectId::new().to_hex()[..6]);
+            let username = format!("{}_{}", base_username, username_suffix());
             let user = user_template(username);
             match self.base.insert_one(&user).await {
-                Ok(id) => return self.base.find_by_id(id).await,
+                Ok(id) => {
+                    return Ok(OAuthSignIn {
+                        user: self.base.find_by_id(id).await?,
+                        created: true,
+                    });
+                }
                 Err(DaoError::DuplicateKey(msg)) => {
                     if !super::base::duplicate_key_is_on(&msg, "username") {
                         // Not ours to fix by re-rolling — surface Mongo's own
@@ -370,6 +442,36 @@ impl UserDao {
             "could not generate a unique username after 5 attempts; last collision: {}",
             last_duplicate.as_deref().unwrap_or("<no detail>")
         )))
+    }
+
+    /// FR-88 P1a — every live account created in `[since, until)`, with the
+    /// two things the activation view joins on: when it was created and what
+    /// it recorded about where it came from. Counts only downstream; no
+    /// name, address or anything else leaves this projection.
+    ///
+    /// Bounded by [`MAX_SIGNUP_ROWS`] so a careless window cannot pull the
+    /// whole collection into memory; the caller reports the truncation.
+    pub async fn signups_between(
+        &self,
+        since: DateTime,
+        until: DateTime,
+    ) -> DaoResult<Vec<SignupRow>> {
+        use futures::TryStreamExt;
+        let coll = self.base.collection().clone_with_type::<SignupRow>();
+        let mut cursor = coll
+            .find(doc! {
+                "created_at": { "$gte": since, "$lt": until },
+                "deleted_at": null,
+            })
+            .projection(doc! { "_id": 1, "created_at": 1, "signup_attribution": 1 })
+            .sort(doc! { "created_at": 1 })
+            .limit(MAX_SIGNUP_ROWS)
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.try_next().await? {
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     /// Batch-fetch display names for a list of user IDs.
@@ -597,6 +699,26 @@ mod tests {
         let a = unverified_placeholder_email("microsoft", "oid-1");
         let b = unverified_placeholder_email("microsoft", "oid-1");
         assert_eq!(a, b);
+    }
+
+    /// Two sign-ups with the same display name inside one second must get
+    /// different usernames, or the second person is refused (see
+    /// [`username_suffix`] for the 256-second window this used to have).
+    #[test]
+    fn username_suffixes_differ_between_consecutive_calls() {
+        let suffixes: Vec<String> = (0..20).map(|_| username_suffix()).collect();
+        let unique: std::collections::HashSet<&String> = suffixes.iter().collect();
+        assert_eq!(
+            unique.len(),
+            suffixes.len(),
+            "repeated suffix: {suffixes:?}"
+        );
+        assert!(
+            suffixes
+                .iter()
+                .all(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{suffixes:?}"
+        );
     }
 
     /// Distinct identities must not collide, or the second one's insert fails

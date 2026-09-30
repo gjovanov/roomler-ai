@@ -48,6 +48,10 @@ mod agent_presence_tests;
 mod agent_self_tests;
 #[cfg(test)]
 mod agent_tests;
+/// FR-88 P1a — sign-up attribution: stored once at creation, absent from
+/// every user-facing response, parked across OAuth, counted for the admin.
+#[cfg(test)]
+mod attribution_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(test)]

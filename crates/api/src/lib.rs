@@ -291,6 +291,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/users", get(routes::stats::admin_users))
         .route("/machines", get(routes::stats::admin_machines))
         .route("/calls", get(routes::stats::admin_calls))
+        // FR-88 P1a — sign-ups by campaign and how many activated (a device
+        // enrolled within 7 days). Counts only; `activated` is null without
+        // the fleet module.
+        .route("/attribution", get(routes::attribution::admin_attribution))
         // Wave 3 — per-user usage. `/usage/{uid}` spans every org, which is
         // what makes "in which org did this happen" answerable.
         .route("/usage", get(routes::usage::admin_usage))
