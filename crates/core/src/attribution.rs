@@ -23,14 +23,21 @@
 //!   `oauth_redirect` already mints, with the `oauth_state` cookie's TTL. No
 //!   new cookie. ⚠️ Nothing here may influence the CSRF check: a missing or
 //!   expired key is "no attribution", never a failed login, which is why
-//!   [`take_for_oauth`] cannot fail — every error is `None`.
+//!   [`take_for_oauth`] cannot fail — every error is `None`. ⚠️ Nothing here
+//!   may slow the sign-in either: before FR-88 the OAuth path made no Redis
+//!   call at all, and `redis`'s connection manager has no response timeout,
+//!   so a reachable-but-hung Redis would hold every redirect and callback.
+//!   Both calls run under [`OAUTH_STORE_BUDGET`]; past it the attribution is
+//!   dropped and the sign-in goes on. The store is a trait
+//!   ([`OauthAttributionStore`]) so that budget is tested against a store
+//!   that never answers, with no Redis in the loop.
 //!
 //! The values are never logged at `info` (they are, in the end, a user's own
 //! answer to "how did you hear about us"), and they are never returned by a
 //! user-facing endpoint — `routes::auth::UserResponse::of` is the seam that
 //! keeps that true.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use bson::DateTime;
 use roomler_ai_db::models::{MAX_ATTRIBUTION_VALUE_LEN, SignupAttribution};
@@ -232,62 +239,143 @@ pub fn oauth_park_key(csrf_state: &str) -> String {
     format!("roomler:oauth_attr:{csrf_state}")
 }
 
-/// Park a sanitised attribution under the CSRF state for the callback to
-/// collect. Stored as BSON bytes (`captured_at` round-trips natively) with
-/// the cookie's TTL. Errors are the caller's to log and ignore — the redirect
-/// must go out regardless.
-pub async fn park_for_oauth(
-    redis: &RedisPubSub,
-    csrf_state: &str,
-    attribution: &SignupAttribution,
-) -> Result<(), redis::RedisError> {
-    let bytes = bson::to_vec(attribution).map_err(|e| {
-        redis::RedisError::from((
-            redis::ErrorKind::TypeError,
-            "attribution did not serialise",
-            e.to_string(),
-        ))
-    })?;
-    let mut conn = redis.connection();
-    redis::cmd("SET")
-        .arg(oauth_park_key(csrf_state))
-        .arg(bytes)
-        .arg("EX")
-        .arg(OAUTH_PARK_TTL_SECS)
-        .query_async::<()>(&mut conn)
-        .await
+/// How long either parking-spot call may take before it is abandoned.
+///
+/// Redis is in-cluster and answers in well under a millisecond, so this is
+/// two orders of magnitude of headroom — and a ceiling on what a hung Redis
+/// can cost a sign-in, which before FR-88 never touched Redis at all. The
+/// attribution is a courtesy the sign-in carries; it is never worth a wait.
+pub const OAUTH_STORE_BUDGET: Duration = Duration::from_millis(250);
+
+/// The future a store operation returns.
+pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The parking spot's two operations, behind a trait so the budget above is
+/// tested against a store that never answers. Errors are strings: the only
+/// thing a caller does with one is log it at `debug`.
+pub trait OauthAttributionStore: Send + Sync {
+    /// `SET key bytes EX ttl_secs`.
+    fn park(
+        &self,
+        key: String,
+        bytes: Vec<u8>,
+        ttl_secs: u64,
+    ) -> StoreFuture<'_, Result<(), String>>;
+    /// Read-and-delete, atomically: a callback that is replayed or raced
+    /// must not collect the value twice.
+    fn take(&self, key: String) -> StoreFuture<'_, Result<Option<Vec<u8>>, String>>;
 }
 
-/// Read-and-delete the parked attribution for a CSRF state. One atomic
-/// `MULTI GET DEL EXEC` (not `GETDEL`, which needs Redis 6.2), so a callback
-/// that is replayed or raced cannot collect it twice.
+impl OauthAttributionStore for RedisPubSub {
+    fn park(
+        &self,
+        key: String,
+        bytes: Vec<u8>,
+        ttl_secs: u64,
+    ) -> StoreFuture<'_, Result<(), String>> {
+        let mut conn = self.connection();
+        Box::pin(async move {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(bytes)
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async::<()>(&mut conn)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// One `MULTI GET DEL EXEC` — not `GETDEL`, which needs Redis 6.2.
+    fn take(&self, key: String) -> StoreFuture<'_, Result<Option<Vec<u8>>, String>> {
+        let mut conn = self.connection();
+        Box::pin(async move {
+            let (value, _deleted): (Option<Vec<u8>>, i64) = redis::pipe()
+                .atomic()
+                .cmd("GET")
+                .arg(&key)
+                .cmd("DEL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(value)
+        })
+    }
+}
+
+/// Why a park did not happen. The caller logs it at `debug` and sends the
+/// redirect regardless.
+#[derive(Debug, PartialEq)]
+pub enum ParkError {
+    Serialise(String),
+    Store(String),
+    /// The store did not answer within [`OAUTH_STORE_BUDGET`].
+    TimedOut,
+}
+
+impl std::fmt::Display for ParkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialise(e) => write!(f, "attribution did not serialise: {e}"),
+            Self::Store(e) => write!(f, "store error: {e}"),
+            Self::TimedOut => write!(
+                f,
+                "store did not answer within {} ms",
+                OAUTH_STORE_BUDGET.as_millis()
+            ),
+        }
+    }
+}
+
+/// Park a sanitised attribution under the CSRF state for the callback to
+/// collect. Stored as BSON bytes (`captured_at` round-trips natively) with
+/// the cookie's TTL, under [`OAUTH_STORE_BUDGET`]. Errors are the caller's
+/// to log and ignore — the redirect must go out regardless.
+pub async fn park_for_oauth(
+    store: &dyn OauthAttributionStore,
+    csrf_state: &str,
+    attribution: &SignupAttribution,
+) -> Result<(), ParkError> {
+    let bytes = bson::to_vec(attribution).map_err(|e| ParkError::Serialise(e.to_string()))?;
+    let parked = store.park(oauth_park_key(csrf_state), bytes, OAUTH_PARK_TTL_SECS);
+    match tokio::time::timeout(OAUTH_STORE_BUDGET, parked).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(ParkError::Store(e)),
+        Err(_elapsed) => Err(ParkError::TimedOut),
+    }
+}
+
+/// Read-and-delete the parked attribution for a CSRF state, under
+/// [`OAUTH_STORE_BUDGET`].
 ///
-/// Cannot fail by construction: a missing key, an expired key, a Redis
-/// error and an unreadable value are all `None`. The login that follows must
-/// not depend on this in any way.
-pub async fn take_for_oauth(redis: &RedisPubSub, csrf_state: &str) -> Option<SignupAttribution> {
-    let key = oauth_park_key(csrf_state);
-    let mut conn = redis.connection();
-    let taken: Result<(Option<Vec<u8>>, i64), redis::RedisError> = redis::pipe()
-        .atomic()
-        .cmd("GET")
-        .arg(&key)
-        .cmd("DEL")
-        .arg(&key)
-        .query_async(&mut conn)
-        .await;
-    match taken {
-        Ok((Some(bytes), _)) => match bson::from_slice::<SignupAttribution>(&bytes) {
-            Ok(attr) if !attr.is_empty() => Some(attr),
-            Ok(_) => None,
-            Err(e) => {
-                debug!(%e, "parked oauth attribution was unreadable; ignored");
-                None
-            }
-        },
-        Ok((None, _)) => None,
-        Err(e) => {
+/// Cannot fail by construction: a missing key, an expired key, a store
+/// error, a store that does not answer in time and an unreadable value are
+/// all `None`. The login that follows must not depend on this in any way.
+pub async fn take_for_oauth(
+    store: &dyn OauthAttributionStore,
+    csrf_state: &str,
+) -> Option<SignupAttribution> {
+    let taken = store.take(oauth_park_key(csrf_state));
+    let bytes = match tokio::time::timeout(OAUTH_STORE_BUDGET, taken).await {
+        Ok(Ok(value)) => value?,
+        Ok(Err(e)) => {
             debug!(%e, "parked oauth attribution could not be read; ignored");
+            return None;
+        }
+        Err(_elapsed) => {
+            debug!(
+                budget_ms = OAUTH_STORE_BUDGET.as_millis() as u64,
+                "the attribution store did not answer in time; signing in without it"
+            );
+            return None;
+        }
+    };
+    match bson::from_slice::<SignupAttribution>(&bytes) {
+        Ok(attr) if !attr.is_empty() => Some(attr),
+        Ok(_) => None,
+        Err(e) => {
+            debug!(%e, "parked oauth attribution was unreadable; ignored");
             None
         }
     }
@@ -579,6 +667,105 @@ mod tests {
         assert_eq!(
             oauth_park_key("11111111-2222-3333-4444-555555555555"),
             "roomler:oauth_attr:11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    /// An in-memory store: the seam's contract without Redis.
+    #[derive(Default)]
+    struct Memory {
+        parked: std::sync::Mutex<HashMap<String, (Vec<u8>, u64)>>,
+    }
+
+    impl OauthAttributionStore for Memory {
+        fn park(
+            &self,
+            key: String,
+            bytes: Vec<u8>,
+            ttl_secs: u64,
+        ) -> StoreFuture<'_, Result<(), String>> {
+            self.parked.lock().unwrap().insert(key, (bytes, ttl_secs));
+            Box::pin(async { Ok(()) })
+        }
+        fn take(&self, key: String) -> StoreFuture<'_, Result<Option<Vec<u8>>, String>> {
+            let value = self.parked.lock().unwrap().remove(&key).map(|(b, _)| b);
+            Box::pin(async move { Ok(value) })
+        }
+    }
+
+    /// A reachable-but-hung store: every call is a future that never
+    /// completes, which is what a wedged Redis looks like to a client with
+    /// no response timeout.
+    struct Hung;
+
+    impl OauthAttributionStore for Hung {
+        fn park(&self, _: String, _: Vec<u8>, _: u64) -> StoreFuture<'_, Result<(), String>> {
+            Box::pin(std::future::pending())
+        }
+        fn take(&self, _: String) -> StoreFuture<'_, Result<Option<Vec<u8>>, String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn parking_is_keyed_by_state_with_the_cookie_ttl_and_collected_once() {
+        let store = Memory::default();
+        let attr = sanitize(input(json!({ "source": "youtube", "campaign": "c1" }))).unwrap();
+        park_for_oauth(&store, "state-a", &attr).await.unwrap();
+        assert_eq!(
+            store
+                .parked
+                .lock()
+                .unwrap()
+                .get(&oauth_park_key("state-a"))
+                .map(|(_, ttl)| *ttl),
+            Some(OAUTH_PARK_TTL_SECS)
+        );
+        assert_eq!(
+            take_for_oauth(&store, "state-b").await,
+            None,
+            "another state"
+        );
+        assert_eq!(take_for_oauth(&store, "state-a").await, Some(attr));
+        assert_eq!(
+            take_for_oauth(&store, "state-a").await,
+            None,
+            "read-and-delete"
+        );
+        // An unreadable value is dropped, never an error.
+        store
+            .parked
+            .lock()
+            .unwrap()
+            .insert(oauth_park_key("state-c"), (vec![1, 2, 3], 1));
+        assert_eq!(take_for_oauth(&store, "state-c").await, None);
+    }
+
+    /// M1 of the P1a review: a store that never answers costs the
+    /// attribution — each call gives up at the budget — and nothing else. The
+    /// callers treat `Err`/`None` as "no attribution" and go on with the
+    /// redirect and the sign-in.
+    #[tokio::test]
+    async fn a_store_that_never_answers_costs_the_attribution_not_the_sign_in() {
+        let attr = sanitize(input(json!({ "source": "youtube" }))).unwrap();
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            park_for_oauth(&Hung, "state", &attr).await,
+            Err(ParkError::TimedOut)
+        );
+        let after_park = t0.elapsed();
+        assert!(
+            after_park >= OAUTH_STORE_BUDGET && after_park < Duration::from_secs(3),
+            "the park gave up at the budget, not later: {after_park:?}"
+        );
+        assert_eq!(take_for_oauth(&Hung, "state").await, None);
+        let total = t0.elapsed();
+        assert!(
+            total >= 2 * OAUTH_STORE_BUDGET && total < Duration::from_secs(6),
+            "the take gave up at the budget too: {total:?}"
+        );
+        assert!(
+            ParkError::TimedOut.to_string().contains("250 ms"),
+            "the log line names the budget"
         );
     }
 }

@@ -10,6 +10,17 @@
 //! the projection the query reads has no name or address in it, and the
 //! payload has no per-user row.
 //!
+//! A sign-up whose window has not closed yet and that has no device so far
+//! is PENDING, not "not activated": it is reported separately (`pending`),
+//! and `settled` (= `signups − pending`) is the denominator an activation
+//! rate must use — a rate over all sign-ups would read yesterday's sign-ups
+//! as failures. Activation is final: an activated sign-up inside its window
+//! counts as activated, not pending.
+//!
+//! ⚠️ Every bucket `key` is client-chosen text — sanitised to at most 64
+//! printable ASCII characters, but chosen by whoever built the link. An admin
+//! UI renders it as TEXT, never as markup (`v-html`).
+//!
 //! It is the HOST's view, like the device listing: users are core, agents
 //! are the `fleet` module's. Without `fleet` — not compiled, or switched off
 //! — every `activated` is `null`, never `0`: "we cannot see devices" and "no
@@ -57,11 +68,17 @@ pub struct AttributionQuery {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Bucket {
     /// The value sign-ups were grouped on; `null` is the sign-ups that
-    /// recorded nothing for this dimension.
+    /// recorded nothing for this dimension. Client-chosen text: render as
+    /// text.
     pub key: Option<String>,
     pub signups: u64,
-    /// `null` when the server cannot see devices (no `fleet`).
+    /// Sign-ups whose org enrolled a device within the window. `null` when
+    /// the server cannot see devices (no `fleet`).
     pub activated: Option<u64>,
+    /// Sign-ups with no device so far whose window has not closed. Not a
+    /// failure: leave them out of any activation denominator. `null` with
+    /// `activated`.
+    pub pending: Option<u64>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -76,7 +93,15 @@ pub struct AttributionReport {
     pub signups: u64,
     /// Sign-ups that recorded ANY attribution field.
     pub attributed: u64,
+    /// See [`Bucket::activated`].
     pub activated: Option<u64>,
+    /// See [`Bucket::pending`].
+    pub pending: Option<u64>,
+    /// `signups − pending`: the sign-ups whose outcome is known (activated,
+    /// or the window closed without a device). The denominator for an
+    /// activation rate — `activated / settled`, never `activated / signups`.
+    /// `null` with `activated`.
+    pub settled: Option<u64>,
     pub by_source: Vec<Bucket>,
     pub by_medium: Vec<Bucket>,
     pub by_campaign: Vec<Bucket>,
@@ -123,6 +148,7 @@ pub async fn admin_attribution(
         enrollments.as_deref(),
         since,
         until,
+        DateTime::now(),
         truncated,
     );
     Ok(Json(serde_json::to_value(report).map_err(|e| {
@@ -178,6 +204,17 @@ fn parse_instant(raw: &str, param: &str) -> Result<DateTime, ApiError> {
     DateTime::parse_rfc3339_str(raw).map_err(|_| bad())
 }
 
+/// What one sign-up amounts to, once devices are visible.
+#[derive(Clone, Copy, PartialEq)]
+enum Fate {
+    /// A device within the window. Final.
+    Activated,
+    /// No device yet, window still open at `now`.
+    Pending,
+    /// The window closed without a device.
+    Cold,
+}
+
 /// The join and the counting, pure so it is testable without a database.
 ///
 /// `enrollments` is `Some` only when the server can see devices; each entry
@@ -185,13 +222,15 @@ fn parse_instant(raw: &str, param: &str) -> Result<DateTime, ApiError> {
 /// a member of enrolled a device in
 /// `[created_at, created_at + ACTIVATION_WINDOW_DAYS]`. Devices enrolled
 /// BEFORE the account existed do not count — joining an org that already had
-/// a fleet is not this sign-up's activation.
+/// a fleet is not this sign-up's activation. `now` decides whether a sign-up
+/// without a device is still pending or cold.
 pub(crate) fn tally(
     rows: &[SignupRow],
     memberships: &[(ObjectId, ObjectId)],
     enrollments: Option<&[(ObjectId, DateTime)]>,
     since: DateTime,
     until: DateTime,
+    now: DateTime,
     truncated: bool,
 ) -> AttributionReport {
     let mut tenants_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -206,8 +245,9 @@ pub(crate) fn tally(
         m
     });
     let window_ms = ACTIVATION_WINDOW_DAYS * 86_400_000;
+    let now_ms = now.timestamp_millis();
 
-    let activated_for = |row: &SignupRow| -> Option<bool> {
+    let fate_of = |row: &SignupRow| -> Option<Fate> {
         let enrolled_at = enrolled_at.as_ref()?;
         let start = row.created_at.timestamp_millis();
         let end = start + window_ms;
@@ -218,24 +258,39 @@ pub(crate) fn tally(
             .filter_map(|tid| enrolled_at.get(tid))
             .flatten()
             .any(|at| (start..=end).contains(at));
-        Some(hit)
+        Some(if hit {
+            Fate::Activated
+        } else if now_ms <= end {
+            Fate::Pending
+        } else {
+            Fate::Cold
+        })
     };
 
     #[derive(Default)]
     struct Tallies {
         signups: u64,
         activated: u64,
+        pending: u64,
+    }
+    impl Tallies {
+        fn add(&mut self, fate: Option<Fate>) {
+            self.signups += 1;
+            match fate {
+                Some(Fate::Activated) => self.activated += 1,
+                Some(Fate::Pending) => self.pending += 1,
+                Some(Fate::Cold) | None => {}
+            }
+        }
     }
     // BTreeMap so equal counts render in a stable order.
     let mut by: [BTreeMap<Option<String>, Tallies>; 4] = Default::default();
-    let (mut signups, mut attributed, mut activated_total) = (0u64, 0u64, 0u64);
+    let mut total = Tallies::default();
+    let mut attributed = 0u64;
 
     for row in rows {
-        signups += 1;
-        let hit = activated_for(row);
-        if hit == Some(true) {
-            activated_total += 1;
-        }
+        let fate = fate_of(row);
+        total.add(fate);
         let attr = row.signup_attribution.as_ref();
         if attr.is_some_and(|a| !a.is_empty()) {
             attributed += 1;
@@ -247,11 +302,7 @@ pub(crate) fn tally(
             attr.and_then(|a| a.self_reported.clone()),
         ];
         for (dim, key) in keys.into_iter().enumerate() {
-            let t = by[dim].entry(key).or_default();
-            t.signups += 1;
-            if hit == Some(true) {
-                t.activated += 1;
-            }
+            by[dim].entry(key).or_default().add(fate);
         }
     }
 
@@ -263,6 +314,7 @@ pub(crate) fn tally(
                 key,
                 signups: t.signups,
                 activated: can_see.then_some(t.activated),
+                pending: can_see.then_some(t.pending),
             })
             .collect();
         out.sort_by(|a, b| b.signups.cmp(&a.signups).then_with(|| a.key.cmp(&b.key)));
@@ -277,9 +329,11 @@ pub(crate) fn tally(
         until: until.try_to_rfc3339_string().unwrap_or_default(),
         activation_window_days: ACTIVATION_WINDOW_DAYS,
         truncated,
-        signups,
+        signups: total.signups,
         attributed,
-        activated: can_see.then_some(activated_total),
+        activated: can_see.then_some(total.activated),
+        pending: can_see.then_some(total.pending),
+        settled: can_see.then_some(total.signups - total.pending),
         by_source: render(source),
         by_medium: render(medium),
         by_campaign: render(campaign),
@@ -318,38 +372,52 @@ mod tests {
             .unwrap_or_else(|| panic!("no bucket {key:?} in {buckets:?}"))
     }
 
+    const T0: i64 = 1_700_000_000_000;
+
+    /// `tally` with the window `[T0, T0 + 10 d)` and `now` far enough out
+    /// that every sign-up's activation window has closed.
+    fn settled_tally(
+        rows: &[SignupRow],
+        memberships: &[(ObjectId, ObjectId)],
+        enrollments: Option<&[(ObjectId, DateTime)]>,
+    ) -> AttributionReport {
+        tally(
+            rows,
+            memberships,
+            enrollments,
+            DateTime::from_millis(T0),
+            DateTime::from_millis(T0 + 10 * DAY),
+            DateTime::from_millis(T0 + 30 * DAY),
+            false,
+        )
+    }
+
     /// Three sign-ups, two orgs, one device enrolled in time, one too late,
     /// one before the account existed.
     #[test]
     fn activation_is_a_device_within_seven_days_of_the_account() {
         let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
         let (org_a, org_c) = (ObjectId::new(), ObjectId::new());
-        let t0 = 1_700_000_000_000;
         let rows = vec![
-            row(a, t0, Some("youtube"), Some("c1")),
-            row(b, t0 + DAY, Some("youtube"), None),
-            row(c, t0 + 2 * DAY, None, None),
+            row(a, T0, Some("youtube"), Some("c1")),
+            row(b, T0 + DAY, Some("youtube"), None),
+            row(c, T0 + 2 * DAY, None, None),
         ];
         let memberships = vec![(a, org_a), (c, org_c)];
         let enrollments = vec![
             // a's org: one device on day 3 — inside the window.
-            (org_a, DateTime::from_millis(t0 + 3 * DAY)),
+            (org_a, DateTime::from_millis(T0 + 3 * DAY)),
             // c's org: a device from BEFORE c signed up, and one on day 8 —
             // neither counts.
-            (org_c, DateTime::from_millis(t0)),
-            (org_c, DateTime::from_millis(t0 + 2 * DAY + 8 * DAY)),
+            (org_c, DateTime::from_millis(T0)),
+            (org_c, DateTime::from_millis(T0 + 2 * DAY + 8 * DAY)),
         ];
-        let r = tally(
-            &rows,
-            &memberships,
-            Some(&enrollments),
-            DateTime::from_millis(t0),
-            DateTime::from_millis(t0 + 10 * DAY),
-            false,
-        );
+        let r = settled_tally(&rows, &memberships, Some(&enrollments));
         assert_eq!(r.signups, 3);
         assert_eq!(r.attributed, 2);
         assert_eq!(r.activated, Some(1));
+        assert_eq!(r.pending, Some(0), "every window has closed");
+        assert_eq!(r.settled, Some(3));
         let yt = bucket(&r.by_source, Some("youtube"));
         assert_eq!((yt.signups, yt.activated), (2, Some(1)));
         let none = bucket(&r.by_source, None);
@@ -362,77 +430,112 @@ mod tests {
         assert!(!r.truncated);
     }
 
+    /// L2 of the P1a review: a sign-up whose window is still open and has no
+    /// device is PENDING, not a failure, and stays out of `settled`. One that
+    /// activated inside its open window is activated, not pending.
+    #[test]
+    fn an_open_window_without_a_device_is_pending_not_cold() {
+        let (fresh, fresh_active, old) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let org = ObjectId::new();
+        let now = T0 + 20 * DAY;
+        let rows = vec![
+            // Signed up yesterday, no device yet: pending.
+            row(fresh, now - DAY, Some("youtube"), None),
+            // Signed up yesterday, device today: activated, window still open.
+            row(fresh_active, now - DAY, Some("youtube"), None),
+            // Signed up three weeks ago, never a device: cold.
+            row(old, T0, Some("tiktok"), None),
+        ];
+        let enrollments = vec![(org, DateTime::from_millis(now))];
+        let r = tally(
+            &rows,
+            &[(fresh_active, org)],
+            Some(&enrollments),
+            DateTime::from_millis(T0),
+            DateTime::from_millis(now),
+            DateTime::from_millis(now),
+            false,
+        );
+        assert_eq!(r.signups, 3);
+        assert_eq!(r.activated, Some(1));
+        assert_eq!(r.pending, Some(1));
+        assert_eq!(r.settled, Some(2), "signups − pending");
+        let yt = bucket(&r.by_source, Some("youtube"));
+        assert_eq!(
+            (yt.signups, yt.activated, yt.pending),
+            (2, Some(1), Some(1))
+        );
+        let tt = bucket(&r.by_source, Some("tiktok"));
+        assert_eq!(
+            (tt.signups, tt.activated, tt.pending),
+            (1, Some(0), Some(0))
+        );
+
+        // The pending edge: `now` exactly at the window's end is still open.
+        let edge = vec![row(fresh, now - 7 * DAY, Some("x"), None)];
+        let at_end = tally(
+            &edge,
+            &[],
+            Some(&[]),
+            DateTime::from_millis(T0),
+            DateTime::from_millis(now),
+            DateTime::from_millis(now),
+            false,
+        );
+        assert_eq!(at_end.pending, Some(1));
+        let past_end = tally(
+            &edge,
+            &[],
+            Some(&[]),
+            DateTime::from_millis(T0),
+            DateTime::from_millis(now),
+            DateTime::from_millis(now + 1),
+            false,
+        );
+        assert_eq!(past_end.pending, Some(0));
+        assert_eq!(past_end.settled, Some(1));
+    }
+
     /// The boundary is inclusive at both ends of the window.
     #[test]
     fn the_window_edges_are_inclusive() {
         let a = ObjectId::new();
         let org = ObjectId::new();
-        let t0 = 1_700_000_000_000;
-        let rows = vec![row(a, t0, Some("x"), None)];
-        let at_edge = vec![(org, DateTime::from_millis(t0 + 7 * DAY))];
-        let r = tally(
-            &rows,
-            &[(a, org)],
-            Some(&at_edge),
-            DateTime::from_millis(t0),
-            DateTime::from_millis(t0 + DAY),
-            false,
-        );
+        let rows = vec![row(a, T0, Some("x"), None)];
+        let at_edge = vec![(org, DateTime::from_millis(T0 + 7 * DAY))];
+        let r = settled_tally(&rows, &[(a, org)], Some(&at_edge));
         assert_eq!(r.activated, Some(1));
-        let past_edge = vec![(org, DateTime::from_millis(t0 + 7 * DAY + 1))];
-        let r = tally(
-            &rows,
-            &[(a, org)],
-            Some(&past_edge),
-            DateTime::from_millis(t0),
-            DateTime::from_millis(t0 + DAY),
-            false,
-        );
+        let past_edge = vec![(org, DateTime::from_millis(T0 + 7 * DAY + 1))];
+        let r = settled_tally(&rows, &[(a, org)], Some(&past_edge));
         assert_eq!(r.activated, Some(0));
     }
 
-    /// Without `fleet` the answer is "cannot see", never "nobody did".
+    /// Without `fleet` the answer is "cannot see", never "nobody did" — for
+    /// `activated`, `pending` and `settled` alike.
     #[test]
     fn without_fleet_every_activated_is_null_never_zero() {
         let a = ObjectId::new();
-        let rows = vec![row(a, 1_700_000_000_000, Some("tiktok"), None)];
-        let r = tally(
-            &rows,
-            &[],
-            None,
-            DateTime::from_millis(0),
-            DateTime::from_millis(1),
-            false,
-        );
+        let rows = vec![row(a, T0, Some("tiktok"), None)];
+        let r = settled_tally(&rows, &[], None);
         assert_eq!(r.signups, 1);
-        assert_eq!(r.activated, None);
-        assert_eq!(bucket(&r.by_source, Some("tiktok")).activated, None);
+        assert_eq!((r.activated, r.pending, r.settled), (None, None, None));
+        let tt = bucket(&r.by_source, Some("tiktok"));
+        assert_eq!((tt.activated, tt.pending), (None, None));
         assert_eq!(bucket(&r.by_medium, None).activated, None);
         // ...and WITH fleet but no devices at all it is a real zero.
-        let r = tally(
-            &rows,
-            &[],
-            Some(&[]),
-            DateTime::from_millis(0),
-            DateTime::from_millis(1),
-            false,
+        let r = settled_tally(&rows, &[], Some(&[]));
+        assert_eq!(
+            (r.activated, r.pending, r.settled),
+            (Some(0), Some(0), Some(1))
         );
-        assert_eq!(r.activated, Some(0));
         assert_eq!(bucket(&r.by_source, Some("tiktok")).activated, Some(0));
     }
 
     #[test]
     fn the_report_never_carries_a_user() {
         let a = ObjectId::new();
-        let rows = vec![row(a, 1_700_000_000_000, Some("youtube"), Some("c1"))];
-        let r = tally(
-            &rows,
-            &[],
-            Some(&[]),
-            DateTime::from_millis(0),
-            DateTime::from_millis(1),
-            false,
-        );
+        let rows = vec![row(a, T0, Some("youtube"), Some("c1"))];
+        let r = settled_tally(&rows, &[], Some(&[]));
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains(&a.to_hex()), "a user id leaked: {json}");
         for key in ["email", "username", "user_id", "users"] {

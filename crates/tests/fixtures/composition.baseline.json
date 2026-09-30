@@ -2144,6 +2144,11 @@
               "display_name": "text",
               "username": "text"
             }
+          },
+          {
+            "key": {
+              "created_at": 1
+            }
           }
         ]
       },
@@ -3568,6 +3573,11 @@
             "key": {
               "display_name": "text",
               "username": "text"
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
             }
           }
         ]
