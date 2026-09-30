@@ -28,6 +28,10 @@ export interface SiteAssets {
   /** The static homepage's own stylesheet and script (P6). */
   homeCss?: string
   homeJs?: string
+  /** FR-88: carries a landing's campaign keys onto the page's own sign-up,
+   *  install and download links (`attribution.js`). Absent when
+   *  `ATTRIBUTION_ENABLED` is off, and then no page loads it. */
+  attribution?: string
 }
 
 export interface OgImage {
@@ -221,6 +225,13 @@ export function renderSearchDialog(assets: SiteAssets, nav: ShellNav = DOCS_NAV)
 }
 
 export function renderBodyScripts(assets: SiteAssets): string {
-  return `<script src="${assets.js}" defer></script>
-<script src="${assets.search}" defer></script>`
+  return [
+    `<script src="${assets.js}" defer></script>`,
+    `<script src="${assets.search}" defer></script>`,
+    // First-party and same-origin, so `script-src 'self'` allows it; it only
+    // rewrites hrefs, so it cannot shift the layout.
+    assets.attribution ? `<script src="${assets.attribution}" defer></script>` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
 }

@@ -10,7 +10,7 @@
         </router-link>
 
         <h1 class="text-h3 font-weight-bold mb-2">Privacy Policy</h1>
-        <p class="text-body-2 legal-muted mb-8">Last updated: August 2026</p>
+        <p class="text-body-2 legal-muted mb-8">Last updated: September 2026</p>
 
         <section class="mb-8">
           <h2 class="text-h5 font-weight-bold mb-3">1. Introduction</h2>
@@ -141,7 +141,8 @@
           <h3 class="text-h6 font-weight-bold mb-2">2.14 Product Update Emails</h3>
           <p class="text-body-1 legal-muted mb-4">
             If you give us your email address through the "keep me posted" form on our website, we store that
-            address, which page you submitted it from, and the times you submitted it and confirmed it. We use it
+            address, which page you submitted it from (or, if a campaign link brought you there, that campaign's
+            name, as described in 2.16), and the times you submitted it and confirmed it. We use it
             for one purpose: occasional email about the product. We do not need an account for this, and the
             address is <strong>not linked to any account you may separately hold</strong>.
           </p>
@@ -155,9 +156,43 @@
 
           <h3 class="text-h6 font-weight-bold mb-2">2.15 Analytics</h3>
           <p class="text-body-1 legal-muted mb-4">
-            We use our own self-hosted analytics to understand how the site is used. It records page views and
-            coarse information such as the country a request came from, derived from the IP address. We do not
-            use third-party advertising or cross-site tracking services.
+            We use our own self-hosted analytics to understand how the site is used. For each page you view, it
+            records the page's address, the address of the page that sent you to it (in full, as your browser
+            reports it), and coarse information such as the country a request came from, derived from the IP
+            address. It also records a few named events: creating an account, subscribing to product updates,
+            copying an install command, and following a link to our source code. We do not use third-party
+            advertising or cross-site tracking services.
+          </p>
+
+          <h3 class="text-h6 font-weight-bold mb-2">2.16 How You Found Us</h3>
+          <p class="text-body-1 legal-muted mb-4">
+            Links we publish, for example under a video or in a post, can carry campaign tags: the
+            <code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>, <code>utm_content</code>,
+            <code>utm_term</code> or <code>ref</code> parameters in the address. When you arrive through such a link,
+            our pages pass the tags on in the address of their own sign-in, sign-up, install and download links,
+            and give the campaign's name to the product-updates form (2.14). Our analytics (2.15) sees them too,
+            because it records the address of each page you view. If you then create an account, we store with it
+            the source, medium, campaign, content and term from those tags, the name of the website that sent you
+            (for example <code>www.youtube.com</code>), and the path of the first page you visited on our site. The
+            account keeps only that website's name, never the full address of the page that linked to you; our
+            analytics records that full address, as your browser reports it (2.15).
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
+            The sign-up form also asks "How did you hear about Roomler?". Answering is optional; if you choose an
+            answer, we store it with the account in the same way. If you sign up through Google or another
+            provider, these details wait on our server for at most ten minutes while you sign in there, and are
+            then attached to the new account or discarded.
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
+            We use this for one purpose: to learn which of our channels bring people to Roomler, and we look at it
+            as counts per channel. It is recorded once, when the account is created, and never changed. It is not
+            shown on your profile or to anyone in your workspace, and it is deleted together with your account. The
+            legal basis is our legitimate interest in knowing which of our channels work (Art. 6(1)(f) GDPR); you
+            can object to it at any time (section 9).
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
+            <strong>Nothing about this is stored on your device</strong>: no cookie, no local storage, no session
+            storage. The tags travel only in the links you follow.
           </p>
         </section>
 
@@ -218,6 +253,7 @@
             <li class="mb-1">Process call recordings when recording is enabled</li>
             <li class="mb-1">Process payments and manage subscription billing</li>
             <li class="mb-1">Send service-related communications (e.g., account verification, security alerts)</li>
+            <li class="mb-1">Learn which of our channels bring people to Roomler, counted per channel (section 2.16)</li>
             <li class="mb-1">Diagnose faults, monitor performance and reliability, and detect abuse</li>
             <li class="mb-1">Comply with legal obligations</li>
           </ul>
