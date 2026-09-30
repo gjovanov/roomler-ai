@@ -69,11 +69,14 @@ pub async fn oauth_redirect(
 
     // FR-88 — park the attribution under the state the cookie below binds.
     // Same TTL as the cookie, no cookie of its own, and a Redis that is
-    // absent or failing costs the attribution, never the sign-in.
+    // absent, failing or not answering in time costs the attribution, never
+    // the sign-in (`park_for_oauth` gives up at `OAUTH_STORE_BUDGET`).
     if let Some(attr) = attribution::sanitize(AttributionInput::from_query(&query)) {
         match state.redis_pubsub.as_ref() {
             Some(redis) => {
-                if let Err(e) = attribution::park_for_oauth(redis, &csrf_state, &attr).await {
+                if let Err(e) =
+                    attribution::park_for_oauth(redis.as_ref(), &csrf_state, &attr).await
+                {
                     debug!(%e, "oauth attribution not parked; continuing without it");
                 }
             }
@@ -144,10 +147,11 @@ pub async fn complete_sign_in(
     csrf_state: &str,
 ) -> Result<Response, ApiError> {
     // FR-88 — collect (and delete) whatever the redirect parked under this
-    // state. A missing, expired or unreadable key is `None`, and the DAO
-    // applies a `Some` only when it CREATES the account.
+    // state. A missing, expired or unreadable key, and a Redis that does not
+    // answer within `OAUTH_STORE_BUDGET`, are all `None`; the DAO applies a
+    // `Some` only when it CREATES the account.
     let signup_attribution = match state.redis_pubsub.as_ref() {
-        Some(redis) => attribution::take_for_oauth(redis, csrf_state).await,
+        Some(redis) => attribution::take_for_oauth(redis.as_ref(), csrf_state).await,
         None => None,
     };
 

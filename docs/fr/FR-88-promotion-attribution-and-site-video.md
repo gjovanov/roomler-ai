@@ -127,10 +127,16 @@ sequenceDiagram
   (`crates/api/src/lib.rs:283-297`). It returns counts only, never a user list:
   - signups by `source`/`medium`/`campaign` and by `self_reported`;
   - activated signups, where the user's tenant enrolled at least one agent within 7 days of the
-    user's `created_at`.
+    user's `created_at`;
+  - `pending` signups — no device yet and the 7-day window still open — reported beside
+    `activated`, and `settled` (= `signups − pending`), the only valid denominator for an
+    activation rate: a rate over all signups would count yesterday's as failures.
 - It is the host's view, like its siblings: users are core, agents belong to `fleet`. With `fleet`
-  unmounted it reports `activated: null`, never `0`.
+  unmounted it reports `activated: null`, never `0` (`pending` and `settled` likewise).
 - Same gate as the siblings: 404 to anyone who is not a platform admin.
+- ⚠️ Every bucket `key` is text chosen by whoever built the link — sanitised to ≤ 64 printable
+  ASCII characters, but still attacker-chosen. An admin UI renders it as text (`{{ key }}`),
+  never as markup (`v-html`).
 - The new route changes the composition baseline
   (`crates/tests/fixtures/composition.baseline.json`). Re-record with `COMPOSITION_UPDATE=1` and
   say why in the commit.
@@ -222,6 +228,12 @@ measured from their first view. Each phase is its own promote.
 2. **When the self-reported question is asked:** on the register form, optional (default), or after
    the first login.
 3. **The option list** for the self-reported question (the default is in §3a).
+4. **What "the user's tenant" means for activation** (raised by the P1a review). P1a credits a
+   signup when ANY org the person belongs to at query time enrolled a device within the window —
+   including an org they were invited into, and regardless of when they joined it. The
+   alternatives: only memberships joined within the window, or only the org created at
+   registration. The definition is unchanged until the operator decides; the join is one
+   function (`tally` in `crates/api/src/routes/attribution.rs`).
 
 ## 7. Out of scope
 
