@@ -156,10 +156,12 @@
 
           <h3 class="text-h6 font-weight-bold mb-2">2.15 Analytics</h3>
           <p class="text-body-1 legal-muted mb-4">
-            We use our own self-hosted analytics to understand how the site is used. It records page views, a few
-            named events (creating an account, subscribing to product updates, copying an install command, and
-            following a link to our source code), and coarse information such as the country a request came from,
-            derived from the IP address. We do not use third-party advertising or cross-site tracking services.
+            We use our own self-hosted analytics to understand how the site is used. For each page you view, it
+            records the page's address, the address of the page that sent you to it (in full, as your browser
+            reports it), and coarse information such as the country a request came from, derived from the IP
+            address. It also records a few named events: creating an account, subscribing to product updates,
+            copying an install command, and following a link to our source code. We do not use third-party
+            advertising or cross-site tracking services.
           </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.16 How You Found Us</h3>
@@ -167,11 +169,13 @@
             Links we publish, for example under a video or in a post, can carry campaign tags: the
             <code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>, <code>utm_content</code>,
             <code>utm_term</code> or <code>ref</code> parameters in the address. When you arrive through such a link,
-            our pages pass the tags on in the address of their own sign-up, install and download links, and give
-            the campaign's name to the product-updates form (2.14); they go nowhere else. If you then create an
-            account, we store with it the source, medium, campaign, content and term from those tags, the name of
-            the website that sent you (for example <code>www.youtube.com</code>, never the full address of the
-            page), and the path of the first page you visited on our site.
+            our pages pass the tags on in the address of their own sign-in, sign-up, install and download links,
+            and give the campaign's name to the product-updates form (2.14). Our analytics (2.15) sees them too,
+            because it records the address of each page you view. If you then create an account, we store with it
+            the source, medium, campaign, content and term from those tags, the name of the website that sent you
+            (for example <code>www.youtube.com</code>), and the path of the first page you visited on our site. The
+            account keeps only that website's name, never the full address of the page that linked to you; our
+            analytics records that full address, as your browser reports it (2.15).
           </p>
           <p class="text-body-1 legal-muted mb-4">
             The sign-up form also asks "How did you hear about Roomler?". Answering is optional; if you choose an
