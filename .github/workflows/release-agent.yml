@@ -282,20 +282,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system build deps
+      # FR-6 wave 19 (#773): every package this job installs, from the Actions
+      # cache instead of the Ubuntu mirror. These were three raw `apt-get`
+      # steps (this one, the companion's desktop deps, patchelf), and on
+      # 2026-10-01 from 17:38Z the Azure mirror stalled them for 18 min of a
+      # 35.5 min job (594 s + 512 s, against ~22 s each); the same mirror had
+      # stalled ci.yml's profiles job the day before. A tag build restores the
+      # set the master rehearsal saved (a run may restore the default branch's
+      # caches), so for packages it makes no mirror contact; only the index
+      # refresh below still does.
+      #
+      # ⚠️ The key carries `u2204` because cache-apt-pkgs-action keys on the
+      # package list + `version` + CPU arch only, never the OS release.
+      # ci.yml's lanes cache a near-identical list on ubuntu-latest (24.04);
+      # sharing their key here would unpack 24.04 libraries onto this 22.04
+      # builder, and from there into the .deb it ships.
+      - name: Configure apt retries and refresh the index
+        # Before the cached step: on a stale index the action resolves versions
+        # the mirror has dropped, installs NOTHING and still reports success
+        # (ci.yml's composite records both incidents).
         run: |
-          # libvpx-dev needed for the `vp9-444` feature (bindgen + link).
-          # Ubuntu 24.04 (ubuntu-latest) ships libvpx 1.14.0 — bindgen
-          # 0.68.1 + libclang handles its `vpx_codec_enc_cfg` struct
-          # correctly; libvpx 1.16.x changes the header-include order
-          # in a way that triggers a known bindgen forward-declaration
-          # bug, so do not bump beyond apt's pinned version here.
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
-            cmake libclang-dev pkg-config \
-            libvpx-dev \
-            libasound2-dev
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+
+      - name: Install system build deps (cached apt)
+        # libvpx-dev for the `vp9-444` feature (bindgen + link). Ubuntu ships
+        # its own libvpx; libvpx 1.16.x changes the header-include order in a
+        # way that triggers a known bindgen forward-declaration bug, so do not
+        # bump beyond apt's version here. xcb + alsa for capture and audio; the
+        # GTK/WebKit + ayatana set for the desktop companion further down;
+        # patchelf for the FFmpeg bundling step. Bump `version:` whenever this
+        # list changes.
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
+          version: release-linux-u2204-v1
+
+      - name: Verify the build deps really landed (fallback to apt-get)
+        # Asks what the build consults (pkg-config, the loader, the tools),
+        # never the action's status, and never dpkg: a restore untars files and
+        # registers nothing. `sudo ldconfig` first, because the restore runs no
+        # postinst and /etc/ld.so.cache would otherwise miss libvpx on every hit.
+        run: |
+          set -euo pipefail
+          pkgs="libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf"
+          check() {
+            sudo ldconfig
+            for m in vpx xcb xcb-shm xcb-randr alsa glib-2.0 gtk+-3.0 libsoup-3.0 javascriptcoregtk-4.1 webkit2gtk-4.1 ayatana-appindicator3-0.1; do
+              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
+            done
+            for t in cmake patchelf; do
+              command -v "$t" >/dev/null || { echo "missing: $t"; return 1; }
+            done
+            # Not `grep -q`: it exits at the first match, ldconfig takes SIGPIPE,
+            # and under pipefail a present library would read as missing.
+            ldconfig -p | grep 'libvpx\.so' >/dev/null || { echo "missing: libvpx.so in the loader cache"; return 1; }
+            compgen -G '/usr/lib/llvm-*/lib/libclang*.so*' >/dev/null || { echo "missing: libclang"; return 1; }
+          }
+          if ! check; then
+            echo "::warning::the cached apt set did not deliver the release build deps; installing directly"
+            sudo apt-get update -qq
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $pkgs
+          fi
+          check || { echo "::error::release build deps still missing after the fallback install"; exit 1; }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -498,7 +548,7 @@ jobs:
           # 9.0.1 (libavcodec.so.63), so the .deb must CARRY its own FFmpeg or it
           # won't start on a stock box. Ship each lib under its SONAME as a real
           # file (no symlinks) into /usr/lib/roomler-agent; RPATH wires it up.
-          sudo apt-get update -qq && sudo apt-get install -y patchelf
+          # patchelf comes from the cached apt set at the top of this job.
           dst=agents/roomlerd/vendor-ffmpeg
           rm -rf "$dst" && mkdir -p "$dst"
           # P3e Phase 3: bundle ONLY the vendored libs the binary actually
@@ -641,15 +691,9 @@ jobs:
       # consent prompt and no "being viewed" indicator at all — the daemon's
       # native overlay is Windows-only. It already COMPILED on Linux (workspace
       # clippy in ci.yml walks it with webkit2gtk installed); only packaging
-      # was missing.
-      - name: Install desktop build deps (companion only)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev
-
+      # was missing. Its GTK/WebKit + ayatana build deps come from the cached
+      # apt set at the top of this job (FR-6 wave 19): they used to be a raw
+      # `apt-get` here, which spent 512 s in the mirror stall of 2026-10-01.
       - name: Build the desktop companion
         run: cargo build -p roomler-desktop --release
 
