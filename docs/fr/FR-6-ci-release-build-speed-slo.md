@@ -92,7 +92,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
 | 15 | 09-28 | Actions-cache storage limit 10 → 20 GB (the operator, paid); the dead `key: wf-…` inputs removed, and the comments that relied on them corrected | #1772 |
 | 16 | 09-29 | `cargo-cache-salt`: each of the 14 PR-facing Swatinem jobs (`ci.yml`, `integration-tests.yml`, `installer-smoke.yml`) salts its key with a hash of its own definition, so a new step's dependency builds reach the cache on the next master run (root cause 4, for real this time) | #1784 |
-| 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #PR |
+| 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #1805 |
 
 ## Acceptance criteria
 
