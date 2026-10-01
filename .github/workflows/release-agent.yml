@@ -1928,6 +1928,77 @@ jobs:
           shared-key: installer-smoke-windows
 
   # ---------------------------------------------------------------------------
+  # 2c. macOS companion — roomler-desktop, built in PARALLEL with the .pkg job
+  #     (FR-6 wave 18, #773). It was the last step build-macos ran before
+  #     staging, and the .pkg job is the release's long pole: on agent-v0.4.112
+  #     to 0.4.114 the job took 12.2 min, 158–177 s of it this build, after a
+  #     450–603 s agent build. The crate needs none of that job's setup (its
+  #     deps are agent-core + localapi + Tauri: no brew libvpx, no FFmpeg, no
+  #     roomlerd), so it builds on a bare macos-14 while the agent compiles,
+  #     and build-macos picks the binary up at the point it used to build it.
+  #     Signing, staging and the .app checks stay in build-macos, unchanged.
+  #
+  #     ⚠️ The artifact is the raw, EXTENSIONLESS binary on purpose: the
+  #     release job publishes every downloaded file matching
+  #     *.msi/*.pkg/*.deb/*.exe/*.tar.gz/*.sha256, so packing this into a
+  #     .tar.gz would publish an intermediate as a release asset.
+  # ---------------------------------------------------------------------------
+  build-macos-companion:
+    name: Build desktop companion (macOS arm64)
+    needs: validate-version
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Its OWN family: the agent-macos seed stops carrying the companion's
+        # artifacts now that build-macos no longer builds it. Same scheme as
+        # every other lane (see build-macos and .github/actions/seed-cache-restore).
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-macos-companion
+
+      # `custom-protocol` is on unconditionally in its Cargo.toml, so a plain
+      # `cargo build` embeds the frontend and no Tauri toolchain is needed on
+      # the runner (the same reason the Windows lane uses `cargo build`).
+      - name: Build the desktop companion
+        run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
+
+      - name: Upload the companion binary (for build-macos)
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-companion
+          path: target/aarch64-apple-darwin/release/roomler-desktop
+          if-no-files-found: error
+          # A re-run of this job replaces it rather than failing on the name.
+          overwrite: true
+          # Consumed within this run only.
+          retention-days: 1
+
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-macos-companion
+
+  # ---------------------------------------------------------------------------
   # 3. macOS — signed + notarised .pkg. Unsigned unless Apple secrets present.
   # ---------------------------------------------------------------------------
   build-macos:
@@ -2198,12 +2269,55 @@ jobs:
       - name: Build the roomler CLI shim
         run: cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
 
-      # The desktop companion — the macOS counterpart of roomler-desktop.exe.
-      # `custom-protocol` is on unconditionally in its Cargo.toml, so a plain
-      # `cargo build` embeds the frontend and no Tauri toolchain is needed on
-      # the runner (the same reason the Windows lane uses `cargo build`).
-      - name: Build the desktop companion
-        run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
+      # The desktop companion — the macOS counterpart of roomler-desktop.exe —
+      # is built by the parallel `build-macos-companion` job (FR-6 wave 18).
+      # Collect it where this job used to build it: the staging step below
+      # copies `target/aarch64-apple-darwin/release/roomler-desktop` into the
+      # .app. The agent build above takes 7.5–10 min and the companion ~3, so
+      # it is normally waiting already.
+      #
+      # ⚠️ Waits on the JOB, not on the artifact listing: a failed or skipped
+      # companion job fails this step at once, instead of after the timeout.
+      - name: Wait for the desktop companion (built in parallel)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The `name:` of the build-macos-companion job.
+          COMPANION_JOB: Build desktop companion (macOS arm64)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 180); do # 30 min at 10 s
+            state=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.name == env.COMPANION_JOB) | "\(.status) \(.conclusion // "")"' | head -n1)
+            case "$state" in
+              "completed success")
+                echo "companion ready (waited $(( (i - 1) * 10 )) s)"
+                exit 0 ;;
+              completed*)
+                echo "::error::'$COMPANION_JOB' finished '${state#completed }', so there is no companion to package"
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::'$COMPANION_JOB' did not finish within 30 min"
+          exit 1
+
+      - name: Download the desktop companion
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-companion
+          path: target/aarch64-apple-darwin/release
+
+      - name: Check the downloaded companion
+        # Artifacts do not keep file modes, and this is the binary the .app
+        # will launch, so check it is what the build produced.
+        run: |
+          set -euo pipefail
+          f=target/aarch64-apple-darwin/release/roomler-desktop
+          chmod +x "$f"
+          desc="$(file "$f")"
+          echo "$desc"
+          echo "$desc" | grep -q 'Mach-O 64-bit executable arm64' \
+            || { echo "::error::the companion artifact is not an arm64 Mach-O executable"; exit 1; }
 
       # ── The STABLE self-signed code-signing identity ────────────────────
       # TCC keys Screen Recording / Accessibility grants on the code-signing
@@ -2879,7 +2993,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -3021,8 +3135,9 @@ jobs:
        needs.build-linux-arm64.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.build-windows-companions.result == 'failure' ||
+       needs.build-macos-companion.result == 'failure' ||
        needs.build-macos.result == 'failure')
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -3081,8 +3196,9 @@ jobs:
       needs.build-linux-arm64.result == 'success' &&
       needs.build-windows.result == 'success' &&
       needs.build-windows-companions.result == 'success' &&
+      needs.build-macos-companion.result == 'success' &&
       needs.build-macos.result == 'success'
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
