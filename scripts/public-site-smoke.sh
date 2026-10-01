@@ -66,7 +66,7 @@ secset() { headers "$1" | grep -Ei "^($SEC):" | sort; }
 echo "public-site smoke against $BASE"
 
 # 1. Relative redirects, one URL per page.
-for path in /docs /docs/start; do
+for path in /docs /docs/start /links; do
   read -r code loc <<< "$(redirect "$BASE$path")"
   if [ "$code" = "301" ] && [ "${loc#/}" != "$loc" ] && [ "$loc" = "$path/" ]; then
     ok "$path -> 301 Location: $loc (relative, slash form)"
@@ -77,7 +77,7 @@ done
 
 # 2. Real 404s, never the SPA shell — and the site's own 404 page, which
 #    offers search and the sections, not nginx's bare one.
-for path in /docs/fr87-smoke-missing/ /blog/fr87-smoke-missing/; do
+for path in /docs/fr87-smoke-missing/ /blog/fr87-smoke-missing/ /links/fr88-smoke-missing/; do
   code="$(status "$BASE$path")"
   if [ "$code" != "404" ]; then
     bad "$path -> $code (want 404; a 200 here is a soft 404)"
@@ -100,7 +100,7 @@ ROOT_SET="$(secset "$BASE/")"
 if [ -z "$ROOT_SET" ]; then
   bad "/ carries none of the security headers — cannot compare"
 else
-  pages="/docs/ /docs/start/"
+  pages="/docs/ /docs/start/ /links/"
   [ "$(status "$BASE/blog/")" = "200" ] && pages="$pages /blog/"
   for path in $pages; do
     got="$(secset "$BASE$path")"
@@ -171,7 +171,36 @@ done <<'PAIRS'
 /pricing?utm_source=smoke /?utm_source=smoke#pricing
 PAIRS
 
-# 5c. The IndexNow key (P7): an engine verifies a submission by fetching
+# 5c. FR-88 P2 — the link hub, and one short path per channel profile that
+#     302s to it WITH the channel as the campaign source. A short path that
+#     fell through to `location /` would answer 200 with the SPA shell, which
+#     is why the status and the exact Location are both checked.
+hub="$(curl -ksS -m 15 "$BASE/links/" 2>/dev/null)"
+if printf '%s' "$hub" | grep -q '<h1 class="links-title">' && printf '%s' "$hub" | grep -q 'content="noindex, follow"'; then
+  ok "/links/ -> the link hub (H1, noindex)"
+else
+  bad "/links/ -> not the link hub (is dist/links/index.html missing?)"
+fi
+cc="$(header "$BASE/links/" cache-control)"
+case "$cc" in
+  *no-cache*) ok "/links/ Cache-Control: $cc" ;;
+  *) bad "/links/ Cache-Control: '${cc:-none}' (want no-cache)" ;;
+esac
+while read -r from to; do
+  read -r code loc <<< "$(redirect "$BASE$from")"
+  if [ "$code" = "302" ] && [ "$loc" = "$to" ]; then
+    ok "$from -> 302 Location: $loc"
+  else
+    bad "$from -> $code Location: '${loc:-none}' (want 302 to '$to')"
+  fi
+done <<'PAIRS'
+/yt /links/?utm_source=youtube&utm_medium=bio&utm_campaign=profile
+/tt /links/?utm_source=tiktok&utm_medium=bio&utm_campaign=profile
+/ig /links/?utm_source=instagram&utm_medium=bio&utm_campaign=profile
+/fb /links/?utm_source=facebook&utm_medium=bio&utm_campaign=profile
+PAIRS
+
+# 5d. The IndexNow key (P7): an engine verifies a submission by fetching
 #     /<key>.txt, so the file must be served exactly as committed. A missing
 #     one would not 404: `location /` answers it with the SPA shell. Needs the
 #     repo, where the key file is named.
@@ -192,7 +221,7 @@ fi
 #    image reserves its box (width + height). The og:image is absolute and
 #    keeps a stable name on purpose (the SPA's index.html points at it), so
 #    it is not matched here. `/` (no cookie) is the static homepage (P6).
-for path in / /docs/ /docs/start/quickstart/; do
+for path in / /docs/ /docs/start/quickstart/ /links/; do
   html="$(curl -ksS -m 20 "$BASE$path" 2>/dev/null)"
   refs="$(printf '%s' "$html" | grep -oE '(href|src|data-search-index)="/docs/assets/[^"]+"' | sed -E 's/^[^"]+"//; s/"$//' | sort -u)"
   n="$(printf '%s\n' "$refs" | grep -c .)"
