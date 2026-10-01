@@ -93,6 +93,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 15 | 09-28 | Actions-cache storage limit 10 → 20 GB (the operator, paid); the dead `key: wf-…` inputs removed, and the comments that relied on them corrected | #1772 |
 | 16 | 09-29 | `cargo-cache-salt`: each of the 14 PR-facing Swatinem jobs (`ci.yml`, `integration-tests.yml`, `installer-smoke.yml`) salts its key with a hash of its own definition, so a new step's dependency builds reach the cache on the next master run (root cause 4, for real this time) | #1784 |
 | 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #1805 |
+| 18 | 10-01 | The macOS desktop companion builds in a parallel job (`build-macos-companion`, its own seed family `agent-macos-companion`) instead of serially at the end of `build-macos`, which collects the binary where it used to build it | #1804 |
 
 ## Acceptance criteria
 
@@ -113,11 +114,16 @@ itself on the affected run's page. Baseline when the program started: releases t
       of the janitor's 22 sweeps in that window deleted one as `pr-cargo`, so none was
       ever written, not merely swept. Each of the 12 master families held exactly one
       generation; the janitor had retired 7 superseded ones
-- [ ] A changed or added CI step's dependency builds reach its job's cargo cache on the
+- [x] A changed or added CI step's dependency builds reach its job's cargo cache on the
       next master run, without a cold run (wave 16). Field: the first master run after
       the salt lands saves a new generation for every salted job from a prefix restore
       (`full match: false`, not `No cache found`), and a later edit to one job's steps
-      rotates that job's key alone
+      rotates that job's key alone. Both halves, 2026-10-01: master CI re-run 36819352918
+      (attempt 2) restored all 11 salted lanes from the pre-salt generation and saved
+      each salted one, once the budget let writes through; then PR #1805, which edits only
+      the profiles job, rotated `ci-profiles` alone (`…-767ec95a` against master's
+      `…-4829dd40`, a prefix restore), while every other salted job restored master's key
+      with a full match (run 36907082419)
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
@@ -151,7 +157,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   `recorder` + `recorder-audio` sharing one) stays in reserve. The registry copy each
   family carries is only ~167 MB for the whole lockfile, so deduplicating it is not
   the lever.
-- **Resolved 2026-09-29 by wave 16, field check owed: a new CI step's dependency builds
+- **Resolved by wave 16 (merged 09-29, field-verified 10-01): a new CI step's dependency builds
   stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
   open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
   the calling job's own definition rather than the whole of `ci.yml`, so an edit to
@@ -169,6 +175,13 @@ itself on the affected run's page. Baseline when the program started: releases t
   workflow change and still restore the previous generation as a prefix match. That
   relies on a rust-cache implementation detail; if it changes, the salt is ignored and
   the lane behaves as it does today.
+- **The release Linux x86_64 job still installs from the mirror** (found by wave 18's
+  rehearsal). Its two raw `apt-get` steps cost 18 min on 10-01 from 17:38Z, the window
+  in which the same Azure mirror also stalled PR #1804's profiles job (on the pre-wave-17
+  step). The mirror had stalled the profiles job on 09-30 15:47Z too, so this recurs. A
+  tag built in such a window misses the 10-min goal on this job alone. Lever: the CI
+  lanes' answer, `cache-apt-pkgs-action` sets that the master rehearsal saves and tag
+  builds restore. Cost: a second package list to keep in step.
 
 ## Out of scope
 
@@ -296,3 +309,23 @@ itself on the affected run's page. Baseline when the program started: releases t
   its first `macos-pkg-smoke` entry. Pool afterwards: 12.9 GB in 24 entries.
   A detector note: rust-cache v2.9.2 logs a successful save only as `Sent N of N
   (100.0%)`; there is no "Cache saved" line to grep for.
+- 2026-10-01: **Wave 16's second field half, and wave 17 under a live stall.** PR #1805
+  edits only the profiles job. Its run (36907082419, whole CI 8.5 min) rotated
+  `ci-profiles` alone (`…-767ec95a` against master's `…-4829dd40`, a prefix restore);
+  the other ten salted jobs restored master's key with a full match. Its cached apt step
+  took 21 s and the job 2.0 min, where PR #1804's run 50 min earlier, on the old raw
+  step, had spent 455 s in apt during the mirror stall described below.
+- 2026-10-01: **Wave 18, pre-merge rehearsal** (run 36900740850, on the branch,
+  artifacts-only). `Build .pkg (macOS arm64)` took 10.6 min, against 12.2 on
+  agent-v0.4.114. Agent 478 s, then it waited 1 s for the companion (finished at
+  17:44:29, before the agent build did), downloaded it in 1 s and checked it in 0 s;
+  staging, codesign and notarisation ran unchanged. A tag skips the 53 s seed save, so
+  about 9.7 min there. The new `Build desktop companion (macOS arm64)` took 6.6 min cold
+  (342 s build, no seed family yet) and saved its first seed. The same rehearsal also
+  showed two slow jobs this wave does not touch:
+  - `Build .deb (Linux x86_64)` took 35.5 min, 18 of them in raw `apt-get` against the
+    Azure Ubuntu mirror ("Install system build deps" 594 s, the companion's deps 512 s,
+    against about 22 s each on 09-28). Its aarch64 sibling (`ports.ubuntu.com`) installed
+    in 27 s.
+  - `Build .msi (Windows x86_64)` took 22.7 min, its agent compile 1085 s against 408 s
+    on the tag, building against seeds three days old. The rehearsal saved fresh ones.
