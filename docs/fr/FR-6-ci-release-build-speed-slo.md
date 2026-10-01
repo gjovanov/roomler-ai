@@ -92,6 +92,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 14 | 09-27 | **PR CI regression**: the "Rust checks" monolith split into five parallel lanes + an aggregate; PR runs write no cargo caches (`save-if` in `ci.yml`, `integration-tests.yml`, `installer-smoke.yml`); `line-tables-only` debuginfo; PR-run `concurrency`; janitor sweeps PR-ref cargo caches and superseded master generations | #1743 |
 | 15 | 09-28 | Actions-cache storage limit 10 → 20 GB (the operator, paid); the dead `key: wf-…` inputs removed, and the comments that relied on them corrected | #1772 |
 | 16 | 09-29 | `cargo-cache-salt`: each of the 14 PR-facing Swatinem jobs (`ci.yml`, `integration-tests.yml`, `installer-smoke.yml`) salts its key with a hash of its own definition, so a new step's dependency builds reach the cache on the next master run (root cause 4, for real this time) | #1784 |
+| 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #PR |
 
 ## Acceptance criteria
 
@@ -143,7 +144,10 @@ itself on the affected run's page. Baseline when the program started: releases t
   overnight, unit at midday, agent and both recorder lanes in the evening), and each
   eviction cost the next PR a cold lane (log, 2026-09-28). The operator raised the
   repo's limit to **20 GB** (paid; `PUT repos/{repo}/actions/cache/storage-limit`
-  answered 402 until the account had a payment method). Trimming families (e.g.
+  answered 402 until the account had a payment method). ⚠️ The limit alone was not
+  enough: with the Actions budget at its default, the pool above the free 10 GB was
+  read-only from 09-28 21:37Z until the operator set a $10 budget on 10-01 (log).
+  Trimming families (e.g.
   `recorder` + `recorder-audio` sharing one) stays in reserve. The registry copy each
   family carries is only ~167 MB for the whole lockfile, so deduplicating it is not
   the lever.
@@ -257,3 +261,38 @@ itself on the affected run's page. Baseline when the program started: releases t
   applied. The awk also reads to EOF instead of `exit`ing at the next job, because an
   early exit can SIGPIPE the upstream `tr`, which `pipefail` turns into a failed step.
   macOS `macos-mesh-test.yml` (manual dispatch only) is not salted.
+- 2026-09-29: **Correction: the 20 GB raise made the cache read-only.** It was
+  "verified" by reading the limit back, the wrong check. The pool was 10.58 GB, above
+  the free 10 GB, and with the account's Actions budget at its default every save from
+  then on logged `Cache reservation failed: You have reached your configured budget,
+  your cache is now read only to prevent additional charges.` as a warning, inside a
+  job that stayed green. Last successful saves 09-28 19:43 and 20:17Z; limit raised
+  21:04Z; first refusal 21:37Z; then 20 of 20 save attempts across 78 master runs
+  refused, including all 13 salted jobs of wave 16's merge run. The newest cache entry
+  on any ref stayed at 09-28 20:24Z and the janitor logged the same 10576 MB pool on
+  every sweep. Cost: `integration-tests` ran cold every time, 22.3–24.8 min against
+  13–19 min before (its family was missing and could not be re-saved). PR lanes kept
+  restoring the pre-salt generation and stayed near-warm (whole CI median 6.8 min over
+  19 PR runs, 09-29 19:00Z to 09-30 22:00Z).
+- 2026-09-30: **A mirror stall in the profiles job** (wave 17). `Build profiles`, ~2 min,
+  took 9.3, 10.3 and 10.6 min in three runs between 15:47 and 16:20Z. Its step "Build
+  deps for the SFU worker (collab)" ran a raw `apt-get install` against
+  `azure.archive.ubuntu.com`: 113 s for the 28.8 MB `libclang-18-dev`, then 300 s for
+  the 5 kB `libclang-dev` (run 36739413410). The Rust lanes take the same packages from
+  `cache-apt-pkgs-action` and were unaffected. Fix: the job uses the lanes' composite.
+  Its cached sets carry everything that step installed (`cmake`, `cmake-data`,
+  `libclang-18-dev`, `libclang-dev`, `libjsoncpp25`, `librhash0`); `python3-pip` ships
+  with the runner image ("already the newest version"). The composite costs ~21 s in a
+  lane, against ~14 s for the raw step on a good day.
+- 2026-10-01: **Budget $10 (the operator); saves resume, and wave 16 in the field.**
+  Re-ran master CI at `37fa997ae` (run 36819352918, attempt 2, 7.8 min): all 11 salted
+  `ci.yml` jobs restored the pre-salt generation (`full match: false`, none cold) and
+  SAVED their salted one, every key the one PR #1784's run had computed, the first
+  writes since 09-28 20:24Z. installer-smoke's Windows job (run 36899658523) did the
+  same. The janitor's `workflow_run` sweep then retired all 11 superseded generations,
+  freeing 9.5 GB; the pool had peaked at 20.0 GB, both generations side by side.
+  A dispatched `integration-tests` (run 36899638438, 21 min cold) saved `ci-integration`
+  (1.1 GB), missing since 09-28, and installer-smoke's macOS job (13.7 min cold) saved
+  its first `macos-pkg-smoke` entry. Pool afterwards: 12.9 GB in 24 entries.
+  A detector note: rust-cache v2.9.2 logs a successful save only as `Sent N of N
+  (100.0%)`; there is no "Cache saved" line to grep for.
