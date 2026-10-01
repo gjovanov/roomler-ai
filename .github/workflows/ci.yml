@@ -1661,13 +1661,17 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      - name: Configure apt retries
-        run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-
-      # `collab` is the only reduced profile that links mediasoup, whose
-      # worker build wants these; the others need nothing beyond the toolchain.
-      - name: Build deps for the SFU worker (collab)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev cmake python3-pip
+      # `collab` is the only reduced profile that links mediasoup, whose worker
+      # build wants cmake + libclang; the others need nothing beyond the
+      # toolchain (python3-pip ships with the runner image). FR-6 wave 17
+      # (#773): from the Rust lanes' cached apt sets rather than a raw
+      # `apt-get install` against the Ubuntu mirror, which on 2026-09-30
+      # 15:47–16:20Z stalled ~7.5 min fetching libclang (113 s on a 28.8 MB
+      # package, then 300 s on a 5 kB one) and stretched this ~2 min job to
+      # 9.3–10.6 min three runs in a row. The sets cover both packages and
+      # their dependencies, and the composite carries the empty-restore guards.
+      - name: Build deps for the SFU worker (collab) — cached apt, verified
+        uses: ./.github/actions/ci-linux-system-deps
 
       - name: Check every reduced profile compiles
         run: |
