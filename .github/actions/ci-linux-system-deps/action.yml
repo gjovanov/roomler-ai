@@ -10,7 +10,9 @@ description: >-
   identical, so a package added once reaches every lane, and the apt cache
   keys (`ci-gtk-v3`, `ci-vpx-v3`) stay the same across lanes, so every lane
   restores the same apt entries. The comments below are the original
-  ones, moved here unchanged.
+  ones, moved here unchanged. Since FR-6 wave 17 the profiles job uses it
+  too, for the SFU worker's cmake + libclang, instead of a raw apt-get
+  against the mirror.
 runs:
   using: composite
   steps:
