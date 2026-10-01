@@ -51,7 +51,9 @@ export const DEFAULT_OG_IMAGE: OgImage = { url: `${SITE_ORIGIN}${OG_IMAGE}`, ...
  * exactly as it was (FR-87 P4's kill switch).
  */
 export interface ShellNav {
-  current: 'docs' | 'blog' | 'home'
+  /** `links` is FR-88's link hub (`/links/`): the homepage's plain brand, and
+   *  the nav every page other than the homepage shows. */
+  current: 'docs' | 'blog' | 'home' | 'links'
   hasBlog: boolean
 }
 
@@ -150,17 +152,19 @@ export function renderTopbar(nav: ShellNav = DOCS_NAV): string {
       ? `<button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>`
       : ''
   const brand =
-    current === 'home'
+    current === 'home' || current === 'links'
       ? `<a class="brand" href="/"><span class="brand__mark">Roomler</span></a>`
       : `<a class="brand" href="${current === 'blog' ? BLOG_BASE : BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">${current === 'blog' ? 'Blog' : 'Docs'}</span></a>`
   const docsLink = `<a href="${BASE}/"${here(current === 'docs')}>Docs</a>\n      `
   const blogLink = nav.hasBlog ? `<a href="${BLOG_BASE}/"${here(current === 'blog')}>Blog</a>\n      ` : ''
   // FR-87 P6: the product page IS `/` now (`/landing` and `/pricing` 301 there),
   // so the links go straight to it instead of through a redirect.
+  // A docs page without a blog leaves out the Docs link: the brand already
+  // goes there. The link hub's brand goes to `/`, so it keeps the link.
   const links =
     current === 'home'
       ? `<a href="#features">Features</a>\n      <a href="#pricing">Pricing</a>\n      ${docsLink}${blogLink}<a href="/login">Log in</a>`
-      : `${nav.hasBlog ? `${docsLink}${blogLink}` : ''}<a href="/">Product</a>\n      <a href="/#pricing">Pricing</a>`
+      : `${nav.hasBlog || current === 'links' ? `${docsLink}${blogLink}` : ''}<a href="/">Product</a>\n      <a href="/#pricing">Pricing</a>`
   return `<header class="topbar">
   <div class="topbar__inner">
     ${brand}
