@@ -94,6 +94,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 16 | 09-29 | `cargo-cache-salt`: each of the 14 PR-facing Swatinem jobs (`ci.yml`, `integration-tests.yml`, `installer-smoke.yml`) salts its key with a hash of its own definition, so a new step's dependency builds reach the cache on the next master run (root cause 4, for real this time) | #1784 |
 | 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #1805 |
 | 18 | 10-01 | The macOS desktop companion builds in a parallel job (`build-macos-companion`, its own seed family `agent-macos-companion`) instead of serially at the end of `build-macos`, which collects the binary where it used to build it | #1804 |
+| 19 | 10-01 | The release Linux x86_64 job installs every package from one cached apt set (`release-linux-u2204-v1`, the master rehearsal saves it, tags restore it) instead of three raw `apt-get` steps against the mirror | #1806 |
 
 ## Acceptance criteria
 
@@ -126,8 +127,13 @@ itself on the affected run's page. Baseline when the program started: releases t
       with a full match (run 36907082419)
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
-      pending the next tag; 2026-08-26's warm Windows execution was 18.3 min against a
-      dozen-PR same-day delta + signing steps (see Open decisions)
+      **not met.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
+      waves 18 and 19, whose agent code is 0.4.114's) took **14.9 min**: Windows MSI
+      13.9, macOS `.pkg` 10.4, Linux x86_64 9.9, aarch64 7.4. Over the 12 tags 0.4.102–
+      0.4.115 the MSI job ran 9.2–14.9 min and is the steady long pole. Of its 13.9 min,
+      586 s were the final single-crate compile of `roomlerd` under `codegen-units=1`, which
+      took 349 s on 0.4.114 for the same code: runner speed, not work. The remaining
+      levers are the operator's (see Open decisions)
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
@@ -135,7 +141,12 @@ itself on the affected run's page. Baseline when the program started: releases t
   bump invalidates every crate) under the size-optimized `cgu=1` profile, plus Azure
   signing steps. If normal-delta tags still exceed 10 min: relax `cgu=1` in CI (undoes
   part of P3e's size wins), decouple the per-release version bump (touches self-update
-  identity), or paid 8-core runners.
+  identity), or paid 8-core runners. **Measured 2026-10-01, now that macOS and Linux are
+  off the critical path (waves 18–19): they do** (agent-v0.4.115, 14.9 min). The MSI job
+  is the pole (9.2–14.9 min across 12 tags), and most of it is ONE crate: `roomlerd`'s
+  final compile, single-threaded under `cgu=1`, swings 349–586 s with the runner on
+  identical code. Every remaining lever is one of the three above, and each is an
+  operator decision.
 - Runner-pool queue time is outside repo control (observed 35–70 min during bursts);
   rehearsal concurrency caps our own contribution. A self-hosted Windows runner is the
   reserve option.
@@ -175,7 +186,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   workflow change and still restore the previous generation as a prefix match. That
   relies on a rust-cache implementation detail; if it changes, the salt is ignored and
   the lane behaves as it does today.
-- **The release Linux x86_64 job still installs from the mirror** (found by wave 18's
+- **Resolved 2026-10-01 by wave 19 (#1806): the release Linux x86_64 job installed from the mirror** (found by wave 18's
   rehearsal). Its two raw `apt-get` steps cost 18 min on 10-01 from 17:38Z, the window
   in which the same Azure mirror also stalled PR #1804's profiles job (on the pre-wave-17
   step). The mirror had stalled the profiles job on 09-30 15:47Z too, so this recurs. A
@@ -329,3 +340,35 @@ itself on the affected run's page. Baseline when the program started: releases t
     in 27 s.
   - `Build .msi (Windows x86_64)` took 22.7 min, its agent compile 1085 s against 408 s
     on the tag, building against seeds three days old. The rehearsal saved fresh ones.
+- 2026-10-01: **Wave 19, pre-merge rehearsal** (run 36934413598, on the branch). The
+  cached-apt step missed, as a first run must, and cached 146 packages (180 MB) under its
+  own key. Its install spent ~8.5 min in the mirror, still stalling at 22:20Z; the
+  caching itself took 9 s. The verify step passed in 0 s on the real 22.04 runner: every
+  pkg-config module, the loader, cmake/patchelf and libclang, with no fallback warning
+  emitted. On master (rehearsal 36936407900) the set missed again, because a branch's
+  caches are invisible to master. It installed in 40 s, the mirror having recovered, and
+  saved on master at 22:40:57Z.
+- 2026-10-01: **agent-v0.4.115, the field test of waves 18 and 19** (run 36937794461,
+  tagged 22:54:13Z on `dd50b13b6`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
+  (the pole), `.pkg` 10.4 (12.2 on 0.4.114, median 12.3 over the last 12 tags), Linux
+  x86_64 9.9, aarch64 7.4, the companions 3.3 (macOS) and 6.1 (Windows).
+  - Release: 28 assets, names identical to 0.4.114's apart from the version, each
+    artifact with its `.asc` and `.sha256`, and no intermediate leaked.
+    `/api/agent/latest-release` served 0.4.115 with both daemon `.deb`s before the
+    companion's.
+  - Lockstep: `setup-v0.4.115` published at 23:26:27Z on the same commit, and
+    `/api/setup/{windows,linux,macos}` all serve 0.4.115 filenames.
+  - zeus (Linux x86_64, systemd-supervised, checked first): `self-update --check-only`
+    verified the `.deb`'s `.asc` against the pinned release key, and the real update
+    installed and verified itself (`SucceededVerified`). A CLI-run self-update leaves
+    the live daemon on the deleted inode, as `dpkg -i` does, so a `systemd-run`
+    scheduled restart moved it to 0.4.115. The server recorded it at once, and the
+    overlay came back on DERP, then re-upgraded to direct 2.3 min later.
+  - The operator's MacBook, read-only: the `.pkg`'s checksum matched; it is Developer ID
+    signed and notarised (`spctl`: accepted, source=Notarized Developer ID). The
+    companion inside it, built by the new parallel job, is an arm64 Mach-O whose `.app`
+    passes `codesign --verify --deep --strict` (team 4TG7586MY5) and links only system
+    libraries.
+  - Fleet uptake at 23:25Z: 1 of 8 online devices on 0.4.115 (zeus, updated by hand);
+    the rest follow their updaters (~4 h, the Mac's helper ~6 h). 0.4.115 changes nothing
+    a device runs, so uptake proves the artifacts, not a behaviour.
