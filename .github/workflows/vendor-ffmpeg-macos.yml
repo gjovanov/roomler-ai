@@ -35,8 +35,17 @@ permissions:
 jobs:
   build:
     name: Build + upload FFmpeg 9.0.1 (macOS arm64, LGPL)
-    runs-on: macos-14
+    # macos-15, pinned: GitHub retires macos-14 by 2026-11-02.
+    runs-on: macos-15
     timeout-minutes: 90
+    env:
+      # The dylibs' own minimum macOS, made explicit so a runner move cannot
+      # raise it. Without this clang targets the RUNNER's macOS, which is how
+      # the asset now on vendored-ffmpeg-9.0.1 came to require 14.0 (built on
+      # macos-14). Kept at 14.0 so a rebuild produces what ships today. It must
+      # stay at or below release-agent.yml's MACOS_FLOOR, and that job's bundle
+      # check fails the release if it does not.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - name: Install build deps
         # nasm is x86-only (harmless on arm64 — FFmpeg uses its own arm64 asm
