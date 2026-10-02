@@ -224,6 +224,23 @@ are unnecessary from rc.435 and should be removed.
 
 ## macOS
 
+> **Requires macOS 15 (Sequoia) or later, on Apple silicon (arm64).** The
+> `.pkg` enforces this itself. Below the floor, the installer refuses the
+> package rather than install a daemon that cannot start. On a Mac that already
+> runs Roomler, the root update helper's install fails, the Mac stays on the
+> version it has, and the helper raises its usual notice ("Self-update to … failed
+> … this Mac is still on …", with `/var/log/install.log` naming the OS
+> requirement). The last release that installs on macOS 14 is **0.4.115**.
+>
+> Why 15: the `.pkg` bundles dylibs (Homebrew's libvpx and the vendored FFmpeg),
+> and each carries its own minimum macOS. Homebrew no longer publishes a macOS 14
+> build of libvpx, and GitHub retires its macOS 14 build runners in November
+> 2026. The release job derives the installer gate, both bundles'
+> `LSMinimumSystemVersion` and a build-time check of every shipped binary from
+> one value, `MACOS_FLOOR` in `release-agent.yml`. A future runner move that
+> raises a dylib's minimum fails the release instead of shipping a daemon that
+> cannot start.
+
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 

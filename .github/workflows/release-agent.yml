@@ -1978,7 +1978,7 @@ jobs:
   #     to 0.4.114 the job took 12.2 min, 158–177 s of it this build, after a
   #     450–603 s agent build. The crate needs none of that job's setup (its
   #     deps are agent-core + localapi + Tauri: no brew libvpx, no FFmpeg, no
-  #     roomlerd), so it builds on a bare macos-14 while the agent compiles,
+  #     roomlerd), so it builds on a bare macos-15 while the agent compiles,
   #     and build-macos picks the binary up at the point it used to build it.
   #     Signing, staging and the .app checks stay in build-macos, unchanged.
   #
@@ -1990,7 +1990,8 @@ jobs:
   build-macos-companion:
     name: Build desktop companion (macOS arm64)
     needs: validate-version
-    runs-on: macos-14
+    # Same pinned image as build-macos (see there).
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -2048,10 +2049,22 @@ jobs:
   build-macos:
     name: Build .pkg (macOS arm64)
     needs: validate-version
-    runs-on: macos-14
+    # macos-15, pinned, not `macos-latest`: GitHub retires macos-14 by
+    # 2026-11-02 (brownouts from 10-05), and a floating label would move the
+    # build — and the bundled dylibs' minimum macOS — without a commit.
+    runs-on: macos-15
     timeout-minutes: 180
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
+      # The minimum macOS this .pkg supports, enforced three ways from this ONE
+      # value: the installer gate (scripts/macos-productbuild-gated.sh), both
+      # Info.plists' LSMinimumSystemVersion, and the bundle check that fails the
+      # build when anything shipped needs a newer macOS. 15.0 since the move off
+      # macos-14: Homebrew no longer publishes a macOS 14 libvpx bottle, and on
+      # 0.4.115 the bundled libvpx + FFmpeg dylibs already required 14.0 (the
+      # Rust binaries 11.0). The operator chose to raise it rather than build
+      # libvpx ourselves (2026-10-02).
+      MACOS_FLOOR: "15.0"
       # Mirror the signing secrets into env once so the `if:` guards below can
       # reference `env.*` instead of `secrets.*` (secrets are not allowed in
       # step-level `if:` conditions).
@@ -2557,7 +2570,7 @@ jobs:
           echo "  clean — every load command is /usr/lib, /System or @rpath."
 
           echo "=== self-containment check: run it with Homebrew HIDDEN ==="
-          # macos-14 is arm64, so the staged binary runs here. Hiding the brew
+          # macos-15 is arm64, so the staged binary runs here. Hiding the brew
           # prefix for the duration makes this an honest end-user simulation
           # rather than a check the builder's own environment can satisfy.
           # Restore BEFORE acting on the result, so a failure cannot leave the
@@ -2598,7 +2611,7 @@ jobs:
               <key>CFBundleShortVersionString</key>  <string>${VERSION}</string>
               <key>CFBundleVersion</key>             <string>${VERSION}</string>
               <key>CFBundlePackageType</key>         <string>APPL</string>
-              <key>LSMinimumSystemVersion</key>      <string>12.0</string>
+              <key>LSMinimumSystemVersion</key>      <string>${MACOS_FLOOR}</string>
               <key>LSUIElement</key>                 <true/>
               <key>NSPrincipalClass</key>            <string>NSApplication</string>
               <key>NSScreenCaptureUsageDescription</key>
@@ -2675,7 +2688,7 @@ jobs:
               <key>CFBundleVersion</key>             <string>${VERSION}</string>
               <key>CFBundlePackageType</key>         <string>APPL</string>
               <key>CFBundleIconFile</key>            <string>icon.png</string>
-              <key>LSMinimumSystemVersion</key>      <string>12.0</string>
+              <key>LSMinimumSystemVersion</key>      <string>${MACOS_FLOOR}</string>
               <!-- Menu-bar only: no Dock tile, no app-switcher entry. -->
               <key>LSUIElement</key>                 <true/>
               <key>NSHighResolutionCapable</key>     <true/>
@@ -2798,6 +2811,42 @@ jobs:
                    "stage/Roomler.app"
           codesign --verify --strict "stage/Roomler.app"
 
+      # Every Mach-O this .pkg ships must run on its declared floor. The
+      # dylibs carry their own minimum macOS (on 0.4.115: libvpx and the three
+      # FFmpeg libs 14.0, the Rust binaries 11.0), and a runner-image move
+      # raises it without a word: Homebrew pours the bottle built for the
+      # runner's macOS. Fail the build instead of shipping a daemon that dies
+      # at launch on the Macs the installer gate still lets in.
+      - name: Check the bundle runs on its declared minimum macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          # LC_BUILD_VERSION's minos, or the legacy LC_VERSION_MIN_MACOSX.
+          minos() { otool -l "$1" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ {b = 1} b && ($1 == "minos" || $1 == "version") {print $2; exit}'; }
+          # $1 <= $2, as dotted versions.
+          le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)" = "$2" ]; }
+          fail=0; n=0
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in *Mach-O*) ;; *) continue ;; esac
+            n=$((n + 1))
+            m=$(minos "$f")
+            if [ -z "$m" ]; then
+              echo "::error::no minimum macOS recorded in $f"; fail=1
+            elif le "$m" "$MACOS_FLOOR"; then
+              echo "  ok   macOS $m  $f"
+            else
+              echo "::error::$f requires macOS $m, above this .pkg's floor of $MACOS_FLOOR"; fail=1
+            fi
+          done < <(find stage/roomlerd.app stage/Roomler.app \
+                        target/aarch64-apple-darwin/release/roomler-shim -type f -print0)
+          [ "$n" -gt 0 ] || { echo "::error::found no Mach-O files to check"; exit 1; }
+          for p in stage/roomlerd.app/Contents/Info.plist stage/Roomler.app/Contents/Info.plist; do
+            v=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$p")
+            [ "$v" = "$MACOS_FLOOR" ] || { echo "::error::$p declares LSMinimumSystemVersion $v, not $MACOS_FLOOR"; fail=1; }
+          done
+          echo "checked $n Mach-O files against macOS $MACOS_FLOOR"
+          exit "$fail"
+
       - name: Build component + product pkg
         id: pkg
         shell: bash
@@ -2886,10 +2935,13 @@ jobs:
           # already-published `-unsigned` releases keep resolving too.
           artifact="dist/roomlerd-$VERSION-aarch64-apple-darwin.pkg"
 
+          # The product archive carries an installer-enforced minimum macOS
+          # (MACOS_FLOOR): a Mac below it refuses the update and keeps running
+          # what it has. See the script's header.
           if [[ "${{ steps.apple.outputs.mode }}" == "full" ]]; then
-            productbuild --package component.pkg --sign "Developer ID Installer" "$artifact"
+            bash scripts/macos-productbuild-gated.sh component.pkg "$artifact" "$MACOS_FLOOR" "Developer ID Installer"
           else
-            productbuild --package component.pkg "$artifact"
+            bash scripts/macos-productbuild-gated.sh component.pkg "$artifact" "$MACOS_FLOOR"
           fi
 
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"

@@ -41,6 +41,7 @@ on:
     paths:
       - 'agents/roomlerd/**'
       - '.github/workflows/installer-smoke.yml'
+      - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
   # agent. Until now this job ran on push-to-master and dispatch only, so its
   # checks (including the PE import audit added in #647) first executed AFTER
@@ -73,6 +74,7 @@ on:
       # decides from this module; a change to it changes what an install does.
       - 'agents/roomlerd/src/win_service/system_context_attempt.rs'
       - '.github/workflows/installer-smoke.yml'
+      - 'scripts/macos-productbuild-gated.sh'
   workflow_dispatch: {}
 
 # actions:write was for a "Refresh the cache seed (delete BEFORE restore)"
@@ -723,7 +725,9 @@ jobs:
   # permission reporting made assertable.
   macos-pkg-install:
     name: macOS pkg install smoke
-    runs-on: macos-14
+    # Pinned to the image release-agent.yml builds the shipped .pkg on (GitHub
+    # retires macos-14 by 2026-11-02).
+    runs-on: macos-15
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -879,7 +883,11 @@ jobs:
           pkgbuild --root payload --component-plist component.plist \
             --scripts scripts --identifier com.roomler.agent \
             --version "$VERSION" --install-location / component.pkg
-          productbuild --package component.pkg dist/smoke.pkg
+          # Gated exactly as the release is (release-agent.yml's MACOS_FLOOR), and
+          # a second product gated at an impossible macOS for the negative
+          # control below.
+          bash scripts/macos-productbuild-gated.sh component.pkg dist/smoke.pkg 15.0
+          bash scripts/macos-productbuild-gated.sh component.pkg dist/smoke-gate-99.pkg 99.0
 
           # Prove what is actually IN the package before installing it, so a
           # script failure can never again be confused with a staging failure.
@@ -889,6 +897,24 @@ jobs:
             || { echo "::error::the LaunchAgent plist is not in the payload"; exit 1; }
           pkgutil --payload-files component.pkg | grep -q 'usr/local/bin/roomler' \
             || { echo "::error::the CLI is not in the payload"; exit 1; }
+
+      # The shipped .pkg refuses a Mac below its floor, and on this runner every
+      # real floor passes, so prove the mechanism with an impossible one. If
+      # `installer` ever stopped honouring <allowed-os-versions>, a Mac below the
+      # floor would install a daemon that cannot start. Runs BEFORE the real
+      # install, while nothing of ours is on this runner yet.
+      - name: The installer gate refuses an unsupported macOS (negative control)
+        run: |
+          set -uo pipefail
+          if sudo installer -pkg dist/smoke-gate-99.pkg -target / > gate.log 2>&1; then
+            cat gate.log
+            echo "::error::installer ACCEPTED a package gated at macOS 99.0"
+            exit 1
+          fi
+          cat gate.log
+          [ ! -e /Library/Roomler/roomlerd.app ] \
+            || { echo "::error::the refused install still put the daemon bundle down"; exit 1; }
+          echo "refused, and nothing landed"
 
       - name: Install it
         run: sudo installer -verbose -pkg dist/smoke.pkg -target /
