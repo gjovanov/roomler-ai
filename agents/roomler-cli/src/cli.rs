@@ -218,9 +218,9 @@ enum Command {
     /// List the peers the local daemon currently sees, with each peer's live
     /// connection type (direct / relay / tunnel / blocked / offline).
     ///
-    ///   roomler peers                          # every peer, by mesh name
-    ///   roomler peers --display-name           # NAME = the dashboard display name
-    ///   roomler peers laptop "Office PC"       # only these, in this order
+    /// `roomler peers --display-name` puts the dashboard display names in
+    /// NAME; `roomler peers laptop "Office PC"` shows only those two, in
+    /// that order — each a mesh name or a display name.
     Peers {
         /// FR-49 - show only this enrollment (`roomlerd org ls`; `primary` for
         /// the scalar identity). Without it every org's peers are printed
@@ -355,8 +355,8 @@ enum Command {
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
     ///
-    ///   roomler ping build-box
-    ///   roomler ping "Office PC"               # a dashboard display name
+    /// `roomler ping build-box` — or, by dashboard display name,
+    /// `roomler ping "Office PC"`.
     Ping {
         /// Overlay peer to ping — a mesh name (e.g. `build-box`), a dashboard
         /// display name, or an overlay IP (either family;
@@ -386,8 +386,8 @@ enum Command {
     /// Commands run as the target daemon's identity (SYSTEM on Windows,
     /// root under systemd) and every attempt is audited.
     ///
-    ///   roomler exec build-box -- uptime
-    ///   roomler exec "Office PC" -- hostname    # a dashboard display name
+    /// `roomler exec build-box -- uptime` — or, by dashboard display name,
+    /// `roomler exec "Office PC" -- hostname`.
     Exec {
         /// Target device — a device name (e.g. `build-box`), a dashboard
         /// display name, or a hex agent id. A display name is resolved from
@@ -421,7 +421,8 @@ enum Command {
     ///
     ///   roomler ssh winhost-a
     ///   roomler ssh winhost-a -- uptime
-    ///   roomler ssh "Office PC"                # a dashboard display name
+    ///
+    /// A dashboard display name works too: `roomler ssh "Office PC"`.
     Ssh {
         /// Target device — a device name (e.g. `build-box`), a dashboard
         /// display name, or a hex agent id. Resolved like `exec`'s: a display
