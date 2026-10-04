@@ -1,9 +1,9 @@
 # FR-87: A blog at roomler.ai/blog, a crawlable homepage, and a site Google can index
 
 **Issue:** [#1776](https://github.com/gjovanov/roomler-ai/issues/1776) · **Status:** **closed
-2026-09-30**, all 14 criteria field-verified. P1–P7 live since 2026-09-29. Scheduled follow-ups,
-none blocking: `LEGACY_UNHASHED_ASSETS` off in a release from 2026-10-03, and Search Console
-reviews at +3/+14/+28 days · **Owner:** web / public site · **Builds on:**
+2026-09-30**, all 14 criteria field-verified. P1–P7 live since 2026-09-29. Follow-ups, none
+blocking: `LEGACY_UNHASHED_ASSETS` turned off on 2026-10-04 (live with the next promote), and
+Search Console reviews at +3/+14/+28 days · **Owner:** web / public site · **Builds on:**
 [FR-60](FR-60-public-docs-site.md) (the static docs generator)
 
 ## 1. Goal
@@ -123,7 +123,8 @@ following the `enrollCommands.ts` pattern.
   in the first phase after P2's promote, but P2 rolled with P1–P5 on 2026-09-29 and P6 is
   ready the same day. Pre-P1 HTML carried no `Cache-Control`, so a browser may still hold it
   under heuristic caching (about 2.8 days). The flag is therefore turned off in the first
-  release on or after **2026-10-03**, not in P6.
+  release on or after **2026-10-03**, not in P6. It was turned off on 2026-10-04, and reaches
+  production with the next promote.
 - `social-preview.png` keeps its stable name, because `ui/index.html` points at it.
 - **Inline markdown images** get a markdown-it rule that emits `width`/`height` read from the
   file itself (PNG, GIF, JPEG, WebP and SVG parsed by hand, no dependency),
