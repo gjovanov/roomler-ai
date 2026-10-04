@@ -16,14 +16,17 @@
 //! injected, never read from the clock) so the table rendering is unit-tested
 //! with no live daemon.
 
+use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use tunnel_core::localapi::{
-    self, ConnectionType, DaemonMode, FlowInfo, FlowKind, NodeStatus, PeerInfo, RouteInfo,
-    RouteState,
+    self, ConnectionType, DaemonMode, DeviceRowLite, FlowInfo, FlowKind, NodeStatus, PeerInfo,
+    RouteInfo, RouteState,
 };
+
+use crate::names::{self, NamedPeer, Need, Resolution};
 
 /// Em-dash for an absent / null field — matches the tray's `devices.js`
 /// convention so the two surfaces read the same.
@@ -176,6 +179,19 @@ pub async fn netcheck(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The flags of `roomler peers`.
+#[derive(Debug, Clone, Default)]
+pub struct PeersArgs {
+    /// FR-49 — one enrollment label; `None` = every org.
+    pub org: Option<String>,
+    /// NAME shows each peer's dashboard display name (the device list joined
+    /// in); `--json` gains a `display_name` per peer.
+    pub display_name: bool,
+    /// Positional filter: mesh names or display names, in output order.
+    pub names: Vec<String>,
+    pub json: bool,
+}
+
 /// `roomler peers` — every peer this node sees, with its live connection type.
 ///
 /// FR-49 — `org` scopes the output to ONE enrollment. Not only ergonomics: on a
@@ -185,38 +201,248 @@ pub async fn netcheck(json: bool) -> Result<()> {
 /// with its overlay OFF can be SHOWN as such: it has no peers, so it used to
 /// produce no section at all — indistinguishable from an org whose peers merely
 /// happen to be offline.
-pub async fn peers(json: bool, org: Option<String>) -> Result<()> {
+///
+/// Display names (`--display-name`, and a `NAME…` filter that may name a
+/// device by either name) come from the device list, never from the netmap —
+/// `docs/device-naming.md` — so they are a per-org JOIN done here, in the
+/// client ([`names::name_peers`]). Without the list (an older daemon, a server
+/// that did not answer) the column shows mesh names and one stderr line says
+/// so; `--json` is the wire verbatim unless `--display-name` asked for more.
+pub async fn peers(args: PeersArgs) -> Result<()> {
+    let PeersArgs {
+        org,
+        display_name,
+        names,
+        json,
+    } = args;
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let peers = client.peers().await.map_err(daemon_err)?;
     let peers: Vec<PeerInfo> = match &org {
         Some(want) => peers.into_iter().filter(|p| &p.org == want).collect(),
         None => peers,
     };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&peers)?);
-        return Ok(());
-    }
     // A second round trip on a local pipe, for the one thing the peer list
     // cannot say: which enrollments exist but contribute no peers, and why.
-    let orgs = client
-        .status()
-        .await
-        .map(|s| s.orgs)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|o| org.as_deref().is_none_or(|w| o.label == w))
-        .collect::<Vec<_>>();
-    if let Some(want) = &org
+    // Human mode only — and BEFORE the name filter, so an unknown `--org` is
+    // called that rather than "no peer named".
+    let orgs = if json {
+        Vec::new()
+    } else {
+        client
+            .status()
+            .await
+            .map(|s| s.orgs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|o| org.as_deref().is_none_or(|w| o.label == w))
+            .collect::<Vec<_>>()
+    };
+    if !json
+        && let Some(want) = &org
         && orgs.is_empty()
         && peers.is_empty()
     {
         println!("No enrollment labelled {want:?} — see `roomlerd org ls`.");
         return Ok(());
     }
-    print_peers(&peers, now_ms());
-    print_dark_orgs(&orgs, &peers);
+    // The device list of each org on screen, for the column and for the
+    // filter alike — a filter argument may be a display name too.
+    let rows_by_org = if (display_name || !names.is_empty()) && !peers.is_empty() {
+        device_lists_for(&mut client, &peers).await
+    } else {
+        HashMap::new()
+    };
+    let named = names::name_peers(&peers, &rows_by_org);
+    let named = if names.is_empty() {
+        named
+    } else {
+        let (kept, unmatched) = names::filter_by_names(named, &names);
+        for miss in &unmatched {
+            eprintln!("warning: no peer named {miss:?}");
+        }
+        if kept.is_empty() {
+            bail!("none of the given names matches a peer — `roomler peers` lists them");
+        }
+        kept
+    };
+    if json {
+        println!("{}", peers_json(&named, display_name)?);
+        return Ok(());
+    }
+    print_peers(&named, display_name, now_ms());
+    // An org with no rows is only worth explaining when nothing was asked
+    // for by name — a filter narrows the screen to what was named.
+    if names.is_empty() {
+        print_dark_orgs(&orgs, &peers);
+    }
     print_other_daemon_hint();
     Ok(())
+}
+
+/// `peers --json`: the peer structs verbatim — and, under `--display-name`
+/// only, a `display_name` on each (`null` when the device list knows none),
+/// so a script that never asked sees the wire it always saw.
+fn peers_json(named: &[NamedPeer<'_>], display_name: bool) -> Result<String> {
+    if !display_name {
+        let plain: Vec<&PeerInfo> = named.iter().map(|n| n.peer).collect();
+        return Ok(serde_json::to_string_pretty(&plain)?);
+    }
+    let rows = named
+        .iter()
+        .map(|n| {
+            let mut v = serde_json::to_value(n.peer)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "display_name".to_string(),
+                    n.display_name
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
+            }
+            Ok(v)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::to_string_pretty(&rows)?)
+}
+
+/// The device list of every org the peer rows belong to, keyed as the rows
+/// are stamped (`""` = a single-org daemon, whose rows are the primary's).
+///
+/// Best effort: an org whose list is unavailable is left out — its peers keep
+/// their mesh names — and ONE line on stderr says so, with the cause, because
+/// a column that silently fell back would read as "nobody set a display name".
+async fn device_lists_for(
+    client: &mut localapi::Client,
+    peers: &[PeerInfo],
+) -> HashMap<String, Vec<DeviceRowLite>> {
+    let mut orgs: Vec<&str> = Vec::new();
+    for p in peers {
+        if !orgs.contains(&p.org.as_str()) {
+            orgs.push(&p.org);
+        }
+    }
+    let multi = orgs.len() > 1;
+    let mut lists = HashMap::new();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut first_error = None;
+    for org in orgs {
+        match fetch_all_devices(client, org).await {
+            Ok(rows) => {
+                lists.insert(org.to_string(), rows);
+            }
+            Err(e) => {
+                failed.push(if org.is_empty() { "primary" } else { org });
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        let which = if multi {
+            format!(" for {}", failed.join(", "))
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "warning: device list unavailable{which} — showing mesh names ({})",
+            explain_directory_error(e)
+        );
+    }
+    lists
+}
+
+/// Every page of `org`'s device list (`""` / `primary` = the primary
+/// enrollment), at the server's page cap. The server's own `exec` resolver
+/// reads at most 500 agents, so the page ceiling here is generous, not a
+/// limit anyone meets.
+async fn fetch_all_devices(
+    client: &mut localapi::Client,
+    org: &str,
+) -> Result<Vec<DeviceRowLite>, localapi::DirectoryError> {
+    const PER_PAGE: u64 = 100;
+    const MAX_PAGES: u64 = 50;
+    let mut all = Vec::new();
+    let mut page = 1;
+    loop {
+        let query = localapi::DevicesQuery {
+            page,
+            per_page: PER_PAGE,
+            ..Default::default()
+        };
+        let got = client.devices(org, &query).await?;
+        let last = got.items.is_empty() || page >= got.total_pages || page >= MAX_PAGES;
+        all.extend(got.items);
+        if last {
+            return Ok(all);
+        }
+        page += 1;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Device selectors — display names for `ping` / `exec` / `ssh`
+// (`docs/device-naming.md`; the rule itself is `names::resolve_selector`)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The device list of the PRIMARY enrollment — the org these commands already
+/// act in: the daemon's `ping` reads only the primary's mesh, and `exec` /
+/// `ssh` ride the primary's control WS, so the server resolves their target
+/// within that org. `None` when it cannot be had, for any reason — the
+/// commands then behave exactly as before.
+async fn primary_devices(client: &mut localapi::Client) -> Option<Vec<DeviceRowLite>> {
+    match fetch_all_devices(client, "").await {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            tracing::debug!(error = %e, "device list unavailable — the selector goes as typed");
+            None
+        }
+    }
+}
+
+/// `exec` / `ssh`: the selector to SEND for what a person typed — as typed,
+/// or the hex agent id of the one device whose display name it is. Refuses an
+/// ambiguous display name; a command runs as SYSTEM/root on whatever it names.
+pub async fn agent_selector(target: &str) -> Result<String> {
+    if names::is_literal(target) {
+        return Ok(target.to_string());
+    }
+    // A daemon that cannot be reached fails the command itself a moment
+    // later, with the error that explains it — not here.
+    let Ok(mut client) = localapi::connect().await else {
+        return Ok(target.to_string());
+    };
+    let rows = primary_devices(&mut client).await;
+    match names::resolve_selector(target, rows.as_deref(), Need::AgentId) {
+        Resolution::AsTyped => Ok(target.to_string()),
+        Resolution::Device(r) => Ok(r.id.clone()),
+        Resolution::Ambiguous(c) => Err(names::ambiguity_error(target, &c)),
+    }
+}
+
+/// `ping`: the target to SEND — as typed, or the overlay address of the one
+/// device whose display name it is (the published IPv6 with `prefer_v6`).
+async fn ping_target(
+    client: &mut localapi::Client,
+    target: &str,
+    prefer_v6: bool,
+) -> Result<String> {
+    if names::is_literal(target) {
+        return Ok(target.to_string());
+    }
+    let rows = primary_devices(client).await;
+    match names::resolve_selector(target, rows.as_deref(), Need::OverlayIp) {
+        Resolution::AsTyped => Ok(target.to_string()),
+        Resolution::Device(r) => {
+            // The derived v6 is published per peer by the overlay runtime,
+            // not listed by the server — one more local read, only for `-6`.
+            let peers = if prefer_v6 {
+                client.peers().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Ok(names::ping_address(r, &peers, prefer_v6).unwrap_or_else(|| target.to_string()))
+        }
+        Resolution::Ambiguous(c) => Err(names::ambiguity_error(target, &c)),
+    }
 }
 
 /// FR-49 — name the enrollments that contribute no peers BECAUSE they are not
@@ -569,10 +795,14 @@ pub async fn rename(name: &str) -> Result<()> {
 /// other daemons reply "not supported". The daemon's own error (unknown peer /
 /// timeout / not-a-netstack-node) is surfaced verbatim — only a *connect* failure
 /// maps through [`daemon_err`].
+///
+/// A dashboard display name is translated here to the device's overlay
+/// address ([`ping_target`]); the output line keeps what was TYPED.
 pub async fn ping(target: &str, timeout_ms: u64, prefer_v6: bool, json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let send = ping_target(&mut client, target, prefer_v6).await?;
     let (overlay_ip, rtt_ms) = client
-        .ping(target, timeout_ms, prefer_v6)
+        .ping(&send, timeout_ms, prefer_v6)
         .await
         .map_err(|e| anyhow!("{e}"))?;
     if json {
@@ -754,6 +984,10 @@ pub async fn ssh_session(node: &str, public_key: &str, session_secs: u64) -> Res
 ///
 /// Exit status mirrors the remote command's, so this composes in a script:
 /// a refused or failed command is a non-zero exit here too, never a silent 0.
+///
+/// `device` may be a dashboard display name: [`agent_selector`] turns it into
+/// the hex agent id before the request leaves, and refuses one two devices
+/// share. The server still resolves and gates whatever is sent.
 pub async fn exec(
     device: &str,
     shell: &str,
@@ -761,7 +995,12 @@ pub async fn exec(
     timeout_ms: u64,
     json: bool,
 ) -> Result<()> {
-    let run = run_remote(device, shell, command, timeout_ms).await?;
+    let node = agent_selector(device).await?;
+    let mut run = run_remote(&node, shell, command, timeout_ms).await?;
+    // The daemon echoes the selector it was sent. Show the one that was
+    // TYPED — identical whenever nothing was translated, and the name the
+    // person recognises when a display name was.
+    run.node = device.to_string();
     if json {
         println!(
             "{}",
@@ -889,10 +1128,10 @@ const SECTION_MARK: &str = "===ROOMLER-DIAG-SECTION===";
 /// expands `$env:OS` to `Windows_NT`, while bash sees an unset `$env` followed
 /// by the literal `:OS`. Cheaper and more reliable than trying to run `uname`
 /// under PowerShell, and it needs no OS field on the wire.
-async fn detect_windows(node: &str) -> Result<bool> {
+async fn detect_windows(node: &str, label: &str) -> Result<bool> {
     let run = run_remote(node, "", "echo $env:OS", 15_000).await?;
     if let Some(e) = run.error {
-        return Err(anyhow!("{node}: {e}"));
+        return Err(anyhow!("{label}: {e}"));
     }
     Ok(run.stdout.contains("Windows_NT"))
 }
@@ -906,7 +1145,10 @@ async fn detect_windows(node: &str) -> Result<bool> {
 pub async fn diag_bundle(devices: &[String], json: bool) -> Result<()> {
     let mut all = Vec::new();
     for device in devices {
-        let is_windows = detect_windows(device).await?;
+        // Same selector rule as `exec`: a display name becomes the hex id
+        // once, and both execs below address that.
+        let node = agent_selector(device).await?;
+        let is_windows = detect_windows(&node, device).await?;
         let sections = if is_windows {
             WINDOWS_BUNDLE
         } else {
@@ -927,7 +1169,7 @@ pub async fn diag_bundle(devices: &[String], json: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let run = run_remote(device, "", &script, 120_000).await?;
+        let run = run_remote(&node, "", &script, 120_000).await?;
         all.push((device.clone(), run));
     }
 
@@ -1729,18 +1971,58 @@ fn fmt_last_seen(last_seen_ms: Option<u64>, now_ms: u64) -> String {
     }
 }
 
-/// One `peers` table row: `<glyph> NAME OVERLAY-IP CONN RTT LAST-SEEN`.
-fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
-    let rtt = match p.rtt_ms {
-        Some(ms) => format!("{ms} ms"),
-        None => DASH.to_string(),
-    };
-    // A peer can arrive without a friendly name (seen in the field); show its
-    // short node id rather than a blank cell so the row still identifies it.
-    let name = if p.name.is_empty() {
+/// The NAME a peer row shows by default: its mesh name — or, for a peer that
+/// arrived without one (seen in the field), its short node id rather than a
+/// blank cell, so the row still identifies it.
+fn peer_mesh_name(p: &PeerInfo) -> String {
+    if p.name.is_empty() {
         short_id(&p.node_id)
     } else {
         p.name.clone()
+    }
+}
+
+/// The NAME a peer row shows: under `display`, its dashboard display name
+/// when the device list knows one; else [`peer_mesh_name`].
+fn peer_label(n: &NamedPeer<'_>, display: bool) -> String {
+    match (&n.display_name, display) {
+        (Some(d), true) => d.clone(),
+        _ => peer_mesh_name(n.peer),
+    }
+}
+
+/// Cut a label to `width` with an ellipsis — only when asked (`cut`): the
+/// default table never truncated a mesh name and must not start.
+fn fit_label(label: &str, width: usize, cut: bool) -> String {
+    if cut && label.chars().count() > width {
+        label
+            .chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    } else {
+        label.to_string()
+    }
+}
+
+/// One `peers` table row: `<glyph> NAME OVERLAY-IP CONN RTT LAST-SEEN`, the
+/// NAME being the mesh name in its fixed 20-column cell — the default row,
+/// kept as the shape the tests pin (`print_peers` reaches it through
+/// [`fmt_peer_row_as`] with the same label and width).
+#[cfg(test)]
+fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
+    fmt_peer_row_as(p, &peer_mesh_name(p), PEER_NAME_W, now_ms)
+}
+
+/// The NAME column's width when nothing widens it — the table's shape since
+/// the first `roomler peers`, which the diag bundle and older readers parse.
+const PEER_NAME_W: usize = 20;
+
+/// One `peers` table row with `name` in a NAME cell `name_w` wide.
+fn fmt_peer_row_as(p: &PeerInfo, name: &str, name_w: usize, now_ms: u64) -> String {
+    let rtt = match p.rtt_ms {
+        Some(ms) => format!("{ms} ms"),
+        None => DASH.to_string(),
     };
     // rc.275 honesty — a carrier the health sweep judged SILENTLY ONE-WAY
     // renders as `stalled`, not as a healthy-looking `direct`/`relay` (the
@@ -1760,7 +2042,7 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
             relay_qualified_label(p)
         };
     format!(
-        "{} {:<20} {:<16} {:<26} {:<15} {:>7} {}",
+        "{} {:<name_w$} {:<16} {:<26} {:<15} {:>7} {}",
         up_glyph(p.online),
         name,
         opt(p.overlay_ip.as_deref()),
@@ -2188,24 +2470,45 @@ fn dark_orgs<'a>(
         .collect()
 }
 
-fn print_peers(peers: &[PeerInfo], now_ms: u64) {
+/// The `peers` table. Under `display` the NAME column is each peer's
+/// dashboard display name (its mesh name when it has none), widened to fit
+/// and cut at 34 like the `devices` table; otherwise it is the mesh name in
+/// its fixed cell — byte for byte the table it has always been.
+fn print_peers(named: &[NamedPeer<'_>], display: bool, now_ms: u64) {
+    let labels: Vec<String> = named.iter().map(|n| peer_label(n, display)).collect();
+    let name_w = if display {
+        labels
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .clamp(PEER_NAME_W, 34)
+    } else {
+        PEER_NAME_W
+    };
     println!(
-        "  {:<20} {:<16} {:<26} {:<15} {:>7} LAST SEEN",
+        "  {:<name_w$} {:<16} {:<26} {:<15} {:>7} LAST SEEN",
         "NAME", "OVERLAY IP", "OVERLAY IP6", "CONN", "RTT"
     );
-    if peers.is_empty() {
+    if named.is_empty() {
         println!("(no peers)");
         return;
     }
-    for (i, (org, rows)) in group_peers_by_org(peers).into_iter().enumerate() {
+    let rows: Vec<(&NamedPeer<'_>, &str)> = named
+        .iter()
+        .zip(labels.iter().map(String::as_str))
+        .collect();
+    let grouped = group_by_org(&rows, |(n, _)| n.peer.org.as_str());
+    for (i, (org, group)) in grouped.into_iter().enumerate() {
         if let Some(org) = org {
             if i > 0 {
                 println!();
             }
             println!("  ── org: {org} ──");
         }
-        for p in rows {
-            println!("{}", fmt_peer_row(p, now_ms));
+        for (n, label) in group {
+            let cell = fit_label(label, name_w, display);
+            println!("{}", fmt_peer_row_as(n.peer, &cell, name_w, now_ms));
         }
     }
 }
@@ -2279,19 +2582,10 @@ fn device_name(r: &localapi::DeviceRowLite) -> String {
 }
 
 /// The local peer behind a listed device: by overlay node id, else by the
-/// backing agent id.
+/// backing agent id — the one join rule, shared with the display-name
+/// lookups ([`names::peer_for_device`]).
 fn peer_for_row<'a>(r: &localapi::DeviceRowLite, peers: &'a [PeerInfo]) -> Option<&'a PeerInfo> {
-    if let Some(node) = r.overlay_node_id.as_deref()
-        && let Some(p) = peers.iter().find(|p| p.node_id == node)
-    {
-        return Some(p);
-    }
-    if r.kind == "agent" && !r.id.is_empty() {
-        return peers
-            .iter()
-            .find(|p| p.agent_id.as_deref() == Some(r.id.as_str()));
-    }
-    None
+    names::peer_for_device(r, peers)
 }
 
 /// One `devices` table row — pure, so the column rules are unit-tested.
@@ -2381,21 +2675,37 @@ fn devices_hint(page: &localapi::DevicesPage, searched: bool) -> Option<&'static
 /// older CLIs — and the diag bundle, which shells out to `roomler peers` —
 /// already expect. Rows with no org alongside labelled ones (mixed daemon
 /// shapes) are kept in a trailing `(unlabelled)` group rather than dropped.
+#[cfg(test)]
 fn group_peers_by_org(peers: &[PeerInfo]) -> Vec<(Option<&str>, Vec<&PeerInfo>)> {
+    group_by_org(peers, |p| p.org.as_str())
+}
+
+/// [`group_peers_by_org`] over any row type that knows its org — the table
+/// prints `(peer, label)` pairs under `--display-name`.
+fn group_by_org<T>(
+    items: &[T],
+    org_of: impl for<'b> Fn(&'b T) -> &'b str,
+) -> Vec<(Option<&str>, Vec<&T>)> {
     let mut order: Vec<&str> = Vec::new();
-    for p in peers {
-        if !p.org.is_empty() && !order.contains(&p.org.as_str()) {
-            order.push(p.org.as_str());
+    for it in items {
+        let org = org_of(it);
+        if !org.is_empty() && !order.contains(&org) {
+            order.push(org);
         }
     }
     if order.is_empty() {
-        return vec![(None, peers.iter().collect())];
+        return vec![(None, items.iter().collect())];
     }
-    let mut out: Vec<(Option<&str>, Vec<&PeerInfo>)> = order
+    let mut out: Vec<(Option<&str>, Vec<&T>)> = order
         .into_iter()
-        .map(|org| (Some(org), peers.iter().filter(|p| p.org == org).collect()))
+        .map(|org| {
+            (
+                Some(org),
+                items.iter().filter(|it| org_of(it) == org).collect(),
+            )
+        })
         .collect();
-    let orphans: Vec<&PeerInfo> = peers.iter().filter(|p| p.org.is_empty()).collect();
+    let orphans: Vec<&T> = items.iter().filter(|it| org_of(it).is_empty()).collect();
     if !orphans.is_empty() {
         out.push((Some("(unlabelled)"), orphans));
     }
@@ -3322,5 +3632,107 @@ mod devices_tests {
         )))
         .to_string();
         assert!(msg.contains("not running"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    fn peer(node: &str, name: &str) -> PeerInfo {
+        let mut p: PeerInfo = serde_json::from_str(
+            r#"{"node_id":"x","name":"x","online":true,"connection":"direct","overlay_ip":"100.64.0.5"}"#,
+        )
+        .unwrap();
+        p.node_id = node.into();
+        p.name = name.into();
+        p
+    }
+
+    /// Without `--display-name` a row is byte-identical to the row it has
+    /// always been — the mesh name in its fixed cell, never cut — and with it
+    /// the label is the display name, cut only past the widened cell.
+    #[test]
+    fn default_rows_are_unchanged_and_display_labels_widen_and_cut() {
+        let now = 1_000u64;
+        let p = peer("node-laptop", "laptop");
+        let n = NamedPeer {
+            peer: &p,
+            display_name: Some("Travel Laptop".into()),
+        };
+        assert_eq!(
+            fmt_peer_row_as(&p, &peer_label(&n, false), PEER_NAME_W, now),
+            fmt_peer_row(&p, now),
+            "the flag off is today's row"
+        );
+        assert_eq!(peer_label(&n, false), "laptop");
+        assert_eq!(peer_label(&n, true), "Travel Laptop");
+        let unnamed = NamedPeer {
+            peer: &p,
+            display_name: None,
+        };
+        assert_eq!(
+            peer_label(&unnamed, true),
+            "laptop",
+            "no display name: the mesh name"
+        );
+
+        // A peer with no mesh name shows its short node id either way.
+        let blank = peer("0123456789abcdef0123", "");
+        let b = NamedPeer {
+            peer: &blank,
+            display_name: None,
+        };
+        assert_eq!(peer_label(&b, true), "0123456789ab…");
+
+        let long = "a-mesh-name-longer-than-twenty-chars";
+        assert_eq!(
+            fit_label(long, PEER_NAME_W, false),
+            long,
+            "never cut by default"
+        );
+        let cut = fit_label(&"x".repeat(40), 34, true);
+        assert_eq!(cut.chars().count(), 34);
+        assert!(cut.ends_with('…'));
+        assert_eq!(fit_label("short", 34, true), "short");
+
+        // The widened row really is wider: the OVERLAY IP column moves.
+        let wide = fmt_peer_row_as(&p, "Travel Laptop", 30, now);
+        let narrow = fmt_peer_row_as(&p, "Travel Laptop", PEER_NAME_W, now);
+        assert_eq!(
+            wide.find("100.64.0.5").unwrap(),
+            narrow.find("100.64.0.5").unwrap() + 10
+        );
+    }
+
+    /// `--json` is the wire verbatim; `--display-name --json` adds exactly one
+    /// field per peer, `null` when the device list knows none.
+    #[test]
+    fn json_adds_display_name_only_when_asked() {
+        let a = peer("n1", "laptop");
+        let b = peer("n2", "home-server");
+        let named = vec![
+            NamedPeer {
+                peer: &a,
+                display_name: Some("Travel Laptop".into()),
+            },
+            NamedPeer {
+                peer: &b,
+                display_name: None,
+            },
+        ];
+        let plain: serde_json::Value =
+            serde_json::from_str(&peers_json(&named, false).unwrap()).unwrap();
+        assert_eq!(
+            plain,
+            serde_json::to_value([&a, &b]).unwrap(),
+            "without the flag the JSON is the PeerInfo wire, nothing added"
+        );
+        let with: serde_json::Value =
+            serde_json::from_str(&peers_json(&named, true).unwrap()).unwrap();
+        assert_eq!(with[0]["display_name"], "Travel Laptop");
+        assert!(with[1]["display_name"].is_null());
+        assert_eq!(with[0]["name"], "laptop", "the mesh name stays alongside");
+        assert_eq!(with.as_array().unwrap().len(), 2);
     }
 }

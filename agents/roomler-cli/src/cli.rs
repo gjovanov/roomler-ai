@@ -14,7 +14,7 @@
 //!   roomler run [--config <path>]
 //!   roomler diagnose [--agent <agent_id>]
 //!   roomler status [--json]     # local daemon's node state (LocalAPI)
-//!   roomler peers  [--json]     # peers + connection types (LocalAPI)
+//!   roomler peers  [--json] [--display-name] [NAME…]   # peers + connection types (LocalAPI)
 //!   roomler devices [--json]    # the devices this one may see, server-listed (LocalAPI)
 //!   roomler flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
 
@@ -217,6 +217,10 @@ enum Command {
     },
     /// List the peers the local daemon currently sees, with each peer's live
     /// connection type (direct / relay / tunnel / blocked / offline).
+    ///
+    /// `roomler peers --display-name` puts the dashboard display names in
+    /// NAME; `roomler peers laptop "Office PC"` shows only those two, in
+    /// that order — each a mesh name or a display name.
     Peers {
         /// FR-49 - show only this enrollment (`roomlerd org ls`; `primary` for
         /// the scalar identity). Without it every org's peers are printed
@@ -224,6 +228,18 @@ enum Command {
         /// personal one is unusable on a shared screen or in a bug report.
         #[arg(long)]
         org: Option<String>,
+        /// Show each peer's dashboard display name in NAME (the mesh name
+        /// where a device has none), joined from the org's device list. When
+        /// that list is unavailable the mesh names are shown and one warning
+        /// says so. With `--json`, adds a `display_name` field to every peer
+        /// (null when unknown); without this flag the JSON is unchanged.
+        #[arg(long)]
+        display_name: bool,
+        /// Only these peers — each a mesh name or a dashboard display name,
+        /// case-insensitive — in the order given. A name that matches nothing
+        /// is warned about; the command fails only when none matched.
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -338,9 +354,16 @@ enum Command {
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
+    ///
+    /// `roomler ping build-box` — or, by dashboard display name,
+    /// `roomler ping "Office PC"`.
     Ping {
-        /// Overlay peer to ping — a name (e.g. `devbox`) or an overlay IP
-        /// (either family; `fd72:6f6f:6d6c::<v4>` is the derived overlay IPv6).
+        /// Overlay peer to ping — a mesh name (e.g. `build-box`), a dashboard
+        /// display name, or an overlay IP (either family;
+        /// `fd72:6f6f:6d6c::<v4>` is the derived overlay IPv6). A display name
+        /// is looked up in the org's device list only when no mesh name
+        /// matches it, and refused when two devices share it; the typed name
+        /// is what the output line shows.
         target: String,
         /// Round-trip timeout in milliseconds.
         #[arg(long, default_value_t = 3000)]
@@ -362,8 +385,15 @@ enum Command {
     ///
     /// Commands run as the target daemon's identity (SYSTEM on Windows,
     /// root under systemd) and every attempt is audited.
+    ///
+    /// `roomler exec build-box -- uptime` — or, by dashboard display name,
+    /// `roomler exec "Office PC" -- hostname`.
     Exec {
-        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
+        /// Target device — a device name (e.g. `build-box`), a dashboard
+        /// display name, or a hex agent id. A display name is resolved from
+        /// the org's device list only when no device NAME matches it, and
+        /// refused when two devices share it — the server then resolves and
+        /// gates whatever is sent, exactly as before.
         device: String,
         /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`. Default: the
         /// target host's own default shell.
@@ -391,8 +421,13 @@ enum Command {
     ///
     ///   roomler ssh winhost-a
     ///   roomler ssh winhost-a -- uptime
+    ///
+    /// A dashboard display name works too: `roomler ssh "Office PC"`.
     Ssh {
-        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
+        /// Target device — a device name (e.g. `build-box`), a dashboard
+        /// display name, or a hex agent id. Resolved like `exec`'s: a display
+        /// name counts only when no device NAME matches it, and one that two
+        /// devices share is refused rather than guessed.
         device: String,
         /// Session lifetime in seconds. 0 = the server's ceiling.
         #[arg(long, default_value_t = 0)]
@@ -840,7 +875,20 @@ where
             lines,
             fmt,
         } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
-        Command::Peers { org, fmt } => localclient::peers(fmt.json, org).await,
+        Command::Peers {
+            org,
+            display_name,
+            names,
+            fmt,
+        } => {
+            localclient::peers(localclient::PeersArgs {
+                org,
+                display_name,
+                names,
+                json: fmt.json,
+            })
+            .await
+        }
         Command::Devices {
             org,
             q,
@@ -1235,14 +1283,71 @@ mod tests {
             let cli = Cli::try_parse_from(["roomler", verb]).unwrap();
             match (verb, cli.command) {
                 ("status", Command::Status { fmt }) => assert!(!fmt.json),
-                ("peers", Command::Peers { org, fmt }) => {
+                (
+                    "peers",
+                    Command::Peers {
+                        org,
+                        display_name,
+                        names,
+                        fmt,
+                    },
+                ) => {
                     assert!(!fmt.json);
                     // FR-49 - absent means "every org", never "the primary".
                     assert!(org.is_none());
+                    // The default table is the mesh-name table, unfiltered.
+                    assert!(!display_name);
+                    assert!(names.is_empty());
                 }
                 ("flows", Command::Flows { fmt }) => assert!(!fmt.json),
                 (v, other) => panic!("verb {v} parsed as {other:?}"),
             }
+        }
+    }
+
+    /// `peers --display-name NAME…` — the flag, the positional filter (in
+    /// order, spaces and all), `--org` and `--json` together; and the filter
+    /// alone, without the flag.
+    #[test]
+    fn parses_peers_display_names_and_filter() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "peers",
+            "--org",
+            "acme",
+            "--display-name",
+            "laptop",
+            "Office PC",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Peers {
+                org,
+                display_name,
+                names,
+                fmt,
+            } => {
+                assert_eq!(org.as_deref(), Some("acme"));
+                assert!(display_name);
+                assert_eq!(names, ["laptop", "Office PC"]);
+                assert!(fmt.json);
+            }
+            other => panic!("expected Peers, got {other:?}"),
+        }
+        match Cli::try_parse_from(["roomler", "peers", "home-server"])
+            .unwrap()
+            .command
+        {
+            Command::Peers {
+                display_name,
+                names,
+                ..
+            } => {
+                assert!(!display_name, "a filter does not switch the column");
+                assert_eq!(names, ["home-server"]);
+            }
+            other => panic!("expected Peers, got {other:?}"),
         }
     }
 
