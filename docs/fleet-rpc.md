@@ -143,6 +143,7 @@ truncated sample still ties to what ran.
 roomler exec winhost-a -- Get-NetRoute -AddressFamily IPv4
 roomler exec devbox --shell pwsh --timeout 60 -- Get-NetAdapter
 roomler exec winhost-a --json -- ipconfig /all
+roomler exec "Office PC" -- hostname      # a dashboard display name works too
 
 # canned evidence bundles
 roomler diag host winhost-a
@@ -151,6 +152,14 @@ roomler diag pair DEVBOX winhost-a
 
 Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
+
+The target is a device name or a hex agent id, resolved by the server within
+the caller's org (`crates/modules/fleet/src/socket.rs:893` `resolve_exec_target`:
+hex id → exact name → case-insensitive name). A dashboard **display name** is
+turned into the hex id by the CLI before the request leaves — only when no
+device name matches it, and refused when two devices share it
+(`docs/device-naming.md` § Display names on the command line). The server never
+sees a display name and gates the hex id exactly as it would a typed one.
 
 The diagnostic bundles live in the **CLI**, not the agent, so a new probe is a
 CLI release rather than a fleet-wide agent rollout. That inversion is the whole
