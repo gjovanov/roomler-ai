@@ -21,6 +21,9 @@ pub mod forward;
 /// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
 pub mod localclient;
 pub mod mesh;
+/// Display names on the CLI: the peers↔devices join and the device-selector
+/// rule for `ping` / `exec` / `ssh` (pure; `docs/device-naming.md`).
+pub mod names;
 pub mod sshcmd;
 pub mod update;
 

@@ -513,7 +513,13 @@ so a device that switches SSH off stops advertising a key it no longer holds.
 ```
 roomler ssh winhost-a
 roomler ssh winhost-a -- uptime
+roomler ssh "Office PC"            # a dashboard display name works too
 ```
+
+`<device>` is a device name or a hex agent id — the server resolves it, as for
+`exec` — or a dashboard display name, which the CLI translates to the hex id
+before the grant request by the rule in `docs/device-naming.md` (never over a
+device name, and refused when two devices share it).
 
 **It execs the system `ssh` rather than embedding a client.** What roomler adds
 is discovery, authorization and host-key distribution — which device, may you,

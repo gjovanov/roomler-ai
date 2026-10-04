@@ -50,7 +50,11 @@ pub async fn run(device: &str, session_secs: u64, args: &[String]) -> Result<i32
         .context("encoding the session public key")?;
 
     // 2. Ask the daemon, which relays to the server over its authenticated WS.
-    let grant = localclient::ssh_session(device, &public_openssh, session_secs).await?;
+    //    A dashboard display name is turned into the hex agent id first
+    //    (`docs/device-naming.md`); anything the server resolves itself —
+    //    a fleet name, an id — goes exactly as typed.
+    let node = localclient::agent_selector(device).await?;
+    let grant = localclient::ssh_session(&node, &public_openssh, session_secs).await?;
 
     if let Some(err) = grant.error {
         bail!("{err}");

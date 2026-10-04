@@ -9,10 +9,12 @@ order: 1
 a thin shim onto the agent's own command surface, so the two can never disagree
 about their version.
 
-:::warning Device selectors are hex ids, not display names
-`--agent`, and the target argument to `exec`, take the **hex device id** from
-the dashboard. A friendly name is not resolved, and passing one fails in a way
-that looks like the device is missing rather than like a bad argument.
+:::warning `--agent` takes the hex device id
+`--agent` on `forward`, `socks5` and `route add` takes the **hex device id** from
+the dashboard; a name is not resolved there, and passing one fails in a way that
+looks like the device is missing rather than like a bad argument. The target of
+`exec`, `ssh` and `ping` is different: it takes a device name, a dashboard
+display name or the hex id — see Remote access below.
 :::
 
 ## Status and inspection
@@ -21,11 +23,13 @@ that looks like the device is missing rather than like a bad argument.
 |---|---|
 | `roomler status` | This machine: id, version, mode, mesh address, server connection — **and** the mesh state per organization |
 | `roomler peers` | Every peer the local agent sees, with its live connection type |
+| `roomler peers --display-name` | The same table, with the dashboard display name in NAME where one is set (`--json` gains a `display_name` per peer) |
+| `roomler peers <name>…` | Only those peers — each a device name or a display name, in the order given |
 | `roomler why <peer>` | Why **one** peer rides the path it does: the ladder, each tier's eligibility, and any hold-down overriding the ranking |
 | `roomler netcheck` | This machine's measured network capability: reachability, relay verdict, floor health, NAT class |
 | `roomler flows` | Flows the local agent is currently running |
 | `roomler logs --tail <n>` | Tail the agent's log, resolved **by** the agent — the path differs per process and platform |
-| `roomler ping <peer>` | Reachability over the mesh |
+| `roomler ping <peer>` | Reachability over the mesh — by device name, display name or overlay address |
 
 :::tip `why` is the command to reach for on a relay question
 `peers` tells you a pair is relayed. `why` tells you which tier was eligible,
@@ -72,14 +76,19 @@ roomler route rm <id>
 ## Remote access
 
 ```bash
-roomler exec <agent-id> -- <command>
-roomler ssh <agent-id>
-roomler proxy <host> <port>        # for OpenSSH ProxyCommand
+roomler exec <device> -- <command>     # <device>: device name, display name or hex id
+roomler ssh <device>
+roomler ping <device>
+roomler proxy <host> <port>            # for OpenSSH ProxyCommand
 ```
 
-:::warning `exec` and `ssh` do not resolve display names either
-Use the hex device id. This is the most common cause of "the CLI says my device
-does not exist" when it is plainly in the dashboard.
+:::tip How a device selector is read
+A hex id or an address is used as is. A device **name** — the one the machine
+reported, or the admin-set name — is resolved by the server, as it always was.
+A dashboard **display name** is resolved by the CLI from your org's device list,
+only when no device name matches it (exactly first, then ignoring case), and
+when two devices share one the command refuses and lists both rather than
+guessing. `roomler proxy` resolves device names and MagicDNS names only.
 :::
 
 :::danger On Windows, quote-containing arguments to `exec` can be lost
