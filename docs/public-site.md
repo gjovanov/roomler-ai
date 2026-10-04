@@ -110,10 +110,11 @@ revalidated on every load (`expires -1`, §5), and it is what moves a reader to 
 
 - The search index is hashed too; its URL reaches `search.js` through `data-search-index`.
 - `social-preview.png` keeps a stable name: `ui/index.html` names it as the SPA's `og:image`.
-- `LEGACY_UNHASHED_ASSETS` ([`site.ts:38`](../ui/docs/site.ts)) also publishes each file under
-  its old plain name, for HTML a browser cached before revalidation began. Pre-FR-87 HTML
-  carried no `Cache-Control` at all, so a browser may hold it under heuristic caching. Turn
-  the flag off in the first release on or after **2026-10-03** (FR-87 §4c).
+- `LEGACY_UNHASHED_ASSETS` ([`site.ts:38`](../ui/docs/site.ts)), when on, also publishes each
+  file under its old plain name, for HTML a browser cached before revalidation began. Pre-FR-87
+  HTML carried no `Cache-Control` at all, so a browser could hold it under heuristic caching
+  (about 2.8 days). The flag has been **off since 2026-10-04** (FR-87 §4c): only hashed names
+  are published.
 - **Images carry their real size**, read from the file's own header (PNG, GIF, JPEG, WebP, SVG
   parsed by hand), so the browser reserves the right box. FR-60 hard-coded 960×420 on heroes
   that are 760×400 or 600×540. An image alone in its paragraph becomes a `<figure>`, its
