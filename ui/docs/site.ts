@@ -29,13 +29,13 @@ export const SITE_TITLE_SUFFIX = 'Roomler Docs'
 export const OG_IMAGE = `${BASE}/assets/social-preview.png`
 
 /**
- * FR-87 (#1776) P2: also publish every hashed asset under its old, plain
- * name (`docs.css`, `search.js`, the heroes), so HTML a browser cached
+ * FR-87 (#1776) P2: when true, also publish every hashed asset under its old,
+ * plain name (`docs.css`, `search.js`, the heroes), so HTML a browser cached
  * before P1 made pages revalidate keeps loading its styles and scripts.
- * One release is enough for that HTML to age out; the phase after the first
- * promote that carries hashed names sets this to `false`.
+ * Off since 2026-10-04: hashed names went live on 2026-09-29, and pre-P1 HTML
+ * (no `Cache-Control`, so heuristic caching of about 2.8 days) has aged out.
  */
-export const LEGACY_UNHASHED_ASSETS = true
+export const LEGACY_UNHASHED_ASSETS = false
 
 /** Hard ceiling on the search index. Above this the build FAILS rather
  *  than shipping a page-load cost nobody decided to spend. */
