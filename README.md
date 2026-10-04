@@ -27,7 +27,11 @@ tunnelled bytes.
      is offered honestly, as a download.
      To get a real inline player, the video has to be uploaded through GitHub's
      web UI (drag it into an issue comment) and embedded by its
-     user-attachments URL — a manual step, like the social preview. -->
+     user-attachments URL — a manual step, like the social preview.
+     The narrated trailer is on YouTube. A README cannot embed its player
+     (GitHub strips iframes), so it is linked from a still of the trailer
+     itself, docs/assets/trailer-thumbnail.jpg — YouTube's own automatic
+     thumbnail is a bare Windows desktop with no Roomler in it. -->
 <p align="center">
   <img src="docs/assets/demo-preview.gif" alt="One browser tab reaching four machines in turn — a MacBook and three Windows laptops: press Connect, the screen appears, and the viewer goes full screen" width="800">
 </p>
@@ -36,6 +40,10 @@ tunnelled bytes.
   Four machines, two operating systems, one tab —
   <a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-demo.mp4">the full 43-second demo</a>
   is a 5.5&nbsp;MB MP4 download.
+</p>
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=ttpby58Rwyc"><img src="docs/assets/trailer-thumbnail.jpg" alt="The Roomler trailer on YouTube: a Windows laptop's desktop live in a browser tab, with a play button" width="640"></a><br>
+  <a href="https://www.youtube.com/watch?v=ttpby58Rwyc"><b>Watch the trailer on YouTube</b></a> — the same machines, narrated, in 54 seconds.
 </p>
 
 ## Run it
