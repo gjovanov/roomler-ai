@@ -38,6 +38,7 @@ once the two ends can talk. It coordinates; it is never a data path.
 - **[Consent](/docs/remote-desktop/consent/)** icon:shield — Who gets asked, on which surface, and what happens when nobody answers.
 - **[Codecs and performance](/docs/remote-desktop/codecs-and-performance/)** icon:video — Hardware encoders per platform, and what to change when it feels slow.
 - **[Files and clipboard](/docs/remote-desktop/files-and-clipboard/)** icon:copy — Move files and clipboard contents in both directions.
+- **[Screen recording](/docs/remote-desktop/recording/)** icon:video — Record your own screen or a remote one in full quality, then cut it, speed it up and add music.
 - **[Per-OS permissions](/docs/remote-desktop/per-os-permissions/)** icon:wrench — What each operating system makes you grant before capture works.
 :::
 

@@ -33,6 +33,7 @@ knowing:
 | **Remote control** | Open a device's screen |
 | **Run commands on a device** | Execute a command remotely |
 | **SSH to a device** | Open an SSH session |
+| **Record remote screens** | Record the screen of a device you control. The device's owner must also allow it ([screen recording](/docs/remote-desktop/recording/)); you can always record a device you own |
 | **View command audit** | Read the record of remote commands |
 | **View SSH audit** | Read the record of SSH decisions |
 
@@ -42,6 +43,8 @@ knowing:
 Neither **run commands** nor **SSH** is included in the default administrator
 role, and they are separate from each other. Being able to manage a fleet is a
 different job from being able to execute code on every machine in it.
+**Record remote screens** is left out of it for the same reason: watching a
+session is not keeping a copy of it.
 
 The audit-reading permissions are the mirror image: **view SSH audit** *is* in
 the default admin role, while **SSH** is not — because reviewing who held a
