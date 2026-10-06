@@ -179,7 +179,9 @@ pub(crate) mod resample;
 pub(crate) static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// FR-77 — `ROOMLERD_ENCODER_CELLS_DENY` has the same shape: three tests set
 /// it (`cells.rs` x2, `caps.rs`), `test_env` serialises nothing, and the
-/// harness runs them in parallel — it flaked once in four native runs.
+/// harness runs them in parallel — it flaked once in four native runs. A test
+/// that only READS it twice and compares (`caps::tests::
+/// not_probed_never_triggers_a_probe`) needs the lock as much as a writer.
 #[cfg(test)]
 pub(crate) static DENY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
