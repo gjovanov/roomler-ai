@@ -202,6 +202,7 @@ is why it is sequenced last, behind its own feature and the probe.
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
+| 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **implemented** (2026-10-06, the record-demo PR) — the reveal logic has 6 unit tests; field pending on a Mac |
 
 ## Acceptance criteria
 
@@ -233,6 +234,11 @@ Ticked only where a run is recorded in the field log below.
 - [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
       ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
       `DEFAULT_ADMIN` — an operator grant, not a code change.
+- [ ] P9, on a Mac: a session start brings the banner up without taking focus (the
+      next click into the person's own window acts), it hides 2.5 s after the
+      pointer leaves (after its 4 s first show), returns after a 1.2 s rest at the
+      top edge, stays while a recording runs, and a red frame surrounds the screen
+      for exactly the session's duration.
 - [ ] A live session shows "Being viewed by «name»" with a working Disconnect on
       Windows, macOS and a Linux X11 desktop. (Windows border confirmed visible +
       capture-excluded during a session; the reveal-on-hover badge and the other
@@ -275,6 +281,8 @@ Ticked only where a run is recorded in the field log below.
   `CGWindowListCreateImage`, but **not** by `CGDisplayStream`, which is what
   `capture/scrap_backend.rs` uses. True for the native panel and the Tauri one
   alike. Fixing it means moving macOS capture to ScreenCaptureKit — its own FR.
+  P9's red frame is in the stream too: the controller sees a red frame round a
+  Mac's screen during a session (accepted by the operator, 2026-10-06).
 - **Wayland on GNOME/KDE gets no native overlay.** `wlr-layer-shell` covers
   sway/hyprland and is a stretch item; GNOME and KDE do not expose it to
   arbitrary clients, so those sessions use the companion.
