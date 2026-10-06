@@ -566,7 +566,8 @@ impl Carrier {
     /// Forward one accepted local connection through this session — the
     /// per-connection task the session's accept loop used to spawn, unchanged:
     /// socket tuning, SOCKS5 / static target resolution, UDP ASSOCIATE, the
-    /// forward request and the pump. Never blocks the caller.
+    /// forward request and the pump. Never blocks the caller: the flow listener
+    /// calls it under its own lock (#1816, [`crate::flow_listener::Carry`]).
     pub fn carry(&self, mut tcp: tokio::net::TcpStream, peer_addr: std::net::SocketAddr) {
         tune_local_socket(&tcp, peer_addr);
         debug!(%peer_addr, transport = self.transport, "accepted local TCP connection");
