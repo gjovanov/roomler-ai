@@ -14,6 +14,9 @@
 #   - bun, and ffmpeg on PATH (or in WSL)
 #
 # Usage:
+#   ./scripts/record-demo.sh --login     once: sign in with the credentials below and
+#                                        save the session to ~/.roomler-demo-state.json
+#                                        (ROOMLER_DEMO_STATE); later takes need no password
 #   ROOMLER_DEMO_USER=…  ROOMLER_DEMO_PASS=…  ROOMLER_DEMO_TENANT=<org id> \
 #   ROOMLER_DEMO_DEVICES="office-mac,laptop-17,laptop-42" \
 #   ROOMLER_DEMO_LABELS="MacBook|Windows laptop|Second laptop" \
@@ -23,6 +26,15 @@
 #
 # ROOMLER_DEMO_BLUR (optional) blurs regions of a device's desktop, per layout:
 # see cut-demo.ts. Measure the rectangles on the take's own frames.
+#
+# Optional scenes, each documented where it is defined in record-demo.spec.ts:
+#   ROOMLER_DEMO_RECORD / ROOMLER_DEMO_RECORD_PROBE   the viewer's Record button, filmed
+#   ROOMLER_DEMO_STEPS                                 scripted input on a remote app
+#   ROOMLER_DEMO_NETWORK=1                             the dashboard's Network card
+# ROOMLER_DEMO_LOCKCHECK (strongly advised): `roomler exec` selectors to check
+# for a signed-in screen right before the take — see below.
+# `bun ui/e2e/video/list-demo-devices.ts` lists, from the saved session, the
+# orgs and device display names the account can film.
 #
 # Output, in the take folder (default ~/Videos/Roomler/demo/<date-time>):
 #   frames/ + take.json    the raw take: every composited frame, and the marks
@@ -61,18 +73,48 @@ UI_DIR="$PROJECT_DIR/ui"
 
 BASE_URL="${ROOMLER_DEMO_URL:-https://roomler.ai}"
 
-# Credentials may come from the environment or from a 0600 file, so a re-record
-# does not need them re-typed. The file is never echoed by this script.
-for envfile in "${ROOMLER_DEMO_ENV:-}" "$HOME/.roomler-demo.env" ./.roomler-demo.env; do
-  if [ -n "$envfile" ] && [ -f "$envfile" ]; then
-    set -a; . "$envfile"; set +a
-    echo "credentials: loaded from $envfile"
-    break
-  fi
-done
+# `--login` signs in once and saves the browser session to $STATE; every take
+# after that starts from the session and never loads the password, so a take
+# can be run by someone (or something) that must not handle it. The session
+# lasts as long as the refresh token (30 days); then run --login again.
+LOGIN=0
+[ "${1:-}" = "--login" ] && LOGIN=1
+STATE="${ROOMLER_DEMO_STATE:-$HOME/.roomler-demo-state.json}"
 
-: "${ROOMLER_DEMO_USER:?set ROOMLER_DEMO_USER, or put it in ~/.roomler-demo.env}"
-: "${ROOMLER_DEMO_PASS:?set ROOMLER_DEMO_PASS, or put it in ~/.roomler-demo.env}"
+if [ $LOGIN -eq 1 ] || [ ! -f "$STATE" ]; then
+  # Credentials may come from the environment or from a 0600 file, so a
+  # re-record does not need them re-typed. The file is never echoed.
+  for envfile in "${ROOMLER_DEMO_ENV:-}" "$HOME/.roomler-demo.env" ./.roomler-demo.env; do
+    if [ -n "$envfile" ] && [ -f "$envfile" ]; then
+      set -a; . "$envfile"; set +a
+      echo "credentials: loaded from $envfile"
+      break
+    fi
+  done
+  : "${ROOMLER_DEMO_USER:?set ROOMLER_DEMO_USER, or put it in ~/.roomler-demo.env}"
+  : "${ROOMLER_DEMO_PASS:?set ROOMLER_DEMO_PASS, or put it in ~/.roomler-demo.env}"
+fi
+
+if [ $LOGIN -eq 1 ]; then
+  echo "=== Roomler demo: sign in once and save the session ==="
+  cd "$UI_DIR" || exit 1
+  E2E_BASE_URL="$BASE_URL" \
+  E2E_USERNAME="$ROOMLER_DEMO_USER" \
+  E2E_PASSWORD="$ROOMLER_DEMO_PASS" \
+  E2E_SAVE_STATE=1 \
+  E2E_STORAGE_STATE="$STATE" \
+    bunx playwright test e2e/video/record-demo.spec.ts \
+      --config=playwright.video.config.ts --reporter=list
+  RC=$?
+  if [ $RC -ne 0 ] || [ ! -f "$STATE" ]; then
+    echo "ERROR: the sign-in did not finish (Playwright exited $RC) — read the log above."
+    exit 1
+  fi
+  chmod 600 "$STATE" 2>/dev/null
+  echo "Session saved to $STATE. Takes now run without the password."
+  exit 0
+fi
+
 : "${ROOMLER_DEMO_TENANT:?set ROOMLER_DEMO_TENANT — the org id the devices are in}"
 : "${ROOMLER_DEMO_DEVICES:?set ROOMLER_DEMO_DEVICES — display names, comma-separated, in filming order}"
 
@@ -94,15 +136,79 @@ if ! curl -fsS -o /dev/null "$BASE_URL/health"; then
   exit 1
 fi
 
+# ⚠️ Every screen signed in, checked right before THIS take. A locked screen takes typed text
+# as a sign-in attempt (2026-10-06: a take that started after a Mac had locked typed a folder
+# path into its password field), and a managed laptop's lock screen prints its name and
+# addresses on every frame. ROOMLER_DEMO_LOCKCHECK lists `roomler exec` selectors, each with
+# the OS that decides how to ask: "laptop-17:win,office-mac:mac". A screen that is locked, or a
+# check that cannot answer, stops the take before anything is filmed. Selectors are machine
+# names: pass them at run time, never write them down here.
+if [ -n "${ROOMLER_DEMO_LOCKCHECK:-}" ]; then
+  IFS=',' read -ra lockchecks <<< "$ROOMLER_DEMO_LOCKCHECK"
+  for c in "${lockchecks[@]}"; do
+    sel="${c%%:*}"
+    os="${c##*:}"
+    case "$os" in
+      win)
+        out=$(timeout 60 roomler exec "$sel" 'tasklist /FI "IMAGENAME eq LogonUI.exe" /NH' 2>&1)
+        RC=$?
+        # Decide on the process name and the INFO prefix alone: the "nothing found" sentence is
+        # localized ("Es werden keine Aufgaben …" on a German laptop).
+        if [ $RC -ne 0 ]; then
+          echo "ERROR: could not check $sel (roomler exec exited $RC) — not filming."
+          exit 1
+        elif printf '%s' "$out" | grep -q 'LogonUI.exe'; then
+          echo "ERROR: $sel is at its lock screen — sign it in first."
+          exit 1
+        elif ! printf '%s' "$out" | grep -q -E '^INFO'; then
+          echo "ERROR: $sel answered something unexpected — not filming:"
+          printf '%s\n' "$out" | head -3
+          exit 1
+        fi
+        ;;
+      mac)
+        out=$(timeout 60 roomler exec "$sel" 'ioreg -n Root -d1 -a' 2>&1)
+        RC=$?
+        # Unlocked here = the lock key absent (or false) while the console session reports
+        # LoginDone true.
+        if [ $RC -ne 0 ]; then
+          echo "ERROR: could not check $sel (roomler exec exited $RC) — not filming."
+          exit 1
+        elif printf '%s' "$out" | grep -A1 CGSSessionScreenIsLocked | grep -q '<true/>'; then
+          echo "ERROR: $sel is locked — sign it in first."
+          exit 1
+        elif ! printf '%s' "$out" | grep -A1 kCGSessionLoginDoneKey | grep -q '<true/>'; then
+          echo "ERROR: $sel has no signed-in console session — not filming."
+          exit 1
+        fi
+        ;;
+      *)
+        echo "ERROR: ROOMLER_DEMO_LOCKCHECK entry '$c' needs :win or :mac."
+        exit 1
+        ;;
+    esac
+    echo "screen  : $sel signed in"
+  done
+fi
+
 echo "[2/3] Recording…"
 cd "$UI_DIR" || exit 1
+if [ -f "$STATE" ]; then
+  echo "session : $STATE (no password)"
+  AUTH=(E2E_STORAGE_STATE="$STATE")
+else
+  AUTH=(E2E_USERNAME="$ROOMLER_DEMO_USER" E2E_PASSWORD="$ROOMLER_DEMO_PASS")
+fi
 # The spec refuses an unknown or offline device before it films anything.
+env "${AUTH[@]}" \
 E2E_BASE_URL="$BASE_URL" \
-E2E_USERNAME="$ROOMLER_DEMO_USER" \
-E2E_PASSWORD="$ROOMLER_DEMO_PASS" \
 E2E_TENANT_ID="$ROOMLER_DEMO_TENANT" \
 E2E_DEMO_DEVICES="$ROOMLER_DEMO_DEVICES" \
 E2E_DEMO_LABELS="${ROOMLER_DEMO_LABELS:-}" \
+E2E_DEMO_NETWORK="${ROOMLER_DEMO_NETWORK:-}" \
+E2E_DEMO_RECORD="${ROOMLER_DEMO_RECORD:-}" \
+E2E_DEMO_RECORD_PROBE="${ROOMLER_DEMO_RECORD_PROBE:-}" \
+E2E_DEMO_STEPS="${ROOMLER_DEMO_STEPS:-}" \
 E2E_DEMO_OUT="$TAKE" \
   bunx playwright test e2e/video/record-demo.spec.ts \
     --config=playwright.video.config.ts --reporter=list
