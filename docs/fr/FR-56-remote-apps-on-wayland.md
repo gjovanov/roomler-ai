@@ -158,8 +158,10 @@ one video surface, and changing that is a much larger UI program than this.
       ⛔ **Still owed: a refusal reason rendered in a dialog.** No host in a
       refusing state exists: every online Linux/Windows hello carries `list`,
       the cluster nodes run the daemon's own Xvfb, the Wayland host has a login
-      session, and the WSL node's remote view hands the connection to the
-      Windows host on the same machine. The refusal's content is verified on
+      session, and the WSL node runs its own Xvfb too (its remote view connects
+      to it; an earlier note that it "hands the connection to the Windows host"
+      was a mis-targeted click on the adjacent device's "Connect to agent" link,
+      ruled out by a wire-level repro on 2026-10-07). The refusal's content is verified on
       the agent (0.4.103, `reason [no_session]`), its rendering by the parser
       tests only. Becomes `[x]` when a dialog on a host whose live reply
       refuses — a Linux host with nobody logged in and no Xvfb, or the Wayland
