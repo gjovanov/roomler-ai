@@ -1046,11 +1046,62 @@ From `remote_audit` (90 d), consent excluded (`consent_granted` → `session_sta
   consent; it fits a **half-open agent control WS delaying offer delivery**
   (the "GREEN but `agent_offline`" class; agents ≥ rc.293 self-heal in ≤ ~2 min).
 
-Both are localizations, not a traced mechanism: no single stall could be read
-through both ends' logs, because the explanatory logs had aged out while the
-audit row survived, and the browser marks that name the phase were not
-persisted. Part 4 exists so the next one is. The full read, with the per-host
-table, is in `docs/fr/FR-22-time-to-first-frame.md`.
+Both were localizations, not a traced mechanism — the explanatory logs had aged
+out while the audit row survived, and the marks that name the phase were not
+yet persisted. Part 4 changed that within two weeks of landing.
+
+#### 12.1.7 The stall, traced end to end (2026-10-06, prod `0.4.116`)
+
+The first fleet-wide census of the persisted records (7 d window, 1 654 browser
+batches, 254 foreground `first_frame`s) found the FR-22 symptom in the data: **7
+foreground connects of 14–19.5 s, every one `attempt=2, after_drop=true`, every
+one spending +11.4…+16.3 s in `session_created → ready`.** Two were traced
+through all three records — browser marks, `remote_audit`, the agent's own log:
+
+```mermaid
+sequenceDiagram
+    participant B as Viewer
+    participant H as API pod (hub)
+    participant A as Agent (a corporate laptop)
+    Note over A: MAJOR network change — "probing the control WS now"<br/>the WS is now half-open; the probe does not conclude
+    Note over B,A: ~5 s later the live session's ICE pair moves — media stops
+    B->>H: rc:terminate controller_hangup (the ladder, after the 4 s pc grace)
+    B->>H: rc:session.request — attempt 2, after_drop
+    H-->>B: rc:session.created (+24 ms) → mark session_created
+    H--xA: rc:request written into the dead socket — never arrives
+    Note over A: 19–22 s after its own probe: ws read → WSAECONNRESET<br/>(+5 s if the old peer's close overruns its budget)
+    A->>H: redial · rc:agent.hello 1.6 s later
+    H->>A: the pending rc:request — 54–70 ms after hello
+    A->>H: rc:consent granted (AutoGrant, 0 ms)
+    H-->>B: rc:ready → mark ready (+15 570 ms / +11 399 ms)
+    Note over B,A: offer→answer ~200 ms · ICE 1.7–2.7 s · first_frame at 14–19.5 s
+```
+
+The browser's `session_created → ready` and the hub's `consent_prompted →
+consent_granted` are the same interval **to the millisecond** (15 570 vs 15 571,
+11 399 vs 11 400), so the wait sits between the hub pushing `rc:request` and the
+agent answering — and the agent's log says why: its **control WebSocket was
+half-open** from a host network-path change (default route moved) until the far
+end's TCP reset arrived, **18.9–22.3 s after the agent had itself logged `MAJOR
+network change — probing the control WS now`**. Once re-registered, the hub
+delivered the pending request in 54–70 ms and AutoGrant consent took 0 ms.
+
+| it is | it is not |
+|---|---|
+| the agent's half-open **control WS** after a path change, surviving until the remote reset | the session **slot** (no `agent_busy`; the consent broker ran the instant the request arrived) |
+| visible only on **attempt 2**, because the event that killed the first session's media is the one that killed the socket | **consent** (0 ms once delivered) or the **carrier** (ICE came after, 1.7–2.7 s) |
+| ~15 s because both ends are timers: 19–22 s of dead socket minus the 4 s pc grace, detection and the 250 ms ladder step | a server defect — the hub re-delivered the pending request within 70 ms of `hello` |
+
+⚠️ **Why a server-only read mis-named the band.** The 09-25 read put the stall
+in `negotiating` because `consent_prompted` is stamped when the hub *sends* the
+request, not when the agent *receives* it. Only the browser marks can split
+"sent" from "arrived", which is the reason part 4 exists.
+
+The proposed fix (FR-22 Part 5, not built) is agent-side: after a MAJOR network
+change, probe the control WS with a short deadline and redial on silence,
+instead of waiting for the far end to reset it; and redial before a slow peer
+close. Its kill switch, risks and fail-first are in
+`docs/fr/FR-22-time-to-first-frame.md`.
 
 ## 13. Testing strategy
 
