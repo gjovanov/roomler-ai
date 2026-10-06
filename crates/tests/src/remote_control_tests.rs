@@ -304,6 +304,250 @@ async fn delete_agent_removes_from_list() {
     assert_eq!(list["items"].as_array().unwrap().len(), 0);
 }
 
+/// #1821 — removal is FINAL on every per-device route, not only in the
+/// listing. `find_by_id_in_tenant` filtered `{_id, tenant_id}` and nothing
+/// else, so after `DELETE` the tombstone still answered `GET` with the whole
+/// row and took every per-device WRITE — a stale page holding the id kept
+/// editing a device that no longer existed. The lookup every per-device route
+/// sits on is live-scoped now, and so are the admin setters underneath it.
+///
+/// Negative control (recorded on the PR): with the `deleted_at` predicate
+/// taken back out of the lookup, this fails at "GET of a removed device"
+/// with 200; with it taken out of the setters' filter, at "a setter must
+/// not land on a tombstone".
+#[tokio::test]
+async fn a_removed_device_is_a_404_on_every_per_device_route() {
+    use bson::{Bson, doc, oid::ObjectId};
+    use reqwest::Method;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcgone").await;
+    let admin = seeded.admin.access_token.clone();
+    let (agent_id, _) = enroll_helper(&app, &seeded, "mach-rcgone-A", "Gone box").await;
+    let base = format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id);
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let aid = ObjectId::parse_str(&agent_id).unwrap();
+    let agents = app.db.collection::<bson::Document>("agents");
+
+    // Every per-device route this locks, with a body each accepts: the
+    // writes (settings, the three policies, the config intent, the update
+    // order), a session start (exec) and a read that is about the device's
+    // future (join-targets). The listing-style audit reads are NOT here —
+    // `recording-activity/{aid}` deliberately still resolves a removed device.
+    let routes: Vec<(&str, Method, String, Value)> = vec![
+        (
+            "PUT settings",
+            Method::PUT,
+            base.clone(),
+            json!({ "tags": ["after"] }),
+        ),
+        (
+            "PUT exec-policy",
+            Method::PUT,
+            format!("{base}/exec-policy"),
+            json!({}),
+        ),
+        (
+            "PUT ssh-policy",
+            Method::PUT,
+            format!("{base}/ssh-policy"),
+            json!({}),
+        ),
+        (
+            "PUT desired-config",
+            Method::PUT,
+            format!("{base}/desired-config"),
+            json!({}),
+        ),
+        (
+            "PUT peer-relay-policy",
+            Method::PUT,
+            format!("{base}/peer-relay-policy"),
+            json!({}),
+        ),
+        (
+            "POST update",
+            Method::POST,
+            format!("{base}/update"),
+            json!({}),
+        ),
+        (
+            "POST exec",
+            Method::POST,
+            format!("{base}/exec"),
+            json!({ "command": "true" }),
+        ),
+        (
+            "GET join-targets",
+            Method::GET,
+            format!("{base}/join-targets"),
+            Value::Null,
+        ),
+    ];
+    let call = |method: Method, path: &str, body: &Value| {
+        let mut req = app
+            .client
+            .request(method, app.url(path))
+            .header("Authorization", format!("Bearer {admin}"));
+        if !body.is_null() {
+            req = req.json(body);
+        }
+        req.send()
+    };
+
+    // The positive control: for a LIVE device none of these is a 404 — so a
+    // 404 after the removal is the lookup's answer, not a route that never
+    // existed or a body the parser refused before the lookup ran.
+    for (name, method, path, body) in &routes {
+        let status = call(method.clone(), path, body)
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_ne!(status, 404, "control: {name} must resolve a live device");
+    }
+    let resp = app.auth_get(&base, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "control: GET of a live device");
+    // The LAST write before the removal — what the tombstone must still say
+    // after every write below it has been refused (the control loop above
+    // wrote `after` while the device was live, which is why this comes last).
+    let resp = app
+        .auth_put(&base, &admin)
+        .json(&json!({ "tags": ["before"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "control: settings write on a live device"
+    );
+
+    // Remove it.
+    let resp = app.auth_delete(&base, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["deleted"], true);
+
+    // The row is a TOMBSTONE, not gone — the case the bug lived in.
+    let row = agents
+        .find_one(doc! { "_id": aid })
+        .await
+        .unwrap()
+        .expect("a permanent device tombstones in place");
+    let removed_at = match row.get("deleted_at") {
+        Some(Bson::DateTime(at)) => *at,
+        other => panic!("tombstone must carry a removal time, got {other:?}"),
+    };
+
+    // GET: 404, exactly like a bogus id.
+    let resp = app.auth_get(&base, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "GET of a removed device");
+
+    // Every other per-device route: 404.
+    for (name, method, path, body) in &routes {
+        let status = call(method.clone(), path, body)
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 404, "{name} on a removed device");
+    }
+
+    // …and none of those writes reached the tombstone.
+    let row = agents.find_one(doc! { "_id": aid }).await.unwrap().unwrap();
+    assert_eq!(
+        row.get_array("tags").unwrap(),
+        &vec![Bson::String("before".into())],
+        "the settings write must not land on the tombstone"
+    );
+
+    // The setters are live-scoped on their own, not only behind the routes'
+    // lookup ("a gate applies at every entry point, or it is a courtesy"):
+    // reached directly, one still refuses the tombstone.
+    let fleet = app.state.fleet();
+    assert!(
+        !fleet
+            .agents
+            .set_tags(tid, aid, &["dao".into()])
+            .await
+            .unwrap(),
+        "a setter must not land on a tombstone"
+    );
+    // The removal time is written once: a repeat tombstoning is a no-op.
+    assert!(!fleet.agents.soft_delete(tid, aid).await.unwrap());
+    let row = agents.find_one(doc! { "_id": aid }).await.unwrap().unwrap();
+    assert_eq!(row.get_datetime("deleted_at").unwrap(), &removed_at);
+    assert_eq!(
+        row.get_array("tags").unwrap(),
+        &vec![Bson::String("before".into())]
+    );
+
+    // A repeat DELETE is a 404 — the same answer the listing gives, and the
+    // one that leaves the state alone (re-finding the tombstone would re-run
+    // the cascade and re-stamp the removal time).
+    let resp = app.auth_delete(&base, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a repeat DELETE");
+
+    // The two views agree: gone from the listing too.
+    let list: Value = app
+        .auth_get(&format!("/api/tenant/{}/agent", seeded.tenant_id), &admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 0);
+}
+
+/// #1821 — the live predicate is `deleted_at: null`, which is null OR
+/// ABSENT: a row that never carried the field was never tombstoned, and it is
+/// the predicate the listing uses, so the two views agree by construction.
+/// The `{ "$type": "null" }` spelling belongs to the partial unique indexes;
+/// in this lookup it would 404 a live device whose field is missing, on
+/// every per-device route at once. Locked so a later "tidy" cannot do that.
+#[tokio::test]
+async fn a_live_device_whose_deleted_at_field_is_absent_is_still_live() {
+    use bson::{doc, oid::ObjectId};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcabsent").await;
+    let admin = &seeded.admin.access_token;
+    let (agent_id, _) = enroll_helper(&app, &seeded, "mach-rcabsent-A", "Absent box").await;
+    let aid = ObjectId::parse_str(&agent_id).unwrap();
+    let base = format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id);
+
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(doc! { "_id": aid }, doc! { "$unset": { "deleted_at": "" } })
+        .await
+        .unwrap();
+
+    let resp = app.auth_get(&base, admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET: absent is live");
+    let resp = app
+        .auth_put(&base, admin)
+        .json(&json!({ "tags": ["still-here"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PUT: absent is live");
+    let list: Value = app
+        .auth_get(&format!("/api/tenant/{}/agent", seeded.tenant_id), admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        1,
+        "the listing agrees"
+    );
+}
+
 #[tokio::test]
 async fn get_missing_agent_returns_404() {
     let app = TestApp::spawn().await;

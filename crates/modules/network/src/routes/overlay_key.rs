@@ -139,8 +139,10 @@ pub async fn rotate_overlay_key(
     )
     .await?;
 
-    // Tenant-scoped: a foreign agent id is a 404, not a cross-tenant order.
-    let agent = state.fleet.agents.find_in_tenant(tid, aid).await?;
+    // Tenant-scoped: a foreign agent id is a 404, not a cross-tenant order —
+    // and LIVE: a rotation order on a removed device would be desired state
+    // written onto a tombstone, with nothing left to reconcile it (#1821).
+    let agent = state.fleet.agents.find_live_in_tenant(tid, aid).await?;
 
     let request_id = ObjectId::new().to_hex();
     let online = state.fleet.rc_hub.is_agent_online(aid);

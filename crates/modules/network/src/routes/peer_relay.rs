@@ -198,13 +198,9 @@ pub async fn set_policy(
         .await?;
 
     // Tenant-scoped, so an agent id from another org is a 404 rather than a
-    // cross-tenant read.
-    let agent = state
-        .fleet
-        .agents
-        .base
-        .find_by_id_in_tenant(tid, aid)
-        .await?;
+    // cross-tenant read — and LIVE: an org-relay approval is a gate on a
+    // device that serves, and a removed one serves nothing (#1821).
+    let agent = state.fleet.agents.find_live_in_tenant(tid, aid).await?;
     // Static endpoints are server-pushed probe targets that every device in
     // the tenant will dial as SYSTEM/root: public `ip:port` literals only
     // (spec §5, SSRF). Checked before the decision so a refused body never

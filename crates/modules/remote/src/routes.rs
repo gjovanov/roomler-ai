@@ -301,7 +301,12 @@ pub async fn recording_activity(
         "VIEW_REMOTE_AUDIT",
     )
     .await?;
-    let _ = state.fleet.agents.find_in_tenant(tid, aid).await?;
+    // ANY, not live (#1821): this is an audit view, and a removed device's
+    // recording trail must stay readable — otherwise removing the device
+    // would be the way to hide what it reported. The lookup is only the
+    // tenant scope (a foreign or bogus id is a 404); nothing of the row is
+    // returned.
+    let _ = state.fleet.agents.find_any_in_tenant(tid, aid).await?;
 
     let page = state
         .recording_activity

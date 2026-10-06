@@ -251,7 +251,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device) |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
-| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release) |
+| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`) still resolve a removed device |
 | GET | `…/agent/{aid}/crash` | Crash reports |
 | POST/GET | `…/agent/{aid}/logs` | Log batch ingest (agent JWT) / admin listing |
 | POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |

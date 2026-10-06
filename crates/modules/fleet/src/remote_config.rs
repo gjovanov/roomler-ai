@@ -159,8 +159,9 @@ pub async fn set_desired_config(
         .await?;
 
     // Tenant-scoped, so an agent id from another org is a 404 rather than a
-    // cross-tenant read.
-    let agent = state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    // cross-tenant read — and LIVE, so a removed device's tombstone cannot
+    // keep taking configuration intents nothing will ever reconcile (#1821).
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     let requested = DesiredConfig {
         exec_enabled: body.exec_enabled,
