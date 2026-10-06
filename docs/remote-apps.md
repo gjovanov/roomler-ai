@@ -348,7 +348,9 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 | 2026-09-26 | GNOME Wayland (Asahi), 0.4.103 | the live session arm | `supported: true` · `NOT listed: native Wayland windows…` · `missing tools: tmux …` — the P2/P5 arms byte-for-byte |
 | 2026-09-26 | the server's `agents` collection | the hello on 0.4.103 | every online Linux/Windows device advertises `status · list · focus · launch`; macOS `null`; each probed host's `list` matches its live state |
 | 2026-09-26 | the hosted server | the viewer half | **not yet deployable**: `/health` still `0.4.102`, and the served `RemoteControl-*.js` has none of the P6 strings — the deployed dialog still drops `missing_tools` until a server promote |
-| owed | the GNOME Wayland host and a headless host, in a browser, after a server promote | the viewer half of P6 | the Apps dialog showing the `tmux` warning, and the `no_session` reason instead of *"No windows reported"* |
+| 2026-10-07 | GNOME Wayland (Asahi), a live session in a browser; prod 0.4.116 serving the P6 viewer, agent 0.4.116 | the viewer half of P6 — P2 + P5 on a screen | the Apps dialog rendered *Not listed — native Wayland windows: …* and *tmux is not installed on the agent host — persistent shell sessions … (apt install tmux)* beside the one Xwayland window, under the title *List, focus or launch apps on the controlled host* — 3 s after the request, in a hidden tab |
+| 2026-10-07 | the viewer's roster (three orgs) | a refusing host to read | none: no online hello is `status` without `list`; the cluster nodes run Xvfb, the Wayland host has a session, macOS hides the entry; the WSL node's remote view hands the connection to the Windows host on the same machine (twice) |
+| owed | a host whose live reply refuses — nobody logged in and no Xvfb, or the Wayland host after a logout | the refusal rendered | the dialog showing the `no_session` reason instead of *"No windows reported"* — its content is proven on the agent (0.4.103), its rendering by the parser tests only |
 
 Still owed to a human: a window streamed to the browser and a switch between
 two (somebody must answer the picker), and native enumeration on a wlroots host
