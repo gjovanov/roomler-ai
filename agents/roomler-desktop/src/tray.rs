@@ -234,6 +234,12 @@ pub fn sessions_answered<R: Runtime>(
     apply_red(app);
 }
 
+/// FR-27 P9 — whether a recording runs, by the same two watches that turn the
+/// tray red. The session banner stays up for as long as this says yes.
+pub fn recording_now() -> bool {
+    REMOTE_MARKED.load(Ordering::Acquire) || RECORDER_RUNNING.load(Ordering::Acquire)
+}
+
 /// Red while either says a recording runs; back after.
 fn apply_red<R: Runtime>(app: &AppHandle<R>) {
     let Ok(mut shown) = SHOWN_RED.lock() else {

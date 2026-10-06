@@ -78,6 +78,23 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+# FR-27 P9 — the session banner shown WITHOUT taking key status
+# (`orderFrontRegardless`), `NSWindowSharingNone` on the panels, and the red
+# frame round the screen (`panels.rs`). All three crates are already in the
+# lockfile (tauri pulls them on macOS, `roomlerd` declares them the same way),
+# so this is a target-scoped direct dep, not new supply-chain surface.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSColor",
+    "NSGraphics",
+    "NSResponder",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
