@@ -22,6 +22,10 @@
  *      cells produce real motion; input-less cells are still covered by the
  *      idle keepalive re-encode (FR-38), which keeps fps > 0 on a static
  *      desktop.
+ *   4. the picture has CONTENT — some of it is lit (#1719: steps 1–3 all
+ *      passed on a uniformly black stream). A lane whose desktop is dark by
+ *      design opts out with `E2E_RD_EXPECT_CONTENT=0`; every lane saves the
+ *      viewer screenshot `rd-surface.png` either way.
  *
  * Env (all required; spec skips otherwise): E2E_BASE_URL, E2E_API_URL,
  * E2E_VMTEST_TENANT_ID, E2E_VMTEST_EMAIL, E2E_VMTEST_PASSWORD, E2E_AGENT_NAME.
@@ -188,6 +192,93 @@ async function wiggle(page: Page): Promise<void> {
   }
 }
 
+/** #1719 — CONTENT, not only motion. Every oracle above proves LIVENESS
+ *  (frames decode, time advances, the viewer reports fps), and all of them
+ *  passed on a stream that was uniformly BLACK: the Ubuntu cells are GNOME
+ *  Wayland sessions, and a capture that falls through to XShm reads
+ *  Xwayland's empty root. A remote desktop that shows nothing is the one
+ *  failure this check exists to catch.
+ *
+ *  Default ON. A lane whose captured desktop is legitimately dark sets
+ *  `E2E_RD_EXPECT_CONTENT=0` — the ARM cells, whose Xvfb virtual desktop has
+ *  a black root by design — and is checked for liveness only; the
+ *  measurement is still logged and the screenshot still saved, so the
+ *  difference stays visible. */
+const EXPECT_CONTENT = process.env.E2E_RD_EXPECT_CONTENT !== '0'
+/** Share of sampled pixels that must be brighter than luma 40 (of 255). A
+ *  black stream measures 0 %; a desktop with a wallpaper measures tens of
+ *  percent, so 1 % separates them with a wide margin either side. */
+const MIN_LIT = 0.01
+
+type Content = { lit: number; spread: number } | 'none' | 'tainted'
+
+/** Sample whatever surface is painting — the `<video>` on the RTP path, the
+ *  largest `<canvas>` on the DataChannel paths, the same choice
+ *  `surfaceSig` makes — at 64×40 and measure how much of it is lit. */
+async function surfaceContent(page: Page): Promise<Content> {
+  return await page.evaluate(() => {
+    let src: HTMLVideoElement | HTMLCanvasElement | null = null
+    const v = document.querySelector('video') as HTMLVideoElement | null
+    if (v && v.videoWidth > 0) src = v
+    else
+      src =
+        (Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[])
+          .filter((x) => x.width > 100 && x.height > 100)
+          .sort((a, b) => b.width * b.height - a.width * a.height)[0] ?? null
+    if (!src) return 'none'
+    try {
+      const s = document.createElement('canvas')
+      s.width = 64
+      s.height = 40
+      const ctx = s.getContext('2d', { willReadFrequently: true })!
+      ctx.drawImage(src, 0, 0, 64, 40)
+      const d = ctx.getImageData(0, 0, 64, 40).data
+      let lit = 0
+      let min = 255
+      let max = 0
+      for (let i = 0; i < d.length; i += 4) {
+        const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]
+        if (y > 40) lit++
+        if (y < min) min = y
+        if (y > max) max = y
+      }
+      return { lit: lit / (d.length / 4), spread: max - min }
+    } catch {
+      return 'tainted'
+    }
+  })
+}
+
+/** The picture must have SOMETHING in it. Polls for 20 s — the first frames
+ *  of a stream can legitimately be dark while the encoder settles — and always
+ *  saves a screenshot of the viewer to the test output (`rd-surface.png`),
+ *  which `run-rd-check.sh` keeps with the cell, so a pass is inspectable too. */
+async function proveContent(page: Page): Promise<void> {
+  let last: Content = 'none'
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    await wiggle(page)
+    last = await surfaceContent(page)
+    if (typeof last !== 'string' && last.lit >= MIN_LIT) break
+    await page.waitForTimeout(1_000)
+  }
+  const shot = test.info().outputPath('rd-surface.png')
+  await page.screenshot({ path: shot }).catch(() => undefined)
+  const desc =
+    typeof last === 'string'
+      ? last
+      : `lit=${(last.lit * 100).toFixed(1)}% spread=${last.spread.toFixed(0)}`
+  console.log(`[vmtest-remote] content: ${desc}${EXPECT_CONTENT ? '' : ' (not asserted on this lane)'}`)
+  if (!EXPECT_CONTENT) return
+  expect(last, 'remote surface pixels unreadable (tainted)').not.toBe('tainted')
+  expect(
+    typeof last !== 'string' && last.lit >= MIN_LIT,
+    `the remote picture is BLACK (${desc}): frames flow but show nothing — on a Wayland ` +
+      'guest that is the XShm fallback reading the empty Xwayland root (#1719); the ' +
+      "guest's own screen is in the cell's desktop-*.ppm",
+  ).toBe(true)
+}
+
 test.describe('vmtest remote-desktop check (named agent)', () => {
   test.skip(
     !API_URL || !BASE_URL || !TENANT_ID || !EMAIL || !PASSWORD || !AGENT_NAME,
@@ -246,6 +337,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       // transport. The hooks strengthen this automatically once they ship.
       console.warn('[vmtest-remote] FR-61 hooks absent -- using the surface pixel-change fallback')
       await proveStreamLive(page)
+      await proveContent(page)
       return
     }
 
@@ -278,6 +370,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
         '[vmtest-remote] RTP counters flat (DataChannel transport?) — proving liveness on the SURFACE',
       )
       await proveStreamLive(page)
+      await proveContent(page)
       return
     }
 
@@ -292,6 +385,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       advanced,
       `stream froze (framesDecoded ${s0.frames} → ${s1.frames}, fps ${s0.fps} → ${s1.fps})`,
     ).toBe(true)
+    await proveContent(page)
 
     if (consoleErrors.length > 0) {
       console.warn(`[vmtest-remote] ${consoleErrors.length} console errors:`)
