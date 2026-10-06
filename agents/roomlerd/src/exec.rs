@@ -84,8 +84,15 @@ pub struct ExecRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ExecOutcome {
     pub exit_code: Option<i32>,
+    /// `stdout_bytes`, decoded for the JSON wire (fleet RPC, LocalAPI), which
+    /// carries text. Lossy: a byte that is not UTF-8 becomes U+FFFD here.
     pub stdout: String,
     pub stderr: String,
+    /// The output as the command wrote it, redacted the same way. A byte
+    /// stream (Roomler SSH) sends THESE: decoding first turned a binary file
+    /// fetched with `ssh <node> cat f > f` into U+FFFD soup (2026-10-06).
+    pub stdout_bytes: Vec<u8>,
+    pub stderr_bytes: Vec<u8>,
     pub truncated: bool,
     pub duration_ms: u64,
     /// Set when the command never ran, timed out, or was cancelled.
@@ -157,6 +164,22 @@ impl Redactor {
         }
         let out = mask_bearer(&out);
         mask_jwt_shaped(&out)
+    }
+
+    /// [`Self::apply`] over raw output: each valid UTF-8 run is redacted as
+    /// text and every other byte passes through untouched, so text is masked
+    /// exactly as `apply` masks it and binary output stays byte-exact. A
+    /// secret is ASCII, so it can never straddle a byte that is not UTF-8.
+    pub fn apply_bytes(&self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        for chunk in input.utf8_chunks() {
+            let valid = chunk.valid();
+            if !valid.is_empty() {
+                out.extend_from_slice(self.apply(valid).as_bytes());
+            }
+            out.extend_from_slice(chunk.invalid());
+        }
+        out
     }
 }
 
@@ -959,8 +982,12 @@ impl ExecEngine {
 
         self.inflight.lock().await.remove(&req.request_id);
 
-        outcome.stdout = redactor.apply(&outcome.stdout);
-        outcome.stderr = redactor.apply(&outcome.stderr);
+        // Redact the bytes, then decode once for the text wire: both views
+        // stay the same output, and the byte view stays byte-exact.
+        outcome.stdout_bytes = redactor.apply_bytes(&outcome.stdout_bytes);
+        outcome.stderr_bytes = redactor.apply_bytes(&outcome.stderr_bytes);
+        outcome.stdout = String::from_utf8_lossy(&outcome.stdout_bytes).into_owned();
+        outcome.stderr = String::from_utf8_lossy(&outcome.stderr_bytes).into_owned();
         // The error string leaves the host too — it is streamed to an SSH
         // client's stderr and persisted in `exec_audit` for 90 days — so it
         // gets the same treatment as the output. It is agent-generated today
@@ -1109,13 +1136,16 @@ impl ExecEngine {
             feeder.abort();
         }
 
-        let (stdout, out_trunc) = out_task.await.unwrap_or_default();
-        let (stderr, err_trunc) = err_task.await.unwrap_or_default();
+        let (stdout_bytes, out_trunc) = out_task.await.unwrap_or_default();
+        let (stderr_bytes, err_trunc) = err_task.await.unwrap_or_default();
 
+        // The text views are filled after redaction (`run_fed`).
         ExecOutcome {
             exit_code: status.and_then(|s| s.code()),
-            stdout,
-            stderr,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes,
+            stderr_bytes,
             truncated: out_trunc || err_trunc,
             duration_ms: 0,
             error,
@@ -1143,14 +1173,14 @@ async fn feed_child_stdin(sin: Option<tokio::process::ChildStdin>, mut feed: Std
     drop(sin);
 }
 
-/// Drain one pipe into a String, stopping once the shared budget is spent.
-/// Returns `(text, truncated)`.
-async fn read_capped<R>(reader: Option<R>, budget: Arc<AtomicU64>) -> (String, bool)
+/// Drain one pipe, stopping once the shared budget is spent. Returns
+/// `(bytes, truncated)`: the bytes exactly as written, never decoded here.
+async fn read_capped<R>(reader: Option<R>, budget: Arc<AtomicU64>) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let Some(mut reader) = reader else {
-        return (String::new(), false);
+        return (Vec::new(), false);
     };
     let mut collected: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -1185,7 +1215,7 @@ where
             Err(_) => break,
         }
     }
-    (String::from_utf8_lossy(&collected).into_owned(), truncated)
+    (collected, truncated)
 }
 
 /// Kill the child AND everything it spawned. A diagnostic that shells out
@@ -1656,6 +1686,66 @@ mod tests {
     }
 
     #[test]
+    fn apply_bytes_leaves_binary_output_byte_exact() {
+        // The 2026-10-06 bug: an MP4 fetched with `ssh <node> cat f > f`
+        // arrived as U+FFFD noise, because the output was decoded to text
+        // before it went down the channel.
+        let r = Redactor::new(["a-registered-secret".to_string()]);
+        let binary: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        assert_eq!(r.apply_bytes(&binary), binary);
+    }
+
+    #[test]
+    fn apply_bytes_masks_text_exactly_like_apply() {
+        let r = Redactor::new(["a-registered-secret".to_string()]);
+        // Built at run time, as in `redacts_jwt_shaped_strings`: a token-shaped
+        // LITERAL in the source is what a secret scanner flags on every commit.
+        let jwt = [
+            shaped("headerpart", 20),
+            shaped("payloadpart", 19),
+            shaped("signaturepart", 28),
+        ]
+        .join(".");
+        for sample in [
+            "plain output".to_string(),
+            "token a-registered-secret here".to_string(),
+            format!("Authorization: Bearer {}", shaped("bearertoken", 24)),
+            format!("token: {jwt} end"),
+        ] {
+            assert_eq!(
+                r.apply_bytes(sample.as_bytes()),
+                r.apply(&sample).into_bytes(),
+                "{sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_bytes_masks_a_secret_between_binary_bytes() {
+        let r = Redactor::new(["a-registered-secret".to_string()]);
+        let mut input = vec![0xff, 0xfe, 0x00];
+        input.extend_from_slice(b"key=a-registered-secret;");
+        input.extend_from_slice(&[0x80, 0xc3]);
+        let mut want = vec![0xff, 0xfe, 0x00];
+        want.extend_from_slice(b"key=[redacted];");
+        want.extend_from_slice(&[0x80, 0xc3]);
+        assert_eq!(r.apply_bytes(&input), want);
+    }
+
+    /// End to end: the byte view of a real run is what the command wrote, and
+    /// the text view is its lossy decode for the JSON wire.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_output_survives_the_engine_byte_exact() {
+        let engine = ExecEngine::new();
+        let outcome = engine
+            .run(req(r"printf '\377\000\200ok'"), &Redactor::default())
+            .await;
+        assert_eq!(outcome.stdout_bytes, b"\xff\x00\x80ok", "{outcome:?}");
+        assert!(outcome.stdout.contains('\u{fffd}'), "{outcome:?}");
+    }
+
+    #[test]
     fn redacts_literal_secrets() {
         let token = shaped("agenttoken", 24);
         let r = Redactor::new([token.clone()]);
@@ -1927,10 +2017,13 @@ mod win_console {
             _ => None,
         };
 
+        // The text views are filled after redaction (`run_fed`).
         ExecOutcome {
             exit_code: if error.is_some() { None } else { exit_code },
-            stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes: out_bytes,
+            stderr_bytes: err_bytes,
             truncated: out_trunc || err_trunc,
             duration_ms: 0,
             error,
