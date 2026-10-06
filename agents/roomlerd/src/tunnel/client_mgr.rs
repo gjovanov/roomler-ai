@@ -950,16 +950,64 @@ impl DrainableCarrier for Carrier {
     }
 }
 
+/// The end of a draining carrier, as a guard so it runs on EVERY exit of its
+/// reaper — the normal ones (drained / dead) and the ABORT (#1816): `kill_flow`
+/// aborts the flow supervisor, whose `drains` drop and abort each reaper
+/// mid-`select!`, and the supervisor's own returns (a permanent error, the
+/// hub's shutdown) drop them the same way. Before this the demux reap was the
+/// reaper's last line: an aborted reaper still dropped the carrier (the future
+/// owned it, so the exit was told) but left `client_sessions[old_sid]` behind
+/// for the life of the daemon — `kill_flow` reaps only the ACTIVE session's id,
+/// and nothing reaps it lazily, because the server forgets a session the client
+/// terminated and never sends for it again.
+///
+/// The order is the one the body had, made explicit instead of left to how an
+/// aborted `async fn` drops its parameters against its locals: the carrier
+/// FIRST — its drop sends the `rc:tunnel.terminate` the exit acts on (#1754),
+/// while the entry still routes — THEN the entry.
+struct DrainGuard<C: ?Sized> {
+    hub: TunnelClientHub,
+    old_sid: ObjectId,
+    /// The carrier, until `Drop` takes it: `take()`n and dropped as a statement
+    /// before the reap, so the order is not a field order.
+    old: Option<Arc<C>>,
+}
+
+impl<C: ?Sized> Drop for DrainGuard<C> {
+    fn drop(&mut self) {
+        // Dropping the carrier ends its session (TerminateOnDrop → the exit
+        // frees its peer) ...
+        drop(self.old.take());
+        // ... then reap the demux entry the promotion left registered for it.
+        self.hub
+            .inner
+            .client_sessions
+            .lock()
+            .unwrap()
+            .remove(&self.old_sid);
+    }
+}
+
 /// Drain a carrier the flow re-upgraded away from: keep it carrying its
 /// established connections until its last one ends ([`Carrier::drained`]) — or
 /// until it dies on its own — then drop it, which sends the `rc:tunnel.terminate`
 /// the exit acts on (#1754) and reaps its demux entry. **No maximum drain time:
 /// an established connection is never cut** — the make-before-break guarantee.
+/// The end is a [`DrainGuard`], so an aborted reaper ends the same way (#1816).
 async fn drain_carrier<C: DrainableCarrier + ?Sized>(
     hub: TunnelClientHub,
     old_sid: ObjectId,
     old: Arc<C>,
 ) {
+    let guard = DrainGuard {
+        hub,
+        old_sid,
+        old: Some(old),
+    };
+    let old: &C = guard
+        .old
+        .as_deref()
+        .expect("the guard holds the carrier until it drops");
     tokio::select! {
         _ = old.drained() => {
             info!(session = %old_sid, "re-upgrade: draining carrier reached 0 connections; closing");
@@ -968,10 +1016,8 @@ async fn drain_carrier<C: DrainableCarrier + ?Sized>(
             info!(session = %old_sid, "re-upgrade: draining carrier died before it drained; closing");
         }
     }
-    // Dropping the carrier ends its session (TerminateOnDrop → the exit frees
-    // its peer). Then reap the demux entry the promotion left registered for it.
-    drop(old);
-    hub.inner.client_sessions.lock().unwrap().remove(&old_sid);
+    // `guard` drops here — or at the `select!` above when the reaper is aborted
+    // — ending the carrier (→ terminate) and then reaping its demux entry.
 }
 
 /// Spawn a [`drain_carrier`] reaper, returning its abort guard (held by the
@@ -2629,10 +2675,35 @@ mod tests {
         idle: Arc<tokio::sync::Notify>,
         dead: Arc<tokio::sync::Notify>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
+        /// #1816 — when set, Drop records whether the hub still routed the
+        /// session at that moment: the reaper's order of ends, observed.
+        entry_at_drop: Option<EntryAtDrop>,
+    }
+
+    /// What `FakeDrain`'s Drop looks at (#1816): is `sid` still in the hub's
+    /// `client_sessions` as the carrier drops? `present` gets the answer.
+    struct EntryAtDrop {
+        hub: TunnelClientHub,
+        sid: ObjectId,
+        present: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Drop for FakeDrain {
         fn drop(&mut self) {
+            if let Some(e) = self.entry_at_drop.take() {
+                // `try_lock`: a reaper that dropped the carrier while HOLDING
+                // the demux lock would deadlock a `lock()` here — it fails the
+                // order assertion instead.
+                let present = e
+                    .hub
+                    .inner
+                    .client_sessions
+                    .try_lock()
+                    .map(|m| m.contains_key(&e.sid))
+                    .unwrap_or(false);
+                e.present
+                    .store(present, std::sync::atomic::Ordering::SeqCst);
+            }
             self.dropped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -2677,6 +2748,7 @@ mod tests {
             idle: idle.clone(),
             dead,
             dropped: dropped.clone(),
+            entry_at_drop: None,
         });
         let hub = TunnelClientHub::new("t".into());
         let sid = oid(9);
@@ -2716,6 +2788,7 @@ mod tests {
             idle,
             dead: dead.clone(),
             dropped: dropped.clone(),
+            entry_at_drop: None,
         });
         let hub = TunnelClientHub::new("t".into());
         let reaper = tokio::spawn(drain_carrier(hub, oid(10), fake));
@@ -2727,5 +2800,66 @@ mod tests {
             .expect("reaper finishes on death")
             .unwrap();
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// #1816 — the reaper is ABORTED mid-drain (`kill_flow` aborts the flow
+    /// supervisor, whose `drains` drop; a supervisor return does the same): it
+    /// still ends the carrier (→ terminate) AND reaps the demux entry the
+    /// promotion left registered for the old session — the carrier first, while
+    /// the entry still routes. Before the guard the reap was the reaper's last
+    /// line, so an abort dropped the carrier and leaked the entry for the life
+    /// of the daemon. NC1816-1 (the reap back on the reaper's last line) turns
+    /// the "reaped its demux entry" assertion red; NC1816-1b (the entry reaped
+    /// before the carrier drops) the order assertion.
+    #[tokio::test]
+    async fn an_aborted_drain_reaper_still_reaps_its_demux_entry_carrier_first() {
+        let hub = TunnelClientHub::new("t".into());
+        let sid = oid(11);
+        // What a promotion leaves behind: the old session's demux entry, now
+        // the reaper's to reap.
+        let (tx, _rx) = mpsc::channel::<ServerMsg>(1);
+        hub.inner.client_sessions.lock().unwrap().insert(sid, tx);
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entry_present_at_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = Arc::new(FakeDrain {
+            active: Arc::new(AtomicU64::new(1)), // never drains
+            idle: Arc::new(tokio::sync::Notify::new()),
+            dead: Arc::new(tokio::sync::Notify::new()), // never dies
+            dropped: dropped.clone(),
+            entry_at_drop: Some(EntryAtDrop {
+                hub: hub.clone(),
+                sid,
+                present: entry_present_at_drop.clone(),
+            }),
+        });
+        let reaper = tokio::spawn(drain_carrier(hub.clone(), sid, fake));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "parked in its select!, the reaper holds the carrier"
+        );
+        assert!(hub.inner.client_sessions.lock().unwrap().contains_key(&sid));
+
+        // What `kill_flow` does to a reaper: abort it, mid-select!.
+        reaper.abort();
+        let err = tokio::time::timeout(Duration::from_secs(2), reaper)
+            .await
+            .expect("an aborted reaper finishes")
+            .expect_err("aborted, not completed");
+        assert!(err.is_cancelled());
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the aborted reaper dropped the carrier (→ terminate)"
+        );
+        assert!(
+            !hub.inner.client_sessions.lock().unwrap().contains_key(&sid),
+            "the aborted reaper reaped its demux entry"
+        );
+        assert!(
+            entry_present_at_drop.load(Ordering::SeqCst),
+            "the carrier is dropped BEFORE the entry is removed (and never under the demux lock)"
+        );
     }
 }

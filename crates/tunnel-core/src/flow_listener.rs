@@ -42,7 +42,11 @@ use crate::driver::AbortOnDrop;
 /// tests use a fake so the hold and hand-off rules are locked without a peer.
 pub trait Carry: Send + Sync + 'static {
     /// Take ownership of `tcp` and forward it through this carrier's session.
-    /// Must not block: the listener's accept task calls it inline.
+    /// The listener's accept task calls it inline, **under the listener's
+    /// lock** (#1816): it must not block, and it must not call back into the
+    /// listener. Holding the lock is what makes the carry COUNT the connection
+    /// on the current carrier before [`install`](FlowListener::install) can
+    /// swap it away — see `Slot::offer`.
     fn carry(&self, tcp: TcpStream, peer_addr: SocketAddr);
 }
 
@@ -91,7 +95,9 @@ pub struct FlowListener<C: Carry> {
 
 /// The listener's shared state: the current carrier and the hold queue, under
 /// ONE lock so that "no carrier ⇒ hold" and "install ⇒ drain the hold" can
-/// never interleave to strand a connection in the queue.
+/// never interleave to strand a connection in the queue — and, since #1816, so
+/// that "carrier ⇒ carry" and "install ⇒ swap" can never interleave to hand a
+/// connection to a carrier whose drain has already seen it at zero.
 struct Slot<C> {
     policy: HoldPolicy,
     state: Mutex<SlotState<C>>,
@@ -187,11 +193,21 @@ impl<C: Carry> FlowListener<C> {
 impl<C: Carry> Slot<C> {
     /// One accepted connection: to the current carrier, else into the hold
     /// (or closed when the hold is full). The decision and the enqueue happen
-    /// under the one lock — see [`Slot`].
+    /// under the one lock — see [`Slot`] — and so does the carry.
     fn offer(&self, tcp: TcpStream, peer_addr: SocketAddr) {
         let mut st = self.state.lock().unwrap();
-        if let Some(carrier) = st.carrier.as_ref().map(Arc::clone) {
-            drop(st);
+        if let Some(carrier) = &st.carrier {
+            // #1816 — carried, which is to say COUNTED (`carry` runs
+            // `InFlight::new` synchronously before it spawns), while the lock is
+            // held. `install` swaps under the same lock, so a connection is
+            // either counted on the old carrier before a promotion — and the
+            // old carrier's drain waits for it — or offered to the new one.
+            // Before this the `Arc` was cloned and the lock released first; in
+            // that gap `install(new)` + `spawn_drain(old)` saw `active() == 0`
+            // and closed the old carrier, and the carry landed on a carrier
+            // this call's returning `Arc` then dropped for good — cutting the
+            // connection it had just spawned, the one cut P2 promises never
+            // happens.
             carrier.carry(tcp, peer_addr);
             return;
         }
@@ -273,6 +289,7 @@ async fn sleep_until_or_never(at: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
@@ -285,6 +302,28 @@ mod tests {
     impl Carry for FakeCarrier {
         fn carry(&self, tcp: TcpStream, peer_addr: SocketAddr) {
             let _ = self.tx.send((tcp, peer_addr));
+        }
+    }
+
+    /// A carrier whose `carry` BLOCKS until the test releases it — or until
+    /// the release sender is gone, or 5 s pass, so a red run fails instead of
+    /// hanging on a thread parked in it. It signals when it is entered and sets
+    /// `returned` as it leaves. The way to hold the listener mid-carry.
+    struct BlockingCarrier {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        returned: Arc<AtomicBool>,
+    }
+
+    impl Carry for BlockingCarrier {
+        fn carry(&self, _tcp: TcpStream, _peer_addr: SocketAddr) {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            self.returned.store(true, Ordering::SeqCst);
         }
     }
 
@@ -573,5 +612,93 @@ mod tests {
             a_rx.try_recv().is_err(),
             "a connection after promotion must not reach the old carrier A"
         );
+    }
+
+    /// #1816 — a promotion can never hand a connection to a carrier whose
+    /// drain has already seen it at zero: the listener carries — COUNTS — a
+    /// connection on the current carrier under the same lock `install` swaps
+    /// carriers under, so `install(B)` cannot complete while A's `carry` is in
+    /// progress. (Before this `offer` cloned A's `Arc`, released the lock and
+    /// then carried; in that gap `install(B)` + A's reaper, seeing
+    /// `active() == 0`, closed A under the connection about to be counted on
+    /// it.) NC1816-2 (carry after releasing the lock) turns this red.
+    ///
+    /// A multi-thread runtime so the accept task's worker can block inside A's
+    /// `carry`. The whole observation runs OFF the runtime — on the blocking
+    /// pool, with `install` on its own OS thread — because a blocking `carry`
+    /// occupies a runtime worker and the test body, if it were an ordinary
+    /// `async` task, gets starved behind it: measured, it did not resume to
+    /// check the invariant until carry returned 5 s later, long after the
+    /// window it meant to observe. Sync `std` sockets and sleeps are immune to
+    /// that, and the runtime is left to drive only the accept loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_cannot_complete_while_a_carry_on_the_old_carrier_is_in_progress() {
+        let port = free_port().await;
+        let listener = Arc::new(
+            FlowListener::bind(port, HoldPolicy::default())
+                .await
+                .expect("bind"),
+        );
+        let addr = listener.local_addr();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let a_returned = Arc::new(AtomicBool::new(false));
+        let a = Arc::new(BlockingCarrier {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            returned: Arc::clone(&a_returned),
+        });
+        // B carries nothing here; built so that even if it did, it would not
+        // block (its release sender is already dropped ⇒ recv returns at once).
+        let b = Arc::new(BlockingCarrier {
+            entered: std::sync::mpsc::channel::<()>().0,
+            release: Mutex::new(std::sync::mpsc::channel::<()>().1),
+            returned: Arc::new(AtomicBool::new(false)),
+        });
+
+        listener.install(Arc::clone(&a));
+        let listener2 = Arc::clone(&listener);
+        let a_returned2 = Arc::clone(&a_returned);
+        tokio::task::spawn_blocking(move || {
+            // A sync connect triggers the accept loop (on a runtime worker),
+            // which enters A's `carry` and parks there, holding the slot lock.
+            let _c = std::net::TcpStream::connect(addr).expect("a client connects while A serves");
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("A's carry is entered for the connection");
+
+            // Promote to B from its own OS thread: `install` must WAIT for the
+            // slot lock A's carry holds. It returns whether A's carry had
+            // already returned by the time the swap completed — true is the
+            // invariant: the connection was counted on A before the carrier
+            // changed under it.
+            let install = {
+                let listener = Arc::clone(&listener2);
+                let a_returned = Arc::clone(&a_returned2);
+                std::thread::spawn(move || {
+                    listener.install(b);
+                    a_returned.load(Ordering::SeqCst)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !install.is_finished(),
+                "install(B) must not complete while A's carry is in progress"
+            );
+            assert!(!a_returned2.load(Ordering::SeqCst));
+
+            // Release A's carry: install completes — and only after A's carry
+            // returned, the connection counted on A.
+            release_tx
+                .send(())
+                .expect("A's carry is waiting on the release");
+            let a_had_returned = install.join().expect("the install thread");
+            assert!(
+                a_had_returned,
+                "install(B) completed only after A's carry had returned"
+            );
+        })
+        .await
+        .expect("the probe task");
     }
 }
