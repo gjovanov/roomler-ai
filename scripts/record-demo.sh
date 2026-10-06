@@ -209,6 +209,7 @@ E2E_DEMO_NETWORK="${ROOMLER_DEMO_NETWORK:-}" \
 E2E_DEMO_RECORD="${ROOMLER_DEMO_RECORD:-}" \
 E2E_DEMO_RECORD_PROBE="${ROOMLER_DEMO_RECORD_PROBE:-}" \
 E2E_DEMO_STEPS="${ROOMLER_DEMO_STEPS:-}" \
+E2E_DEMO_LOCKCHECK="${ROOMLER_DEMO_LOCKCHECK:-}" \
 E2E_DEMO_OUT="$TAKE" \
   bunx playwright test e2e/video/record-demo.spec.ts \
     --config=playwright.video.config.ts --reporter=list

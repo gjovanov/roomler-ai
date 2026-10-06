@@ -38,8 +38,44 @@
  * LABELS), the OS and the version.
  */
 import { test, expect, type CDPSession, type Page } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, writeFile, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+
+/**
+ * `E2E_DEMO_LOCKCHECK` (`record-demo.sh` passes `ROOMLER_DEMO_LOCKCHECK`): `roomler exec`
+ * selectors with their OS, one per device in filming order — `"laptop-17:win,office-mac:mac"`.
+ * Each device is checked right before it is FILMED, not just when the take starts: managed
+ * laptops lock after a few idle minutes, and the second machine of a take sat idle while the
+ * first was filmed (2026-10-07: two takes refused in a row as one laptop then the other locked).
+ */
+const LOCKCHECK = (process.env.E2E_DEMO_LOCKCHECK || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+/** Whether the device's screen is signed in now, by `roomler exec`. Anything unclear is "no". */
+function signedIn(check: string): { ok: boolean; why: string } {
+  const i = check.lastIndexOf(':')
+  const [sel, os] = [check.slice(0, i), check.slice(i + 1)]
+  const cmd = os === 'win' ? 'tasklist /FI "IMAGENAME eq LogonUI.exe" /NH' : os === 'mac' ? 'ioreg -n Root -d1 -a' : ''
+  if (!cmd) return { ok: false, why: `"${check}" needs :win or :mac` }
+  let out: string
+  try {
+    out = execFileSync('roomler', ['exec', sel, cmd], { encoding: 'utf8', timeout: 60_000 })
+  } catch (e) {
+    return { ok: false, why: `could not check ${sel}: ${(e as Error).message.split('\n')[0]}` }
+  }
+  if (os === 'win') {
+    // The process name and the INFO prefix alone: "nothing found" is localized.
+    if (out.includes('LogonUI.exe')) return { ok: false, why: `${sel} is at its lock screen` }
+    return out.trimStart().startsWith('INFO') ? { ok: true, why: '' } : { ok: false, why: `${sel} answered: ${out.slice(0, 80)}` }
+  }
+  if (/CGSSessionScreenIsLocked<\/key>\s*<true\/>/.test(out)) return { ok: false, why: `${sel} is locked` }
+  return /kCGSessionLoginDoneKey<\/key>\s*<true\/>/.test(out)
+    ? { ok: true, why: '' }
+    : { ok: false, why: `${sel} has no signed-in console session` }
+}
 
 const USERNAME = process.env.E2E_USERNAME || ''
 const PASSWORD = process.env.E2E_PASSWORD || ''
@@ -116,8 +152,11 @@ type RecordUi = { record: [number, number]; start: [number, number]; stop: [numb
 const RECORD: null | {
   ui?: RecordUi | RecordUi[]
   drag?: Array<null | [[number, number], [number, number]]>
-  /** Per device: click `at` (an editor's text) and type `text` there, before the drag. */
-  type?: Array<null | { at: [number, number]; text: string }>
+  /**
+   * Per device: click `at` (an editor's text) and type `text` there, before the drag; `clear`
+   * empties the editor first (select all, delete) so a re-take does not type after the last one.
+   */
+  type?: Array<null | { at: [number, number]; text: string; clear?: boolean }>
 } = process.env.E2E_DEMO_RECORD ? JSON.parse(process.env.E2E_DEMO_RECORD) : null
 const RECORD_PROBE = process.env.E2E_DEMO_RECORD_PROBE === '1'
 /**
@@ -398,16 +437,35 @@ async function recordScene(
   await page.keyboard.press('Escape') // the menu, so the pointer reaches the desktop
   await page.waitForTimeout(800)
 
-  const typing = RECORD?.type?.[index]
+  // ⚠️ Once more, right before any typing. The connect already moved the pointer over the
+  // stream, which resets the device's idle timer; if it is still signed in NOW it will not lock
+  // during the next minute. If it locked between the pre-take check and that pointer move
+  // (2026-10-07: a laptop locked seconds after passing the check), typing would go into its
+  // password field — so nothing is typed or dragged.
+  const lockCheck = LOCKCHECK[index]
+  const inputOk = !lockCheck || signedIn(lockCheck).ok
+  if (!inputOk) {
+    console.log(`  ${label}: screen locked before typing — no typing, no drag`)
+    mark(label, 'input-skipped-locked')
+  }
+  const typing = inputOk ? RECORD?.type?.[index] : undefined
   if (typing) {
     // Focus the editor's text with a click, then type: the latency a person feels.
     await page.mouse.click(typing.at[0], typing.at[1])
     await page.waitForTimeout(400)
+    if (typing.clear) {
+      // Select all + delete: a re-take starts from an empty editor, not from the last take's
+      // text. The viewer sends Ctrl as Cmd to a Mac.
+      await page.keyboard.press('Control+a')
+      await page.waitForTimeout(250)
+      await page.keyboard.press('Backspace')
+      await page.waitForTimeout(400)
+    }
     mark(label, 'type')
     await typeText(page, cap.cdp, typing.text)
     await page.waitForTimeout(700)
   }
-  const pair = RECORD?.drag?.[index]
+  const pair = inputOk ? RECORD?.drag?.[index] : undefined
   if (pair) {
     mark(label, 'drag')
     await drag(page, cap.cdp, pair[0], pair[1])
@@ -632,6 +690,17 @@ test.describe('Roomler demo recording', () => {
     await cap.start()
 
     for (const shot of shots) {
+      // Right before THIS device is filmed (see `LOCKCHECK`): a locked screen is skipped, and
+      // never typed into or filmed.
+      const check = LOCKCHECK[shots.indexOf(shot)]
+      if (check) {
+        const s = signedIn(check)
+        if (!s.ok) {
+          console.log(`  ${shot.shown}: SKIPPED, not filmed — ${s.why}`)
+          mark(shot.shown, 'skipped-locked')
+          continue
+        }
+      }
       await page.goto(`/tenant/${TENANT_ID}/agent/${shot.id}/remote`)
       await page.waitForLoadState('networkidle')
       await collapseSidebar(page)
