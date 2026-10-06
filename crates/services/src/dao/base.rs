@@ -158,9 +158,42 @@ where
             .ok_or(DaoError::NotFound)
     }
 
+    /// The row by id, in this tenant, **tombstone included**. For a collection
+    /// that soft-deletes (`deleted_at`) this is the ANY lookup: it answers for
+    /// a removed row exactly as for a live one, which is right for the readers
+    /// whose job is the tombstone (a revocation check that must say *why*, an
+    /// audit view of something since removed) and wrong for everything else —
+    /// a GET, a write, a session start want [`Self::find_live_by_id_in_tenant`].
+    /// Reaching for this one on a tombstoned collection is a decision; say why
+    /// at the call site.
     pub async fn find_by_id_in_tenant(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<T> {
         self.collection
             .find_one(doc! { "_id": id, "tenant_id": tenant_id })
+            .await?
+            .ok_or(DaoError::NotFound)
+    }
+
+    /// The row by id, in this tenant, and LIVE — `NotFound` for a tombstone,
+    /// the same answer a bogus or foreign id gets (#1821: the per-id view and
+    /// the listing disagreed, so a removed device was still readable and
+    /// writable by anyone holding its id).
+    ///
+    /// The predicate is `deleted_at: null`, which matches null OR absent: a
+    /// row that never carried the field was never tombstoned, and this is the
+    /// predicate every live-scoped listing in this crate already uses, so the
+    /// two views agree by construction. ⚠️ Not `{ "$type": "null" }` — that
+    /// spelling belongs to the PARTIAL UNIQUE INDEXES (`index_unique_partial`),
+    /// where a filter must name an explicit value; in a query it is strictly
+    /// narrower and the only rows it drops are LIVE ones whose field is
+    /// missing, i.e. it would 404 a live device on every per-device route. A
+    /// tombstone always carries a `DateTime`, so neither spelling can match one.
+    pub async fn find_live_by_id_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<T> {
+        self.collection
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "deleted_at": null })
             .await?
             .ok_or(DaoError::NotFound)
     }
