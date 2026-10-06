@@ -595,12 +595,12 @@ established beside the first, promoted, the first drained.
 
 | Piece | What it is | Where |
 |---|---|---|
-| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:872`](../crates/tunnel-core/src/driver.rs) |
-| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:443`](../crates/tunnel-core/src/driver.rs) · `carry` `:527` · `dead` `:687` |
+| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:916`](../crates/tunnel-core/src/driver.rs) |
+| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:443`](../crates/tunnel-core/src/driver.rs) · `carry` `:571` · `dead` `:731` |
 | `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
-| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:742`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:881` `run_flow_cycle` |
-| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:810`](../crates/tunnel-core/src/driver.rs) |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1198`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1360` `run_flow_cycle` |
+| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:854`](../crates/tunnel-core/src/driver.rs) |
 
 ```mermaid
 sequenceDiagram
@@ -641,7 +641,7 @@ open's 15 s and the ready's 30 s are caps a healthy exit cuts to 1–5 s) and is
 client timeout worth waiting out. Both are constants in P1, not config.
 
 ⚠️ **Nothing about #1754 moved.** The terminate guard is created at the same point
-([`driver.rs:970`](../crates/tunnel-core/src/driver.rs), the moment the session id is
+([`driver.rs:1014`](../crates/tunnel-core/src/driver.rs), the moment the session id is
 known) and *moves into the carrier*, so an early `?`, a `QuicSetupFailed` soft-fall, the
 carrier's drop and the `kill_flow` abort all still tell the exit, and `kill_flow`'s
 synchronous fast path is unchanged. A killed flow drops its listener — the accept task is
