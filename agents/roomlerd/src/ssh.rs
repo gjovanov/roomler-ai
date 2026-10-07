@@ -1941,14 +1941,32 @@ mod sshd {
             .run_fed(req, &crate::exec::redactor(), Some(stdin))
             .await;
 
-        if !outcome.stdout.is_empty() {
+        // The BYTES, not the text view: an SSH channel is a byte stream, and
+        // `ssh <node> cat f > f` must land the file as it is on the device.
+        // Sending the decoded text turned every byte that is not UTF-8 into
+        // U+FFFD — a 4.4 MB MP4 arrived as 1.9 MB of noise (2026-10-06).
+        if !outcome.stdout_bytes.is_empty() {
+            let _ = handle.data(channel, outcome.stdout_bytes.clone()).await;
+        }
+        if !outcome.stderr_bytes.is_empty() {
             let _ = handle
-                .data(channel, outcome.stdout.clone().into_bytes())
+                .extended_data(channel, 1, outcome.stderr_bytes.clone())
                 .await;
         }
-        if !outcome.stderr.is_empty() {
+        // The ceiling is the exec engine's (`docs/roomler-ssh.md` §3). Hitting
+        // it must say so: the output simply stopping, with exit 1 and no word,
+        // read as a corrupt transfer rather than a limit.
+        if outcome.truncated {
             let _ = handle
-                .extended_data(channel, 1, outcome.stderr.clone().into_bytes())
+                .extended_data(
+                    channel,
+                    1,
+                    format!(
+                        "roomler-ssh: output stopped at {} bytes, the exec ceiling. Copy files with scp or sftp, which stream them whole.\r\n",
+                        exec_limits::MAX_OUTPUT_BYTES
+                    )
+                    .into_bytes(),
+                )
                 .await;
         }
         // A run that never reached a process still has to say so on stderr:

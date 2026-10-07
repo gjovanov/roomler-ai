@@ -8590,6 +8590,9 @@ version = "0.4.116"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "roomler-localapi",
  "roomler-node-core",
  "serde",
