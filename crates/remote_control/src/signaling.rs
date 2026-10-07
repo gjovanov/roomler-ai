@@ -741,6 +741,57 @@ pub enum ClientMsg {
         cost_usd: Option<f64>,
     },
 
+    /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
+    /// whether it will serve this viewer. The server tells the browser to
+    /// dial only after an answer without `refused` (FR-83).
+    ///
+    /// ⚠️ The server applies it only to a grant it pushed to the sending
+    /// device; grant ids are ObjectIds, structured, not secret.
+    #[serde(rename = "rc:hive.view.grant_ack")]
+    HiveViewGrantAck {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        /// Absent = the device will answer the viewer's offer. Present =
+        /// refused, decoded leniently — see [`crate::hive::HiveViewRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::view_refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveViewRefusal>,
+        /// A few words for the viewer. Capped by the device, re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// FR-90 P0d-2 — the device's SDP answer to a viewer's offer, relayed to
+    /// the browser connection that holds the grant.
+    #[serde(rename = "rc:hive.view.answer")]
+    HiveViewAnswer {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        sdp: String,
+    },
+
+    /// FR-90 P0d-2 — one of the device's ICE candidates for a viewer peer.
+    #[serde(rename = "rc:hive.view.ice")]
+    HiveViewIce {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        candidate: serde_json::Value,
+    },
+
+    /// FR-90 P0d-2 — the device closed a viewer peer on its own side: the
+    /// grant ran out, the peer failed, the viewer went away. The server drops
+    /// the grant and tells the browser.
+    #[serde(rename = "rc:hive.view.closed")]
+    HiveViewClosed {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        reason: String,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1465,6 +1516,10 @@ impl ClientMsg {
             ClientMsg::HiveStartAck { .. } => "rc:hive.start_ack",
             ClientMsg::HiveState { .. } => "rc:hive.state",
             ClientMsg::HiveTurn { .. } => "rc:hive.turn",
+            ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
+            ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
+            ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
+            ClientMsg::HiveViewClosed { .. } => "rc:hive.view.closed",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -1554,7 +1609,11 @@ impl ClientMsg {
             | ClientMsg::OverlayWarmRelayRequest { .. } => Owner::Network,
             ClientMsg::HiveStartAck { .. }
             | ClientMsg::HiveState { .. }
-            | ClientMsg::HiveTurn { .. } => Owner::Hive,
+            | ClientMsg::HiveTurn { .. }
+            | ClientMsg::HiveViewGrantAck { .. }
+            | ClientMsg::HiveViewAnswer { .. }
+            | ClientMsg::HiveViewIce { .. }
+            | ClientMsg::HiveViewClosed { .. } => Owner::Hive,
         }
     }
 }
@@ -1581,6 +1640,10 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.start_ack", Owner::Hive),
     ("rc:hive.state", Owner::Hive),
     ("rc:hive.turn", Owner::Hive),
+    ("rc:hive.view.grant_ack", Owner::Hive),
+    ("rc:hive.view.answer", Owner::Hive),
+    ("rc:hive.view.ice", Owner::Hive),
+    ("rc:hive.view.closed", Owner::Hive),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -2713,6 +2776,69 @@ pub enum ServerMsg {
         #[serde(default)]
         reason: String,
     },
+
+    // ─── Hive viewer peer (rc:hive.view.*) — FR-90 P0d-2 ─────────────────
+    /// A view grant: `user_id` may read `session_id` over a data-only WebRTC
+    /// peer for `ttl_secs`, and send it prompts if `may_prompt`. The device
+    /// answers [`ClientMsg::HiveViewGrantAck`] before the server tells the
+    /// browser to dial; a repeated grant id is answered again, not doubled.
+    ///
+    /// The TTL is RELATIVE — the device starts its own clock on receipt, so
+    /// clock skew cannot expire a fresh grant or extend a stale one.
+    #[serde(rename = "rc:hive.view.grant")]
+    HiveViewGrant {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        user_id: ObjectId,
+        /// How this viewer's prompts are attributed in the transcript.
+        #[serde(default)]
+        user_name: String,
+        /// The viewer drives the session: prompts go to its harness. False =
+        /// read only; a prompt over the peer is refused on the device.
+        #[serde(default)]
+        may_prompt: bool,
+        ttl_secs: u32,
+    },
+
+    /// A grant's renewal: a fresh `ttl_secs` from receipt, after the server
+    /// re-checked the viewer's right to read.
+    #[serde(rename = "rc:hive.view.renew")]
+    HiveViewRenew {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        ttl_secs: u32,
+    },
+
+    /// The viewer's SDP offer for a confirmed grant, with the ICE servers
+    /// the server minted for this peer (the browser gets the same).
+    #[serde(rename = "rc:hive.view.offer")]
+    HiveViewOffer {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        sdp: String,
+        ice_servers: Vec<IceServer>,
+    },
+
+    /// One of the viewer's ICE candidates.
+    #[serde(rename = "rc:hive.view.ice")]
+    HiveViewIce {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        candidate: serde_json::Value,
+    },
+
+    /// The grant is over — the viewer closed the room, its socket went, it
+    /// lost the right to read. The device closes the peer. Idempotent.
+    #[serde(rename = "rc:hive.view.close")]
+    HiveViewClose {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3648,6 +3774,116 @@ mod tests {
                 prompted_by,
                 ..
             } => assert_eq!((status, steps, prompted_by), (None, 0, None)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-90 P0d-2 — the viewer peer's signalling: a grant, its answer, and
+    /// a WebRTC handshake. The field sets are LOCKED: the server relays these
+    /// frames, and none of them may grow a field that carries what the peer
+    /// is for. The grant's TTL is relative (`ttl_secs`), never a timestamp.
+    #[test]
+    fn the_view_frames_carry_a_handshake_and_nothing_of_the_session() {
+        use crate::hive::HiveViewRefusal;
+
+        let (grant, sid, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort_unstable();
+            k
+        };
+
+        let g = serde_json::to_value(ServerMsg::HiveViewGrant {
+            grant_id: grant,
+            session_id: sid,
+            user_id: user,
+            user_name: "Alice".into(),
+            may_prompt: true,
+            ttl_secs: 600,
+        })
+        .unwrap();
+        assert_eq!(g["t"], "rc:hive.view.grant");
+        assert_eq!(g["grant_id"], grant.to_hex());
+        assert_eq!(
+            keys(&g),
+            [
+                "grant_id",
+                "may_prompt",
+                "session_id",
+                "t",
+                "ttl_secs",
+                "user_id",
+                "user_name"
+            ]
+        );
+
+        let offer = serde_json::to_value(ServerMsg::HiveViewOffer {
+            grant_id: grant,
+            sdp: "v=0".into(),
+            ice_servers: vec![],
+        })
+        .unwrap();
+        assert_eq!(keys(&offer), ["grant_id", "ice_servers", "sdp", "t"]);
+        for (frame, t) in [
+            (
+                ServerMsg::HiveViewRenew {
+                    grant_id: grant,
+                    ttl_secs: 600,
+                },
+                "rc:hive.view.renew",
+            ),
+            (
+                ServerMsg::HiveViewIce {
+                    grant_id: grant,
+                    candidate: serde_json::json!({"candidate": "c"}),
+                },
+                "rc:hive.view.ice",
+            ),
+            (
+                ServerMsg::HiveViewClose {
+                    grant_id: grant,
+                    reason: "viewer_left".into(),
+                },
+                "rc:hive.view.close",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(frame).unwrap()["t"], t);
+        }
+
+        // The device's side — every one owned by `hive`.
+        let accepted = ClientMsg::HiveViewGrantAck {
+            grant_id: grant,
+            refused: None,
+            detail: None,
+        };
+        let v = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(keys(&v), ["grant_id", "t"], "an acceptance is just the id");
+        for m in [
+            accepted,
+            ClientMsg::HiveViewAnswer {
+                grant_id: grant,
+                sdp: "v=0".into(),
+            },
+            ClientMsg::HiveViewIce {
+                grant_id: grant,
+                candidate: serde_json::json!({}),
+            },
+            ClientMsg::HiveViewClosed {
+                grant_id: grant,
+                reason: "expired".into(),
+            },
+        ] {
+            assert_eq!(m.namespace(), Owner::Hive, "{m:?}");
+        }
+
+        // A newer device's refusal word is still a refusal.
+        let newer = serde_json::json!({
+            "t": "rc:hive.view.grant_ack", "grant_id": grant.to_hex(), "refused": "busy_elsewhere"
+        });
+        match serde_json::from_value::<ClientMsg>(newer).expect("the frame must still parse") {
+            ClientMsg::HiveViewGrantAck { refused, .. } => {
+                assert_eq!(refused, Some(HiveViewRefusal::Other))
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }

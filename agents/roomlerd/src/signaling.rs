@@ -4139,6 +4139,82 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P0d-2 — the viewer peer. A grant is answered with
+        // `rc:hive.view.grant_ack` on THIS connection, from a task (it reads
+        // the replica store); the rest feeds the grant's own actor. A build
+        // without `hive` does not advertise `hive-view`, so no server sends
+        // it any of these.
+        ServerMsg::HiveViewGrant {
+            grant_id,
+            session_id,
+            user_id,
+            user_name,
+            may_prompt,
+            ttl_secs,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_view_grant(
+                crate::hive::ViewGrant {
+                    grant_id,
+                    session_id,
+                    user_id,
+                    user_name,
+                    may_prompt,
+                    ttl_secs,
+                },
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = (session_id, user_id, &user_name, may_prompt, ttl_secs);
+                debug!(grant = %grant_id, "rc:hive.view.grant ignored — this build does not serve agent sessions");
+            }
+        }
+        ServerMsg::HiveViewOffer {
+            grant_id,
+            sdp,
+            ice_servers,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_view_offer(grant_id, sdp, ice_servers, ctx.is_primary);
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = (&sdp, &ice_servers);
+                debug!(grant = %grant_id, "rc:hive.view.offer ignored");
+            }
+        }
+        ServerMsg::HiveViewIce {
+            grant_id,
+            candidate,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_view_ice(grant_id, candidate, ctx.is_primary);
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = &candidate;
+                debug!(grant = %grant_id, "rc:hive.view.ice ignored");
+            }
+        }
+        ServerMsg::HiveViewRenew { grant_id, ttl_secs } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_view_renew(grant_id, ttl_secs, ctx.is_primary);
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = ttl_secs;
+                debug!(grant = %grant_id, "rc:hive.view.renew ignored");
+            }
+        }
+        ServerMsg::HiveViewClose { grant_id, reason } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_view_close(grant_id, reason, ctx.is_primary);
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = &reason;
+                debug!(grant = %grant_id, "rc:hive.view.close ignored");
+            }
+        }
+
         // Roomler SSH — the answer to a session THIS device asked for
         // (`roomler ssh`). Handed to whichever LocalAPI call is parked on it;
         // an unknown id means that caller already gave up.

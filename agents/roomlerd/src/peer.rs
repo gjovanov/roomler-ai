@@ -10769,7 +10769,7 @@ async fn or_stopped<T>(
 ///
 /// Multi-org v2: per-org adapters are named `roomler-<suffix>`, so the
 /// `roomler-` prefix is ours as well.
-fn is_overlay_iface(name: &str) -> bool {
+pub(crate) fn is_overlay_iface(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
     n == "roomler"
         || n.starts_with("roomler-")
@@ -10777,7 +10777,7 @@ fn is_overlay_iface(name: &str) -> bool {
         || n.starts_with("roomler.")
 }
 
-fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
+pub(crate) fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
     servers
         .iter()
         .map(|s| RTCIceServer {
@@ -10796,7 +10796,7 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 /// survives it. Keeps only `turns:…?transport=tcp` URLs and drops STUN +
 /// plain-UDP TURN. Returns the full mapping unchanged when no TCP-relay
 /// URL is present, so the knob can never break connectivity outright.
-fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServer> {
+pub(crate) fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServer> {
     let all = map_ice_servers(servers);
     let filtered: Vec<RTCIceServer> = all
         .iter()

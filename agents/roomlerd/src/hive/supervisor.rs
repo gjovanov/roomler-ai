@@ -41,7 +41,7 @@ use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_node_core::config::AgentConfig;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use super::gates::{self, HiveConfig};
@@ -171,6 +171,10 @@ pub struct Supervisor {
     /// The newest `rc:hive.turn` per session, replayed with the states.
     turns: Mutex<HashMap<ObjectId, ClientMsg>>,
     reporter: Mutex<Option<mpsc::Sender<ClientMsg>>>,
+    /// Every state as it is reported, for the viewers of that session.
+    states: broadcast::Sender<(ObjectId, HiveRunState)>,
+    /// The viewer peers this device serves (P0d-2).
+    viewers: super::view::Viewers,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
@@ -282,6 +286,8 @@ impl Supervisor {
             reports: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             reporter: Mutex::new(None),
+            states: broadcast::channel(64).0,
+            viewers: Default::default(),
         }
     }
 
@@ -290,7 +296,7 @@ impl Supervisor {
         self.live.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    async fn start(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
+    pub(crate) async fn start(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
         let _serial = self.start_lock.lock().await;
         let answer = self.decide_and_launch(&order, is_primary).await;
         match &answer.refused {
@@ -405,7 +411,7 @@ impl Supervisor {
         })
     }
 
-    fn stop(&self, session: ObjectId, fence: u64, reason: String) {
+    pub(crate) fn stop(&self, session: ObjectId, fence: u64, reason: String) {
         let input = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             match live.get(&session) {
@@ -494,6 +500,8 @@ impl Supervisor {
                     at: Instant::now(),
                 },
             );
+        // Viewers of the session hear it too (P0d-2); nobody watching is fine.
+        let _ = self.states.send((session, state));
         let tx = self
             .reporter
             .lock()
@@ -506,6 +514,64 @@ impl Supervisor {
                 state: Some(state),
                 detail,
             });
+        }
+    }
+
+    // ─── What the viewer peer (P0d-2, `super::view`) reads ──────────────
+
+    /// The device's own `hive_enabled`.
+    pub(crate) fn enabled(&self) -> bool {
+        self.cfg.enabled
+    }
+
+    pub(crate) fn store_handle(&self) -> Result<StoreHandle, String> {
+        self.store.clone()
+    }
+
+    /// Whether this device runs `session` now.
+    pub(crate) fn holds_live(&self, session: ObjectId) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&session)
+    }
+
+    /// The latest state reported for `session`, while it is remembered.
+    pub(crate) fn run_state(&self, session: ObjectId) -> Option<HiveRunState> {
+        self.reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|r| r.state)
+    }
+
+    /// Every state reported from now on, of every session.
+    pub(crate) fn subscribe_states(&self) -> broadcast::Receiver<(ObjectId, HiveRunState)> {
+        self.states.subscribe()
+    }
+
+    pub(crate) fn viewers(&self) -> &super::view::Viewers {
+        &self.viewers
+    }
+
+    /// Send a frame on the primary connection that is up NOW. Not replayed:
+    /// a viewer's handshake that loses a frame times out, and the browser
+    /// asks again.
+    pub(crate) fn send(&self, msg: ClientMsg) {
+        let tx = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match tx {
+            Some(tx) => {
+                if tx.try_send(msg).is_err() {
+                    debug!(
+                        "hive: the control connection's queue is full — a view frame was dropped"
+                    );
+                }
+            }
+            None => debug!("hive: no control connection — a view frame was dropped"),
         }
     }
 
@@ -1073,7 +1139,7 @@ fn describe_end(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A stand-in for Claude Code that speaks just enough stream-json. Like
@@ -1081,7 +1147,7 @@ mod tests {
     /// its first prompt arrives, then answers each prompt with a text block
     /// and a turn result. A prompt containing `crash` exits 3 with a word on
     /// stderr; `slow` takes a second; `tool` makes one tool call first.
-    const FAKE_HARNESS: &str = r#"#!/bin/sh
+    pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 first=1
 while IFS= read -r line; do
   case "$line" in
@@ -1105,15 +1171,15 @@ while IFS= read -r line; do
 done
 "#;
 
-    struct Rig {
-        sup: Arc<Supervisor>,
-        store: StoreHandle,
-        reports: mpsc::Receiver<ClientMsg>,
-        root: tempfile::TempDir,
-        user: ObjectId,
+    pub(crate) struct Rig {
+        pub(crate) sup: Arc<Supervisor>,
+        pub(crate) store: StoreHandle,
+        pub(crate) reports: mpsc::Receiver<ClientMsg>,
+        pub(crate) root: tempfile::TempDir,
+        pub(crate) user: ObjectId,
     }
 
-    fn rig(enabled: bool, max: usize) -> Rig {
+    pub(crate) fn rig(enabled: bool, max: usize) -> Rig {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let work = root.path().join("work");
@@ -1149,7 +1215,7 @@ done
         }
     }
 
-    fn order(r: &Rig) -> StartOrder {
+    pub(crate) fn order(r: &Rig) -> StartOrder {
         StartOrder {
             session_id: ObjectId::new(),
             harness: HARNESS_CLAUDE_CODE.into(),
@@ -1164,7 +1230,10 @@ done
     }
 
     /// The next state reported for `session`.
-    async fn next_state(r: &mut Rig, session: ObjectId) -> (HiveRunState, Option<String>) {
+    pub(crate) async fn next_state(
+        r: &mut Rig,
+        session: ObjectId,
+    ) -> (HiveRunState, Option<String>) {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
                 .await
@@ -1245,7 +1314,7 @@ done
         }
     }
 
-    fn dev(r: &Rig) -> Option<Author> {
+    pub(crate) fn dev(r: &Rig) -> Option<Author> {
         Some(Author {
             user_id: r.user,
             name: "Dev".into(),
