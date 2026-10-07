@@ -8438,6 +8438,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bson",
+ "bytes",
  "chrono",
  "futures",
  "hex",
