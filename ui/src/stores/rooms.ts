@@ -33,6 +33,12 @@ export interface Room {
   member_count: number
   message_count: number
   created_at: string
+  /**
+   * FR-90 — another module owns what this room means: `{module: 'hive',
+   * ref: <session id>}` is an agent session's room. Chat stores it and never
+   * interprets it; the SPA uses it to show the session's transcript.
+   */
+  binding?: { module: string; ref: string }
 }
 
 export interface Participant {
