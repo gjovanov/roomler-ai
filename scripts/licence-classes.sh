@@ -87,6 +87,7 @@ SERVER_CRATES=(
   roomler-ai-mod-fleet
   roomler-ai-mod-remote
   roomler-ai-mod-network
+  roomler-ai-mod-hive
   roomler-ai-services
   roomler-ai-db
   roomler-ai-config

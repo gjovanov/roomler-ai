@@ -28,12 +28,12 @@ import {
 // composite value changes and this fails loudly.
 
 describe('permission catalog', () => {
-  it('defines all 32 flags with unique bits and keys', () => {
-    expect(PERMISSION_FLAGS).toHaveLength(32)
+  it('defines all 33 flags with unique bits and keys', () => {
+    expect(PERMISSION_FLAGS).toHaveLength(33)
     const bits = PERMISSION_FLAGS.map((f) => f.bit)
-    expect(new Set(bits).size).toBe(32)
+    expect(new Set(bits).size).toBe(33)
     const keys = PERMISSION_FLAGS.map((f) => f.key)
-    expect(new Set(keys).size).toBe(32)
+    expect(new Set(keys).size).toBe(33)
     // Every bit is a single power of two. The ceiling is now bit 52, not 30
     // (#888): the file uses arithmetic rather than bitwise operators, so the
     // limit is the JSON number's exact-integer range, not int32 coercion.
@@ -51,10 +51,11 @@ describe('permission catalog', () => {
     // first flag a bitwise OR would coerce to a NEGATIVE int32.
     const all = PERMISSION_FLAGS.reduce((m, f) => maskUnion(m, f.bit), 0)
     expect(all).toBe(ALL_PERMISSIONS)
-    // `(1 << 32) - 1` — the Rust spelling — is 0 in JS. Assert the POSITIVE
-    // value so a copy-paste of the Rust expression fails here.
-    expect(ALL_PERMISSIONS).toBe(4294967295)
-    expect(ALL_PERMISSIONS).toBe(2 ** 32 - 1)
+    // `(1 << 33) - 1` — the Rust spelling — is 1 in JS (a shift count is
+    // taken mod 32). Assert the POSITIVE value so a copy-paste of the Rust
+    // expression fails here.
+    expect(ALL_PERMISSIONS).toBe(8589934591)
+    expect(ALL_PERMISSIONS).toBe(2 ** 33 - 1)
     expect(ALL_PERMISSIONS).toBeGreaterThan(0)
   })
 
@@ -72,6 +73,7 @@ describe('permission catalog', () => {
     expect(bit('SSH_DEVICE')).toBe(1 << 29)
     expect(bit('VIEW_SSH_AUDIT')).toBe(1 << 30)
     expect(bit('RECORD_REMOTE_SCREEN')).toBe(2 ** 31)
+    expect(bit('HIVE_RUN')).toBe(2 ** 32)
   })
 
   it('withholds the fleet-access grants from the admin preset', () => {
@@ -88,6 +90,8 @@ describe('permission catalog', () => {
     expect(DEFAULT_ADMIN & (1 << 30)).not.toBe(0) // VIEW_SSH_AUDIT
     // FR-85 — a recording outlives the session: never in the admin preset.
     expect(maskHas(DEFAULT_ADMIN, 2 ** 31)).toBe(false) // RECORD_REMOTE_SCREEN
+    // FR-90 — an agent session runs commands on a device: an explicit grant.
+    expect(maskHas(DEFAULT_ADMIN, 2 ** 32)).toBe(false) // HIVE_RUN
   })
 
   it('a preset round-trip preserves every bit the preset claims to set', () => {

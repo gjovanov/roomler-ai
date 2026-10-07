@@ -30,6 +30,9 @@ members = [
     "crates/modules/fleet",
     "crates/modules/remote",
     "crates/modules/network",
+    # FR-90 — agent sessions, the server side: the session record and its
+    # lifecycle, never what is in a session.
+    "crates/modules/hive",
 
     "crates/api",
     "crates/tests",

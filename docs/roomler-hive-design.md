@@ -2,8 +2,8 @@
 
 *Design doc · v0.4 · 2026-10-07 · supersedes v0.3 (same day) and v0.2 (2026-09-03).
 Anchors are `path:line` on `origin/master` `d2dc0efa6`. Status: **design approved
-2026-10-07, tracked as [FR-90](fr/FR-90-hive-agent-sessions.md); nothing built yet**
-(§17). Decisions are in §0.1; the review that produced v0.3 is
+2026-10-07, tracked as [FR-90](fr/FR-90-hive-agent-sessions.md); being built — P0a (the device core)
+and P0b (the server module) are in, no device runs a session yet** (§17). Decisions are in §0.1; the review that produced v0.3 is
 [Appendix A](#appendix-a--review-of-v02).*
 
 > **What changed.** v0.2 kept Hive outside Roomler: a separate product behind a new
