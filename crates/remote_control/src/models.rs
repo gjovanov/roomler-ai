@@ -608,6 +608,22 @@ pub enum RpcCap {
     /// `ssh` would wait out its whole bound on every grant to such a device.
     /// Equality-matched, locked by test.
     SshGrantAck,
+    /// FR-90 — `rc:hive.start` / `rc:hive.stop`: the agent runs Hive agent
+    /// sessions — it answers a start with `rc:hive.start_ack` and reports
+    /// each session's lifecycle with `rc:hive.state`
+    /// (`docs/roomler-hive-design.md` §3.4).
+    ///
+    /// ⚠️ Never sent blind, for the `exec` reason: a caller waits for the
+    /// start's answer, and a pre-feature agent drops the unknown tag at
+    /// `debug!`. Advertising it says the frames are UNDERSTOOD — the device's
+    /// own `hive_enabled` (default off), `hive_accounts` and `hive_roots`
+    /// still decide whether anything runs.
+    ///
+    /// ⚠️ The design names `hive-replica` next (a replica that holds copies
+    /// of sessions). `hive` will be its prefix, and the two mean different
+    /// things — running sessions is not holding other people's — so matching
+    /// stays equality, as for `ssh` / `ssh-consent`.
+    Hive,
 }
 
 impl RpcCap {
@@ -628,11 +644,12 @@ impl RpcCap {
             Self::RelayServer => "relay-server",
             Self::KeyRotate => "key-rotate",
             Self::SshGrantAck => "ssh-grant-ack",
+            Self::Hive => "hive",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 9] = [
+    pub const ALL: [RpcCap; 10] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -642,6 +659,7 @@ impl RpcCap {
         Self::RelayServer,
         Self::KeyRotate,
         Self::SshGrantAck,
+        Self::Hive,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4368,6 +4386,7 @@ mod tests {
         assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
         assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
         assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
+        assert_eq!(RpcCap::Hive.wire(), "hive");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4575,6 +4594,29 @@ mod tests {
             ..Default::default()
         };
         assert!(acking.has_rpc(RpcCap::SshGrantAck));
+    }
+
+    /// FR-90 — `hive` is matched by equality, in both directions that will
+    /// matter: the replica verb the design names next must not read as "runs
+    /// sessions", and no existing verb reads as `hive`. A device that holds
+    /// copies of other people's sessions has not agreed to run them.
+    #[test]
+    fn hive_is_matched_by_equality() {
+        let runs = AgentCaps {
+            rpc: vec!["exec".into(), "hive".into()],
+            ..Default::default()
+        };
+        assert!(runs.has_rpc(RpcCap::Hive));
+
+        let replica_only = AgentCaps {
+            rpc: vec!["hive-replica".into(), "hives".into()],
+            ..Default::default()
+        };
+        assert!(
+            !replica_only.has_rpc(RpcCap::Hive),
+            "a verb that merely starts with `hive` must not read as `hive`"
+        );
+        assert!(RpcCap::from_wire("hive-replica").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
