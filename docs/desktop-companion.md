@@ -455,3 +455,48 @@ flowchart LR
 "hidden"`): timers are throttled to once a minute after a while and synthetic mouse presses
 are dropped. Script clicks through the page (`element.click()`) or run timing checks right
 after a reload.
+
+## 12. The session banner and the red frame (FR-27 P9)
+
+On macOS and Linux the companion IS the "Being viewed by …" indicator (Windows draws its own,
+in the daemon, `indicator/win.rs`). P9 gives it the Windows badge's manners:
+
+| | Behaviour | Where |
+|---|---|---|
+| Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:112`, `:331` |
+| Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:51` |
+| Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:47-49` |
+| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:239` |
+| Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
+| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:428` |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Shown: a session starts
+    Shown --> Hidden: pointer away 2.5 s<br/>(after the 4 s first show,<br/>nothing recording)
+    Hidden --> Shown: pointer rests at the top 1.2 s
+    Hidden --> Shown: a recording starts
+    Shown --> [*]: the session ends (banner and frame go)
+```
+
+The decision is a pure state machine (`Reveal::step`, `panels.rs:247`) fed every 120 ms by a
+watch thread; its six unit tests are the spec.
+
+⚠️ **On macOS `show()` makes a window KEY**, whatever `focused(false)` said when it was built.
+Every session's banner therefore took key status from the window the person was using, and
+their next click into it was spent making it key again and did nothing else (measured
+2026-10-06: the first click into roomler-desktop after each new session was lost). The banner
+is now brought up with `orderFrontRegardless` (`show_without_focus`, `panels.rs:347`), the way
+the native consent panel shows itself.
+
+⚠️ **The pointer cannot always be read** (a Wayland session keeps it to itself). Then the
+banner never hides: one that tucked itself away with no way back would be worse than one
+that stays.
+
+⚠️ **Both the banner and the frame appear in the captured stream on macOS.** Our capture is
+`CGDisplayStream`, which ignores `NSWindowSharingNone`; the flag is set anyway and becomes
+true the day capture moves to ScreenCaptureKit (FR-27's deviations). The controller sees a red
+frame round a Mac's screen during a session; that was the operator's call (2026-10-06).
+
+Kill switches, each on its own: `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (the banner stays, as
+before P9) and `ROOMLER_DESKTOP_FRAME=0` (no frame).
