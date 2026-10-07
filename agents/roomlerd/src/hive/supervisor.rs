@@ -67,7 +67,8 @@ const MAX_LINE: usize = 8 * 1024 * 1024;
 /// How long a stopped harness gets between SIGTERM and SIGKILL, and an
 /// exiting one before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
-/// How much of a failed harness's stderr its `ended` detail keeps.
+/// How much of a failed harness's stderr its transcript note keeps — on the
+/// device; the `ended` detail, which the server stores, never carries it.
 const STDERR_TAIL: usize = 400;
 
 /// What `rc:hive.start` asks for, as the supervisor uses it.
@@ -148,11 +149,12 @@ struct Report {
 
 /// How a harness is spawned. Production has exactly one way: as the account
 /// the device mapped the starter to. The other exists for the tests, which
-/// cannot become another account, and is unconstructible outside them.
+/// cannot become another account, and is unconstructible outside them — the
+/// unit tests, and an integration test built with `hive-test-launcher`.
 #[derive(Debug, Clone)]
 enum Launcher {
     AsMappedAccount,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hive-test-launcher"))]
     AsDaemon {
         home: PathBuf,
     },
@@ -204,6 +206,38 @@ pub fn init(cfg: &AgentConfig) {
         store,
     );
     let _ = SUPERVISOR.set(Arc::new(sup));
+}
+
+/// FR-90 P0f — an integration test's supervisor: sessions launch as the
+/// daemon's OWN account, because a test process cannot become another one;
+/// the store and the settings live where the test says.
+///
+/// ⚠️ Only with the `hive-test-launcher` feature, which no release build
+/// enables — and even then refused when the daemon is root, so this can
+/// never be how a session comes to run as root. One per process, like
+/// [`init`]: a test that needs it gets a test binary of its own.
+#[cfg(feature = "hive-test-launcher")]
+pub fn init_as_daemon(
+    cfg: &AgentConfig,
+    store: &Path,
+    runtime: &Path,
+    home: &Path,
+) -> Result<(), String> {
+    // SAFETY: geteuid reads our own credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("the test launcher never runs sessions as root".into());
+    }
+    let sup = Supervisor::new(
+        HiveConfig::from_agent(cfg),
+        runtime.to_path_buf(),
+        Launcher::AsDaemon {
+            home: home.to_path_buf(),
+        },
+        StoreHandle::spawn(Some(store)),
+    );
+    SUPERVISOR
+        .set(Arc::new(sup))
+        .map_err(|_| "a supervisor is already set up in this process".to_string())
 }
 
 /// The daemon's supervisor, once [`init`] ran.
@@ -765,7 +799,7 @@ impl Supervisor {
             Launcher::AsMappedAccount => {
                 crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "hive-test-launcher"))]
             Launcher::AsDaemon { home } => home.clone(),
         };
         let harness = resolve_harness(&self.cfg, &home).ok_or_else(|| {
@@ -827,7 +861,7 @@ impl Supervisor {
                 crate::exec::apply_run_as(&mut cmd, &crate::exec::RunAs::Named(account.to_string()))
                     .map_err(|e| (HiveRefusal::NoAccount, e))?
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "hive-test-launcher"))]
             Launcher::AsDaemon { .. } => {}
         }
         // The session's token, never the provider's key: good for this
@@ -1226,7 +1260,22 @@ async fn run(
             .unwrap_or_default(),
         None => String::new(),
     };
-    describe_end(stopped.as_deref(), status, &tail)
+    // What a harness writes is the session's own output — it can echo a
+    // prompt, a path, a tool's error — so its last words stay with the
+    // transcript, on the device. The server hears only HOW it ended (FR-90
+    // AC2; the canary test found this channel).
+    let clean = status.is_some_and(|s| s.success());
+    let said = stopped.is_none() && !clean && !tail.is_empty();
+    if said {
+        task.store.append(
+            &task.sid,
+            fence,
+            TranscriptEvent::Note {
+                text: format!("The harness's last words on stderr: {tail}"),
+            },
+        );
+    }
+    describe_end(stopped.as_deref(), status, said)
 }
 
 /// The last [`STDERR_TAIL`] characters a harness wrote to stderr, on one line.
@@ -1268,10 +1317,13 @@ async fn terminate(child: &mut Child) {
     }
 }
 
+/// The `ended` detail, which the SERVER stores and posts in the session's
+/// room: how the harness ended, never what it said — `said` only points at
+/// the transcript, where its last words are.
 fn describe_end(
     stopped: Option<&str>,
     status: Option<std::process::ExitStatus>,
-    stderr_tail: &str,
+    said: bool,
 ) -> String {
     use std::os::unix::process::ExitStatusExt;
     if let Some(reason) = stopped {
@@ -1283,9 +1335,8 @@ fn describe_end(
         Some((None, Some(sig))) => format!("the harness was killed by signal {sig}"),
         _ => "the harness ended".into(),
     };
-    if !stderr_tail.is_empty() {
-        detail.push_str(": ");
-        detail.push_str(stderr_tail);
+    if said {
+        detail.push_str("; its last words are in the transcript");
     }
     detail.chars().take(hive_limits::MAX_DETAIL_LEN).collect()
 }
@@ -1559,8 +1610,11 @@ done
         );
     }
 
+    /// The `ended` detail goes to the SERVER, so it says how the harness
+    /// ended and never what it wrote: its stderr can echo a prompt or a
+    /// tool's output. The words stay in the transcript, on the device (AC2).
     #[tokio::test]
-    async fn a_crash_ends_the_session_with_the_harness_s_words() {
+    async fn a_crash_ends_the_session_and_its_last_words_stay_on_the_device() {
         let mut r = rig(true, 4);
         let o = order(&r);
         let sid = o.session_id;
@@ -1580,8 +1634,25 @@ done
         };
         assert!(detail.contains("code 3"), "{detail}");
         assert!(
-            detail.contains("boom"),
-            "the stderr tail explains it: {detail}"
+            !detail.contains("boom"),
+            "what the harness wrote never reaches the server: {detail}"
+        );
+        assert!(
+            detail.contains("transcript"),
+            "the detail says where the words are: {detail}"
+        );
+        let notes: Vec<String> = r
+            .store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Note { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.contains("boom")),
+            "the stderr tail explains it, on the device: {notes:?}"
         );
     }
 
