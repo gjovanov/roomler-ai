@@ -76,6 +76,28 @@ describe('useCapabilitiesStore', () => {
     expect(store.version).toBe('0.4.70')
   })
 
+  /** FR-90 — a default-OFF module fails CLOSED: before the answer, and when
+   *  the request fails, a server that probably does not run it shows no link
+   *  to it. Present only once the server names it. */
+  it('keeps a default-off module hidden until the server names it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const store = useCapabilitiesStore()
+    expect(store.has('hive')).toBe(false)
+    expect(store.has('chat')).toBe(true)
+
+    mockApi.get.mockRejectedValueOnce(new Error('503'))
+    await store.load()
+    expect(store.failed).toBe(true)
+    // A failed answer is not a yes.
+    expect(store.has('hive')).toBe(false)
+
+    store.reset()
+    mockApi.get.mockResolvedValueOnce({ version: 'x', modules: ['chat', 'fleet', 'hive'] })
+    await store.load()
+    expect(store.has('hive')).toBe(true)
+    warn.mockRestore()
+  })
+
   it('ignores module names it does not know (a newer server)', async () => {
     mockApi.get.mockResolvedValueOnce({ version: 'x', modules: ['chat', 'holograms'] })
     const store = useCapabilitiesStore()
