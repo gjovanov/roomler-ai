@@ -3,7 +3,7 @@
 *Design doc · v0.4 · 2026-10-07 · supersedes v0.3 (same day) and v0.2 (2026-09-03).
 Anchors are `path:line` on `origin/master` `d2dc0efa6`. Status: **design approved
 2026-10-07, tracked as [FR-90](fr/FR-90-hive-agent-sessions.md); being built — P0a (the device core),
-P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server) are in, and P0d-3 (the UI) is built; nothing feeds a session from a browser yet** (§17). Decisions are in §0.1; the review that produced v0.3 is
+P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server) and P0d-3 (the UI) are in, and P0e (the model sidecar) is built; nothing feeds a session from a browser yet** (§17). Decisions are in §0.1; the review that produced v0.3 is
 [Appendix A](#appendix-a--review-of-v02).*
 
 > **What changed.** v0.2 kept Hive outside Roomler: a separate product behind a new
@@ -1418,6 +1418,14 @@ back; keep `x-claude-code-session-id` for attribution. Metering reads `usage` fr
 `cache_creation_input_tokens`, `cache_read_input_tokens`) into `llm_usage` and the turn
 stub's cost. Upstream TLS uses the OS trust store and the system proxy, so a
 TLS-inspecting corporate middlebox works the way the browser on that machine does.
+
+**As built (P0e):** the pass-through with the fence — one credential, from the device's
+`hive_api_key_helper`; no routes, metering or failover yet. A session token opens exactly
+`POST /v1/messages` and `POST /v1/messages/count_tokens`. `/v1/models` is left out, because
+Claude Code calls it only under `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`, which Hive
+doesn't set; so is everything else the key would open, because the Files API holds every
+session's uploads under that key and a batch runs on after its session and its fence. The
+FR-90 spec §3c has the table.
 
 ⚠️ **Routes are cache-affine.** Prompt caches are isolated per workspace on the Claude
 API, scoped to one model, and never shared across organizations. Round-robin across keys

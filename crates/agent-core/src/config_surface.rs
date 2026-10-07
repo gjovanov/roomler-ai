@@ -399,7 +399,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "string",
-        description: "FR-90 P0 - a command a session's Claude Code runs, as the mapped account, to print its API key (apiKeyHelper). A stop-gap until the device's loopback sidecar issues per-session tokens. Empty = none, and the session's model calls fail.",
+        description: "FR-90 - a command the DAEMON runs (as SYSTEM/root) to print the model API key. Sessions never see it: each gets a per-session token for the loopback model sidecar. Empty = no model credential, and sessions' model calls fail.",
     },
     KeyMeta {
         key: "ssh_enabled",
