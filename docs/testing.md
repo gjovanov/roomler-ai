@@ -42,7 +42,19 @@ Coverage areas: auth · tenant (+archive) · member · role · room/channel · m
 reaction · recording · file · invite · notification · oauth · billing ·
 multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · conference
 (+messages) · cluster · stats · relay-region · remote-control · agent
-(+e2e, +crash, +exec, +presence) · overlay · tunnel.
+(+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
+
+> [!NOTE]
+> **`tests/hive_canary.rs` is a second test binary, on purpose.** FR-90's
+> canary test (AC2) drives a real in-process device with the Hive supervisor
+> on, and that supervisor is process-global. In the lib's binary every other
+> in-process agent would re-point it at its own socket. `cargo test -p
+> roomler-ai-tests` runs both binaries, and the lane's count sums them. The
+> test is Linux-only and turns on `roomlerd`'s `hive-test-launcher` feature
+> through a Linux-only dev-dependency. That feature launches sessions as the
+> test's own account and refuses to run as root. Its log checks run under a
+> thread-default subscriber around a current-thread runtime, so they see
+> every task of the server and the device without `RUST_LOG`.
 
 ## Frontend tests
 
