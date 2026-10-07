@@ -35,6 +35,7 @@
 
 mod framing;
 pub mod gates;
+mod sidecar;
 mod store;
 mod supervisor;
 pub mod view;

@@ -46,6 +46,11 @@ roomler-cli = { path = "../roomler-cli" }
 # FR-90 — Hive's device core (transcript chain, stream-json adapter, replica
 # store, launch spec). Only the `hive` feature links it, and with it SQLite.
 roomler-hive-node = { path = "../../crates/hive-node", optional = true }
+# FR-90 P0e — the loopback model sidecar's HTTP/1.1 server (already in the
+# tree through reqwest, which makes the upstream call).
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 # Async + networking
 tokio = { workspace = true }
@@ -604,7 +609,7 @@ uinput-input = []
 # ⚠️ Deliberately NOT in `full`: no release build compiles it until the P0
 # field cell has run, and even compiled, every gate is closed by default
 # (`hive_enabled = false`, an empty account map, empty roots = nowhere).
-hive = ["dep:roomler-hive-node"]
+hive = ["dep:roomler-hive-node", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # Everything needed for a full remote-control session, software only.
 full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
 # Everything needed including the MF hardware encoder. Production
