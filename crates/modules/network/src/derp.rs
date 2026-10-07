@@ -378,7 +378,16 @@ pub async fn derp_upgrade(
     // Checked BEFORE the upgrade: refusing the handshake is a clean signal,
     // whereas accepting and then dropping looks like a network fault to a
     // client that marks its mux "up" on send.
-    match state.fleet.agents.find_in_tenant(tenant_id, agent_id).await {
+    //
+    // ANY, not live (#1821): the tombstone is what this read is for — a
+    // removed device is refused with its REASON in the log, and the `Err` arm
+    // keeps meaning "the row could not be read", which is a different fault.
+    match state
+        .fleet
+        .agents
+        .find_any_in_tenant(tenant_id, agent_id)
+        .await
+    {
         Ok(agent) => {
             if let Some(reason) = roomler_ai_mod_fleet::auth_agent::refusal_reason(&agent) {
                 info!(%agent_id, %tenant_id, reason, "derp: REFUSED before upgrade");
