@@ -10,8 +10,11 @@
 //!   coexist with an `sshd` that already holds `0.0.0.0:22`.
 //! * **P2 — this file's server.** russh over that stream: publickey auth
 //!   against [`ssh_authorized_keys`], and an `exec` channel routed through the
-//!   daemon's existing [`crate::exec`] engine. PTY, SFTP and forwarding are
-//!   refused with an explicit reason rather than left to hang.
+//!   daemon's existing [`crate::exec`] engine — since FR-89 its streaming
+//!   variant, so output flows as it is produced with no ceiling and the
+//!   channel owns the command's lifetime. PTY, SFTP and forwarding came later
+//!   (P4, P7); anything else is refused with an explicit reason rather than
+//!   left to hang.
 //! * **P3a — the device half of authorization.** `rc:ssh.grant` carries a
 //!   server-minted, single-use, short-lived authorization naming a roomler
 //!   principal and an ephemeral public key; [`record_grant`] holds it and
@@ -485,6 +488,12 @@ mod sshd {
         /// Refuses rather than queues, matching `exec`: a forward that opens
         /// two minutes late is worse than one that fails now and says so.
         pub forwards: Arc<tokio::sync::Semaphore>,
+        /// FR-89 — `ssh_exec_streaming`: a one-shot command's output goes to
+        /// the channel as it is produced, with no ceiling and no wall clock
+        /// (the default), or — the kill switch — through the engine's
+        /// buffered path with its 1 MiB ceiling and 300 s limit, exactly as
+        /// before FR-89.
+        pub exec_streaming: bool,
     }
 
     /// Process-wide ceiling on live `direct-tcpip` channels. Generous enough
@@ -579,6 +588,7 @@ mod sshd {
                 authorized_keys = authorized.len(),
                 key_list_run_as = key_list_run_as.as_ref().map(|r| r.label()).unwrap_or_else(|_| "unset".into()),
                 %deny_daemon_grants,
+                exec_streaming = cfg.ssh_exec_streaming,
                 "ssh: server ready"
             );
             Some(Arc::new(Self {
@@ -589,6 +599,7 @@ mod sshd {
                 services,
                 forward_acl: cfg.forward_acl.clone(),
                 forwards: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FORWARDS)),
+                exec_streaming: cfg.ssh_exec_streaming,
             }))
         }
     }
@@ -781,6 +792,14 @@ mod sshd {
         channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of the live terminal.
         pty_handle: Option<crate::pty::PtyHandle>,
+        /// FR-89 — one abort per exec channel, fired when the client closes
+        /// that channel ([`channel_close`](russh::server::Handler::channel_close))
+        /// or when the session ends (`Drop`). A streamed command has no wall
+        /// clock, so THIS is what ends one whose reader has gone; a token
+        /// cancels synchronously, which is what `Drop` needs. Minted before
+        /// the consent wait, so a channel closed during the prompt leaves
+        /// nothing to run (the engine checks it before spawning).
+        exec_aborts: std::collections::HashMap<ChannelId, tokio_util::sync::CancellationToken>,
         /// FR-55 — holds the machine awake for as long as this session lives.
         ///
         /// A field rather than a call pair, for the same reason `Drop` below
@@ -807,6 +826,7 @@ mod sshd {
                 pty_req: None,
                 channel_input: None,
                 pty_handle: None,
+                exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
             }
         }
@@ -818,8 +838,10 @@ mod sshd {
         ///
         /// Disconnecting is the whole enforcement: the pty pump's writes then
         /// fail, which drops the terminal and kills its process group, and an
-        /// exec still in flight is bounded by the engine's own wall-clock
-        /// ceiling. Key-list sessions have no deadline (see
+        /// exec still in flight is cancelled by the handler's `Drop` (FR-89 —
+        /// a streamed command has no wall clock of its own; the buffered
+        /// kill-switch path is additionally bounded by the engine's).
+        /// Key-list sessions have no deadline (see
         /// [`ResolvedSessionPolicy::from_key_list`]) and never arm this.
         /// Report one P8 activity event for this session, if the device opted
         /// in AND the session has resolved a policy.
@@ -902,10 +924,14 @@ mod sshd {
             };
 
             // Windows can only spawn as another user through
-            // `CreateProcessAsUserW`, and the streaming variant of that lives
-            // in the pty module's pseudoconsole path — it has no pipes form
-            // yet. Refusing is the honest answer; silently running the
-            // transfer as SYSTEM would be the dangerous one.
+            // `CreateProcessAsUserW`. Its piped, streaming form exists —
+            // `exec`'s console-user path uses it, and since FR-89 it streams
+            // — but this subsystem spawns `sftp-server` through
+            // `tokio::process`, which cannot take a token, and is not wired
+            // to that spawn yet (FR-89, open decision 3). Refusing is the
+            // honest answer; silently running the transfer as SYSTEM would be
+            // the dangerous one. `ssh <node> 'cat f' > f` streams a file whole
+            // in the meantime.
             #[cfg(windows)]
             if !matches!(run_as, crate::exec::RunAs::Daemon) {
                 return refuse(
@@ -914,8 +940,9 @@ mod sshd {
                     self.peer,
                     "sftp",
                     "file transfer as the signed-in user is not supported on Windows yet \
-                     (it needs a piped CreateProcessAsUserW). Interactive shells and \
-                     commands work; scp/sftp here would otherwise run as SYSTEM, which \
+                     (the sftp subsystem is not wired to the piped CreateProcessAsUserW \
+                     spawn). Interactive shells and commands work — `ssh <node> 'cat f' > f` \
+                     streams a file whole; scp/sftp here would otherwise run as SYSTEM, which \
                      is why this refuses instead.",
                 );
             }
@@ -1232,9 +1259,19 @@ mod sshd {
     /// Reporting is `try_send`, so this is safe in a destructor: no await, no
     /// runtime needed, and a full queue drops the line rather than blocking
     /// teardown.
+    ///
+    /// FR-89 — the same event ends every exec the session still has running:
+    /// a client that disconnected (or whose carrier died, or whose grant
+    /// reached its time limit) no longer has a channel the output could go
+    /// to, and a streamed command has no wall clock that would end it
+    /// otherwise. Cancelling a token is synchronous, so this needs no
+    /// runtime either.
     impl Drop for Handler {
         fn drop(&mut self) {
             self.report(SshActivityKind::SessionClose, None, None, true);
+            for (_, abort) in self.exec_aborts.drain() {
+                abort.cancel();
+            }
         }
     }
 
@@ -1493,13 +1530,25 @@ mod sshd {
             // arrive while consent is pending wait here; a refusal drops them.
             let (tx, stdin) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             self.channel_input = Some(tx);
-            tokio::spawn(async move {
-                run_exec(
-                    handle, channel, command, caller, run_as, consent, broker, indicator, activity,
-                    stdin,
-                )
-                .await;
-            });
+            // FR-89 — minted HERE, before the consent wait, so a channel that
+            // closes while the operator is being asked leaves nothing to run.
+            let abort = tokio_util::sync::CancellationToken::new();
+            self.exec_aborts.insert(channel, abort.clone());
+            let job = ExecJob {
+                handle,
+                channel,
+                command,
+                caller,
+                run_as,
+                consent,
+                broker,
+                indicator,
+                activity,
+                stdin,
+                abort,
+                streaming: self.ctx.exec_streaming,
+            };
+            tokio::spawn(run_exec(job));
             Ok(())
         }
 
@@ -1608,6 +1657,23 @@ mod sshd {
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
             self.channel_input = None;
+            Ok(())
+        }
+
+        /// The client closed the channel (FR-89). A command still running on
+        /// it has nowhere to write to — russh accepts and DISCARDS data for a
+        /// closed channel, so the pump cannot tell — and no wall clock would
+        /// end it, so it is ended here: the abort kills the process tree.
+        /// A channel whose command already finished has a token that fires
+        /// into nothing.
+        async fn channel_close(
+            &mut self,
+            channel: ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(abort) = self.exec_aborts.remove(&channel) {
+                abort.cancel();
+            }
             Ok(())
         }
 
@@ -1860,43 +1926,80 @@ mod sshd {
         })
     }
 
-    /// Run one command through the daemon's existing execution engine and
-    /// stream the result back over the channel.
-    ///
-    /// Deliberately NOT a fresh `Command::spawn`: [`crate::exec`] already owns
-    /// the wall-clock timeout, the output ceiling, the per-device concurrency
-    /// cap, secret redaction, and process-tree kill on timeout or cancel. An
-    /// SSH transport is not a reason to re-implement any of that, and every
-    /// bound it enforces is one the device owner already reasoned about for
-    /// Fleet RPC.
-    ///
-    /// The cost is that output is delivered when the command finishes rather
-    /// than as it is produced — the engine buffers to enforce its ceiling.
-    /// P4's PTY path is what makes long-running output live.
-    ///
-    /// `stdin` is the client's stdin, fed to the command in order and closed
-    /// at the client's EOF. So a command that reads stdin waits for it, as
-    /// under OpenSSH. Because the output is buffered, a command that PROMPTS
-    /// waits for an answer to a question the caller cannot see: `ssh -n` is
-    /// the answer for commands that must not read stdin.
-    // 9 params: each is a distinct decision resolved at authentication
-    // (identity, consent, bound, reporting, the client's input) and bundling
-    // them into a struct would only move the same fields behind a name that
-    // hides which of them a reader must check.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_exec(
+    /// Everything [`run_exec`] needs. Each field is a distinct decision —
+    /// resolved at authentication (identity, consent, reporting) or in
+    /// `exec_request` (the client's input, the abort, the device's streaming
+    /// switch) — named so a reader can see which of them a path must check;
+    /// nothing here is derived from anything the client said.
+    struct ExecJob {
         handle: russh::server::Handle,
         channel: ChannelId,
         command: String,
         caller: String,
         run_as: crate::exec::RunAs,
+        /// The consent sentinel to prompt on; `None` = no prompt.
         consent: Option<String>,
         broker: crate::consent::ConsentBroker,
         indicator: crate::indicator::ViewerIndicator,
+        /// The P8 sink and the grant to attribute the report to.
         activity: Option<(ActivitySink, Option<String>)>,
         stdin: crate::exec::StdinFeed,
-    ) {
+        /// FR-89 — fired when the channel closes or the session ends.
+        abort: tokio_util::sync::CancellationToken,
+        /// FR-89 — the device's `ssh_exec_streaming`.
+        streaming: bool,
+    }
+
+    /// What a run came to, whichever path ran it.
+    struct Finished {
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        /// Bytes that reached the channel, both streams.
+        bytes: u64,
+        error: Option<String>,
+    }
+
+    /// Chunks waiting between the engine's redaction stage and the channel.
+    /// Small on purpose: the whole point of streaming is that a slow client
+    /// stops the command rather than filling the daemon (FR-89 D1).
+    const SINK_QUEUE: usize = 8;
+
+    /// Run one command through the daemon's existing execution engine and
+    /// stream the result back over the channel.
+    ///
+    /// Deliberately NOT a fresh `Command::spawn`: [`crate::exec`] already owns
+    /// the identity model, the per-device concurrency cap, secret redaction,
+    /// and process-tree kill. An SSH transport is not a reason to re-implement
+    /// any of that.
+    ///
+    /// FR-89: the default path is the engine's **streaming** variant —
+    /// output goes to the channel as it is produced, with no ceiling and no
+    /// wall clock; what ends the command is the channel (`abort`). The
+    /// buffered variant, with the engine's 1 MiB ceiling and 300 s limit,
+    /// stays whole behind `ssh_exec_streaming = false`.
+    ///
+    /// `stdin` is the client's stdin, fed to the command in order and closed
+    /// at the client's EOF. So a command that reads stdin waits for it, as
+    /// under OpenSSH — and because the output streams, a command that
+    /// PROMPTS now shows its prompt. `ssh -n` is still the answer for
+    /// commands that must not read stdin.
+    async fn run_exec(job: ExecJob) {
         use roomler_ai_remote_control::models::exec_limits;
+
+        let ExecJob {
+            handle,
+            channel,
+            command,
+            caller,
+            run_as,
+            consent,
+            broker,
+            indicator,
+            activity,
+            stdin,
+            abort,
+            streaming,
+        } = job;
 
         // Ask BEFORE anything runs, and refuse rather than fall through. The
         // prompt is deliberately here and not at grant-arrival time: the server
@@ -1922,6 +2025,19 @@ mod sshd {
             return;
         }
 
+        // FR-89 — the channel closed while the operator was being asked. The
+        // consent prompt ran its course (its own teardown is one place, and
+        // stays so); what must not happen is the command starting now, as
+        // SYSTEM/root, for a reader that left. The engine checks the token
+        // again before it spawns; this check just spares the log a run that
+        // was never going to deliver anything.
+        if abort.is_cancelled() {
+            info!(%caller, "ssh: the channel closed before the command started — not running it");
+            let _ = handle.exit_status_request(channel, 1).await;
+            let _ = handle.close(channel).await;
+            return;
+        }
+
         let request_id = format!("ssh-{:016x}", rand::random::<u64>());
         let identity = run_as.label();
         let privileged = run_as.is_privileged();
@@ -1930,12 +2046,139 @@ mod sshd {
             // Empty = the host's own default shell, matching `roomler exec`.
             shell: String::new(),
             command: command.clone(),
+            // Read by the buffered path only; the streamed path has no wall
+            // clock and no ceiling (FR-89 D4).
             timeout_ms: exec_limits::MAX_TIMEOUT_MS,
             max_output_bytes: exec_limits::MAX_OUTPUT_BYTES,
             cwd: None,
             caller: caller.clone(),
             run_as,
         };
+
+        let finished = if streaming {
+            stream_to_channel(&handle, channel, req, stdin, abort).await
+        } else {
+            buffer_to_channel(&handle, channel, req, stdin).await
+        };
+
+        // A run that never reached a process still has to say so on stderr:
+        // an empty stream plus exit 0 would read as "the command succeeded and
+        // printed nothing", which is the opposite of what happened.
+        if let Some(err) = &finished.error {
+            let _ = handle
+                .extended_data(channel, 1, format!("roomler-ssh: {err}\r\n").into_bytes())
+                .await;
+        }
+
+        // SSH carries an unsigned status, so anything that is not a clean
+        // 0..=255 has to be mapped — and it must map to FAILURE. Clamping
+        // instead would turn a negative code (a signal-encoded exit) into 0,
+        // reporting success for a process that was killed. `None` means the
+        // command never ran at all (refused, timed out, cancelled); 1 is the
+        // conventional shell answer for both.
+        let status = match finished.exit_code {
+            Some(c) if (0..=255).contains(&c) => c as u32,
+            _ => 1,
+        };
+        let _ = handle.exit_status_request(channel, status).await;
+        let _ = handle.eof(channel).await;
+        let _ = handle.close(channel).await;
+
+        // `privileged` is on the line on purpose: "who ran this, and was it as
+        // root?" is the question anyone reading these logs after an incident
+        // is actually asking, and it should not require joining against the
+        // device's policy to answer.
+        info!(
+            %caller, run_as = %identity, privileged,
+            exit = status, duration_ms = finished.duration_ms,
+            bytes = finished.bytes, streamed = streaming,
+            "ssh: exec finished"
+        );
+
+        // P8 — reported AFTER the run, so the row carries the real exit code
+        // rather than "a command was accepted". The command text is the only
+        // thing recorded; its OUTPUT stays on this host, which is the whole
+        // distinction this feature is built around.
+        if let Some((sink, grant_id)) = activity {
+            sink.report(
+                grant_id,
+                &caller,
+                SshActivityKind::Exec,
+                Some(command),
+                finished.exit_code,
+                true,
+            );
+        }
+    }
+
+    /// FR-89 — the streamed path: a pump task moves redacted chunks from the
+    /// engine's sink onto the channel as they come, and the engine run is
+    /// awaited beside it. The pump ends when the sink closes, which the
+    /// engine does only after the last chunk, so by the time this returns
+    /// everything the command wrote has been handed to russh — the exit
+    /// status the caller sends next cannot overtake the output.
+    ///
+    /// Backpressure is the chain of bounded queues (`docs/roomler-ssh.md`
+    /// §3): `handle.data` blocks while the client's window is spent, the sink
+    /// fills, the engine's readers stop, the pipe fills, the child blocks.
+    async fn stream_to_channel(
+        handle: &russh::server::Handle,
+        channel: ChannelId,
+        req: crate::exec::ExecRequest,
+        stdin: crate::exec::StdinFeed,
+        abort: tokio_util::sync::CancellationToken,
+    ) -> Finished {
+        use crate::exec::{Chunk, OutStream};
+
+        let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(SINK_QUEUE);
+        let pump_handle = handle.clone();
+        let pump_abort = abort.clone();
+        let pump = tokio::spawn(async move {
+            let mut delivered = 0u64;
+            while let Some(chunk) = chunks.recv().await {
+                let n = chunk.bytes.len() as u64;
+                let sent = match chunk.stream {
+                    OutStream::Stdout => pump_handle.data(channel, chunk.bytes).await.is_ok(),
+                    OutStream::Stderr => pump_handle
+                        .extended_data(channel, 1, chunk.bytes)
+                        .await
+                        .is_ok(),
+                };
+                if !sent {
+                    // The SESSION is gone (a closed channel still accepts and
+                    // discards — `channel_close` covers that one). Nothing can
+                    // be delivered any more, so end the command rather than
+                    // let it run on for nobody.
+                    pump_abort.cancel();
+                    break;
+                }
+                delivered += n;
+            }
+            delivered
+        });
+
+        let outcome = crate::exec::shared()
+            .run_streamed(req, &crate::exec::redactor(), Some(stdin), sink, abort)
+            .await;
+        let delivered = pump.await.unwrap_or(0);
+        Finished {
+            exit_code: outcome.exit_code,
+            duration_ms: outcome.duration_ms,
+            bytes: delivered,
+            error: outcome.error,
+        }
+    }
+
+    /// The pre-FR-89 path, kept whole behind `ssh_exec_streaming = false`:
+    /// the engine's wall clock and ceiling, the output after the run, and a
+    /// notice when the ceiling cut it.
+    async fn buffer_to_channel(
+        handle: &russh::server::Handle,
+        channel: ChannelId,
+        req: crate::exec::ExecRequest,
+        stdin: crate::exec::StdinFeed,
+    ) -> Finished {
+        use roomler_ai_remote_control::models::exec_limits;
 
         let outcome = crate::exec::shared()
             .run_fed(req, &crate::exec::redactor(), Some(stdin))
@@ -1962,60 +2205,18 @@ mod sshd {
                     channel,
                     1,
                     format!(
-                        "roomler-ssh: output stopped at {} bytes, the exec ceiling. Copy files with scp or sftp, which stream them whole.\r\n",
+                        "roomler-ssh: output stopped at {} bytes, the exec ceiling (ssh_exec_streaming is off on this device). Copy files with scp or sftp, which stream them whole.\r\n",
                         exec_limits::MAX_OUTPUT_BYTES
                     )
                     .into_bytes(),
                 )
                 .await;
         }
-        // A run that never reached a process still has to say so on stderr:
-        // an empty stream plus exit 0 would read as "the command succeeded and
-        // printed nothing", which is the opposite of what happened.
-        if let Some(err) = &outcome.error {
-            let _ = handle
-                .extended_data(channel, 1, format!("roomler-ssh: {err}\r\n").into_bytes())
-                .await;
-        }
-
-        // SSH carries an unsigned status, so anything that is not a clean
-        // 0..=255 has to be mapped — and it must map to FAILURE. Clamping
-        // instead would turn a negative code (a signal-encoded exit) into 0,
-        // reporting success for a process that was killed. `None` means the
-        // command never ran at all (refused, timed out, cancelled); 1 is the
-        // conventional shell answer for both.
-        let status = match outcome.exit_code {
-            Some(c) if (0..=255).contains(&c) => c as u32,
-            _ => 1,
-        };
-        let _ = handle.exit_status_request(channel, status).await;
-        let _ = handle.eof(channel).await;
-        let _ = handle.close(channel).await;
-
-        // `privileged` is on the line on purpose: "who ran this, and was it as
-        // root?" is the question anyone reading these logs after an incident
-        // is actually asking, and it should not require joining against the
-        // device's policy to answer.
-        info!(
-            %caller, run_as = %identity, privileged,
-            exit = status, duration_ms = outcome.duration_ms,
-            bytes = outcome.output_bytes(), truncated = outcome.truncated,
-            "ssh: exec finished"
-        );
-
-        // P8 — reported AFTER the run, so the row carries the real exit code
-        // rather than "a command was accepted". The command text is the only
-        // thing recorded; its OUTPUT stays on this host, which is the whole
-        // distinction this feature is built around.
-        if let Some((sink, grant_id)) = activity {
-            sink.report(
-                grant_id,
-                &caller,
-                SshActivityKind::Exec,
-                Some(command),
-                outcome.exit_code,
-                true,
-            );
+        Finished {
+            exit_code: outcome.exit_code,
+            duration_ms: outcome.duration_ms,
+            bytes: outcome.output_bytes(),
+            error: outcome.error,
         }
     }
 }
@@ -2655,6 +2856,7 @@ mod tests {
     /// the daemon's real exec engine and gets its output and exit status.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_authorized_key_runs_a_command_and_gets_its_output() {
+        let _slot = exec_slot().await;
         let (key, line) = client_key(4);
         // `daemon` is stated explicitly. It used to be what an unset mode
         // silently produced, and this test passing without naming it was how
@@ -2692,6 +2894,7 @@ mod tests {
     /// and an empty file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_clients_stdin_reaches_an_execd_command() {
+        let _slot = exec_slot().await;
         let (key, line) = client_key(44);
         let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
         let session = connect(addr, key).await;
@@ -2723,6 +2926,96 @@ mod tests {
             "the client's stdin never reached the command: stdout {stdout:?}"
         );
         assert_eq!(exit, Some(0));
+    }
+
+    /// A command that emits `bytes` bytes of output in ONE fast operation —
+    /// far past the exec engine's 1 MiB ceiling. One operation rather than a
+    /// shell loop on purpose: these run against the process-wide
+    /// `exec::shared()` engine, whose 4-permit cap the whole SSH suite
+    /// competes for, and a slow command holds its permit long enough to
+    /// starve the others. A single write also arrives as one long
+    /// whitespace-free run, which exercises the redactor's force-settle path.
+    fn big_output(bytes: usize) -> String {
+        if cfg!(windows) {
+            format!("[Console]::Out.Write('x' * {bytes})")
+        } else {
+            format!("head -c {bytes} /dev/zero | tr '\\0' x")
+        }
+    }
+
+    /// Drive a command over a real SSH connection and return
+    /// `(stdout_len, stderr_text, exit)`.
+    async fn run_over_ssh(
+        cfg: &crate::config::AgentConfig,
+        key: PrivateKey,
+        cmd: &str,
+    ) -> (usize, String, Option<u32>) {
+        let _slot = exec_slot().await;
+        let addr = serve_one(cfg).await;
+        let session = connect(addr, key).await;
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, cmd).await.unwrap();
+        let mut stdout_len = 0usize;
+        let mut stderr = Vec::new();
+        let mut exit = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => stdout_len += data.len(),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    stderr.extend_from_slice(data)
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+        (
+            stdout_len,
+            String::from_utf8_lossy(&stderr).into_owned(),
+            exit,
+        )
+    }
+
+    /// AC1 — a command whose output is far larger than the engine's 1 MiB
+    /// ceiling arrives WHOLE, with exit 0 and no ceiling notice: the streamed
+    /// path (the default) has no ceiling. This is the file `ssh <node> cat
+    /// bigfile > f` could not move before FR-89.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_command_output_streams_whole() {
+        let (key, line) = client_key(60);
+        let (stdout_len, stderr, exit) = run_over_ssh(
+            &cfg_with_mode(vec![line], Some("daemon")),
+            key,
+            &big_output(1_500_000),
+        )
+        .await;
+        assert_eq!(exit, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout_len > 1024 * 1024,
+            "streamed output was capped at {stdout_len} bytes — the ceiling was not lifted"
+        );
+        assert!(
+            !stderr.contains("ceiling"),
+            "a streamed run must not announce a ceiling it does not have: {stderr:?}"
+        );
+    }
+
+    /// AC9 — the kill switch restores the pre-FR-89 behaviour exactly: the
+    /// same large command, with `ssh_exec_streaming = false`, is capped at
+    /// 1 MiB and says so on stderr.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_kill_switch_restores_the_buffered_ceiling() {
+        let (key, line) = client_key(61);
+        let mut cfg = cfg_with_mode(vec![line], Some("daemon"));
+        cfg.ssh_exec_streaming = false;
+        let (stdout_len, stderr, _exit) = run_over_ssh(&cfg, key, &big_output(1_500_000)).await;
+        assert!(
+            stdout_len <= 1024 * 1024,
+            "the buffered path must cap at 1 MiB, got {stdout_len} bytes"
+        );
+        assert!(
+            stderr.contains("exec ceiling"),
+            "hitting the ceiling must be announced on stderr: {stderr:?}"
+        );
     }
 
     /// A refused request must say why. `scp` turning into a silent hang is the
@@ -2827,6 +3120,30 @@ mod tests {
         guard
     }
 
+    /// The SSH server runs commands through the PROCESS-WIDE exec engine
+    /// (`crate::exec::shared()`), whose per-device cap —
+    /// `exec_limits::MAX_CONCURRENT_PER_AGENT`, 4 — is a product invariant,
+    /// not a test knob. `cargo test` runs this whole suite in one process on
+    /// many threads, so every test that actually runs a command holds one of
+    /// exactly that many slots for its duration: the suite can then never
+    /// have more commands in flight than the engine admits. Without this a
+    /// fifth overlapping test is refused with "device is already running 4
+    /// commands" and reads as a product bug — measured 2026-10-07 as two
+    /// grant tests, then the kill-switch test, each failing on an empty
+    /// stdout while passing serialized.
+    static EXEC_TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
+        roomler_ai_remote_control::models::exec_limits::MAX_CONCURRENT_PER_AGENT,
+    );
+
+    /// Hold a slot for the life of a test that runs a command. Taken AFTER
+    /// [`grant_test`] wherever both apply, so there is exactly one lock order.
+    async fn exec_slot() -> tokio::sync::SemaphorePermit<'static> {
+        EXEC_TEST_SLOTS
+            .acquire()
+            .await
+            .expect("the slot semaphore is never closed")
+    }
+
     fn now_ms() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
@@ -2876,6 +3193,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_grant_admits_its_key_exactly_once() {
         let _lock = grant_test().await;
+        let _slot = exec_slot().await;
         let (key, line) = client_key(10);
         // The device-owned list is EMPTY: this proves the grant alone let the
         // session in.
@@ -3235,6 +3553,8 @@ mod tests {
     ) -> (String, String, Option<u32>, bool) {
         use roomler_ai_remote_control::models::ConsentMode;
 
+        // The callers hold `grant_test()` already; the slot comes second.
+        let _slot = exec_slot().await;
         let (key, line) = client_key(key_seed);
         let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
         let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();

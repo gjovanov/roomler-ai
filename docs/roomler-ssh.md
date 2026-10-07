@@ -108,28 +108,30 @@ can be pinned out of band.
 ## 3. What a session can do today
 
 - `ssh <node> <command>` — routed through the daemon's existing
-  [`exec`](fleet-rpc.md) engine, so it inherits the wall-clock timeout, the
-  output ceiling, the per-device concurrency cap, secret redaction and
-  process-tree kill. An SSH transport is not a reason to reimplement any of
-  that. The cost: output arrives when the command finishes rather than
-  streaming, because the engine buffers to enforce its ceiling.
+  [`exec`](fleet-rpc.md) engine's **streaming variant** (FR-89): stdout and
+  stderr reach the client **as the command produces them**, with **no output
+  ceiling and no wall-clock timeout** — the command lives exactly as long as
+  the channel does. It keeps everything of the engine that is not about
+  buffering: the `RunAs` identity model, operator consent, the per-device
+  concurrency cap, secret redaction (now over the stream), process-tree kill,
+  and the client's stdin. The mechanics, the lifetime table and the kill
+  switch are in [One-shot commands stream](#one-shot-commands-stream-fr-89)
+  below.
   **The output is byte-exact**: `ssh <node> cat f > f` lands the file as it
-  is on the device, and redaction masks only text inside it
-  (`Redactor::apply_bytes`). ⚠️ Until 2026-10-06 the output was decoded to
-  text first, so every byte that is not UTF-8 arrived as U+FFFD: a 4.4 MB MP4
-  came back as 1.9 MB of noise.
-  ⚠️ **Past the ceiling (1 MiB) the output stops and stderr says so.** The
-  command is cut off mid-write (on macOS it died of SIGPIPE and `ssh` exited
-  1). Copy files with `scp` or `sftp` (below), which stream them whole; before
-  the notice the cut-off read as a corrupt transfer.
+  is on the device, and redaction masks only text inside it. ⚠️ Until
+  2026-10-06 the output was decoded to text first, so every byte that is not
+  UTF-8 arrived as U+FFFD: a 4.4 MB MP4 came back as 1.9 MB of noise. ⚠️ And
+  until FR-89 it was **capped at 1 MiB** (the engine's Fleet-RPC ceiling): the
+  command was cut off mid-write, died of SIGPIPE, and `ssh` exited 1 — on the
+  `console_user` corporate laptops, where `scp`/`sftp` refuse, nothing could
+  move a file over 1 MiB.
   **The client's stdin reaches the command** ([#1747](https://github.com/gjovanov/roomler-ai/issues/1747)):
   `ssh <node> 'cat > f' < file`, `tar c . | ssh <node> 'tar x'` and
   `ssh <node> 'sh -s' < script` work, and the client's EOF ends the input.
   ⚠️ Until #1747 the command read NUL and the bytes were dropped without a
   word, so the first of those wrote an empty file and exited 0.
-  ⚠️ Because the output is buffered, a command that **prompts** waits for an
-  answer to a question you cannot see. Pass `-n` (stdin from `/dev/null`) to
-  a command that must not read stdin, or use a terminal session.
+  A command that **prompts** now shows its prompt (the output streams); pass
+  `-n` (stdin from `/dev/null`) to a command that must not read stdin.
   ⚠️ `ssh -vv` prints `read failed … Broken pipe` at the end of piped stdin.
   That is this OpenSSH client's normal EOF, not a fault: it shows up just the
   same against a stock `sshd`, and it sent #1747's diagnosis the wrong way once.
@@ -145,6 +147,91 @@ can be pinned out of band.
 - **`ssh -R` is not implemented** and is refused by russh's own default,
   promptly and cleanly. That is a decision, not a gap — see P7b below.
 
+### One-shot commands stream (FR-89)
+
+Spec: [`docs/fr/FR-89-ssh-exec-streaming.md`](fr/FR-89-ssh-exec-streaming.md) ·
+[#1826](https://github.com/gjovanov/roomler-ai/issues/1826).
+
+Before FR-89, `ssh <node> 'cmd'` was handed to the Fleet-RPC engine's one
+bounded run (`ExecEngine::run_fed`): the whole output was collected against a
+1 MiB ceiling and sent when the process ended, under a 300 s wall clock.
+Correct for `roomler exec`, whose answer is one persisted audit row; wrong for
+a byte stream. The engine now has a second entry point beside it,
+`ExecEngine::run_streamed` (`agents/roomlerd/src/exec.rs`), and the SSH server
+uses that one (`ssh.rs` `stream_to_channel`):
+
+```mermaid
+flowchart LR
+    C[child process] -->|stdout pipe| R1[reader, 32 KiB reads]
+    C -->|stderr pipe| R2[reader, 32 KiB reads]
+    R1 -->|raw chunks, bounded 4| S[redaction stage<br/>one StreamRedactor per stream]
+    R2 -->|raw chunks, bounded 4| S
+    S -->|sink, bounded 8| P[ssh pump]
+    P -->|handle.data / extended_data| W[russh session<br/>window-blocked ⇒ handle not polled]
+    W -->|CHANNEL_DATA| K[client]
+```
+
+**Backpressure reaches the child.** `russh::server::Handle::data` is an
+`await` on a bounded channel that the session loop stops polling while any
+channel has window-blocked data. So: the client's window fills → the pump
+blocks → the sink (8) fills → the stage blocks → the raw queue (4) fills → the
+readers stop reading → the OS pipe fills → **the child blocks on `write`**. The
+daemon holds at most ~13 chunks plus two small carries (≈ 0.5 MiB) per command,
+however slow the client — `ssh <node> 'cat big' | (sleep 30; wc -c)` parks the
+command for 30 s and then delivers everything. ⚠️ That is also why a client
+that stops reading does **not** end the command: it costs nothing, and it is
+exactly what OpenSSH does.
+
+**What ends a command.** There is no wall clock, on purpose — a fixed limit is
+what kills a long `tar` or a `journalctl -f`, and the pty path has run without
+one since P4. The channel owns the lifetime:
+
+| Event | What ends the command |
+|---|---|
+| the client closes the channel (Ctrl-C, `ssh` exiting) | `Handler::channel_close` fires the channel's abort token → `ExecEngine::cancel` → process-**tree** kill (`taskkill /T` / the process group) |
+| the client disconnects, or the carrier dies | the handler drops; `Drop` cancels every exec it still tracks |
+| the grant's `session_secs` deadline | `arm_session_deadline` disconnects → the same `Drop` |
+| the session itself vanishes under the pump | `handle.data` fails → the pump cancels the abort |
+| a key-list (break-glass) session | unbounded, as its pty is; the 600 s inactivity timeout still reaps a dead carrier |
+
+⚠️ russh accepts and **discards** data for a channel the client has closed —
+the pump cannot tell — which is why `channel_close` is wired rather than
+relying on a failed write. The abort token is minted **before** the consent
+wait, so a channel closed while the operator is being asked leaves nothing to
+run; the engine re-checks it before spawning.
+
+**Redaction cannot split a secret.** Every masked shape — the registered agent
+tokens, `Bearer <token>`, JWT-shaped runs — is whitespace-free, so
+`StreamRedactor` settles bytes only at a **word boundary** (right after the
+last ASCII whitespace); the word in progress waits in a carry and a token is
+always masked whole. The literal pass runs over everything visible before the
+cut, a settled prefix ending in `bearer ` is pulled back to the boundary before
+it, and binary passes through byte-exact. Two bounds, both documented in the
+spec: a whitespace-free run over 64 KiB is force-settled holding back
+max(8 KiB, longest literal − 1) bytes, and a carry that waits 150 ms with no
+new bytes is flushed (holding back a literal prefix and a `bearer ` context) so
+a prompt with no trailing newline still appears. Unit tests drive every secret
+kind through **every split offset** of a two-chunk split.
+
+**Windows `console_user` streams too.** `CreateProcessAsUserW` with three
+anonymous pipes (`supervisor::spawn_in_session_captured`) is what P5b always
+used; its drain read each pipe to EOF into a `Vec`. `read_pipe_streamed` hands
+each `ReadFile` to the raw queue with `blocking_send` from the drain thread —
+and that *is* the backpressure on this platform: a full queue parks the thread,
+the 4 KiB pipe fills, the child blocks on `WriteFile`.
+
+**The kill switch** — `ssh_exec_streaming = false` (device-owned, default
+**on**, read at daemon start, never server-settable) restores the pre-FR-89
+path exactly: `run_fed` with the 1 MiB ceiling and the 300 s wall clock, the
+output after the run, and a stderr notice when the ceiling cut it. **Fleet
+RPC is unaffected either way**: `rc:rpc.exec` never calls the streaming
+variant.
+
+**Exit status**: a real `0..=255` code is the SSH status; a signal-encoded or
+absent one (killed, cancelled, refused) is **1**. It is sent only after the
+pump delivered the last chunk, then `eof`, then `close` — the order `scp` and
+scripts rely on.
+
 ### Interactive sessions (P4a Unix, P4b Windows)
 
 `ssh <node>` allocates a terminal, runs a login shell on it, streams both ways,
@@ -154,15 +241,17 @@ single code path, which is deliberate: an interactive session is where a
 per-platform divergence would be least visible and most annoying, and two
 handlers would have grown two subtly different privilege and teardown stories.
 
-**A pty session deliberately does not go through the exec engine.** The engine
-buffers a command's whole output to enforce a ceiling and returns it at the
-end — correct for one-shot commands, and the exact opposite of what an
-interactive session needs, where the output *is* the interaction. So a terminal
-session has **no output ceiling and no wall-clock timeout**. It keeps the parts
-that still apply: the same `RunAs` identity model (via the same
-`exec::apply_run_as`, so every refusal is identical and there is not a second
-privilege story for shells), the same operator-consent gate, and process-group
-teardown.
+**A pty session deliberately does not go through the exec engine.** Before
+FR-89 the engine buffered a command's whole output to enforce a ceiling and
+returned it at the end — the exact opposite of what an interactive session
+needs, where the output *is* the interaction. One-shot commands stream through
+the engine now too (above), but a terminal still needs a pty rather than pipes:
+a pty merges the two streams, cooks line endings and gives the shell a tty. So
+a terminal session has **no output ceiling and no wall-clock timeout**, as a
+streamed command has. It keeps the parts that still apply: the same `RunAs`
+identity model (via the same `exec::apply_run_as`, so every refusal is
+identical and there is not a second privilege story for shells), the same
+operator-consent gate, and process-group teardown.
 
 Mechanics worth knowing:
 
@@ -578,10 +667,17 @@ files. Same `apply_run_as`, same consent gate, same identity — and roomler
 never parses an SFTP packet.
 
 ⚠️ **Windows non-daemon accounts refuse.** Spawning as another user there needs
-`CreateProcessAsUserW`, whose streaming form currently only exists in the
-pty's pseudoconsole path — there is no pipes variant yet. Running the transfer
-as SYSTEM instead would be the dangerous answer, so it refuses and says so.
-Unix (all modes) and Windows-as-daemon work; **corplap does not get scp yet.**
+`CreateProcessAsUserW`. Its piped form *does* exist — `exec`'s console-user
+path has used `supervisor::spawn_in_session_captured` since P5b, and since
+FR-89 that drain streams — but this subsystem spawns `sftp-server` through
+`tokio::process`, which cannot take a token, and is not wired to that spawn
+yet (FR-89, open decision 3). Running the transfer as SYSTEM instead would be
+the dangerous answer, so it refuses and says so. Unix (all modes) and
+Windows-as-daemon work; **corplap does not get scp yet** — but
+`ssh <node> 'cat f' > f` and `ssh <node> 'cat > f' < f` stream a file whole
+there, as the signed-in user. (An earlier version of this note said the
+streaming form existed only in the pty's pseudoconsole path; that was outdated
+the day P5b shipped.)
 
 ⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
 covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
@@ -843,6 +939,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
 | FR-83 | `rc:ssh.grant_ack` + `ssh-grant-ack`: the caller is answered only once the target confirms the grant (≤ 10 s), and the device's refusals — gate 4, expired on arrival — reach the caller by name | **shipped** 0.4.101, field-verified — 40/40 grant-issued sessions recorded before they opened across the FR-81 matrix |
 | M5 | `ssh_max_privilege` — the device refuses a server grant that asks for the daemon identity. The one gate that survives a compromised control plane | **shipped**, default unset (permissive) |
+| FR-89 | One-shot commands **stream** — no 1 MiB ceiling, no 300 s wall clock, the channel owns the command's life (close/disconnect ⇒ tree kill), redaction across chunk boundaries, Windows `console_user` included; `ssh_exec_streaming` kill switch. Fleet RPC untouched | **in review** [#1826](https://github.com/gjovanov/roomler-ai/issues/1826); field verification owed |
 
 ## 6. Build
 
