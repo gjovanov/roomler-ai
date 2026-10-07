@@ -42,6 +42,7 @@ flowchart TB
         OC["overlay-communication.md"]
         TUN["tunnels.md"]
         MO["multi-org.md"]
+        OKR["overlay-key-rotation.md"]
         MDNS["magicdns.md"]
     end
 
@@ -105,6 +106,7 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 | [overlay-exit-nodes.md](overlay-exit-nodes.md) | Tailscale-style exit nodes: full-egress routing (v4+v6+DNS) with the never-self-wedge safety model |
 | [overlay-wfp.md](overlay-wfp.md) | Windows: surviving a Group-Policy-locked firewall via the Windows Filtering Platform — and the daemon's own Defender rule, written by the service host before the worker's first bind (#1698) |
 | [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, the shared carrier plane, mux NAT |
+| [overlay-key-rotation.md](overlay-key-rotation.md) | Retiring a device's overlay (WireGuard) key from the device grid (FR-40): an **order, never a delivery** — the device mints locally, persists first, reports with public keys only and re-joins, the join is the proof, and the server never sees a private key; the four cells of the route's decision (`pushed` · `queued` · 409 `rate_limited` · 409 `agent_unsupported`), the server-resolved states the chip names, reconcile-on-connect and the three field-run races it must not re-run, the device kill switch, what is deliberately not rotated |
 | [tunnels.md](tunnels.md) | Concepts & protocol: forwards, SOCKS5 (TCP+UDP), mesh mode, declared routes, transports, the flow-owned listener + carriers (FR-86), LocalAPI, CLI |
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |
 | [fleet-rpc.md](fleet-rpc.md) | `roomler exec` remote command execution: transport, the four default-deny gates, audit |
