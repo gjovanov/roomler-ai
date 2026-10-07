@@ -336,7 +336,9 @@ jobs:
         # `recording` (FR-85) is in `full` again (P4c, after the canaries). It
         # stays named so this lane keeps linting it if it is ever held out
         # of `full` again, as it was from 2026-09-26 to 09-27.
-        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
+        # `hive` (FR-90 P0c) is held out of `full` until the P0 field cell,
+        # so it is named here for the same reason: no other lane lints it.
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording,hive --all-targets -- -D warnings -A dead_code
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
@@ -536,7 +538,11 @@ jobs:
         #     of it ran here. It also puts the Unix half of the privilege drop
         #     under test on a real Linux host, which a Windows dev box cannot
         #     exercise at all. russh is pure Rust; the cost is compile time.
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server --lib
+        #   - Hive (`hive`, FR-90 P0c): the device's gates and the supervisor
+        #     driving a stand-in harness through start, prompt, turn, crash and
+        #     stop. Linux-only by construction and held out of `full`, so this
+        #     is the one lane that runs it. Bundled SQLite compiles from C.
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback

@@ -16,6 +16,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::acl::AgentForwardAcl;
@@ -369,6 +370,54 @@ pub struct AgentConfig {
     /// lives in `ssh_audit` and does not depend on this key.
     #[serde(default)]
     pub ssh_activity_log: bool,
+
+    // ─── FR-90: Hive agent sessions ─────────────────────────────────────
+    // The device's own gates, every one of them default-deny, and none of them
+    // settable by the server: which local account runs a session and where it
+    // may run are the DEVICE's answer, so a compromised server can neither
+    // pick SYSTEM/root nor point a session at `/etc` (design §4.2, §13).
+    /// May this device RUN agent sessions (`rc:hive.start`)? Default
+    /// **`false`** — gate 4, the refusal that survives a compromised server,
+    /// like [`Self::exec_enabled`] and [`Self::ssh_enabled`]. A session is a
+    /// model running commands on this machine as one of its accounts.
+    #[serde(default)]
+    pub hive_enabled: bool,
+
+    /// Which local account a Roomler user's sessions run as:
+    /// `{ "<user id, or the user's proven email>" = "<account>" }`.
+    ///
+    /// **Unmapped means refused** (`no_account`) — never a fallback to the
+    /// daemon's own identity, and never an account the server names (the
+    /// start frame carries none). A mapping to a uid-0 account is refused at
+    /// launch too, by the same privilege path exec and SSH use.
+    #[serde(default)]
+    pub hive_accounts: BTreeMap<String, String>,
+
+    /// The folders sessions may run in, checked on the resolved path, so
+    /// `..` and a symlink out of a root do not count. **Empty means nowhere**,
+    /// never anywhere — the overlay ACL's `Some([])` lesson, applied before
+    /// anyone ships the other reading.
+    #[serde(default)]
+    pub hive_roots: Vec<String>,
+
+    /// The most sessions this device runs at once (`at_capacity` past it).
+    /// `None` = 4.
+    #[serde(default)]
+    pub hive_max_sessions: Option<u32>,
+
+    /// The harness binary (Claude Code), absolute. `None` = the first of
+    /// `~/.local/bin/claude`, `/usr/local/bin/claude`, `/usr/bin/claude` that
+    /// exists, the first one resolved in the mapped account's home.
+    #[serde(default)]
+    pub hive_harness: Option<String>,
+
+    /// FR-90 P0 — the command a session's Claude Code runs, as the mapped
+    /// account, to get its API key (`apiKeyHelper` in the session's settings).
+    /// A stop-gap until the loopback sidecar hands out a fence-bound session
+    /// token (P0e). Unset = the harness's own login — which a per-session
+    /// config directory does not have, so its model calls fail.
+    #[serde(default)]
+    pub hive_api_key_helper: Option<String>,
 
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
@@ -2114,6 +2163,12 @@ pub fn test_fixture() -> AgentConfig {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
+        hive_enabled: false,
+        hive_accounts: BTreeMap::new(),
+        hive_roots: Vec::new(),
+        hive_max_sessions: None,
+        hive_harness: None,
+        hive_api_key_helper: None,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,

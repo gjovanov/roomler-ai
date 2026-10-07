@@ -349,6 +349,58 @@ const KEYS: &[KeyMeta] = &[
         kind: "bool",
         description: "FR-84 - let a person at this device restart the service from the companion (Apply now) or `roomler restart`. The daemon restarts itself only under a service manager it can prove (a Windows service or scheduled task, systemd, launchd), and at most once every 30 s; a hand-started `roomlerd run` always refuses. Off = every such request is refused. Never settable by the server, which cannot restart a daemon at all. Default: on.",
     },
+    // FR-90 — Hive. Every key is the DEVICE's: none is settable by the server
+    // (they are absent from `DesiredConfig`), because which account runs a
+    // session and where it may run are exactly what a compromised server must
+    // not be able to choose.
+    KeyMeta {
+        key: "hive_enabled",
+        group: Group::Access,
+        tier: Tier::Essential,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - run AI agent sessions (Claude Code) on this device when a member of the org starts one. Each runs as the local account hive_accounts maps that member to - never SYSTEM/root - and only in a folder under hive_roots. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
+        key: "hive_accounts",
+        group: Group::Access,
+        tier: Tier::Standard,
+        live: false,
+        kind: "json",
+        description: "FR-90 - which local account a Roomler user's agent sessions run as: JSON {\"<user id or proven email>\": \"<account>\"}. Unmapped = refused (no_account), and a uid-0 account is refused too. Empty = nobody.",
+    },
+    KeyMeta {
+        key: "hive_roots",
+        group: Group::Access,
+        tier: Tier::Standard,
+        live: false,
+        kind: "list",
+        description: "FR-90 - comma-separated absolute folders agent sessions may run in, checked on the resolved path (no `..` or symlink escape). Empty = nowhere.",
+    },
+    KeyMeta {
+        key: "hive_max_sessions",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 - the most agent sessions this device runs at once (1-64). Empty = built-in default (4).",
+    },
+    KeyMeta {
+        key: "hive_harness",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 - absolute path of the agent harness (Claude Code). Empty = the first of ~/.local/bin/claude, /usr/local/bin/claude, /usr/bin/claude that exists for the mapped account.",
+    },
+    KeyMeta {
+        key: "hive_api_key_helper",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 P0 - a command a session's Claude Code runs, as the mapped account, to print its API key (apiKeyHelper). A stop-gap until the device's loopback sidecar issues per-session tokens. Empty = none, and the session's model calls fail.",
+    },
     KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
@@ -1605,6 +1657,12 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ssh_account_mode" => cfg.ssh_account_mode.clone(),
         "ssh_max_privilege" => cfg.ssh_max_privilege.clone(),
         "ssh_activity_log" => Some(fmt_bool(cfg.ssh_activity_log)),
+        "hive_enabled" => Some(fmt_bool(cfg.hive_enabled)),
+        "hive_accounts" => serde_json::to_string(&cfg.hive_accounts).ok(),
+        "hive_roots" => Some(cfg.hive_roots.join(",")),
+        "hive_max_sessions" => cfg.hive_max_sessions.map(|n| n.to_string()),
+        "hive_harness" => cfg.hive_harness.clone(),
+        "hive_api_key_helper" => cfg.hive_api_key_helper.clone(),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -1830,6 +1888,26 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
         // Clearing it means OFF, like every other reporting/capability switch.
         "ssh_activity_log" => cfg.ssh_activity_log = parse_bool_or(value, false)?,
+        "hive_enabled" => cfg.hive_enabled = parse_bool_or(value, false)?,
+        // Validated on the way IN, like `ssh_account_mode`: a typo should be a
+        // rejected `config set`, not a session refused `no_account` for a
+        // reason the owner then has to dig out of the daemon log.
+        "hive_accounts" => cfg.hive_accounts = parse_hive_accounts(value)?,
+        // Clearing empties the list, i.e. nowhere — the fail-safe direction.
+        "hive_roots" => cfg.hive_roots = parse_absolute_list("hive_roots", value)?,
+        "hive_max_sessions" => {
+            cfg.hive_max_sessions = parse_u32_range("hive_max_sessions", value, 1, 64)?
+        }
+        "hive_harness" => cfg.hive_harness = parse_absolute_path("hive_harness", value)?,
+        "hive_api_key_helper" => {
+            cfg.hive_api_key_helper = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) if v.chars().any(char::is_control) => {
+                    return Err("hive_api_key_helper must be one line".into());
+                }
+                Some(v) => Some(v.to_string()),
+            }
+        }
         "ssh_port" => {
             cfg.ssh_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -2302,6 +2380,73 @@ fn parse_u32_range(
     }
 }
 
+/// FR-90 — `hive_accounts`: a JSON object of `"<user id or email>": "<account>"`.
+/// Empty clears to nobody. A key must name a user the way the start frame
+/// does — a 24-hex user id, or an address (`@`) — and an account must be one
+/// plain local name. `root` is refused here as well as at launch: the launch
+/// refuses any uid-0 account whatever its name, but a mapping to root should
+/// never get as far as being saved.
+fn parse_hive_accounts(
+    value: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Default::default());
+    };
+    let raw: std::collections::BTreeMap<String, String> = serde_json::from_str(v).map_err(|e| {
+        format!("hive_accounts: invalid JSON (want {{\"<user id or email>\": \"<account>\"}}): {e}")
+    })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (user, account) in raw {
+        let user = user.trim();
+        let account = account.trim();
+        let is_id = user.len() == 24 && user.chars().all(|c| c.is_ascii_hexdigit());
+        if !(is_id || user.contains('@')) || user.chars().any(char::is_control) {
+            return Err(format!(
+                "hive_accounts: {user:?} is neither a user id (24 hex) nor an email address"
+            ));
+        }
+        if account.is_empty()
+            || account.len() > 64
+            || account
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '/' | '\\'))
+        {
+            return Err(format!(
+                "hive_accounts: {account:?} is not a local account name"
+            ));
+        }
+        if account == "root" {
+            return Err("hive_accounts: sessions never run as root".into());
+        }
+        out.insert(user.to_string(), account.to_string());
+    }
+    Ok(out)
+}
+
+/// A comma-separated list of absolute paths; empty clears.
+fn parse_absolute_list(key: &str, value: Option<&str>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for token in value.unwrap_or("").split(',').map(str::trim) {
+        if token.is_empty() {
+            continue;
+        }
+        if !std::path::Path::new(token).is_absolute() {
+            return Err(format!("{key}: {token:?} is not an absolute path"));
+        }
+        out.push(token.to_string());
+    }
+    Ok(out)
+}
+
+/// One absolute path, or empty to clear.
+fn parse_absolute_path(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(v) if std::path::Path::new(v).is_absolute() => Ok(Some(v.to_string())),
+        Some(v) => Err(format!("{key}: {v:?} is not an absolute path")),
+    }
+}
+
 /// Shared parse/validate for the four `rate_factor_*` keys: empty clears
 /// (built-in applies), numeric must be 50–400 %.
 fn parse_rate_factor(key: &str, value: Option<&str>) -> Result<Option<u32>, String> {
@@ -2591,6 +2736,7 @@ mod tests {
             "exec_enabled",
             "remote_config_enabled",
             "ssh_enabled",
+            "hive_enabled",
             "encoder_preference",
             "files_dir",
             "power_policy",
@@ -3570,6 +3716,90 @@ mod tests {
             !e.restart_required,
             "the restart verb reads the file per request — the key is live"
         );
+    }
+
+    /// FR-90 — every Hive gate defaults CLOSED and clears closed: off, nobody,
+    /// nowhere. The defaults are the security property here, as for
+    /// `remote_config_enabled` below.
+    #[test]
+    fn hive_gates_default_closed_and_clear_closed() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.hive_enabled);
+        assert!(cfg.hive_accounts.is_empty(), "nobody");
+        assert!(cfg.hive_roots.is_empty(), "nowhere");
+        // The wire default agrees with the serde default of an absent key.
+        let e = entry_for(&cfg, "hive_enabled").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+
+        apply(&mut cfg, "hive_enabled", Some("true")).unwrap();
+        let root = if cfg!(windows) {
+            r"C:\src"
+        } else {
+            "/home/dev/src"
+        };
+        apply(&mut cfg, "hive_roots", Some(&format!(" {root} , "))).unwrap();
+        assert_eq!(
+            cfg.hive_roots,
+            vec![root.to_string()],
+            "trimmed, blanks dropped"
+        );
+        apply(
+            &mut cfg,
+            "hive_accounts",
+            Some(r#"{"dev@example.com": "dev", "0123456789abcdef01234567": " svc "}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.hive_accounts.get("dev@example.com").map(String::as_str),
+            Some("dev")
+        );
+        assert_eq!(
+            cfg.hive_accounts
+                .get("0123456789abcdef01234567")
+                .map(String::as_str),
+            Some("svc"),
+            "values are trimmed"
+        );
+        // It echoes as the JSON it was set from.
+        let echoed = entry_for(&cfg, "hive_accounts").unwrap().value.unwrap();
+        assert!(echoed.contains("\"dev@example.com\":\"dev\""), "{echoed}");
+
+        // Clearing closes every gate again.
+        for key in ["hive_enabled", "hive_accounts", "hive_roots"] {
+            apply(&mut cfg, key, None).unwrap();
+        }
+        assert!(!cfg.hive_enabled && cfg.hive_accounts.is_empty() && cfg.hive_roots.is_empty());
+    }
+
+    /// FR-90 — what `config set` refuses for the Hive keys, so a typo is a
+    /// refusal now rather than a session refused later for a reason the owner
+    /// has to dig out of a log.
+    #[test]
+    fn hive_keys_refuse_what_a_launch_would_misread() {
+        let mut cfg = crate::config::test_fixture();
+        for bad in [
+            r#"{"dev@example.com": "root"}"#,
+            r#"{"dev@example.com": ""}"#,
+            r#"{"dev@example.com": "two words"}"#,
+            r#"{"dev@example.com": "named:dev"}"#,
+            r#"{"just-a-name": "dev"}"#,
+            r#"{"0123": "dev"}"#,
+            "not json",
+            r#"["dev"]"#,
+        ] {
+            let err = apply(&mut cfg, "hive_accounts", Some(bad)).unwrap_err();
+            assert!(err.contains("hive_accounts"), "{bad}: {err}");
+        }
+        assert!(cfg.hive_accounts.is_empty(), "nothing half-applied");
+
+        assert!(apply(&mut cfg, "hive_roots", Some("src,relative/dir")).is_err());
+        assert!(apply(&mut cfg, "hive_harness", Some("claude")).is_err());
+        assert!(apply(&mut cfg, "hive_max_sessions", Some("0")).is_err());
+        assert!(apply(&mut cfg, "hive_max_sessions", Some("65")).is_err());
+        apply(&mut cfg, "hive_max_sessions", Some("2")).unwrap();
+        assert_eq!(cfg.hive_max_sessions, Some(2));
+        assert!(apply(&mut cfg, "hive_api_key_helper", Some("a\nb")).is_err());
     }
 
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
