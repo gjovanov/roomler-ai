@@ -253,14 +253,127 @@ async fn policy_crud_round_trips() {
         resp.status()
     );
 
+    // --- After delete: removal is FINAL on every per-policy route (#1829) ---
+    // `soft_delete` sets `deleted_at` and the row stays as a tombstone. The
+    // listing the admin UI reads and the forward gate's compile set
+    // (`list_for_tenant` / `list_active_for_tenant`) filter `deleted_at:
+    // null`, and the per-id lookup now agrees with them: GET-one is a 404,
+    // PUT is a 404 and writes nothing, a repeat DELETE is a 404. This
+    // assertion once said "GET-one still returns the tombstone — a deferred
+    // API-semantics call"; #1824 made that call for agents, and a deleted
+    // POLICY has even less business being served or edited.
+    //
+    // Negative control (recorded on the PR): with the `deleted_at` predicate
+    // taken out of the lookup this fails at "GET of a removed policy" with
+    // 200; with it taken out of the write filter, at "a write must not land
+    // on a tombstone".
+    use bson::{Bson, doc, oid::ObjectId};
+    use roomler_ai_services::dao::base::DaoError;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let pid = ObjectId::parse_str(policy_id).unwrap();
+    let policies = app.db.collection::<bson::Document>("tunnel_policies");
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .expect("a deleted policy tombstones in place");
+    let removed_at = match row.get("deleted_at") {
+        Some(Bson::DateTime(at)) => *at,
+        other => panic!("tombstone must carry a removal time, got {other:?}"),
+    };
+    let one = format!(
+        "/api/tenant/{}/tunnel-policy/{}",
+        seeded.tenant_id, policy_id
+    );
+
+    // GET: 404, exactly like a bogus id.
+    let resp = app
+        .auth_get(&one, &seeded.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "GET of a removed policy");
+
+    // PUT: 404 — and nothing lands on the tombstone (the earlier PUT left
+    // the name at `loopback-renamed`; that is what the row must still say).
+    let resp = app
+        .auth_put(&one, &seeded.admin.access_token)
+        .json(&json!({ "name": "zombie" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "PUT on a removed policy");
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.get_str("name").unwrap(),
+        "loopback-renamed",
+        "the PUT must not land on the tombstone"
+    );
+
+    // The writes are live-scoped on their own, not only behind the routes'
+    // lookup ("a gate applies at every entry point, or it is a courtesy").
+    let network = app.state.network();
+    assert!(
+        !network
+            .tunnel_policies
+            .update(tid, pid, Some("dao".into()), None, None, None, None, None)
+            .await
+            .unwrap(),
+        "a write must not land on a tombstone"
+    );
+    // The removal time is written once: a repeat tombstoning is a no-op.
+    assert!(!network.tunnel_policies.soft_delete(tid, pid).await.unwrap());
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_datetime("deleted_at").unwrap(), &removed_at);
+    assert_eq!(row.get_str("name").unwrap(), "loopback-renamed");
+
+    // The two lookups differ by NAME: LIVE is NotFound, ANY still sees the
+    // tombstone (the reader an audit log of this policy would need).
+    assert!(matches!(
+        network.tunnel_policies.find_live_in_tenant(tid, pid).await,
+        Err(DaoError::NotFound)
+    ));
+    assert!(
+        network
+            .tunnel_policies
+            .find_any_in_tenant(tid, pid)
+            .await
+            .unwrap()
+            .deleted_at
+            .is_some()
+    );
+
+    // The gate's compile input no longer carries it — a deleted policy is
+    // never COMPILED, and the evaluator would skip it even if it were
+    // (`tunnel_core::policy`, locked by `soft_deleted_policy_is_ignored`).
+    let active = network
+        .tunnel_policies
+        .list_active_for_tenant(tid)
+        .await
+        .unwrap();
+    assert!(
+        active.iter().all(|p| p.id != Some(pid)),
+        "a deleted policy must not reach the forward gate"
+    );
+
+    // A repeat DELETE is a 404 — the same answer the listing gives, and the
+    // one that leaves the removal time alone.
+    let resp = app
+        .auth_delete(&one, &seeded.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a repeat DELETE");
+
     // --- LIST after delete → policy gone from the active listing ---
-    // `soft_delete` sets `deleted_at`; the listing the admin UI reads
-    // (`list_active_for_tenant` / `list_for_tenant`) filters on
-    // `deleted_at: null`, so the row disappears from it. NOTE: GET-one
-    // (`find_in_tenant`) does NOT filter `deleted_at`, so it still returns
-    // the tombstone (200) — an intentional asymmetry today; whether GET-one
-    // should 404 for a soft-deleted policy is a separate API-semantics call
-    // (tracked outside P3b-2). The listing is the contract the UI relies on.
     let list_after: Value = app
         .auth_get(
             &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
@@ -278,6 +391,340 @@ async fn policy_crud_round_trips() {
             .iter()
             .all(|p| p["id"].as_str() != Some(policy_id)),
         "soft-deleted policy must not appear in the active listing"
+    );
+}
+
+/// #1829 — the live predicate is `deleted_at: null`, which is null OR
+/// ABSENT: a row that never carried the field was never tombstoned, and it is
+/// the predicate the listing and the gate's compile set use, so the three
+/// views agree by construction. `tunnel_policies` has no `$type: "null"`
+/// partial index to mirror (no unique index at all — only the plain
+/// `(tenant_id, deleted_at)` compound that serves this very equality); a
+/// `$type` predicate here would 404 a live policy whose field is missing and
+/// drop it from the per-id view while the gate still compiled it.
+#[tokio::test]
+async fn a_live_tunnel_policy_whose_deleted_at_field_is_absent_is_still_live() {
+    use bson::{doc, oid::ObjectId};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tunnel-policy-absent").await;
+    let admin = &seeded.admin.access_token;
+    let created: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
+            admin,
+        )
+        .json(&json!({
+            "name": "absent-field",
+            "subjects": [{ "kind": "all_users" }],
+            "targets": [{ "kind": "all_agents" }],
+            "allowlist": [{
+                "host_pattern": { "kind": "cidr", "value": "127.0.0.0/8" },
+                "port_range": { "low": 9000, "high": 9999 }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy_id = created["id"].as_str().expect("policy id").to_string();
+    let pid = ObjectId::parse_str(&policy_id).unwrap();
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let one = format!(
+        "/api/tenant/{}/tunnel-policy/{}",
+        seeded.tenant_id, policy_id
+    );
+
+    app.db
+        .collection::<bson::Document>("tunnel_policies")
+        .update_one(doc! { "_id": pid }, doc! { "$unset": { "deleted_at": "" } })
+        .await
+        .unwrap();
+
+    let resp = app.auth_get(&one, admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET: absent is live");
+    let resp = app
+        .auth_put(&one, admin)
+        .json(&json!({ "name": "still-here" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PUT: absent is live");
+    let list: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
+            admin,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        1,
+        "the listing agrees"
+    );
+    let active = app
+        .state
+        .network()
+        .tunnel_policies
+        .list_active_for_tenant(tid)
+        .await
+        .unwrap();
+    assert!(
+        active.iter().any(|p| p.id == Some(pid)),
+        "the gate still compiles it"
+    );
+}
+
+/// Enrol a tunnel client the way the CLI does: an admin mints the enrollment
+/// token, the client exchanges it. Returns the new row's id.
+async fn enroll_tunnel_client(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    machine_id: &str,
+    machine_name: &str,
+) -> String {
+    let et: Value = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/tunnel-client/enroll-token",
+                seeded.tenant_id
+            ),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let enrolled: Value = app
+        .client
+        .post(format!("{}/api/tunnel-client/enroll", app.base_url))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().expect("enrollment_token"),
+            "machine_id": machine_id,
+            "machine_name": machine_name,
+            "os": "linux",
+            "client_version": "0.3.0-test"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    enrolled["tunnel_client_id"]
+        .as_str()
+        .expect("tunnel_client_id in enroll response")
+        .to_string()
+}
+
+/// #1829 — removal is FINAL on the per-client routes, not only in the
+/// listing. `find_by_id_in_tenant` filtered `{_id, tenant_id}` and nothing
+/// else, so after `DELETE …/tunnel-client/{id}` the tombstone still took
+/// `PUT` (rename, display name, tags) and a repeat `DELETE` re-ran the whole
+/// removal on it. The lookup both routes sit on is live-scoped now, and so
+/// are the admin setters underneath it. (There is no `GET …/{id}` for tunnel
+/// clients — the listing is the only read.)
+///
+/// Negative control (recorded on the PR): with the `deleted_at` predicate
+/// taken out of the lookup this fails at "PUT on a removed client" with 200;
+/// with it taken out of the setters' filter, at "a setter must not land on a
+/// tombstone".
+#[tokio::test]
+async fn a_removed_tunnel_client_is_a_404_on_its_per_client_routes() {
+    use bson::{Bson, doc, oid::ObjectId};
+    use roomler_ai_services::dao::base::DaoError;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tunnel-client-gone").await;
+    let admin = seeded.admin.access_token.clone();
+    let client_id = enroll_tunnel_client(&app, &seeded, "mach-tcgone-A", "Gone laptop").await;
+    let one = format!(
+        "/api/tenant/{}/tunnel-client/{}",
+        seeded.tenant_id, client_id
+    );
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let cid = ObjectId::parse_str(&client_id).unwrap();
+    let clients = app.db.collection::<bson::Document>("tunnel_clients");
+
+    // The positive control: the LAST write before the removal — what the
+    // tombstone must still say after every write below it has been refused.
+    let resp = app
+        .auth_put(&one, &admin)
+        .json(&json!({ "tags": ["before"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "control: settings write on a live client"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["client"]["tags"], json!(["before"]));
+
+    // Remove it.
+    let resp = app.auth_delete(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["deleted"], true);
+
+    // The row is a TOMBSTONE, not gone — the case the bug lived in.
+    let row = clients
+        .find_one(doc! { "_id": cid })
+        .await
+        .unwrap()
+        .expect("a removed tunnel client tombstones in place");
+    let removed_at = match row.get("deleted_at") {
+        Some(Bson::DateTime(at)) => *at,
+        other => panic!("tombstone must carry a removal time, got {other:?}"),
+    };
+
+    // PUT: 404, exactly like a bogus id — and none of its three writes
+    // reaches the tombstone.
+    let resp = app
+        .auth_put(&one, &admin)
+        .json(&json!({ "name": "zombie", "display_name": "Zombie", "tags": ["after"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "PUT on a removed client");
+    let row = clients
+        .find_one(doc! { "_id": cid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_str("name").unwrap(), "Gone laptop");
+    assert!(row.get("display_name").is_none());
+    assert_eq!(
+        row.get_array("tags").unwrap(),
+        &vec![Bson::String("before".into())],
+        "the settings write must not land on the tombstone"
+    );
+
+    // The setters are live-scoped on their own, not only behind the route's
+    // lookup ("a gate applies at every entry point, or it is a courtesy").
+    let network = app.state.network();
+    assert!(
+        !network
+            .tunnel_clients
+            .set_tags(tid, cid, &["dao".into()])
+            .await
+            .unwrap(),
+        "a setter must not land on a tombstone"
+    );
+    assert!(
+        !network
+            .tunnel_clients
+            .rename(tid, cid, "dao")
+            .await
+            .unwrap()
+    );
+    // The removal time is written once: a repeat tombstoning is a no-op.
+    assert!(!network.tunnel_clients.soft_delete(tid, cid).await.unwrap());
+    let row = clients
+        .find_one(doc! { "_id": cid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_datetime("deleted_at").unwrap(), &removed_at);
+    assert_eq!(row.get_str("name").unwrap(), "Gone laptop");
+
+    // The two lookups differ by NAME. LIVE is NotFound; ANY still sees the
+    // tombstone — the contract the tunnel WS connect-time check and the 60 s
+    // revocation poll rely on to send the typed `rc:tunnel.revoked` (a LIVE
+    // read there would turn a removal into "lookup failed; keeping
+    // connection open").
+    assert!(matches!(
+        network.tunnel_clients.find_live_in_tenant(tid, cid).await,
+        Err(DaoError::NotFound)
+    ));
+    assert!(
+        network
+            .tunnel_clients
+            .find_any_in_tenant(tid, cid)
+            .await
+            .unwrap()
+            .deleted_at
+            .is_some()
+    );
+
+    // A repeat DELETE is a 404 — the same answer the listing gives, and the
+    // one that leaves the state alone (re-finding the tombstone would re-run
+    // the overlay release and re-stamp the removal time).
+    let resp = app.auth_delete(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a repeat DELETE");
+
+    // The two views agree: gone from the listing too.
+    let list: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/tunnel-client", seeded.tenant_id),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 0);
+}
+
+/// #1829 — the live predicate is `deleted_at: null` (null OR ABSENT), the
+/// one every live listing on `tunnel_clients` uses, so the per-id view and
+/// the listing agree by construction. The collection's unique index is
+/// unconditional (re-enrolling a machine rehydrates its tombstone, as for
+/// agents), so no `$type: "null"` partial-index rule binds here; in a query
+/// that spelling would 404 a live client whose field is missing.
+#[tokio::test]
+async fn a_live_tunnel_client_whose_deleted_at_field_is_absent_is_still_live() {
+    use bson::{doc, oid::ObjectId};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tunnel-client-absent").await;
+    let admin = &seeded.admin.access_token;
+    let client_id = enroll_tunnel_client(&app, &seeded, "mach-tcabsent-A", "Absent laptop").await;
+    let cid = ObjectId::parse_str(&client_id).unwrap();
+    let one = format!(
+        "/api/tenant/{}/tunnel-client/{}",
+        seeded.tenant_id, client_id
+    );
+
+    app.db
+        .collection::<bson::Document>("tunnel_clients")
+        .update_one(doc! { "_id": cid }, doc! { "$unset": { "deleted_at": "" } })
+        .await
+        .unwrap();
+
+    let resp = app
+        .auth_put(&one, admin)
+        .json(&json!({ "tags": ["still-here"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PUT: absent is live");
+    let list: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/tunnel-client", seeded.tenant_id),
+            admin,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        1,
+        "the listing agrees"
     );
 }
 
