@@ -33,13 +33,15 @@
 //! that may drive — over its one DataChannel. The server relays the
 //! handshake and never sees what flows over the peer.
 
-mod framing;
+pub mod framing;
 pub mod gates;
 mod sidecar;
 mod store;
 mod supervisor;
 pub mod view;
 
+#[cfg(feature = "hive-test-launcher")]
+pub use supervisor::init_as_daemon;
 pub use supervisor::{
     Author, StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
 };

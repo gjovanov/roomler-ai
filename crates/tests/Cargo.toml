@@ -47,3 +47,13 @@ tempfile = { workspace = true }
 tokio-test = "0.4"
 tokio-tungstenite = "0.26"
 futures.workspace = true
+# FR-90 P0f — the canary test's browser writes binary DataChannel frames.
+bytes = "1"
+
+# FR-90 P0f — the canary test (`tests/hive_canary.rs`) drives a REAL device:
+# the Hive supervisor, its replica store and its viewer peer, with sessions
+# launched as the test's own account (`hive-test-launcher` — never in a
+# release build). Linux only, like `hive`, and a DEV-dependency, so nothing
+# but a test build of this crate compiles it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+roomlerd = { path = "../../agents/roomlerd", features = ["hive-test-launcher"] }
