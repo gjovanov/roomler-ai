@@ -3,13 +3,17 @@
 //! FR-90 — the Hive wire vocabulary: what the server and a device say ABOUT
 //! an agent session, never what is in one.
 //!
-//! Four frames (`crate::signaling`): the server's `rc:hive.start` and
-//! `rc:hive.stop`, the device's `rc:hive.start_ack` and `rc:hive.state`.
-//! None of them carries a prompt, a tool argument, a tool output or a line of
-//! transcript, and the tests in `signaling` lock the start frame's field set
-//! so it cannot grow one: content travels device-to-browser over the viewer
-//! peer and device-to-device between replicas, never through the server
-//! (`docs/roomler-hive-design.md` §3.3).
+//! The lifecycle frames (`crate::signaling`): the server's `rc:hive.start`
+//! and `rc:hive.stop`, the device's `rc:hive.start_ack`, `rc:hive.state` and
+//! `rc:hive.turn`. None of them carries a prompt, a tool argument, a tool
+//! output or a line of transcript, and the tests in `signaling` lock their
+//! field sets so they cannot grow one: content travels device-to-browser
+//! over the viewer peer and device-to-device between replicas, never through
+//! the server (`docs/roomler-hive-design.md` §3.3).
+//!
+//! The viewer peer's signalling (P0d-2, `rc:hive.view.*`) is a grant, its
+//! answer, and the SDP and ICE of a data-only WebRTC peer — the server relays
+//! the handshake and never sees what then flows over the peer.
 //!
 //! The server pushes a Hive frame only to an agent advertising
 //! [`crate::models::RpcCap::Hive`]: a caller is waiting for the answer, and a
@@ -48,6 +52,66 @@ pub mod hive_limits {
     pub const MAX_TITLE_LEN: usize = 200;
     /// A device's `detail` is clamped by the device AND again on receipt.
     pub const MAX_DETAIL_LEN: usize = 512;
+}
+
+/// FR-90 P0d-2 — bounds on a viewer peer, read by both ends.
+pub mod view_limits {
+    /// A view grant's life, sent as a RELATIVE `ttl_secs` so the device sets
+    /// its own deadline on receipt — a device whose clock is off must not
+    /// refuse every grant, nor keep one past its time. The browser renews at
+    /// half-life while the room is open, and the server re-checks the
+    /// viewer's right to read on every renewal: a member taken out of the
+    /// room loses the view within this bound.
+    pub const GRANT_TTL_SECS: u32 = 10 * 60;
+    /// How long the server waits for the device to confirm a grant before it
+    /// tells the browser no. The browser dials only after the device said
+    /// yes (FR-83).
+    pub const GRANT_ACK_TIMEOUT_SECS: u64 = 10;
+    /// Viewer peers one device serves at once.
+    pub const MAX_PER_DEVICE: usize = 32;
+    /// Viewer peers one session has at once.
+    pub const MAX_PER_SESSION: usize = 8;
+    /// View opens per (user, session) per minute, after the identity gates.
+    pub const OPEN_RATE_PER_MINUTE: u32 = 20;
+}
+
+/// Why a device refused a view grant, carried in `rc:hive.view.grant_ack`.
+/// Absent = the device holds the session and will answer the viewer's offer.
+///
+/// ⚠️ Decoded LENIENTLY, like [`HiveRefusal`]: an unknown word is
+/// [`Self::Other`], still a refusal — never "the browser may dial".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveViewRefusal {
+    /// The device's own `hive_enabled` is off.
+    HiveDisabled,
+    /// The device holds no transcript of this session — it never ran it, or
+    /// its store was lost.
+    NoSession,
+    /// [`view_limits::MAX_PER_DEVICE`] or [`view_limits::MAX_PER_SESSION`].
+    AtCapacity,
+    /// A word this build does not know.
+    Other,
+}
+
+impl HiveViewRefusal {
+    /// The spelling on the wire. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HiveDisabled => "hive_disabled",
+            Self::NoSession => "no_session",
+            Self::AtCapacity => "at_capacity",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveViewRefusal; 4] = [
+        Self::HiveDisabled,
+        Self::NoSession,
+        Self::AtCapacity,
+        Self::Other,
+    ];
 }
 
 /// Why a device refused `rc:hive.start`, carried in `rc:hive.start_ack`.
@@ -190,6 +254,26 @@ where
     ))
 }
 
+/// Lenient decoder for `rc:hive.view.grant_ack`'s `refused`, as
+/// [`refusal_lenient`]: only absent or `null` lets the browser dial.
+pub(crate) fn view_refusal_lenient<'de, D>(de: D) -> Result<Option<HiveViewRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveViewRefusal::Other));
+    };
+    Ok(Some(
+        HiveViewRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveViewRefusal::Other),
+    ))
+}
+
 /// Lenient decoder for `rc:hive.state`'s `state`: a state this build cannot
 /// name is `None` — the server keeps what it knew and logs the word — rather
 /// than a hard error that would drop the frame and every later one shaped
@@ -323,6 +407,41 @@ mod tests {
         );
         assert_eq!(ack(r#"{"refused":7}"#), Some(HiveRefusal::Other));
         assert_eq!(ack(r#"{"refused":{"kind":"x"}}"#), Some(HiveRefusal::Other));
+    }
+
+    /// WIRE LOCK for the view refusals, and the fallback's direction: an
+    /// unknown word still refuses — the browser must never be told to dial on
+    /// a word nobody here understood.
+    #[test]
+    fn view_refusals_are_locked_and_an_unknown_one_still_refuses() {
+        let words: Vec<&str> = HiveViewRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            ["hive_disabled", "no_session", "at_capacity", "other"]
+        );
+        for r in HiveViewRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct V {
+            #[serde(default, deserialize_with = "view_refusal_lenient")]
+            refused: Option<HiveViewRefusal>,
+        }
+        let v = |j: &str| serde_json::from_str::<V>(j).unwrap().refused;
+        assert_eq!(v("{}"), None);
+        assert_eq!(v(r#"{"refused":null}"#), None);
+        assert_eq!(
+            v(r#"{"refused":"no_session"}"#),
+            Some(HiveViewRefusal::NoSession)
+        );
+        assert_eq!(
+            v(r#"{"refused":"viewer_banned"}"#),
+            Some(HiveViewRefusal::Other)
+        );
+        assert_eq!(v(r#"{"refused":false}"#), Some(HiveViewRefusal::Other));
     }
 
     #[derive(Deserialize)]
