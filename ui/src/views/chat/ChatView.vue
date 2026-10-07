@@ -29,6 +29,15 @@
               inline
             />
           </v-btn>
+          <v-btn
+            v-if="hiveSessionId"
+            icon="mdi-robot-outline"
+            size="small"
+            :color="showTranscript ? 'primary' : undefined"
+            :title="$t('hive.viewer.toggle')"
+            data-testid="hive-transcript-toggle"
+            @click="showTranscript = !showTranscript"
+          />
           <v-btn icon="mdi-pin" size="small" @click="showPinned = !showPinned" />
           <v-btn icon="mdi-folder" size="small" data-testid="files-btn" @click="showFiles = !showFiles" />
           <v-btn icon="mdi-account-group" size="small" @click="showMembers = !showMembers" />
@@ -94,6 +103,12 @@
             @open-giphy-picker="showGiphyPicker = true"
           />
         </div>
+      </div>
+
+      <!-- FR-90 — an agent session's room: its transcript, streamed from the
+           device over a viewer peer (the server holds only the stubs above). -->
+      <div v-if="hiveSessionId && showTranscript" class="chat-side-panel hive-panel border-s d-flex flex-column">
+        <hive-transcript :session-id="hiveSessionId" />
       </div>
 
       <!-- Thread panel -->
@@ -180,6 +195,7 @@ import MessageEditor from '@/components/chat/MessageEditor.vue'
 import type { MentionData } from '@/components/chat/MessageEditor.vue'
 import type { MentionItem } from '@/components/chat/MentionList.vue'
 import MemberPanel from '@/components/chat/MemberPanel.vue'
+import HiveTranscript from '@/components/hive/HiveTranscript.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
@@ -206,6 +222,12 @@ const activeThread = ref<{ id: string } | null>(null)
 const showPinned = ref(false)
 const showMembers = ref(false)
 const showFiles = ref(false)
+// FR-90 — the room is an agent session's: show its transcript by default.
+const hiveSessionId = computed(() => {
+  const b = roomStore.current?.binding
+  return b?.module === 'hive' ? b.ref : null
+})
+const showTranscript = ref(true)
 const showEmojiPicker = ref(false)
 const showGiphyPicker = ref(false)
 const emojiTarget = ref<'editor' | 'thread'>('editor')
@@ -473,6 +495,11 @@ onMounted(async () => {
   min-width: 280px;
   min-height: 0;
   overflow: hidden;
+}
+/* FR-90 — a transcript (tool output, diffs) wants more room than a thread. */
+.hive-panel {
+  width: 50%;
+  min-width: 360px;
 }
 .message-highlight {
   animation: highlight-fade 3s ease-out;

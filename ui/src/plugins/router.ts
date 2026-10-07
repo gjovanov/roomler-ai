@@ -216,6 +216,14 @@ const routes: RouteRecordRaw[] = [
             meta: { module: 'fleet' },
           },
           {
+            // FR-90 — your agent sessions. A session's own page is its
+            // chat room (`room/:roomId`), where the transcript is read.
+            path: 'sessions',
+            name: 'hive-sessions',
+            component: () => import('@/views/hive/HiveSessionsView.vue'),
+            meta: { module: 'hive' },
+          },
+          {
             // S4 pivot — the overlay/tunnel network group, promoted out
             // of Admin (Tailscale-style IA). Sections stay child routes
             // (bookmarkable, back/forward-friendly), same pattern as
