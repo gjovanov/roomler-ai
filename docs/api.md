@@ -230,6 +230,14 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET/POST | `…/room/{rid}/recording` | List / create recordings |
 | DELETE | `…/recording/{rec_id}` | Delete recording |
 
+A room or message response may carry `binding {module, ref}` — another module owns what it
+means (FR-90: an agent session's room, and the turn stubs in it). Chat stores it and never
+interprets it. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`).
+An agent's message is authored by its **session**: `author_id` is the session's id and
+`author_name` is `Claude · <device>`. The edit and delete routes match the author, so they
+refuse every person, the session's owner included — a stub reads as the agent's, and only the
+agent's session can change it.
+
 ### Files, tasks, export
 
 | Method | Path | Purpose |

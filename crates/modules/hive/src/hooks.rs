@@ -54,7 +54,16 @@ async fn end_and_tell(
             .rc_hub
             .push_hive(s.location.device_id, s.tenant_id, msg);
     }
-    Ok(state.sessions.end_all_matching(filter, reason).await?)
+    let ended = state.sessions.end_all_matching(filter, reason).await?;
+    // Say why in each session's room (P0d) — best-effort, after the record
+    // is already ended.
+    for s in live {
+        let mut s = s;
+        s.end_reason = Some(reason.to_string());
+        s.detail = None;
+        crate::room::note(state, &s, crate::room::ended_note(&s)).await;
+    }
+    Ok(ended)
 }
 
 #[async_trait]

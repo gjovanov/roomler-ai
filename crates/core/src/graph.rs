@@ -21,17 +21,17 @@ pub const MODULES: &[&str] = &[
 /// core calls no module. Anything not listed here is forbidden — in particular
 /// `chat ↔ remote`, `chat ↔ network` and `remote ↔ network`.
 ///
-/// FR-90 — `hive → fleet` only: a session lives on a device and its frames
-/// ride the agent socket, so hive needs the Hub. Hive never calls `remote`
-/// or `network`: it reaches a device over the control WS like exec does, and
-/// session content travels device-to-browser, never through a module. The
-/// `hive → chat` edge (a session renders as a room) arrives with the slice
-/// that uses it, not before.
+/// FR-90 — `hive → fleet`: a session lives on a device and its frames ride
+/// the agent socket, so hive needs the Hub. `hive → chat` (P0d): a session is
+/// a room, and its turns are messages in it. Hive never calls `remote` or
+/// `network`: it reaches a device over the control WS like exec does, and
+/// session content travels device-to-browser, never through a module.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),
     ("network", "fleet"),
     ("hive", "fleet"),
+    ("hive", "chat"),
 ];
 
 /// The modules `id` may call, besides core.

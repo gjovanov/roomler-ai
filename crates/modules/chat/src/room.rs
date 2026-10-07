@@ -41,6 +41,11 @@ pub struct RoomResponse {
     pub conference_status: Option<String>,
     pub meeting_code: Option<String>,
     pub participant_count: u32,
+    /// FR-90 — what owns this room's meaning (an agent session), if anything:
+    /// a client renders such a room as that module's surface. Chat never
+    /// interprets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<roomler_ai_db::models::Binding>,
 }
 
 /// Optional sidebar-search params. Flat (never `#[serde(flatten)]` behind
@@ -453,5 +458,6 @@ fn to_response(r: roomler_ai_db::models::Room) -> RoomResponse {
         conference_status: r.conference_status,
         meeting_code: r.meeting_code,
         participant_count: r.participant_count,
+        binding: r.binding,
     }
 }

@@ -74,6 +74,8 @@ impl MessageDao {
             thread_metadata: None,
             author_id,
             author_type: AuthorType::User,
+            author_display: None,
+            binding: None,
             content,
             content_type: ContentType::Markdown,
             message_type,
@@ -100,6 +102,85 @@ impl MessageDao {
         }
 
         self.base.find_by_id(id).await
+    }
+
+    /// FR-90 — a message whose author is not a user: an agent session's turn
+    /// stub. `author_id` is the session's id, `author_display` the name a
+    /// client shows ("Claude · mars"), `binding` what the owning module calls
+    /// it. Never a reply, never mentions anyone, read by nobody yet.
+    ///
+    /// Not reachable from the REST route — only a module that owns sessions
+    /// writes these, so no user can post as an agent.
+    pub async fn create_agent(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        author_id: ObjectId,
+        author_display: String,
+        binding: roomler_ai_db::models::Binding,
+        content: String,
+    ) -> DaoResult<Message> {
+        let now = DateTime::now();
+        let message = Message {
+            id: None,
+            tenant_id,
+            room_id,
+            thread_id: None,
+            is_thread_root: false,
+            thread_metadata: None,
+            author_id,
+            author_type: AuthorType::Bot,
+            author_display: Some(author_display),
+            binding: Some(binding),
+            content,
+            content_type: ContentType::Markdown,
+            message_type: MessageType::Default,
+            embeds: Vec::new(),
+            attachments: Vec::new(),
+            mentions: Mentions::default(),
+            reaction_summary: Vec::new(),
+            referenced_message_id: None,
+            is_pinned: false,
+            is_edited: false,
+            edited_at: None,
+            nonce: None,
+            readby: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        let id = self.base.insert_one(&message).await?;
+        self.base.find_by_id(id).await
+    }
+
+    /// FR-90 — replace an agent message's content (a turn's stub as the turn
+    /// progresses). Only a live `bot` message in this tenant AND this room
+    /// moves, so this can never rewrite what a person wrote, nor a message
+    /// the caller did not name the room of.
+    pub async fn update_agent_content(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        message_id: ObjectId,
+        content: String,
+    ) -> DaoResult<Option<Message>> {
+        let updated = self
+            .base
+            .update_one(
+                doc! {
+                    "_id": message_id,
+                    "tenant_id": tenant_id,
+                    "room_id": room_id,
+                    "author_type": "bot",
+                    "deleted_at": null,
+                },
+                doc! { "$set": { "content": content, "updated_at": DateTime::now() } },
+            )
+            .await?;
+        if !updated {
+            return Ok(None);
+        }
+        Ok(Some(self.base.find_by_id(message_id).await?))
     }
 
     /// FR-32 — live messages in the tenant, for **reporting only**.

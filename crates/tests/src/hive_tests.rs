@@ -244,6 +244,47 @@ async fn grant_hive_run_to_member(app: &TestApp, seeded: &SeededTenant) {
     assert!(resp.status().is_success(), "assign: {:?}", resp.status());
 }
 
+/// The session room's messages as `token` reads them: (status, items).
+async fn room_messages(app: &TestApp, tid: &str, token: &str, room: &str) -> (u16, Vec<Value>) {
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/room/{room}/message?per_page=100"),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    (status, v["items"].as_array().cloned().unwrap_or_default())
+}
+
+/// Poll the session room until `pred` holds for its messages — the device's
+/// reports are applied, and their notes posted, by a task after the frame.
+async fn wait_messages(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    room: &str,
+    what: &str,
+    pred: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (code, items) = room_messages(app, tid, token, room).await;
+        assert_eq!(code, 200, "the owner reads the session's room");
+        if pred(&items) {
+            return items;
+        }
+        assert!(Instant::now() < deadline, "{what}: {items:#?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn bound_to(m: &Value, reference: &str) -> bool {
+    m["binding"]["module"] == "hive" && m["binding"]["ref"] == reference
+}
+
 /// The module's switch is the one that defaults OFF: a roll that ships the
 /// code serves none of it until an operator turns it on.
 #[tokio::test]
@@ -456,6 +497,198 @@ async fn a_device_refusal_is_the_callers_answer_with_its_gate() {
     assert_eq!(
         s["detail"], "no hive_accounts entry for this user",
         "kept on one line"
+    );
+
+    // P0d — and the session's room says so, in the device's own words.
+    let room = s["room_id"].as_str().expect("the session has a room");
+    let items = wait_messages(&app, &tid, &token, room, "a refusal note", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("refused the session"))
+        })
+    })
+    .await;
+    let note = items
+        .iter()
+        .find(|m| m["content"].as_str().unwrap().contains("refused"))
+        .unwrap();
+    assert!(
+        note["content"].as_str().unwrap().contains("hive_accounts"),
+        "{note}"
+    );
+    assert_eq!(note["author_type"], "bot");
+}
+
+/// P0d — a session is a `Secret` room the session itself writes into: a
+/// note when it starts, one stub per turn updated in place as the turn
+/// finishes, a note when it ends. Nobody else in the org can see the room,
+/// and a turn report from another device writes nothing.
+#[tokio::test]
+async fn a_session_is_a_secret_room_its_device_writes_stubs_into() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveroom").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-room", RUNS_HIVE).await;
+    let mut stranger = device(&app, &seeded, "hive-room-x", RUNS_HIVE).await;
+
+    let caller = start(&app, &tid, &token, &dev.agent_id, "/srv/app");
+    let target = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": f["session_id"], "fence": 1, "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let room = body["session"]["room_id"]
+        .as_str()
+        .expect("a session has a room")
+        .to_string();
+
+    // The room is the session's: bound to it, and secret to everyone else.
+    let r: Value = app
+        .auth_get(&format!("/api/tenant/{tid}/room/{room}"), &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["visibility"], "secret", "{r}");
+    assert!(bound_to(&r, &sid), "{r}");
+    assert_eq!(r["name"], "app", "titled like the session: {r}");
+    let other = &seeded.member.access_token;
+    let resp = app
+        .auth_get(&format!("/api/tenant/{tid}/room/{room}"), other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a non-member learns nothing");
+    assert_eq!(room_messages(&app, &tid, other, &room).await.0, 404);
+
+    // …and not a channel: the plan's `max_channels` gate and the compliance
+    // report count with `channel_filter`, which must not see a bound room,
+    // or a few sessions would lock the org out of creating channels.
+    // The seeded rooms are the positive control: a filter that saw nothing
+    // would pass the absence alone.
+    let rooms = app.db.collection::<Document>("rooms");
+    let in_org = doc! { "tenant_id": ObjectId::parse_str(&tid).unwrap() };
+    let mut live = doc! { "deleted_at": null };
+    live.extend(in_org.clone());
+    let mut channels = roomler_ai_services::dao::room::RoomDao::channel_filter();
+    channels.extend(in_org);
+    let seeded_rooms = seeded.rooms.len() as u64;
+    assert_eq!(rooms.count_documents(live).await.unwrap(), seeded_rooms + 1);
+    assert_eq!(
+        rooms.count_documents(channels).await.unwrap(),
+        seeded_rooms,
+        "the seeded rooms are channels; the session's room is not"
+    );
+
+    // The start note, authored by the session.
+    let items = wait_messages(&app, &tid, &token, &room, "the start note", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Started on"))
+        })
+    })
+    .await;
+    let started = items
+        .iter()
+        .find(|m| m["content"].as_str().unwrap().contains("Started on"))
+        .unwrap();
+    assert_eq!(started["author_type"], "bot");
+    assert_eq!(started["author_name"], "Claude · hive-room");
+    assert_eq!(started["author_id"], sid, "the session authors it");
+    assert!(
+        started["content"].as_str().unwrap().contains("**dev**"),
+        "as the account the device reported: {started}"
+    );
+
+    // A turn starts: one stub, bound to the session's turn 1.
+    let turn_ref = format!("{sid}#1");
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 1,
+               "status": "running", "prompted_by": seeded.admin.id, "steps": 0}),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "a running stub", |items| {
+        items.iter().any(|m| bound_to(m, &turn_ref))
+    })
+    .await;
+    let stub = items.iter().find(|m| bound_to(m, &turn_ref)).unwrap();
+    let stub_id = stub["id"].as_str().unwrap().to_string();
+    let content = stub["content"].as_str().unwrap();
+    assert!(
+        content.contains("Turn 1") && content.contains("working"),
+        "{content}"
+    );
+    assert!(content.contains("asked by"), "attributed: {content}");
+
+    // It finishes: the SAME message is updated, no second stub.
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 1,
+               "status": "ok", "prompted_by": seeded.admin.id, "steps": 3,
+               "duration_ms": 42000, "cost_usd": 0.12}),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "the stub updated", |items| {
+        items.iter().any(|m| {
+            bound_to(m, &turn_ref) && m["content"].as_str().is_some_and(|c| c.contains("done"))
+        })
+    })
+    .await;
+    let stubs: Vec<&Value> = items.iter().filter(|m| bound_to(m, &turn_ref)).collect();
+    assert_eq!(stubs.len(), 1, "one stub per turn: {stubs:#?}");
+    assert_eq!(stubs[0]["id"], stub_id, "updated in place");
+    let content = stubs[0]["content"].as_str().unwrap();
+    assert!(
+        content.contains("3 steps") && content.contains("42 s") && content.contains("$0.12"),
+        "{content}"
+    );
+
+    // Another device's report for this session writes nothing. Its frame is
+    // applied by ITS connection's task, so give that time before looking.
+    let stranger_ref = format!("{sid}#2");
+    send(
+        &mut stranger.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 2, "status": "running"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, items) = room_messages(&app, &tid, &token, &room).await;
+    assert!(
+        !items.iter().any(|m| bound_to(m, &stranger_ref)),
+        "another device's turn report must not write into the room: {items:#?}"
+    );
+
+    // The session's device ends it: the end note follows, and the stranger's
+    // turn 2 still never appeared.
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "ended",
+               "detail": "the harness exited"}),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "the end note", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Session ended"))
+        })
+    })
+    .await;
+    assert!(
+        !items.iter().any(|m| bound_to(m, &stranger_ref)),
+        "another device's turn report must not write into the room: {items:#?}"
     );
 }
 
@@ -748,6 +981,55 @@ async fn a_silent_device_leaves_the_start_pending_and_is_asked_again() {
     }
 }
 
+/// An unanswered start whose device comes back as a build that does not run
+/// sessions is over: nothing there can launch it. The record says `lost`, and
+/// the session's room says so — once — like every other way a session ends.
+#[tokio::test]
+async fn a_start_its_device_can_no_longer_run_is_lost_and_the_room_says_so() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivelost").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-lost", RUNS_HIVE).await;
+
+    let caller = start(&app, &tid, &token, &dev.agent_id, "/srv");
+    let target = async { read_until(&mut dev.ws, "rc:hive.start").await.unwrap() };
+    let (body, _) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "pending", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let room = body["session"]["room_id"]
+        .as_str()
+        .expect("the session has a room")
+        .to_string();
+
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let mut ws = connect(&app, &dev.token, &dev.machine, NO_HIVE).await;
+    let s = wait_status(&app, &tid, &token, &sid, "lost").await;
+    assert_eq!(s["end_reason"], "never_answered", "{s}");
+    assert!(
+        read_until(&mut ws, "rc:hive.start").await.is_none(),
+        "a start was re-sent to a build that would drop it"
+    );
+
+    let ended = |m: &Value| {
+        bound_to(m, &sid)
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("⏹ Session ended"))
+    };
+    let items = wait_messages(&app, &tid, &token, &room, "the lost note", |items| {
+        items.iter().any(ended)
+    })
+    .await;
+    let note = items.iter().find(|m| ended(m)).unwrap();
+    let text = note["content"].as_str().unwrap();
+    assert!(text.contains("never answered"), "{text}");
+    assert!(text.contains("does not run agent sessions"), "{text}");
+    assert_eq!(note["author_type"], "bot");
+    assert_eq!(items.iter().filter(|m| ended(m)).count(), 1, "{items:#?}");
+}
+
 /// A stop for a device that is away is queued, and delivered when it
 /// connects — the same path as an online one.
 #[tokio::test]
@@ -842,6 +1124,79 @@ async fn removing_a_member_ends_their_sessions_and_tells_the_device() {
         .expect("the device is told to stop");
     assert_eq!(order["session_id"], sid);
     assert_eq!(order["reason"], "member_removed");
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_str("status").unwrap(), "ended");
+    assert_eq!(s.get_str("end_reason").unwrap(), "member_removed");
+}
+
+/// The same removal while the device is AWAY: the record ends at once, but
+/// the stop cannot reach it, and nothing is pending for reconcile to re-send.
+/// The device's own replay on reconnect — "I run this, idle" — is what it is
+/// answered on: a stop, with the record's reason. Its `ended` reply changes
+/// nothing, and draws no second stop.
+#[tokio::test]
+async fn a_device_that_missed_the_end_is_told_when_it_reports_the_session() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivemissed").await;
+    let tid = seeded.tenant_id.clone();
+    grant_hive_run_to_member(&app, &seeded).await;
+    let mut dev = device(&app, &seeded, "hive-missed", RUNS_HIVE).await;
+
+    let caller = start(
+        &app,
+        &tid,
+        &seeded.member.access_token,
+        &dev.agent_id,
+        "/srv",
+    );
+    let target = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": f["session_id"], "fence": 1}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{tid}/member/{}", seeded.member.id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {:?}", resp.status());
+    assert_eq!(stored(&app, &sid).await.get_str("status").unwrap(), "ended");
+
+    // Back, and still running it — as the device's replay says.
+    let mut ws = connect(&app, &dev.token, &dev.machine, RUNS_HIVE).await;
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+    )
+    .await;
+    let order = read_until(&mut ws, "rc:hive.stop")
+        .await
+        .expect("a device running a session that is over is told to stop");
+    assert_eq!(order["session_id"], sid);
+    assert_eq!(order["fence"], 1);
+    assert_eq!(order["reason"], "member_removed");
+
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "ended"}),
+    )
+    .await;
+    assert!(
+        read_until(&mut ws, "rc:hive.stop").await.is_none(),
+        "an `ended` answer drew another stop"
+    );
     let s = stored(&app, &sid).await;
     assert_eq!(s.get_str("status").unwrap(), "ended");
     assert_eq!(s.get_str("end_reason").unwrap(), "member_removed");

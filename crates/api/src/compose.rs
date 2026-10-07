@@ -183,10 +183,15 @@ impl Modules {
         {
             // `hive → fleet`, the same seam: a session's frames ride the
             // agent socket, and its gate reads the Hub's per-connection caps.
-            if let Some(fleet) = modules.fleet.clone() {
-                modules.hive =
-                    init_one::<roomler_ai_mod_hive::HiveState>(core.clone(), settings, fleet)
-                        .await?;
+            // `hive → chat` (P0d): a session is a room. Either switched off
+            // means no `hive` — a session nobody could see is no session.
+            if let (Some(fleet), Some(chat)) = (modules.fleet.clone(), modules.chat.clone()) {
+                modules.hive = init_one::<roomler_ai_mod_hive::HiveState>(
+                    core.clone(),
+                    settings,
+                    (fleet, chat),
+                )
+                .await?;
                 if let Some(m) = &modules.hive {
                     modules.ws.extend(m.ws().handlers);
                 }

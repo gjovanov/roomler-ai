@@ -195,7 +195,7 @@ The rules that keep it a monolith rather than a pile of crates:
   namespaces, index specs, jobs, lifecycle hooks, capabilities — and the host composes the
   concrete types under `#[cfg(feature)]`. No dynamic loading, no runtime registry.
 - **A DAG, not peers.** Any module may call core; `conference → chat`, `remote → fleet`,
-  `network → fleet`, `hive → fleet`. Core never calls a module: the inverse flows (tenant
+  `network → fleet`, `hive → fleet`, `hive → chat`. Core never calls a module: the inverse flows (tenant
   archive, agent removal, member removal) are hooks that core invokes in a fixed order.
 - **Core membership.** Something lives in core only if at least two modules need it **and** it is
   identity, tenancy or infrastructure. Everything else belongs to a module.

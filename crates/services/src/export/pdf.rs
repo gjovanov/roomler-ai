@@ -17,9 +17,10 @@ pub fn export_conversation(
     pdf.add_text("", 10.0, false); // blank line
 
     for msg in messages {
-        let author = users
-            .get(&msg.author_id)
-            .map(|u| u.display_name.as_str())
+        // FR-90 — an agent's turn carries its own name; a user's comes from users.
+        let author = msg
+            .agent_display()
+            .or_else(|| users.get(&msg.author_id).map(|u| u.display_name.as_str()))
             .unwrap_or("Unknown");
         let timestamp = msg
             .created_at

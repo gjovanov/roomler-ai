@@ -294,6 +294,30 @@ impl AgentSessionDao {
             .await
     }
 
+    /// Record the newest turn's stub — only when it IS newer, so two reports
+    /// racing across pods cannot move it backwards.
+    pub async fn set_last_turn(
+        &self,
+        id: ObjectId,
+        stub: crate::model::TurnStub,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "$or": [
+                        { "last_turn": Bson::Null },
+                        { "last_turn.turn": { "$lt": i64::from(stub.turn) } },
+                    ],
+                },
+                doc! { "$set": { "last_turn": {
+                    "turn": i64::from(stub.turn),
+                    "message_id": stub.message_id,
+                } } },
+            )
+            .await
+    }
+
     /// What a device must be told when it connects: stops it has not
     /// confirmed, and starts it never answered.
     pub async fn needing_delivery(

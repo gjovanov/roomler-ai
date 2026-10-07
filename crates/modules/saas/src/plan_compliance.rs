@@ -111,7 +111,16 @@ pub async fn admin_plan_compliance(
     let count = doc! { "$sum": 1 };
 
     let members = group_by_tenant(&state, "tenant_members", count.clone(), None).await?;
-    let channels = group_by_tenant(&state, "rooms", count.clone(), Some(live.clone())).await?;
+    // The gate's own definition (a bound room — an agent session's — is not
+    // a channel), so the report never calls an org over a limit the gate
+    // would let it stay under.
+    let channels = group_by_tenant(
+        &state,
+        "rooms",
+        count.clone(),
+        Some(roomler_ai_services::dao::room::RoomDao::channel_filter()),
+    )
+    .await?;
     let devices = group_by_tenant(&state, "agents", count.clone(), Some(live.clone())).await?;
     let clients =
         group_by_tenant(&state, "tunnel_clients", count.clone(), Some(live.clone())).await?;
