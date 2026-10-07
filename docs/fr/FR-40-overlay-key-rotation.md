@@ -214,7 +214,7 @@ and permission-gated; a defective push is stopped by the device switch.
       `KeyRotate` frame has no key-shaped field, and the audit row stores none
 - [ ] (P2) a join presenting a retired key is refused `key_retired`, and a device with the verb
       is ordered to rotate instead of staying off-mesh
-- [ ] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** —
       [`docs/overlay-key-rotation.md`](../overlay-key-rotation.md) in the house style of the
       other `docs/*.md`: the rotation end to end as a `mermaid` sequence diagram, the
       server-side state resolution as a `mermaid` flowchart, the route's four decision cells,
@@ -227,7 +227,9 @@ and permission-gated; a defective push is stopped by the device switch.
       `overlay-communication.md` §1, `security-baseline.md` §4, `api.md`, `real-time.md` and
       `data-model.md`. ⚠️ **Added retroactively (2026-10-07)**: FR-40 opened on 2026-08-29,
       before the docs-before-close rule (#1401, 2026-09-05), and a close after that date
-      binds it. Ticked when the page is on master
+      binds it. Ticked when the page is on master. **On master since 2026-10-07 as `a1d0027f9` (#1833)**:
+      `docs/overlay-key-rotation.md` (338 lines, 2 mermaid diagrams), indexed at
+      `docs/README.md:109` with its map node.
 
 ## Open decisions
 
