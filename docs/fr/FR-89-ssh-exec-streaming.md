@@ -173,32 +173,32 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | **in review** [#1830](https://github.com/gjovanov/roomler-ai/pull/1830) — the row was rebased onto master beside the FR-90 claim ([#1828](https://github.com/gjovanov/roomler-ai/pull/1828)), which landed meanwhile: the ledger arbitrated a textual conflict, not a number collision |
 | P1 | `run_streamed` + `StreamRedactor` + Windows drain streaming in the engine; SSH exec on it; `channel_close`/`Drop` cancel; `ssh_exec_streaming`; tests; docs (`docs/roomler-ssh.md` §3, the sftp note, `docs/fleet-rpc.md`, `docs/README.md`) | `ssh_exec_streaming = false` (next daemon restart) | **in review** [#1830](https://github.com/gjovanov/roomler-ai/pull/1830), stacked on #1819: 87/87 `exec::` + `ssh::` tests at default concurrency, twice; the SSH suite's command-running tests now hold one of `MAX_CONCURRENT_PER_AGENT` slots (they share the process-wide `exec::shared()` engine, and a fifth overlapping test was being refused) |
-| P2 | agent release; field verification on the matrix (Linux root daemon, Windows SYSTEM, Windows `console_user` corp laptop, macOS); tick AC1–AC9; close | as P1 | owed |
+| P2 | agent release; field verification on the matrix (Linux root daemon, Windows SYSTEM, Windows `console_user` corp laptop, macOS); tick AC1–AC9; close | as P1 | **released** `agent-v0.4.117` → `88f24d91c` (#1838, 2026-10-07 11:29Z; 28 assets with `.asc`, `setup-v0.4.117` in lockstep, the MSI's ProductVersion bound to the tag by `real_published_msi`); **field-verified** 2026-10-07 — see the log; the macOS and relay-carried corporate-laptop GREEN rows wait for those devices' own updaters; the close is the operator's |
 
 ## Acceptance criteria
 
-- [ ] **AC1** — `ssh <node> 'cat bigfile' > f` for a file over 1 MiB lands whole and byte-exact (SHA-256
+- [x] **AC1** — `ssh <node> 'cat bigfile' > f` for a file over 1 MiB lands whole and byte-exact (SHA-256
   matches on both ends), exit 0, no ceiling notice. *(Unit: an in-process 2 MiB exec over russh. Field: a
   real file on a Linux and a Windows device.)*
-- [ ] **AC2** — Output streams: `ssh <node> 'for i in 1 2 3; do date; sleep 1; done'` prints each line as it
+- [x] **AC2** — Output streams: `ssh <node> 'for i in 1 2 3; do date; sleep 1; done'` prints each line as it
   happens, not all three after three seconds. *(Field.)*
-- [ ] **AC3** — A command longer than the old `MAX_TIMEOUT_MS` (`sleep 330; echo done`) runs to completion
+- [x] **AC3** — A command longer than the old `MAX_TIMEOUT_MS` (`sleep 330; echo done`) runs to completion
   with exit 0. *(Unit: a request's timeout is ignored by the streamed path. Field.)*
-- [ ] **AC4** — Closing the channel (Ctrl-C at the client) or disconnecting kills the command **and its
+- [x] **AC4** — Closing the channel (Ctrl-C at the client) or disconnecting kills the command **and its
   process tree**: nothing of it is left running on the device. *(Unit: a file-writing loop stops growing after
   `channel.close()` and after a client disconnect. Field: `pgrep` after Ctrl-C.)*
-- [ ] **AC5** — A client that stops reading stops the command, and the daemon's memory does not grow:
+- [x] **AC5** — A client that stops reading stops the command, and the daemon's memory does not grow:
   `ssh <node> 'cat big' | (sleep 30; wc -c)` holds the command for 30 s and then delivers everything. *(Unit:
   a stalled consumer leaves the run unfinished and loses no bytes. Field: the daemon's RSS during the pause.)*
-- [ ] **AC6** — Streamed output is redacted like buffered output, including a secret split across a chunk
+- [x] **AC6** — Streamed output is redacted like buffered output, including a secret split across a chunk
   boundary: the agent token, `Bearer …` and JWT shapes never leave the host. *(Unit: every split offset. Field:
   `ssh <node> 'cat <config>' | grep agent_token` prints `[redacted]`.)*
-- [ ] **AC7** — Windows `console_user` sessions (the managed corporate laptops) stream too, as the signed-in
+- [x] **AC7** — Windows `console_user` sessions (the managed corporate laptops) stream too, as the signed-in
   user. *(Field — the only lane that runs that spawn.)*
-- [ ] **AC8** — Fleet RPC is untouched: `roomler exec` still caps at 1 MiB with `truncated`, times out at its
+- [x] **AC8** — Fleet RPC is untouched: `roomler exec` still caps at 1 MiB with `truncated`, times out at its
   limit, and answers the same JSON. *(Unit: the existing engine tests, unmodified. Field: one `roomler exec`
   over 1 MiB on the new release.)*
-- [ ] **AC9** — `ssh_exec_streaming = false` restores the buffered behaviour exactly (the ceiling notice is
+- [x] **AC9** — `ssh_exec_streaming = false` restores the buffered behaviour exactly (the ceiling notice is
   back). *(Unit. Field: one device flipped, restarted, re-checked.)*
 - [x] **AC10** — Docs: `docs/roomler-ssh.md` §3 rewritten for streaming (mermaid exec path, the lifetime
   table, the kill switch, the corrected Windows sftp note), `docs/fleet-rpc.md` cross-references the streamed
@@ -230,4 +230,15 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
 
 | When (UTC) | Release | What | Result |
 |---|---|---|---|
-| | | | |
+| 2026-10-07 10:30–10:49 | **0.4.116** (RED, before anything shipped) | a 2,000,000-byte single-write stream, and five lines printed one second apart, each stamped by the client on arrival — on a Linux fleet host (direct), a Windows corporate laptop as `console_user` (direct **and** relay-carried), the macOS daemon (direct) | **cut at 1,048,576 bytes on every node** (the same SHA-256 of 1 MiB of `x`), `ssh` exit 141 (SIGPIPE) on Linux/macOS and 0 on Windows, no notice (#1819's, unreleased); **all five lines arrived together ~7 s after the first**. A relay-carried Linux WSL node refuses by name (`ssh_enabled` off, gate 4) and was left as its owner set it |
+| 2026-10-07 11:13–11:29 | release | `agent-v0.4.117` on `88f24d91c`; the three Linux fleet hosts confirmed through `roomlerd self-update` (which logged "installer `.asc` verified against the pinned release signing key" on `--check-only` first); every other device on its own 4 h updater cadence | 28 assets, each installer with `.asc` + `.sha256`; `setup-v0.4.117` in lockstep; "Resolved MSI ProductVersion: 0.4.117 (from 0.4.117)"; the downloaded perMachine MSI passed `real_published_msi` (binds to its tag, refuses a forged one); hosted image not promoted |
+| 2026-10-07 13:05–13:18 | **0.4.117** (GREEN) **AC1 / AC2 / AC7** | the same two runs on two Linux fleet hosts (A relay-carried at the time, 47 ms, fresh from its restart; B direct, 20 ms) and a Windows corporate laptop as `console_user` (relay-carried at the time, 52 ms) | **2,000,000 bytes, byte-exact** (SHA-256 equals the local reference), exit 0, no notice, on all three; **lines arrive one per second** (arrival deltas 0.9–1.1 s) |
+| 2026-10-07 13:07, 13:18 | 0.4.117 **AC4 (D4)** | a tree under one exec (shell → two wrapper shells → two long sleeps, a marker in the wrappers' command lines), the client SIGINT'd after 6 s, the node asked 8 s later | Linux and Windows: the tree was alive at the interrupt (rc 124, `started` seen) and **nothing of it survived** — the process-group kill and the `taskkill /T` path |
+| 2026-10-07 13:08–13:17 | 0.4.117 **AC9** | Linux host A: `config set ssh_exec_streaming false` + restart; then `true` + restart | off ⇒ **1,048,576 bytes, exit 141, the notice "output stopped at 1048576 bytes, the exec ceiling (ssh_exec_streaming is off on this device)"**, the start-up line `exec_streaming=false`; on ⇒ 2,000,000 bytes, one line per second, `exec_streaming=true` |
+| 2026-10-07 13:20 | 0.4.117 **AC6** | over the streamed path: `Authorization: Bearer <30-char run>`, a three-segment base64url shape, a route-table line | `Bearer [redacted]`, `[redacted]`, the route line untouched |
+| 2026-10-07 13:20 | 0.4.117 **AC8** | `roomler exec` of the same 2,000,000-byte command | **262,144 bytes**, "[output truncated at the device's limit]", exit 141 — Fleet RPC untouched |
+| 2026-10-07 13:21–13:27 | 0.4.117 **AC3** | `sleep 330; echo done-after-330s` on Linux host A | **completed in 332 s, exit 0, the line delivered** — past the old `MAX_TIMEOUT_MS` (300 s) |
+| 2026-10-07 13:21–13:22 | 0.4.117 **AC5** | a 20,000,000-byte stream into a consumer that read nothing for 30 s; the privileged daemon's RSS sampled on the device before, twice during, and after | **20,000,000 bytes** once the consumer read (40 s total, exit 0); RSS **flat at 60,164 KB** through the park, 60,580 KB after the drain |
+| 2026-10-07 13:17 | 0.4.117 **#1816 (FR-86 P2 nits) no-regression, client half** | this client's daemon restarted on 0.4.117 | all 7 declared routes `active`, **7/7 live flows on `quic-v1`**; the exit half follows the two exits' (the corporate laptops') own updates |
+| 2026-10-07 13:18 | 0.4.117 post-roll health | `roomler peers` / `roomler devices` | the three servers back on **direct** (18–20 ms) minutes after their restarts; **12 of 17** devices online, the pre-roll count |
+| 2026-10-07 13:09 | 0.4.117 (harness note) | a session opened 0.7 s before a scheduled daemon restart | stalled at 94,208 bytes and the client waited: the daemon *is* the SSH server, so a restart ends a session without a FIN — expected; the AC9 harness now waits 90 s after a restart (a `systemctl restart` of this daemon takes ~30 s end to end) |
