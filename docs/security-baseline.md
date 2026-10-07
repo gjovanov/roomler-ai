@@ -254,7 +254,10 @@ possession of the private half, so a second enrolled device could advertise a
 peer's key and black-hole its DERP traffic (registration is last-writer-wins).
 
 Live-scoped so tombstones do not block a joiner; `machine_id`-scoped so a device
-rotating its **own** key is unaffected.
+rotating its **own** key is unaffected. That rotation is an admin action from the
+device grid — an *order* the device answers with a locally minted key, never a key
+the server chose or saw; the device's re-join under the new key is what the server
+verifies: [`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
 
 ---
 

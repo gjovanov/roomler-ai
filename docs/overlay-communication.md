@@ -89,6 +89,13 @@ The data plane is always **WireGuard**: a userspace boringtun tunnel presenting
 a `roomler0` TUN on `100.64.0.0/10` (CGNAT range, Tailscale convention) at MTU
 1280. Only the *envelope* under WireGuard changes between tiers.
 
+**A node's identity on the data plane is its WireGuard public key**, minted on the
+device at enrollment; the server distributes the public half in the netmap and never
+holds the private one. An admin can retire it from the device grid — the server
+*orders* a re-mint it never sees, the device persists the new key and re-joins under
+it, and every peer reinstalls the carrier on the resulting netmap upsert:
+[`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
+
 ### Address leases — allocation and release
 
 Each tenant has one `overlay_networks` row: a CIDR (`100.64.0.0/10`), a
