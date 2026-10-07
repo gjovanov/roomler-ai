@@ -157,11 +157,11 @@ pub async fn handle_agent_ssh_request(
 
     // The origin's owner is the person whose permissions this runs under. A
     // device whose row vanished mid-flight has no principal, so it gets
-    // nothing.
+    // nothing — and LIVE means a removed device counts as vanished.
     let origin = match state
         .fleet
         .agents
-        .find_in_tenant(tenant_id, origin_agent_id)
+        .find_live_in_tenant(tenant_id, origin_agent_id)
         .await
     {
         Ok(a) => a,

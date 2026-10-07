@@ -246,9 +246,15 @@ pub async fn authorize(
 
     // The device-originated leg only: the ORIGINATING device must be blessed.
     // Without this, compromising any enrolled laptop would inherit its owner's
-    // SSH rights across the whole fleet.
+    // SSH rights across the whole fleet. LIVE: a removed device cannot
+    // originate, whatever `can_originate` its tombstone still says (#1821).
     if let Some(origin) = caller.origin_agent_id {
-        match state.fleet.agents.find_in_tenant(tenant_id, origin).await {
+        match state
+            .fleet
+            .agents
+            .find_live_in_tenant(tenant_id, origin)
+            .await
+        {
             Ok(a) if a.ssh_policy.can_originate => {}
             _ => return Err(SshDenyReason::OriginNotAllowed),
         }
@@ -623,10 +629,12 @@ async fn load_agent(
 ) -> Result<Agent, ApiError> {
     let aid = ObjectId::parse_str(agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent id".into()))?;
+    // LIVE: the session target and the policy write both come through here,
+    // and neither has a meaning for a removed device (#1821).
     state
         .fleet
         .agents
-        .find_in_tenant(tenant_id, aid)
+        .find_live_in_tenant(tenant_id, aid)
         .await
         .map_err(|_| ApiError::NotFound("Agent not found".into()))
 }

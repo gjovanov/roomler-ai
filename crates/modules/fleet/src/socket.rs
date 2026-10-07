@@ -177,7 +177,10 @@ pub async fn handle_agent_socket(
     // another key is the proof (P1d, third cycle — a lost report plus two
     // reconnects turned one click into three rotations).
     let mut pending_key_rotation: Option<String> = None;
-    if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
+    // LIVE: the upgrade already refused a tombstone with the typed goodbye,
+    // so this only differs if the device was removed in the meantime — and
+    // then there is nothing to seed; the removal's kick is on its way.
+    if let Ok(row) = state.agents.find_live_in_tenant(tenant_id, agent_id).await {
         if let Some(req) = row.key_rotation.as_ref()
             && !roomler_ai_remote_control::models::order_is_satisfied(
                 req,
@@ -788,10 +791,10 @@ async fn handle_agent_exec_request(
 
     // Resolve the origin's owner — the person whose permissions this runs
     // under. A device whose row vanished mid-flight has no principal, so it
-    // gets nothing.
+    // gets nothing — and LIVE means a removed device counts as vanished.
     let origin = match state
         .agents
-        .find_in_tenant(tenant_id, origin_agent_id)
+        .find_live_in_tenant(tenant_id, origin_agent_id)
         .await
     {
         Ok(a) => a,
@@ -895,8 +898,10 @@ pub async fn resolve_exec_target(
     tenant_id: bson::oid::ObjectId,
     target: &str,
 ) -> Option<roomler_ai_remote_control::models::Agent> {
+    // LIVE, like the by-name arm below, which searches the live listing: an
+    // id must not reach a device a name cannot (#1821).
     if let Ok(oid) = bson::oid::ObjectId::parse_str(target)
-        && let Ok(a) = state.agents.find_in_tenant(tenant_id, oid).await
+        && let Ok(a) = state.agents.find_live_in_tenant(tenant_id, oid).await
     {
         return Some(a);
     }
@@ -1160,7 +1165,13 @@ pub fn ws_upgrade_agent(
             // Verify the agent still exists and isn't quarantined/deleted before
             // we pump any signalling. One Mongo read per connect is cheap and
             // gives us a clean revocation story without needing a token blacklist.
-            let agent = match state.agents.find_in_tenant(tenant_id, agent_id).await {
+            //
+            // ANY, not live (#1821): the tombstone is what this read is FOR.
+            // A removed device must reach the `refusal_reason` arm below and
+            // get the typed `rc:goodbye AgentDeleted` it exits 7 on; a bare
+            // `NotFound` here drops the socket with no frame, and the daemon
+            // reads that as a network fault and reconnects forever.
+            let agent = match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
                 Ok(a) => a,
                 Err(e) => {
                     warn!(%agent_id, %e, "agent lookup failed on WS connect");

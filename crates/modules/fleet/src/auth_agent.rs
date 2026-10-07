@@ -140,9 +140,14 @@ pub async fn authenticate(
     // against what reads as server trouble, instead of hearing that its
     // credential is dead (and the agent's self-unenroll deliberately
     // treats 401 as "already gone").
+    //
+    // ANY, not live (#1821): this reader's job IS the tombstone. A removed
+    // device must take the `refusal_reason` branch below and hear "deleted",
+    // and the `NotFound` arm must keep meaning what the paragraph above says
+    // — a REAPED row — so the log can tell the two apart.
     let agent = fleet
         .agents
-        .find_in_tenant(tenant_id, agent_id)
+        .find_any_in_tenant(tenant_id, agent_id)
         .await
         .map_err(|e| match e {
             roomler_ai_services::dao::base::DaoError::NotFound => {

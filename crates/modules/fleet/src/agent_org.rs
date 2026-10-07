@@ -136,10 +136,12 @@ pub async fn join_org(
     .await?;
 
     // The device must be OURS (tenant-scoped lookup) — an agent id alone
-    // must never address a device in someone else's org.
+    // must never address a device in someone else's org — and LIVE: a join
+    // token minted for a removed device would be an invitation nothing can
+    // consume (#1821).
     let agent = state
         .agents
-        .find_in_tenant(tid, aid)
+        .find_live_in_tenant(tid, aid)
         .await
         .map_err(|_| ApiError::NotFound("Device not found in this organization".into()))?;
 
@@ -321,9 +323,11 @@ pub async fn join_targets(
         "MANAGE_AGENTS",
     )
     .await?;
+    // LIVE: the picker offers what a join will work for, and a removed device
+    // joins nothing.
     let agent = state
         .agents
-        .find_in_tenant(tid, aid)
+        .find_live_in_tenant(tid, aid)
         .await
         .map_err(|_| ApiError::NotFound("Device not found in this organization".into()))?;
 
