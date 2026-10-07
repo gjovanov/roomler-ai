@@ -9,18 +9,42 @@
 //! the REST one — who may read the room, the fan-out to its members — and the
 //! caller supplies only what it owns: the name, the binding, the content.
 //!
+//! [`BoundChat`] is STATELESS — the core plus two DAOs over `core.db` — so a
+//! module built on chat re-creates it with [`BoundChat::new`] rather than
+//! taking chat's state as its `Module::Deps` (FR-69 rule 5: only a live object
+//! is a dependency; `remote`'s Hub is one, a DAO is not).
+//!
 //! None of this is reachable from a route: no user can bind a room or post as
 //! an agent.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bson::oid::ObjectId;
-use roomler_ai_db::models::{Binding, Room};
+use roomler_ai_db::models::{Binding, Message, Room};
 use roomler_ai_services::dao::base::DaoResult;
+use roomler_ai_services::dao::message::MessageDao;
+use roomler_ai_services::dao::room::RoomDao;
+use roomler_core::Core;
 
-use crate::ChatState;
+/// Chat's bound-room surface for another module.
+#[derive(Clone)]
+pub struct BoundChat {
+    core: Core,
+    rooms: Arc<RoomDao>,
+    messages: Arc<MessageDao>,
+}
 
-impl ChatState {
+impl BoundChat {
+    /// Built from the core alone: nothing here outlives a call.
+    pub fn new(core: &Core) -> Self {
+        Self {
+            rooms: Arc::new(RoomDao::new(&core.db)),
+            messages: Arc::new(MessageDao::new(&core.db)),
+            core: core.clone(),
+        }
+    }
+
     /// A `Secret` room bound to `binding`, with `owner` as its only member,
     /// at a `path` the caller guarantees unique.
     pub async fn create_bound_room(
@@ -65,8 +89,8 @@ impl ChatState {
     }
 
     /// Replace an agent message's content and fan out `message:update`.
-    /// `false` = no such agent message in this tenant — a person's message is
-    /// never touched by this path.
+    /// `false` = no such agent message in this tenant and room — a person's
+    /// message is never touched by this path.
     pub async fn update_agent_message(
         &self,
         tenant_id: ObjectId,
@@ -87,12 +111,7 @@ impl ChatState {
         }
     }
 
-    async fn fan_out(
-        &self,
-        room_id: ObjectId,
-        kind: &str,
-        message: roomler_ai_db::models::Message,
-    ) {
+    async fn fan_out(&self, room_id: ObjectId, kind: &str, message: Message) {
         let members = match self.rooms.find_member_user_ids(room_id).await {
             Ok(m) => m,
             Err(e) => {
@@ -103,8 +122,8 @@ impl ChatState {
         let response = crate::message::to_response(message, &HashMap::new(), None);
         let event = serde_json::json!({ "type": kind, "data": &response });
         roomler_core::ws::dispatcher::broadcast_with_redis(
-            &self.ws_storage,
-            &self.redis_pubsub,
+            &self.core.ws_storage,
+            &self.core.redis_pubsub,
             &members,
             &event,
         )
