@@ -5216,10 +5216,22 @@ mod tests {
         // FR-84 D3 — nor may the server switch the LOCAL restart on, or ask
         // for a restart at all: the daemon restarts itself only when a local
         // client asks over the LocalAPI.
+        // FR-90 — nor any Hive gate. Which local account runs an agent
+        // session (`hive_accounts`) and where it may run (`hive_roots`) are
+        // exactly what a compromised server must not be able to choose, and
+        // `hive_enabled` is the device's refusal like `exec_enabled` is. (The
+        // design allows `hive_enabled` to become pushable to devices that
+        // opted into remote config; until a change argues that here, none is.)
         for forbidden in [
             "remote_config_enabled",
             "ssh_max_privilege",
             "local_restart_enabled",
+            "hive_enabled",
+            "hive_accounts",
+            "hive_roots",
+            "hive_harness",
+            "hive_api_key_helper",
+            "hive_max_sessions",
         ] {
             assert!(
                 !keys.contains(&forbidden),
