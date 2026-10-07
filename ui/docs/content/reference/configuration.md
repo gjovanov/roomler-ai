@@ -80,6 +80,7 @@ property these gates exist for.
 | `hive_accounts` | empty | Which local account each member's sessions run as, `{"<user id or email>": "<account>"}`. **Empty means nobody**; never root |
 | `hive_roots` | empty | Folders sessions may run in, checked on the resolved path. **Empty means nowhere** |
 | `hive_max_sessions` | `4` | Sessions this machine runs at once |
+| `hive_api_key_helper` | unset | A command **the daemon** runs (as SYSTEM/root) to print the model API key. Sessions never see the key: each gets a token for this machine's loopback model sidecar, good only for that session's model calls while it runs here — not for anything else the key opens, such as files or batches. Unset means sessions have no model access |
 
 :::danger These are the gates the server cannot write
 Every one of the settings above is device-owned. That is the property that makes
