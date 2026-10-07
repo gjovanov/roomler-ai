@@ -29,6 +29,68 @@ pub struct RoomDao {
     db: Database,
 }
 
+/// What differs between two new rooms; everything else starts the same.
+struct NewRoom {
+    tenant_id: ObjectId,
+    parent_id: Option<ObjectId>,
+    name: String,
+    path: String,
+    creator_id: ObjectId,
+    is_open: bool,
+    media_settings: Option<MediaSettings>,
+    conference_settings: Option<ConferenceSettings>,
+    meeting_code: Option<String>,
+    join_url: Option<String>,
+}
+
+/// The one constructor every new room goes through.
+fn new_room(r: NewRoom) -> Room {
+    let now = DateTime::now();
+    Room {
+        id: None,
+        tenant_id: r.tenant_id,
+        parent_id: r.parent_id,
+        name: r.name,
+        path: r.path,
+        emoji: None,
+        topic: None,
+        purpose: None,
+        icon: None,
+        position: 0,
+        is_open: r.is_open,
+        // New rooms are Public: the room-level control is opt-IN, and a
+        // room nobody has joined yet that defaulted to members-only would
+        // be unreachable by everyone including its creator.
+        visibility: RoomVisibility::Public,
+        is_archived: false,
+        is_read_only: false,
+        is_default: false,
+        permission_overwrites: Vec::new(),
+        tags: Vec::new(),
+        media_settings: r.media_settings,
+        conference_settings: r.conference_settings,
+        conference_status: None,
+        current_call_id: None,
+        meeting_code: r.meeting_code,
+        join_url: r.join_url,
+        organizer_id: None,
+        co_organizer_ids: Vec::new(),
+        creator_id: r.creator_id,
+        last_message_id: None,
+        last_activity_at: None,
+        member_count: 1,
+        message_count: 0,
+        participant_count: 0,
+        peak_participant_count: 0,
+        actual_start_time: None,
+        actual_end_time: None,
+        binding: None,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    }
+}
+
 impl RoomDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -67,49 +129,18 @@ impl RoomDao {
             (None, None)
         };
 
-        let now = DateTime::now();
-        let room = Room {
-            id: None,
+        let room = new_room(NewRoom {
             tenant_id,
             parent_id,
             name,
             path,
-            emoji: None,
-            topic: None,
-            purpose: None,
-            icon: None,
-            position: 0,
+            creator_id,
             is_open,
-            // New rooms are Public: the room-level control is opt-IN, and a
-            // room nobody has joined yet that defaulted to members-only would
-            // be unreachable by everyone including its creator.
-            visibility: RoomVisibility::Public,
-            is_archived: false,
-            is_read_only: false,
-            is_default: false,
-            permission_overwrites: Vec::new(),
-            tags: Vec::new(),
             media_settings,
             conference_settings,
-            conference_status: None,
-            current_call_id: None,
             meeting_code,
             join_url,
-            organizer_id: None,
-            co_organizer_ids: Vec::new(),
-            creator_id,
-            last_message_id: None,
-            last_activity_at: None,
-            member_count: 1,
-            message_count: 0,
-            participant_count: 0,
-            peak_participant_count: 0,
-            actual_start_time: None,
-            actual_end_time: None,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-        };
+        });
 
         let room_id = self.base.insert_one(&room).await?;
 
@@ -119,13 +150,58 @@ impl RoomDao {
         self.base.find_by_id(room_id).await
     }
 
+    /// FR-90 — a room another module owns the meaning of: `Secret` (a
+    /// non-member gets 404, not proof it exists), not listed in Explore, at an
+    /// explicit `path` its owner guarantees unique (`hive-<session id>` — a
+    /// path derived from the name would collide with any room of that name),
+    /// carrying its `binding`. Built by the same constructor as every other
+    /// room, so it cannot drift from one; the creator joins it, as always.
+    pub async fn create_bound(
+        &self,
+        tenant_id: ObjectId,
+        name: String,
+        path: String,
+        creator_id: ObjectId,
+        binding: roomler_ai_db::models::Binding,
+    ) -> DaoResult<Room> {
+        let mut room = new_room(NewRoom {
+            tenant_id,
+            parent_id: None,
+            name,
+            path,
+            creator_id,
+            is_open: false,
+            media_settings: None,
+            conference_settings: None,
+            meeting_code: None,
+            join_url: None,
+        });
+        room.visibility = RoomVisibility::Secret;
+        room.binding = Some(binding);
+        let room_id = self.base.insert_one(&room).await?;
+        self.join(tenant_id, room_id, creator_id).await?;
+        self.base.find_by_id(room_id).await
+    }
+
+    /// What counts as a CHANNEL against the plan's `max_channels` — for the
+    /// gate below and for the plan-compliance report, which must agree.
+    ///
+    /// A live room that no other module owns. Soft-deleted rooms are
+    /// excluded (FR-32: an archived channel is not occupying a seat the
+    /// customer is paying for), and so are BOUND rooms (FR-90): an agent
+    /// session's room is that module's object, one per session, and counting
+    /// it would let a handful of sessions lock an org out of creating
+    /// channels. `binding: null` also matches an absent field — every room
+    /// before FR-90 and every unbound one since.
+    pub fn channel_filter() -> bson::Document {
+        doc! { "deleted_at": null, "binding": null }
+    }
+
     /// FR-32 — live channels in the tenant, for the plan `max_channels` gate.
-    /// Soft-deleted rooms are excluded: an archived channel is not occupying a
-    /// seat the customer is paying for.
     pub async fn count_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
-        self.base
-            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
-            .await
+        let mut filter = Self::channel_filter();
+        filter.insert("tenant_id", tenant_id);
+        self.base.count(filter).await
     }
 
     pub async fn find_by_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<Room>> {

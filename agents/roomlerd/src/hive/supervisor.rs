@@ -26,12 +26,13 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HARNESS_CLAUDE_CODE, HiveRefusal, HiveRunState, hive_limits,
+    HARNESS_CLAUDE_CODE, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::TranscriptEvent;
@@ -49,8 +50,12 @@ use super::store::StoreHandle;
 /// How long an `ended` report is replayed on reconnect: long enough to cross
 /// a control-WS flap, short enough not to replay history forever.
 const ENDED_REPLAY: Duration = Duration::from_secs(10 * 60);
-/// Prompts queued per session before the next is refused.
+/// A session task's input channel: its prompts and its stop.
 const INPUT_QUEUE: usize = 16;
+/// Prompts a session holds — admitted, not yet written to the harness —
+/// before it refuses the next. Half the input channel, so a stop always
+/// finds room in it.
+const MAX_WAITING: usize = INPUT_QUEUE / 2;
 /// Runs as the session's account: makes the session's config directory (so
 /// the daemon never writes into a tree that account owns), enters the folder,
 /// then becomes the harness. Arguments are positional — no value is ever
@@ -105,10 +110,18 @@ impl Answer {
     }
 }
 
+/// Who a prompt came from: the user it is attributed to in the transcript
+/// (by name) and on the turn's stub (by id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Author {
+    pub user_id: ObjectId,
+    pub name: String,
+}
+
 /// What the session task is fed.
 enum Input {
     Prompt {
-        author: Option<String>,
+        author: Option<Author>,
         text: String,
     },
     Stop {
@@ -120,6 +133,9 @@ struct Live {
     fence: u64,
     account: String,
     input: mpsc::Sender<Input>,
+    /// Prompts admitted and not yet begun — shared with the session task,
+    /// which holds them while a turn runs (see `Task::prompt`).
+    waiting: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -152,6 +168,8 @@ pub struct Supervisor {
     start_lock: tokio::sync::Mutex<()>,
     live: Mutex<HashMap<ObjectId, Live>>,
     reports: Mutex<HashMap<ObjectId, Report>>,
+    /// The newest `rc:hive.turn` per session, replayed with the states.
+    turns: Mutex<HashMap<ObjectId, ClientMsg>>,
     reporter: Mutex<Option<mpsc::Sender<ClientMsg>>>,
 }
 
@@ -262,6 +280,7 @@ impl Supervisor {
             start_lock: tokio::sync::Mutex::new(()),
             live: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
             reporter: Mutex::new(None),
         }
     }
@@ -353,22 +372,37 @@ impl Supervisor {
             .map(|l| l.account.clone())
     }
 
-    /// Feed a prompt to a running session. The viewer peer (P0d) is what
-    /// calls this; until then the tests do.
+    /// Feed a prompt to a running session. The viewer peer (P0d-2) is what
+    /// calls this; until then the tests do. A prompt that arrives while a turn
+    /// runs waits for it (see `Task::prompt`).
     pub fn prompt(
         &self,
         session: ObjectId,
-        author: Option<String>,
+        author: Option<Author>,
         text: String,
     ) -> Result<(), String> {
-        let input = {
+        let (input, waiting) = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            live.get(&session).map(|l| l.input.clone())
-        };
-        let input = input.ok_or("no such session on this device")?;
-        input
-            .try_send(Input::Prompt { author, text })
-            .map_err(|_| "the session is not taking prompts".to_string())
+            live.get(&session)
+                .map(|l| (l.input.clone(), Arc::clone(&l.waiting)))
+        }
+        .ok_or("no such session on this device")?;
+        // A place is taken BEFORE the send, atomically, so two callers cannot
+        // both have the last one.
+        if waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_WAITING).then_some(n + 1)
+            })
+            .is_err()
+        {
+            return Err(format!(
+                "{MAX_WAITING} prompts are already waiting for this session"
+            ));
+        }
+        input.try_send(Input::Prompt { author, text }).map_err(|_| {
+            waiting.fetch_sub(1, Ordering::AcqRel);
+            "the session is not taking prompts".to_string()
+        })
     }
 
     fn stop(&self, session: ObjectId, fence: u64, reason: String) {
@@ -406,6 +440,17 @@ impl Supervisor {
             reports.retain(|_, r| r.state != HiveRunState::Ended || r.at.elapsed() < ENDED_REPLAY);
             reports.iter().map(|(s, r)| (*s, r.clone())).collect()
         };
+        let turns: Vec<ClientMsg> = {
+            let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+            // A session whose state report was pruned is history.
+            turns.retain(|s, _| replay.iter().any(|(r, _)| r == s));
+            turns.values().cloned().collect()
+        };
+        // Each session's newest turn, then its state: the server applies
+        // them in order, and a stub before the state is how they happened.
+        for t in turns {
+            let _ = tx.try_send(t);
+        }
         for (session_id, r) in replay {
             let _ = tx.try_send(ClientMsg::HiveState {
                 session_id,
@@ -415,6 +460,22 @@ impl Supervisor {
             });
         }
         *self.reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Record and send a turn's stub (`rc:hive.turn`), like [`Self::report`].
+    fn report_turn(&self, session: ObjectId, msg: ClientMsg) {
+        self.turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session, msg.clone());
+        let tx = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(msg);
+        }
     }
 
     /// Record and send a state. `try_send` keeps reports in order and never
@@ -466,12 +527,14 @@ impl Supervisor {
     ) -> Result<(), (HiveRefusal, String)> {
         let child = self.spawn(order, account, folder)?;
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
+        let waiting = Arc::new(AtomicUsize::new(0));
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
             order.session_id,
             Live {
                 fence: order.fence,
                 account: account.to_string(),
                 input: input_tx,
+                waiting: Arc::clone(&waiting),
             },
         );
         // Up and waiting for its first prompt.
@@ -479,7 +542,11 @@ impl Supervisor {
         let sup = Arc::clone(self);
         let (session, fence) = (order.session_id, order.fence);
         tokio::spawn(async move {
-            let detail = run(&sup, session, fence, child, input_rx, store).await;
+            let inputs = Inputs {
+                rx: input_rx,
+                waiting,
+            };
+            let detail = run(&sup, session, fence, child, inputs, store).await;
             sup.finish(session, fence, detail);
         });
         Ok(())
@@ -683,17 +750,171 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
     }
 }
 
+/// The turn in progress.
+struct Current {
+    prompted_by: Option<ObjectId>,
+    steps: u32,
+    started: Instant,
+}
+
+/// One session's live state, owned by its task.
+///
+/// A TURN is one prompt and the harness's work on it, ended by the
+/// stream-json `result`. Prompts are written ONE AT A TIME: one that arrives
+/// while a turn runs waits in `queued`, because the harness would queue it
+/// itself and its `result` would then close the wrong turn's stub.
+struct Task<'a> {
+    sup: &'a Supervisor,
+    session: ObjectId,
+    fence: u64,
+    sid: String,
+    store: StoreHandle,
+    stdin: Option<ChildStdin>,
+    state: HiveRunState,
+    count: u32,
+    current: Option<Current>,
+    queued: std::collections::VecDeque<(Option<Author>, String)>,
+    /// `Live::waiting`: a prompt's place is given back when it BEGINS.
+    waiting: Arc<AtomicUsize>,
+}
+
+/// What a session task is fed, and the count of prompts it holds.
+struct Inputs {
+    rx: mpsc::Receiver<Input>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Task<'_> {
+    fn set_state(&mut self, state: HiveRunState) {
+        if self.state != state {
+            self.state = state;
+            self.sup.report(self.session, self.fence, state, None);
+        }
+    }
+
+    async fn prompt(&mut self, author: Option<Author>, text: String) {
+        if self.current.is_some() {
+            self.queued.push_back((author, text));
+            return;
+        }
+        self.begin(author, text).await;
+    }
+
+    /// Write one prompt and open its turn.
+    async fn begin(&mut self, author: Option<Author>, text: String) {
+        // Out of the waiting count whatever happens next: a prompt that
+        // cannot be written is not waiting either.
+        let _ = self
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let Some(w) = self.stdin.as_mut() else { return };
+        let mut out = user_input_line(&text);
+        out.push('\n');
+        if w.write_all(out.as_bytes()).await.is_err() || w.flush().await.is_err() {
+            warn!(session = %self.session, "hive: the harness stopped reading prompts");
+            return;
+        }
+        self.count += 1;
+        let prompted_by = author.as_ref().map(|a| a.user_id);
+        self.store.append(
+            &self.sid,
+            self.fence,
+            TranscriptEvent::UserMessage {
+                author: author.map(|a| a.name),
+                text,
+            },
+        );
+        self.current = Some(Current {
+            prompted_by,
+            steps: 0,
+            started: Instant::now(),
+        });
+        self.turn_report(HiveTurnStatus::Running, None, None);
+        self.set_state(HiveRunState::Running);
+    }
+
+    /// Record one event; a `result` closes the turn and lets the next queued
+    /// prompt in.
+    async fn on_event(&mut self, ev: TranscriptEvent) {
+        if matches!(ev, TranscriptEvent::ToolUse { .. })
+            && let Some(c) = self.current.as_mut()
+        {
+            c.steps += 1;
+        }
+        let end = match &ev {
+            TranscriptEvent::Turn {
+                ok,
+                duration_ms,
+                cost_usd,
+                ..
+            } => Some((*ok, *duration_ms, *cost_usd)),
+            _ => None,
+        };
+        self.store.append(&self.sid, self.fence, ev);
+        if let Some((ok, duration_ms, cost_usd)) = end
+            && self.current.is_some()
+        {
+            let status = if ok {
+                HiveTurnStatus::Ok
+            } else {
+                HiveTurnStatus::Error
+            };
+            let duration_ms = duration_ms.or_else(|| self.elapsed_ms());
+            self.turn_report(status, duration_ms, cost_usd);
+            self.current = None;
+            match self.queued.pop_front() {
+                Some((author, text)) => self.begin(author, text).await,
+                None => self.set_state(HiveRunState::Idle),
+            }
+        }
+    }
+
+    /// A turn the harness never finished — a stop, an exit, a crash.
+    fn interrupt(&mut self) {
+        if self.current.is_some() {
+            let elapsed = self.elapsed_ms();
+            self.turn_report(HiveTurnStatus::Interrupted, elapsed, None);
+            self.current = None;
+        }
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.current
+            .as_ref()
+            .map(|c| u64::try_from(c.started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn turn_report(&self, status: HiveTurnStatus, duration_ms: Option<u64>, cost_usd: Option<f64>) {
+        let Some(c) = &self.current else { return };
+        self.sup.report_turn(
+            self.session,
+            ClientMsg::HiveTurn {
+                session_id: self.session,
+                fence: self.fence,
+                turn: self.count,
+                status: Some(status),
+                prompted_by: c.prompted_by,
+                steps: c.steps,
+                duration_ms,
+                cost_usd,
+            },
+        );
+    }
+}
+
 /// Own the session until its harness exits; return the `ended` detail.
 async fn run(
     sup: &Supervisor,
     session: ObjectId,
     fence: u64,
     mut child: Child,
-    mut input: mpsc::Receiver<Input>,
+    inputs: Inputs,
     store: StoreHandle,
 ) -> String {
-    let sid = session.to_hex();
-    let mut stdin: Option<ChildStdin> = child.stdin.take();
+    let Inputs {
+        rx: mut input,
+        waiting,
+    } = inputs;
     let Some(stdout) = child.stdout.take() else {
         return "the harness has no stdout".into();
     };
@@ -701,9 +922,21 @@ async fn run(
         .stderr
         .take()
         .map(|err| tokio::spawn(read_stderr_tail(session, err)));
+    let mut task = Task {
+        sup,
+        session,
+        fence,
+        sid: session.to_hex(),
+        store,
+        stdin: child.stdin.take(),
+        state: HiveRunState::Idle,
+        count: 0,
+        current: None,
+        queued: Default::default(),
+        waiting,
+    };
     let mut lines = LineReader::new(BufReader::new(stdout));
     let limits = Limits::default();
-    let mut state = HiveRunState::Idle;
     let mut stopped: Option<String> = None;
 
     loop {
@@ -722,12 +955,7 @@ async fn run(
                     match parse_line(text.trim_end(), &limits) {
                         Ok(parsed) => {
                             for ev in parsed.record {
-                                let turn_ended = matches!(ev, TranscriptEvent::Turn { .. });
-                                store.append(&sid, fence, ev);
-                                if turn_ended && state != HiveRunState::Idle {
-                                    state = HiveRunState::Idle;
-                                    sup.report(session, fence, state, None);
-                                }
+                                task.on_event(ev).await;
                             }
                             if !parsed.skipped.is_empty() {
                                 debug!(session = %session, skipped = ?parsed.skipped, "hive: stream-json lines not recorded");
@@ -743,20 +971,7 @@ async fn run(
                 }
             },
             cmd = input.recv() => match cmd {
-                Some(Input::Prompt { author, text }) => {
-                    let Some(w) = stdin.as_mut() else { continue };
-                    let mut out = user_input_line(&text);
-                    out.push('\n');
-                    if w.write_all(out.as_bytes()).await.is_err() || w.flush().await.is_err() {
-                        warn!(session = %session, "hive: the harness stopped reading prompts");
-                        continue;
-                    }
-                    store.append(&sid, fence, TranscriptEvent::UserMessage { author, text });
-                    if state != HiveRunState::Running {
-                        state = HiveRunState::Running;
-                        sup.report(session, fence, state, None);
-                    }
-                }
+                Some(Input::Prompt { author, text }) => task.prompt(author, text).await,
                 Some(Input::Stop { reason }) => {
                     stopped = Some(reason);
                     break;
@@ -770,9 +985,10 @@ async fn run(
         }
     }
 
+    task.interrupt();
     // EOF on stdin ends a stream-json harness; the signals cover one that
     // does not listen, and the tools it started.
-    drop(stdin);
+    drop(task.stdin.take());
     if stopped.is_some() {
         terminate(&mut child).await;
     }
@@ -863,8 +1079,8 @@ mod tests {
     /// A stand-in for Claude Code that speaks just enough stream-json. Like
     /// the headless harness reading stream-json input, it says `init` once
     /// its first prompt arrives, then answers each prompt with a text block
-    /// and a turn result — and exits 3 with a word on stderr for a prompt
-    /// containing `crash`.
+    /// and a turn result. A prompt containing `crash` exits 3 with a word on
+    /// stderr; `slow` takes a second; `tool` makes one tool call first.
     const FAKE_HARNESS: &str = r#"#!/bin/sh
 first=1
 while IFS= read -r line; do
@@ -875,8 +1091,17 @@ while IFS= read -r line; do
     echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
     first=0
   fi
+  case "$line" in
+    *slow*) sleep 1 ;;
+  esac
+  case "$line" in
+    *tool*)
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]}}'
+      ;;
+  esac
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from the fake"}]}}'
-  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.0}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.25}'
 done
 "#;
 
@@ -967,6 +1192,66 @@ done
         }
     }
 
+    /// One turn report, as the tests compare it.
+    #[derive(Debug, PartialEq)]
+    struct Turn {
+        turn: u32,
+        status: HiveTurnStatus,
+        steps: u32,
+        prompted_by: Option<ObjectId>,
+    }
+
+    /// Every report for `session` up to the state `until`: the turns, and
+    /// the states in order.
+    async fn reports_until(
+        r: &mut Rig,
+        session: ObjectId,
+        until: HiveRunState,
+    ) -> (Vec<Turn>, Vec<HiveRunState>, Vec<ClientMsg>) {
+        let (mut turns, mut states, mut raw) = (Vec::new(), Vec::new(), Vec::new());
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("a report within 10 s")
+                .expect("the reporter is open");
+            match &msg {
+                ClientMsg::HiveTurn {
+                    session_id,
+                    turn,
+                    status: Some(status),
+                    steps,
+                    prompted_by,
+                    ..
+                } if *session_id == session => turns.push(Turn {
+                    turn: *turn,
+                    status: *status,
+                    steps: *steps,
+                    prompted_by: *prompted_by,
+                }),
+                ClientMsg::HiveState {
+                    session_id,
+                    state: Some(s),
+                    ..
+                } if *session_id == session => {
+                    states.push(*s);
+                    if *s == until {
+                        raw.push(msg);
+                        return (turns, states, raw);
+                    }
+                }
+                _ => {}
+            }
+            raw.push(msg);
+        }
+    }
+
+    fn dev(r: &Rig) -> Option<Author> {
+        Some(Author {
+            user_id: r.user,
+            name: "Dev".into(),
+        })
+    }
+
     #[tokio::test]
     async fn every_closed_gate_refuses_with_its_own_word() {
         let off = rig(false, 4);
@@ -1014,9 +1299,7 @@ done
         assert_eq!(r.sup.start(o.clone(), true).await, Answer::accepted("dev"));
         assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
 
-        r.sup
-            .prompt(sid, Some("Dev".into()), "say hello".into())
-            .unwrap();
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
         assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
         assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
 
@@ -1050,12 +1333,185 @@ done
         let sid = o.session_id;
         assert!(r.sup.start(o, true).await.refused.is_none());
         r.sup.prompt(sid, None, "crash".into()).unwrap();
-        let detail = until_ended(&mut r, sid).await.unwrap();
+        let (turns, _, raw) = reports_until(&mut r, sid, HiveRunState::Ended).await;
+        // The turn the crash cut short is reported as such, before the end.
+        assert_eq!(
+            turns.iter().map(|t| t.status).collect::<Vec<_>>(),
+            [HiveTurnStatus::Running, HiveTurnStatus::Interrupted]
+        );
+        let detail = match raw.last() {
+            Some(ClientMsg::HiveState {
+                detail: Some(d), ..
+            }) => d.clone(),
+            other => panic!("expected the ended state, got {other:?}"),
+        };
         assert!(detail.contains("code 3"), "{detail}");
         assert!(
             detail.contains("boom"),
             "the stderr tail explains it: {detail}"
         );
+    }
+
+    /// A turn is reported when its prompt goes in and when its result comes
+    /// back — numbered, attributed, with its tool steps and what it cost.
+    #[tokio::test]
+    async fn a_turn_is_reported_when_it_starts_and_when_it_ends() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, dev(&r), "use a tool".into()).unwrap();
+        let (turns, states, raw) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        let by = Some(r.user);
+        assert_eq!(
+            turns,
+            [
+                Turn {
+                    turn: 1,
+                    status: HiveTurnStatus::Running,
+                    steps: 0,
+                    prompted_by: by
+                },
+                Turn {
+                    turn: 1,
+                    status: HiveTurnStatus::Ok,
+                    steps: 1,
+                    prompted_by: by
+                },
+            ]
+        );
+        assert_eq!(states, [HiveRunState::Running, HiveRunState::Idle]);
+        let ended = raw
+            .iter()
+            .find_map(|m| match m {
+                ClientMsg::HiveTurn {
+                    status: Some(HiveTurnStatus::Ok),
+                    duration_ms,
+                    cost_usd,
+                    ..
+                } => Some((*duration_ms, *cost_usd)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ended, (Some(5), Some(0.25)), "the harness's own figures");
+        r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// A prompt that arrives while a turn runs waits for that turn's result:
+    /// the harness would queue it too, and its result would then close the
+    /// wrong turn. The session stays `running` across both.
+    #[tokio::test]
+    async fn a_prompt_during_a_turn_waits_for_it() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, dev(&r), "slow one".into()).unwrap();
+        r.sup.prompt(sid, None, "second".into()).unwrap();
+        let (turns, states, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert_eq!(
+            turns
+                .iter()
+                .map(|t| (t.turn, t.status, t.prompted_by))
+                .collect::<Vec<_>>(),
+            [
+                (1, HiveTurnStatus::Running, Some(r.user)),
+                (1, HiveTurnStatus::Ok, Some(r.user)),
+                (2, HiveTurnStatus::Running, None),
+                (2, HiveTurnStatus::Ok, None),
+            ]
+        );
+        assert_eq!(
+            states,
+            [HiveRunState::Running, HiveRunState::Idle],
+            "running across both turns, idle only after the second"
+        );
+        let events = r.store.events(&sid.to_hex());
+        let kinds: Vec<&str> = events.iter().map(TranscriptEvent::kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                "user_message",
+                "session_init",
+                "assistant_text",
+                "turn",
+                "user_message",
+                "assistant_text",
+                "turn",
+            ],
+            "the second prompt went in after the first turn's result"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// What waits behind a running turn is bounded, and the caller is TOLD:
+    /// past `MAX_WAITING` a prompt is refused, never queued without end nor
+    /// dropped after an `Ok`. Every admitted prompt still runs, in order, and
+    /// the places come back as they begin.
+    #[tokio::test]
+    async fn prompts_waiting_behind_a_turn_are_bounded_and_refused_out_loud() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, None, "slow one".into()).unwrap();
+        // Turn 1 has begun (its place is back) before the rest are sent.
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("a report within 10 s")
+                .expect("the reporter is open");
+            if matches!(
+                msg,
+                ClientMsg::HiveTurn {
+                    turn: 1,
+                    status: Some(HiveTurnStatus::Running),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        for i in 0..MAX_WAITING {
+            r.sup
+                .prompt(sid, None, format!("waiting {i}"))
+                .unwrap_or_else(|e| panic!("prompt {i} of {MAX_WAITING} refused: {e}"));
+        }
+        let refused = r
+            .sup
+            .prompt(sid, None, "one too many".into())
+            .expect_err("a prompt past the bound is refused");
+        assert!(refused.contains("already waiting"), "{refused}");
+
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        let finished: Vec<u32> = turns
+            .iter()
+            .filter(|t| t.status == HiveTurnStatus::Ok)
+            .map(|t| t.turn)
+            .collect();
+        let expected: Vec<u32> = (1..=1 + MAX_WAITING as u32).collect();
+        assert_eq!(finished, expected, "every admitted prompt ran, in order");
+        let texts: Vec<String> = r
+            .store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::UserMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t == "one too many"),
+            "the refused prompt reached the harness: {texts:?}"
+        );
+        // Idle again: every place is back.
+        r.sup
+            .prompt(sid, None, "after".into())
+            .expect("an idle session takes a prompt again");
+        r.sup.stop(sid, 1, "owner".into());
     }
 
     #[tokio::test]

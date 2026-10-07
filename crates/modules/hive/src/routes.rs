@@ -46,10 +46,10 @@ use roomler_core::{ApiError, extractors::auth::AuthUser, guards::parse_tid};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::HiveState;
 use crate::model::{
     AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionStatus, SessionView,
 };
+use crate::{HiveState, room};
 
 /// `POST …/hive/session`.
 #[derive(Debug, Deserialize)]
@@ -103,7 +103,7 @@ impl StartDenyReason {
 }
 
 /// What the device's refusal words mean to the person who started it.
-fn device_refusal_message(word: &str) -> &'static str {
+pub(crate) fn device_refusal_message(word: &str) -> &'static str {
     match word {
         "hive_disabled" => "the device does not allow agent sessions (its hive_enabled is off)",
         "no_account" => "the device maps no local account to you (hive_accounts)",
@@ -331,7 +331,7 @@ pub async fn start(
     let title = clean_title(body.title.as_deref(), &folder)?;
     let device_id = parse_oid(&body.device_id, "device_id")?;
     // LIVE: a removed device runs nothing, and its id answers like a bogus one.
-    state
+    let device = state
         .fleet
         .agents
         .find_live_in_tenant(tid, device_id)
@@ -365,17 +365,23 @@ pub async fn start(
     let user = state.users.base.find_by_id(auth.user_id).await?;
     let now = DateTime::now();
     let sid = ObjectId::new();
+    // The session's room first (P0d): the record names it, and a session
+    // nobody could see is no session.
+    let room_id = room::open(&state, tid, sid, &title, auth.user_id).await?;
     let session = AgentSession {
         id: Some(sid),
         tenant_id: tid,
         owner_id: auth.user_id,
         title,
+        room_id: Some(room_id),
+        last_turn: None,
         harness: HarnessRef {
             id: HARNESS_CLAUDE_CODE.to_string(),
             session: uuid::Uuid::new_v4().to_string(),
         },
         location: SessionLocation {
             device_id,
+            device_name: device.name.clone(),
             folder: folder.clone(),
             account: None,
         },
@@ -414,7 +420,7 @@ pub async fn start(
             HubError::ExecUnsupported(_) => StartDenyReason::DeviceUnsupported,
             _ => StartDenyReason::DeviceOffline,
         };
-        state
+        let lost = state
             .sessions
             .mark_lost(sid, "the device was gone before the start reached it")
             .await?;
@@ -422,6 +428,9 @@ pub async fn start(
             .write(&state)
             .await;
         let s = state.sessions.find(sid).await?;
+        if lost && let Some(s) = &s {
+            room::note(&state, s, room::ended_note(s)).await;
+        }
         return Ok(Json(StartResponse::refused_by_server(reason, s.as_ref())));
     }
     audit(Some(sid), "sent", None).write(&state).await;
@@ -511,14 +520,17 @@ pub async fn stop(
         Err(HubError::ExecUnsupported(_)) => {
             // Connected as a build that does not run sessions: nothing there
             // can still be running this one, so there is nobody to ask.
-            state
+            if state
                 .sessions
                 .end_now(
                     sid,
                     "stopped",
                     "the device's agent no longer runs agent sessions",
                 )
-                .await?;
+                .await?
+            {
+                room::note_ended(&state, sid).await;
+            }
             "ended"
         }
         // Not connected here: told on its next connection

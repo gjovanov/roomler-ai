@@ -113,10 +113,7 @@ pub async fn search(
         .into_iter()
         .map(|m| {
             let room_name = room_name_map.get(&m.room_id).cloned().unwrap_or_default();
-            let author_name = author_names
-                .get(&m.author_id)
-                .cloned()
-                .unwrap_or_else(|| m.author_id.to_hex());
+            let author_name = m.author_label(&author_names);
             // Truncate the preview on a CHAR boundary. `&m.content[..200]`
             // sliced on a BYTE index and panics ("byte index 200 is not a
             // char boundary") whenever a multi-byte UTF-8 char straddles byte
