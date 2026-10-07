@@ -624,6 +624,16 @@ pub enum RpcCap {
     /// things — running sessions is not holding other people's — so matching
     /// stays equality, as for `ssh` / `ssh-consent`.
     Hive,
+    /// FR-90 P0d-2 — `rc:hive.view.*`: the agent serves a session's
+    /// transcript to a browser over a data-only WebRTC peer. It answers a view
+    /// grant with `rc:hive.view.grant_ack` before the browser is told to dial,
+    /// answers the relayed offer, and closes the peer when the grant ends.
+    ///
+    /// ⚠️ `hive` is its prefix and the two are different promises — a P0c
+    /// agent runs sessions and drops every `rc:hive.view.*` frame at `debug!`,
+    /// so a server that read `hive-view` out of `hive` would leave the viewer
+    /// waiting out its bound on every open. Equality-matched, locked by test.
+    HiveView,
 }
 
 impl RpcCap {
@@ -645,11 +655,12 @@ impl RpcCap {
             Self::KeyRotate => "key-rotate",
             Self::SshGrantAck => "ssh-grant-ack",
             Self::Hive => "hive",
+            Self::HiveView => "hive-view",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 10] = [
+    pub const ALL: [RpcCap; 11] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -660,6 +671,7 @@ impl RpcCap {
         Self::KeyRotate,
         Self::SshGrantAck,
         Self::Hive,
+        Self::HiveView,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4394,6 +4406,7 @@ mod tests {
         assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
         assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
         assert_eq!(RpcCap::Hive.wire(), "hive");
+        assert_eq!(RpcCap::HiveView.wire(), "hive-view");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4411,13 +4424,16 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 3] = [
+        const KNOWN: [(RpcCap, RpcCap); 4] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
             // server" is not "confirms a grant". Locked by
             // `ssh_does_not_imply_ssh_grant_ack`.
             (RpcCap::Ssh, RpcCap::SshGrantAck),
+            // FR-90 P0d-2 — "runs sessions" is not "serves them to a
+            // browser". Locked by `hive_does_not_imply_hive_view`.
+            (RpcCap::Hive, RpcCap::HiveView),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -4624,6 +4640,30 @@ mod tests {
             "a verb that merely starts with `hive` must not read as `hive`"
         );
         assert!(RpcCap::from_wire("hive-replica").is_none());
+    }
+
+    /// FR-90 P0d-2 — `hive` (runs sessions) does not imply `hive-view`
+    /// (serves them to a browser), nor the other way round: a P0c agent drops
+    /// every view frame, and a server that read the view verb out of `hive`
+    /// would leave each viewer waiting out its bound.
+    #[test]
+    fn hive_does_not_imply_hive_view() {
+        let runs = AgentCaps {
+            rpc: vec!["hive".into()],
+            ..Default::default()
+        };
+        assert!(runs.has_rpc(RpcCap::Hive));
+        assert!(!runs.has_rpc(RpcCap::HiveView));
+
+        let serves = AgentCaps {
+            rpc: vec!["hive-view".into()],
+            ..Default::default()
+        };
+        assert!(serves.has_rpc(RpcCap::HiveView));
+        assert!(!serves.has_rpc(RpcCap::Hive));
+        assert_eq!(RpcCap::HiveView.wire(), "hive-view");
+        assert_eq!(RpcCap::from_wire("hive-view"), Some(RpcCap::HiveView));
+        assert!(RpcCap::from_wire("hive-views").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

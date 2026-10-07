@@ -25,10 +25,24 @@
 //! the device's owner; a secondary org's admin must not start sessions on a
 //! device that org merely borrows — the rule `rc:agent.update` already follows.
 
+//!
+//! # Reading a session from a browser (P0d-2)
+//!
+//! [`view`]: a view grant from the server, a data-only WebRTC peer to the
+//! browser, and the transcript — pages, the live feed, prompts from a viewer
+//! that may drive — over its one DataChannel. The server relays the
+//! handshake and never sees what flows over the peer.
+
+mod framing;
 pub mod gates;
 mod store;
 mod supervisor;
+pub mod view;
 
 pub use supervisor::{
     Author, StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
+};
+pub use view::{
+    ViewGrant, handle_view_close, handle_view_grant, handle_view_ice, handle_view_offer,
+    handle_view_renew,
 };
