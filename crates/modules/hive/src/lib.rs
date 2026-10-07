@@ -35,7 +35,7 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
-use roomler_ai_mod_chat::ChatState;
+use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_mod_fleet::FleetState;
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx, rate_limit::RateLimiter,
@@ -58,7 +58,8 @@ pub struct HiveState {
     pub fleet: FleetState,
     /// `hive → chat` (P0d): a session is a room, and its turns are messages
     /// in it, written through chat so chat keeps its own invariants.
-    pub chat: ChatState,
+    /// Stateless, so re-created here rather than taken as a dependency.
+    pub chat: BoundChat,
     pub sessions: Arc<dao::AgentSessionDao>,
     pub audit: Arc<dao::HiveAuditDao>,
     /// Start requests waiting for their device's answer (pod-local).
@@ -85,21 +86,19 @@ impl FromRef<HiveState> for Core {
 impl Module for HiveState {
     const ID: &'static str = "hive";
 
-    type Deps = (FleetState, ChatState);
+    /// The Hub is one live object, so `fleet` is the dependency. Chat is
+    /// stateless and re-created ([`BoundChat::new`], FR-69 rule 5).
+    type Deps = FleetState;
 
-    async fn init(
-        core: Core,
-        _settings: &Settings,
-        (fleet, chat): (FleetState, ChatState),
-    ) -> anyhow::Result<Self> {
+    async fn init(core: Core, _settings: &Settings, fleet: FleetState) -> anyhow::Result<Self> {
         let db = &core.db;
         let state = Self {
             sessions: Arc::new(dao::AgentSessionDao::new(db)),
             audit: Arc::new(dao::HiveAuditDao::new(db)),
             start_acks: Arc::new(acks::StartAcks::new()),
             start_limiter: Arc::new(RateLimiter::new()),
+            chat: BoundChat::new(&core),
             fleet,
-            chat,
             core,
         };
         // The agent socket is fleet's; the device's `rc:hive.*` answers are
