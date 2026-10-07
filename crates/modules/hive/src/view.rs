@@ -42,7 +42,7 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_remote_control::hive::view_limits;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, ServerMsg};
-use roomler_ai_remote_control::turn_creds::ice_servers_for_session;
+use roomler_ai_remote_control::turn_creds::ice_servers_for_session_with_ttl;
 use roomler_core::{WsCtx, WsHandler};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -58,6 +58,12 @@ const MAX_SDP_BYTES: usize = 64 * 1024;
 const MAX_CANDIDATE_BYTES: usize = 4 * 1024;
 /// A browser's `ref`, echoed back, capped.
 const MAX_REF: usize = 64;
+/// The TURN credential's life. Its timestamp bounds the ALLOCATION's whole life
+/// (refreshes re-authenticate with the same username), and a viewer peer
+/// stays open as long as its room — renewing the grant renews nothing here.
+/// The config TTL (600 s by default) would cut a relayed viewer at ten
+/// minutes, the bug the overlay's warm grants hit (72 h there).
+const TURN_TTL_SECS: u32 = 12 * 3600;
 
 struct Grant {
     tenant_id: ObjectId,
@@ -261,10 +267,11 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         Err(_) => String::new(),
     };
     let grant_id = ObjectId::new();
-    let ice_servers = ice_servers_for_session(
+    let ice_servers = ice_servers_for_session_with_ttl(
         &user.to_hex(),
         &grant_id.to_hex(),
         state.core.turn_map.cfg_for(None),
+        TURN_TTL_SECS,
     );
     // The grant BEFORE the push: the device's answer, however fast, must find
     // it.
