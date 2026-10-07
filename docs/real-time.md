@@ -44,6 +44,7 @@ JSON messages, `{"type": "...", ...}`.
 | `media:producer_close` | Stop publishing |
 | `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
 | `presence:update` | Presence state |
+| `hive:view.open` / `offer` / `ice` / `renew` / `close` | FR-90 — read an agent session over a viewer peer (module `hive`) |
 | `ping` | Keepalive |
 
 **Server → client** (consumed by `ui/src/stores/ws.ts`)
@@ -56,10 +57,20 @@ JSON messages, `{"type": "...", ...}`.
 | `typing:start` | Typing indicators |
 | `notification:new` / `notification:unread_count` | Notification bell |
 | `task:update` | Background-task progress |
+| `hive:view.ready` / `refused` / `answer` / `ice` / `renewed` / `closed` | FR-90 — the viewer peer's handshake, addressed to the ONE connection that opened it |
 
 The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
 parameters, and producer/consumer ids — the SFU forwards RTP between participants
 without decoding it.
+
+The viewer peer's signalling (`hive:view.*`, FR-90) is a view grant and the SDP
+and ICE of a **data-only** WebRTC peer between the browser and the device that
+holds the session. The server tells the browser `ready` only after the device has
+confirmed the grant (FR-83), relays the handshake to and from the one connection
+that holds the grant, and never sees the transcript that then flows over the
+peer. The server's half is
+[`crates/modules/hive/src/view.rs`](../crates/modules/hive/src/view.rs), the
+device's `agents/roomlerd/src/hive/view.rs`.
 
 ## The `rc:*` plane (agents, tunnel clients, controllers)
 

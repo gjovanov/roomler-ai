@@ -38,7 +38,8 @@ use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
 use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_mod_fleet::FleetState;
 use roomler_core::{
-    AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx, rate_limit::RateLimiter,
+    AgentSocketHooks, Capabilities, Core, Hooks, Module, Role, TenantCtx, WsHandlerSpec,
+    WsRegistration, rate_limit::RateLimiter,
 };
 
 pub mod acks;
@@ -48,6 +49,7 @@ pub mod hooks;
 pub mod model;
 pub mod room;
 pub mod routes;
+pub mod view;
 
 /// The module's state: the core, the fleet module it is built on, and what
 /// hive owns.
@@ -66,6 +68,10 @@ pub struct HiveState {
     pub start_acks: Arc<acks::StartAcks>,
     /// The per-(user, device) start ceiling.
     pub start_limiter: Arc<RateLimiter>,
+    /// P0d-2 — the view grants this pod minted (pod-local).
+    pub view_grants: Arc<view::ViewGrants>,
+    /// The per-(user, session) view-open ceiling.
+    pub view_limiter: Arc<RateLimiter>,
 }
 
 impl std::ops::Deref for HiveState {
@@ -97,6 +103,8 @@ impl Module for HiveState {
             audit: Arc::new(dao::HiveAuditDao::new(db)),
             start_acks: Arc::new(acks::StartAcks::new()),
             start_limiter: Arc::new(RateLimiter::new()),
+            view_grants: Arc::new(view::ViewGrants::new()),
+            view_limiter: Arc::new(RateLimiter::new()),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -131,6 +139,21 @@ impl Module for HiveState {
         Router::new()
             .nest("/tenant/{tenant_id}/hive/session", session)
             .with_state(self.clone())
+    }
+
+    /// P0d-2 — the viewer peer's signalling on the user socket
+    /// (`hive:view.*`, [`view`]).
+    fn ws(&self) -> WsRegistration {
+        WsRegistration {
+            handlers: vec![WsHandlerSpec {
+                role: Role::User,
+                namespace: "hive",
+                handler: Arc::new(view::HiveView {
+                    state: self.clone(),
+                }),
+            }],
+            upgrades: Vec::new(),
+        }
     }
 
     fn indexes(&self) -> Vec<IndexSet> {

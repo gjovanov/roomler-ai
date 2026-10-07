@@ -192,19 +192,20 @@ pub struct StopResponse {
     pub session: SessionView,
 }
 
-/// One server decision, for `hive_audit`.
-struct Audit {
-    tenant_id: ObjectId,
-    user_id: ObjectId,
-    device_id: ObjectId,
-    session_id: Option<ObjectId>,
-    action: &'static str,
-    outcome: &'static str,
-    reason: Option<&'static str>,
+/// One server decision, for `hive_audit` — the routes' and the viewer
+/// grants' (`crate::view`).
+pub(crate) struct Audit {
+    pub(crate) tenant_id: ObjectId,
+    pub(crate) user_id: ObjectId,
+    pub(crate) device_id: ObjectId,
+    pub(crate) session_id: Option<ObjectId>,
+    pub(crate) action: &'static str,
+    pub(crate) outcome: &'static str,
+    pub(crate) reason: Option<&'static str>,
 }
 
 impl Audit {
-    async fn write(self, state: &HiveState) {
+    pub(crate) async fn write(self, state: &HiveState) {
         let ev = HiveAuditEvent {
             id: None,
             tenant_id: self.tenant_id,

@@ -102,7 +102,7 @@ erDiagram
 | `overlay_policies` | Overlay L3 ACL rules (compiled into per-node netmaps under `enforce`) |
 | `overlay_blocks` | **Global** (not tenant-scoped) registry of disjoint `/22` address blocks for multi-org; slot-unique, freed blocks quarantined |
 | `agent_sessions` | FR-90 (module `hive`): one agent session — owner, title, harness + its own session UUID, `location {device_id, device_name, folder, account}`, `room_id` (its secret room), `last_turn {turn, message_id}` (the newest turn's stub — advanced by a compare-and-set, so a late report of an older turn never rewinds it), `status` (`starting` → `idle`/`running`/`awaiting_approval` → `stopping` → `ended`; or `refused`/`lost`), `fence`, `accepted_at`, `refusal`, `end_reason`. **Never content** — no prompt, tool call or output. Every device-driven move is a compare-and-set on device + fence + status. `(tenant_id, owner_id, created_at desc)`, `(tenant_id, location.device_id, status)`, `(tenant_id, status)`. No TTL |
-| `hive_audit` | FR-90: the server's own decision on every session start (`sent` or `refused` with the gate) and stop (`sent`/`queued`/`ended`). `(tenant_id, at desc)`, `(session_id, at)`. 90 d TTL |
+| `hive_audit` | FR-90: the server's own decision on every session start (`sent` or `refused` with the gate) and stop (`sent`/`queued`/`ended`), and on every view of one (`action: view` — `sent` or `refused` with the gate; P0d-2). `(tenant_id, at desc)`, `(session_id, at)`. 90 d TTL |
 
 ## Observability & analytics
 
