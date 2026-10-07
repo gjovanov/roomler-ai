@@ -113,6 +113,12 @@ pub struct ModulesSettings {
     pub network: bool,
     #[serde(default = "modules_default_on")]
     pub saas: bool,
+    /// FR-90 — agent sessions. **Default OFF**, the only module that is: it
+    /// is the P0 kill switch while the pillar is built, so a roll that ships
+    /// the code exposes nothing until an operator turns it on
+    /// (`ROOMLER__MODULES__HIVE=true`). Listed in [`Self::DEFAULT_OFF`].
+    #[serde(default)]
+    pub hive: bool,
 }
 
 fn modules_default_on() -> bool {
@@ -128,13 +134,20 @@ impl Default for ModulesSettings {
             remote: true,
             network: true,
             saas: true,
+            hive: false,
         }
     }
 }
 
 impl ModulesSettings {
+    /// Modules whose switch is OFF unless an operator turns it on. Their
+    /// absence from a build that does not link them is the default, not a
+    /// configuration worth a boot warning.
+    pub const DEFAULT_OFF: &'static [&'static str] = &["hive"];
+
     /// The module ids an operator has switched off, in the composition order
-    /// of `roomler_core::graph::MODULES`.
+    /// of `roomler_core::graph::MODULES` — including a default-off module
+    /// nobody switched on, so `modules = compiled − switched_off` holds.
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
         if !self.saas {
@@ -154,6 +167,9 @@ impl ModulesSettings {
         }
         if !self.network {
             off.push("network");
+        }
+        if !self.hive {
+            off.push("hive");
         }
         off
     }

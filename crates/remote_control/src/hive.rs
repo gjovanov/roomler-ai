@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-90 — the Hive wire vocabulary: what the server and a device say ABOUT
+//! an agent session, never what is in one.
+//!
+//! Four frames (`crate::signaling`): the server's `rc:hive.start` and
+//! `rc:hive.stop`, the device's `rc:hive.start_ack` and `rc:hive.state`.
+//! None of them carries a prompt, a tool argument, a tool output or a line of
+//! transcript, and the tests in `signaling` lock the start frame's field set
+//! so it cannot grow one: content travels device-to-browser over the viewer
+//! peer and device-to-device between replicas, never through the server
+//! (`docs/roomler-hive-design.md` §3.3).
+//!
+//! The server pushes a Hive frame only to an agent advertising
+//! [`crate::models::RpcCap::Hive`]: a caller is waiting for the answer, and a
+//! pre-feature agent drops an unknown tag at `debug!`, which would read as a
+//! hang (the `exec` rule).
+//!
+//! Everything a device REFUSES with is decoded leniently — an unknown word
+//! from a newer agent is still a refusal ([`HiveRefusal::Other`]), and an
+//! unknown run state is "a state this build cannot name" rather than an error
+//! failing the whole frame. The reasons are the same as FR-83's grant ack;
+//! see `grant_refusal_lenient` in `signaling`.
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// The one harness P0 runs: Claude Code, headless on stream-json.
+pub const HARNESS_CLAUDE_CODE: &str = "claude-code";
+
+/// Server-side bounds on the Hive frames. Duplicated by no one: the device
+/// reads them from here too, so a clamp cannot drift between the two ends.
+pub mod hive_limits {
+    /// How long a start request holds its caller for the device's answer.
+    /// An ack that arrives later still lands on the record — the caller is
+    /// told `starting` and learns the outcome from the session itself.
+    pub const START_ACK_TIMEOUT_SECS: u64 = 10;
+    /// A `starting` session still unanswered when its device reconnects is
+    /// started again on that connection only within this window; past it,
+    /// the start is marked `lost` rather than launching a session its owner
+    /// may have given up on an hour ago.
+    pub const START_REDELIVERY_WINDOW_SECS: i64 = 10 * 60;
+    /// Session starts per (user, device) per minute, enforced AFTER the
+    /// identity gates so a refusal is attributable (the exec rule).
+    pub const START_RATE_PER_MINUTE: u32 = 10;
+    /// The folder as typed. The device resolves and confines it; the server
+    /// only refuses what no filesystem would accept.
+    pub const MAX_FOLDER_LEN: usize = 1024;
+    pub const MAX_TITLE_LEN: usize = 200;
+    /// A device's `detail` is clamped by the device AND again on receipt.
+    pub const MAX_DETAIL_LEN: usize = 512;
+}
+
+/// Why a device refused `rc:hive.start`, carried in `rc:hive.start_ack`.
+///
+/// Absent from the ack = ACCEPTED: the device passed its own gates and is
+/// launching the harness; what happens next arrives as `rc:hive.state`.
+/// Present = no session runs, and the word says which of the device's gates
+/// said no — each one has a different fix, which is why they are not folded.
+///
+/// ⚠️ Decoded LENIENTLY ([`refusal_lenient`]): an unknown word lands on
+/// [`Self::Other`], still a refusal. It must never land on "accepted" — that
+/// would show a session as starting on a device that has just said no.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveRefusal {
+    /// Gate 4 — the device's own `hive_enabled` is off (the default).
+    HiveDisabled,
+    /// `hive_accounts` maps no local account to the starting user. Never a
+    /// fallback to the daemon's own identity, which is SYSTEM/root.
+    NoAccount,
+    /// Windows: nobody is signed in at the console, so there is no account a
+    /// session could run as (design D2 — no S4U, no stored credentials).
+    NoConsoleUser,
+    /// The folder does not resolve under a `hive_roots` entry, or
+    /// `hive_roots` is empty — which means nowhere, never anywhere.
+    FolderNotAllowed,
+    /// The harness is not installed where the mapped account can run it.
+    HarnessMissing,
+    /// The harness was found but did not start.
+    LaunchFailed,
+    /// The device already runs `hive_max_sessions` sessions.
+    AtCapacity,
+    /// A word this build does not know.
+    Other,
+}
+
+impl HiveRefusal {
+    /// The spelling on the wire and in the session record. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HiveDisabled => "hive_disabled",
+            Self::NoAccount => "no_account",
+            Self::NoConsoleUser => "no_console_user",
+            Self::FolderNotAllowed => "folder_not_allowed",
+            Self::HarnessMissing => "harness_missing",
+            Self::LaunchFailed => "launch_failed",
+            Self::AtCapacity => "at_capacity",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveRefusal; 8] = [
+        Self::HiveDisabled,
+        Self::NoAccount,
+        Self::NoConsoleUser,
+        Self::FolderNotAllowed,
+        Self::HarnessMissing,
+        Self::LaunchFailed,
+        Self::AtCapacity,
+        Self::Other,
+    ];
+}
+
+/// Where a running session is, as its device reports it in `rc:hive.state`.
+/// The server's record mirrors it; nothing here says what the session is
+/// doing, only whether it is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveRunState {
+    /// The harness is up and waiting for a prompt.
+    Idle,
+    /// A turn is running.
+    Running,
+    /// A tool call is waiting for a person's answer.
+    AwaitingApproval,
+    /// The harness exited and the session is over on this device — stopped,
+    /// finished, or crashed (`detail` says which).
+    Ended,
+}
+
+impl HiveRunState {
+    /// The spelling on the wire and in the session record. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+/// Lenient decoder for `rc:hive.start_ack`'s `refused`. Only an absent or
+/// `null` value means accepted; anything present that is not a known word —
+/// an unknown string, a number, an object from some future shape — is
+/// [`HiveRefusal::Other`].
+pub(crate) fn refusal_lenient<'de, D>(de: D) -> Result<Option<HiveRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveRefusal::Other));
+    };
+    // Re-parse through the derive so the spellings live in exactly one place.
+    Ok(Some(
+        HiveRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveRefusal::Other),
+    ))
+}
+
+/// Lenient decoder for `rc:hive.state`'s `state`: a state this build cannot
+/// name is `None` — the server keeps what it knew and logs the word — rather
+/// than a hard error that would drop the frame and every later one shaped
+/// like it.
+pub(crate) fn run_state_lenient<'de, D>(de: D) -> Result<Option<HiveRunState>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(None);
+    };
+    Ok(HiveRunState::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WIRE LOCK — what a device sends and what the record stores. Spelled
+    /// out literally so a rename has to be a deliberate edit here.
+    #[test]
+    fn refusal_words_are_locked_and_match_serde() {
+        let words: Vec<&str> = HiveRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "hive_disabled",
+                "no_account",
+                "no_console_user",
+                "folder_not_allowed",
+                "harness_missing",
+                "launch_failed",
+                "at_capacity",
+                "other",
+            ]
+        );
+        for r in HiveRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into()),
+                "{r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_state_words_are_locked_and_match_serde() {
+        for (s, w) in [
+            (HiveRunState::Idle, "idle"),
+            (HiveRunState::Running, "running"),
+            (HiveRunState::AwaitingApproval, "awaiting_approval"),
+            (HiveRunState::Ended, "ended"),
+        ] {
+            assert_eq!(s.as_str(), w);
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(w));
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct Ack {
+        #[serde(default, deserialize_with = "refusal_lenient")]
+        refused: Option<HiveRefusal>,
+    }
+
+    fn ack(json: &str) -> Option<HiveRefusal> {
+        serde_json::from_str::<Ack>(json)
+            .expect("an ack decodes")
+            .refused
+    }
+
+    /// The direction of the fallback is the point: anything PRESENT is a
+    /// refusal, and only absence or `null` is acceptance.
+    #[test]
+    fn an_unknown_refusal_is_still_a_refusal() {
+        assert_eq!(ack("{}"), None);
+        assert_eq!(ack(r#"{"refused":null}"#), None);
+        assert_eq!(
+            ack(r#"{"refused":"no_account"}"#),
+            Some(HiveRefusal::NoAccount)
+        );
+        assert_eq!(
+            ack(r#"{"refused":"quota_exhausted"}"#),
+            Some(HiveRefusal::Other),
+            "a newer device's word"
+        );
+        assert_eq!(ack(r#"{"refused":7}"#), Some(HiveRefusal::Other));
+        assert_eq!(ack(r#"{"refused":{"kind":"x"}}"#), Some(HiveRefusal::Other));
+    }
+
+    #[derive(Deserialize)]
+    struct State {
+        #[serde(default, deserialize_with = "run_state_lenient")]
+        state: Option<HiveRunState>,
+    }
+
+    #[test]
+    fn an_unknown_run_state_is_unnamed_not_an_error() {
+        let s = |j: &str| serde_json::from_str::<State>(j).expect("decodes").state;
+        assert_eq!(s(r#"{"state":"running"}"#), Some(HiveRunState::Running));
+        assert_eq!(s(r#"{"state":"compacting"}"#), None);
+        assert_eq!(s(r#"{"state":3}"#), None);
+        assert_eq!(s("{}"), None);
+    }
+}

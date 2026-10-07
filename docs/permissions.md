@@ -67,6 +67,16 @@ but a recording outlives both. The same test checks it, and
 `DEFAULT_ADMIN`. The session bit it gates, and the other gates in the chain, are
 in [recording.md](recording.md) §10.
 
+⚠️ **`HIVE_RUN` (bit 32, FR-90) follows it too — the first bit above 31.** It
+starts and drives agent sessions on a device: remote code execution, even
+though a session runs as the local account the DEVICE maps the starter to and
+never as SYSTEM/root. The same two tests pin it, and the UI catalogue lists it
+under *Fleet access* as `2 ** 32` (a shift cannot express it in JS). The rest of
+its chain — the module switch, the ceiling, and the device's own
+`hive_enabled` / `hive_accounts` / `hive_roots` — is in
+[FR-90](fr/FR-90-hive-agent-sessions.md) and the
+[design](roomler-hive-design.md) §3.4.
+
 ⚠️ `owner` holds these bits, as part of `ALL`. That is not an exception to the
 rule so much as outside it: the row carries `ADMINISTRATOR`, so `has()` already
 answers true for every bit, and the two bits confer nothing there. The test
@@ -290,6 +300,7 @@ The catalogue splits powers that look adjacent, and each split was paid for:
 | `VIEW_EXEC_AUDIT` | `EXEC_DEVICE` | an admin should see every command the fleet ran without silently gaining the power to run one |
 | `VIEW_SSH_AUDIT` | `SSH_DEVICE` | same asymmetry, and `VIEW_SSH_AUDIT` *is* in `DEFAULT_ADMIN` while `SSH_DEVICE` is not |
 | `REMOTE_CONTROL` | `RECORD_REMOTE_SCREEN` | watching a screen ends with the session; a recording is a copy that outlives it (FR-85) |
+| `EXEC_DEVICE` / `SSH_DEVICE` | `HIVE_RUN` | running a command yourself is not handing a model a shell on the box to run its own — and a session runs as the device-mapped account, not SYSTEM/root, so neither power contains the other (FR-90) |
 | `ADMINISTRATOR` under break-glass | recording | break-glass skips the host's consent, so a recording made under it would be covert — the hub strips `RECORD` whatever the mask says |
 | any bit below `ADMINISTRATOR` | `MANAGE_TENANT` | configuring the org is the owner's job — nothing in `DEFAULT_ADMIN` reaches it, only the bypass does |
 

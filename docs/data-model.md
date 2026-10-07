@@ -78,6 +78,8 @@ erDiagram
     tunnel_clients ||--o| overlay_nodes : "joins as"
     tenants ||--o{ overlay_policies : "L3 ACL"
     overlay_blocks ||--o{ overlay_networks : "carves blocks (global)"
+    agents ||--o{ agent_sessions : "runs (FR-90)"
+    agent_sessions ||--o{ hive_audit : "start / stop decisions"
 ```
 
 | Collection | Purpose · key fields / indexes |
@@ -98,6 +100,8 @@ erDiagram
 | `overlay_nodes` | Mesh membership: overlay IP, WG pubkey, advertised + approved routes, exit-node flag. Unique `(tenant_id, machine_id)` and `(tenant_id, network_id, overlay_ip)`; **partial-unique `name`** (MagicDNS) scoped to live rows — nodes are *tombstoned*, not deleted, so a released address/name can be re-issued while history is kept |
 | `overlay_policies` | Overlay L3 ACL rules (compiled into per-node netmaps under `enforce`) |
 | `overlay_blocks` | **Global** (not tenant-scoped) registry of disjoint `/22` address blocks for multi-org; slot-unique, freed blocks quarantined |
+| `agent_sessions` | FR-90 (module `hive`): one agent session — owner, title, harness + its own session UUID, `location {device_id, folder, account}`, `status` (`starting` → `idle`/`running`/`awaiting_approval` → `stopping` → `ended`; or `refused`/`lost`), `fence`, `accepted_at`, `refusal`, `end_reason`. **Never content** — no prompt, tool call or output. Every device-driven move is a compare-and-set on device + fence + status. `(tenant_id, owner_id, created_at desc)`, `(tenant_id, location.device_id, status)`, `(tenant_id, status)`. No TTL |
+| `hive_audit` | FR-90: the server's own decision on every session start (`sent` or `refused` with the gate) and stop (`sent`/`queued`/`ended`). `(tenant_id, at desc)`, `(session_id, at)`. 90 d TTL |
 
 ## Observability & analytics
 
@@ -118,7 +122,7 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 |---|---|
 | Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
 | Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
-| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
+| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
 
 Two patterns worth knowing when touching this layer:
 

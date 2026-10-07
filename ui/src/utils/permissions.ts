@@ -135,6 +135,16 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     description:
       'Record a device’s screen during a remote-control session. The device must allow it, and the person there sees it. A recording outlives the session, so no role gets this by default.',
   },
+  {
+    key: 'HIVE_RUN',
+    // FR-90 — the first flag above bit 31: `2 ** 32`, which a shift cannot
+    // even express in JS (`1 << 32` is 1).
+    bit: 2 ** 32,
+    label: 'Run agent sessions',
+    group: 'Fleet access',
+    description:
+      'Start and drive AI agent sessions on a device. A session runs as the account the device maps you to — never SYSTEM or root — and only where the device allows it. It runs commands on that device, so no role gets this by default.',
+  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -193,11 +203,12 @@ export const DEFAULT_ADMIN = maskUnion(
 )
 
 /**
- * Every defined bit — server `ALL = (1 << 32) - 1` = bits 0–31.
- * Written as `2 ** 32 - 1` because the Rust spelling evaluates to a NEGATIVE
- * number in JS (see the int32 note at the top of this file).
+ * Every defined bit — server `ALL = (1 << 33) - 1` = bits 0–32.
+ * Written as `2 ** 33 - 1` because the Rust spelling is not a JS expression
+ * at all: a shift coerces to int32, so `1 << 33` is 2 (see the int32 note at
+ * the top of this file).
  */
-export const ALL_PERMISSIONS = 2 ** 32 - 1
+export const ALL_PERMISSIONS = 2 ** 33 - 1
 
 /**
  * Mask arithmetic that is exact to `Number.MAX_SAFE_INTEGER`, i.e. bits 0–52.

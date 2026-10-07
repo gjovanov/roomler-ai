@@ -71,7 +71,11 @@ fn baseline_path() -> PathBuf {
 }
 
 async fn snapshot() -> Snapshot {
-    let app = TestApp::spawn().await;
+    // Every compiled module MOUNTED, including FR-90's `hive`, whose switch
+    // defaults off: a default-off module's routes and indexes are still a
+    // claim this build makes, and a change to them must be a reviewed line
+    // in the baseline rather than invisible until someone turns it on.
+    let app = TestApp::spawn_with_settings(|s| s.modules.hive = true).await;
     // A second router from the same state: the one `TestApp` serves is owned
     // by its listener task, and `build_router` is pure composition.
     let router = build_router(app.state.clone());

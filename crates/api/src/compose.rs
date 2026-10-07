@@ -53,6 +53,8 @@ pub const EXTRACTED: &[&str] = &[
     "remote",
     #[cfg(feature = "network")]
     "network",
+    #[cfg(feature = "hive")]
+    "hive",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -80,6 +82,11 @@ pub struct Modules {
     /// tunnel routes are absent).
     #[cfg(feature = "network")]
     pub network: Option<roomler_ai_mod_network::NetworkState>,
+    /// FR-90 — agent sessions, built on `fleet`; `None` when switched off
+    /// (the default): the session routes are absent and a device's
+    /// `rc:hive.*` frames reach no handler.
+    #[cfg(feature = "hive")]
+    pub hive: Option<roomler_ai_mod_hive::HiveState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -92,7 +99,11 @@ impl Modules {
     /// module that is not extracted yet — that switch unmounts nothing.
     pub async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
         for id in settings.modules.switched_off() {
-            if !EXTRACTED.contains(&id) {
+            // A default-off module (FR-90 `hive`) that this build does not
+            // link is the default state, not something an operator did.
+            if !EXTRACTED.contains(&id)
+                && !roomler_ai_config::ModulesSettings::DEFAULT_OFF.contains(&id)
+            {
                 warn!(
                     module = id,
                     "[modules] switch is OFF in config but that module is not yet extracted — \
@@ -168,6 +179,19 @@ impl Modules {
                 }
             }
         }
+        #[cfg(feature = "hive")]
+        {
+            // `hive → fleet`, the same seam: a session's frames ride the
+            // agent socket, and its gate reads the Hub's per-connection caps.
+            if let Some(fleet) = modules.fleet.clone() {
+                modules.hive =
+                    init_one::<roomler_ai_mod_hive::HiveState>(core.clone(), settings, fleet)
+                        .await?;
+                if let Some(m) = &modules.hive {
+                    modules.ws.extend(m.ws().handlers);
+                }
+            }
+        }
 
         let _ = core;
         Ok(modules)
@@ -200,6 +224,10 @@ impl Modules {
         #[cfg(feature = "network")]
         if self.network.is_some() {
             ids.push("network");
+        }
+        #[cfg(feature = "hive")]
+        if self.hive.is_some() {
+            ids.push("hive");
         }
         ids
     }
@@ -234,6 +262,10 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             api = api.merge(network.routes().with_state(()));
+        }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            api = api.merge(hive.routes().with_state(()));
         }
         api
     }
@@ -407,6 +439,10 @@ impl Modules {
         if let Some(network) = &self.network {
             root = root.merge(network.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            root = root.merge(hive.unlimited_routes().with_state(()));
+        }
         root
     }
 
@@ -438,6 +474,10 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             sets.extend(network.indexes());
+        }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            sets.extend(hive.indexes());
         }
         sets
     }
@@ -472,6 +512,10 @@ impl Modules {
         if let Some(network) = &self.network {
             sets.extend(network.indexes_for(multi_block));
         }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            sets.extend(hive.indexes_for(multi_block));
+        }
         sets
     }
 
@@ -502,6 +546,10 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             jobs.extend(network.jobs());
+        }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            jobs.extend(hive.jobs());
         }
         jobs
     }
@@ -541,6 +589,11 @@ impl Modules {
         if let Some(network) = &self.network {
             core.hooks
                 .register(roomler_ai_mod_network::NetworkState::ID, network.hooks());
+        }
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            core.hooks
+                .register(roomler_ai_mod_hive::HiveState::ID, hive.hooks());
         }
     }
 
@@ -596,6 +649,10 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        #[cfg(feature = "hive")]
+        if let Some(hive) = &self.hive {
+            hive.shutdown().await;
+        }
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             network.shutdown().await;

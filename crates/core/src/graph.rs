@@ -7,15 +7,31 @@
 //! topological order of this graph; the hook order is its reverse.
 
 /// Every module, in the order the host composes them (dependencies first).
-pub const MODULES: &[&str] = &["saas", "chat", "conference", "fleet", "remote", "network"];
+pub const MODULES: &[&str] = &[
+    "saas",
+    "chat",
+    "conference",
+    "fleet",
+    "remote",
+    "network",
+    "hive",
+];
 
 /// The allowed **module → module** call edges. Every module may call core;
 /// core calls no module. Anything not listed here is forbidden — in particular
 /// `chat ↔ remote`, `chat ↔ network` and `remote ↔ network`.
+///
+/// FR-90 — `hive → fleet` only: a session lives on a device and its frames
+/// ride the agent socket, so hive needs the Hub. Hive never calls `remote`
+/// or `network`: it reaches a device over the control WS like exec does, and
+/// session content travels device-to-browser, never through a module. The
+/// `hive → chat` edge (a session renders as a room) arrives with the slice
+/// that uses it, not before.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),
     ("network", "fleet"),
+    ("hive", "fleet"),
 ];
 
 /// The modules `id` may call, besides core.
@@ -74,6 +90,10 @@ mod tests {
             ("chat", "remote"),
             ("chat", "network"),
             ("remote", "network"),
+            // FR-90 — a session's content never flows through another
+            // module, and its device path is the control WS (fleet's).
+            ("hive", "remote"),
+            ("hive", "network"),
         ] {
             assert!(!is_allowed_edge(a, b), "{a} -> {b} must not be allowed");
             assert!(!is_allowed_edge(b, a), "{b} -> {a} must not be allowed");

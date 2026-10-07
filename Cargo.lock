@@ -8149,6 +8149,7 @@ dependencies = [
  "roomler-ai-mod-chat",
  "roomler-ai-mod-conference",
  "roomler-ai-mod-fleet",
+ "roomler-ai-mod-hive",
  "roomler-ai-mod-network",
  "roomler-ai-mod-remote",
  "roomler-ai-mod-saas",
@@ -8269,6 +8270,29 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "roomler-ai-mod-hive"
+version = "0.4.116"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bson",
+ "dashmap",
+ "mongodb",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-mod-fleet",
+ "roomler-ai-remote-control",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
