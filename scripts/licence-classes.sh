@@ -101,6 +101,7 @@ CLIENT_CRATES=(
   roomler-setup
   roomler-cli
   roomler-node-core
+  roomler-hive-node
   roomler-setup-core
   roomler-ai-tunnel-core
   roomler-ai-remote-control
