@@ -171,8 +171,8 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | this PR |
-| P1 | `run_streamed` + `StreamRedactor` + Windows drain streaming in the engine; SSH exec on it; `channel_close`/`Drop` cancel; `ssh_exec_streaming`; tests; docs (`docs/roomler-ssh.md` §3, the sftp note, `docs/fleet-rpc.md`, `docs/README.md`) | `ssh_exec_streaming = false` (next daemon restart) | this PR |
+| P0 | spec + ledger row + issue | — | **in review** [#1830](https://github.com/gjovanov/roomler-ai/pull/1830) — the row was rebased onto master beside the FR-90 claim ([#1828](https://github.com/gjovanov/roomler-ai/pull/1828)), which landed meanwhile: the ledger arbitrated a textual conflict, not a number collision |
+| P1 | `run_streamed` + `StreamRedactor` + Windows drain streaming in the engine; SSH exec on it; `channel_close`/`Drop` cancel; `ssh_exec_streaming`; tests; docs (`docs/roomler-ssh.md` §3, the sftp note, `docs/fleet-rpc.md`, `docs/README.md`) | `ssh_exec_streaming = false` (next daemon restart) | **in review** [#1830](https://github.com/gjovanov/roomler-ai/pull/1830), stacked on #1819: 87/87 `exec::` + `ssh::` tests at default concurrency, twice; the SSH suite's command-running tests now hold one of `MAX_CONCURRENT_PER_AGENT` slots (they share the process-wide `exec::shared()` engine, and a fifth overlapping test was being refused) |
 | P2 | agent release; field verification on the matrix (Linux root daemon, Windows SYSTEM, Windows `console_user` corp laptop, macOS); tick AC1–AC9; close | as P1 | owed |
 
 ## Acceptance criteria
@@ -202,7 +202,7 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
   back). *(Unit. Field: one device flipped, restarted, re-checked.)*
 - [x] **AC10** — Docs: `docs/roomler-ssh.md` §3 rewritten for streaming (mermaid exec path, the lifetime
   table, the kill switch, the corrected Windows sftp note), `docs/fleet-rpc.md` cross-references the streamed
-  variant, and the `docs/README.md` index row names it. *(This PR.)*
+  variant, and the `docs/README.md` index row names it. *(#1830.)*
 
 ## Open decisions
 
