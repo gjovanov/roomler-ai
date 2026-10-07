@@ -704,6 +704,43 @@ pub enum ClientMsg {
         detail: Option<String>,
     },
 
+    /// FR-90 — one turn's STUB: who asked, how it stands, how big it was.
+    /// Sent when a prompt goes in (`running`) and again when the turn ends.
+    ///
+    /// ⚠️ Never what was asked or answered, never a tool's name, argument or
+    /// output — the field set is locked by test. The server turns this into a
+    /// message in the session's room; the content streams to a viewer from a
+    /// replica, never through the server (`docs/roomler-hive-design.md` §5.1).
+    #[serde(rename = "rc:hive.turn")]
+    HiveTurn {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// 1-based, counted per session by the device that runs it.
+        turn: u32,
+        /// `None` = a status this build cannot name; decoded leniently.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::turn_status_lenient"
+        )]
+        status: Option<crate::hive::HiveTurnStatus>,
+        /// The user whose prompt started the turn, when one did.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "option_oid_hex"
+        )]
+        prompted_by: Option<ObjectId>,
+        /// Tool calls in the turn so far.
+        #[serde(default)]
+        steps: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1427,6 +1464,7 @@ impl ClientMsg {
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
             ClientMsg::HiveStartAck { .. } => "rc:hive.start_ack",
             ClientMsg::HiveState { .. } => "rc:hive.state",
+            ClientMsg::HiveTurn { .. } => "rc:hive.turn",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -1514,7 +1552,9 @@ impl ClientMsg {
             | ClientMsg::OverlayRelayProbe { .. }
             | ClientMsg::OverlayRelayRequest { .. }
             | ClientMsg::OverlayWarmRelayRequest { .. } => Owner::Network,
-            ClientMsg::HiveStartAck { .. } | ClientMsg::HiveState { .. } => Owner::Hive,
+            ClientMsg::HiveStartAck { .. }
+            | ClientMsg::HiveState { .. }
+            | ClientMsg::HiveTurn { .. } => Owner::Hive,
         }
     }
 }
@@ -1540,6 +1580,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:agent.key_rotated", Owner::Network),
     ("rc:hive.start_ack", Owner::Hive),
     ("rc:hive.state", Owner::Hive),
+    ("rc:hive.turn", Owner::Hive),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -3550,6 +3591,63 @@ mod tests {
                 state,
                 ..
             } => assert_eq!((session_id, fence, state), (sid, 2, None)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-90 — a turn's stub carries its shape and nothing it said: the field
+    /// set is spelled out so a `prompt`, `text`, `tool` or `output` field is a
+    /// deliberate edit here, not a quiet addition that ships content through
+    /// the server into a room's message store.
+    #[test]
+    fn hive_turn_is_a_stub_and_carries_no_content() {
+        use crate::hive::HiveTurnStatus;
+
+        let sid = ObjectId::new();
+        let who = ObjectId::new();
+        let m = ClientMsg::HiveTurn {
+            session_id: sid,
+            fence: 1,
+            turn: 3,
+            status: Some(HiveTurnStatus::Ok),
+            prompted_by: Some(who),
+            steps: 5,
+            duration_ms: Some(42_000),
+            cost_usd: Some(0.12),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cost_usd",
+                "duration_ms",
+                "fence",
+                "prompted_by",
+                "session_id",
+                "status",
+                "steps",
+                "t",
+                "turn",
+            ]
+        );
+        assert_eq!(v["t"], "rc:hive.turn");
+        assert_eq!(v["prompted_by"], who.to_hex());
+        assert_eq!(m.namespace(), Owner::Hive);
+
+        // A newer device's status keeps the frame; a bare running stub parses.
+        let newer = serde_json::json!({
+            "t": "rc:hive.turn", "session_id": sid.to_hex(), "fence": 1, "turn": 1,
+            "status": "paused"
+        });
+        match serde_json::from_value::<ClientMsg>(newer).expect("the frame must still parse") {
+            ClientMsg::HiveTurn {
+                status,
+                steps,
+                prompted_by,
+                ..
+            } => assert_eq!((status, steps, prompted_by), (None, 0, None)),
             other => panic!("wrong variant: {other:?}"),
         }
     }

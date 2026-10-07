@@ -12,8 +12,9 @@ path = "src/lib.rs"
 
 # Built ON `fleet` (`hive → fleet` in the module graph): a session lives on a
 # device and its frames ride the agent socket, so the module needs the Hub and
-# the agent rows. Never on `remote` or `network` — a session's content travels
-# device-to-browser, not through another module.
+# the agent rows. And ON `chat` (`hive → chat`, P0d): a session is a room, its
+# turns are messages in it. Never on `remote` or `network` — a session's
+# content travels device-to-browser, not through another module.
 [dependencies]
 roomler-core = { path = "../../core" }
 roomler-ai-config = { path = "../../config" }
@@ -21,6 +22,7 @@ roomler-ai-db = { path = "../../db" }
 roomler-ai-services = { path = "../../services" }
 roomler-ai-remote-control = { path = "../../remote_control" }
 roomler-ai-mod-fleet = { path = "../fleet" }
+roomler-ai-mod-chat = { path = "../chat" }
 
 anyhow.workspace = true
 async-trait.workspace = true

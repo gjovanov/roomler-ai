@@ -22,7 +22,9 @@
 //! until an operator turns it on.
 //!
 //! Built on `fleet` (`hive → fleet`): the Hub carries the frames and knows
-//! which connections advertise `hive`.
+//! which connections advertise `hive`. And on `chat` (`hive → chat`, P0d): a
+//! session is a `Secret` room bound to it, where the session posts a stub per
+//! turn ([`room`]).
 
 use std::sync::Arc;
 
@@ -33,6 +35,7 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
+use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_mod_fleet::FleetState;
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx, rate_limit::RateLimiter,
@@ -43,6 +46,7 @@ pub mod agent_socket;
 pub mod dao;
 pub mod hooks;
 pub mod model;
+pub mod room;
 pub mod routes;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -52,6 +56,10 @@ pub struct HiveState {
     pub core: Core,
     /// `hive → fleet`: the Hub and the agent rows.
     pub fleet: FleetState,
+    /// `hive → chat` (P0d): a session is a room, and its turns are messages
+    /// in it, written through chat so chat keeps its own invariants.
+    /// Stateless, so re-created here rather than taken as a dependency.
+    pub chat: BoundChat,
     pub sessions: Arc<dao::AgentSessionDao>,
     pub audit: Arc<dao::HiveAuditDao>,
     /// Start requests waiting for their device's answer (pod-local).
@@ -78,6 +86,8 @@ impl FromRef<HiveState> for Core {
 impl Module for HiveState {
     const ID: &'static str = "hive";
 
+    /// The Hub is one live object, so `fleet` is the dependency. Chat is
+    /// stateless and re-created ([`BoundChat::new`], FR-69 rule 5).
     type Deps = FleetState;
 
     async fn init(core: Core, _settings: &Settings, fleet: FleetState) -> anyhow::Result<Self> {
@@ -87,6 +97,7 @@ impl Module for HiveState {
             audit: Arc::new(dao::HiveAuditDao::new(db)),
             start_acks: Arc::new(acks::StartAcks::new()),
             start_limiter: Arc::new(RateLimiter::new()),
+            chat: BoundChat::new(&core),
             fleet,
             core,
         };

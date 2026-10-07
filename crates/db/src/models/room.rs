@@ -120,6 +120,10 @@ pub struct Room {
     pub peak_participant_count: u32,
     pub actual_start_time: Option<DateTime>,
     pub actual_end_time: Option<DateTime>,
+    /// FR-90 — the module that owns this room's meaning, if any (an agent
+    /// session's room). Chat stores it and never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<super::Binding>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,

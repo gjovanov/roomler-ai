@@ -35,6 +35,7 @@ use roomler_ai_services::{
 };
 use roomler_core::{Capabilities, Core, Module, Role, TenantCtx, WsHandlerSpec, WsRegistration};
 
+pub mod bound;
 pub mod export;
 pub mod file;
 pub mod giphy;
