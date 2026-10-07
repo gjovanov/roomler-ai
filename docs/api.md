@@ -257,6 +257,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |
 | POST | `…/agent/{aid}/exec/{request_id}/cancel` | Cancel a running exec |
 | PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |
+| POST | `…/agent/{aid}/overlay-key/rotate` | Order the device to retire its overlay (WireGuard) key — it mints locally, re-joins and reports back; the server never sees a private key (FR-40). `MANAGE_AGENTS`, one order per device per minute. 200 `{request_id, dispatch: "pushed" \| "queued", delivered}`; 409 `rate_limited` / `agent_unsupported` (online device without the `key-rotate` verb) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
 | GET | `…/exec-audit` | Org-wide exec attempt log (every refusal included) |
 | GET/PUT | `…/exec-settings` | Org exec kill-switch (gate 1 of 4) |
 | GET | `…/session/{sid}` | Remote-desktop session detail |
