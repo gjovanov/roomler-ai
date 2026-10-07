@@ -896,7 +896,9 @@ pub async fn get_agent(
         return Err(ApiError::NotAMember);
     }
 
-    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    // LIVE: a removed device is a 404 here exactly as it is absent from the
+    // listing (#1821 — this GET answered 200 with the whole tombstone).
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
     let redis_fresh = agent_presence_batch(&state, std::slice::from_ref(&agent)).await;
     let fresh = agent.id.map(|i| redis_fresh.contains(&i)).unwrap_or(false);
     Ok(Json(to_agent_response(&state, agent, fresh)))
@@ -967,6 +969,14 @@ pub async fn update_agent(
     )
     .await?;
 
+    // LIVE, before anything below writes (#1821): this handler used to go
+    // straight to the setters, so a stale page holding a removed device's id
+    // edited the tombstone and only the refetch at the end noticed. A removed
+    // device is a 404 here, like a bogus id. The setters filter on the live
+    // row as well, so a removal between this read and those writes cannot
+    // land one on the tombstone either.
+    state.agents.find_live_in_tenant(tid, aid).await?;
+
     if let Some(owner) = body.owner_user_id {
         let owner_id = ObjectId::parse_str(&owner)
             .map_err(|_| ApiError::BadRequest("Invalid owner_user_id".to_string()))?;
@@ -1022,7 +1032,7 @@ pub async fn update_agent(
 
     // Hand back the refreshed row so the UI can patch without a refetch —
     // additive around the legacy `{"updated": true}`.
-    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
     let redis_fresh = agent_presence_batch(&state, std::slice::from_ref(&agent)).await;
     let fresh = agent.id.map(|i| redis_fresh.contains(&i)).unwrap_or(false);
     Ok(Json(serde_json::json!({
@@ -1062,7 +1072,15 @@ pub async fn delete_agent(
     // a bool the handler used to discard, so deleting a nonexistent agent
     // reported `{"deleted": true}`), and yields the machine_id the overlay node
     // is keyed by.
-    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    //
+    // LIVE (#1821): the row this tombstones is live when it is found, and a
+    // REPEAT delete is a 404 — the same answer the listing gives, and the
+    // only one that leaves the state alone. Finding the tombstone instead
+    // would re-run the whole cascade on it: re-stamp `deleted_at` (the
+    // removal time, now lost), re-fire the holders' hooks against a node
+    // that was already released, and report `deleted: true` for something
+    // somebody else removed earlier.
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     // FR-51 — ONE removal sequence, shared with the ephemeral reaper
     // (overlay release before the row delete before the kick; the ordering
@@ -1180,8 +1198,9 @@ pub async fn trigger_agent_update(
     )
     .await?;
 
-    // Tenant-scope the target (404 for a foreign agent id).
-    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    // Tenant-scope the target (404 for a foreign agent id) — LIVE, because an
+    // update order for a removed device has nowhere to go (#1821).
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     // FR-2: refuse a stale pin that would downgrade, unless forced.
     if let Some(pin) = body.pin.as_deref()
@@ -1264,8 +1283,9 @@ pub async fn trigger_agents_update(
             for id in ids {
                 let aid = ObjectId::parse_str(&id)
                     .map_err(|_| ApiError::BadRequest(format!("Invalid agent_id: {id}")))?;
-                // Tenant-scope every explicit target.
-                let a = state.agents.find_in_tenant(tid, aid).await?;
+                // Tenant-scope every explicit target — LIVE, like the
+                // "all devices" arm below, which lists live rows only.
+                let a = state.agents.find_live_in_tenant(tid, aid).await?;
                 out.push((aid, a.agent_version));
             }
             out

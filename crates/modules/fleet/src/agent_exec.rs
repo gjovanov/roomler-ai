@@ -305,9 +305,10 @@ pub async fn authorize(
 
     // The CLI leg only: the ORIGINATING device must be blessed. Without this,
     // compromising any enrolled laptop would inherit its owner's exec rights
-    // across the whole fleet.
+    // across the whole fleet. LIVE: a removed device cannot originate,
+    // whatever `can_originate` its tombstone still says (#1821).
     if let Some(origin) = caller.origin_agent_id {
-        match state.agents.find_in_tenant(tenant_id, origin).await {
+        match state.agents.find_live_in_tenant(tenant_id, origin).await {
             Ok(a) if a.exec_policy.can_originate => {}
             _ => return Err(ExecDenyReason::OriginNotAllowed),
         }
@@ -553,7 +554,9 @@ async fn load_agent(
 ) -> Result<Agent, ApiError> {
     let aid = ObjectId::parse_str(agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".into()))?;
-    Ok(state.agents.find_in_tenant(tenant_id, aid).await?)
+    // LIVE: the exec target, the cancel target and the policy write all come
+    // through here, and none of them has a meaning for a removed device.
+    Ok(state.agents.find_live_in_tenant(tenant_id, aid).await?)
 }
 
 /// Resolve the acting principal for a browser/API caller.

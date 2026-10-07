@@ -270,12 +270,62 @@ impl AgentDao {
             .await
     }
 
-    pub async fn find_in_tenant(
+    /// The per-device lookup every per-agent route, write and session start
+    /// wants: this id, this tenant, and LIVE. A removed device is `NotFound`
+    /// here exactly as it is absent from [`Self::list_for_tenant`] — the two
+    /// disagreeing was #1821: `GET …/agent/{id}` answered 200 with the whole
+    /// tombstone, and every per-device write (config, policies, owner
+    /// settings) landed on it, so a stale page could keep editing a device
+    /// that no longer existed.
+    ///
+    /// There is deliberately no un-suffixed `find_in_tenant` any more: a
+    /// caller chooses LIVE or [`Self::find_any_in_tenant`] by name, and the
+    /// compiler asks the question of every future call site too.
+    pub async fn find_live_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> DaoResult<Agent> {
+        self.base
+            .find_live_by_id_in_tenant(tenant_id, agent_id)
+            .await
+    }
+
+    /// The per-device lookup that also returns a TOMBSTONE — for the readers
+    /// whose job is the tombstone, and nothing else:
+    ///
+    /// * the revocation checks (`auth_agent`, the agent WS upgrade, DERP) read
+    ///   `deleted_at` to tell a device *why* it is refused. The WS one sends
+    ///   the typed `rc:goodbye AgentDeleted` the daemon exits 7 on — a plain
+    ///   `NotFound` there would drop the socket and leave the device
+    ///   reconnecting forever against what reads as a network fault;
+    /// * an audit view of a removed device's history, where "removed" must
+    ///   not mean "unauditable".
+    ///
+    /// Never for a write, never for a session start, never for a GET of the
+    /// device itself — those are [`Self::find_live_in_tenant`].
+    pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
         self.base.find_by_id_in_tenant(tenant_id, agent_id).await
+    }
+
+    /// The filter every ADMIN-driven setter below writes through: this row,
+    /// in this tenant, and LIVE (#1821). The routes look the device up live
+    /// first; this closes the window between that read and the write, and
+    /// holds for a caller that never did the read ("a gate applies at every
+    /// entry point, or it is a courtesy"). A tombstone matches nothing, so the
+    /// setter reports `false` and the removal time it carries stays as it was.
+    ///
+    /// The DEVICE-written fields (`record_config_report`, the key-rotation
+    /// report, the overlay identity) deliberately keep the plain
+    /// `{_id, tenant_id}` filter: their writer was already gated by
+    /// `auth_agent`, and a report that races the removal is still what the
+    /// host said — it is the server's own audit rows that settle a dispute.
+    fn live_row(tenant_id: ObjectId, agent_id: ObjectId) -> Document {
+        doc! { "_id": agent_id, "tenant_id": tenant_id, "deleted_at": null }
     }
 
     /// FR-43 P2c — refresh only the capability blob, mid-connection.
@@ -522,7 +572,7 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "access_policy": policy_bson } },
             )
             .await
@@ -541,7 +591,7 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "exec_policy": policy_bson } },
             )
             .await
@@ -560,7 +610,7 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "ssh_policy": policy_bson } },
             )
             .await
@@ -580,7 +630,7 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "peer_relay_policy": policy_bson } },
             )
             .await
@@ -644,7 +694,7 @@ impl AgentDao {
         let bson = bson::to_bson(request).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "key_rotation": bson } },
             )
             .await
@@ -741,7 +791,7 @@ impl AgentDao {
         let routes_bson = bson::to_bson(routes).unwrap_or(bson::Bson::Array(vec![]));
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "routes": routes_bson } },
             )
             .await
@@ -755,7 +805,7 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 // The flag is what stops the next re-enroll's `rehydrate`
                 // from clobbering this rename with the machine-reported name.
                 doc! { "$set": { "name": name, "name_admin_set": true } },
@@ -776,7 +826,7 @@ impl AgentDao {
             None => doc! { "$unset": { "display_name": "" } },
         };
         self.base
-            .update_one(doc! { "_id": agent_id, "tenant_id": tenant_id }, update)
+            .update_one(Self::live_row(tenant_id, agent_id), update)
             .await
     }
 
@@ -789,14 +839,24 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "tags": tags.to_vec() } },
             )
             .await
     }
 
+    /// Tombstone a LIVE row. `deleted_at` is the removal time and is written
+    /// once: a repeat on a tombstone matches nothing and reports `false`
+    /// rather than re-stamping it. The route 404s a repeat `DELETE` before
+    /// reaching here (#1821); this keeps the removal hooks' and the archive
+    /// sweep's calls to the same answer.
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
-        self.base.soft_delete_in_tenant(tenant_id, agent_id).await
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "deleted_at": DateTime::now() } },
+            )
+            .await
     }
 
     /// FR-51 — remove an EPHEMERAL row outright. The `(tenant_id, machine_id)`
@@ -882,7 +942,7 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "owner_user_id": owner_user_id } },
             )
             .await
