@@ -4190,6 +4190,9 @@ async fn handle_server_msg(
                 &request_id,
                 crate::exec::ExecOutcome {
                     exit_code,
+                    // The wire carried text; the byte views are that text.
+                    stdout_bytes: stdout.as_bytes().to_vec(),
+                    stderr_bytes: stderr.as_bytes().to_vec(),
                     stdout,
                     stderr,
                     truncated,

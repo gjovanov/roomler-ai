@@ -113,6 +113,15 @@ can be pinned out of band.
   process-tree kill. An SSH transport is not a reason to reimplement any of
   that. The cost: output arrives when the command finishes rather than
   streaming, because the engine buffers to enforce its ceiling.
+  **The output is byte-exact**: `ssh <node> cat f > f` lands the file as it
+  is on the device, and redaction masks only text inside it
+  (`Redactor::apply_bytes`). ⚠️ Until 2026-10-06 the output was decoded to
+  text first, so every byte that is not UTF-8 arrived as U+FFFD: a 4.4 MB MP4
+  came back as 1.9 MB of noise.
+  ⚠️ **Past the ceiling (1 MiB) the output stops and stderr says so.** The
+  command is cut off mid-write (on macOS it died of SIGPIPE and `ssh` exited
+  1). Copy files with `scp` or `sftp` (below), which stream them whole; before
+  the notice the cut-off read as a corrupt transfer.
   **The client's stdin reaches the command** ([#1747](https://github.com/gjovanov/roomler-ai/issues/1747)):
   `ssh <node> 'cat > f' < file`, `tar c . | ssh <node> 'tar x'` and
   `ssh <node> 'sh -s' < script` work, and the client's EOF ends the input.
