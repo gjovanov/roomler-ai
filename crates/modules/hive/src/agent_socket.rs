@@ -75,6 +75,9 @@ enum Report {
         fence: u64,
         report: room::TurnReport,
     },
+    /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
+    /// the device's answer must reach the browser before its candidates.
+    View(ClientMsg),
 }
 
 /// A device's words, kept short and on one line: they are shown to a person
@@ -153,6 +156,10 @@ impl AgentMsgHandler for HiveAgentSocket {
                     cost_usd,
                 },
             },
+            view @ (ClientMsg::HiveViewGrantAck { .. }
+            | ClientMsg::HiveViewAnswer { .. }
+            | ClientMsg::HiveViewIce { .. }
+            | ClientMsg::HiveViewClosed { .. }) => Report::View(view),
             other => return Some(other),
         };
         let tx = self.conns.get(&ctx.conn_id).map(|e| e.value().clone());
@@ -339,6 +346,7 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                     Err(e) => warn!(session = %session_id, %e, "hive: a turn report was not read"),
                 }
             }
+            Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
         }
     }
 }
