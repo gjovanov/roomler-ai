@@ -640,6 +640,70 @@ pub enum ClientMsg {
         detail: Option<String>,
     },
 
+    /// FR-90 — the device's answer to [`ServerMsg::HiveStart`]: whether its
+    /// own gates let the session run.
+    ///
+    /// Sent once the device has decided — accepted means the harness is being
+    /// launched, and what follows arrives as [`Self::HiveState`]. Sent on
+    /// EVERY outcome, refusals included: each refusal names a different gate
+    /// with a different fix.
+    ///
+    /// ⚠️ `tenant_id` / `agent_id` come from the authenticated WS, NOT from
+    /// this frame, and the server applies an answer only to a session located
+    /// on the device that sent it, at the fence it was started with — session
+    /// ids are ObjectIds, structured, not secret.
+    #[serde(rename = "rc:hive.start_ack")]
+    HiveStartAck {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Echo of the start's `fence`. An answer to an older start of the
+        /// same session is stale and changes nothing.
+        fence: u64,
+        /// Absent = accepted. Present = refused, decoded leniently — see
+        /// [`crate::hive::HiveRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveRefusal>,
+        /// On acceptance, the local account the device mapped the starter to
+        /// — shown with the session, so "who is this running as" has an
+        /// answer. A claim by the device, like everything in this frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// A short reason for the person who started it. Redacted and capped
+        /// by the device; re-clamped on receipt. Never transcript content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// FR-90 — a session's lifecycle on the device: idle, running, waiting
+    /// for an approval, ended.
+    ///
+    /// Whether, never what: no prompt, tool name, argument or output rides
+    /// this frame. The same ownership rule as [`Self::HiveStartAck`] — the
+    /// server moves only a session located on the sending device, at its
+    /// current fence.
+    #[serde(rename = "rc:hive.state")]
+    HiveState {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// `None` = a state this build cannot name (a newer device); the
+        /// server keeps what it knew. Decoded leniently.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::run_state_lenient"
+        )]
+        state: Option<crate::hive::HiveRunState>,
+        /// For `ended`: stopped, exited, or crashed, in a few words. Capped
+        /// like [`Self::HiveStartAck`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1325,6 +1389,9 @@ pub enum Owner {
     /// The mesh and what rides it: overlay, tunnels, relays and DERP
     /// tickets, SSH, key rotation.
     Network,
+    /// FR-90 — agent sessions: a device's answer to a start, and each
+    /// session's lifecycle.
+    Hive,
 }
 
 impl Owner {
@@ -1334,6 +1401,7 @@ impl Owner {
             Owner::Fleet => "fleet",
             Owner::Remote => "remote",
             Owner::Network => "network",
+            Owner::Hive => "hive",
         }
     }
 }
@@ -1357,6 +1425,8 @@ impl ClientMsg {
             ClientMsg::SshGrantAck { .. } => "rc:ssh.grant_ack",
             ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
+            ClientMsg::HiveStartAck { .. } => "rc:hive.start_ack",
+            ClientMsg::HiveState { .. } => "rc:hive.state",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -1444,6 +1514,7 @@ impl ClientMsg {
             | ClientMsg::OverlayRelayProbe { .. }
             | ClientMsg::OverlayRelayRequest { .. }
             | ClientMsg::OverlayWarmRelayRequest { .. } => Owner::Network,
+            ClientMsg::HiveStartAck { .. } | ClientMsg::HiveState { .. } => Owner::Hive,
         }
     }
 }
@@ -1467,6 +1538,8 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:ssh.grant_ack", Owner::Network),
     ("rc:agent.config_status", Owner::Fleet),
     ("rc:agent.key_rotated", Owner::Network),
+    ("rc:hive.start_ack", Owner::Hive),
+    ("rc:hive.state", Owner::Hive),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -1592,6 +1665,19 @@ mod namespace_tests {
                 grant_id: "g1".into(),
                 refused: None,
             },
+            ClientMsg::HiveStartAck {
+                session_id: ObjectId::new(),
+                fence: 1,
+                refused: None,
+                account: None,
+                detail: None,
+            },
+            ClientMsg::HiveState {
+                session_id: ObjectId::new(),
+                fence: 1,
+                state: Some(crate::hive::HiveRunState::Idle),
+                detail: None,
+            },
         ];
         for m in &samples {
             let v = serde_json::to_value(m).expect("a client message serialises");
@@ -1613,7 +1699,7 @@ mod namespace_tests {
     /// The ids are what the module graph spells, and they serialise as such.
     #[test]
     fn owner_ids_are_stable_lowercase_module_ids() {
-        for owner in [Owner::Fleet, Owner::Remote, Owner::Network] {
+        for owner in [Owner::Fleet, Owner::Remote, Owner::Network, Owner::Hive] {
             let json = serde_json::to_string(&owner).unwrap();
             assert_eq!(json, format!("\"{}\"", owner.id()));
         }
@@ -2514,6 +2600,78 @@ pub enum ServerMsg {
     /// the agent re-requests at ~90 % of the TTL.
     #[serde(rename = "rc:relay.derp_ticket")]
     DerpTicket { ticket: String, exp: u64 },
+
+    // ─── Hive (rc:hive.*) — FR-90 ─────────────────────────────────────
+    /// Start (or resume) one agent session on this device, and answer with
+    /// [`ClientMsg::HiveStartAck`].
+    ///
+    /// The server has cleared its gates before this is sent: the module is
+    /// on, the starter holds `HIVE_RUN`, the device is in the starter's org,
+    /// the per-(user, device) ceiling. The device then applies its own, which
+    /// survive a compromised server: `hive_enabled`, the account
+    /// `hive_accounts` maps the starter to (never SYSTEM/root, never an
+    /// account the server names — this frame carries none), and the folder
+    /// confined to `hive_roots`.
+    ///
+    /// ⚠️ Metadata only. No prompt, no context, no secret: the first prompt
+    /// reaches the harness over the viewer peer, and the field set is locked
+    /// by test so this frame cannot grow one.
+    ///
+    /// ⚠️ Gate on [`crate::models::RpcCap::Hive`] — a caller waits for the
+    /// answer, so it is never sent blind.
+    ///
+    /// ⚠️ IDEMPOTENT on `session_id` + `fence`, and a device must keep it so:
+    /// a start whose answer was lost is sent again when the device reconnects
+    /// (reconcile-on-connect), so a device already running that session at
+    /// that fence answers `accepted` again and launches nothing.
+    #[serde(rename = "rc:hive.start")]
+    HiveStart {
+        /// The server's record of the session (`agent_sessions._id`).
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Which harness to run — [`crate::hive::HARNESS_CLAUDE_CODE`] in P0.
+        harness: String,
+        /// The harness's OWN session id (a UUID), server-minted so every
+        /// replica resumes the same conversation: `--session-id` on a first
+        /// start, `--resume` when `resume` is set.
+        harness_session: String,
+        /// The lease fence this start runs under. The device writes it into
+        /// every transcript event and refuses work from an older one.
+        fence: u64,
+        /// The folder as the starter typed it. The device resolves it as the
+        /// mapped account and refuses anything outside `hive_roots`.
+        folder: String,
+        /// Who is starting it — the key the device's `hive_accounts` maps
+        /// through (by id or by the proven address below).
+        #[serde(with = "oid_hex")]
+        user_id: ObjectId,
+        /// The starter's address, only if their account PROVED it — otherwise
+        /// the `.invalid` placeholder `users.email` holds, which no
+        /// `hive_accounts` entry should ever match.
+        user_email: String,
+        /// Display name — written to the device's log, so the person at the
+        /// device can see who started what.
+        caller: String,
+        /// `true` = resume the harness session (`--resume`); `false` = a
+        /// first start (`--session-id`).
+        resume: bool,
+    },
+
+    /// Stop a session: interrupt any running turn, let the harness exit, and
+    /// report `ended` through [`ClientMsg::HiveState`]. Idempotent — a stop
+    /// for a session the device does not run is answered `ended` too.
+    #[serde(rename = "rc:hive.stop")]
+    HiveStop {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence the stop applies to; a device holding a NEWER fence for
+        /// this session ignores it (the session moved on).
+        fence: u64,
+        /// Why, in a word, for the device's log: `owner`, `member_removed`,
+        /// `device_removed`, `tenant_archived`.
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3233,6 +3391,167 @@ mod tests {
             absent,
             ClientMsg::SshGrantAck { refused: None, .. }
         ));
+    }
+
+    /// FR-90 — the start frame carries metadata and nothing else. Its field
+    /// set is spelled out here so adding a `prompt`, a `context` or an
+    /// `env` is a deliberate edit to this test — the server never carries
+    /// session content (`docs/roomler-hive-design.md` §3.3), and the first
+    /// prompt reaches the harness over the viewer peer. Also locks that it
+    /// names no ACCOUNT: which local account runs a session is the device's
+    /// decision (`hive_accounts`), never the server's.
+    #[test]
+    fn hive_start_is_metadata_only_and_names_no_account() {
+        let sid = ObjectId::new();
+        let uid = ObjectId::new();
+        let m = ServerMsg::HiveStart {
+            session_id: sid,
+            harness: crate::hive::HARNESS_CLAUDE_CODE.into(),
+            harness_session: "0b9e3c7e-6a43-4a43-9d63-2d1b0d1c2f10".into(),
+            fence: 1,
+            folder: "/home/dev/src/app".into(),
+            user_id: uid,
+            user_email: "dev@example.com".into(),
+            caller: "Dev".into(),
+            resume: false,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "caller",
+                "fence",
+                "folder",
+                "harness",
+                "harness_session",
+                "resume",
+                "session_id",
+                "t",
+                "user_email",
+                "user_id",
+            ]
+        );
+        assert_eq!(v["t"], "rc:hive.start");
+        assert_eq!(v["session_id"], sid.to_hex(), "ObjectIds are raw hex");
+        assert_eq!(v["user_id"], uid.to_hex());
+        match serde_json::from_value::<ServerMsg>(v).unwrap() {
+            ServerMsg::HiveStart {
+                session_id, fence, ..
+            } => assert_eq!((session_id, fence), (sid, 1)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hive_stop_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let m = ServerMsg::HiveStop {
+            session_id: sid,
+            fence: 3,
+            reason: "owner".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.stop", "session_id": sid.to_hex(), "fence": 3, "reason": "owner"
+            })
+        );
+        // A stop from a server that sent no reason still decodes.
+        let bare = serde_json::json!({"t": "rc:hive.stop", "session_id": sid.to_hex(), "fence": 3});
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(bare).unwrap(),
+            ServerMsg::HiveStop { fence: 3, .. }
+        ));
+    }
+
+    /// FR-90 — "accepted" is the ABSENCE of `refused`, as for FR-83's grant
+    /// ack; an unknown refusal is still a refusal and never an acceptance.
+    #[test]
+    fn hive_start_ack_wire_shape_and_lenient_refusal() {
+        use crate::hive::HiveRefusal;
+
+        let sid = ObjectId::new();
+        let accepted = ClientMsg::HiveStartAck {
+            session_id: sid,
+            fence: 1,
+            refused: None,
+            account: None,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&accepted).unwrap(),
+            serde_json::json!({"t": "rc:hive.start_ack", "session_id": sid.to_hex(), "fence": 1})
+        );
+        let with_account: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:hive.start_ack", "session_id": sid.to_hex(), "fence": 1, "account": "dev"
+        }))
+        .unwrap();
+        assert!(matches!(
+            with_account,
+            ClientMsg::HiveStartAck { refused: None, account: Some(ref a), .. } if a == "dev"
+        ));
+
+        let parse = |refused: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "t": "rc:hive.start_ack", "session_id": sid.to_hex(), "fence": 1
+            });
+            v["refused"] = refused;
+            match serde_json::from_value::<ClientMsg>(v).expect("the frame must still parse") {
+                ClientMsg::HiveStartAck { refused, .. } => refused,
+                other => panic!("wrong variant: {other:?}"),
+            }
+        };
+        assert_eq!(
+            parse(serde_json::json!("no_account")),
+            Some(HiveRefusal::NoAccount)
+        );
+        assert_eq!(
+            parse(serde_json::json!("a_reason_from_2027")),
+            Some(HiveRefusal::Other)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"quota": 3})),
+            Some(HiveRefusal::Other)
+        );
+        assert_eq!(parse(serde_json::Value::Null), None);
+    }
+
+    /// FR-90 — a state this build cannot name keeps the FRAME: the session id
+    /// and fence still arrive, and `state` is `None` rather than the whole
+    /// report being dropped at `debug!`.
+    #[test]
+    fn hive_state_survives_an_unknown_state() {
+        use crate::hive::HiveRunState;
+
+        let sid = ObjectId::new();
+        let m = ClientMsg::HiveState {
+            session_id: sid,
+            fence: 2,
+            state: Some(HiveRunState::AwaitingApproval),
+            detail: None,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:hive.state", "session_id": sid.to_hex(), "fence": 2,
+                "state": "awaiting_approval"
+            })
+        );
+        let newer = serde_json::json!({
+            "t": "rc:hive.state", "session_id": sid.to_hex(), "fence": 2, "state": "compacting"
+        });
+        match serde_json::from_value::<ClientMsg>(newer).expect("the frame must still parse") {
+            ClientMsg::HiveState {
+                session_id,
+                fence,
+                state,
+                ..
+            } => assert_eq!((session_id, fence, state), (sid, 2, None)),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     /// The optional fields must all be omissible: a `session_open` carries no

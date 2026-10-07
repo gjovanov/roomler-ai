@@ -140,6 +140,9 @@ pub async fn handle_agent_socket(
     // a recorder at all (`available`). Equality-matched: `remote` is a
     // prefix of `remote-audio`.
     let records = crate::hub::RecordSupport::from_caps(&caps);
+    // FR-90 — this connection runs Hive sessions. Equality-matched: the
+    // replica verb the design names next will have `hive` as its prefix.
+    let runs_hive = caps.has_rpc(RpcCap::Hive);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -154,6 +157,7 @@ pub async fn handle_agent_socket(
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
     state.rc_hub.set_agent_record_support(agent_id, records);
+    state.rc_hub.set_agent_hive_support(agent_id, runs_hive);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

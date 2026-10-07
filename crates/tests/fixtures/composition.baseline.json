@@ -405,6 +405,18 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/session",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/stop",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/invite",
       "methods": "GET,HEAD,POST"
     },
@@ -833,6 +845,31 @@
         ]
       },
       {
+        "collection": "agent_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "owner_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "location.device_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "agents",
         "indexes": [
           {
@@ -1067,6 +1104,29 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "hive_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -2265,6 +2325,31 @@
         ]
       },
       {
+        "collection": "agent_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "owner_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "location.device_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "agents",
         "indexes": [
           {
@@ -2499,6 +2584,29 @@
               "external_source.provider": 1,
               "external_source.external_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "hive_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -3631,6 +3739,8 @@
     "rc:ssh.grant_ack",
     "rc:agent.config_status",
     "rc:agent.key_rotated",
+    "rc:hive.start_ack",
+    "rc:hive.state",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -3713,6 +3823,8 @@
     "rc:overlay.join_refused",
     "rc:relay.regions",
     "rc:relay.derp_ticket",
+    "rc:hive.start",
+    "rc:hive.stop",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -3724,6 +3836,8 @@
     "rc:agent.key_rotated": "network",
     "rc:consent": "fleet",
     "rc:consent.pending": "fleet",
+    "rc:hive.start_ack": "hive",
+    "rc:hive.state": "hive",
     "rc:ice": "remote",
     "rc:overlay.endpoints": "network",
     "rc:overlay.join": "network",
