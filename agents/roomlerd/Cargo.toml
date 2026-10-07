@@ -43,6 +43,9 @@ roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
 # Cheap to add: this crate's lib is CLI glue over tunnel-core + remote-control,
 # both of which are already in the graph above.
 roomler-cli = { path = "../roomler-cli" }
+# FR-90 — Hive's device core (transcript chain, stream-json adapter, replica
+# store, launch spec). Only the `hive` feature links it, and with it SQLite.
+roomler-hive-node = { path = "../../crates/hive-node", optional = true }
 
 # Async + networking
 tokio = { workspace = true }
@@ -592,6 +595,16 @@ portal-capture = ["dep:zbus"]
 # application's device list. Shipped in `full` with its gate closed, same as
 # `drm-capture`.
 uinput-input = []
+# FR-90 P0c — Hive agent sessions on this device: advertise `hive`, answer
+# `rc:hive.start` through the device's own gates, run Claude Code headless as
+# the account `hive_accounts` maps the starter to, keep the transcript in the
+# replica store. Linux only in P0 (a named account; the re-exec'd `hive-host`
+# that covers Windows' console user and macOS is P1).
+#
+# ⚠️ Deliberately NOT in `full`: no release build compiles it until the P0
+# field cell has run, and even compiled, every gate is closed by default
+# (`hive_enabled = false`, an empty account map, empty roots = nowhere).
+hive = ["dep:roomler-hive-node"]
 # Everything needed for a full remote-control session, software only.
 full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
 # Everything needed including the MF hardware encoder. Production

@@ -27,8 +27,11 @@ use serde_json::{Value, json};
 /// Everything needed to start (or resume) one session's harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
-    /// The Hive session id — a UUID, because Claude Code's `--session-id`
-    /// requires one, and the harness session id is the Hive session id.
+    /// The HARNESS's session id — a UUID, because Claude Code's
+    /// `--session-id` requires one. The server mints it with the session
+    /// (`rc:hive.start`'s `harness_session`), separately from the Hive session
+    /// id the store and the chain key on, so every replica resumes the same
+    /// conversation.
     pub session: String,
     /// Absolute path to the harness binary, resolved as the session's account.
     pub harness: PathBuf,
@@ -197,7 +200,9 @@ pub fn user_input_line(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsSpec {
     /// The command Claude Code runs to get the session's fence-bound token.
-    pub api_key_helper: String,
+    /// `None` until the loopback sidecar issues one (P0e): the key is then
+    /// left out, and the harness uses whatever login its config dir holds.
+    pub api_key_helper: Option<String>,
     /// The session's memory snapshot directory (design §10.3).
     pub auto_memory_directory: Option<PathBuf>,
     /// The session's egress proxy, when the sandbox is on (Linux, macOS, WSL2).
@@ -222,10 +227,10 @@ impl SettingsSpec {
     pub fn to_json(&self) -> Value {
         let mut deny: Vec<String> = vec!["Read(//proc/**)".to_string()];
         deny.extend(self.extra_read_denies.iter().cloned());
-        let mut doc = json!({
-            "apiKeyHelper": self.api_key_helper,
-            "permissions": {"deny": deny},
-        });
+        let mut doc = json!({"permissions": {"deny": deny}});
+        if let Some(helper) = &self.api_key_helper {
+            doc["apiKeyHelper"] = json!(helper);
+        }
         if let Some(dir) = &self.auto_memory_directory {
             doc["autoMemoryDirectory"] = json!(dir.to_string_lossy());
         }
@@ -367,7 +372,7 @@ mod tests {
     #[test]
     fn settings_deny_proc_and_carry_the_helper_memory_dir_and_sandbox() {
         let doc = SettingsSpec {
-            api_key_helper: "roomler hive token --session 6f1c".into(),
+            api_key_helper: Some("roomler hive token --session 6f1c".into()),
             auto_memory_directory: Some(root().join("memory")),
             sandbox_proxy: Some(SandboxProxy {
                 http_port: 47001,
@@ -384,12 +389,23 @@ mod tests {
         assert!(doc["autoMemoryDirectory"].is_string());
         // No sandbox block at all where there is no sandbox (native Windows).
         let bare = SettingsSpec {
-            api_key_helper: "h".into(),
+            api_key_helper: None,
             auto_memory_directory: None,
             sandbox_proxy: None,
             extra_read_denies: vec![],
         }
         .to_json();
         assert!(bare.get("sandbox").is_none());
+        // No helper until the sidecar issues tokens: the key is absent, never
+        // an empty command the harness would try to run.
+        assert!(bare.get("apiKeyHelper").is_none());
+        assert!(
+            bare["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d == "Read(//proc/**)"),
+            "the /proc deny holds without a helper too"
+        );
     }
 }

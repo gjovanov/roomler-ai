@@ -127,6 +127,14 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
+        // FR-90 — a freshly enrolled device runs no agent sessions: every
+        // Hive gate starts closed, and only whoever holds the box opens them.
+        hive_enabled: false,
+        hive_accounts: Default::default(),
+        hive_roots: Vec::new(),
+        hive_max_sessions: None,
+        hive_harness: None,
+        hive_api_key_helper: None,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
         overlay_direct: None,
