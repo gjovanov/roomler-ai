@@ -251,8 +251,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
 - [ ] **AC16:** a correction made in a session on one device becomes an accepted fact that a session
   on another device loads; a poisoned proposal is quarantined; two contradicting facts raise a card.
 - [ ] **AC17:** a session is found by its card while every one of its replicas is offline.
-- [ ] **AC18:** `HIVE_RUN` is seeded in no managed role below `ADMINISTRATOR`, and
-  `no_managed_role_below_administrator_seeds_a_root_shell` fails when a row is given it.
+- [x] **AC18:** `HIVE_RUN` is seeded in no managed role below `ADMINISTRATOR`, and
+  `no_managed_role_below_administrator_seeds_a_root_shell` fails when a row is given it. *Verified
+  2026-10-07 by negative control: `DEFAULT_ADMIN | HIVE_RUN` injected (marker in the diff) fails
+  it with "managed role `admin` seeds HIVE_RUN without the ADMINISTRATOR bypass"; reverted, it
+  passes (step log on #1827).*
 - [ ] **AC19:** docs created with mermaid diagrams, tables and `file:line` anchors —
   `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md` — and indexed in
   `docs/README.md`.
