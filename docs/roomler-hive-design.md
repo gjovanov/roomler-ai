@@ -3,7 +3,7 @@
 *Design doc · v0.4 · 2026-10-07 · supersedes v0.3 (same day) and v0.2 (2026-09-03).
 Anchors are `path:line` on `origin/master` `d2dc0efa6`. Status: **design approved
 2026-10-07, tracked as [FR-90](fr/FR-90-hive-agent-sessions.md); being built — P0a (the device core),
-P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server) and P0d-3 (the UI) are in, and P0e (the model sidecar) is built; nothing feeds a session from a browser yet** (§17). Decisions are in §0.1; the review that produced v0.3 is
+P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server), P0d-3 (the UI) and P0e (the model sidecar) are in, and P0f (the canary test) is built; nothing feeds a session from a browser yet** (§17). Decisions are in §0.1; the review that produced v0.3 is
 [Appendix A](#appendix-a--review-of-v02).*
 
 > **What changed.** v0.2 kept Hive outside Roomler: a separate product behind a new
@@ -1564,6 +1564,15 @@ user, acceptable in v1), and the existing tokio/axum/russh/quinn/webrtc stack.
   collection, no object-store key and no server log line, and that it does appear in
   every replica's store. Negative control: make a turn stub carry the prompt text, and
   the test must fail.
+  *As built (P0f, one device): `crates/tests/tests/hive_canary.rs`. There are three
+  canaries: a prompt over the viewer peer, a tool's output, and a crashing harness's
+  stderr. Each is searched in every Mongo document's raw BSON, the object store's files,
+  the server's log lines and every frame the server sent the browser. Each absence is
+  checked beside a presence that proves the check can see. The turn stub carries no text
+  by construction, so the injected negative control is a prompt put into a state report's
+  `detail`, the device's one free-text channel to the server. The test also found a real
+  leak on that channel: the `ended` detail carried the harness's stderr tail. That tail
+  now stays on the device as a transcript note.*
 - **Replicaset chaos**: kill the primary mid-turn and promote the freshest replica;
   compare `prev_hash` chains across members; purge a session with a member offline,
   bring it back, assert the purge; partition the primary and assert it makes no model

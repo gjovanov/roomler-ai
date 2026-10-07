@@ -610,6 +610,14 @@ uinput-input = []
 # field cell has run, and even compiled, every gate is closed by default
 # (`hive_enabled = false`, an empty account map, empty roots = nowhere).
 hive = ["dep:roomler-hive-node", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+# FR-90 P0f — TESTS ONLY: `hive::init_as_daemon`, a supervisor that launches
+# sessions as the daemon's OWN account, for the integration test that cannot
+# switch users (`crates/tests/tests/hive_canary.rs`).
+#
+# ⚠️ Never in a release build — it is in no aggregate, and the release
+# workflows name their features. Even compiled, `init_as_daemon` refuses when
+# the daemon is root, so it can never be how a session runs as root.
+hive-test-launcher = ["hive"]
 # Everything needed for a full remote-control session, software only.
 full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
 # Everything needed including the MF hardware encoder. Production
