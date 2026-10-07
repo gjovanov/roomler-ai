@@ -175,6 +175,15 @@ pub struct Supervisor {
     states: broadcast::Sender<(ObjectId, HiveRunState)>,
     /// The viewer peers this device serves (P0d-2).
     viewers: super::view::Viewers,
+    /// P0e — the model sidecar: its port once bound, the session tokens it
+    /// honours, the provider key the helper printed, and when the primary
+    /// connection was lost (the `offline_grace` clock).
+    sidecar_port: tokio::sync::OnceCell<u16>,
+    tokens: super::sidecar::Tokens,
+    model_key: tokio::sync::Mutex<Option<(String, Instant)>>,
+    offline_since: Mutex<Option<Instant>>,
+    upstream: String,
+    offline_grace: Duration,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
@@ -288,6 +297,12 @@ impl Supervisor {
             reporter: Mutex::new(None),
             states: broadcast::channel(64).0,
             viewers: Default::default(),
+            sidecar_port: tokio::sync::OnceCell::new(),
+            tokens: Default::default(),
+            model_key: tokio::sync::Mutex::new(None),
+            offline_since: Mutex::new(None),
+            upstream: super::sidecar::DEFAULT_UPSTREAM.to_string(),
+            offline_grace: super::sidecar::OFFLINE_GRACE,
         }
     }
 
@@ -364,7 +379,18 @@ impl Supervisor {
             Ok(s) => s.clone(),
             Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e.clone()),
         };
-        match self.launch(order, &account, &folder, store) {
+        // P0e — with a model credential configured, the harness reaches the
+        // provider only through the loopback sidecar, with a session token;
+        // the key itself never enters the session.
+        let sidecar = if self.cfg.api_key_helper.is_some() {
+            match self.sidecar_port().await {
+                Ok(port) => Some(port),
+                Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e),
+            }
+        } else {
+            None
+        };
+        match self.launch(order, &account, &folder, store, sidecar) {
             Ok(()) => Answer::accepted(&account),
             Err((r, detail)) => Answer::refused(r, detail),
         }
@@ -440,7 +466,20 @@ impl Supervisor {
         }
     }
 
-    fn connected(&self, tx: mpsc::Sender<ClientMsg>) {
+    pub(crate) fn connected(self: &Arc<Self>, tx: mpsc::Sender<ClientMsg>) {
+        // P0e — online again; and when THIS connection closes, the
+        // `offline_grace` clock starts (unless a newer one replaced it).
+        *self.offline_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let watched = tx.clone();
+            let me = Arc::downgrade(self);
+            tokio::spawn(async move {
+                watched.closed().await;
+                if let Some(me) = me.upgrade() {
+                    me.lost_connection(&watched);
+                }
+            });
+        }
         let replay: Vec<(ObjectId, Report)> = {
             let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
             reports.retain(|_, r| r.state != HiveRunState::Ended || r.at.elapsed() < ENDED_REPLAY);
@@ -575,7 +614,101 @@ impl Supervisor {
         }
     }
 
-    fn finish(&self, session: ObjectId, fence: u64, detail: String) {
+    // ─── The model sidecar's side of the supervisor (P0e) ───────────────
+
+    /// The sidecar's port, binding it on first use.
+    async fn sidecar_port(self: &Arc<Self>) -> Result<u16, String> {
+        self.sidecar_port
+            .get_or_try_init(|| async {
+                let (listener, port) = super::sidecar::bind().await?;
+                super::sidecar::serve(listener, Arc::downgrade(self));
+                info!(port, "hive: the model sidecar listens on loopback");
+                Ok::<u16, String>(port)
+            })
+            .await
+            .copied()
+    }
+
+    pub(crate) fn tokens(&self) -> &super::sidecar::Tokens {
+        &self.tokens
+    }
+
+    /// Whether `session` runs here at `fence`.
+    pub(crate) fn runs_at(&self, session: ObjectId, fence: u64) -> bool {
+        self.running(session, fence).is_some()
+    }
+
+    /// How long the primary connection has been gone; `None` while it is up.
+    pub(crate) fn offline_for(&self) -> Option<Duration> {
+        self.offline_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed())
+    }
+
+    pub(crate) fn offline_grace(&self) -> Duration {
+        self.offline_grace
+    }
+
+    pub(crate) fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    /// `watched` closed: the device is offline — unless a newer connection
+    /// already took its place.
+    fn lost_connection(&self, watched: &mpsc::Sender<ClientMsg>) {
+        let current = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.same_channel(watched));
+        if current {
+            let mut since = self.offline_since.lock().unwrap_or_else(|e| e.into_inner());
+            if since.is_none() {
+                *since = Some(Instant::now());
+            }
+        }
+    }
+
+    /// The provider key, from the device's helper, reused for [`KEY_TTL`].
+    ///
+    /// [`KEY_TTL`]: super::sidecar::KEY_TTL
+    pub(crate) async fn model_key(&self) -> Result<String, String> {
+        let mut cached = self.model_key.lock().await;
+        if let Some((key, at)) = cached.as_ref()
+            && at.elapsed() < super::sidecar::KEY_TTL
+        {
+            return Ok(key.clone());
+        }
+        let helper = self
+            .cfg
+            .api_key_helper
+            .as_deref()
+            .ok_or("this device has no model credential (hive_api_key_helper)")?;
+        let key = super::sidecar::run_key_helper(helper).await?;
+        *cached = Some((key.clone(), Instant::now()));
+        Ok(key)
+    }
+
+    /// The provider refused the key: run the helper again next time.
+    pub(crate) async fn forget_model_key(&self) {
+        *self.model_key.lock().await = None;
+    }
+
+    /// Tests only: a mock provider, and a shorter `offline_grace`.
+    #[cfg(test)]
+    pub(crate) fn with_sidecar(mut self, upstream: String, offline_grace: Duration) -> Self {
+        self.upstream = upstream;
+        self.offline_grace = offline_grace;
+        self
+    }
+
+    fn finish(&self, session: ObjectId, fence: u64, token: Option<&str>, detail: String) {
+        // Its model access ends with it.
+        if let Some(token) = token {
+            self.tokens.revoke(token);
+        }
         self.live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -590,8 +723,9 @@ impl Supervisor {
         account: &str,
         folder: &Path,
         store: StoreHandle,
+        sidecar: Option<u16>,
     ) -> Result<(), (HiveRefusal, String)> {
-        let child = self.spawn(order, account, folder)?;
+        let (child, token) = self.spawn(order, account, folder, sidecar)?;
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -613,18 +747,20 @@ impl Supervisor {
                 waiting,
             };
             let detail = run(&sup, session, fence, child, inputs, store).await;
-            sup.finish(session, fence, detail);
+            sup.finish(session, fence, token.as_deref(), detail);
         });
         Ok(())
     }
 
-    /// Spawn the harness as the session's account, through the wrapper.
+    /// Spawn the harness as the session's account, through the wrapper; with
+    /// the sidecar, also the model token this run holds.
     fn spawn(
         &self,
         order: &StartOrder,
         account: &str,
         folder: &Path,
-    ) -> Result<Child, (HiveRefusal, String)> {
+        sidecar: Option<u16>,
+    ) -> Result<(Child, Option<String>), (HiveRefusal, String)> {
         let home = match &self.launcher {
             Launcher::AsMappedAccount => {
                 crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?
@@ -641,7 +777,7 @@ impl Supervisor {
             )
         })?;
         let sid = order.session_id.to_hex();
-        let settings = write_settings(&self.runtime, &sid, &self.cfg).map_err(|e| {
+        let settings = write_settings(&self.runtime, &sid).map_err(|e| {
             (
                 HiveRefusal::LaunchFailed,
                 format!("writing the session settings: {e}"),
@@ -654,7 +790,7 @@ impl Supervisor {
             state_dir: home.join(".roomler").join("hive").join(&sid),
             settings,
             mcp_config: None,
-            sidecar_base_url: None,
+            sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
             resume: order.resume,
             permission_prompt_tool: None,
         };
@@ -677,8 +813,8 @@ impl Supervisor {
         );
         cmd.env_clear()
             .envs(unix_base_env(&home, account, Some(&path)))
-            .envs(spec.env_overrides())
-            .stdin(Stdio::piped())
+            .envs(spec.env_overrides());
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -694,12 +830,26 @@ impl Supervisor {
             #[cfg(test)]
             Launcher::AsDaemon { .. } => {}
         }
-        cmd.spawn().map_err(|e| {
-            (
-                HiveRefusal::LaunchFailed,
-                format!("starting the harness: {e}"),
-            )
-        })
+        // The session's token, never the provider's key: good for this
+        // session at this fence, through the sidecar, and nothing else.
+        // Minted last, and taken back if the start fails, so no launch that
+        // did not happen leaves one behind.
+        let token = sidecar.map(|_| self.tokens.mint(order.session_id, order.fence));
+        if let Some(token) = &token {
+            cmd.env("ANTHROPIC_API_KEY", token);
+        }
+        match cmd.spawn() {
+            Ok(child) => Ok((child, token)),
+            Err(e) => {
+                if let Some(token) = &token {
+                    self.tokens.revoke(token);
+                }
+                Err((
+                    HiveRefusal::LaunchFailed,
+                    format!("starting the harness: {e}"),
+                ))
+            }
+        }
     }
 }
 
@@ -723,7 +873,7 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
 
 /// `<runtime>/<sid>/settings.json`, daemon-owned: readable by the session,
 /// writable by nobody else. A link on the way is refused, never followed.
-fn write_settings(runtime: &Path, sid: &str, cfg: &HiveConfig) -> Result<PathBuf, String> {
+fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     for d in [runtime, dir.as_path()] {
         match std::fs::symlink_metadata(d) {
@@ -736,8 +886,10 @@ fn write_settings(runtime: &Path, sid: &str, cfg: &HiveConfig) -> Result<PathBuf
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("{}: {e}", d.display()))?;
     }
+    // P0e — the key helper is the DAEMON's (the sidecar runs it); the session
+    // has no `apiKeyHelper`, so nothing in it can print the provider's key.
     let doc = SettingsSpec {
-        api_key_helper: cfg.api_key_helper.clone(),
+        api_key_helper: None,
         auto_memory_directory: None,
         sandbox_proxy: None,
         extra_read_denies: Vec::new(),
@@ -1180,6 +1332,17 @@ done
     }
 
     pub(crate) fn rig(enabled: bool, max: usize) -> Rig {
+        rig_with(enabled, max, |_| {}, |s| s)
+    }
+
+    /// [`rig`], with the config and the supervisor adjusted before it runs
+    /// (the sidecar's tests point it at a mock provider).
+    pub(crate) fn rig_with(
+        enabled: bool,
+        max: usize,
+        cfg_with: impl FnOnce(&mut HiveConfig),
+        sup_with: impl FnOnce(Supervisor) -> Supervisor,
+    ) -> Rig {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let work = root.path().join("work");
@@ -1189,7 +1352,7 @@ done
         std::fs::write(&harness, FAKE_HARNESS).unwrap();
         std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
         let user = ObjectId::new();
-        let cfg = HiveConfig {
+        let mut cfg = HiveConfig {
             enabled,
             accounts: [(user.to_hex(), "dev".to_string())].into_iter().collect(),
             roots: vec![work],
@@ -1197,13 +1360,14 @@ done
             harness: Some(harness),
             api_key_helper: None,
         };
+        cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
-        let sup = Arc::new(Supervisor::new(
+        let sup = Arc::new(sup_with(Supervisor::new(
             cfg,
             root.path().join("run"),
             Launcher::AsDaemon { home },
             Ok(store.clone()),
-        ));
+        )));
         let (tx, reports) = mpsc::channel(64);
         sup.connected(tx);
         Rig {

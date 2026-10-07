@@ -411,11 +411,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub hive_harness: Option<String>,
 
-    /// FR-90 P0 — the command a session's Claude Code runs, as the mapped
-    /// account, to get its API key (`apiKeyHelper` in the session's settings).
-    /// A stop-gap until the loopback sidecar hands out a fence-bound session
-    /// token (P0e). Unset = the harness's own login — which a per-session
-    /// config directory does not have, so its model calls fail.
+    /// FR-90 P0e — the command the DAEMON runs (as SYSTEM/root) to print the
+    /// model provider's API key. The key stays in the daemon: a session's
+    /// Claude Code gets a per-session token for the loopback model sidecar,
+    /// which checks it (this session, still running here at its fence, and a
+    /// device not offline past `offline_grace`) and swaps the key in on the
+    /// way out. Unset = no model credential, and a session's model calls fail
+    /// (a per-session config directory holds no login of its own).
     #[serde(default)]
     pub hive_api_key_helper: Option<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
