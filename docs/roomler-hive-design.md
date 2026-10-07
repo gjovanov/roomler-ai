@@ -510,15 +510,19 @@ SYSTEM/Administrators ACL, macOS under `/Library/Application Support/roomler`:
 The primary keeps the same store, so viewers and replication read the daemon's copy and
 never the user's directories.
 
-**Events.** `TranscriptEvent` lives in a new MPL crate shared by the daemon and the
-server, `crates/hive-proto`, classified in `scripts/licence-classes.sh:45-57` (shared
-crates take the weaker licence). Variants: `UserMessage {author}`, `AssistantText`
-(deltas), `Thinking` (summary only), `ToolUse {name, input}`,
-`ToolResult {ok, output, truncated}`, `Approval`, `Compaction`,
-`Turn {model, tokens, cost, duration}`, `Note`. Every event carries a per-session
-`seq`, the `fence`, and `prev_hash` (BLAKE3 over the previous event, from v0.2), so two
-members can prove they hold the same history and spot a divergence. The server sees
-`seq` numbers and hashes in acks, never events.
+**Events.** `TranscriptEvent` lives in `crates/hive-node` (MPL), a daemon-only crate —
+the server never parses an event, so it never links it, and SQLite stays out of the
+server build. Variants: `SessionInit`, `UserMessage {author}`, `AssistantText` (complete
+blocks only — streaming deltas go to live viewers and are never recorded, because the
+complete block always follows), `Thinking` (a summary, only when non-empty),
+`ToolUse {id, name, input}`, `ToolResult {ok, output, truncated}`, `Turn {ok,
+num_turns, duration, cost, usage}`, `Compaction`, `Note`; `Approval` joins with P1.
+Every event carries a per-session `seq`, the `fence`, and `prev_hash` (BLAKE3 over the
+previous event, from v0.2), so two members can prove they hold the same history and
+spot a divergence. ⚠️ The chain carries each event as its exact JSON text and the enum
+is only a view of it, so a member on an older daemon stores and forwards a kind it has
+never heard of instead of refusing it. The server sees `seq` numbers and hashes in acks,
+never events.
 
 **Replication.** The primary streams events in `seq` order, and a thin git pack per
 checkpoint, to each member over tunnel-core carriers — the same carrier and grant model
@@ -1516,7 +1520,7 @@ Device config, on `roomler config`'s surface and default-deny: `hive_enabled`,
 crates/modules/hive/       roomler-ai-mod-hive (AGPL)     sessions · leases · replicaset · stubs · cards · moves · brain · gateway
 crates/modules/vault/      roomler-ai-mod-vault (AGPL)    secrets · envelope + KMS · roles · Cedar · leases · templates · audit
 crates/modules/knowhow/    roomler-ai-mod-knowhow (AGPL)  graph · sync · scan intake · proposals · verification · access plans
-crates/hive-proto/         (MPL)  TranscriptEvent · replication frames · toolbelt schemas · access-plan types
+crates/hive-node/          (MPL)  daemon-only: events + hash chain · stream-json adapter · replica store (SQLite + FTS5) · launch spec · roots
 crates/remote_control/     (MPL)  + rc:hive.*, rc:vault.*, rc:knowhow.* variants; RpcCap hive, hive-replica, vault, knowhow-scan
 crates/localapi/           (MPL)  + per-session endpoint types
 crates/tunnel-core/        (MPL)  + authenticated SOCKS5, Principal::Session, the replication carrier
@@ -1527,7 +1531,7 @@ ui/src/…/hive/             (AGPL) session chrome · viewer peer · renderers �
 ```
 
 No AGPL crate may enter a shipped agent's dependency graph, and CI enforces it
-(`docs/licensing.md`); that is why `hive-proto` is MPL and the modules are not linked by
+(`docs/licensing.md`); that is why `hive-node` is MPL and the modules are not linked by
 the daemon.
 
 What to reuse from oxmux (checked file by file; Appendix B): the tmux control-mode
