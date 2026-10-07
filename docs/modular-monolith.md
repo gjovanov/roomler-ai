@@ -68,7 +68,7 @@ inside one (FR-24, FR-69 AC10).
 | RC session routes, `rc:*` controller dispatch + authz + consent-mode gate, the cross-pod RC relay, `/turn/credentials`, `/relay/regions` | **remote** | the session state machine stays in fleet's Hub; the controller path is a host → module **call**, not a `ws` namespace |
 | overlay engine (IPAM, netmaps, leases, L3 ACL, relay grants), the org relay mint, the DERP ACL cache + `/derp` upgrade + cluster convergence, tunnel clients + policies, peer relays, Roomler SSH, the ephemeral reaper | **network** | `Module::indexes_for(multi_block)` is born here — `overlay_blocks` has two schemas |
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
-| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (the Hub) **and** chat (the session room): `Module::Deps = (FleetState, ChatState)`. Chat stores a room's or message's `binding {module, ref}` and never interprets it; the ONLY module whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`), so `switched_off` lists it until an operator turns it on; leads `HOOK_ORDER` as a session holder |
+| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; the ONLY module whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`), so `switched_off` lists it until an operator turns it on; leads `HOOK_ORDER` as a session holder |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -106,7 +106,8 @@ What the host drives, and in which order — each of these is a rule paid for in
   is initialised before its dependant by construction, and a module that needs a *live object*
   of another (remote needs fleet's Hub — one registry, or it would dispatch into an empty one)
   receives that module's state as `Deps`. A stateless dependency (a DAO over `core.db`, a pure
-  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards.
+  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards and hive with
+  chat's `BoundChat`.
 - **`WsHandler::closed(ctx)`** is called by the host for every handler of the socket's role after
   its own cleanup and before it logs the disconnect; a module holding per-connection state
   (conference: transports + the call session) releases it there — never by watching the registry.
