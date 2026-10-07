@@ -60,6 +60,18 @@ impl BoundChat {
             .await
     }
 
+    /// Whether `user` is a member of `room_id` in `tenant_id` — chat's own
+    /// rule, so a module deciding who may see what a room is about decides it
+    /// exactly as the room's routes do.
+    pub async fn is_member(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user: ObjectId,
+    ) -> DaoResult<bool> {
+        self.rooms.is_member(tenant_id, room_id, user).await
+    }
+
     /// Post a message authored by an agent (`author_id`, shown as
     /// `author_display`) into `room_id`, and fan it out to the room's members
     /// as `message:create` — the event every client already renders.
