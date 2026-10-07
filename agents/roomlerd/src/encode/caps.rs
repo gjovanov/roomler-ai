@@ -1618,6 +1618,10 @@ fn rpc_caps() -> Vec<String> {
     // says so in the ack. Linux only in P0.
     #[cfg(all(feature = "hive", target_os = "linux"))]
     caps.push(RpcCap::Hive);
+    // FR-90 P0d-2 — and serves a session's transcript to a browser over a
+    // viewer peer: answers `rc:hive.view.grant` before the browser dials.
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    caps.push(RpcCap::HiveView);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
