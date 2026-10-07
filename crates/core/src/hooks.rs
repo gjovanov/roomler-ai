@@ -31,10 +31,23 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 
-/// The order the cascade runs in: session holders (`remote`) release first,
-/// then lease holders (`network`), then the record owner (`fleet`); the
-/// collaboration modules and `saas` follow, in composition order.
-pub const HOOK_ORDER: &[&str] = &["remote", "network", "fleet", "conference", "chat", "saas"];
+/// The order the cascade runs in: session holders (`hive`, `remote`) release
+/// first, then lease holders (`network`), then the record owner (`fleet`);
+/// the collaboration modules and `saas` follow, in composition order.
+///
+/// FR-90 — `hive` leads: an agent session is the longest-lived thing a
+/// device holds for anyone, and ending it (the record, and the stop order to
+/// a device that is still connected) must happen while the device's row and
+/// socket are still there to address.
+pub const HOOK_ORDER: &[&str] = &[
+    "hive",
+    "remote",
+    "network",
+    "fleet",
+    "conference",
+    "chat",
+    "saas",
+];
 
 /// What a lease holder freed when an agent was removed — the one piece of
 /// hook output a caller reports back (the admin delete route answers with
@@ -282,6 +295,25 @@ impl HookRegistry {
         None
     }
 
+    /// Run every `member_removed` hook in order (FR-90: `hive` ends the
+    /// member's agent sessions). Called BEFORE the membership row goes, the
+    /// agent cascade's order: a failing holder stops it and the caller
+    /// reports the error, so a removal never reads as clean while a pillar
+    /// still runs something for that member — and a retry still finds a
+    /// member to remove and holders to re-run.
+    pub async fn member_removed(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.tenant_lifecycles() {
+            hook.member_removed(tenant_id, user_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: member_removed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Run every `tenant_archived` hook in order and sum what they did. A
     /// failing holder stops the cascade — the caller reports the error
     /// rather than an archive that silently left a pillar's state behind.
@@ -323,6 +355,7 @@ mod tests {
     #[test]
     fn session_holders_run_before_lease_holders_before_the_record_owner() {
         let pos = |id: &str| HOOK_ORDER.iter().position(|m| *m == id).unwrap();
+        assert!(pos("hive") < pos("network"));
         assert!(pos("remote") < pos("network"));
         assert!(pos("network") < pos("fleet"));
     }
@@ -400,6 +433,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("network: agent_removed"));
+    }
+
+    /// Records the order `member_removed` reached each holder, and fails on
+    /// request.
+    struct Member {
+        id: &'static str,
+        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl TenantLifecycle for Member {
+        async fn member_removed(
+            &self,
+            _tenant_id: ObjectId,
+            _user_id: ObjectId,
+        ) -> anyhow::Result<()> {
+            self.seen.lock().unwrap().push(self.id);
+            if self.fail {
+                anyhow::bail!("sessions still live");
+            }
+            Ok(())
+        }
+    }
+
+    /// FR-90 — `member_removed` runs in HOOK_ORDER (hive first), and a holder
+    /// that fails stops the cascade with its name, so the route can refuse
+    /// the removal instead of reporting a clean one.
+    #[tokio::test]
+    async fn member_removed_runs_in_hook_order_and_a_failure_stops_it() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reg = HookRegistry::default();
+        for (id, fail) in [("chat", false), ("hive", false)] {
+            reg.register(
+                id,
+                Hooks {
+                    tenant: Some(Arc::new(Member {
+                        id,
+                        seen: seen.clone(),
+                        fail,
+                    })),
+                    ..Default::default()
+                },
+            );
+        }
+        reg.member_removed(ObjectId::new(), ObjectId::new())
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["hive", "chat"]);
+
+        seen.lock().unwrap().clear();
+        reg.register(
+            "hive",
+            Hooks {
+                tenant: Some(Arc::new(Member {
+                    id: "hive",
+                    seen: seen.clone(),
+                    fail: true,
+                })),
+                ..Default::default()
+            },
+        );
+        let err = reg
+            .member_removed(ObjectId::new(), ObjectId::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("hive: member_removed"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec!["hive"], "the cascade stopped");
     }
 
     #[test]

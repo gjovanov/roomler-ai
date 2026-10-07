@@ -99,6 +99,17 @@ pub mod permissions {
     /// whoever is at it and ends with the session, but a recording is a copy
     /// that outlives both. An org grants it on purpose or not at all.
     pub const RECORD_REMOTE_SCREEN: u64 = 1 << 31;
+    /// FR-90 — start and drive Hive agent sessions on a device
+    /// (`docs/roomler-hive-design.md` §3.4). The first bit above 31: the UI
+    /// mirror's mask arithmetic is exact to bit 52 since #888.
+    ///
+    /// ⚠️ In NO managed row below the ADMINISTRATOR bypass, like
+    /// [`EXEC_DEVICE`], [`SSH_DEVICE`] and [`RECORD_REMOTE_SCREEN`]: an agent
+    /// session is remote code execution on a device. It runs as the account
+    /// the DEVICE maps the starter to — never SYSTEM/root — but "an AI
+    /// typing commands as you on that box" is still a power an org grants on
+    /// purpose or not at all.
+    pub const HIVE_RUN: u64 = 1 << 32;
     // ⚠️ Bit 52 is the ceiling, and the reason is the JSON number rather than
     // anything here: a mask crosses the wire as a JSON integer, which is exact
     // only below 2^53. The UI mirror (`ui/src/utils/permissions.ts`) does its
@@ -158,7 +169,7 @@ pub mod permissions {
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 32) - 1;
+    pub const ALL: u64 = (1 << 33) - 1;
 
     /// Every named bit, with its wire name. Lives here rather than in the test
     /// module because two callers need it: `all_contains_every_named_permission`
@@ -198,6 +209,7 @@ pub mod permissions {
         ("SSH_DEVICE", SSH_DEVICE),
         ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
         ("RECORD_REMOTE_SCREEN", RECORD_REMOTE_SCREEN),
+        ("HIVE_RUN", HIVE_RUN),
     ];
 
     /// Names of every named bit set in `mask`, for error messages. An
@@ -433,6 +445,13 @@ mod tests {
                 "managed role `{}` seeds RECORD_REMOTE_SCREEN without the ADMINISTRATOR bypass",
                 r.name
             );
+            // FR-90 — an agent session is remote code execution on a device.
+            assert_eq!(
+                r.permissions & HIVE_RUN,
+                0,
+                "managed role `{}` seeds HIVE_RUN without the ADMINISTRATOR bypass",
+                r.name
+            );
         }
     }
 
@@ -540,6 +559,11 @@ mod tests {
             DEFAULT_ADMIN & RECORD_REMOTE_SCREEN,
             0,
             "RECORD_REMOTE_SCREEN must stay an explicit grant"
+        );
+        assert_eq!(
+            DEFAULT_ADMIN & HIVE_RUN,
+            0,
+            "HIVE_RUN must stay an explicit grant"
         );
     }
 
