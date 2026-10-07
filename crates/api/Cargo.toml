@@ -28,7 +28,7 @@ path = "src/main.rs"
 # boot smoke asserts the image does not mount it — enforced where the image is
 # made, not by a default a recipe would have to remember.
 default = ["profile-full", "saas"]
-profile-full = ["chat", "conference", "fleet", "remote", "network"]
+profile-full = ["chat", "conference", "fleet", "remote", "network", "hive"]
 profile-collab = ["chat", "conference"]
 profile-remote = ["fleet", "remote"]
 profile-mesh = ["fleet", "network"]
@@ -44,6 +44,10 @@ conference = ["dep:roomler-ai-mod-conference", "chat"]
 fleet = ["dep:roomler-ai-mod-fleet"]
 remote = ["dep:roomler-ai-mod-remote", "fleet"]
 network = ["dep:roomler-ai-mod-network", "fleet"]
+# FR-90 — agent sessions, built ON `fleet` (a session's frames ride the agent
+# socket). In `profile-full` only, and its runtime switch is the one that
+# defaults OFF: `[modules] hive = true` turns it on.
+hive = ["dep:roomler-ai-mod-hive", "fleet"]
 
 
 [dependencies]
@@ -68,6 +72,7 @@ roomler-ai-mod-fleet = { path = "../modules/fleet", optional = true }
 # code still calls the engine that moved here (`state.network()`). It becomes a
 # feature when the sockets move (P7b).
 roomler-ai-mod-network = { path = "../modules/network", optional = true }
+roomler-ai-mod-hive = { path = "../modules/hive", optional = true }
 
 axum.workspace = true
 tokio.workspace = true

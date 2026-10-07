@@ -294,6 +294,18 @@ before it leaves the host.
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
 
+### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `…/hive/session` | `{device_id, folder, title?}` — start an agent session on a device. Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit` |
+| GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
+| GET | `…/hive/session/{sid}` | One of the caller's sessions — anyone else's id is a **404**, the answer a bogus one gets |
+| POST | `…/hive/session/{sid}/stop` | Stop it: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
+
+Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
+output — see [the design](roomler-hive-design.md) §3.3.
+
 ### Observability
 
 | Method | Path | Purpose |

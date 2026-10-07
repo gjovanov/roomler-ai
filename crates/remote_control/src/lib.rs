@@ -17,6 +17,7 @@
 //! - [`turn_url`]    — port-correct TURN URL parsing + transport-variant expansion
 //! - [`audit`]       — write-side of the remote_audit collection
 //! - [`models`]      — Mongo-backed entities (Agent, RemoteSession, RemoteAuditEvent)
+//! - [`hive`]        — FR-90 Hive vocabulary: session refusals, run states, limits
 //! - [`error`]       — unified error type
 //!
 //! This crate intentionally does NOT depend on the mediasoup crate. The SFU
@@ -35,6 +36,7 @@ pub mod audit;
 pub mod consent;
 pub mod derp_ticket;
 pub mod error;
+pub mod hive;
 pub mod models;
 pub mod permissions;
 pub mod serde_helpers;

@@ -128,6 +128,12 @@ pub struct ConnectedAgent {
     /// OFF and a rollback alike. Anything but [`RecordSupport::Serves`] ⇒
     /// `create_session` strips `Permissions::RECORD`.
     pub record_support: RecordSupport,
+    /// FR-90 — the agent advertises `hive`: it answers `rc:hive.start` with
+    /// `rc:hive.start_ack` and reports sessions with `rc:hive.state`. Per
+    /// CONNECTION, for [`Self::supports_ssh_grant_ack`]'s reason — a stored
+    /// row outlives a rollback, and a start pushed to an agent that drops it
+    /// would leave the caller waiting on silence.
+    pub supports_hive: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -400,6 +406,9 @@ impl Hub {
             // FR-85 P3 — set by `set_agent_record_support` right after
             // registration; `None` (RECORD stripped) until it is.
             record_support: RecordSupport::None,
+            // FR-90 — set by `set_agent_hive_support`; `false` = no session
+            // frame is ever pushed to this connection.
+            supports_hive: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1580,6 +1589,43 @@ impl Hub {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.record_support = support;
         }
+    }
+
+    /// FR-90 — record whether this connection runs Hive sessions (`hive`),
+    /// right after registration, like [`Self::set_agent_ssh_support`].
+    pub fn set_agent_hive_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive = supports;
+        }
+    }
+
+    /// FR-90 — whether a connected agent advertises `hive`. `None` = not
+    /// online on this pod.
+    pub fn agent_supports_hive(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner.agents.get(&agent_id).map(|a| a.supports_hive)
+    }
+
+    /// FR-90 — push a Hive frame (`rc:hive.start` / `rc:hive.stop`) to a
+    /// device, checked in the lookup that sends it so a reconnect cannot fall
+    /// between the check and the push: offline (or another tenant's —
+    /// reported identically, so org A cannot tell org B's devices from absent
+    /// ones) is [`Error::AgentOffline`]; a connection that did not advertise
+    /// `hive` is [`Error::ExecUnsupported`] and receives nothing.
+    pub fn push_hive(&self, agent_id: ObjectId, tenant_id: ObjectId, msg: ServerMsg) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
     }
 
     /// FR-85 P3 — a LIVE session's `(agent_id, controller_user_id,
