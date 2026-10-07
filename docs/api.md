@@ -314,6 +314,17 @@ before it leaves the host.
 Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
 output — see [the design](roomler-hive-design.md) §3.3.
 
+**Reading a session (P0d-2) is not a route.** A member of the session's room sends
+`hive:view.open {session_id}` on the user WebSocket ([real-time.md](real-time.md)). The server
+checks org and room membership (anyone else gets `not_found`), the device (online, advertising
+`hive-view`) and a rate (20 opens per minute per user and session). It then mints a grant, and
+answers `hive:view.ready` with ICE servers only once the device has confirmed it. Refusals name
+who said no: the server's `not_found` · `device_offline` · `device_unsupported` ·
+`too_many_views` · `rate_limited` · `no_answer`, or the device's `hive_disabled` · `no_session` ·
+`at_capacity`. The transcript itself flows browser ⇄ device over the peer and never through the
+server. The starter of a live session may prompt it; everyone else reads. Every open is in
+`hive_audit` (`action: view`).
+
 ### Observability
 
 | Method | Path | Purpose |

@@ -1239,3 +1239,429 @@ async fn removing_a_device_ends_its_sessions() {
     assert_eq!(s["status"], "ended", "{s}");
     assert_eq!(s["end_reason"], "device_removed");
 }
+
+// ─── P0d-2b — the viewer peer's signalling ─────────────────────────────────
+
+/// A build that runs sessions AND serves them to a browser.
+const VIEWS_HIVE: &[&str] = &["exec", "hive", "hive-view"];
+
+type UserWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn user_ws(app: &TestApp, token: &str) -> UserWs {
+    let url = format!(
+        "ws://{}/ws?token={}",
+        app.addr,
+        token
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
+    );
+    let (ws, _) = connect_async(&url).await.expect("user ws connect");
+    ws
+}
+
+async fn user_send(ws: &mut UserWs, kind: &str, data: Value) {
+    ws.send(Message::Text(
+        json!({ "type": kind, "data": data }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// The `data` of the next user-socket frame of `kind`, within `within`.
+async fn user_read_for(ws: &mut UserWs, kind: &str, within: Duration) -> Option<Value> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["type"] == kind
+                {
+                    return Some(v["data"].clone());
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) => return None,
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+async fn user_read(ws: &mut UserWs, kind: &str) -> Option<Value> {
+    user_read_for(ws, kind, Duration::from_secs(5)).await
+}
+
+/// Whether the device receives `want` within `within` — for asserting that
+/// it does NOT, without waiting `read_until`'s five seconds.
+async fn device_hears(ws: &mut AgentWs, want: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["t"] == want
+                {
+                    return true;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) => return false,
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// Start a session as `token` on `dev`, which accepts it; its id.
+async fn started_session(app: &TestApp, tid: &str, token: &str, dev: &mut Device) -> String {
+    let caller = start(app, tid, token, &dev.agent_id, "/srv");
+    let target = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": f["session_id"], "fence": 1, "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    body["session"]["id"].as_str().unwrap().to_string()
+}
+
+/// Open a view and have the device confirm it; the grant id.
+async fn ready_view(ws: &mut UserWs, dev: &mut Device, sid: &str) -> String {
+    user_send(ws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant")
+        .await
+        .expect("the device is asked");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+    )
+    .await;
+    let ready = user_read(ws, "hive:view.ready").await.expect("ready");
+    assert_eq!(ready["grant_id"], gid);
+    gid
+}
+
+/// FR-83's rule for the viewer: the browser is told it may dial only once
+/// the DEVICE confirmed the grant; then the handshake is relayed both ways
+/// with the ICE servers minted for this one peer, and the browser's socket
+/// closing tells the device.
+#[tokio::test]
+async fn a_view_is_ready_only_after_the_device_confirms_its_grant() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveview").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-view", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut dev).await;
+
+    let mut ws = user_ws(&app, &token).await;
+    user_send(
+        &mut ws,
+        "hive:view.open",
+        json!({"session_id": sid, "ref": "r1"}),
+    )
+    .await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant")
+        .await
+        .expect("the device is asked first");
+    assert_eq!(grant["session_id"], sid);
+    assert_eq!(grant["user_id"], seeded.admin.id);
+    assert_eq!(
+        grant["may_prompt"], true,
+        "the starter drives a live session"
+    );
+    assert_eq!(grant["ttl_secs"], 600);
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    assert!(
+        user_read_for(&mut ws, "hive:view.ready", Duration::from_millis(400))
+            .await
+            .is_none(),
+        "the browser was told to dial before the device confirmed"
+    );
+
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+    )
+    .await;
+    let ready = user_read(&mut ws, "hive:view.ready")
+        .await
+        .expect("ready once the device confirmed");
+    assert_eq!(ready["grant_id"], gid);
+    assert_eq!(ready["ref"], "r1");
+    assert_eq!(ready["may_prompt"], true);
+    assert!(!ready["ice_servers"].as_array().unwrap().is_empty());
+
+    // The handshake, relayed — with the same ICE servers on both ends.
+    user_send(
+        &mut ws,
+        "hive:view.offer",
+        json!({"grant_id": gid, "sdp": "v=0 offer"}),
+    )
+    .await;
+    let offer = read_until(&mut dev.ws, "rc:hive.view.offer").await.unwrap();
+    assert_eq!(offer["sdp"], "v=0 offer");
+    assert_eq!(offer["ice_servers"], ready["ice_servers"]);
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.answer", "grant_id": gid, "sdp": "v=0 answer"}),
+    )
+    .await;
+    assert_eq!(
+        user_read(&mut ws, "hive:view.answer").await.unwrap()["sdp"],
+        "v=0 answer"
+    );
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.ice", "grant_id": gid, "candidate": {"candidate": "from-device"}}),
+    )
+    .await;
+    assert_eq!(
+        user_read(&mut ws, "hive:view.ice").await.unwrap()["candidate"]["candidate"],
+        "from-device"
+    );
+    user_send(
+        &mut ws,
+        "hive:view.ice",
+        json!({"grant_id": gid, "candidate": {"candidate": "from-browser"}}),
+    )
+    .await;
+    assert_eq!(
+        read_until(&mut dev.ws, "rc:hive.view.ice").await.unwrap()["candidate"]["candidate"],
+        "from-browser"
+    );
+
+    // A renewal re-checks the right to read and gives the device a fresh TTL.
+    user_send(&mut ws, "hive:view.renew", json!({"grant_id": gid})).await;
+    assert_eq!(
+        read_until(&mut dev.ws, "rc:hive.view.renew").await.unwrap()["ttl_secs"],
+        600
+    );
+    assert_eq!(
+        user_read(&mut ws, "hive:view.renewed").await.unwrap()["ttl_secs"],
+        600
+    );
+
+    let audited = app
+        .db
+        .collection::<Document>("hive_audit")
+        .count_documents(doc! { "action": "view", "outcome": "sent" })
+        .await
+        .unwrap();
+    assert_eq!(audited, 1, "the grant is the server's decision, audited");
+
+    // The browser goes: the device closes the peer.
+    drop(ws);
+    let close = read_until(&mut dev.ws, "rc:hive.view.close")
+        .await
+        .expect("the device is told the viewer left");
+    assert_eq!(close["grant_id"], gid);
+    assert_eq!(close["reason"], "viewer_left");
+}
+
+/// Every refusal names who said no. A member outside the session's room
+/// learns nothing — the answer a bogus id gets — and the device's own
+/// refusal reaches the viewer in its words.
+#[tokio::test]
+async fn a_view_is_refused_in_the_servers_words_or_the_devices() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveviewno").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-view-no", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut dev).await;
+
+    let mut member = user_ws(&app, &seeded.member.access_token).await;
+    user_send(
+        &mut member,
+        "hive:view.open",
+        json!({"session_id": sid, "ref": "m"}),
+    )
+    .await;
+    let no = user_read(&mut member, "hive:view.refused").await.unwrap();
+    assert_eq!(no["reason"], "not_found", "{no}");
+    assert_eq!(no["ref"], "m");
+    user_send(
+        &mut member,
+        "hive:view.open",
+        json!({"session_id": ObjectId::new().to_hex()}),
+    )
+    .await;
+    assert_eq!(
+        user_read(&mut member, "hive:view.refused").await.unwrap()["reason"],
+        "not_found",
+        "a bogus id and a room you are not in answer alike"
+    );
+    assert!(
+        !device_hears(
+            &mut dev.ws,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "no grant was minted for a non-member"
+    );
+
+    // The device's own word.
+    let mut ws = user_ws(&app, &token).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant").await.unwrap();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": grant["grant_id"], "refused": "no_session", "detail": "store\nlost"}),
+    )
+    .await;
+    let refused = user_read(&mut ws, "hive:view.refused").await.unwrap();
+    assert_eq!(refused["reason"], "no_session");
+    assert_eq!(
+        refused["message"], "store lost",
+        "the device's words, on one line"
+    );
+
+    // A build that runs sessions but does not serve them is never asked.
+    let mut old = device(&app, &seeded, "hive-old-view", RUNS_HIVE).await;
+    let old_sid = started_session(&app, &tid, &token, &mut old).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": old_sid})).await;
+    assert_eq!(
+        user_read(&mut ws, "hive:view.refused").await.unwrap()["reason"],
+        "device_unsupported"
+    );
+    assert!(
+        !device_hears(
+            &mut old.ws,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "a grant was pushed to a build that would drop it"
+    );
+
+    // And one that is away is offline.
+    drop(old.ws);
+    wait_offline(&app, &seeded, &old.agent_id).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": old_sid})).await;
+    assert_eq!(
+        user_read(&mut ws, "hive:view.refused").await.unwrap()["reason"],
+        "device_offline"
+    );
+}
+
+/// A grant belongs to one connection and one device: another socket's
+/// frames for it, or another device's, move nothing.
+#[tokio::test]
+async fn frames_for_someone_elses_grant_move_nothing() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveviewx").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-view-x", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut dev).await;
+    let mut ws = user_ws(&app, &token).await;
+    let gid = ready_view(&mut ws, &mut dev, &sid).await;
+
+    // The same user on another tab, and another user: neither can drive it.
+    let mut tab = user_ws(&app, &token).await;
+    let mut stranger = user_ws(&app, &seeded.member.access_token).await;
+    for other in [&mut tab, &mut stranger] {
+        user_send(
+            other,
+            "hive:view.offer",
+            json!({"grant_id": gid, "sdp": "v=0 hijack"}),
+        )
+        .await;
+        user_send(other, "hive:view.close", json!({"grant_id": gid})).await;
+    }
+    assert!(
+        !device_hears(
+            &mut dev.ws,
+            "rc:hive.view.offer",
+            Duration::from_millis(500)
+        )
+        .await,
+        "an offer from a socket that does not hold the grant reached the device"
+    );
+
+    // Another device answering for it reaches nobody.
+    let mut other_dev = device(&app, &seeded, "hive-view-y", VIEWS_HIVE).await;
+    send(
+        &mut other_dev.ws,
+        json!({"t": "rc:hive.view.answer", "grant_id": gid, "sdp": "v=0 forged"}),
+    )
+    .await;
+    assert!(
+        user_read_for(&mut ws, "hive:view.answer", Duration::from_millis(500))
+            .await
+            .is_none(),
+        "another device's answer reached the viewer"
+    );
+
+    // The grant still works for its holder.
+    user_send(
+        &mut ws,
+        "hive:view.offer",
+        json!({"grant_id": gid, "sdp": "v=0 real"}),
+    )
+    .await;
+    assert_eq!(
+        read_until(&mut dev.ws, "rc:hive.view.offer").await.unwrap()["sdp"],
+        "v=0 real"
+    );
+}
+
+/// A device that never answers a grant: the viewer is told, and the device
+/// told to drop it should its answer come after all.
+#[tokio::test]
+async fn a_silent_device_is_no_answer_for_the_viewer() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveviewq").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-view-q", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut dev).await;
+
+    let mut ws = user_ws(&app, &token).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant").await.unwrap();
+    let refused = user_read_for(&mut ws, "hive:view.refused", Duration::from_secs(15))
+        .await
+        .expect("the viewer hears no_answer");
+    assert_eq!(refused["reason"], "no_answer");
+    let close = read_until(&mut dev.ws, "rc:hive.view.close").await.unwrap();
+    assert_eq!(close["grant_id"], grant["grant_id"]);
+    assert_eq!(close["reason"], "no_answer");
+}
+
+/// A member who is removed stops READING too: their views close, on the
+/// device, at once — not when the grant runs out.
+#[tokio::test]
+async fn removing_a_member_closes_their_views() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveviewm").await;
+    let tid = seeded.tenant_id.clone();
+    grant_hive_run_to_member(&app, &seeded).await;
+    let mut dev = device(&app, &seeded, "hive-view-m", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &seeded.member.access_token, &mut dev).await;
+    let mut ws = user_ws(&app, &seeded.member.access_token).await;
+    let gid = ready_view(&mut ws, &mut dev, &sid).await;
+
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{tid}/member/{}", seeded.member.id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {:?}", resp.status());
+
+    let close = read_until(&mut dev.ws, "rc:hive.view.close")
+        .await
+        .expect("the device hears the view close");
+    assert_eq!(close["grant_id"], gid);
+    assert_eq!(close["reason"], "member_removed");
+}

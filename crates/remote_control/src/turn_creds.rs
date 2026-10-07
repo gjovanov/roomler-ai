@@ -83,7 +83,21 @@ impl TurnConfig {
     /// creds independently by the Hub — pick the SAME worker. With <2 workers
     /// this is exactly [`Self::issue`].
     pub fn issue_for_session(&self, user_id: &str, session_key: &str) -> IceServer {
-        let mut server = self.issue(user_id);
+        self.issue_for_session_with_ttl(user_id, session_key, self.ttl_secs)
+    }
+
+    /// FR-90 P0d-2 — [`Self::issue_for_session`] with an explicit credential
+    /// TTL, for a peer that must outlive the config TTL: the credential's
+    /// timestamp bounds a TURN allocation's TOTAL life (see
+    /// [`Self::issue_with_ttl`]), and a viewer peer stays open as long as its
+    /// room is.
+    pub fn issue_for_session_with_ttl(
+        &self,
+        user_id: &str,
+        session_key: &str,
+        ttl_secs: u32,
+    ) -> IceServer {
+        let mut server = self.issue_with_ttl(user_id, ttl_secs);
         if self.workers.len() >= 2
             && let Some(idx) = pick_index_fnv1a(session_key, self.workers.len())
         {
@@ -399,6 +413,26 @@ pub fn ice_servers_for_session(
     out
 }
 
+/// FR-90 P0d-2 — [`ice_servers_for_session`] with an explicit credential
+/// TTL ([`TurnConfig::issue_for_session_with_ttl`]): the viewer peer's ICE
+/// servers, one set minted per grant for both ends.
+pub fn ice_servers_for_session_with_ttl(
+    user_id: &str,
+    session_key: &str,
+    turn: Option<&TurnConfig>,
+    ttl_secs: u32,
+) -> Vec<IceServer> {
+    let mut out = vec![IceServer {
+        urls: vec!["stun:stun.l.google.com:19302".into()],
+        username: None,
+        credential: None,
+    }];
+    if let Some(t) = turn {
+        out.push(t.issue_for_session_with_ttl(user_id, session_key, ttl_secs));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +472,37 @@ mod tests {
         // FNV-1a("6a54bf440b4fd609a7356f97") % 3 == 0 → worker 1 first.
         let s = cfg.issue_for_session("u", "6a54bf440b4fd609a7356f97");
         assert_eq!(s.urls[0], "turn:coturn-1.example:3478");
+    }
+
+    /// FR-90 P0d-2 — a viewer peer's credential carries ITS ttl (the
+    /// username's expiry is what bounds a TURN allocation's life), and the
+    /// same worker affinity as the config-TTL path.
+    #[test]
+    fn a_session_credential_with_its_own_ttl_keeps_the_worker() {
+        let cfg = affinity_cfg();
+        let key = "6a54bf440b4fd609a7356f97";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let long = cfg.issue_for_session_with_ttl("viewer", key, 12 * 3600);
+        let expiry: u64 = long
+            .username
+            .as_deref()
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            expiry >= now + 12 * 3600 - 5 && expiry <= now + 12 * 3600 + 5,
+            "{expiry} vs {now}"
+        );
+        assert_eq!(long.urls, cfg.issue_for_session("viewer", key).urls);
+        let servers = ice_servers_for_session_with_ttl("viewer", key, Some(&cfg), 12 * 3600);
+        assert_eq!(servers.len(), 2, "STUN, then the TURN credential");
+        assert_eq!(servers[1].urls, long.urls);
     }
 
     #[test]
