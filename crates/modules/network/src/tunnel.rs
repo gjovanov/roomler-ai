@@ -103,9 +103,14 @@ pub async fn handle_tunnel_client_socket(
     // Look up tunnel-client metadata once for audit-row enrichment
     // (client_version + client_os). Best-effort — audit rows still
     // get written if this fails, just with empty version/os.
+    //
+    // LIVE (#1829): the connect-time check already refused a tombstone; a
+    // removal in the gap between it and here means there is nothing to
+    // enrich with, the WARN below names the client, and the 60 s poll's
+    // kick is on its way.
     let (client_version, client_os) = match state
         .tunnel_clients
-        .find_in_tenant(tenant_id, tunnel_client_id)
+        .find_live_in_tenant(tenant_id, tunnel_client_id)
         .await
     {
         Ok(c) => (c.client_version, c.os),
@@ -1526,9 +1531,16 @@ fn spawn_revocation_check(
         tick.tick().await;
         loop {
             tick.tick().await;
+            // ANY, deliberately (#1829): this read's job IS the tombstone.
+            // `deleted_at` decides between the heartbeat arm and the typed
+            // `rc:tunnel.revoked` kick below, while the `Err` arm means "row
+            // unreadable" and keeps the socket OPEN (a Mongo blip must not
+            // revoke a healthy fleet). A LIVE lookup would fold a removal
+            // into that `Err` arm — and a deleted client would never be
+            // kicked, for as long as its session lived.
             match state
                 .tunnel_clients
-                .find_in_tenant(tenant_id, tunnel_client_id)
+                .find_any_in_tenant(tenant_id, tunnel_client_id)
                 .await
             {
                 Ok(c)
@@ -2011,9 +2023,16 @@ pub fn ws_upgrade_tunnel_client(
         .on_upgrade(move |socket| async move {
         // Connect-time revocation check. Periodic re-check (every 60 s)
         // lives in `ws::tunnel::handle_tunnel_client_socket`.
+        //
+        // ANY, deliberately (#1829): the tombstone is what this read is FOR
+        // — `deleted_at` below selects the typed `rc:tunnel.revoked` goodbye
+        // (close 4003, "re-enrol to revive") the CLI logs and stops on. A
+        // LIVE lookup would turn a removal into the `Err` arm's frameless
+        // `return`, and the CLI would reconnect forever against what reads
+        // as a network fault.
         let client = match state
             .tunnel_clients
-            .find_in_tenant(tenant_id, tunnel_client_id)
+            .find_any_in_tenant(tenant_id, tunnel_client_id)
             .await
         {
             Ok(c) => c,

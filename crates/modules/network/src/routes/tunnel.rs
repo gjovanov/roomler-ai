@@ -345,8 +345,11 @@ pub async fn update_tunnel_client(
     )
     .await?;
 
-    // Tenant-scope the target first — a bogus/foreign id 404s.
-    state.tunnel_clients.find_in_tenant(tid, cid).await?;
+    // Tenant-scope the target first, LIVE — a bogus, foreign or REMOVED id
+    // 404s (#1829). The setters below are live-scoped on their own too; this
+    // read is what makes a stale page's edit of a removed client a clean 404
+    // rather than a silent no-op.
+    state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
 
     let mut dns_renamed: Option<bool> = None;
     let mut dns_name: Option<String> = None;
@@ -382,7 +385,7 @@ pub async fn update_tunnel_client(
         state.tunnel_clients.set_tags(tid, cid, &normalized).await?;
     }
 
-    let client = state.tunnel_clients.find_in_tenant(tid, cid).await?;
+    let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
     Ok(Json(serde_json::json!({
         "updated": true,
         "client": to_tunnel_client_response(client),
@@ -421,8 +424,12 @@ pub async fn delete_tunnel_client(
     )
     .await?;
 
-    // Read first — tenant-scopes the target and 404s a bogus id.
-    let client = state.tunnel_clients.find_in_tenant(tid, cid).await?;
+    // Read first, LIVE — tenant-scopes the target and 404s a bogus id, and
+    // makes a REPEAT delete a 404 too (#1829): re-finding the tombstone would
+    // re-run the release on an already-released node, re-stamp `deleted_at`
+    // (the removal time, lost) and report `deleted: true` for a removal
+    // someone else did. 404 is the one answer that leaves the state alone.
+    let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
 
     let released = crate::overlay::release_overlay_node_for(
         &state,
@@ -634,12 +641,18 @@ pub async fn get_tunnel_policy(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::NotAMember);
     }
-    let policy = state.tunnel_policies.find_in_tenant(tid, pid).await?;
+    // LIVE: a deleted policy is a 404 here exactly as it is absent from the
+    // listing and from the gate's compile set (#1829).
+    let policy = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
     Ok(Json(policy.into()))
 }
 
 /// PUT /api/tenant/{tenant_id}/tunnel-policy/{policy_id} — partial
 /// update. Any field omitted from the body stays unchanged.
+///
+/// A deleted policy is a 404 (#1829): the lookup below is live, and the
+/// write underneath it is live-scoped on its own, so neither a stale page nor
+/// a caller that skips the read can edit a tombstone back into service.
 pub async fn update_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -653,6 +666,9 @@ pub async fn update_tunnel_policy(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::NotAMember);
     }
+    // Resolve the target LIVE before touching it — a removed policy is a 404
+    // whatever the body says, like a bogus or foreign id.
+    state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
     // Validate only the fields that ARE being updated.
     if let Some(n) = &body.name
         && n.trim().is_empty()
@@ -702,9 +718,11 @@ pub async fn update_tunnel_policy(
         )
         .await?;
     if !changed {
+        // The live-scoped write matched nothing: the policy was removed
+        // between the lookup above and here.
         return Err(ApiError::NotFound("Tunnel policy not found".into()));
     }
-    let policy = state.tunnel_policies.find_in_tenant(tid, pid).await?;
+    let policy = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
     Ok(Json(policy.into()))
 }
 
