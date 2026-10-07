@@ -264,7 +264,9 @@ crates/
                         Built ON `fleet`
   modules/hive/       → FR-90 agent sessions, server side: the session record + lifecycle,
                         `rc:hive.*`, `hive_audit` — never session content. Built ON
-                        `fleet`; its `[modules]` switch is the one that defaults OFF
+                        `fleet` and `chat` (a session IS a secret room, written to only
+                        as notes + turn stubs); its `[modules]` switch is the one that
+                        defaults OFF
   api/              → Axum HTTP/WS server: ~85 routes + /ws + /health; `compose.rs` is
                       the host composition
   tests/            → Integration tests (spawns real servers; drives the agent in-process)
@@ -290,7 +292,7 @@ scripts/            → dev-xvfb.sh · e2e-*.sh · name-audit.sh · fr-registry-
 Full treatment: **`docs/modular-monolith.md`**. What constrains new work:
 
 1. **The DAG is data** (`crates/core/src/graph.rs`). Any module → core;
-   `conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`. **Core never calls a
+   `conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`. **Core never calls a
    module** — the inverse flows are hooks core invokes in `hooks::HOOK_ORDER`
    (session holders → lease holders → the record owner), and a failing holder
    STOPS the cascade. A hook is the *only* way a module reaches "up".

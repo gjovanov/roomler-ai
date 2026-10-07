@@ -30,5 +30,5 @@ mod store;
 mod supervisor;
 
 pub use supervisor::{
-    StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
+    Author, StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
 };

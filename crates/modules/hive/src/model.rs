@@ -86,6 +86,10 @@ pub struct HarnessRef {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SessionLocation {
     pub device_id: ObjectId,
+    /// The device's name when the session started — how the session's room
+    /// names its author ("Claude · mars").
+    #[serde(default)]
+    pub device_name: String,
     /// As the starter typed it; the device resolves it and confines it to
     /// its own `hive_roots`.
     pub folder: String,
@@ -104,6 +108,13 @@ pub struct AgentSession {
     /// Who started it — in P0 the only person who may see or stop it.
     pub owner_id: ObjectId,
     pub title: String,
+    /// The session's room (P0d): `Secret`, bound to this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<ObjectId>,
+    /// The newest turn with a stub in the room, and that stub's message —
+    /// the next report for the same turn updates it instead of adding one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<TurnStub>,
     pub harness: HarnessRef,
     pub location: SessionLocation,
     pub status: SessionStatus,
@@ -134,6 +145,22 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub const COLLECTION: &'static str = "agent_sessions";
+
+    /// How the session authors its room's messages.
+    pub fn author_display(&self) -> String {
+        if self.location.device_name.is_empty() {
+            "Claude".to_string()
+        } else {
+            format!("Claude · {}", self.location.device_name)
+        }
+    }
+}
+
+/// A turn's stub message in the session's room.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnStub {
+    pub turn: u32,
+    pub message_id: ObjectId,
 }
 
 /// What the API answers about a session: ids as hex, times as RFC 3339.
@@ -145,6 +172,8 @@ pub struct SessionView {
     pub id: String,
     pub owner_id: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
     pub harness: String,
     pub harness_session: String,
     pub device_id: String,
@@ -177,6 +206,7 @@ impl From<&AgentSession> for SessionView {
             id: s.id.map(|i| i.to_hex()).unwrap_or_default(),
             owner_id: s.owner_id.to_hex(),
             title: s.title.clone(),
+            room_id: s.room_id.map(|r| r.to_hex()),
             harness: s.harness.id.clone(),
             harness_session: s.harness.session.clone(),
             device_id: s.location.device_id.to_hex(),
@@ -279,12 +309,15 @@ mod tests {
             tenant_id: ObjectId::new(),
             owner_id: ObjectId::new(),
             title: "t".into(),
+            room_id: None,
+            last_turn: None,
             harness: HarnessRef {
                 id: "claude-code".into(),
                 session: "u".into(),
             },
             location: SessionLocation {
                 device_id: ObjectId::new(),
+                device_name: "mars".into(),
                 folder: "/src".into(),
                 account: None,
             },
@@ -304,5 +337,9 @@ mod tests {
         assert_eq!(v["device_id"], s.location.device_id.to_hex());
         assert_eq!(v["fence"], 1);
         assert!(v.get("accepted_at").is_none(), "absent, not null: {v}");
+        assert_eq!(s.author_display(), "Claude · mars");
+        let mut nameless = s.clone();
+        nameless.location.device_name.clear();
+        assert_eq!(nameless.author_display(), "Claude");
     }
 }

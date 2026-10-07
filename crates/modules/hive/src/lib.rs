@@ -22,7 +22,9 @@
 //! until an operator turns it on.
 //!
 //! Built on `fleet` (`hive → fleet`): the Hub carries the frames and knows
-//! which connections advertise `hive`.
+//! which connections advertise `hive`. And on `chat` (`hive → chat`, P0d): a
+//! session is a `Secret` room bound to it, where the session posts a stub per
+//! turn ([`room`]).
 
 use std::sync::Arc;
 
@@ -33,6 +35,7 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
+use roomler_ai_mod_chat::ChatState;
 use roomler_ai_mod_fleet::FleetState;
 use roomler_core::{
     AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx, rate_limit::RateLimiter,
@@ -43,6 +46,7 @@ pub mod agent_socket;
 pub mod dao;
 pub mod hooks;
 pub mod model;
+pub mod room;
 pub mod routes;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -52,6 +56,9 @@ pub struct HiveState {
     pub core: Core,
     /// `hive → fleet`: the Hub and the agent rows.
     pub fleet: FleetState,
+    /// `hive → chat` (P0d): a session is a room, and its turns are messages
+    /// in it, written through chat so chat keeps its own invariants.
+    pub chat: ChatState,
     pub sessions: Arc<dao::AgentSessionDao>,
     pub audit: Arc<dao::HiveAuditDao>,
     /// Start requests waiting for their device's answer (pod-local).
@@ -78,9 +85,13 @@ impl FromRef<HiveState> for Core {
 impl Module for HiveState {
     const ID: &'static str = "hive";
 
-    type Deps = FleetState;
+    type Deps = (FleetState, ChatState);
 
-    async fn init(core: Core, _settings: &Settings, fleet: FleetState) -> anyhow::Result<Self> {
+    async fn init(
+        core: Core,
+        _settings: &Settings,
+        (fleet, chat): (FleetState, ChatState),
+    ) -> anyhow::Result<Self> {
         let db = &core.db;
         let state = Self {
             sessions: Arc::new(dao::AgentSessionDao::new(db)),
@@ -88,6 +99,7 @@ impl Module for HiveState {
             start_acks: Arc::new(acks::StartAcks::new()),
             start_limiter: Arc::new(RateLimiter::new()),
             fleet,
+            chat,
             core,
         };
         // The agent socket is fleet's; the device's `rc:hive.*` answers are
