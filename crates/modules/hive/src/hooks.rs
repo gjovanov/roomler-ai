@@ -84,6 +84,14 @@ impl FleetLifecycle for HiveHooks {
         if ended > 0 {
             info!(tenant = %tenant_id, device = %agent_id, ended, "hive: device removed — its sessions ended");
         }
+        // Its viewers are told; the device itself is going, so not it.
+        crate::view::end_grants(
+            &self.state,
+            |_, _, device| *device == agent_id,
+            "device_removed",
+            false,
+        )
+        .await;
         Ok(None)
     }
 }
@@ -104,6 +112,13 @@ impl TenantLifecycle for HiveHooks {
         if ended > 0 {
             info!(tenant = %tenant_id, ended, "hive: organization archived — its sessions ended");
         }
+        crate::view::end_grants(
+            &self.state,
+            |tenant, _, _| *tenant == tenant_id,
+            "tenant_archived",
+            true,
+        )
+        .await;
         Ok(TenantArchived::default())
     }
 
@@ -119,6 +134,15 @@ impl TenantLifecycle for HiveHooks {
         if ended > 0 {
             info!(tenant = %tenant_id, user = %user_id, ended, "hive: member removed — their sessions ended");
         }
+        // And stops READING them — theirs or anyone's — now, not at the next
+        // renewal.
+        crate::view::end_grants(
+            &self.state,
+            |tenant, user, _| *tenant == tenant_id && *user == user_id,
+            "member_removed",
+            true,
+        )
+        .await;
         Ok(())
     }
 }
