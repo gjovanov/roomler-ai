@@ -208,11 +208,15 @@ cancelled, refused) is **1**. `exit-status` is sent only after the pump has deli
 
 1. **The idle flush (150 ms) and what it may split.** A pattern token (not a literal) is split only when the
    writer pauses mid-token for 150 ms. Accept, or hold back any trailing base64url run too — at the cost of
-   `Press any key` style prompts never appearing until EOF?
+   `Press any key` style prompts never appearing until EOF? *Recommendation: accept, as shipped. Not yet
+   decided.*
 2. **Server-settable?** Recommendation: no (D5). Say if an org needs to switch a fleet back without touching
-   each device.
+   each device. *Recommendation stands. Not yet decided.*
 3. **`sftp` as `console_user` on Windows** can now ride the same piped spawn. Follow-up FR, or a P3 here?
-4. **Default on for the first release**, with the switch as the fallback — or off for one release first?
+   *Recommendation: a follow-up FR. Not yet decided.*
+4. ~~**Default on for the first release**, with the switch as the fallback — or off for one release first?~~
+   **Decided (Goran, 2026-10-07): default ON** — `ssh_exec_streaming = true` ships in the first release
+   (0.4.117); the switch is the fallback. "Make ssh streaming default (merge, deploy, field test)."
 
 ## Out of scope
 
