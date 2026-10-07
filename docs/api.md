@@ -274,9 +274,9 @@ before it leaves the host.
 |---|---|---|
 | GET | `…/tunnel-client` | List enrolled tunnel clients |
 | POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token |
-| DELETE | `…/tunnel-client/{cid}` | Revoke a client |
+| PUT/DELETE | `…/tunnel-client/{cid}` | Rename / relabel / re-tag a client · revoke it (releases its overlay node; a live session is kicked by the 60 s revocation sweep with `rc:tunnel.revoked`). Removal is final: from then on the client is a **404 on both routes** — PUT and a repeat DELETE — like the listing that no longer shows it. There is no GET by id; the listing is the only read |
 | GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny) |
-| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD |
+| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again |
 
 ### Overlay network
 
@@ -288,7 +288,7 @@ before it leaves the host.
 | DELETE | `…/overlay-node/{nid}` | Evict from the mesh + release the address back to the pool |
 | GET/POST | `…/overlay-acl` | Overlay L3 ACL policies |
 | GET/PUT | `…/overlay-acl/mode` | Tenant posture: `off` (default) \| `warn` \| `enforce` |
-| GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD |
+| GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the netmap compiler's set — it is never served, edited (in particular never re-`enabled`) or compiled again, and a repeat DELETE re-fans nobody |
 | GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |

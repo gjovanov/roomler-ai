@@ -136,12 +136,68 @@ impl TunnelClientDao {
             .await
     }
 
-    pub async fn find_in_tenant(
+    /// The per-client lookup every admin route wants: this id, this tenant,
+    /// and LIVE. A removed client is `NotFound` here exactly as it is absent
+    /// from [`Self::list_for_tenant`] — the two disagreeing was #1829 (the
+    /// #1821 hole, on this DAO): `PUT …/tunnel-client/{id}` renamed and
+    /// re-tagged a tombstone, and a repeat `DELETE` re-ran the whole removal
+    /// on it and re-stamped the removal time.
+    ///
+    /// There is deliberately no un-suffixed `find_in_tenant` any more: a
+    /// caller chooses LIVE or [`Self::find_any_in_tenant`] by name, and the
+    /// compiler asks the question of every future call site too.
+    ///
+    /// The predicate is `deleted_at: null` (null OR absent) — the one every
+    /// live listing on this collection uses, so the two views agree by
+    /// construction. The `tunnel_clients` unique index is unconditional (same
+    /// re-enroll-rehydrates contract as `agents`), so no `$type: "null"`
+    /// partial-index rule binds here; see `BaseDao::find_live_by_id_in_tenant`.
+    pub async fn find_live_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        client_id: ObjectId,
+    ) -> DaoResult<TunnelClient> {
+        self.base
+            .find_live_by_id_in_tenant(tenant_id, client_id)
+            .await
+    }
+
+    /// The per-client lookup that also returns a TOMBSTONE — for the two
+    /// readers whose job is the tombstone, and nothing else: the tunnel WS
+    /// connect-time check and the 60 s revocation poll (`ws::tunnel`). Both
+    /// read `deleted_at` to send the typed `rc:tunnel.revoked` the CLI logs
+    /// and stops reconnecting on. With a LIVE lookup a removal would reach
+    /// them as `Err(NotFound)` — the poll keeps the socket OPEN on an error
+    /// (a Mongo blip must not revoke a healthy fleet), so a deleted client
+    /// would never be kicked, and the connect path would drop the socket
+    /// with no frame, leaving the CLI reconnecting forever against what
+    /// reads as a network fault.
+    ///
+    /// Never for a write, never for an admin route — those are
+    /// [`Self::find_live_in_tenant`].
+    pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         client_id: ObjectId,
     ) -> DaoResult<TunnelClient> {
         self.base.find_by_id_in_tenant(tenant_id, client_id).await
+    }
+
+    /// The filter every ADMIN-driven setter below writes through: this row,
+    /// in this tenant, and LIVE (#1829). The routes look the client up live
+    /// first; this closes the window between that read and the write, and
+    /// holds for a caller that never did the read ("a gate applies at every
+    /// entry point, or it is a courtesy"). A tombstone matches nothing, so the
+    /// setter reports `false` and the removal time it carries stays as it was.
+    ///
+    /// The DEVICE-written fields (`mark_status`, `touch_heartbeat`) keep the
+    /// plain by-id filter: their writer is the tunnel WS handler, which only
+    /// runs after the connect-time check admitted a live row and whose poll
+    /// re-reads the row before every heartbeat. `rehydrate` is the one write
+    /// whose JOB is the tombstone (re-enrolment revives it) and keeps its own
+    /// filter too.
+    fn live_row(tenant_id: ObjectId, client_id: ObjectId) -> bson::Document {
+        doc! { "_id": client_id, "tenant_id": tenant_id, "deleted_at": null }
     }
 
     pub async fn mark_status(&self, client_id: ObjectId, status: AgentStatus) -> DaoResult<bool> {
@@ -180,7 +236,7 @@ impl TunnelClientDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": client_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, client_id),
                 doc! { "$set": { "name": name, "name_admin_set": true } },
             )
             .await
@@ -198,7 +254,7 @@ impl TunnelClientDao {
             None => doc! { "$unset": { "display_name": "" } },
         };
         self.base
-            .update_one(doc! { "_id": client_id, "tenant_id": tenant_id }, update)
+            .update_one(Self::live_row(tenant_id, client_id), update)
             .await
     }
 
@@ -211,7 +267,7 @@ impl TunnelClientDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": client_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, client_id),
                 doc! { "$set": { "tags": tags.to_vec() } },
             )
             .await
@@ -220,7 +276,7 @@ impl TunnelClientDao {
     pub async fn quarantine(&self, tenant_id: ObjectId, client_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": client_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, client_id),
                 doc! { "$set": {
                     "status": bson::to_bson(&AgentStatus::Quarantined).unwrap(),
                     "updated_at": DateTime::now(),
@@ -229,7 +285,16 @@ impl TunnelClientDao {
             .await
     }
 
+    /// Tombstone a LIVE row. `deleted_at` is the removal time and is written
+    /// once: a repeat on a tombstone matches nothing and reports `false`
+    /// rather than re-stamping it. The route 404s a repeat `DELETE` before
+    /// reaching here (#1829).
     pub async fn soft_delete(&self, tenant_id: ObjectId, client_id: ObjectId) -> DaoResult<bool> {
-        self.base.soft_delete_in_tenant(tenant_id, client_id).await
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, client_id),
+                doc! { "$set": { "deleted_at": DateTime::now() } },
+            )
+            .await
     }
 }
