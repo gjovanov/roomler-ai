@@ -439,6 +439,9 @@ jobs:
       # S2: its orchestrator now decides the overlay default per install
       # flavour, and that rule ran in no lane either. `--lib` only — its
       # bin is `test = false` by the UAC lib-naming rule.
+      # `roomler-hive-node` (FR-90 P0a) joined with its first commit: the
+      # transcript chain's one-writer and no-gap checks, the replica store's
+      # search scoping and the empty-roots-means-nowhere rule are its tests.
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -447,6 +450,7 @@ jobs:
           -p roomler-ai-services -p roomler-ai-db -p roomler-ai-config
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
+          -p roomler-hive-node
 
       # FR-85 P2b — the desktop companion's unit tests ran in NO lane: the
       # macOS job only `cargo check`s it, and the step above is `--lib`, which
