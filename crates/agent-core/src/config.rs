@@ -418,6 +418,27 @@ pub struct AgentConfig {
     /// config directory does not have, so its model calls fail.
     #[serde(default)]
     pub hive_api_key_helper: Option<String>,
+    /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
+    /// the client as it is produced. Default **on**.
+    ///
+    /// ON: no output ceiling and no wall-clock timeout. The command lives as
+    /// long as the channel does — closing it, disconnecting, or the grant's
+    /// session limit kills the command and its process tree — redaction runs
+    /// over the stream, and a client that stops reading stops the command
+    /// rather than growing the daemon.
+    ///
+    /// OFF is the kill switch: the pre-FR-89 path, where the command runs
+    /// inside the Fleet-RPC engine's bounds — output buffered up to a 1 MiB
+    /// combined ceiling (then cut, with a notice on stderr) and a 300 s wall
+    /// clock. Read at daemon start; a change applies on the next restart.
+    ///
+    /// Device-owned and never settable by the server: it grants nothing, but
+    /// a control plane that could switch a device's data path from under its
+    /// owner would be a precedent this surface has refused since
+    /// `remote_config_enabled`. Fleet RPC (`roomler exec`) is unaffected
+    /// either way.
+    #[serde(default = "default_true")]
+    pub ssh_exec_streaming: bool,
 
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
@@ -2169,6 +2190,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_max_sessions: None,
         hive_harness: None,
         hive_api_key_helper: None,
+        ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,

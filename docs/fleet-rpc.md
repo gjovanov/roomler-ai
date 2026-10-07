@@ -119,7 +119,13 @@ unbounded run (`models::exec_limits`):
   explicit `truncated` flag
 - 4 concurrent commands per device; beyond that it refuses rather than queues
   (a caller on a deadline wants a fast "busy", not a slow timeout)
-- no stdin, no interactivity, no streaming
+- no stdin, no interactivity, no streaming — **on this wire**. The engine has a
+  streaming entry point beside `run_fed`, `ExecEngine::run_streamed` (FR-89),
+  with no ceiling and no wall clock; Roomler SSH's `ssh <node> 'cmd'` uses it
+  ([`roomler-ssh.md`](roomler-ssh.md) §3). `rc:rpc.exec` keeps every bound
+  above, because its answer is one persisted `exec_audit` row, and the two
+  paths share the identity model, the permit, the redactor and the tree kill —
+  only the shape of the output differs.
 
 Output is swept for the agent token(s), `Bearer …` headers and JWT-shaped
 strings **before it leaves the host** — results are persisted in `exec_audit`
@@ -195,5 +201,7 @@ the machine, on purpose.
   plus exposing the existing `status` / `peers` / `ping` / `config` /
   `tail-log` LocalAPI verbs remotely.
 - Run-as-interactive-user (the `system_context/` `CreateProcessAsUser`
-  machinery already exists), output streaming, scheduled probes, and an
+  machinery already exists), output streaming **on the RPC wire** (the engine
+  itself streams for Roomler SSH since FR-89; the `rc:rpc.result` row and its
+  audit sample would need a different shape), scheduled probes, and an
   `exec_policies` selector collection shaped like `overlay_policies`.
