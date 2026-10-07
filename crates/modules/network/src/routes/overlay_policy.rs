@@ -203,15 +203,22 @@ pub async fn get(
     let tid = gate(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
+    // LIVE: a deleted policy is a 404 here exactly as it is absent from the
+    // listing and from the netmap compiler's set (#1829).
     Ok(Json(
         state
             .overlay_policies
-            .find_in_tenant(tid, pid)
+            .find_live_in_tenant(tid, pid)
             .await?
             .into(),
     ))
 }
 
+/// A deleted policy is a 404 (#1829): the lookup is live, the write under it
+/// is live-scoped on its own, and the tenant is re-fanned only when a row
+/// actually changed — before this, a `PUT` on a tombstone wrote `enabled:
+/// true` onto it, re-fanned every node for an edit the compiler could not
+/// see, and then served the edited tombstone back.
 pub async fn update(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -221,8 +228,11 @@ pub async fn update(
     let tid = gate(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
+    // Resolve the target LIVE before touching it — a removed policy is a 404
+    // whatever the body says, like a bogus or foreign id.
+    state.overlay_policies.find_live_in_tenant(tid, pid).await?;
     validate(&body)?;
-    state
+    let changed = state
         .overlay_policies
         .update(
             tid,
@@ -234,16 +244,25 @@ pub async fn update(
             Some(body.destinations),
         )
         .await?;
-    refan_tenant(&state, tid).await;
+    if changed {
+        refan_tenant(&state, tid).await;
+    }
+    // The refetch is live too: a removal that raced the write is a 404, not
+    // a 200 carrying the tombstone.
     Ok(Json(
         state
             .overlay_policies
-            .find_in_tenant(tid, pid)
+            .find_live_in_tenant(tid, pid)
             .await?
             .into(),
     ))
 }
 
+/// Soft-delete. A repeat `DELETE` (or a bogus / foreign id) is a 404, the
+/// same answer the tunnel-policy sibling gives and the one that leaves the
+/// state alone (#1829): the write is live-scoped, so a tombstone matches
+/// nothing — before this it re-stamped the removal time, answered
+/// `deleted: true` and re-fanned the tenant for a removal someone else did.
 pub async fn delete(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -253,10 +272,11 @@ pub async fn delete(
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     let removed = state.overlay_policies.soft_delete(tid, pid).await?;
-    if removed {
-        refan_tenant(&state, tid).await;
+    if !removed {
+        return Err(ApiError::NotFound("Overlay policy not found".into()));
     }
-    Ok(Json(serde_json::json!({ "deleted": removed })))
+    refan_tenant(&state, tid).await;
+    Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 pub async fn get_mode(

@@ -79,12 +79,56 @@ impl TunnelPolicyDao {
             .await
     }
 
-    pub async fn find_in_tenant(
+    /// The per-policy lookup the admin routes want: this id, this tenant, and
+    /// LIVE. A deleted policy is `NotFound` here exactly as it is absent from
+    /// [`Self::list_for_tenant`] and from the gate's
+    /// [`Self::list_active_for_tenant`] — the per-id view disagreeing with
+    /// both was #1829 (the #1821 hole, on this DAO): `GET …/tunnel-policy/{id}`
+    /// served a deleted policy and `PUT` edited it. A deleted policy is never
+    /// served, edited or compiled; the evaluator additionally skips any row
+    /// with `deleted_at` set (`tunnel_core::policy`), as defence in depth.
+    ///
+    /// There is deliberately no un-suffixed `find_in_tenant` any more: a
+    /// caller chooses LIVE or [`Self::find_any_in_tenant`] by name.
+    ///
+    /// The predicate is `deleted_at: null` (null OR absent), the one every
+    /// listing on this collection uses. `tunnel_policies` has no unique index
+    /// at all; its only `deleted_at` index is the plain compound
+    /// `(tenant_id, deleted_at)` that serves exactly this equality — a
+    /// `$type: "null"` predicate would not even be served by it.
+    pub async fn find_live_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        policy_id: ObjectId,
+    ) -> DaoResult<TunnelPolicy> {
+        self.base
+            .find_live_by_id_in_tenant(tenant_id, policy_id)
+            .await
+    }
+
+    /// The per-policy lookup that also returns a TOMBSTONE. No caller today:
+    /// the only legitimate one is an audit or decision log that names a
+    /// removed policy by id and must still be able to show what it said.
+    /// Never for a GET of the policy itself, never for a write, never to
+    /// compile — those are [`Self::find_live_in_tenant`] and
+    /// [`Self::list_active_for_tenant`]. It exists so that a future reader
+    /// that genuinely needs the tombstone chooses it BY NAME, with a reason at
+    /// the call site, rather than reaching through `base`.
+    pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         policy_id: ObjectId,
     ) -> DaoResult<TunnelPolicy> {
         self.base.find_by_id_in_tenant(tenant_id, policy_id).await
+    }
+
+    /// The filter every write below goes through: this row, in this tenant,
+    /// and LIVE (#1829). The routes look the policy up live first; this
+    /// closes the window between that read and the write, and holds for a
+    /// caller that never did the read. A tombstone matches nothing, so the
+    /// write reports `false` and the removal time it carries stays as it was.
+    fn live_row(tenant_id: ObjectId, policy_id: ObjectId) -> bson::Document {
+        doc! { "_id": policy_id, "tenant_id": tenant_id, "deleted_at": null }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -127,14 +171,21 @@ impl TunnelPolicyDao {
             );
         }
         self.base
-            .update_one(
-                doc! { "_id": policy_id, "tenant_id": tenant_id },
-                doc! { "$set": set },
-            )
+            .update_one(Self::live_row(tenant_id, policy_id), doc! { "$set": set })
             .await
     }
 
+    /// Tombstone a LIVE row. `deleted_at` is the removal time and is written
+    /// once: a repeat on a tombstone matches nothing and reports `false`, which
+    /// the route answers with 404 (#1829) — before this, a repeat `DELETE`
+    /// re-stamped the removal time and reported success for a removal someone
+    /// else did.
     pub async fn soft_delete(&self, tenant_id: ObjectId, policy_id: ObjectId) -> DaoResult<bool> {
-        self.base.soft_delete_in_tenant(tenant_id, policy_id).await
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, policy_id),
+                doc! { "$set": { "deleted_at": DateTime::now() } },
+            )
+            .await
     }
 }

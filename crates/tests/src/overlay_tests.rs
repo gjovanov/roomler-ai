@@ -1071,6 +1071,267 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
     assert_eq!(list["items"].as_array().unwrap().len(), 0);
 }
 
+/// A valid overlay ACL body that needs no real node: every node may reach
+/// every node on the whole carrier-grade range.
+fn acl_body(name: &str, enabled: bool) -> Value {
+    serde_json::json!({
+        "name": name,
+        "enabled": enabled,
+        "sources": [{ "kind": "all_nodes" }],
+        "via": [{ "kind": "all_nodes" }],
+        "destinations": [{ "cidr": "100.64.0.0/10" }],
+    })
+}
+
+/// #1829 — removal is FINAL on every per-policy route, not only in the
+/// listing. `find_by_id_in_tenant` filtered `{_id, tenant_id}` and nothing
+/// else, so after `DELETE …/overlay-acl/{id}` the tombstone still answered
+/// `GET` with the whole policy, `PUT` wrote `enabled: true` onto it and
+/// re-fanned the tenant, and a repeat `DELETE` re-stamped the removal time.
+/// The lookup every per-policy route sits on is live-scoped now, and so are
+/// the writes underneath it — and the netmap compiler's input
+/// (`list_active_for_tenant`) never carried the tombstone, so a deleted policy
+/// is never served, edited or compiled.
+///
+/// Negative control (recorded on the PR): with the `deleted_at` predicate
+/// taken out of the lookup this fails at "GET of a removed policy" with 200;
+/// with it taken out of the write filter, at "a write must not land on a
+/// tombstone".
+#[tokio::test]
+async fn a_removed_overlay_acl_policy_is_a_404_on_every_per_policy_route() {
+    use bson::Bson;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovaclgone").await;
+    let admin = seeded.admin.access_token.clone();
+    let list_url = format!("/api/tenant/{}/overlay-acl", seeded.tenant_id);
+    let created: Value = app
+        .auth_post(&list_url, &admin)
+        .json(&acl_body("gone grant", true))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy_id = created["id"].as_str().expect("policy id").to_string();
+    let one = format!("{list_url}/{policy_id}");
+    let tenant_id = tid(&seeded.tenant_id);
+    let pid = tid(&policy_id);
+    let policies = app.db.collection::<bson::Document>("overlay_policies");
+
+    // The positive control: a LIVE policy resolves on both routes, and the
+    // LAST write before the removal is what the tombstone must still say.
+    let resp = app.auth_get(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "control: GET of a live policy");
+    let resp = app
+        .auth_put(&one, &admin)
+        .json(&acl_body("before", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "control: PUT on a live policy");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "before");
+    assert_eq!(body["enabled"], false);
+
+    // Remove it.
+    let resp = app.auth_delete(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["deleted"], true);
+
+    // The row is a TOMBSTONE, not gone — the case the bug lived in.
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .expect("a deleted policy tombstones in place");
+    let removed_at = match row.get("deleted_at") {
+        Some(Bson::DateTime(at)) => *at,
+        other => panic!("tombstone must carry a removal time, got {other:?}"),
+    };
+
+    // GET: 404, exactly like a bogus id.
+    let resp = app.auth_get(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "GET of a removed policy");
+
+    // PUT: 404 — and in particular `enabled: true` is NOT written back onto
+    // the tombstone.
+    let resp = app
+        .auth_put(&one, &admin)
+        .json(&acl_body("zombie", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "PUT on a removed policy");
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_str("name").unwrap(), "before");
+    assert!(
+        !row.get_bool("enabled").unwrap(),
+        "the PUT must not re-enable the tombstone"
+    );
+
+    // The writes are live-scoped on their own, not only behind the routes'
+    // lookup ("a gate applies at every entry point, or it is a courtesy").
+    let network = app.state.network();
+    assert!(
+        !network
+            .overlay_policies
+            .update(
+                tenant_id,
+                pid,
+                Some("dao".into()),
+                Some(true),
+                None,
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+        "a write must not land on a tombstone"
+    );
+    // The removal time is written once: a repeat tombstoning is a no-op.
+    assert!(
+        !network
+            .overlay_policies
+            .soft_delete(tenant_id, pid)
+            .await
+            .unwrap()
+    );
+    let row = policies
+        .find_one(doc! { "_id": pid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_datetime("deleted_at").unwrap(), &removed_at);
+    assert_eq!(row.get_str("name").unwrap(), "before");
+    assert!(!row.get_bool("enabled").unwrap());
+
+    // The two lookups differ by NAME: LIVE is NotFound, ANY still sees the
+    // tombstone (the reader an audit log naming this policy would need).
+    assert!(matches!(
+        network
+            .overlay_policies
+            .find_live_in_tenant(tenant_id, pid)
+            .await,
+        Err(DaoError::NotFound)
+    ));
+    assert!(
+        network
+            .overlay_policies
+            .find_any_in_tenant(tenant_id, pid)
+            .await
+            .unwrap()
+            .deleted_at
+            .is_some()
+    );
+
+    // The netmap compiler's input does not carry it: `try_load_acl` reads
+    // `list_active_for_tenant`, nothing reads a policy by id, and the
+    // evaluator skips `deleted_at` / `!enabled` rows besides. With no live
+    // policy left, an ENFORCING tenant compiles `Some([])` — deny — and a
+    // tombstone cannot turn that back into a grant.
+    let active = network
+        .overlay_policies
+        .list_active_for_tenant(tenant_id)
+        .await
+        .unwrap();
+    assert!(
+        active.is_empty(),
+        "a deleted policy must not reach the netmap compiler"
+    );
+
+    // A repeat DELETE is a 404 — the same answer the tunnel-policy sibling
+    // gives, and the one that leaves the removal time alone and re-fans
+    // nobody.
+    let resp = app.auth_delete(&one, &admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "a repeat DELETE");
+
+    // The two views agree: gone from the listing too.
+    let list: Value = app
+        .auth_get(&list_url, &admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 0);
+}
+
+/// #1829 — the live predicate is `deleted_at: null` (null OR ABSENT), the
+/// one both listings on `overlay_policies` use, so the per-id view, the admin
+/// listing and the compiler's set agree by construction. ⚠️ The
+/// `$type: "null"` partial unique indexes live on `overlay_nodes`, not here —
+/// `overlay_policies` declares no index set at all — and even the node DAO's
+/// own live lookups query with equality-null. A `$type` predicate here would
+/// 404 a live policy whose field is missing while the compiler still shipped
+/// it: the per-id view disagreeing with the listing in the other direction.
+#[tokio::test]
+async fn a_live_overlay_acl_policy_whose_deleted_at_field_is_absent_is_still_live() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovaclabsent").await;
+    let admin = &seeded.admin.access_token;
+    let list_url = format!("/api/tenant/{}/overlay-acl", seeded.tenant_id);
+    let created: Value = app
+        .auth_post(&list_url, admin)
+        .json(&acl_body("absent-field", true))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy_id = created["id"].as_str().expect("policy id").to_string();
+    let one = format!("{list_url}/{policy_id}");
+    let pid = tid(&policy_id);
+
+    app.db
+        .collection::<bson::Document>("overlay_policies")
+        .update_one(doc! { "_id": pid }, doc! { "$unset": { "deleted_at": "" } })
+        .await
+        .unwrap();
+
+    let resp = app.auth_get(&one, admin).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET: absent is live");
+    let resp = app
+        .auth_put(&one, admin)
+        .json(&acl_body("still-here", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PUT: absent is live");
+    let list: Value = app
+        .auth_get(&list_url, admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        1,
+        "the listing agrees"
+    );
+    let active = app
+        .state
+        .network()
+        .overlay_policies
+        .list_active_for_tenant(tid(&seeded.tenant_id))
+        .await
+        .unwrap();
+    assert!(
+        active.iter().any(|p| p.id == Some(pid)),
+        "the compiler still ships it"
+    );
+}
+
 /// An agent and a tunnel client on the SAME box share a `machine_id`, and only
 /// one of them can own the overlay node. Deleting the agent must not release a
 /// node the still-enrolled tunnel client owns.
