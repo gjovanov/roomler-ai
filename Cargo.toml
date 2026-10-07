@@ -7,6 +7,9 @@ members = [
     "crates/remote_control",
     "crates/localapi",
     "crates/agent-core",
+    # FR-90 — Hive on the device: transcript events, the replica store, the
+    # stream-json adapter, the launch spec. Daemon-side only (MPL).
+    "crates/hive-node",
     "crates/tunnel-core",
     # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
     # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND
@@ -218,6 +221,10 @@ genpdf = "0.2"
 
 # File handling
 tempfile = "3"
+
+# FR-90 Hive — the device-side replica store and its event hash chain
+rusqlite = { version = "0.40", features = ["bundled"] }
+blake3 = "1.8"
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
