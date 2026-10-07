@@ -177,6 +177,9 @@ pub struct SessionView {
     pub harness: String,
     pub harness_session: String,
     pub device_id: String,
+    /// The device's name when the session started (P0d-1), for a list that
+    /// should not need a second lookup per row. Empty for an older record.
+    pub device_name: String,
     pub folder: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
@@ -210,6 +213,7 @@ impl From<&AgentSession> for SessionView {
             harness: s.harness.id.clone(),
             harness_session: s.harness.session.clone(),
             device_id: s.location.device_id.to_hex(),
+            device_name: s.location.device_name.clone(),
             folder: s.location.folder.clone(),
             account: s.location.account.clone(),
             status: s.status,

@@ -126,6 +126,16 @@
           :title="$t('nav.dashboard')"
           exact
         />
+        <!-- FR-90 — agent sessions; only where the server runs `hive`, which
+             is switched off unless an operator turns it on (the capability
+             gate fails CLOSED for it). -->
+        <v-list-item
+          v-if="caps.has('hive')"
+          :to="`/tenant/${tenantId}/sessions`"
+          prepend-icon="mdi-robot-outline"
+          :title="$t('nav.agentSessions')"
+          data-testid="nav-agent-sessions"
+        />
         <!-- Devices-first (2026-08-26): the flat Devices item became a
              collapsible group listing the fleet's AGENTS (a tap lands in the
              remote view; tunnel clients have none, so they live only on the

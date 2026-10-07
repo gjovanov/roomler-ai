@@ -3,7 +3,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { api } from '@/api/client'
-import { BUILT_MODULES, isModuleId, type ModuleId } from '@/modules/registry'
+import { BUILT_MODULES, DEFAULT_OFF, isModuleId, type ModuleId } from '@/modules/registry'
 
 /** `GET /api/capabilities` (FR-69 D10) — unauthenticated, one request per page load. */
 export interface ServerCapabilities {
@@ -76,11 +76,12 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
    * Is a module usable from this bundle against this server? Both gates:
    * the bundle must carry it (`VITE_MODULES`) AND the server must mount it —
    * or the server has not answered yet, in which case the bundle's word
-   * stands (fail-open).
+   * stands (fail-open). A DEFAULT-OFF module (FR-90 `hive`) is the exception:
+   * it is present only once the server has said so.
    */
   function has(module: ModuleId): boolean {
     if (!BUILT_MODULES.includes(module)) return false
-    if (modules.value === null) return true
+    if (modules.value === null) return !DEFAULT_OFF.includes(module)
     return modules.value.includes(module)
   }
 

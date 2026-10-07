@@ -9,24 +9,26 @@ flowchart LR
     subgraph views["Views (ui/src/views/)"]
         L["LandingView · auth/ · legal/"]
         CORE["dashboard/ · rooms/ · chat/<br/>conference/ · files/ · invite/<br/>profile/ · billing/"]
-        FLEET["devices/ · remote/<br/>network/ · observability/<br/>analytics/ · admin/"]
+        FLEET["devices/ · remote/<br/>network/ · observability/<br/>analytics/ · admin/ · hive/"]
     end
 
-    subgraph state["Pinia stores (20)"]
+    subgraph state["Pinia stores (21)"]
         S1["auth · tenant · rooms ·<br/>messages · conference · files ·<br/>invite · members · role ·<br/>notification · tasks · user · ws"]
-        S2["agents · tunnelClients ·<br/>tunnelPolicies · overlayRoutes ·<br/>overlayAcl · orgBadges · stats"]
+        S2["agents · tunnelClients ·<br/>tunnelPolicies · overlayRoutes ·<br/>overlayAcl · orgBadges · stats · hive"]
     end
 
     subgraph rt["Real-time & media"]
         WS["useWebSocket → /ws"]
         MS["mediasoup-client<br/>(conference)"]
         RC["useRemoteControl<br/>(remote desktop viewer)"]
+        HV["useHiveViewer<br/>(agent-session viewer peer)"]
         WK["decode workers<br/>webcodecs · hevc · vp9-444"]
     end
 
     views --> state
     CORE --> WS & MS
     FLEET --> RC --> WK
+    FLEET --> HV
     state --> WS
 ```
 
@@ -37,15 +39,22 @@ flowchart LR
 | Marketing / auth | `LandingView`, `auth/{Login,Register,OAuthCallback}View`, `legal/{Terms,PrivacyPolicy}View` | |
 | Collaboration | `dashboard/{DashboardView,TenantDashboard}`, `rooms/{RoomList,ExploreView}`, `chat/ChatView`, `conference/ConferenceView`, `files/FilesBrowser`, `invite/{InviteLanding,InviteManage}View`, `profile/{Profile,ProfileEdit}View`, `billing/BillingView` | `ChatView`/`ConferenceView` own their layout (no `v-container`) |
 | Fleet | `devices/DevicesView` (enrolled machines), `remote/RemoteControl` (the viewer), `remote/ConsentView`, `network/NetworkPanel` (overlay mesh), `observability/ObservabilityView`, `analytics/AnalyticsView`, `admin/AdminPanel` | |
+| Agent sessions (FR-90, module `hive`) | `hive/HiveSessionsView` (your sessions, start dialog, stop) | a session's own page is its chat room: `ChatView` opens `components/hive/HiveTranscript` as a side panel when the room's `binding.module` is `hive` |
 | Fallback | `NotFoundView` | |
 
-## Stores (20)
+## Stores (21)
 
 `auth` · `tenant` · `user` · `rooms` · `messages` · `conference` · `files` ·
 `invite` · `members` · `role` · `notification` · `tasks` · `ws` — the
 collaboration core — plus the fleet set: `agents`, `tunnelClients`,
 `tunnelPolicies`, `overlayRoutes`, `overlayAcl`, `orgBadges` (multi-org
-indicators), `stats` (observability series).
+indicators), `stats` (observability series) — and `hive` (FR-90: the
+server's RECORD of your agent sessions; never their content).
+
+⚠️ `hive` is the one module the server switches OFF by default, so the
+capability gate (`stores/capabilities.ts`) fails **closed** for it while
+`/api/capabilities` is unknown (`modules/registry.ts` `DEFAULT_OFF`), where every other
+module fails open.
 
 ## Composables
 
@@ -55,6 +64,7 @@ indicators), `stats` (observability series).
 | `useWebSocket` | The `/ws` connection + event dispatch into stores |
 | `useRemoteControl` | The entire remote-desktop viewer engine (below) |
 | `useRemoteRecording` | The viewer's half of the session's `record` channel: start/stop, the device's list, a checked, resumable download ([recording.md](recording.md) §10) |
+| `useHiveViewer` | FR-90 — the browser's half of the agent-session viewer peer: `hive:view.*` signalling on the user socket, a data-only `RTCPeerConnection` dialled only after the device confirmed the grant, the `hive` DataChannel in `utils/hiveFraming.ts` frames (SCTP drops a message over 64 KiB), history + live follow + "ask the agent". ⚠️ The peer is `close()`d on every way out — a dropped peer frees nothing |
 | `useConferenceLayout` / `useActiveSpeaker` / `useAudioPlayback` / `usePictureInPicture` | Conference UX |
 | `useMarkdown` | markdown-it + DOMPurify rendering |
 | `usePush` | Web-push subscribe/unsubscribe |
