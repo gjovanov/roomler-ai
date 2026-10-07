@@ -1254,6 +1254,13 @@ async fn connect_once(
     // rotation, say so again on this healthy socket: the copy sent on the
     // dying session can be lost (it was, in the second field run).
     drain_pending_rotation_report(&cfg.tenant_id, &outbound_tx);
+    // FR-90 — the primary enrollment's connection carries this device's Hive
+    // state reports: point the supervisor at THIS one, which also replays
+    // the latest state of every session a dropped connection may have lost.
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    if ctx.is_primary {
+        crate::hive::on_connected(outbound_tx.clone());
+    }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // FR-43 P2b — point the delegation channel at THIS connection's outbound
     // queue, so a worker's `SdpAnswer` / `Ice` reach the server.
@@ -4063,6 +4070,72 @@ async fn handle_server_msg(
                     %grant_id, %caller,
                     "rc:ssh.grant ignored — this build lacks the `ssh-server` feature"
                 );
+            }
+        }
+
+        // FR-90 — start an agent session. Answered with `rc:hive.start_ack`
+        // on THIS connection, from a task of its own (launching is I/O this
+        // loop must not wait on), after the device's own gates.
+        ServerMsg::HiveStart {
+            session_id,
+            harness,
+            harness_session,
+            fence,
+            folder,
+            user_id,
+            user_email,
+            caller,
+            resume,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_start(
+                crate::hive::StartOrder {
+                    session_id,
+                    harness,
+                    harness_session,
+                    fence,
+                    folder,
+                    user_id,
+                    user_email,
+                    caller,
+                    resume,
+                },
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            // No ack from this build: it does not advertise `hive`, so no
+            // server sends it a start or waits on one.
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = (
+                    &harness,
+                    &harness_session,
+                    fence,
+                    &folder,
+                    user_id,
+                    &user_email,
+                    resume,
+                );
+                warn!(
+                    session = %session_id, %caller,
+                    "rc:hive.start ignored — this build does not run agent sessions"
+                );
+            }
+        }
+
+        // FR-90 — stop an agent session; its `ended` arrives as
+        // `rc:hive.state` once the harness is gone.
+        ServerMsg::HiveStop {
+            session_id,
+            fence,
+            reason,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_stop(session_id, fence, reason, ctx.is_primary);
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = (fence, &reason);
+                debug!(session = %session_id, "rc:hive.stop ignored — this build does not run agent sessions");
             }
         }
 

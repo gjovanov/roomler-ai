@@ -75,6 +75,10 @@ property these gates exist for.
 | `ssh_host_key` | minted | Generated on first SSH-enabled start |
 | `forward_acl` | empty | SSH port-forward destinations. **Empty means nowhere** |
 | `ssh_activity_log` | off | Whether this machine reports what its SSH sessions did |
+| `hive_enabled` | off | Run AI agent sessions here when an org member starts one (builds with the `hive` feature; Linux) |
+| `hive_accounts` | empty | Which local account each member's sessions run as, `{"<user id or email>": "<account>"}`. **Empty means nobody**; never root |
+| `hive_roots` | empty | Folders sessions may run in, checked on the resolved path. **Empty means nowhere** |
+| `hive_max_sessions` | `4` | Sessions this machine runs at once |
 
 :::danger These are the gates the server cannot write
 Every one of the settings above is device-owned. That is the property that makes

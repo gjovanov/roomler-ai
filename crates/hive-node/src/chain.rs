@@ -30,7 +30,8 @@ const HASH_CONTEXT: &str = "roomler hive transcript event v1";
 /// One event as it is stored and replicated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
-    /// The Hive session id (also the harness session id).
+    /// The Hive session id — the server's `agent_sessions` id, as hex. Not
+    /// the harness's own UUID, which the launch spec carries separately.
     pub session: String,
     /// 1-based, gapless within the session.
     pub seq: u64,

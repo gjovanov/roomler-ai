@@ -8750,6 +8750,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
  "roomler-cli",
+ "roomler-hive-node",
  "roomler-node-core",
  "russh",
  "scrap",
