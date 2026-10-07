@@ -528,6 +528,10 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
     }
 }
 
+/// FR-90 — a Hive session's state lives under its account's home; the home
+/// comes from the same lookup that refuses uid 0. Gated to its one consumer.
+#[cfg(all(target_os = "linux", feature = "hive"))]
+pub(crate) use unix_priv::account_home;
 /// Unix privilege drop.
 ///
 /// Split into a "resolve everything first, then apply" shape for one specific
@@ -676,6 +680,13 @@ mod unix_priv {
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
         let a = resolve(account)?;
         Ok((a.uid, a.gid, a.groups))
+    }
+
+    /// FR-90 — an account's home directory, resolved as [`resolve`] resolves
+    /// it (uid 0 refused, so a session can never be pointed at root's home).
+    #[cfg(all(target_os = "linux", feature = "hive"))]
+    pub(crate) fn account_home(account: &str) -> Result<std::path::PathBuf, String> {
+        Ok(std::path::PathBuf::from(resolve(account)?.home))
     }
 
     /// FR-85 P1e-unix — the name of the account with `uid` (`getpwuid_r`,
