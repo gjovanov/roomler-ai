@@ -24,20 +24,29 @@
 //! `lost`, not launched an hour after someone gave up on them). A device that
 //! reconnects as a build without Hive cannot be running anything: its
 //! pending stops end and its pending starts are lost.
+//!
+//! # What is over stays over
+//!
+//! A session the server ended while its device could not hear — its starter
+//! removed, its org archived — is not pending anything, so reconcile sends it
+//! nothing. The device learns from its own reports instead: one that says it
+//! RUNS a session whose record is over is answered with a stop
+//! ([`stop_if_over`]). That covers the replay a device sends on every
+//! connection, so a removed member's session cannot outlive one reconnect.
 
 use async_trait::async_trait;
 use bson::{DateTime, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
-    hive::{HiveRefusal, HiveRunState, hive_limits},
+    hive::{HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits},
     signaling::{ClientMsg, ServerMsg},
 };
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::HiveState;
 use crate::model::SessionStatus;
+use crate::{HiveState, room};
 
 /// Reports queued per connection before new ones are dropped. A device
 /// sends a handful per turn; a full queue means a flood or a stalled
@@ -60,6 +69,11 @@ enum Report {
         fence: u64,
         state: Option<HiveRunState>,
         detail: Option<String>,
+    },
+    Turn {
+        session_id: ObjectId,
+        fence: u64,
+        report: room::TurnReport,
     },
 }
 
@@ -117,6 +131,27 @@ impl AgentMsgHandler for HiveAgentSocket {
                 fence,
                 state,
                 detail,
+            },
+            ClientMsg::HiveTurn {
+                session_id,
+                fence,
+                turn,
+                status,
+                prompted_by,
+                steps,
+                duration_ms,
+                cost_usd,
+            } => Report::Turn {
+                session_id,
+                fence,
+                report: room::TurnReport {
+                    turn,
+                    status,
+                    prompted_by,
+                    steps,
+                    duration_ms,
+                    cost_usd,
+                },
             },
             other => return Some(other),
         };
@@ -194,12 +229,27 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                         );
                         // AFTER the write: the woken caller re-reads the record.
                         state.start_acks.deliver(session_id, device_id);
+                        // And say so in the session's room (P0d).
+                        if let Ok(Some(s)) = state.sessions.find(session_id).await {
+                            let text = match refused {
+                                None => room::started_note(&s),
+                                Some(_) => room::refused_note(&s),
+                            };
+                            room::note(state, &s, text).await;
+                        }
                     }
-                    Ok(false) => debug!(
-                        session = %session_id, device = %device_id, fence,
-                        "hive: a start answer matched no unanswered start — a duplicate, \
-                         a stale fence, or not this device's session"
-                    ),
+                    Ok(false) => {
+                        debug!(
+                            session = %session_id, device = %device_id, fence,
+                            "hive: a start answer matched no unanswered start — a duplicate, \
+                             a stale fence, or not this device's session"
+                        );
+                        // It launched something the record gave up on (ended
+                        // while the start was in flight, or `lost`).
+                        if refused.is_none() {
+                            stop_if_over(state, session_id, device_id, fence).await;
+                        }
+                    }
                     Err(e) => {
                         warn!(session = %session_id, %e, "hive: a start answer was not recorded")
                     }
@@ -235,17 +285,95 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                 };
                 match applied {
                     Ok(true) => {
-                        debug!(session = %session_id, state = run.as_str(), "hive: session state")
+                        debug!(session = %session_id, state = run.as_str(), "hive: session state");
+                        if run == HiveRunState::Ended
+                            && let Ok(Some(s)) = state.sessions.find(session_id).await
+                        {
+                            room::note(state, &s, room::ended_note(&s)).await;
+                        }
                     }
-                    Ok(false) => debug!(
-                        session = %session_id, device = %device_id, fence, state = run.as_str(),
-                        "hive: a state report matched no live session at that fence on this device"
-                    ),
+                    Ok(false) => {
+                        debug!(
+                            session = %session_id, device = %device_id, fence, state = run.as_str(),
+                            "hive: a state report matched no live session at that fence on this device"
+                        );
+                        if run != HiveRunState::Ended {
+                            stop_if_over(state, session_id, device_id, fence).await;
+                        }
+                    }
                     Err(e) => {
                         warn!(session = %session_id, %e, "hive: a state report was not recorded")
                     }
                 }
             }
+            Report::Turn {
+                session_id,
+                fence,
+                report,
+            } => {
+                // The same ownership rule as every device report: only the
+                // session's own device, at its current fence.
+                match state.sessions.find(session_id).await {
+                    Ok(Some(s))
+                        if s.location.device_id == device_id
+                            && u64::try_from(s.fence).ok() == Some(fence) =>
+                    {
+                        if !s.status.is_terminal() {
+                            room::turn_stub(state, &s, report).await;
+                            continue;
+                        }
+                        // Over on the record. The device may still FINISH the
+                        // stub it has (the turn its stop interrupted), never
+                        // open a new one; a turn it says is running, it stops.
+                        let running = matches!(report.status, Some(HiveTurnStatus::Running) | None);
+                        if running {
+                            stop_if_over(state, session_id, device_id, fence).await;
+                        } else if s.last_turn.is_some_and(|t| t.turn == report.turn) {
+                            room::turn_stub(state, &s, report).await;
+                        }
+                    }
+                    Ok(_) => debug!(
+                        session = %session_id, device = %device_id, fence,
+                        "hive: a turn report for no session of this device at that fence"
+                    ),
+                    Err(e) => warn!(session = %session_id, %e, "hive: a turn report was not read"),
+                }
+            }
+        }
+    }
+}
+
+/// The device says it RUNS a session — `session_id` at `fence` — that the
+/// record says is over: tell it to stop. Nothing else would ever reach that
+/// process (reconcile re-sends only what is pending), and the record is the
+/// source of truth. A device answers a stop for a session it does not run with
+/// `ended`, which changes nothing here, so this cannot loop.
+async fn stop_if_over(state: &HiveState, session_id: ObjectId, device_id: ObjectId, fence: u64) {
+    let s = match state.sessions.find(session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(session = %session_id, %e, "hive: a report's session was not read");
+            return;
+        }
+    };
+    // Only the session's own device is told — a report naming someone
+    // else's session stops nothing.
+    if s.location.device_id != device_id || !s.status.is_terminal() {
+        return;
+    }
+    let msg = ServerMsg::HiveStop {
+        session_id,
+        fence,
+        reason: s.end_reason.unwrap_or_else(|| "ended".to_string()),
+    };
+    match state.fleet.rc_hub.push_hive(device_id, s.tenant_id, msg) {
+        Ok(()) => info!(
+            session = %session_id, device = %device_id, fence,
+            "hive: the device still runs a session that is over — told to stop"
+        ),
+        Err(e) => {
+            debug!(session = %session_id, %e, "hive: a stop for a session that is over was not sent")
         }
     }
 }
@@ -278,14 +406,17 @@ pub(crate) async fn reconcile_on_connect(
         let fence = u64::try_from(s.fence).unwrap_or_default();
         match s.status {
             SessionStatus::Stopping if !runs_hive => {
-                let _ = state
+                if let Ok(true) = state
                     .sessions
                     .end_now(
                         sid,
                         "stopped",
                         "the device's agent no longer runs agent sessions",
                     )
-                    .await;
+                    .await
+                {
+                    room::note_ended(state, sid).await;
+                }
             }
             SessionStatus::Stopping => {
                 let msg = ServerMsg::HiveStop {
@@ -301,24 +432,30 @@ pub(crate) async fn reconcile_on_connect(
                 }
             }
             SessionStatus::Starting if !runs_hive => {
-                let _ = state
+                if let Ok(true) = state
                     .sessions
                     .mark_lost(
                         sid,
                         "the device reconnected with an agent that does not run agent sessions",
                     )
-                    .await;
+                    .await
+                {
+                    room::note_ended(state, sid).await;
+                }
             }
             SessionStatus::Starting => {
                 let age_ms = now_ms.saturating_sub(s.created_at.timestamp_millis());
                 if age_ms > hive_limits::START_REDELIVERY_WINDOW_SECS * 1000 {
-                    let _ = state
+                    if let Ok(true) = state
                         .sessions
                         .mark_lost(
                             sid,
                             "the device came back after the start's redelivery window",
                         )
-                        .await;
+                        .await
+                    {
+                        room::note_ended(state, sid).await;
+                    }
                     continue;
                 }
                 let Ok(owner) = state.users.base.find_by_id(s.owner_id).await else {

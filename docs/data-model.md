@@ -37,10 +37,10 @@ erDiagram
 | `tenants` | Organizations. Unique `slug`; `owner_id`; plan + Stripe linkage |
 | `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username`. ⚠️ Unique `email` is a **reservation**, so it holds only an address the account has *proven* (activation, or a provider that verified it) — an unproven claim goes to the non-indexed `unverified_email` and the row takes a `.invalid` placeholder |
 | `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
-| `roles` | 24-bit permission bitfield. Unique `(tenant_id, name)`, ordered by `position` |
-| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags` |
+| `roles` | Permission bitfield (`u64`; 33 bits defined since FR-90's `HIVE_RUN` — [permissions.md](permissions.md)). Unique `(tenant_id, name)`, ordered by `position` |
+| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means* (FR-90: an agent session's room, `secret`, path `hive-<session id>`); chat stores it and never interprets it |
 | `room_members` | Per-room membership |
-| `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content` |
+| `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display` (FR-90: `Claude · <device>`), which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding` (FR-90: a turn's stub, edited in place when the turn ends) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
 | `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local` |
 | `call_sessions` | Call lifecycle rows (90 d TTL on `started_at`) |
@@ -80,6 +80,7 @@ erDiagram
     overlay_blocks ||--o{ overlay_networks : "carves blocks (global)"
     agents ||--o{ agent_sessions : "runs (FR-90)"
     agent_sessions ||--o{ hive_audit : "start / stop decisions"
+    agent_sessions ||--o| rooms : "its secret room (binding)"
 ```
 
 | Collection | Purpose · key fields / indexes |
@@ -100,7 +101,7 @@ erDiagram
 | `overlay_nodes` | Mesh membership: overlay IP, WG pubkey, advertised + approved routes, exit-node flag. Unique `(tenant_id, machine_id)` and `(tenant_id, network_id, overlay_ip)`; **partial-unique `name`** (MagicDNS) scoped to live rows — nodes are *tombstoned*, not deleted, so a released address/name can be re-issued while history is kept |
 | `overlay_policies` | Overlay L3 ACL rules (compiled into per-node netmaps under `enforce`) |
 | `overlay_blocks` | **Global** (not tenant-scoped) registry of disjoint `/22` address blocks for multi-org; slot-unique, freed blocks quarantined |
-| `agent_sessions` | FR-90 (module `hive`): one agent session — owner, title, harness + its own session UUID, `location {device_id, folder, account}`, `status` (`starting` → `idle`/`running`/`awaiting_approval` → `stopping` → `ended`; or `refused`/`lost`), `fence`, `accepted_at`, `refusal`, `end_reason`. **Never content** — no prompt, tool call or output. Every device-driven move is a compare-and-set on device + fence + status. `(tenant_id, owner_id, created_at desc)`, `(tenant_id, location.device_id, status)`, `(tenant_id, status)`. No TTL |
+| `agent_sessions` | FR-90 (module `hive`): one agent session — owner, title, harness + its own session UUID, `location {device_id, device_name, folder, account}`, `room_id` (its secret room), `last_turn {turn, message_id}` (the newest turn's stub — advanced by a compare-and-set, so a late report of an older turn never rewinds it), `status` (`starting` → `idle`/`running`/`awaiting_approval` → `stopping` → `ended`; or `refused`/`lost`), `fence`, `accepted_at`, `refusal`, `end_reason`. **Never content** — no prompt, tool call or output. Every device-driven move is a compare-and-set on device + fence + status. `(tenant_id, owner_id, created_at desc)`, `(tenant_id, location.device_id, status)`, `(tenant_id, status)`. No TTL |
 | `hive_audit` | FR-90: the server's own decision on every session start (`sent` or `refused` with the gate) and stop (`sent`/`queued`/`ended`). `(tenant_id, at desc)`, `(session_id, at)`. 90 d TTL |
 
 ## Observability & analytics

@@ -27,7 +27,7 @@ flowchart BT
     remote["modules/remote<br/>RC sessions · rc:* controller dispatch<br/>/turn/credentials · /relay/regions · cross-pod relay"]
     network["modules/network<br/>overlay IPAM + netmaps + ACL · tunnels · /derp<br/>peer relays · Roomler SSH · MagicDNS"]
     saas["modules/saas (add-on)<br/>Stripe · newsletter · plan compliance"]
-    hive["modules/hive (FR-90, default OFF)<br/>agent sessions: the record + lifecycle<br/>rc:hive.* · hive_audit · never content"]
+    hive["modules/hive (FR-90, default OFF)<br/>agent sessions: the record + lifecycle<br/>rc:hive.* · hive_audit · turn stubs · never content"]
     fleet --> core
     chat --> core
     saas --> core
@@ -35,6 +35,7 @@ flowchart BT
     remote -->|"the Hub is ONE live object"| fleet
     network -->|"agents, presence, the socket"| fleet
     hive -->|"a session's frames ride the agent socket"| fleet
+    hive -->|"a session IS a secret room"| chat
     style core fill:#e8f0fe
     style saas fill:#fff4e5
     style hive fill:#f3e8fd
@@ -44,7 +45,7 @@ Three rules keep it a monolith rather than a pile of crates:
 
 | Rule | What it means in code |
 |---|---|
-| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the four edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`). Any module may call core; core **never** calls a module. |
+| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the five edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`). Any module may call core; core **never** calls a module. |
 | **Core membership is narrow** | Something is in `roomler-core` only if at least two modules need it **and** it is identity, tenancy or infrastructure. Everything else belongs to exactly one module. |
 | **Inverse flows are hooks** | When core must reach "up" (a tenant is archived, an agent is removed), it invokes a registry of hooks in a fixed order — see §6. |
 
@@ -67,7 +68,7 @@ inside one (FR-24, FR-69 AC10).
 | RC session routes, `rc:*` controller dispatch + authz + consent-mode gate, the cross-pod RC relay, `/turn/credentials`, `/relay/regions` | **remote** | the session state machine stays in fleet's Hub; the controller path is a host → module **call**, not a `ws` namespace |
 | overlay engine (IPAM, netmaps, leases, L3 ACL, relay grants), the org relay mint, the DERP ACL cache + `/derp` upgrade + cluster convergence, tunnel clients + policies, peer relays, Roomler SSH, the ephemeral reaper | **network** | `Module::indexes_for(multi_block)` is born here — `overlay_blocks` has two schemas |
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
-| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect | **hive** (FR-90) | built ON fleet; the ONLY module whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`), so `switched_off` lists it until an operator turns it on; leads `HOOK_ORDER` as a session holder |
+| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; the ONLY module whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`), so `switched_off` lists it until an operator turns it on; leads `HOOK_ORDER` as a session holder |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -105,7 +106,8 @@ What the host drives, and in which order — each of these is a rule paid for in
   is initialised before its dependant by construction, and a module that needs a *live object*
   of another (remote needs fleet's Hub — one registry, or it would dispatch into an empty one)
   receives that module's state as `Deps`. A stateless dependency (a DAO over `core.db`, a pure
-  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards.
+  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards and hive with
+  chat's `BoundChat`.
 - **`WsHandler::closed(ctx)`** is called by the host for every handler of the socket's role after
   its own cleanup and before it logs the disconnect; a module holding per-connection state
   (conference: transports + the call session) releases it there — never by watching the registry.
@@ -343,7 +345,7 @@ sequenceDiagram
     participant N as network (lease holder)
     participant F as fleet (record owner)
     O->>C: agent_removed(agent)
-    C->>H: FleetLifecycle — end its agent sessions, rc:hive.stop while the socket is still there
+    C->>H: FleetLifecycle — end its agent sessions (an end note in each room), rc:hive.stop while the socket is still there
     C->>R: FleetLifecycle — end RC sessions
     C->>N: FleetLifecycle — release the overlay lease (tombstone, pool the host, netmap_delta removes)
     C->>F: FleetLifecycle — delete the row, kick the socket
@@ -361,6 +363,8 @@ Two more shapes the registry carries:
 - **A member removal** (FR-90) is one too: the remove-member route runs `core.hooks.member_removed`
   BEFORE the membership row goes — hive ends the member's agent sessions — so a failing holder
   refuses the removal instead of leaving sessions running for someone a retry would find gone.
+  A device that was away when its session ended is told on its next report of that session —
+  the replay it sends on every connection — because nothing is left pending for reconcile.
 
 ---
 
