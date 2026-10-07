@@ -164,4 +164,5 @@ authoritative.
 | [overlay-session-proof.md](overlay-session-proof.md) | In flight — moving the network plane out of the Windows session (`netd`, flag-off scaffold) |
 | [overlay-warm-relay.md](overlay-warm-relay.md) | Shipping — a UDP relay leg that survives the corporate VPN (C4) |
 | [overlay-symmetric-punch.md](overlay-symmetric-punch.md) | Design — symmetric-NAT-aware punch completion via observed-source promotion |
+| [roomler-hive-design.md](roomler-hive-design.md) | Design — FR-90, agent sessions on the org's own machines: a replicaset that keeps transcripts off the server, chat as the surface, promotion and teleport, the vault, knowhow and a shared brain |
 | [moq-remote-desktop-evaluation.md](moq-remote-desktop-evaluation.md) | Deferred — Media-over-QUIC evaluated for the remote desktop; revisit criteria inside |
