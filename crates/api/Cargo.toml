@@ -45,9 +45,10 @@ fleet = ["dep:roomler-ai-mod-fleet"]
 remote = ["dep:roomler-ai-mod-remote", "fleet"]
 network = ["dep:roomler-ai-mod-network", "fleet"]
 # FR-90 — agent sessions, built ON `fleet` (a session's frames ride the agent
-# socket). In `profile-full` only, and its runtime switch is the one that
-# defaults OFF: `[modules] hive = true` turns it on.
-hive = ["dep:roomler-ai-mod-hive", "fleet"]
+# socket) and ON `chat` (a session is a room; its turns are messages in it).
+# In `profile-full` only, and its runtime switch is the one that defaults OFF:
+# `[modules] hive = true` turns it on.
+hive = ["dep:roomler-ai-mod-hive", "fleet", "chat"]
 
 
 [dependencies]

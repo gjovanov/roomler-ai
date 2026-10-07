@@ -61,6 +61,13 @@ pub struct MessageResponse {
     pub room_id: String,
     pub author_id: String,
     pub author_name: String,
+    /// FR-90 — `user` | `bot` | …: a client renders an agent's turn stub
+    /// differently from a person's message, and must not offer to DM a bot.
+    pub author_type: &'static str,
+    /// FR-90 — what owns this message's meaning (a turn stub's session), if
+    /// anything. Chat never interprets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<roomler_ai_db::models::Binding>,
     pub content: String,
     pub message_type: String,
     pub is_pinned: bool,
@@ -522,15 +529,13 @@ pub async fn thread_replies(
     })))
 }
 
-fn to_response(
+pub(crate) fn to_response(
     m: roomler_ai_db::models::Message,
     names: &HashMap<ObjectId, String>,
     viewer_id: Option<ObjectId>,
 ) -> MessageResponse {
-    let author_name = names
-        .get(&m.author_id)
-        .cloned()
-        .unwrap_or_else(|| m.author_id.to_hex());
+    let author_name = m.author_label(names);
+    let author_type = m.author_type_str();
     let is_read = viewer_id.is_some_and(|uid| m.readby.iter().any(|r| r == &uid));
     let (reply_count, last_reply_at, last_reply_user_id) = match &m.thread_metadata {
         Some(tm) => (
@@ -548,6 +553,8 @@ fn to_response(
         room_id: m.room_id.to_hex(),
         author_id: m.author_id.to_hex(),
         author_name,
+        author_type,
+        binding: m.binding,
         content: m.content,
         message_type: format!("{:?}", m.message_type),
         is_pinned: m.is_pinned,

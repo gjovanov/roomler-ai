@@ -141,6 +141,32 @@ impl HiveRunState {
     }
 }
 
+/// How a turn stands, as its device reports it in `rc:hive.turn`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveTurnStatus {
+    /// A prompt went in; the turn is under way.
+    Running,
+    /// The turn finished.
+    Ok,
+    /// The turn finished with an error (the harness's own `is_error`).
+    Error,
+    /// The harness stopped mid-turn — a stop, a crash, a daemon restart.
+    Interrupted,
+}
+
+impl HiveTurnStatus {
+    /// The spelling on the wire. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// Lenient decoder for `rc:hive.start_ack`'s `refused`. Only an absent or
 /// `null` value means accepted; anything present that is not a known word —
 /// an unknown string, a number, an object from some future shape — is
@@ -184,9 +210,49 @@ where
     .ok())
 }
 
+/// Lenient decoder for `rc:hive.turn`'s `status`, as [`run_state_lenient`]:
+/// a status this build cannot name is `None`, and the stub keeps what it said.
+pub(crate) fn turn_status_lenient<'de, D>(de: D) -> Result<Option<HiveTurnStatus>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(None);
+    };
+    Ok(HiveTurnStatus::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_status_words_are_locked_and_unknown_ones_are_unnamed() {
+        for (s, w) in [
+            (HiveTurnStatus::Running, "running"),
+            (HiveTurnStatus::Ok, "ok"),
+            (HiveTurnStatus::Error, "error"),
+            (HiveTurnStatus::Interrupted, "interrupted"),
+        ] {
+            assert_eq!(s.as_str(), w);
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(w));
+        }
+        #[derive(Deserialize)]
+        struct T {
+            #[serde(default, deserialize_with = "turn_status_lenient")]
+            status: Option<HiveTurnStatus>,
+        }
+        let t = |j: &str| serde_json::from_str::<T>(j).unwrap().status;
+        assert_eq!(t(r#"{"status":"ok"}"#), Some(HiveTurnStatus::Ok));
+        assert_eq!(t(r#"{"status":"paused"}"#), None);
+        assert_eq!(t("{}"), None);
+    }
 
     /// WIRE LOCK — what a device sends and what the record stores. Spelled
     /// out literally so a rename has to be a deliberate edit here.

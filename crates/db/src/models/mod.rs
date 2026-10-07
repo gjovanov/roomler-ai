@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 pub mod background_task;
+pub mod binding;
 pub mod custom_emoji;
 pub mod file;
 pub mod invite;
@@ -18,6 +19,7 @@ pub mod tenant_member;
 pub mod user;
 
 pub use background_task::*;
+pub use binding::*;
 pub use custom_emoji::*;
 pub use file::*;
 pub use invite::*;

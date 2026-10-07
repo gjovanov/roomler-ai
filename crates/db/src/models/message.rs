@@ -16,6 +16,15 @@ pub struct Message {
     pub author_id: ObjectId,
     #[serde(default)]
     pub author_type: AuthorType,
+    /// FR-90 — the name to show for an author that is not a user (an agent
+    /// session's turns: "Claude · mars"). `None` for a user, whose name comes
+    /// from `users` as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_display: Option<String>,
+    /// FR-90 — the module that owns this message's meaning, if any (a turn's
+    /// stub). Chat stores it and never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<super::Binding>,
     pub content: String,
     #[serde(default)]
     pub content_type: ContentType,
@@ -134,4 +143,36 @@ pub struct ReactionSummary {
 
 impl Message {
     pub const COLLECTION: &'static str = "messages";
+
+    /// FR-90 — the name a NON-user author carries (an agent session's turns),
+    /// if any. A user's message never answers here, so no one can name
+    /// themselves by setting the field.
+    pub fn agent_display(&self) -> Option<&str> {
+        match self.author_type {
+            AuthorType::User => None,
+            _ => self.author_display.as_deref(),
+        }
+    }
+
+    /// The name to show for this message's author: a non-user author's own
+    /// name, else the user's display name from `names`, else the raw id.
+    pub fn author_label(&self, names: &std::collections::HashMap<ObjectId, String>) -> String {
+        if let Some(name) = self.agent_display() {
+            return name.to_string();
+        }
+        names
+            .get(&self.author_id)
+            .cloned()
+            .unwrap_or_else(|| self.author_id.to_hex())
+    }
+
+    /// The wire spelling of [`Self::author_type`] (`user` | `bot` | …).
+    pub fn author_type_str(&self) -> &'static str {
+        match self.author_type {
+            AuthorType::User => "user",
+            AuthorType::Bot => "bot",
+            AuthorType::Webhook => "webhook",
+            AuthorType::System => "system",
+        }
+    }
 }
