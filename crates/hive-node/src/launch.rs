@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! The harness command line, environment and settings for one session.
+//!
+//! Pure data: the daemon turns a [`LaunchSpec`] into a process with the one
+//! privilege path it already has (`apply_run_as`), the folder this spec names
+//! as the working directory, and a clean environment.
+//!
+//! Three Claude Code facts shape it (design §4.3):
+//!
+//! - With `CLAUDE_CONFIG_DIR` **and** `CLAUDE_CODE_PROJECT_DIR_NAME` set
+//!   (≥ 2.1.234), a session's transcript, sub-agent transcripts, file history
+//!   and auto-memory live under one pinned `projects/<name>/` whatever the
+//!   working directory is — so moving a session to another folder never
+//!   rewrites a cwd-derived project key.
+//! - A resume restores neither `--settings` nor `--mcp-config`, so the launch
+//!   is rebuilt in full every time, never "just add `--resume`".
+//! - `--settings` outranks every settings file a repository or the model can
+//!   write (only managed settings beat it), which is why the daemon writes it
+//!   into a directory the session's account can read but not change.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+/// Everything needed to start (or resume) one session's harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSpec {
+    /// The Hive session id — a UUID, because Claude Code's `--session-id`
+    /// requires one, and the harness session id is the Hive session id.
+    pub session: String,
+    /// Absolute path to the harness binary, resolved as the session's account.
+    pub harness: PathBuf,
+    /// The working directory, already confined to `hive_roots`.
+    pub folder: PathBuf,
+    /// The session's state directory; Claude Code's config dir lives in it.
+    pub state_dir: PathBuf,
+    /// The daemon-written `--settings` file.
+    pub settings: PathBuf,
+    /// The daemon-written `--mcp-config` file (the `roomler` toolbelt), if any.
+    pub mcp_config: Option<PathBuf>,
+    /// The loopback LLM sidecar for this session, if routed through one.
+    pub sidecar_base_url: Option<String>,
+    /// Resume the existing transcript (`--resume`) rather than start one
+    /// (`--session-id`).
+    pub resume: bool,
+    /// The MCP tool that answers permission prompts.
+    pub permission_prompt_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchError {
+    #[error("session id {0:?} is not a UUID")]
+    SessionId(String),
+    #[error("{what} must be an absolute path, got {path}")]
+    NotAbsolute { what: &'static str, path: PathBuf },
+}
+
+impl LaunchSpec {
+    /// `CLAUDE_CONFIG_DIR` for this session.
+    pub fn config_dir(&self) -> PathBuf {
+        self.state_dir.join("claude")
+    }
+
+    /// `CLAUDE_CODE_PROJECT_DIR_NAME` — the pinned project directory name.
+    pub fn project_dir_name(&self) -> String {
+        format!("hive-{}", self.session)
+    }
+
+    /// Refuse a spec the harness or the daemon would misread.
+    pub fn validate(&self) -> Result<(), LaunchError> {
+        if uuid::Uuid::parse_str(&self.session).is_err() {
+            return Err(LaunchError::SessionId(self.session.clone()));
+        }
+        for (what, path) in [
+            ("harness", &self.harness),
+            ("folder", &self.folder),
+            ("state_dir", &self.state_dir),
+            ("settings", &self.settings),
+        ] {
+            absolute(what, path)?;
+        }
+        if let Some(p) = &self.mcp_config {
+            absolute("mcp_config", p)?;
+        }
+        Ok(())
+    }
+
+    /// The argument vector, without the program.
+    ///
+    /// Headless, stream-json both ways: the daemon writes prompts to stdin and
+    /// reads events from stdout. No secret ever appears here — the model
+    /// credential comes from `apiKeyHelper` in the settings file.
+    pub fn args(&self) -> Vec<OsString> {
+        let mut a: Vec<OsString> = [
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        a.push(
+            if self.resume {
+                "--resume"
+            } else {
+                "--session-id"
+            }
+            .into(),
+        );
+        a.push(self.session.clone().into());
+        a.push("--settings".into());
+        a.push(self.settings.clone().into_os_string());
+        if let Some(p) = &self.mcp_config {
+            a.push("--mcp-config".into());
+            a.push(p.clone().into_os_string());
+        }
+        if let Some(t) = &self.permission_prompt_tool {
+            a.push("--permission-prompt-tool".into());
+            a.push(t.clone().into());
+        }
+        a
+    }
+
+    /// The variables Hive sets, layered over the account's base environment
+    /// ([`unix_base_env`] on Unix; the user's own environment block on Windows).
+    pub fn env_overrides(&self) -> Vec<(OsString, OsString)> {
+        let mut e: Vec<(OsString, OsString)> = vec![
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                self.config_dir().into_os_string(),
+            ),
+            (
+                "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
+                self.project_dir_name().into(),
+            ),
+            // Strip credentials from every subprocess the harness starts, not
+            // just sandboxed Bash.
+            ("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "1".into()),
+            // Headless: nothing reads a terminal.
+            ("TERM".into(), "dumb".into()),
+        ];
+        if let Some(url) = &self.sidecar_base_url {
+            e.push(("ANTHROPIC_BASE_URL".into(), url.clone().into()));
+        }
+        e
+    }
+}
+
+fn absolute(what: &'static str, path: &Path) -> Result<(), LaunchError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(LaunchError::NotAbsolute {
+            what,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// A clean base environment for a Unix account the daemon dropped to. The
+/// daemon's own environment (root's, with `ROOMLERD_*` knobs) must not leak into
+/// a user's session, so the caller clears it and applies this, then
+/// [`LaunchSpec::env_overrides`].
+///
+/// `path` is the account's own `PATH` as its login shell reports it, so the
+/// agent's commands find the user's toolchains; `None` falls back to the
+/// system default.
+pub fn unix_base_env(home: &Path, user: &str, path: Option<&str>) -> Vec<(OsString, OsString)> {
+    vec![
+        ("HOME".into(), home.as_os_str().to_owned()),
+        ("USER".into(), user.into()),
+        ("LOGNAME".into(), user.into()),
+        (
+            "PATH".into(),
+            path.unwrap_or("/usr/local/bin:/usr/bin:/bin").into(),
+        ),
+        ("LANG".into(), "C.UTF-8".into()),
+    ]
+}
+
+/// One prompt as a stream-json input line for the harness's stdin.
+pub fn user_input_line(text: &str) -> String {
+    json!({
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    })
+    .to_string()
+}
+
+/// What the daemon puts in a session's `--settings` file in P0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsSpec {
+    /// The command Claude Code runs to get the session's fence-bound token.
+    pub api_key_helper: String,
+    /// The session's memory snapshot directory (design §10.3).
+    pub auto_memory_directory: Option<PathBuf>,
+    /// The session's egress proxy, when the sandbox is on (Linux, macOS, WSL2).
+    pub sandbox_proxy: Option<SandboxProxy>,
+    /// Paths the model's Read tool must not open, beyond the defaults.
+    pub extra_read_denies: Vec<String>,
+}
+
+/// Where the sandbox sends sandboxed commands' traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxProxy {
+    pub http_port: u16,
+    pub socks_port: u16,
+}
+
+impl SettingsSpec {
+    /// The settings document.
+    ///
+    /// `Read(/proc/**)` is denied by default because the Read tool runs inside
+    /// the harness process, so `/proc/self/environ` would hand the model
+    /// whatever the harness's environment holds.
+    pub fn to_json(&self) -> Value {
+        let mut deny: Vec<String> = vec!["Read(//proc/**)".to_string()];
+        deny.extend(self.extra_read_denies.iter().cloned());
+        let mut doc = json!({
+            "apiKeyHelper": self.api_key_helper,
+            "permissions": {"deny": deny},
+        });
+        if let Some(dir) = &self.auto_memory_directory {
+            doc["autoMemoryDirectory"] = json!(dir.to_string_lossy());
+        }
+        if let Some(p) = self.sandbox_proxy {
+            doc["sandbox"] = json!({
+                "enabled": true,
+                "network": {"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port},
+            });
+        }
+        doc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\hive")
+        } else {
+            PathBuf::from("/var/lib/roomler/hive")
+        }
+    }
+
+    fn spec(resume: bool) -> LaunchSpec {
+        LaunchSpec {
+            session: "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f70".into(),
+            harness: root().join("bin").join("claude"),
+            folder: root().join("src"),
+            state_dir: root().join("s"),
+            settings: root().join("settings.json"),
+            mcp_config: Some(root().join("mcp.json")),
+            sidecar_base_url: Some("http://127.0.0.1:47000/s/6f1c".into()),
+            resume,
+            permission_prompt_tool: Some("mcp__roomler__approve".into()),
+        }
+    }
+
+    fn strings(v: &[OsString]) -> Vec<String> {
+        v.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn a_first_start_pins_the_session_id_and_a_resume_resumes_it() {
+        let first = strings(&spec(false).args());
+        let at = first.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(first[at + 1], spec(false).session);
+        assert!(!first.contains(&"--resume".to_string()));
+
+        let again = strings(&spec(true).args());
+        let at = again.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(again[at + 1], spec(true).session);
+        assert!(!again.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn every_launch_carries_settings_and_toolbelt_because_resume_restores_neither() {
+        for resume in [false, true] {
+            let a = strings(&spec(resume).args());
+            assert!(a.contains(&"--settings".to_string()), "{a:?}");
+            assert!(a.contains(&"--mcp-config".to_string()), "{a:?}");
+            assert!(a.contains(&"--permission-prompt-tool".to_string()), "{a:?}");
+            assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]));
+            assert!(
+                a.windows(2)
+                    .any(|w| w == ["--output-format", "stream-json"])
+            );
+        }
+    }
+
+    #[test]
+    fn the_config_dir_and_project_name_are_pinned_per_session() {
+        let s = spec(false);
+        let env = s.env_overrides();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            get("CLAUDE_CONFIG_DIR"),
+            Some(s.state_dir.join("claude").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            get("CLAUDE_CODE_PROJECT_DIR_NAME"),
+            Some(format!("hive-{}", s.session))
+        );
+        assert_eq!(
+            get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            get("ANTHROPIC_BASE_URL").as_deref(),
+            Some("http://127.0.0.1:47000/s/6f1c")
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_non_uuid_session_and_relative_paths() {
+        assert_eq!(spec(false).validate(), Ok(()));
+        let mut s = spec(false);
+        s.session = "../../etc".into();
+        assert!(matches!(s.validate(), Err(LaunchError::SessionId(_))));
+        let mut s = spec(false);
+        s.folder = PathBuf::from("relative/src");
+        assert!(matches!(
+            s.validate(),
+            Err(LaunchError::NotAbsolute { what: "folder", .. })
+        ));
+    }
+
+    #[test]
+    fn the_unix_base_env_names_the_account_and_never_the_daemons_variables() {
+        let env = unix_base_env(Path::new("/home/alice"), "alice", None);
+        let names: Vec<String> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["HOME", "USER", "LOGNAME", "PATH", "LANG"]);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "PATH" && v == "/usr/local/bin:/usr/bin:/bin")
+        );
+    }
+
+    #[test]
+    fn a_prompt_becomes_one_stream_json_user_line() {
+        let line = user_input_line("run \"cargo test\"\nplease");
+        assert!(!line.contains('\n'), "one line on stdin: {line}");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(
+            v["message"]["content"][0]["text"],
+            "run \"cargo test\"\nplease"
+        );
+    }
+
+    #[test]
+    fn settings_deny_proc_and_carry_the_helper_memory_dir_and_sandbox() {
+        let doc = SettingsSpec {
+            api_key_helper: "roomler hive token --session 6f1c".into(),
+            auto_memory_directory: Some(root().join("memory")),
+            sandbox_proxy: Some(SandboxProxy {
+                http_port: 47001,
+                socks_port: 47002,
+            }),
+            extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
+        }
+        .to_json();
+        assert_eq!(doc["apiKeyHelper"], "roomler hive token --session 6f1c");
+        let deny = doc["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.iter().any(|d| d == "Read(//proc/**)"));
+        assert_eq!(deny.len(), 2);
+        assert_eq!(doc["sandbox"]["network"]["socksProxyPort"], 47002);
+        assert!(doc["autoMemoryDirectory"].is_string());
+        // No sandbox block at all where there is no sandbox (native Windows).
+        let bare = SettingsSpec {
+            api_key_helper: "h".into(),
+            auto_memory_directory: None,
+            sandbox_proxy: None,
+            extra_read_denies: vec![],
+        }
+        .to_json();
+        assert!(bare.get("sandbox").is_none());
+    }
+}
