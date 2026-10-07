@@ -75,6 +75,7 @@ property these gates exist for.
 | `ssh_host_key` | minted | Generated on first SSH-enabled start |
 | `forward_acl` | empty | SSH port-forward destinations. **Empty means nowhere** |
 | `ssh_activity_log` | off | Whether this machine reports what its SSH sessions did |
+| `ssh_exec_streaming` | on | Stream a one-shot command's output as it is produced, with no 1 MiB ceiling and no time limit; the command ends when the SSH channel does. Off restores the buffered path. Restart required |
 | `hive_enabled` | off | Run AI agent sessions here when an org member starts one (builds with the `hive` feature; Linux) |
 | `hive_accounts` | empty | Which local account each member's sessions run as, `{"<user id or email>": "<account>"}`. **Empty means nobody**; never root |
 | `hive_roots` | empty | Folders sessions may run in, checked on the resolved path. **Empty means nowhere** |

@@ -135,6 +135,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_max_sessions: None,
         hive_harness: None,
         hive_api_key_helper: None,
+        // FR-89: on, like every fresh install; `false` is the kill switch
+        // an owner reaches for, never a starting point.
+        ssh_exec_streaming: true,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
         overlay_direct: None,
