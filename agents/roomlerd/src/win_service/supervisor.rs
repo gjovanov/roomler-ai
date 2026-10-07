@@ -2068,6 +2068,42 @@ pub fn read_pipe_to_end(
     (out, truncated)
 }
 
+/// Drain a pipe to EOF, handing each read to `deliver` as it arrives — the
+/// streamed twin of [`read_pipe_to_end`] (FR-89, Roomler SSH's `console_user`
+/// commands). Blocking, like its twin, and with no ceiling: what bounds the
+/// output is the consumer, since `deliver` is expected to block on a full
+/// channel, which parks this thread, fills the pipe and blocks the child on
+/// `WriteFile`.
+///
+/// Once `deliver` returns `false` (the consumer is gone) the rest is read and
+/// discarded, so the child can still finish — or be killed — instead of
+/// blocking forever on a pipe nobody drains.
+pub fn read_pipe_streamed(pipe: &OwnedHandle, mut deliver: impl FnMut(Vec<u8>) -> bool) {
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut delivering = true;
+    loop {
+        let mut read: u32 = 0;
+        // SAFETY: `pipe` is a live read handle we own; `buf`/`read` are valid
+        // out-params for the length passed.
+        let ok = unsafe {
+            ReadFile(
+                pipe.raw(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            // ERROR_BROKEN_PIPE is the normal end: the last writer closed.
+            break;
+        }
+        if delivering && !deliver(buf[..read as usize].to_vec()) {
+            delivering = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,6 +58,58 @@ use roomler_ai_remote_control::models::exec_limits;
 /// its commands keep reading NUL / `/dev/null` exactly as before.
 pub type StdinFeed = tokio::sync::mpsc::Receiver<Vec<u8>>;
 
+// ─── Streaming (FR-89) ──────────────────────────────────────────────────────
+//
+// Roomler SSH's `ssh <node> 'cmd'` wants a command's output AS IT IS PRODUCED,
+// with no ceiling: `cat bigfile`, `tar c`, `journalctl -f`. Fleet RPC wants
+// the opposite — one bounded answer it can persist. Both go through the same
+// spawn, identity model, concurrency cap, redaction and tree kill; only the
+// shape of the output differs, which is why the output mode is ONE enum on
+// the shared spawn path rather than a second engine.
+
+/// Which of a command's two output streams a chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutStream {
+    Stdout,
+    Stderr,
+}
+
+/// One piece of a streamed command's output, redacted. Chunks of ONE stream
+/// arrive in the order the command wrote them; the two streams interleave in
+/// the order they were read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub stream: OutStream,
+    pub bytes: Vec<u8>,
+}
+
+/// Where a streamed run's output goes. BOUNDED on purpose: a consumer that
+/// stops taking chunks stops the command — the readers stop reading, the OS
+/// pipe fills, the child blocks on `write` — instead of growing the daemon's
+/// memory. See [`ExecEngine::run_streamed`].
+pub type ChunkSink = tokio::sync::mpsc::Sender<Chunk>;
+
+/// What a streamed run reports once the command is gone. Its output went to
+/// the sink; nothing of it is retained here.
+#[derive(Debug, Clone, Default)]
+pub struct StreamedOutcome {
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    /// Bytes handed to the sink, both streams, after redaction.
+    pub bytes: u64,
+    /// Set when the command never ran, or was cancelled.
+    pub error: Option<String>,
+}
+
+impl StreamedOutcome {
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Default::default()
+        }
+    }
+}
+
 /// One execution request, already clamped by the server and re-clamped here.
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -156,14 +208,18 @@ impl Redactor {
     }
 
     pub fn apply(&self, input: &str) -> String {
+        mask_patterns(&self.mask_literals(input))
+    }
+
+    /// The literal pass alone: every registered secret, replaced.
+    fn mask_literals(&self, input: &str) -> String {
         let mut out = input.to_string();
         for lit in &self.literals {
             if out.contains(lit.as_str()) {
                 out = out.replace(lit.as_str(), MASK);
             }
         }
-        let out = mask_bearer(&out);
-        mask_jwt_shaped(&out)
+        out
     }
 
     /// [`Self::apply`] over raw output: each valid UTF-8 run is redacted as
@@ -171,16 +227,236 @@ impl Redactor {
     /// exactly as `apply` masks it and binary output stays byte-exact. A
     /// secret is ASCII, so it can never straddle a byte that is not UTF-8.
     pub fn apply_bytes(&self, input: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len());
-        for chunk in input.utf8_chunks() {
-            let valid = chunk.valid();
-            if !valid.is_empty() {
-                out.extend_from_slice(self.apply(valid).as_bytes());
-            }
-            out.extend_from_slice(chunk.invalid());
-        }
-        out
+        map_utf8_runs(input, |s| self.apply(s))
     }
+}
+
+/// The two pattern masks, in the order [`Redactor::apply`] runs them.
+fn mask_patterns(input: &str) -> String {
+    mask_jwt_shaped(&mask_bearer(input))
+}
+
+/// [`mask_patterns`] over raw bytes — see [`Redactor::apply_bytes`].
+fn mask_patterns_bytes(input: &[u8]) -> Vec<u8> {
+    map_utf8_runs(input, mask_patterns)
+}
+
+/// `f` over each valid UTF-8 run of `input`; every other byte passes through
+/// untouched, in place.
+fn map_utf8_runs(input: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for chunk in input.utf8_chunks() {
+        let valid = chunk.valid();
+        if !valid.is_empty() {
+            out.extend_from_slice(f(valid).as_bytes());
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    out
+}
+
+/// [`Redactor`] over a STREAM (FR-89): the same three masks, applied to
+/// output that arrives in pipe-sized pieces, without ever letting a secret
+/// slip through the gap between two of them.
+///
+/// # The rule
+///
+/// Every masked shape is whitespace-free — a registered literal is an agent
+/// token, `mask_bearer` ends a token at whitespace, a JWT is base64url — so
+/// bytes are **settled only at a word boundary**: the position right after
+/// the last ASCII whitespace byte. The word in progress stays in the carry
+/// until something ends it, and a token is therefore always masked whole.
+/// Three refinements, each closing a hole a plain word-boundary rule leaves:
+///
+/// * the **literal pass runs over everything visible** (carry + new bytes)
+///   before the cut, so a literal that straddles the previous cut is masked
+///   the moment it is complete;
+/// * a settled prefix ending in `bearer ` is **pulled back** to the word
+///   boundary before it — settled alone, `Bearer ` leaves its token to the
+///   next chunk, where `mask_bearer` sees no prefix and masks nothing;
+/// * a literal that itself contains whitespace (none is registered today)
+///   adds a hold-back of its own length.
+///
+/// # The bounds
+///
+/// A whitespace-free run longer than [`CARRY_CAP`] (`base64 -w0`, minified
+/// JSON, a binary with few whitespace bytes) would grow the carry without
+/// bound, so it is **force-settled**: the pattern pass runs over the whole
+/// buffer first (a fully visible token straddling the cut is masked anyway),
+/// then all but the last max([`FORCED_HOLD`], longest literal − 1) bytes
+/// are emitted. A literal can never leak at a forced cut; a pattern token
+/// leaks only if more than `FORCED_HOLD` of it is visible and it is still
+/// unfinished.
+///
+/// A prompt with no trailing newline (`Continue? [y/N]`) would otherwise sit
+/// in the carry until EOF, so the owner flushes a carry that has waited
+/// ([`idle_flush`](Self::idle_flush)) — holding back only a tail that is a
+/// proper prefix of a literal, and a `bearer ` context whose token is in
+/// progress. A pattern token is then split only if the WRITER pauses
+/// mid-token, which a secret written with one `write()` never does.
+///
+/// Binary passes through byte-exact: the masks run on valid-UTF-8 runs only
+/// ([`map_utf8_runs`]), a multi-byte character split by a chunk boundary is
+/// an invalid run on both sides, and no cut lands inside one.
+pub struct StreamRedactor {
+    redactor: Redactor,
+    /// Bytes not yet settled: the word in progress (plus whatever a
+    /// pull-back kept), already literal-masked.
+    carry: Vec<u8>,
+    /// Longest registered literal, for the hold-back at a forced cut.
+    longest_literal: usize,
+    /// Hold-back for literals that contain whitespace: such a literal could
+    /// straddle a word boundary. 0 when none is registered.
+    whitespace_literal_hold: usize,
+    /// The carry was already offered to an idle flush and nothing more can
+    /// settle without new bytes — the owner need not time it again.
+    idle_settled: bool,
+}
+
+/// A whitespace-free run longer than this is settled in pieces.
+const CARRY_CAP: usize = 64 * 1024;
+/// How much of such a run stays unsettled at a forced cut, so a token that
+/// straddles the cut is still seen whole (unless it is longer than this).
+const FORCED_HOLD: usize = 8 * 1024;
+/// The prefix `mask_bearer` keys on, for the pull-back.
+const BEARER: &[u8] = b"bearer ";
+
+impl StreamRedactor {
+    pub fn new(redactor: &Redactor) -> Self {
+        let longest_literal = redactor.literals.iter().map(|l| l.len()).max().unwrap_or(0);
+        let whitespace_literal_hold = redactor
+            .literals
+            .iter()
+            .filter(|l| l.bytes().any(|b| b.is_ascii_whitespace()))
+            .map(|l| l.len() - 1)
+            .max()
+            .unwrap_or(0);
+        Self {
+            redactor: redactor.clone(),
+            carry: Vec::new(),
+            longest_literal,
+            whitespace_literal_hold,
+            idle_settled: false,
+        }
+    }
+
+    /// Is something waiting for more bytes that an idle flush could release?
+    pub fn is_holding(&self) -> bool {
+        !self.carry.is_empty() && !self.idle_settled
+    }
+
+    /// Take the next piece of the stream; get back what can be emitted now.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        self.idle_settled = false;
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(bytes);
+        // Literals over everything visible: one that straddled the previous
+        // cut is complete now; one still arriving is wholly in the carry.
+        let mut buf = map_utf8_runs(&buf, |s| self.redactor.mask_literals(s));
+        let p = self.settle_point(&buf);
+        if buf.len() - p > CARRY_CAP {
+            return self.force_settle(buf);
+        }
+        self.carry = buf.split_off(p);
+        mask_patterns_bytes(&buf)
+    }
+
+    /// Flush a carry that has waited for more bytes long enough.
+    pub fn idle_flush(&mut self) -> Vec<u8> {
+        if self.carry.is_empty() {
+            return Vec::new();
+        }
+        self.idle_settled = true;
+        let mut buf = std::mem::take(&mut self.carry);
+        // A tail that is a proper prefix of a literal stays: the rest of the
+        // secret may be the very next thing written.
+        let mut p = buf.len() - longest_literal_prefix_suffix(&self.redactor.literals, &buf);
+        // A `bearer ` context whose token is in progress stays whole.
+        let word_start = word_boundary_at_or_before(&buf, buf.len());
+        if word_start >= BEARER.len()
+            && buf[word_start - BEARER.len()..word_start].eq_ignore_ascii_case(BEARER)
+        {
+            p = p.min(word_boundary_at_or_before(&buf, word_start - BEARER.len()));
+        }
+        p = char_boundary_at_or_before(&buf, p);
+        self.carry = buf.split_off(p);
+        mask_patterns_bytes(&buf)
+    }
+
+    /// End of stream: everything left, masked.
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.idle_settled = false;
+        let buf = std::mem::take(&mut self.carry);
+        self.redactor.apply_bytes(&buf)
+    }
+
+    /// The largest prefix of `buf` that can be emitted without cutting a
+    /// token: a word boundary, pulled back past a trailing `bearer ` and
+    /// past the hold-back for whitespace-bearing literals.
+    fn settle_point(&self, buf: &[u8]) -> usize {
+        let mut p = word_boundary_at_or_before(buf, buf.len());
+        if self.whitespace_literal_hold > 0 {
+            let limit = buf.len().saturating_sub(self.whitespace_literal_hold);
+            if p > limit {
+                p = word_boundary_at_or_before(buf, limit);
+            }
+        }
+        while p >= BEARER.len() && buf[p - BEARER.len()..p].eq_ignore_ascii_case(BEARER) {
+            p = word_boundary_at_or_before(buf, p - BEARER.len());
+        }
+        p
+    }
+
+    /// A whitespace-free run past [`CARRY_CAP`]: settle most of it.
+    fn force_settle(&mut self, buf: Vec<u8>) -> Vec<u8> {
+        // Patterns over everything visible, so a token straddling the cut is
+        // masked wherever it is complete; the carry comes back through this
+        // pass again later, which is harmless — `[redacted]` matches nothing.
+        let mut buf = mask_patterns_bytes(&buf);
+        let hold = FORCED_HOLD.max(self.longest_literal.saturating_sub(1));
+        let p = char_boundary_at_or_before(&buf, buf.len().saturating_sub(hold));
+        self.carry = buf.split_off(p);
+        buf
+    }
+}
+
+/// The largest word boundary — 0, or the position right after an ASCII
+/// whitespace byte — that is ≤ `at`.
+fn word_boundary_at_or_before(buf: &[u8], at: usize) -> usize {
+    buf[..at]
+        .iter()
+        .rposition(|b| b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+/// `at`, moved back off any UTF-8 continuation byte so a cut there never
+/// splits a character.
+fn char_boundary_at_or_before(buf: &[u8], mut at: usize) -> usize {
+    while at > 0 && at < buf.len() && (buf[at] & 0xC0) == 0x80 {
+        at -= 1;
+    }
+    at
+}
+
+/// Length of the longest suffix of `buf` that is a PROPER prefix of some
+/// literal — the part of a secret that may already have been written.
+fn longest_literal_prefix_suffix(literals: &[String], buf: &[u8]) -> usize {
+    let mut best = 0;
+    for lit in literals {
+        let lit = lit.as_bytes();
+        let max_k = lit.len().saturating_sub(1).min(buf.len());
+        for k in (best + 1..=max_k).rev() {
+            if buf.ends_with(&lit[..k]) {
+                best = k;
+                break;
+            }
+        }
+    }
+    best
 }
 
 /// Mask the token after a `Bearer ` / `bearer ` prefix, up to the next
@@ -984,9 +1260,18 @@ impl ExecEngine {
         );
 
         let started = std::time::Instant::now();
+        let cancel = async move {
+            let _ = cancel_rx.await;
+        };
         let mut outcome = self
             .spawn_and_wait(
-                &req, program, &args, timeout_ms, max_output, cancel_rx, stdin,
+                &req,
+                program,
+                &args,
+                Some(timeout_ms),
+                Output::Buffered { max_output },
+                cancel,
+                stdin,
             )
             .await;
         outcome.duration_ms = started.elapsed().as_millis() as u64;
@@ -1020,17 +1305,126 @@ impl ExecEngine {
         outcome
     }
 
-    // 8 params: the resolved shell, the three bounds, the cancel and the stdin
-    // feed are each decided by `run_fed`; a struct would only rename them.
+    /// FR-89 — [`run_fed`](Self::run_fed)'s streaming twin, for Roomler SSH:
+    /// the command's output goes to `sink` as it is read, redacted on the
+    /// way, with **no ceiling and no wall clock**. `req.timeout_ms` and
+    /// `req.max_output_bytes` are ignored; what bounds the run is the caller:
+    /// `abort` (the SSH channel closing, the client disconnecting) or
+    /// [`cancel`](Self::cancel), either of which kills the process tree. A
+    /// sink that is not drained does not end the run either — it stops the
+    /// command, which blocks on a full pipe at no cost to the daemon.
+    ///
+    /// Everything else is `run_fed`'s: the same shell resolution, the same
+    /// `RunAs` refusals, the same per-device permit (refuse, never queue), the
+    /// same redaction — now over the stream — and the same tree kill. Fleet
+    /// RPC never calls this; its wire is one bounded answer.
+    pub async fn run_streamed(
+        &self,
+        req: ExecRequest,
+        redactor: &Redactor,
+        stdin: Option<StdinFeed>,
+        sink: ChunkSink,
+        abort: tokio_util::sync::CancellationToken,
+    ) -> StreamedOutcome {
+        // FR-55 — as in `run_fed`: held for the whole run, dropped on every
+        // return below.
+        let _awake = crate::power::ActivityGuard::new(crate::power::shared_activity());
+
+        let (program, args) = match resolve_shell(&req.shell) {
+            Ok(v) => v,
+            Err(e) => return StreamedOutcome::failed(e),
+        };
+        // The caller went away while this was queued (an SSH channel closed
+        // during the consent wait): a command nobody is reading must not
+        // start, let alone run to completion as SYSTEM/root.
+        if abort.is_cancelled() {
+            return StreamedOutcome::failed("the caller went away before the command started");
+        }
+        let Ok(_permit) = self.sem.clone().try_acquire_owned() else {
+            return StreamedOutcome::failed(format!(
+                "device is already running {} commands (the per-device limit)",
+                exec_limits::MAX_CONCURRENT_PER_AGENT
+            ));
+        };
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.inflight
+            .lock()
+            .await
+            .insert(req.request_id.clone(), cancel_tx);
+
+        info!(
+            request_id = %req.request_id,
+            caller = %req.caller,
+            shell = %req.shell,
+            "exec: streaming command"
+        );
+
+        // Readers → raw (bounded) → the redaction stage → sink (bounded, the
+        // caller's). Each bound is small, so a stalled consumer stops the
+        // readers within a few chunks and the child blocks on its pipe.
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<Chunk>(RAW_QUEUE);
+        let stage = tokio::spawn(redact_stage(raw_rx, redactor.clone(), sink));
+        let cancel = async move {
+            tokio::select! {
+                _ = cancel_rx => {}
+                _ = abort.cancelled() => {}
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = self
+            .spawn_and_wait(
+                &req,
+                program,
+                &args,
+                None,
+                Output::Streamed { raw: raw_tx },
+                cancel,
+                stdin,
+            )
+            .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        // Every reader has returned (`spawn_and_wait` joins them) and the last
+        // raw sender went with the output mode, so the stage now sees EOF,
+        // flushes what it held and drops the sink. Awaited BEFORE the outcome
+        // is reported: the consumer must see the last chunk before the exit
+        // status.
+        let bytes = stage.await.unwrap_or(0);
+
+        self.inflight.lock().await.remove(&req.request_id);
+
+        // The error string leaves the host — see `run_fed`.
+        let error = outcome.error.map(|e| redactor.apply(&e));
+
+        info!(
+            request_id = %req.request_id,
+            exit_code = ?outcome.exit_code,
+            duration_ms,
+            bytes,
+            error = ?error,
+            "exec: streamed command finished"
+        );
+        StreamedOutcome {
+            exit_code: outcome.exit_code,
+            duration_ms,
+            bytes,
+            error,
+        }
+    }
+
+    // 8 params: the resolved shell, the bounds, the output mode, the cancel
+    // and the stdin feed are each decided by the caller; a struct would only
+    // rename them.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_and_wait(
         &self,
         req: &ExecRequest,
         program: &str,
         args: &[&str],
-        timeout_ms: u64,
-        max_output: u64,
-        cancel_rx: oneshot::Receiver<()>,
+        timeout_ms: Option<u64>,
+        output: Output,
+        cancel: impl std::future::Future<Output = ()>,
         stdin: Option<StdinFeed>,
     ) -> ExecOutcome {
         #[cfg(windows)]
@@ -1052,8 +1446,8 @@ impl ExecEngine {
                 &command,
                 req.cwd.clone(),
                 timeout_ms,
-                max_output,
-                cancel_rx,
+                output,
+                cancel,
                 stdin,
             )
             .await;
@@ -1115,16 +1509,35 @@ impl ExecEngine {
 
         let feeder = stdin.map(|feed| tokio::spawn(feed_child_stdin(child.stdin.take(), feed)));
 
-        // One shared budget across both streams — "combined ceiling" is what
-        // the wire promises, so per-stream caps would silently double it.
-        let budget = Arc::new(AtomicU64::new(max_output));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let out_task = tokio::spawn(read_capped(stdout, budget.clone()));
-        let err_task = tokio::spawn(read_capped(stderr, budget.clone()));
+        let (out_task, err_task) = match output {
+            // One shared budget across both streams — "combined ceiling" is
+            // what the wire promises, so per-stream caps would silently
+            // double it.
+            Output::Buffered { max_output } => {
+                let budget = Arc::new(AtomicU64::new(max_output));
+                (
+                    tokio::spawn(read_capped(stdout, budget.clone())),
+                    tokio::spawn(read_capped(stderr, budget)),
+                )
+            }
+            Output::Streamed { raw } => (
+                tokio::spawn(read_streamed(stdout, OutStream::Stdout, raw.clone())),
+                tokio::spawn(read_streamed(stderr, OutStream::Stderr, raw)),
+            ),
+        };
 
-        let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        // No wall clock (`None`) is an arm that never fires, not a long one:
+        // a streamed command's lifetime is its caller's.
+        let timeout = async move {
+            match timeout_ms {
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(timeout);
+        tokio::pin!(cancel);
 
         let (status, error) = tokio::select! {
             res = child.wait() => match res {
@@ -1133,9 +1546,9 @@ impl ExecEngine {
             },
             _ = &mut timeout => {
                 kill_tree(&mut child, pid).await;
-                (None, Some(format!("timed out after {timeout_ms}ms")))
+                (None, Some(format!("timed out after {}ms", timeout_ms.unwrap_or_default())))
             }
-            _ = cancel_rx => {
+            _ = &mut cancel => {
                 kill_tree(&mut child, pid).await;
                 (None, Some("cancelled by the caller".to_string()))
             }
@@ -1182,6 +1595,138 @@ async fn feed_child_stdin(sin: Option<tokio::process::ChildStdin>, mut feed: Std
     }
     let _ = sin.flush().await;
     drop(sin);
+}
+
+/// How a run's output leaves the spawn path.
+enum Output {
+    /// Fleet RPC: collect both streams up to ONE combined ceiling, then hand
+    /// them back in the outcome.
+    Buffered { max_output: u64 },
+    /// Roomler SSH (FR-89): hand each read to the redaction stage as it
+    /// arrives; the outcome carries no bytes.
+    Streamed {
+        raw: tokio::sync::mpsc::Sender<Chunk>,
+    },
+}
+
+/// One pipe read, and so one chunk at most. 32 KiB matches the sftp pump.
+const STREAM_READ: usize = 32 * 1024;
+/// Raw chunks, both streams, waiting for the redaction stage.
+const RAW_QUEUE: usize = 4;
+/// How long a held partial word waits for more bytes before the stage
+/// flushes it anyway — so a prompt with no trailing newline reaches the
+/// caller while the command waits for an answer.
+const IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Drain one pipe into the raw channel, one chunk per read, with no ceiling.
+///
+/// A full channel parks this reader, and that IS the backpressure: the OS
+/// pipe fills and the child blocks on `write`. Once the receiver is gone the
+/// rest is read and discarded, so the child can still finish — or be killed —
+/// rather than hang forever on a pipe nobody drains. The return shape matches
+/// [`read_capped`] so the two are interchangeable at the join.
+async fn read_streamed<R>(
+    reader: Option<R>,
+    stream: OutStream,
+    raw: tokio::sync::mpsc::Sender<Chunk>,
+) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return (Vec::new(), false);
+    };
+    let mut buf = vec![0u8; STREAM_READ];
+    let mut delivering = true;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if delivering
+                    && raw
+                        .send(Chunk {
+                            stream,
+                            bytes: buf[..n].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                {
+                    delivering = false;
+                }
+            }
+        }
+    }
+    (Vec::new(), false)
+}
+
+/// The one place a streamed run's bytes are redacted: raw chunks in, masked
+/// chunks out, one [`StreamRedactor`] per stream. Returns the bytes it sent.
+///
+/// Sitting between the readers and the sink keeps it platform-neutral — the
+/// tokio pipes and the Windows console-user drain threads feed the same
+/// channel — and gives the idle flush one timer instead of one per reader.
+/// Ends when the raw channel closes (every reader is done) or when the sink
+/// is gone, in which case it stops at once: a consumer that left is not
+/// worth masking for, and dropping the raw receiver is what tells the
+/// readers to discard.
+async fn redact_stage(
+    mut raw: tokio::sync::mpsc::Receiver<Chunk>,
+    redactor: Redactor,
+    sink: ChunkSink,
+) -> u64 {
+    let mut out = StreamRedactor::new(&redactor);
+    let mut err = StreamRedactor::new(&redactor);
+    let mut sent = 0u64;
+    loop {
+        let next = if out.is_holding() || err.is_holding() {
+            match tokio::time::timeout(IDLE_FLUSH, raw.recv()).await {
+                Ok(next) => next,
+                Err(_waited) => {
+                    for (stream, r) in
+                        [(OutStream::Stdout, &mut out), (OutStream::Stderr, &mut err)]
+                    {
+                        let bytes = r.idle_flush();
+                        if !bytes.is_empty() {
+                            sent += bytes.len() as u64;
+                            if sink.send(Chunk { stream, bytes }).await.is_err() {
+                                return sent;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            raw.recv().await
+        };
+        match next {
+            Some(Chunk { stream, bytes }) => {
+                let r = match stream {
+                    OutStream::Stdout => &mut out,
+                    OutStream::Stderr => &mut err,
+                };
+                let bytes = r.push(&bytes);
+                if !bytes.is_empty() {
+                    sent += bytes.len() as u64;
+                    if sink.send(Chunk { stream, bytes }).await.is_err() {
+                        return sent;
+                    }
+                }
+            }
+            None => {
+                for (stream, r) in [(OutStream::Stdout, &mut out), (OutStream::Stderr, &mut err)] {
+                    let bytes = r.finish();
+                    if !bytes.is_empty() {
+                        sent += bytes.len() as u64;
+                        if sink.send(Chunk { stream, bytes }).await.is_err() {
+                            return sent;
+                        }
+                    }
+                }
+                return sent;
+            }
+        }
+    }
 }
 
 /// Drain one pipe, stopping once the shared budget is spent. Returns
@@ -1817,6 +2362,423 @@ mod tests {
         }
     }
 
+    // ─── Streaming redaction (FR-89) ─────────────────────────────────────
+    //
+    // The one property that matters: a secret must not slip through the gap
+    // between two chunks. So every case drives a secret through a 2-chunk
+    // split at EVERY offset and through fine chunking, and asserts the
+    // concatenated stream equals the whole-input redaction.
+
+    /// Feed `input` to a fresh `StreamRedactor` in pieces of `size`, then
+    /// finish; return everything it emitted.
+    fn stream_in_pieces(r: &Redactor, input: &[u8], size: usize) -> Vec<u8> {
+        let mut sr = StreamRedactor::new(r);
+        let mut out = Vec::new();
+        for piece in input.chunks(size.max(1)) {
+            out.extend_from_slice(&sr.push(piece));
+        }
+        out.extend_from_slice(&sr.finish());
+        out
+    }
+
+    /// Feed `input` as exactly two chunks split at `at`.
+    fn stream_split_at(r: &Redactor, input: &[u8], at: usize) -> Vec<u8> {
+        let mut sr = StreamRedactor::new(r);
+        let mut out = sr.push(&input[..at]);
+        out.extend_from_slice(&sr.push(&input[at..]));
+        out.extend_from_slice(&sr.finish());
+        out
+    }
+
+    #[test]
+    fn stream_masks_a_literal_split_at_every_offset() {
+        let token = shaped("agenttoken", 24);
+        let r = Redactor::new([token.clone()]);
+        let whole = format!("prefix {token} suffix");
+        let want = r.apply_bytes(whole.as_bytes());
+        assert!(!want.windows(token.len()).any(|w| w == token.as_bytes()));
+        for at in 0..=whole.len() {
+            assert_eq!(
+                stream_split_at(&r, whole.as_bytes(), at),
+                want,
+                "a 2-chunk split at offset {at} leaked or mangled the secret"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_masks_a_bearer_token_split_at_every_offset() {
+        let r = Redactor::default();
+        let token = shaped("bearervalue", 20);
+        // The space after `Bearer` is the exact boundary the pull-back
+        // exists for: settled alone, the token would reach the next chunk
+        // with no prefix to key on.
+        let whole = format!("Authorization: Bearer {token}\r\nnext");
+        let want = r.apply_bytes(whole.as_bytes());
+        assert!(want.windows(token.len()).all(|w| w != token.as_bytes()));
+        for at in 0..=whole.len() {
+            assert_eq!(
+                stream_split_at(&r, whole.as_bytes(), at),
+                want,
+                "bearer token leaked at split offset {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_masks_a_jwt_split_at_every_offset() {
+        let r = Redactor::default();
+        let jwt = [
+            shaped("headerpart", 20),
+            shaped("payloadpart", 19),
+            shaped("signaturepart", 28),
+        ]
+        .join(".");
+        let whole = format!("token: {jwt} end");
+        let want = r.apply_bytes(whole.as_bytes());
+        assert!(want.windows(16).all(|w| w != &jwt.as_bytes()[..16]));
+        for at in 0..=whole.len() {
+            assert_eq!(
+                stream_split_at(&r, whole.as_bytes(), at),
+                want,
+                "jwt leaked at split offset {at}"
+            );
+        }
+        // And through 1..7-byte chunking, the worst case for a carry.
+        for size in 1..=7 {
+            assert_eq!(
+                stream_in_pieces(&r, whole.as_bytes(), size),
+                want,
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_leaves_binary_byte_exact_through_a_split() {
+        let r = Redactor::new([shaped("agenttoken", 16)]);
+        // Every byte value, no whitespace run a cut could settle on cleanly,
+        // and not valid UTF-8 — the passthrough path.
+        let binary: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        let want = r.apply_bytes(&binary);
+        assert_eq!(want, binary, "binary must be identity under redaction");
+        for size in [1usize, 7, 64, 4096] {
+            assert_eq!(
+                stream_in_pieces(&r, &binary, size),
+                binary,
+                "binary mangled at chunk size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_force_settles_a_long_whitespace_free_run_without_leaking_a_literal() {
+        // A run longer than CARRY_CAP must settle in pieces rather than grow
+        // the carry forever — and a literal inside it, wherever it falls,
+        // must still be masked.
+        let token = shaped("agenttoken", 24);
+        let r = Redactor::new([token.clone()]);
+        let mut whole = vec![b'x'; CARRY_CAP + 50_000];
+        // Drop the token in two places: early (settled in an early forced
+        // cut) and late (still in the carry at EOF).
+        whole[10_000..10_000 + token.len()].copy_from_slice(token.as_bytes());
+        let tail = whole.len() - token.len();
+        whole[tail..].copy_from_slice(token.as_bytes());
+        let streamed = stream_in_pieces(&r, &whole, 8192);
+        assert_eq!(
+            streamed,
+            r.apply_bytes(&whole),
+            "the forced-cut path diverged from a whole-input redaction"
+        );
+        assert!(
+            streamed.windows(token.len()).all(|w| w != token.as_bytes()),
+            "a literal leaked through a forced cut"
+        );
+    }
+
+    #[test]
+    fn stream_idle_flush_releases_a_prompt_but_holds_a_partial_secret() {
+        let token = shaped("agenttoken", 24);
+        let r = Redactor::new([token.clone()]);
+        let mut sr = StreamRedactor::new(&r);
+
+        // A prompt whose last word has no trailing whitespace would sit in
+        // the carry forever without the idle flush. `push` settles only up to
+        // the last whitespace — here, up to and including the space after
+        // "Continue?" — and holds the trailing "[y/N]"; the idle flush then
+        // releases the rest, so the whole prompt reaches the caller.
+        let prompt = b"Continue? [y/N]";
+        let mut got = sr.push(prompt);
+        assert!(
+            sr.is_holding(),
+            "the trailing word with no whitespace after it must wait"
+        );
+        got.extend_from_slice(&sr.idle_flush());
+        assert_eq!(
+            got,
+            r.apply_bytes(prompt),
+            "the prompt must reach the caller whole after an idle flush"
+        );
+        assert!(!sr.is_holding(), "a second idle timer would be pointless");
+
+        // But a token still arriving is held: the first half of the literal
+        // must NOT be flushed, or the second half arrives unmatched.
+        let mut sr = StreamRedactor::new(&r);
+        let half = &token.as_bytes()[..token.len() / 2];
+        let shown = sr.push(half);
+        let flushed = sr.idle_flush();
+        let mut got = shown;
+        got.extend_from_slice(&flushed);
+        assert!(
+            !got.windows(half.len()).any(|w| w == half),
+            "the idle flush emitted the start of a secret: it must hold a literal prefix"
+        );
+        // …and it completes correctly once the rest arrives: the whole token
+        // ends up masked, with no half of it left in the clear.
+        let rest = &token.as_bytes()[token.len() / 2..];
+        got.extend_from_slice(&sr.push(rest));
+        got.extend_from_slice(&sr.finish());
+        let got_text = String::from_utf8_lossy(&got);
+        assert!(
+            got_text.contains(MASK),
+            "the completed token should have been masked: {got_text:?}"
+        );
+        assert!(
+            !got.windows(token.len()).any(|w| w == token.as_bytes()),
+            "the token leaked across the idle flush: {got_text:?}"
+        );
+    }
+
+    #[test]
+    fn stream_matches_apply_bytes_on_ordinary_output() {
+        // The redactor is over-eager by design; streaming it must not mangle
+        // a route table, a version string or a path any worse than `apply`.
+        let r = Redactor::new([shaped("agenttoken", 16)]);
+        for sample in [
+            "0.0.0.0/0 via 192.168.68.1 dev eth0\nroomlerd 0.4.116\n".as_bytes(),
+            b"a.b.c file.tar.gz\n",
+            b"line one\nline two\nline three\n",
+        ] {
+            let want = r.apply_bytes(sample);
+            for size in [1usize, 3, 13, 64] {
+                assert_eq!(
+                    stream_in_pieces(&r, sample, size),
+                    want,
+                    "ordinary output diverged at chunk size {size}"
+                );
+            }
+        }
+    }
+
+    // ─── The streaming engine (FR-89) ────────────────────────────────────
+
+    /// Collect a streamed run's output and outcome, with no abort.
+    async fn run_streamed_collect(
+        eng: &ExecEngine,
+        req: ExecRequest,
+    ) -> (StreamedOutcome, Vec<u8>, Vec<u8>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let collector = tokio::spawn(async move {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            while let Some(c) = rx.recv().await {
+                match c.stream {
+                    OutStream::Stdout => out.extend_from_slice(&c.bytes),
+                    OutStream::Stderr => err.extend_from_slice(&c.bytes),
+                }
+            }
+            (out, err)
+        });
+        let outcome = eng
+            .run_streamed(
+                req,
+                &Redactor::default(),
+                None,
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let (out, err) = collector.await.unwrap();
+        (outcome, out, err)
+    }
+
+    #[tokio::test]
+    async fn streamed_run_delivers_stdout_and_a_zero_exit() {
+        let (outcome, out, _err) = run_streamed_collect(&engine(), req(echo_hello())).await;
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(
+            String::from_utf8_lossy(&out).contains("hello"),
+            "stdout was {out:?}"
+        );
+        assert!(outcome.bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn streamed_run_ignores_the_output_ceiling() {
+        // Far more than MAX_OUTPUT_BYTES: the buffered path would truncate at
+        // 1 MiB, the streamed path must deliver all of it.
+        let cmd = if cfg!(windows) {
+            "1..40000 | ForEach-Object { 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }"
+        } else {
+            "for i in $(seq 1 40000); do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done"
+        };
+        let mut r = req(cmd);
+        // Even a tiny requested ceiling must be ignored by the streamed path.
+        r.max_output_bytes = 4096;
+        let (outcome, out, _err) = run_streamed_collect(&engine(), r).await;
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert!(
+            out.len() > 1024 * 1024,
+            "streamed output was capped at {} bytes — the ceiling was not ignored",
+            out.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_run_has_no_wall_clock() {
+        // A command that sleeps well past MAX_TIMEOUT_MS would be killed by
+        // the buffered path; the streamed path must let it finish. (Kept
+        // short in wall-clock terms — the point is that `timeout_ms` is not
+        // consulted, which a 2 s sleep with a 10 ms requested timeout proves.)
+        let cmd = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 1500; Write-Output done"
+        } else {
+            "sleep 1.5; echo done"
+        };
+        let mut r = req(cmd);
+        r.timeout_ms = 10; // would kill it instantly if it were honoured
+        let (outcome, out, _err) = run_streamed_collect(&engine(), r).await;
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(String::from_utf8_lossy(&out).contains("done"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn streamed_run_is_redacted() {
+        let token = shaped("agenttoken", 24);
+        let redactor = Redactor::new([token.clone()]);
+        let cmd = if cfg!(windows) {
+            format!("Write-Output 'tok={token} end'")
+        } else {
+            format!("echo 'tok={token} end'")
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let collector = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(c) = rx.recv().await {
+                out.extend_from_slice(&c.bytes);
+            }
+            out
+        });
+        let outcome = engine()
+            .run_streamed(
+                req(&cmd),
+                &redactor,
+                None,
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let out = collector.await.unwrap();
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert!(
+            !out.windows(token.len()).any(|w| w == token.as_bytes()),
+            "the secret reached the sink unredacted: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(String::from_utf8_lossy(&out).contains(MASK));
+    }
+
+    #[tokio::test]
+    async fn streamed_run_aborts_and_kills_the_command() {
+        let cmd = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let abort = tokio_util::sync::CancellationToken::new();
+        let eng = Arc::new(engine());
+        let runner = {
+            let eng = eng.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                eng.run_streamed(req(cmd), &Redactor::default(), None, tx, abort)
+                    .await
+            })
+        };
+        // Let it reach the process, then abort as the SSH channel-close path
+        // does.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        abort.cancel();
+        let started = std::time::Instant::now();
+        let outcome = runner.await.unwrap();
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "error was {:?}",
+            outcome.error
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "abort did not stop the 30 s sleep promptly ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_run_refuses_an_already_cancelled_caller() {
+        // The SSH channel closed during the consent wait: the command must
+        // not start at all.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let abort = tokio_util::sync::CancellationToken::new();
+        abort.cancel();
+        let outcome = engine()
+            .run_streamed(req(echo_hello()), &Redactor::default(), None, tx, abort)
+            .await;
+        assert!(
+            outcome.error.is_some(),
+            "a cancelled caller must not run the command"
+        );
+        assert_eq!(outcome.exit_code, None, "nothing should have been spawned");
+    }
+
+    #[tokio::test]
+    async fn streamed_stdin_reaches_the_command() {
+        let (sin_tx, sin_rx) = tokio::sync::mpsc::channel(4);
+        sin_tx.send(b"streamed-".to_vec()).await.unwrap();
+        sin_tx.send(b"stdin-ok".to_vec()).await.unwrap();
+        drop(sin_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let collector = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(c) = rx.recv().await {
+                if c.stream == OutStream::Stdout {
+                    out.extend_from_slice(&c.bytes);
+                }
+            }
+            out
+        });
+        let outcome = engine()
+            .run_streamed(
+                req(cat_stdin()),
+                &Redactor::default(),
+                Some(sin_rx),
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let out = collector.await.unwrap();
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert!(
+            String::from_utf8_lossy(&out).contains("streamed-stdin-ok"),
+            "fed stdin did not reach the command: {out:?}"
+        );
+    }
+
     #[test]
     fn outcome_hash_separates_the_two_streams() {
         let a = ExecOutcome {
@@ -1856,9 +2818,7 @@ mod win_console {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-    use tokio::sync::oneshot;
-
-    use super::ExecOutcome;
+    use super::{Chunk, ExecOutcome, OutStream, Output};
     use crate::win_service::supervisor;
 
     /// Build the command line `CreateProcessAsUserW` receives.
@@ -1884,6 +2844,13 @@ mod win_console {
     }
 
     /// Spawn as the console user, drain both pipes, enforce the bounds.
+    ///
+    /// FR-89: `output` decides the drain — to a `Vec` against the combined
+    /// budget (Fleet RPC), or chunk by chunk into the redaction stage's raw
+    /// channel (Roomler SSH), through the very same three pipes. The
+    /// `docs/roomler-ssh.md` note that `CreateProcessAsUserW` had "no pipes
+    /// variant" was outdated the day this module shipped (P5b); what was
+    /// missing was a drain that hands bytes on instead of collecting them.
     // 8 params: the same set `spawn_and_wait` hands over, one for one.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
@@ -1891,9 +2858,9 @@ mod win_console {
         args: &[&str],
         command: &str,
         cwd: Option<String>,
-        timeout_ms: u64,
-        max_output: u64,
-        cancel_rx: oneshot::Receiver<()>,
+        timeout_ms: Option<u64>,
+        output: Output,
+        cancel: impl std::future::Future<Output = ()>,
         stdin: Option<super::StdinFeed>,
     ) -> ExecOutcome {
         let cmdline = build_cmdline(program, args, command);
@@ -1924,10 +2891,6 @@ mod win_console {
             }
         };
 
-        let budget = Arc::new(AtomicU64::new(max_output));
-        let budget_out = budget.clone();
-        let budget_err = budget.clone();
-
         // Everything Win32 happens on ONE blocking thread that owns the child,
         // and hands back the pieces the async side needs. `spawn_blocking`
         // rather than inline: `CreateProcessAsUserW`, `ReadFile` and
@@ -1954,10 +2917,50 @@ mod win_console {
             // BOTH pipes must be drained concurrently. Reading one to EOF
             // first deadlocks as soon as the child fills the other's buffer —
             // the classic two-pipe hang, and it would look like a timeout.
-            let out_t =
-                std::thread::spawn(move || supervisor::read_pipe_to_end(&stdout, &budget_out));
-            let err_t =
-                std::thread::spawn(move || supervisor::read_pipe_to_end(&stderr, &budget_err));
+            // Both drains return `read_pipe_to_end`'s shape; the streamed one
+            // carries nothing back because it handed everything on.
+            let (out_t, err_t) = match output {
+                Output::Buffered { max_output } => {
+                    let budget = Arc::new(AtomicU64::new(max_output));
+                    let budget_err = budget.clone();
+                    (
+                        std::thread::spawn(move || supervisor::read_pipe_to_end(&stdout, &budget)),
+                        std::thread::spawn(move || {
+                            supervisor::read_pipe_to_end(&stderr, &budget_err)
+                        }),
+                    )
+                }
+                // `blocking_send` is legal here — these are plain threads,
+                // not runtime workers — and it is the backpressure: a full
+                // raw channel parks the thread, the pipe fills, the child
+                // blocks on `WriteFile`.
+                Output::Streamed { raw } => {
+                    let raw_err = raw.clone();
+                    (
+                        std::thread::spawn(move || {
+                            supervisor::read_pipe_streamed(&stdout, |bytes| {
+                                raw.blocking_send(Chunk {
+                                    stream: OutStream::Stdout,
+                                    bytes,
+                                })
+                                .is_ok()
+                            });
+                            (Vec::new(), false)
+                        }),
+                        std::thread::spawn(move || {
+                            supervisor::read_pipe_streamed(&stderr, |bytes| {
+                                raw_err
+                                    .blocking_send(Chunk {
+                                        stream: OutStream::Stderr,
+                                        bytes,
+                                    })
+                                    .is_ok()
+                            });
+                            (Vec::new(), false)
+                        }),
+                    )
+                }
+            };
 
             Ok::<_, anyhow::Error>((process, pid, out_t, err_t, stdin_pipe))
         })
@@ -1980,25 +2983,36 @@ mod win_console {
         let process = Arc::new(process);
         let waiter = process.clone();
         // The blocking wait is a BACKSTOP, not the deadline: the `select!`
-        // below owns the timeout. An hour is far beyond `MAX_TIMEOUT_MS`
-        // (300 s), so this only bounds the thread if the select somehow never
-        // fires — a leaked blocking thread is worse than a late one.
+        // below owns the timeout and the cancel, and every one of its exits
+        // either saw the process end or terminated it — so this thread always
+        // returns, and waiting in hour-long slices only bounds how long one
+        // call sits. It used to give up after ONE hour, sized against
+        // `MAX_TIMEOUT_MS`; a streamed command (FR-89) has no wall clock and
+        // may run longer, and a waiter that returned early would report an
+        // exit that had not happened.
         let wait = tokio::task::spawn_blocking(move || {
-            waiter.wait_for_exit(std::time::Duration::from_secs(3600))
+            while !waiter.wait_for_exit(std::time::Duration::from_secs(3600)) {}
         });
         tokio::pin!(wait);
 
-        let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        // `None` is an arm that never fires — see `spawn_and_wait`.
+        let timeout = async move {
+            match timeout_ms {
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(timeout);
+        tokio::pin!(cancel);
 
         let error = tokio::select! {
             _ = &mut wait => None,
             _ = &mut timeout => {
                 super::kill_tree_pid(pid).await;
                 process.terminate();
-                Some(format!("timed out after {timeout_ms}ms"))
+                Some(format!("timed out after {}ms", timeout_ms.unwrap_or_default()))
             }
-            _ = cancel_rx => {
+            _ = &mut cancel => {
                 super::kill_tree_pid(pid).await;
                 process.terminate();
                 Some("cancelled by the caller".to_string())

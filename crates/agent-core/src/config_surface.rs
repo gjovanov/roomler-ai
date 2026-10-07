@@ -449,6 +449,14 @@ const KEYS: &[KeyMeta] = &[
         kind: "string",
         description: "Ceiling on what a SERVER-GRANTED ssh session may run as: daemon (or empty) = no device-side limit; console_user = a grant asking for the daemon identity is refused. The device's answer to 'what do I still refuse when the server asking is the compromised thing'.",
     },
+    KeyMeta {
+        key: "ssh_exec_streaming",
+        group: Group::Ssh,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-89 - stream a one-shot command's output (`ssh <node> 'cmd'`) as it is produced: no 1 MiB ceiling, no 300 s wall clock, and the command lives exactly as long as the channel does (closing it kills the command and its process tree). Off = the buffered pre-FR-89 path, the kill switch. Fleet RPC (`roomler exec`) is unaffected either way. Default: on. Restart required.",
+    },
     // `ssh_host_key` is deliberately ABSENT from this surface: it is private
     // key material, and everything here is readable over the LocalAPI.
     KeyMeta {
@@ -1663,6 +1671,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_max_sessions" => cfg.hive_max_sessions.map(|n| n.to_string()),
         "hive_harness" => cfg.hive_harness.clone(),
         "hive_api_key_helper" => cfg.hive_api_key_helper.clone(),
+        "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -1908,6 +1917,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 Some(v) => Some(v.to_string()),
             }
         }
+        // FR-89 — clearing restores the built-in ON: this is a kill switch
+        // for a data-path shape, not a gate, so OFF is an owner's choice.
+        "ssh_exec_streaming" => cfg.ssh_exec_streaming = parse_bool_or(value, true)?,
         "ssh_port" => {
             cfg.ssh_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
