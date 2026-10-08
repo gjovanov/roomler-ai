@@ -165,12 +165,14 @@ const RECORD_PROBE = process.env.E2E_DEMO_RECORD_PROBE === '1'
  * JSON, one list per device in filming order (null skips it):
  *
  *   {"fullscreen": true}  {"click": [x, y]}  {"dbl": [x, y]}  {"wheel": [x, y, dy]}
- *   {"drag": [[x1, y1], [x2, y2]], "ms": 1400}
+ *   {"move": [x, y], "steps": 12}  {"drag": [[x1, y1], [x2, y2]], "ms": 1400}
  *   {"key": "Meta+Shift+G"}  {"type": "text"}  {"wait": 1500}  {"mark": "name"}
  *
  * The steps start in the page; `fullscreen` switches the viewer to full screen, and the positions
  * after it are full-screen ones. The keys reach the remote through the viewer, once a click on the
- * desktop has given it focus. ⚠️ Every position is measured on an earlier run's frames, as for the
+ * desktop has given it focus. `move` is a pure pointer move, no button, no scroll: what a host's
+ * "rest the pointer at the top edge" reveal (FR-27 P9) needs, which `wheel` with a zero delta only
+ * imitated. ⚠️ Every position is measured on an earlier run's frames, as for the
  * record scene: a run that stops early is how the next position is found.
  *
  * ⚠️ A step that seems to do nothing is not proof its position is wrong. Twice in ~25 Mac runs
@@ -182,6 +184,7 @@ const RECORD_PROBE = process.env.E2E_DEMO_RECORD_PROBE === '1'
 type Step =
   | { fullscreen: true }
   | { wheel: [number, number, number] }
+  | { move: [number, number]; steps?: number }
   | { click: [number, number] }
   | { dbl: [number, number] }
   | { drag: [[number, number], [number, number]]; ms?: number }
@@ -527,7 +530,8 @@ async function stepsScene(
     } else if ('wheel' in s) {
       await page.mouse.move(s.wheel[0], s.wheel[1])
       await page.mouse.wheel(0, s.wheel[2])
-    } else if ('click' in s) await page.mouse.click(s.click[0], s.click[1])
+    } else if ('move' in s) await page.mouse.move(s.move[0], s.move[1], { steps: s.steps ?? 12 })
+    else if ('click' in s) await page.mouse.click(s.click[0], s.click[1])
     else if ('dbl' in s) await page.mouse.dblclick(s.dbl[0], s.dbl[1])
     else if ('drag' in s) await drag(page, cap.cdp, s.drag[0], s.drag[1], s.ms)
     else if ('key' in s) await page.keyboard.press(s.key)
