@@ -65,6 +65,19 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 > device, a browser's socket and viewer peer, the harness's side of a
 > toolbelt) is `tests/hive_support/mod.rs`, a module each includes, not a
 > test target of its own.
+>
+> **`tests/hive_memory.rs` and `tests/hive_memory_off.rs` are a fourth and a
+> fifth** (FR-90 P1e-4, AC8): the same device, with its owner's
+> `hive_core_memory` on and then off. The gate is read once, when the
+> supervisor starts, and a process has one supervisor. The harness
+> (`MEMORY_HARNESS`) copies out what it finds where Claude Code reads core
+> memory — `$CLAUDE_CONFIG_DIR/CLAUDE.md` and the auto-memory `MEMORY.md` —
+> when it starts and at every turn.
+>
+> | gate | what the test asserts |
+> |---|---|
+> | on | An org fact kept before a session starts is in its `CLAUDE.md`, and a device fact is in its `MEMORY.md`. A fact kept while it runs is not, even at its next turn. The next session has both, at a later revision. A write past the org's budget is `409 over_budget` with the numbers, and nothing is evicted |
+> | off | The transcript shows the frame arrived (its revision, and that the gate is off). Nothing reached the session's config directory, nor even the daemon's own disk |
 
 ## Frontend tests
 
