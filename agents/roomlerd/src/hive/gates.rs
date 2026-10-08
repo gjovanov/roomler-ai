@@ -27,6 +27,8 @@ pub struct HiveConfig {
     pub max_sessions: usize,
     pub harness: Option<PathBuf>,
     pub api_key_helper: Option<String>,
+    /// Sent as `anthropic-workspace-id` with the key (P0g).
+    pub api_workspace_id: Option<String>,
 }
 
 impl HiveConfig {
@@ -41,6 +43,7 @@ impl HiveConfig {
                 .unwrap_or(DEFAULT_MAX_SESSIONS),
             harness: cfg.hive_harness.as_deref().map(PathBuf::from),
             api_key_helper: cfg.hive_api_key_helper.clone(),
+            api_workspace_id: cfg.hive_api_workspace_id.clone(),
         }
     }
 
@@ -53,6 +56,7 @@ impl HiveConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             harness: None,
             api_key_helper: None,
+            api_workspace_id: None,
         }
     }
 }
