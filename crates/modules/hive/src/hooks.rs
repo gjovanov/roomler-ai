@@ -134,6 +134,17 @@ impl TenantLifecycle for HiveHooks {
         if ended > 0 {
             info!(tenant = %tenant_id, user = %user_id, ended, "hive: member removed — their sessions ended");
         }
+        // Drives nobody else's (P1c) — moot while they are out of the org,
+        // and wrong if they come back: rejoining the org must not hand back a
+        // driver's seat nobody re-offered.
+        let dropped = self
+            .state
+            .sessions
+            .drop_driver_everywhere(tenant_id, user_id)
+            .await?;
+        if dropped > 0 {
+            info!(tenant = %tenant_id, user = %user_id, dropped, "hive: member removed — no longer drives others' sessions");
+        }
         // And stops READING them — theirs or anyone's — now, not at the next
         // renewal.
         crate::view::end_grants(

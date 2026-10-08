@@ -31,7 +31,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::FromRef,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique};
@@ -42,11 +42,13 @@ use roomler_core::{
     WsRegistration, rate_limit::RateLimiter,
 };
 
+pub mod access;
 pub mod acks;
 pub mod agent_socket;
 pub mod dao;
 pub mod hooks;
 pub mod model;
+pub mod participants;
 pub mod room;
 pub mod routes;
 pub mod view;
@@ -138,7 +140,13 @@ impl Module for HiveState {
         let session = Router::new()
             .route("/", get(routes::list).post(routes::start))
             .route("/{session_id}", get(routes::get_one))
-            .route("/{session_id}/stop", post(routes::stop));
+            .route("/{session_id}/stop", post(routes::stop))
+            // P1c — who besides the owner takes part, and how.
+            .route("/{session_id}/participant", get(participants::list))
+            .route(
+                "/{session_id}/participant/{user_id}",
+                put(participants::set).delete(participants::remove),
+            );
         Router::new()
             .nest("/tenant/{tenant_id}/hive/session", session)
             .with_state(self.clone())
