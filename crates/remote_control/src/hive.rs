@@ -52,6 +52,18 @@ pub mod hive_limits {
     pub const MAX_TITLE_LEN: usize = 200;
     /// A device's `detail` is clamped by the device AND again on receipt.
     pub const MAX_DETAIL_LEN: usize = 512;
+    /// FR-90 P1b — entries one `rc:hive.manifest` may carry. A device runs
+    /// `hive_max_sessions`, a handful; a longer list is not a device's.
+    pub const MAX_MANIFEST: usize = 256;
+}
+
+/// FR-90 P1b — one session a device runs, in `rc:hive.manifest`: its id and
+/// fence, nothing more.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HiveManifestEntry {
+    #[serde(with = "crate::serde_helpers::oid_hex")]
+    pub session_id: bson::oid::ObjectId,
+    pub fence: u64,
 }
 
 /// FR-90 P0d-2 — bounds on a viewer peer, read by both ends.
