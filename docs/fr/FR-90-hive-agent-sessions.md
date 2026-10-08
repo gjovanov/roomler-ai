@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) in review · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -471,6 +471,31 @@ device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hi
 `hive_replica`) can ever be pushed, and only to devices that opted into remote config
 (`crates/remote_control/src/models.rs:1410,5153`).
 
+**P1g, the org gate, as built.** The module switch (`[modules] hive`) is all or nothing for a
+server, so it has a second dial: `hive.tenants` (`ROOMLER__HIVE__TENANTS`), the organizations
+agent sessions serve, as comma-separated ids. Empty or `*` is every one, which is what a
+self-hosted server wants. A hosted server lists one test organization first (decision 10).
+
+```mermaid
+flowchart LR
+    R["a request for org X"] --> M{"a member of X?"}
+    M -- no --> N["403 not_a_member<br/>(nothing about the gate)"]
+    M -- yes --> G{"X in hive.tenants?<br/>(empty = every org)"}
+    G -- no --> F["404: not available<br/>to this organization"]
+    G -- yes --> H["the route"]
+    D["a device of X connects"] --> G2{"X served?"}
+    G2 -- yes --> REC["reconcile: re-send<br/>what it missed"]
+    G2 -- no --> END["its sessions end<br/>(hive_not_enabled);<br/>rc:hive.stop"]
+```
+
+| Where | An organization agent sessions do not serve | Where in the code |
+|---|---|---|
+| every route | **404**, `agent sessions are not available to this organization`, after the membership check (a non-member still gets `not_a_member`) | `routes.rs` `member_tenant` |
+| `GET …/hive` | the SPA's question: `{enabled: true}` or that 404; Hive's pages and nav show only where it is served | `routes.rs` `serves`, `stores/hive.ts` `checkServed`, the router guard |
+| the viewer | `hive:view.open` answers `not_found`, as for a session the caller may not read | `view.rs` `open` |
+| a device connecting | nothing is re-sent; what it still runs for the org ends (`hive_not_enabled`) and is told to stop | `agent_socket.rs` `end_unserved` |
+| a malformed entry | logged, and it matches nothing: a typo shuts the org it meant rather than opening any other | `scope.rs` `TenantScope::parse` |
+
 ## 4. Phases
 
 | P | What | Kill switch | Status |
@@ -504,6 +529,10 @@ device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hi
 | P1e-4 | AC8 end to end in CI (`hive_memory.rs`, the gate on; `hive_memory_off.rs`, the gate off; see the AC8 test above), and the field run | a test | **merged** #1875 `bc717a495` (field-verified 2026-10-08, §8) |
 | P1f-1 | the transcript's renderers (§3c "P1f-1 … as built"): a tool call drawn by its tool — a command line, an edit as a diff, a new file's first lines, a file range, a search, a to-do list — its result folded under it by `tool_use_id`; output coloured from SGR, every other escape dropped; an approval shows its input the same way | none: the old JSON view is the fallback for anything off-shape | **merged** #1876 `5c770db51` (field-verified 2026-10-08, §8) |
 | P1f-2 | the long list (§3c "P1f-2, the long list"): following the newest, the transcript keeps at most 1,000 events, the oldest a "load earlier" away, never while someone reads further up (`content-visibility` was tried and dropped: the first scroll to the bottom landed short) | none: the device keeps every event; the window is the browser's | **merged** #1877 `48cc6d17a` (field-verified 2026-10-08, §8) |
+| P1g | the org gate (§3g "P1g … as built"): `hive.tenants`, the organizations agent sessions serve; every route, the viewer and a connecting device answer an unserved one as if the module were not there for it; `GET …/hive` for the SPA | `hive.tenants` empty (every org), and the module switch itself | in review |
+| P1h | sessions on macOS: the launcher for a mapped account (`setuid`/`setgid` like Linux; the harness's macOS paths), field-verified on prod in the test org (decision 10) | device `hive_enabled = false`, the default | — |
+| P1i | sessions on Windows, as the console user only (design §0.1): the user's token from the active console session, the toolbelt over a named pipe, the account's copy of core memory done as the user; refused `no_console_user` with nobody signed in (AC13) | device `hive_enabled = false`, the default | — |
+| P1j | `adopt` (design §10.8, decision 11): a person mirrors their own terminal sessions as read-only sessions only they see, on a device whose owner allows it | device `hive_adopt = false`, the default | — |
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset: replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` | — |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
@@ -691,16 +720,33 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
    alternative is to make it pushable like `hive_enabled`, only to devices that opted into remote
    config. Revisit once orgs use the brain.
 10. **Where Windows and macOS sessions are field-verified** (the rest of P1: AC3, AC7 and AC20
-    there). Linux was proven on a throwaway server and a namespaced root device on one workstation.
-    The same trick does not carry over: a second daemon on a machine someone is using takes its
-    singleton LocalAPI pipe, its TUN and its updater (`docs/multi-org.md`). The options are a
-    throwaway server reachable from a Windows and a macOS fleet host (or the vmtest VMs) that are
-    not in use, or the `hive` module switched on for a test org on prod (it is off there, and
-    switching it on is the operator's call).
-11. **`adopt`'s visibility** (design §10.8): mirroring the Claude Code sessions people already
-    run in a terminal as read-only org sessions. Whose sessions are listed, to whom, and whether a
-    person adopts per session or per machine, are privacy decisions, not engineering ones. Its "an
-    adopted session becomes a managed one when promoted" half needs P2's replicaset.
+    there). *Decided 2026-10-08 by the operator: on prod, for a test organization* — the vmtest
+    org, into which throwaway Windows, Ubuntu and macOS VMs enroll (FR-61). The module switch
+    alone would have opened the pillar to every organization on prod, so P1g built the org gate
+    first. Devices stay default-deny regardless: a VM runs sessions only once its own
+    `hive_enabled` is on.
+11. **`adopt`'s visibility** (design §10.8). *Decided 2026-10-08 by the operator, on the
+    recommendation below.*
+    - **The person adopts, per machine, as their own account.** `roomler hive adopt` installs
+      Claude Code hooks in that account's user-level settings only. Nobody else's terminal is
+      touched, and `roomler hive unadopt` takes them out.
+    - **The device's owner allows it:** `hive_adopt`, a device key, default off, never pushable.
+      The account must map to the member in the device's own `hive_accounts`; an unmapped
+      account's sessions are refused, never attributed by guess.
+    - **Only its owner sees an adopted session.** Not the org, not its admins, not device managers.
+      The owner may name readers, as for any session (P1c); there are no drivers, because the
+      terminal holds the harness.
+    - **The server holds what it holds for any session:** metadata, never content. The transcript
+      is mirrored into the device's store and read over the viewer peer.
+    - **Why.** A terminal session never passed Hive's gates (`HIVE_RUN`, the device's
+      `hive_enabled`, `hive_accounts`, `hive_roots`): it is the person's own work in their own
+      account. Showing it to anyone else by default would make installing Roomler a way for an
+      organization to read its members' terminals. Titles and folder names alone leak clients and
+      unannounced projects. People would not adopt anything their whole org could see, which would
+      empty the feature of the work it exists to collect. Owner-only with explicit sharing is the
+      default that keeps both the person's and the device owner's consent, and it is what every
+      other Hive surface already does.
+    - Its "an adopted session becomes a managed one when promoted" half needs P2's replicaset.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the

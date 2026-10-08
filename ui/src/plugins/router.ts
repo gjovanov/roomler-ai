@@ -4,6 +4,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
 import { useCapabilitiesStore } from '@/stores/capabilities'
+import { useHiveStore } from '@/stores/hive'
 import type { ModuleId } from '@/modules/registry'
 
 declare module 'vue-router' {
@@ -386,7 +387,16 @@ router.beforeEach(async (to) => {
   if (!wanted) return true
   const caps = useCapabilitiesStore()
   await caps.ready()
-  if (caps.has(wanted)) return true
+  if (caps.has(wanted)) {
+    // FR-90 P1g — agent sessions may serve some organizations and not
+    // others: a deep link into one they do not serve goes to its dashboard.
+    const tid = to.params.tenantId
+    if (wanted === 'hive' && typeof tid === 'string' && tid !== '' && !(await useHiveStore().checkServed(tid))) {
+      console.warn(`[modules] agent sessions do not serve organization ${tid}`)
+      return { name: 'tenant-dashboard', params: { tenantId: tid } }
+    }
+    return true
+  }
   console.warn(
     `[modules] route '${String(to.name)}' needs module '${wanted}', which this server does not mount`,
   )
