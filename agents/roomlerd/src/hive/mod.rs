@@ -14,10 +14,10 @@
 //! # What P0 covers
 //!
 //! Linux, a named account (`RunAs::Named`), the harness as the daemon's child.
-//! The re-exec'd `hive-host` — Windows' console user, macOS, a session that
-//! outlives a daemon restart — is P1; until then a daemon restart ends the
-//! sessions it ran, and they report `ended`. Elsewhere the build does not
-//! advertise `hive`, so no server sends it a start.
+//! The re-exec'd `hive-host` — Windows' console user, macOS — is P1; a daemon
+//! restart still takes every harness down with it, and P1d-2 resumes the
+//! sessions (below). Elsewhere the build does not advertise `hive`, so no
+//! server sends it a start.
 //!
 //! # Whose frames count
 //!
@@ -48,9 +48,21 @@
 //! [`update_wait`] (`hive_update_wait_secs`). Once it goes ahead,
 //! [`begin_update`] holds new prompts and starts so none begins in the gap;
 //! [`end_update`] releases them when no restart came after all.
+//!
+//! # Restarts (P1d-2)
+//!
+//! [`hosted`]: what the device hosts is kept on disk, and the next daemon
+//! resumes it at its first connection — every gate applied again as the
+//! device is configured then, Claude Code relaunched with `--resume`, the
+//! turn count carried on, a turn the restart cut reported interrupted and
+//! its open approvals withdrawn — before its manifest goes out. The daemon
+//! calls [`begin_shutdown`] the moment its shutdown is signalled: a harness
+//! that ends after that went down with it, its session is kept rather than
+//! ended, and what the device hosts is frozen for the next daemon to report.
 
 pub mod framing;
 pub mod gates;
+mod hosted;
 mod lines;
 mod sidecar;
 mod store;
@@ -61,8 +73,8 @@ pub mod view;
 #[cfg(feature = "hive-test-launcher")]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
-    Author, StartOrder, Supervisor, begin_update, end_update, global, handle_start, handle_stop,
-    init, on_connected, turns_running, update_wait,
+    Author, StartOrder, Supervisor, begin_shutdown, begin_update, end_update, global, handle_start,
+    handle_stop, init, on_connected, turns_running, update_wait,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{
