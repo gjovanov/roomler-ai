@@ -39,7 +39,7 @@ flowchart LR
 | Marketing / auth | `LandingView`, `auth/{Login,Register,OAuthCallback}View`, `legal/{Terms,PrivacyPolicy}View` | |
 | Collaboration | `dashboard/{DashboardView,TenantDashboard}`, `rooms/{RoomList,ExploreView}`, `chat/ChatView`, `conference/ConferenceView`, `files/FilesBrowser`, `invite/{InviteLanding,InviteManage}View`, `profile/{Profile,ProfileEdit}View`, `billing/BillingView` | `ChatView`/`ConferenceView` own their layout (no `v-container`) |
 | Fleet | `devices/DevicesView` (enrolled machines), `remote/RemoteControl` (the viewer), `remote/ConsentView`, `network/NetworkPanel` (overlay mesh), `observability/ObservabilityView`, `analytics/AnalyticsView`, `admin/AdminPanel` | |
-| Agent sessions (FR-90, module `hive`) | `hive/HiveSessionsView` (your sessions, start dialog, stop) | a session's own page is its chat room: `ChatView` opens `components/hive/HiveTranscript` as a side panel when the room's `binding.module` is `hive`. Its header's **People** button is `components/hive/HiveParticipants` (P1c): who takes part — the owner adds people as readers or drivers, changes their part, takes them out; everyone else sees the list. The transcript's "ask the agent" composer is a driver's; the room's own composer is ordinary chat, which never reaches the agent |
+| Agent sessions (FR-90, module `hive`) | `hive/HiveSessionsView` (your sessions, start dialog, stop), `hive/HiveMemoryView` (P1e — **Agent memory**: the facts kept for the org's sessions by scope — organization, yours, a chosen device — each with its character budget; add, edit at the version read, archive; a refusal, `409 over_budget` or a 403 on a scope you may not write, shows in the server's words with the draft kept) | a session's own page is its chat room: `ChatView` opens `components/hive/HiveTranscript` as a side panel when the room's `binding.module` is `hive`. Its header's **People** button is `components/hive/HiveParticipants` (P1c): who takes part — the owner adds people as readers or drivers, changes their part, takes them out; everyone else sees the list. The transcript's "ask the agent" composer is a driver's; the room's own composer is ordinary chat, which never reaches the agent |
 | Fallback | `NotFoundView` | |
 
 ## Stores (21)
@@ -49,7 +49,8 @@ flowchart LR
 collaboration core — plus the fleet set: `agents`, `tunnelClients`,
 `tunnelPolicies`, `overlayRoutes`, `overlayAcl`, `orgBadges` (multi-org
 indicators), `stats` (observability series) — and `hive` (FR-90: the
-server's RECORD of your agent sessions; never their content).
+server's RECORD of your agent sessions, never their content; and the
+facts kept for them, `fetchBrain`/`keepFact`/`editFact`/`archiveFact`).
 
 ⚠️ `hive` is the one module the server switches OFF by default, so the
 capability gate (`stores/capabilities.ts`) fails **closed** for it while
