@@ -333,6 +333,68 @@ impl AgentSessionDao {
             .await
     }
 
+    /// FR-90 P1b — the sessions the server holds as running on `device_id`:
+    /// live, and launched there on the device's own word — its answer to the
+    /// start, or a run state only it reports ([`SessionStatus::LAUNCHED`]).
+    /// A start it has said nothing about is not here — it may not be launched
+    /// yet, and reconcile owns it.
+    ///
+    /// ⚠️ Not `accepted_at` alone. The state usually lands BEFORE the answer
+    /// ([`Self::accept`]), so a socket that drops between the two leaves the
+    /// session `idle` with no `accepted_at` — which reconcile never re-sends,
+    /// being no longer `starting`, and which would then outlive its harness
+    /// for ever. Field, 2026-10-08: the one record the first P1b run left.
+    pub async fn running_on_device(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "location.device_id": device_id,
+                    "status": statuses(&SessionStatus::LIVE),
+                    "$or": [
+                        { "accepted_at": { "$type": "date" } },
+                        { "status": statuses(&SessionStatus::LAUNCHED) },
+                    ],
+                },
+                None,
+            )
+            .await
+    }
+
+    /// FR-90 P1b — end a session its device says it does not run: still
+    /// live, still this device's, still at `fence`. A session being stopped
+    /// ends `stopped` (its harness is gone either way); any other,
+    /// `not_on_device`.
+    pub async fn end_not_on_device(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        fence: i64,
+        stopping: bool,
+    ) -> DaoResult<bool> {
+        let reason = if stopping { "stopped" } else { "not_on_device" };
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "location.device_id": device_id,
+                    "fence": fence,
+                    "status": statuses(&SessionStatus::LIVE),
+                },
+                doc! { "$set": {
+                    "status": SessionStatus::Ended.as_str(),
+                    "end_reason": reason,
+                    "detail": "the device reconnected without it",
+                    "ended_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
     /// What a device must be told when it connects: stops it has not
     /// confirmed, and starts it never answered.
     pub async fn needing_delivery(

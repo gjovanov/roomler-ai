@@ -131,6 +131,7 @@ pub(crate) fn ended_note(s: &AgentSession) -> String {
         Some("device_removed") => "its device was removed",
         Some("tenant_archived") => "the organization was archived",
         Some("never_answered") => "the device never answered",
+        Some("not_on_device") => "its device no longer runs it",
         _ => "ended",
     };
     let mut t = format!("⏹ Session ended — {why}");

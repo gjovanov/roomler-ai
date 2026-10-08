@@ -33,12 +33,24 @@
 //! RUNS a session whose record is over is answered with a stop
 //! ([`stop_if_over`]). That covers the replay a device sends on every
 //! connection, so a removed member's session cannot outlive one reconnect.
+//!
+//! # What the device no longer runs (P1b)
+//!
+//! The opposite case: the record says a session runs, the device does not
+//! run it. A restarted daemon holds no replay of what it ran, so every
+//! connection also carries `rc:hive.manifest`, the sessions the device runs
+//! NOW; the server ends each one it holds as running there that the list
+//! leaves out ([`end_what_the_device_does_not_run`]). An unanswered start is
+//! not "running" — reconcile owns it — and no manifest at all (an older
+//! build) changes nothing.
+
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use bson::{DateTime, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
-    hive::{HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits},
+    hive::{HiveManifestEntry, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits},
     signaling::{ClientMsg, ServerMsg},
 };
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
@@ -81,6 +93,8 @@ enum Report {
         fence: u64,
         report: room::ApprovalReport,
     },
+    /// P1b — the sessions the device runs now (`rc:hive.manifest`).
+    Manifest(Vec<HiveManifestEntry>),
     /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
     /// the device's answer must reach the browser before its candidates.
     View(ClientMsg),
@@ -179,6 +193,7 @@ impl AgentMsgHandler for HiveAgentSocket {
                     answered_by,
                 },
             },
+            ClientMsg::HiveManifest { sessions } => Report::Manifest(sessions),
             view @ (ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -213,7 +228,7 @@ impl AgentSocketLifecycle for HiveAgentSocket {
         let (tenant_id, device_id) = (ctx.tenant_id, ctx.agent_id);
         tokio::spawn(async move {
             reconcile_on_connect(&state, tenant_id, device_id).await;
-            apply_reports(&state, device_id, rx).await;
+            apply_reports(&state, tenant_id, device_id, rx).await;
         });
     }
 
@@ -224,7 +239,12 @@ impl AgentSocketLifecycle for HiveAgentSocket {
 }
 
 /// Apply one connection's reports, in order, until it closes.
-async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Receiver<Report>) {
+async fn apply_reports(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    device_id: ObjectId,
+    mut rx: mpsc::Receiver<Report>,
+) {
     while let Some(report) = rx.recv().await {
         match report {
             Report::StartAck {
@@ -397,7 +417,57 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                     }
                 }
             }
+            Report::Manifest(sessions) => {
+                end_what_the_device_does_not_run(state, tenant_id, device_id, &sessions).await;
+            }
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
+        }
+    }
+}
+
+/// P1b — the device says which sessions it runs now. Every session the
+/// server holds as running there that the list leaves out is over — the
+/// daemon restarted, or the harness ended and the word was lost past its
+/// replay — and nothing else would ever say so (finding 7). Ended here, with
+/// its room told and its open approvals withdrawn. An oversized list is not
+/// a device's, and changes nothing: the safe direction.
+async fn end_what_the_device_does_not_run(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    device_id: ObjectId,
+    manifest: &[HiveManifestEntry],
+) {
+    if manifest.len() > hive_limits::MAX_MANIFEST {
+        warn!(device = %device_id, entries = manifest.len(), "hive: an oversized manifest — ignored");
+        return;
+    }
+    let runs: HashSet<(ObjectId, u64)> = manifest.iter().map(|e| (e.session_id, e.fence)).collect();
+    let held = match state.sessions.running_on_device(tenant_id, device_id).await {
+        Ok(held) => held,
+        Err(e) => {
+            warn!(device = %device_id, %e, "hive: the device's sessions were not read for its manifest");
+            return;
+        }
+    };
+    for s in held {
+        let Some(sid) = s.id else { continue };
+        if runs.contains(&(sid, u64::try_from(s.fence).unwrap_or_default())) {
+            continue;
+        }
+        let stopping = s.status == SessionStatus::Stopping;
+        match state
+            .sessions
+            .end_not_on_device(sid, device_id, s.fence, stopping)
+            .await
+        {
+            Ok(true) => {
+                info!(session = %sid, device = %device_id, "hive: the device no longer runs a session — ended");
+                room::note_ended(state, sid).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(session = %sid, %e, "hive: a session the device no longer runs was not ended")
+            }
         }
     }
 }

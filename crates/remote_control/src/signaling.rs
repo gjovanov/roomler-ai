@@ -774,6 +774,17 @@ pub enum ClientMsg {
         answered_by: Option<ObjectId>,
     },
 
+    /// FR-90 P1b — the sessions this device RUNS now, sent on every
+    /// connection of its primary enrollment. The server ends every session
+    /// it holds as running on this device that the list leaves out: a daemon
+    /// that restarted runs none of them, and nothing else would ever say so
+    /// (finding 7, 2026-10-08). Ids and fences only.
+    #[serde(rename = "rc:hive.manifest")]
+    HiveManifest {
+        #[serde(default)]
+        sessions: Vec<crate::hive::HiveManifestEntry>,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1550,6 +1561,7 @@ impl ClientMsg {
             ClientMsg::HiveState { .. } => "rc:hive.state",
             ClientMsg::HiveTurn { .. } => "rc:hive.turn",
             ClientMsg::HiveApproval { .. } => "rc:hive.approval",
+            ClientMsg::HiveManifest { .. } => "rc:hive.manifest",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1645,6 +1657,7 @@ impl ClientMsg {
             | ClientMsg::HiveState { .. }
             | ClientMsg::HiveTurn { .. }
             | ClientMsg::HiveApproval { .. }
+            | ClientMsg::HiveManifest { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1676,6 +1689,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.state", Owner::Hive),
     ("rc:hive.turn", Owner::Hive),
     ("rc:hive.approval", Owner::Hive),
+    ("rc:hive.manifest", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -3864,6 +3878,48 @@ mod tests {
             } => assert_eq!((status, turn, answered_by), (None, None, None)),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// FR-90 P1b — the manifest names the sessions a device runs: ids and
+    /// fences, LOCKED, so nothing about what runs in them can join the list.
+    /// A malformed entry fails the whole frame, which the server then never
+    /// sees — and no manifest means nothing ends, the safe direction.
+    #[test]
+    fn hive_manifest_names_sessions_and_nothing_in_them() {
+        use crate::hive::HiveManifestEntry;
+
+        let sid = ObjectId::new();
+        let m = ClientMsg::HiveManifest {
+            sessions: vec![HiveManifestEntry {
+                session_id: sid,
+                fence: 1,
+            }],
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["sessions", "t"]);
+        let mut entry: Vec<&str> = v["sessions"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        entry.sort_unstable();
+        assert_eq!(entry, ["fence", "session_id"]);
+        assert_eq!(v["t"], "rc:hive.manifest");
+        assert_eq!(v["sessions"][0]["session_id"], sid.to_hex());
+        assert_eq!(m.namespace(), Owner::Hive);
+
+        // An empty manifest is a real one: the device runs nothing.
+        let empty = serde_json::json!({"t": "rc:hive.manifest", "sessions": []});
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(empty).unwrap(),
+            ClientMsg::HiveManifest { sessions } if sessions.is_empty()
+        ));
+        let broken =
+            serde_json::json!({"t": "rc:hive.manifest", "sessions": [{"session_id": "x"}]});
+        assert!(serde_json::from_value::<ClientMsg>(broken).is_err());
     }
 
     /// FR-90 P0d-2 — the viewer peer's signalling: a grant, its answer, and
