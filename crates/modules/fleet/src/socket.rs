@@ -146,6 +146,8 @@ pub async fn handle_agent_socket(
     // FR-90 P0d-2 — and serves viewer peers. `hive` is its prefix and NOT
     // the same promise: a P0c agent drops every view frame.
     let serves_hive_views = caps.has_rpc(RpcCap::HiveView);
+    // FR-90 P1e — and understands core memory; `hive` is its prefix too.
+    let takes_hive_memory = caps.has_rpc(RpcCap::HiveMemory);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -164,6 +166,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_view_support(agent_id, serves_hive_views);
+    state
+        .rc_hub
+        .set_agent_hive_memory_support(agent_id, takes_hive_memory);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

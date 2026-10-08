@@ -2827,6 +2827,40 @@ pub enum ServerMsg {
         reason: String,
     },
 
+    /// FR-90 P1e — a session's core memory, rendered from the org's brain at
+    /// the revision the session pinned when it was created, and sent
+    /// IMMEDIATELY BEFORE its [`ServerMsg::HiveStart`] (and before that
+    /// start's re-send on connect), so the device holds it when the launch
+    /// comes. Only to a device that advertises
+    /// [`crate::models::RpcCap::HiveMemory`].
+    ///
+    /// ⚠️ The one Hive frame with text a model reads — and reads as the
+    /// user's own overriding instructions (Claude Code frames `CLAUDE.md`
+    /// that way). So it is its own frame, keeping `rc:hive.start` metadata
+    /// only, and the device's own `hive_core_memory` (default off) decides
+    /// whether any session sees it. Curated facts only: never a prompt, a
+    /// transcript line or a secret.
+    ///
+    /// ⚠️ FROZEN: the snapshot is the one rendered when the session was
+    /// created; a fact added later reaches the next session, never this one.
+    #[serde(rename = "rc:hive.memory")]
+    HiveMemory {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence of the start this snapshot goes with.
+        fence: u64,
+        /// The org's brain revision it was rendered from.
+        brain_rev: u64,
+        /// `CLAUDE.md` — the org's facts, then the starter's. Absent when
+        /// both scopes are empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_md: Option<String>,
+        /// The auto-memory index `MEMORY.md` — the device's facts. Absent
+        /// when that scope is empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_md: Option<String>,
+    },
+
     // ─── Hive viewer peer (rc:hive.view.*) — FR-90 P0d-2 ─────────────────
     /// A view grant: `user_id` may read `session_id` over a data-only WebRTC
     /// peer for `ttl_secs`, and send it prompts if `may_prompt`. The device
@@ -3665,6 +3699,39 @@ mod tests {
             ServerMsg::HiveStart {
                 session_id, fence, ..
             } => assert_eq!((session_id, fence), (sid, 1)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-90 P1e — the core-memory frame's field set is locked: who, which
+    /// fence, which brain revision, and the two documents — nothing a session
+    /// produced can ride along.
+    #[test]
+    fn hive_memory_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let m = ServerMsg::HiveMemory {
+            session_id: sid,
+            fence: 1,
+            brain_rev: 7,
+            claude_md: Some("# Organization memory\n\n- Deploys go through `release`.\n".into()),
+            memory_md: None,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["brain_rev", "claude_md", "fence", "session_id", "t"],
+            "an empty document is absent, not null: {v}"
+        );
+        assert_eq!(v["t"], "rc:hive.memory");
+        assert_eq!(v["session_id"], sid.to_hex(), "ObjectIds are raw hex");
+        match serde_json::from_value::<ServerMsg>(v).unwrap() {
+            ServerMsg::HiveMemory {
+                brain_rev,
+                memory_md,
+                ..
+            } => assert_eq!((brain_rev, memory_md), (7, None)),
             other => panic!("wrong variant: {other:?}"),
         }
     }
