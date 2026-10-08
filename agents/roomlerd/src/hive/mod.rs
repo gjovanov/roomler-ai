@@ -32,12 +32,22 @@
 //! browser, and the transcript — pages, the live feed, prompts from a viewer
 //! that may drive — over its one DataChannel. The server relays the
 //! handshake and never sees what flows over the peer.
+//!
+//! # Approvals (P1a)
+//!
+//! [`toolbelt`]: the session's `roomler` MCP server, whose `approve` is
+//! Claude Code's permission tool — every tool call that needs one waits for a
+//! driver, who answers over the viewer peer. Claude Code reaches it through
+//! `roomlerd hive-mcp <socket>` ([`relay`]), started as the session's
+//! account.
 
 pub mod framing;
 pub mod gates;
+mod lines;
 mod sidecar;
 mod store;
 mod supervisor;
+mod toolbelt;
 pub mod view;
 
 #[cfg(feature = "hive-test-launcher")]
@@ -45,6 +55,7 @@ pub use supervisor::init_as_daemon;
 pub use supervisor::{
     Author, StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
 };
+pub use toolbelt::{relay, relay_args};
 pub use view::{
     ViewGrant, handle_view_close, handle_view_grant, handle_view_ice, handle_view_offer,
     handle_view_renew,

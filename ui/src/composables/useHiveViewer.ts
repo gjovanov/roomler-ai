@@ -13,7 +13,9 @@
  * Over the peer's one DataChannel (`hive`), JSON messages travel in binary
  * frames (`utils/hiveFraming.ts` — an SCTP message over 64 KiB is silently
  * lost). We ask: `hello`, `page {after, limit}`, `follow {after}`,
- * `prompt {id, text}`; the device answers and pushes `events` and `state`.
+ * `prompt {id, text}`, `answer {id, approval, decision, message?}`; the device
+ * answers and pushes `events`, `state` and `approvals` (the ids open now —
+ * a card is answerable only while its id is in the latest list).
  *
  * ⚠️ The peer is CLOSED on every way out — unmount, close(), a grant the
  * server or the device ends, a socket that redials. A WebRTC peer that is
@@ -42,6 +44,10 @@ export type TranscriptEvent =
     }
   | { kind: 'compaction'; trigger?: string | null; pre_tokens?: number | null }
   | { kind: 'note'; text: string }
+  /** FR-90 P1a — a tool call waiting for a driver; `input` is what will run. */
+  | { kind: 'approval_requested'; id: string; tool_name: string; tool_use_id?: string | null; input: unknown }
+  /** `outcome`: allowed · denied · expired · withdrawn (a newer word is shown as is). */
+  | { kind: 'approval_resolved'; id: string; outcome: string; by?: string | null; message?: string | null }
   /** A kind this build does not know: shown as such, never dropped. */
   | { kind: string; [field: string]: unknown }
 
@@ -113,6 +119,10 @@ export function useHiveViewer() {
   const events = shallowRef<HiveEvent[]>([])
   const runState = ref<string | null>(null)
   const mayPrompt = ref(false)
+  /** A driver answers approvals (P1a): the device says whether we are one. */
+  const mayAnswer = ref(false)
+  /** The approval ids open now, as the device last said. */
+  const pendingApprovals = ref<string[]>([])
   const live = ref(false)
   const hasEarlier = ref(false)
 
@@ -133,6 +143,7 @@ export function useHiveViewer() {
   let helloWaiter: ((m: Frame) => void) | null = null
   let pageWaiter: ((m: Frame) => void) | null = null
   const promptWaiters = new Map<string, (m: Frame) => void>()
+  const answerWaiters = new Map<string, (m: Frame) => void>()
   // An open asked for before the socket was up, sent once it is.
   let openPending = false
 
@@ -202,6 +213,10 @@ export function useHiveViewer() {
     for (const resolve of waiting) resolve?.({ type: 'closed' })
     for (const resolve of promptWaiters.values()) resolve({ type: 'prompt', ok: false, error: 'closed' })
     promptWaiters.clear()
+    for (const resolve of answerWaiters.values()) resolve({ type: 'answer', ok: false, error: 'closed' })
+    answerWaiters.clear()
+    // Nothing is answerable through a peer that is gone.
+    pendingApprovals.value = []
   }
 
   function merge(incoming: HiveEvent[], where: 'append' | 'prepend'): void {
@@ -240,6 +255,15 @@ export function useHiveViewer() {
         resolve?.(m)
         break
       }
+      case 'approvals':
+        pendingApprovals.value = Array.isArray(m.pending) ? m.pending.map(String) : []
+        break
+      case 'answer': {
+        const resolve = answerWaiters.get(m.id)
+        answerWaiters.delete(m.id)
+        resolve?.(m)
+        break
+      }
       case 'error':
         console.warn('[hive] the device answered an error:', m.error)
         break
@@ -257,6 +281,8 @@ export function useHiveViewer() {
       return
     }
     mayPrompt.value = !!hello.may_prompt
+    mayAnswer.value = !!hello.may_answer
+    pendingApprovals.value = Array.isArray(hello.approvals) ? hello.approvals.map(String) : []
     live.value = !!hello.live
     runState.value = hello.state ?? null
     const tip = Number(hello.tip ?? 0)
@@ -404,6 +430,21 @@ export function useHiveViewer() {
     })
   }
 
+  /** Answer an open approval — only a driver's answer is taken (P1a). A
+   *  denial may carry a message, which the agent reads. */
+  function answer(
+    approval: string,
+    decision: 'allow' | 'deny',
+    message?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (status.value !== 'open') return Promise.resolve({ ok: false, error: 'not connected' })
+    const id = newRef()
+    return new Promise((resolve) => {
+      answerWaiters.set(id, (m) => resolve({ ok: !!m.ok, error: m.error }))
+      send({ op: 'answer', id, approval, decision, ...(message ? { message } : {}) })
+    })
+  }
+
   function close(): void {
     teardown(true)
     status.value = 'closed'
@@ -433,5 +474,20 @@ export function useHiveViewer() {
 
   onBeforeUnmount(close)
 
-  return { status, reason, events, runState, mayPrompt, live, hasEarlier, open, close, prompt, loadEarlier }
+  return {
+    status,
+    reason,
+    events,
+    runState,
+    mayPrompt,
+    mayAnswer,
+    pendingApprovals,
+    live,
+    hasEarlier,
+    open,
+    close,
+    prompt,
+    answer,
+    loadEarlier,
+  }
 }

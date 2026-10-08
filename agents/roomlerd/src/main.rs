@@ -1089,6 +1089,23 @@ async fn daemon_main() -> Result<()> {
         return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
     }
 
+    // FR-90 P1a — `roomlerd hive-mcp <socket>`: a Hive session's toolbelt
+    // relay, started by Claude Code as the session's account. Like the
+    // embedded CLI it runs none of the setup below, and it EXITS rather than
+    // returns: the runtime's shutdown would wait on a stdin read the harness
+    // may hold open.
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    if let Some(socket) = roomlerd::hive::relay_args() {
+        let code = match roomlerd::hive::relay(&socket).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("roomlerd hive-mcp: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     // #1705 — the desktop companion's service probes (every 10 s) answer one
     // question about the service manager; none of the daemon setup below is
     // theirs, and its startup lines used to flood the per-user log.

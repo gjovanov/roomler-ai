@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), whose six findings P0g fixes; AC3 and AC4 partly field-verified (§5, §8) · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 (approvals, the device and the UI) in review · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -208,6 +208,30 @@ substitution at a TLS-terminating egress proxy for audience hosts only; every se
 audiences. Knowhow is built from fleet and network sync, opt-in scans and session proposals, and a
 fact turns active only when a probe or a person confirms it.
 
+**P1a builds the toolbelt with one tool, `approve`** (`agents/roomlerd/src/hive/toolbelt.rs`), and
+it was built against Claude Code's contract as MEASURED, not as remembered. Claude Code 2.1.293,
+driven by a fake Messages API and a fake MCP server on 2026-10-08 (§8):
+
+| Claude Code does | so the toolbelt |
+|---|---|
+| probes with `server/discover` (MCP draft `2026-07-28`) before `initialize`, and initializes when told no | answers every unknown method `-32601`; silence would stall the harness's start |
+| calls `approve` with `{tool_name, input, tool_use_id}` and `_meta.progressToken`, and waits | answers `{"behavior":"allow","updatedInput":<input>}` or `{"behavior":"deny","message":…}` as one text block, and sends progress every 60 s while a person decides |
+| asks ONE approval at a time — two parallel writes were two calls, the second after the first was answered | caps a session at 4 open and refuses a fifth at once |
+| hands the model a denial as `tool_result {is_error: true}` with our message verbatim, and lists it in the result's `permission_denials` | says who denied it and why ("Dev denied this: not now") |
+| keeps the permission tool out of the model's own tool list | needs no `--disallowedTools` for `approve` |
+| with the server unreachable, errors every call that needs approval ("MCP tool mcp__roomler__approve … not found") and exits 1 | fails CLOSED: nothing runs unapproved |
+| starts a `-p` run that fetches no feature flags in **`auto`** when nothing sets a mode | is only reached under `--permission-mode default`, which the launch now pins |
+| runs a command in its read-only set (`whoami`) and reads under the working directory without asking, in every mode | — those never reach `approve` |
+
+Claude Code starts the toolbelt itself, as the session's account, so the server it starts is a relay:
+`roomlerd hive-mcp <socket>`, short-circuited at the top of `daemon_main` like the embedded CLI, so it
+runs none of the daemon's start-up and writes nothing as that account. The socket is the session
+account's, `0600`, in `<runtime>/<sid>/` (root, `0755`, holding the daemon-written `settings.json`
+and `mcp.json`), and every connection's peer uid is checked again — a process running as that
+account can connect, and all it can do is ask. The run state is the session task's alone to write:
+the toolbelt reports each approval opening and closing on a channel the task reads after the
+harness's stdout, so the `tool_use` lands in the transcript before the approval it caused.
+
 ### 3f. The brain
 
 Central, in the `hive` module: core memory in four scopes (org, project, user, device) with budgets
@@ -243,7 +267,9 @@ device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hi
 | P0d-3 | the UI: `hive` in the SPA's module registry (default-OFF, so the capability gate fails CLOSED for it, where every other module fails open); `stores/hive` (the record); `views/hive/HiveSessionsView` (list, start dialog, stop); `useHiveViewer`, the browser's half of the viewer peer (`hive:view.*` signalling, a data-only peer dialled only after `ready`, the framing, history + live follow + "ask the agent", `close()` on every way out); `HiveTranscript` as a side panel of a hive-bound room (assistant text through `renderMarkdown`, everything else text-interpolated); `SessionView` gains `device_name` | the server's `[modules] hive` — the SPA shows nothing until the server names the module | **merged** #1842 `eef760896` |
 | P0e | the model sidecar: a loopback HTTP/1.1 endpoint in the daemon. The harness gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/s/<sid>` and a per-session token in `ANTHROPIC_API_KEY` — never the provider's key, which `hive_api_key_helper` prints to the DAEMON (cached 5 min, fetched again after a 401). Each call: this session's token, the session still running here at its fence, the device not offline past `offline_grace` (120 s), else refused in the provider's error shape; only `POST /v1/messages` and `/v1/messages/count_tokens`, matched exactly; forwarded unchanged with the key swapped in, the answer streamed (never buffered), `retry-after` and the rate-limit headers intact | feature `hive` not in `full`; no helper = no model access | **merged** #1843 `12bdadc4e` |
 | P0f | the canary test (AC2, one device): `crates/tests/tests/hive_canary.rs`, its own test binary because the supervisor is process-global, drives a real server and a real in-process device (`hive::init_as_daemon`, feature `hive-test-launcher`: sessions as the test's own account, refused as root, in no release build). A prompt over the viewer peer, a tool's output, and a crashing harness's stderr each carry a canary; each must be in the device's store and in no Mongo document, object-store file, server log line or frame the server sent the browser — each absence checked beside a presence that proves the check can see. It found one channel: the `ended` detail carried the harness's last 400 bytes of stderr to the server, now a `note` in the device's transcript | a test; `hive-test-launcher` is test-only | **merged** #1844 `11f1838d7` |
-| P0g | the AC1 field run's six findings: the server takes a start's answer in any live status (the daemon's `idle` lands first); the viewer waits for the socket before asking, and asks again after a redial; the device wires its channel's handlers inside `on_data_channel` (webrtc-rs reads the channel only after that callback returns) and the browser asks `hello` again until it is answered; `hive_api_workspace_id`, sent by the sidecar as `anthropic-workspace-id`; a turn records what it cost, not the process's running total; a repeated session announcement is shown once | fixes; `hive_api_workspace_id` unset = unchanged | PR open |
+| P0g | the AC1 field run's six findings: the server takes a start's answer in any live status (the daemon's `idle` lands first); the viewer waits for the socket before asking, and asks again after a redial; the device wires its channel's handlers inside `on_data_channel` (webrtc-rs reads the channel only after that callback returns) and the browser asks `hello` again until it is answered; `hive_api_workspace_id`, sent by the sidecar as `anthropic-workspace-id`; a turn records what it cost, not the process's running total; a repeated session announcement is shown once | fixes; `hive_api_workspace_id` unset = unchanged | **merged** #1846 `601cc10f8` |
+| P1a-1 | approvals, the device and the UI: the session's **toolbelt** — one `roomler` MCP server per session on `<runtime>/<sid>/toolbelt.sock` (the session account's, `0600`, in a directory only the daemon writes; every peer's uid checked again), reached by the relay `roomlerd hive-mcp <socket>` that Claude Code itself starts as that account; its `approve` is the `--permission-prompt-tool`. The launch pins `--permission-mode default` (unset, a run behind the sidecar starts in `auto`, where a classifier decides), `--strict-mcp-config` (a repository's `.mcp.json` cannot shadow `roomler`) and `--disallowedTools AskUserQuestion`. While one is open the session is `awaiting_approval`; the transcript gets `approval_requested` (the call's own input) and `approval_resolved`; the viewer's `hello` names the open approvals, the device pushes `approvals` when they change, and a DRIVER's `answer {approval, allow\|deny, message?}` is taken, a reader's refused. Unanswered for 25 min is a denial that says so; a stop, or the harness letting go, withdraws it. The UI's approval card: Allow, Deny with a reason | feature `hive` not in `full`; device `hive_enabled = false` | PR open |
+| P1a-2 | approvals, the server: `rc:hive.approval` (metadata only: the approval's id, open or how it ended, who answered) → a stub in the session's room ("needs approval": no tool, no arguments) edited when it ends; `agent_approvals`; a push with no content to the session's drivers | `[modules] hive = false` | — |
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset: replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` | — |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
@@ -282,7 +308,10 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   Windows device with nobody signed in refuses `no_console_user`. *Linux, in the field
   (2026-10-07): the harness process ran as `hivetest` (`ps`), in `/home/hivetest/work`, under a
   root daemon. The literal `whoami` waits for P1's approvals: headless Claude Code denies Bash
-  without an approval tool. macOS and Windows are P1.*
+  without an approval tool. macOS and Windows are P1.* *Corrected 2026-10-08 by P1a's contract
+  probe: `whoami` is in Claude Code's read-only command set and runs without asking in every mode;
+  what P0's sessions lacked was a pinned permission mode (they started in `auto`, a classifier's
+  call). The literal check needs only a turn that runs it.*
 - [ ] **AC4:** cutting a primary's network stops its model calls within `offline_grace` (120 s), and
   an executor holding a stale fence makes zero model calls (mock-llm capture). *First half
   field-verified 2026-10-07, on the real device, with the session's own token against its sidecar.
@@ -334,6 +363,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
 5. **`fleet_exec` for agents** — keep it behind a permit and a per-call approval (proposed), or drop
    it.
 6. **Subscription logins** — legal review of the design's §11.3 before GA.
+7. **A session's permission mode, and its repository's own settings** (P1a) — the mode is pinned to
+   `default` (a person decides everything but reads). A device-owned `hive_permission_mode`
+   (`acceptEdits`, `auto`, `plan`; never `bypassPermissions`) is the likely next knob. The
+   toolbelt's `--strict-mcp-config` switches a repository's `.mcp.json` off, so nothing can shadow
+   `approve`; a repository's `.claude/settings.json` still loads, and its `permissions.allow` rules
+   merge with ours, so a repository can pre-allow its own commands. That is the user's own repository
+   and account — the prompts are UX, not the boundary — but `--setting-sources` could narrow it.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
@@ -368,6 +404,8 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-07 | master `d5d084c61` | the start and the viewer, end to end | ❌ six findings, all fixed in P0g: (1) a start's answer lost when the device's `idle` arrived first, so the caller waited the whole 10 s and the account and started note were gone; (2) a cold load of the room lost `hive:view.open`; (3) the device dropped the browser's first DataChannel frame, so a panel never got its history; (4) a key not scoped to a workspace needs `anthropic-workspace-id`; (5) turn cost was the process's running total; (6) "Session started" at every turn |
 | 2026-10-08 | P0g branch, same stack | the fixes, end to end | ✅ a new session's start answered in **0.27 s** (it was 10 s), with `account: hivetest`, `accepted_at` and the "Started on … as **hivetest**" note; a **cold load** of its room opened the viewer in 1.2 s; a turn rendered with its own cost ($0.16); the old session's three announcements shown **once**; the frame log shows `hello` answered at the first ask |
 | 2026-10-08 | P0g branch, same stack | a daemon restart | ❌ (7) the sessions it ran stay `idle` on the server — §3d; Stop clears one; not in P0g |
+| 2026-10-08 | Claude Code 2.1.293 alone, as `hivetest` | P1a's contract probe: a fake Messages API (one `tool_use`, then text) and a fake MCP `approve`, no model spend | ✅ the contract in §3e; and two findings it was built around — a `-p` run with no mode set started in **`auto`** (P0's sessions were a classifier's call, not a person's), and `whoami` needs no approval in any mode |
+| 2026-10-08 | P1a-1 branch, `roomlerd` debug | the REAL relay with the REAL Claude Code: `--mcp-config` naming `roomlerd hive-mcp <socket>`, a socket-served approver, the fake model | ✅ Claude Code started the relay as `hivetest`, connected in 83 ms, the `Write` was approved through it and ran as `hivetest`; at the end Claude Code sent the relay SIGINT and it exited cleanly; nothing written under the account's home but Claude Code's own MCP log (metadata only) |
 
 ## 9. Related
 
