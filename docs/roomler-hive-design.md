@@ -494,6 +494,15 @@ every agent mid-turn.
   pushed update — waits on Linux, bounded by the device's `hive_update_wait_secs`, and
   holds new prompts and starts once it goes ahead.*
 
+*As built (FR-90 P1d-2), the park-and-resume, before any `hive-host`, on Linux, where
+sessions run today:* the harness still dies with the daemon, but the session does not. The device
+keeps what it hosts on disk. A harness that dies once the daemon is stopping is kept rather
+than ended. The next daemon resumes each session at its first connection, before its manifest,
+through every gate as configured then. Claude Code is relaunched with `--resume` exactly when
+its own history exists, the turn count carries on, and a cut turn and its approvals are reported
+as such. `hive-host` outside the daemon's cgroup stays the optimisation on top: no relaunch, and
+the session's background processes live on.
+
 Adapters: `claude` in P0, `codex` later (`codex resume`, a custom `model_providers`
 base URL, MCP; its rollout files under `~/.codex/sessions` have no officially documented
 layout). The `Harness` trait from v0.2 stays, without `project_brain` (§10.3 projects

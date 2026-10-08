@@ -115,6 +115,19 @@ impl LaunchSpec {
         format!("hive-{}", self.session)
     }
 
+    /// Where Claude Code keeps this session's own history, written from its
+    /// first prompt on. FR-90 P1d-2: whether it exists decides between
+    /// `--resume` and `--session-id`, because Claude Code refuses the other
+    /// two ways round — "Session ID … is already in use" for a new id whose
+    /// history exists, "No conversation found" for a resume without one
+    /// (2.1.293, probed 2026-10-08).
+    pub fn history_path(&self) -> PathBuf {
+        self.config_dir()
+            .join("projects")
+            .join(self.project_dir_name())
+            .join(format!("{}.jsonl", self.session))
+    }
+
     /// Refuse a spec the harness or the daemon would misread.
     pub fn validate(&self) -> Result<(), LaunchError> {
         if uuid::Uuid::parse_str(&self.session).is_err() {
@@ -474,6 +487,16 @@ mod tests {
         assert_eq!(
             get("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://127.0.0.1:47000/s/6f1c")
+        );
+        // P1d-2 — the history a resume needs, under the pinned project name
+        // whatever the working directory (the layout Claude Code writes).
+        assert_eq!(
+            s.history_path(),
+            s.state_dir
+                .join("claude")
+                .join("projects")
+                .join(format!("hive-{}", s.session))
+                .join(format!("{}.jsonl", s.session))
         );
     }
 

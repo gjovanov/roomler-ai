@@ -3555,7 +3555,22 @@ async fn run_cmd(
     // (restart-required). Built with every gate closed too, so a start is
     // answered with the device's actual refusal rather than silence.
     #[cfg(all(feature = "hive", target_os = "linux"))]
-    roomlerd::hive::init(&cfg);
+    {
+        roomlerd::hive::init(&cfg);
+        // FR-90 P1d-2 — every way the daemon stops signals this first (an
+        // update, a requested restart, a rollback, an OS stop), before its
+        // connections close: from that moment, what its sessions do is going
+        // down with it, and what the device hosts is frozen for the next one.
+        let mut stopping = shutdown_rx.clone();
+        tokio::spawn(async move {
+            while stopping.changed().await.is_ok() {
+                if *stopping.borrow() {
+                    roomlerd::hive::begin_shutdown();
+                    break;
+                }
+            }
+        });
+    }
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
     // Route* verbs (persisting through the write lock).
@@ -4239,6 +4254,11 @@ async fn run_cmd(
     let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
+            // FR-90 P1d-2 — first, on every way out: a harness that ends from
+            // here on went down with the daemon, and its session is resumed
+            // by the next one instead of being ended.
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            roomlerd::hive::begin_shutdown();
             // FR-84 D3 — an accepted restart leaves through the graceful door
             // whatever the signalling loop did on its way out (an error, even
             // a panic): the shutdown is our own, and a crash counted here
@@ -4274,6 +4294,8 @@ async fn run_cmd(
             }
         }
         _ = tokio::signal::ctrl_c() => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            roomlerd::hive::begin_shutdown();
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -4285,6 +4307,10 @@ async fn run_cmd(
         // for what this cost before it existed (#1040 on Unix; #1683 on the
         // Windows SCM service, where the stop arrived only as a hard kill).
         _ = terminate_signal(stop_event) => {
+            // Under systemd the same stop reaches every harness a moment
+            // after this (`KillMode=control-group`).
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            roomlerd::hive::begin_shutdown();
             tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
             os_initiated_stop = true;
