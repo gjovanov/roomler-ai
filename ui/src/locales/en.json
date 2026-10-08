@@ -230,13 +230,14 @@
       "unknownKind": "An event this version cannot show ({kind}).",
       "askPlaceholder": "Ask the agent…",
       "askFailed": "The prompt did not reach the agent.",
-      "readOnly": "You can read this session. Only its starter can prompt it.",
+      "readOnly": "You can read this session and talk in its room. Only its drivers can prompt the agent.",
+      "drivingRefused": "You drive this session, but its device does not let you act there: {why}",
       "approval": {
         "asks": "{tool} needs approval to run",
         "allow": "Allow",
         "deny": "Deny",
         "denyPlaceholder": "Why not? (optional — the agent reads it)",
-        "waiting": "Waiting for the session's starter to answer.",
+        "waiting": "Waiting for one of the session's drivers to answer.",
         "unanswered": "Not answered.",
         "allowed": "Allowed by {by}",
         "denied": "Denied by {by}",
@@ -246,6 +247,21 @@
         "other": "Ended: {outcome}",
         "failed": "The answer did not reach the device."
       }
+    },
+    "people": {
+      "button": "People",
+      "title": "Who takes part",
+      "explain": "Drivers prompt the agent and answer its approvals. Readers read the session and talk in its room — nothing they write reaches the agent. Only the session's owner changes who takes part.",
+      "role": {
+        "owner": "Owner",
+        "driver": "Driver",
+        "reader": "Reader"
+      },
+      "add": "Add someone from the organization",
+      "noMatch": "No one else matches",
+      "addReader": "Add as reader",
+      "addDriver": "Add as driver",
+      "remove": "Take them out of the session"
     }
   }
 }

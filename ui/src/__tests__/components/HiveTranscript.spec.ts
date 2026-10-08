@@ -36,6 +36,7 @@ function makeViewer(events: any[], pending: string[], mayAnswer: boolean) {
     runState: ref(pending.length ? 'awaiting_approval' : 'running'),
     mayPrompt: ref(mayAnswer),
     mayAnswer: ref(mayAnswer),
+    drivingRefused: ref<string | null>(null),
     pendingApprovals: ref(pending),
     live: ref(true),
     hasEarlier: ref(false),
@@ -110,7 +111,7 @@ describe('HiveTranscript — approvals (FR-90 P1a)', () => {
     const w = await render()
     expect(button(w, 'hive-approve').exists()).toBe(false)
     expect(button(w, 'hive-deny').exists()).toBe(false)
-    expect(w.find('[data-approval="a1"]').text()).toContain("Waiting for the session's starter to answer.")
+    expect(w.find('[data-approval="a1"]').text()).toContain("Waiting for one of the session's drivers to answer.")
   })
 
   it('takes the device’s word over the transcript: not open means no buttons', async () => {
@@ -145,5 +146,24 @@ describe('HiveTranscript — approvals (FR-90 P1a)', () => {
     const card = w.find('[data-approval="a1"]')
     expect(card.find('img').exists()).toBe(false)
     expect(card.text()).toContain('<img src=x onerror=')
+  })
+})
+
+describe('HiveTranscript — who drives (FR-90 P1c)', () => {
+  it('tells a reader they read and talk, and gives them no composer', async () => {
+    hoisted.viewer = makeViewer([], [], false)
+    const w = await render()
+    expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
+    expect(w.find('[data-testid="hive-read-only"]').text()).toContain('Only its drivers can prompt the agent.')
+  })
+
+  it("says in the device's words why a driver the server named cannot act there", async () => {
+    hoisted.viewer = makeViewer([], [], false)
+    hoisted.viewer.drivingRefused.value = "this device's hive_accounts maps you to no account"
+    const w = await render()
+    expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
+    expect(w.find('[data-testid="hive-read-only"]').text()).toBe(
+      "You drive this session, but its device does not let you act there: this device's hive_accounts maps you to no account",
+    )
   })
 })
