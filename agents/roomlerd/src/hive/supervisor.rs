@@ -730,6 +730,11 @@ impl Supervisor {
         *self.model_key.lock().await = None;
     }
 
+    /// The workspace a key not scoped to one makes its calls in.
+    pub(crate) fn model_workspace(&self) -> Option<&str> {
+        self.cfg.api_workspace_id.as_deref()
+    }
+
     /// Tests only: a mock provider, and a shorter `offline_grace`.
     #[cfg(test)]
     pub(crate) fn with_sidecar(mut self, upstream: String, offline_grace: Duration) -> Self {
@@ -1028,6 +1033,8 @@ struct Task<'a> {
     queued: std::collections::VecDeque<(Option<Author>, String)>,
     /// `Live::waiting`: a prompt's place is given back when it BEGINS.
     waiting: Arc<AtomicUsize>,
+    /// The harness process's running cost at its last turn's end.
+    spent: f64,
 }
 
 /// What a session task is fed, and the count of prompts it holds.
@@ -1087,11 +1094,24 @@ impl Task<'_> {
 
     /// Record one event; a `result` closes the turn and lets the next queued
     /// prompt in.
-    async fn on_event(&mut self, ev: TranscriptEvent) {
+    async fn on_event(&mut self, mut ev: TranscriptEvent) {
         if matches!(ev, TranscriptEvent::ToolUse { .. })
             && let Some(c) = self.current.as_mut()
         {
             c.steps += 1;
+        }
+        // Claude Code's `total_cost_usd` is its PROCESS's running total, so
+        // every `result` carries all the turns before it too (field,
+        // 2026-10-07: turn 3 read $0.33 for a turn that cost $0.16). The
+        // transcript and the stub both say what THIS turn cost.
+        if let TranscriptEvent::Turn {
+            cost_usd: Some(total),
+            ..
+        } = &mut ev
+        {
+            let this_turn = ((*total - self.spent) * 1e6).round() / 1e6;
+            self.spent = *total;
+            *total = this_turn.max(0.0);
         }
         let end = match &ev {
             TranscriptEvent::Turn {
@@ -1186,6 +1206,7 @@ async fn run(
         current: None,
         queued: Default::default(),
         waiting,
+        spent: 0.0,
     };
     let mut lines = LineReader::new(BufReader::new(stdout));
     let limits = Limits::default();
@@ -1349,9 +1370,12 @@ pub(crate) mod tests {
     /// the headless harness reading stream-json input, it says `init` once
     /// its first prompt arrives, then answers each prompt with a text block
     /// and a turn result. A prompt containing `crash` exits 3 with a word on
-    /// stderr; `slow` takes a second; `tool` makes one tool call first.
+    /// stderr; `slow` takes a second; `tool` makes one tool call first. Its
+    /// `total_cost_usd`, like Claude Code's, is the PROCESS's running total:
+    /// 0.25 more at every turn.
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 first=1
+spent=0
 while IFS= read -r line; do
   case "$line" in
     *crash*) echo "boom" >&2; exit 3 ;;
@@ -1370,7 +1394,9 @@ while IFS= read -r line; do
       ;;
   esac
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from the fake"}]}}'
-  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.25}'
+  spent=$((spent + 25))
+  cost=$(printf '%d.%02d' $((spent / 100)) $((spent % 100)))
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":'"$cost"'}'
 done
 "#;
 
@@ -1410,6 +1436,7 @@ done
             max_sessions: max,
             harness: Some(harness),
             api_key_helper: None,
+            api_workspace_id: None,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -1699,6 +1726,38 @@ done
             })
             .unwrap();
         assert_eq!(ended, (Some(5), Some(0.25)), "the harness's own figures");
+        r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// Claude Code's `total_cost_usd` is its PROCESS's running total; a turn
+    /// costs the difference. Field, 2026-10-07: turn 3 read $0.33 for a turn
+    /// that cost $0.16.
+    #[tokio::test]
+    async fn each_turn_records_what_it_cost_not_the_running_total() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        for _ in 0..3 {
+            r.sup.prompt(sid, None, "hi".into()).unwrap();
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        }
+        let costs: Vec<f64> = r
+            .store
+            .events(&sid.to_hex())
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Turn { cost_usd, .. } => *cost_usd,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            costs,
+            [0.25, 0.25, 0.25],
+            "the harness said 0.25, 0.50, 0.75"
+        );
         r.sup.stop(sid, 1, "owner".into());
     }
 

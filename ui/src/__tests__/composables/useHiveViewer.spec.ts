@@ -7,7 +7,7 @@
  * channel, and that every way out closes the peer.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { defineComponent, h, nextTick } from 'vue'
+import { defineComponent, h, nextTick, reactive } from 'vue'
 import { mount } from '@vue/test-utils'
 import { decodeJson, encodeJson, Reassembler } from '@/utils/hiveFraming'
 
@@ -16,7 +16,7 @@ import { decodeJson, encodeJson, Reassembler } from '@/utils/hiveFraming'
 type Handler = (data: any) => void
 const handlers = new Map<string, Handler>()
 const sent: { type: string; data: Record<string, unknown> }[] = []
-const wsState = { connectionId: 'conn-1' }
+const wsState = reactive<{ connectionId: string | null }>({ connectionId: 'conn-1' })
 vi.mock('@/stores/ws', () => ({
   useWsStore: () => ({
     get connectionId() {
@@ -217,6 +217,93 @@ describe('useHiveViewer', () => {
     ch.deliver({ op: 'prompt', id: req.id, ok: false, error: 'read_only: no' })
     await expect(pending).resolves.toEqual({ ok: false, error: 'read_only: no' })
     unmount()
+  })
+
+  it('waits for the socket before asking: a cold load of the room loses nothing', async () => {
+    // Field, 2026-10-07: the room mounted before the socket's first
+    // `connected`, the store dropped the open, and the panel said
+    // "Asking the device…" for ever.
+    wsState.connectionId = null
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-cold')
+    await flush()
+    expect(sent.filter((s) => s.type === 'hive:view.open')).toEqual([])
+    expect(viewer.status.value).toBe('opening')
+
+    wsState.connectionId = 'conn-first'
+    await flush()
+    const opens = sent.filter((s) => s.type === 'hive:view.open')
+    expect(opens.length).toBe(1)
+    expect(opens[0].data.session_id).toBe('sess-cold')
+    // …and it is the request the answer is routed by.
+    serverSays('hive:view.ready', { ref: opens[0].data.ref, grant_id: 'g-cold', ice_servers: [], ttl_secs: 600 })
+    await flush()
+    expect(FakePeer.last).not.toBeNull()
+    unmount()
+  })
+
+  it('asks again when a redial forgets a request still waiting for its answer', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-redial')
+    expect(sent.filter((s) => s.type === 'hive:view.open').length).toBe(1)
+    wsState.connectionId = 'conn-2'
+    await flush()
+    const opens = sent.filter((s) => s.type === 'hive:view.open')
+    expect(opens.length).toBe(2)
+    expect(opens[1].data.ref).not.toBe(opens[0].data.ref)
+    unmount()
+  })
+
+  it('asks hello again until the device answers, and gives up out loud', async () => {
+    vi.useFakeTimers()
+    try {
+      const { viewer, unmount } = await mountViewer()
+      viewer.open('sess-hello')
+      const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+      serverSays('hive:view.ready', { ref, grant_id: 'g-hello', ice_servers: [], ttl_secs: 600, may_prompt: true })
+      await flush()
+      const ch = FakePeer.last!.channel
+      ch.open()
+      await flush()
+      // The first hello is lost on the device's side: nothing comes back.
+      expect(ch.requests().filter((r) => r.op === 'hello').length).toBe(1)
+      await vi.advanceTimersByTimeAsync(1500)
+      await flush()
+      expect(ch.requests().filter((r) => r.op === 'hello').length).toBe(2)
+      ch.deliver({ op: 'hello', v: 1, tip: 0, live: true, state: 'idle', may_prompt: true })
+      await flush()
+      expect(ch.requests().at(-1)).toEqual({ op: 'page', after: 0, limit: 300 })
+      unmount()
+
+      // A device that never answers ends the viewer with a reason, not a hang.
+      const second = await mountViewer()
+      second.viewer.open('sess-silent')
+      const ref2 = sent.filter((s) => s.type === 'hive:view.open').at(-1)!.data.ref
+      serverSays('hive:view.ready', { ref: ref2, grant_id: 'g-silent', ice_servers: [], ttl_secs: 600 })
+      await flush()
+      FakePeer.last!.channel.open()
+      await flush()
+      await vi.advanceTimersByTimeAsync(4 * 1500 + 10)
+      await flush()
+      expect(second.viewer.status.value).toBe('closed')
+      expect(second.viewer.reason.value).toBe('no_hello')
+      second.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows a session announcement once, not at every turn', async () => {
+    const { withoutRepeatedInits } = await import('@/composables/useHiveViewer')
+    const init = (seq: number, model = 'm') => ({
+      seq,
+      ts: seq,
+      fence: 1,
+      event: { kind: 'session_init', harness_session_id: 'h1', model, cwd: '/w', tools: [] },
+    })
+    const note = (seq: number) => ({ seq, ts: seq, fence: 1, event: { kind: 'note', text: `n${seq}` } })
+    const shown = withoutRepeatedInits([init(1), note(2), init(3), note(4), init(5, 'other'), note(6)])
+    expect(shown.map((e) => e.seq)).toEqual([1, 2, 4, 5, 6])
   })
 
   it('reports a refusal in the words it came with, and dials nothing', async () => {

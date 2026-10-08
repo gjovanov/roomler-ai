@@ -44,7 +44,7 @@
       >
         {{ $t('hive.viewer.empty') }}
       </div>
-      <div v-for="e in viewer.events.value" :key="e.seq" class="hive-event mb-2" :data-kind="e.event.kind">
+      <div v-for="e in shown" :key="e.seq" class="hive-event mb-2" :data-kind="e.event.kind">
         <template v-if="e.event.kind === 'user_message'">
           <div class="text-caption text-medium-emphasis">{{ asText(e.event.author) || $t('hive.viewer.someone') }}</div>
           <div class="hive-prompt pa-2 rounded">{{ asText(e.event.text) }}</div>
@@ -111,11 +111,12 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { renderMarkdown } from '@/composables/useMarkdown'
-import { useHiveViewer } from '@/composables/useHiveViewer'
+import { useHiveViewer, withoutRepeatedInits } from '@/composables/useHiveViewer'
 
 const props = defineProps<{ sessionId: string }>()
 const { t } = useI18n()
 const viewer = useHiveViewer()
+const shown = computed(() => withoutRepeatedInits(viewer.events.value))
 
 const listRef = ref<HTMLElement | null>(null)
 const nearBottom = ref(true)

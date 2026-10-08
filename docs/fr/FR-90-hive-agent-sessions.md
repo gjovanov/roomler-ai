@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; no browser has driven a session on a real device yet: AC1, AC3 and AC4 wait on the operator's choice of server, device and model credential (§4) · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), whose six findings P0g fixes; AC3 and AC4 partly field-verified (§5, §8) · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -188,6 +188,14 @@ supersede an older run still live on the same device (stop it, then launch): as 
 the older run's `finish` would drop the newer run's live entry, and with it the newer run's model
 access (`roomlerd/src/hive/supervisor.rs`).
 
+⚠️ **A daemon restart leaves its sessions live on the server** (found in the field, 2026-10-08).
+The reconcile on connect re-sends only `starting` and `stopping` sessions
+(`crates/modules/hive/src/agent_socket.rs` `reconcile_on_connect`). Live ones rely on the device's
+replay of its last reports, which a restarted daemon no longer holds, so the record reads `idle`
+with no harness behind it. Stop clears one: the device answers "not running on this device" and
+the record ends. The fix is a manifest of the sessions the device runs, sent on connect so the
+server ends the rest, or P1's resume, which makes the session survive the restart.
+
 ### 3e. Toolbelt, vault, knowhow
 
 The `roomler` MCP server per session (over a per-session socket or pipe, not the main LocalAPI):
@@ -235,6 +243,7 @@ device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hi
 | P0d-3 | the UI: `hive` in the SPA's module registry (default-OFF, so the capability gate fails CLOSED for it, where every other module fails open); `stores/hive` (the record); `views/hive/HiveSessionsView` (list, start dialog, stop); `useHiveViewer`, the browser's half of the viewer peer (`hive:view.*` signalling, a data-only peer dialled only after `ready`, the framing, history + live follow + "ask the agent", `close()` on every way out); `HiveTranscript` as a side panel of a hive-bound room (assistant text through `renderMarkdown`, everything else text-interpolated); `SessionView` gains `device_name` | the server's `[modules] hive` — the SPA shows nothing until the server names the module | **merged** #1842 `eef760896` |
 | P0e | the model sidecar: a loopback HTTP/1.1 endpoint in the daemon. The harness gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/s/<sid>` and a per-session token in `ANTHROPIC_API_KEY` — never the provider's key, which `hive_api_key_helper` prints to the DAEMON (cached 5 min, fetched again after a 401). Each call: this session's token, the session still running here at its fence, the device not offline past `offline_grace` (120 s), else refused in the provider's error shape; only `POST /v1/messages` and `/v1/messages/count_tokens`, matched exactly; forwarded unchanged with the key swapped in, the answer streamed (never buffered), `retry-after` and the rate-limit headers intact | feature `hive` not in `full`; no helper = no model access | **merged** #1843 `12bdadc4e` |
 | P0f | the canary test (AC2, one device): `crates/tests/tests/hive_canary.rs`, its own test binary because the supervisor is process-global, drives a real server and a real in-process device (`hive::init_as_daemon`, feature `hive-test-launcher`: sessions as the test's own account, refused as root, in no release build). A prompt over the viewer peer, a tool's output, and a crashing harness's stderr each carry a canary; each must be in the device's store and in no Mongo document, object-store file, server log line or frame the server sent the browser — each absence checked beside a presence that proves the check can see. It found one channel: the `ended` detail carried the harness's last 400 bytes of stderr to the server, now a `note` in the device's transcript | a test; `hive-test-launcher` is test-only | **merged** #1844 `11f1838d7` |
+| P0g | the AC1 field run's six findings: the server takes a start's answer in any live status (the daemon's `idle` lands first); the viewer waits for the socket before asking, and asks again after a redial; the device wires its channel's handlers inside `on_data_channel` (webrtc-rs reads the channel only after that callback returns) and the browser asks `hello` again until it is answered; `hive_api_workspace_id`, sent by the sidecar as `anthropic-workspace-id`; a turn records what it cost, not the process's running total; a repeated session announcement is shown once | fixes; `hive_api_workspace_id` unset = unchanged | PR open |
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset: replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` | — |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
@@ -249,8 +258,14 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1:** a prompt typed in a session room on a Linux device returns a turn stub whose terminal
-  step renders in the browser from the device over a data-only WebRTC peer.
+- [x] **AC1:** a prompt typed in a session room on a Linux device returns a turn stub whose terminal
+  step renders in the browser from the device over a data-only WebRTC peer. *Verified 2026-10-07 on
+  master `d5d084c61`, on a throwaway stack (local server, loopback TURN; prod untouched).
+  The device was a root `roomlerd --features hive` on Linux (WSL), with sessions as the mapped
+  account `hivetest`, running Claude Code 2.1.293 (`claude-opus-5-5`). A prompt typed in the
+  session's transcript panel came back as the room's stub "✅ Turn 2 — done · 1 s · $0.17 · asked by
+  Hive Field". Its terminal step ("Hello, I'm working in /home/hivetest/work." and "Turn done")
+  rendered in the panel, "Live from the device", over the data-only peer. §8 has the run.*
 - [ ] **AC2:** a random canary carried by a prompt and by a tool output appears in every replica's
   store and in no Mongo collection, object-store key or server log line — shown failing first with a
   stub that carries the prompt text. *P0f (2026-10-07), one device:
@@ -264,9 +279,17 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   every replica's store.*
 - [ ] **AC3:** `whoami` inside a session prints the device-mapped account on Linux and macOS and the
   console user on Windows, never SYSTEM or root; an unmapped user is refused `no_account`, and a
-  Windows device with nobody signed in refuses `no_console_user`.
+  Windows device with nobody signed in refuses `no_console_user`. *Linux, in the field
+  (2026-10-07): the harness process ran as `hivetest` (`ps`), in `/home/hivetest/work`, under a
+  root daemon. The literal `whoami` waits for P1's approvals: headless Claude Code denies Bash
+  without an approval tool. macOS and Windows are P1.*
 - [ ] **AC4:** cutting a primary's network stops its model calls within `offline_grace` (120 s), and
-  an executor holding a stale fence makes zero model calls (mock-llm capture).
+  an executor holding a stale fence makes zero model calls (mock-llm capture). *First half
+  field-verified 2026-10-07, on the real device, with the session's own token against its sidecar.
+  Online, the call was forwarded (the provider answered 400). After the device's control path was
+  cut, it was still forwarded at 60 s, refused `503 overloaded_error` at 125 s ("lost its connection
+  to Roomler 125 s ago; model calls stop after 120 s"), and forwarded again after the reconnect. The
+  stale-fence half needs P2's promotion.*
 - [ ] **AC5:** an approval answered from a phone unblocks the tool, and the server's stub for it
   holds no tool arguments.
 - [ ] **AC6:** a non-driver's message in a session room never reaches the harness (mock-llm capture).
@@ -330,8 +353,21 @@ default LLM route is `node`; the database is the brain's source of truth; sessio
 
 ## 8. Field-verification log
 
+The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod untouched:
+- the server ran master's `roomler-ai-api` with `[modules] hive` on, its own database and Redis;
+- TURN was a loopback relay;
+- the device was a root `roomlerd --features hive` on Linux (WSL), in a private mount namespace,
+  enrolled through a relay whose loss cuts only its control path;
+- the browser was the SPA in Chromium.
+
 | Date | Build | What was checked | Result |
 |---|---|---|---|
+| 2026-10-07 | master `d5d084c61` | AC1 — a prompt from the session's panel, a real Claude Code turn | ✅ the room's stub "✅ Turn 2 — done · $0.17"; its terminal step rendered from the device over the data-only peer |
+| 2026-10-07 | master `d5d084c61` | AC2 on one device — the prompt typed in the field | ✅ the prompt text in no collection of the server's database and no server log line; the session's title (the presence check) in `agent_sessions` and `rooms` |
+| 2026-10-07 | master `d5d084c61` | AC4, first half — the sidecar with the session's token, around a control-path cut | ✅ 400 (forwarded) online and at 60 s, `503 overloaded_error` at 125 s, 400 again after the reconnect |
+| 2026-10-07 | master `d5d084c61` | the start and the viewer, end to end | ❌ six findings, all fixed in P0g: (1) a start's answer lost when the device's `idle` arrived first, so the caller waited the whole 10 s and the account and started note were gone; (2) a cold load of the room lost `hive:view.open`; (3) the device dropped the browser's first DataChannel frame, so a panel never got its history; (4) a key not scoped to a workspace needs `anthropic-workspace-id`; (5) turn cost was the process's running total; (6) "Session started" at every turn |
+| 2026-10-08 | P0g branch, same stack | the fixes, end to end | ✅ a new session's start answered in **0.27 s** (it was 10 s), with `account: hivetest`, `accepted_at` and the "Started on … as **hivetest**" note; a **cold load** of its room opened the viewer in 1.2 s; a turn rendered with its own cost ($0.16); the old session's three announcements shown **once**; the frame log shows `hello` answered at the first ask |
+| 2026-10-08 | P0g branch, same stack | a daemon restart | ❌ (7) the sessions it ran stay `idle` on the server — §3d; Stop clears one; not in P0g |
 
 ## 9. Related
 
