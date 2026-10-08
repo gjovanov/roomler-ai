@@ -26,9 +26,9 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
@@ -49,6 +49,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use super::gates::{self, HiveConfig};
+use super::hosted::{Hosted, HostedSession, RunningTurn};
 use super::lines::LineReader;
 use super::store::StoreHandle;
 use super::toolbelt::{self, ApprovalEvent, Toolbelt};
@@ -81,6 +82,24 @@ const STDERR_TAIL: usize = 400;
 const APPROVAL_QUEUE: usize = 32;
 /// Approvals per session whose newest frame a reconnect replays.
 const APPROVAL_REPLAY: usize = 16;
+/// P1d-2 — what the daemon hosts, beside the replica store.
+const HOSTED_FILE: &str = "hosted.json";
+/// P1d-2 — how long a harness that ended without being stopped waits before
+/// its end counts. Under systemd a stop reaches the daemon first and the
+/// harness a moment later, and a session cut by the daemon's own stop is
+/// surviving the restart, not ending.
+const SETTLE: Duration = Duration::from_secs(1);
+/// P1d-2 — a resumed session the daemon does not outlive by this, restarting
+/// again, counts towards [`MAX_QUICK_RESUMES`].
+const RESUME_STABLE: Duration = Duration::from_secs(120);
+/// P1d-2 — resumes in a row that a session did not outlive by
+/// [`RESUME_STABLE`]: at this many it is ended instead, so a resume that
+/// takes the daemon down cannot become a crash loop.
+const MAX_QUICK_RESUMES: u32 = 3;
+/// P1d-2 — how long a connection's manifest waits for the resume. Past it,
+/// the manifest goes out without what is still resuming; the server ends
+/// those, and stops them again when their launch reports in.
+const RESUME_BUDGET: Duration = Duration::from_secs(60);
 
 /// What `rc:hive.start` asks for, as the supervisor uses it.
 #[derive(Debug, Clone)]
@@ -162,6 +181,20 @@ struct Spawned {
     token: Option<String>,
     /// P1a — owned by the task, so it ends exactly when the session does.
     toolbelt: Toolbelt,
+    /// P1d-2 — launched with `--resume`: the harness has its history.
+    history: bool,
+}
+
+/// P1d-2 — where a session the device hosted stood when its last daemon
+/// went down, as the session task takes it up again.
+struct Resumed {
+    turns: u32,
+    /// The turn the restart cut, if one ran.
+    cut: Option<RunningTurn>,
+    /// The approvals it left open.
+    approvals: Vec<String>,
+    /// Whether the harness found its history (`--resume`).
+    history: bool,
 }
 
 #[derive(Clone)]
@@ -224,9 +257,29 @@ pub struct Supervisor {
     /// starts are refused, so no turn begins in the gap before the installer
     /// runs ([`Supervisor::begin_update`]).
     updating: std::sync::atomic::AtomicBool,
+    /// P1d-2 — the sessions this device hosts, on disk ([`super::hosted`]).
+    hosted: Mutex<Hosted>,
+    /// P1d-2 — what the previous daemon hosted, until the first connection
+    /// resumes it. A stop that comes first takes its session out.
+    to_resume: Mutex<Vec<HostedSession>>,
+    /// P1d-2 — set once that resume has run: a manifest waits for it.
+    resumed: tokio::sync::OnceCell<()>,
+    /// P1d-2 — the daemon is stopping ([`begin_shutdown`]): a harness that
+    /// ends from now on went down with it, and its session is the next
+    /// daemon's to resume.
+    going_down: AtomicBool,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
+
+/// FR-90 P1d-2 — the daemon is stopping: an OS stop, a restart it asked for,
+/// or an update's. Called first thing on the way out. What its harnesses do
+/// from now on is going down with it.
+pub fn begin_shutdown() {
+    if let Some(s) = global() {
+        s.begin_shutdown();
+    }
+}
 
 /// FR-90 P1d-1 (AC7) — the sessions mid-turn on this daemon: what an update
 /// waits for. Empty where no supervisor was set up.
@@ -260,15 +313,23 @@ pub fn end_update() {
 /// is answered with the device's actual refusal rather than silence.
 pub fn init(cfg: &AgentConfig) {
     let hive = HiveConfig::from_agent(cfg);
-    let store = store_path().and_then(|p| StoreHandle::spawn(Some(&p)));
+    let path = store_path();
+    let store = path.clone().and_then(|p| StoreHandle::spawn(Some(&p)));
     if let Err(e) = &store {
         warn!(%e, "hive: the replica store is unavailable — every start will be refused");
     }
+    // P1d-2 — what the previous daemon hosted, resumed at the first
+    // connection. Without a data directory nothing can be.
+    let hosted = match path {
+        Ok(p) => Hosted::load(p.with_file_name(HOSTED_FILE), &cfg.agent_id),
+        Err(_) => Hosted::in_memory(),
+    };
     let sup = Supervisor::new(
         hive,
         PathBuf::from("/run/roomler-hive"),
         Launcher::AsMappedAccount,
         store,
+        hosted,
     );
     let _ = SUPERVISOR.set(Arc::new(sup));
 }
@@ -299,6 +360,7 @@ pub fn init_as_daemon(
             home: home.to_path_buf(),
         },
         StoreHandle::spawn(Some(store)),
+        Hosted::load(store.with_file_name(HOSTED_FILE), &cfg.agent_id),
     );
     SUPERVISOR
         .set(Arc::new(sup))
@@ -383,7 +445,9 @@ impl Supervisor {
         runtime: PathBuf,
         launcher: Launcher,
         store: Result<StoreHandle, String>,
+        hosted: Hosted,
     ) -> Self {
+        let to_resume = hosted.sessions().to_vec();
         Self {
             cfg,
             runtime,
@@ -406,6 +470,10 @@ impl Supervisor {
             upstream: super::sidecar::DEFAULT_UPSTREAM.to_string(),
             offline_grace: super::sidecar::OFFLINE_GRACE,
             updating: std::sync::atomic::AtomicBool::new(false),
+            hosted: Mutex::new(hosted),
+            to_resume: Mutex::new(to_resume),
+            resumed: tokio::sync::OnceCell::new(),
+            going_down: AtomicBool::new(false),
         }
     }
 
@@ -458,16 +526,28 @@ impl Supervisor {
 
     pub(crate) async fn start(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
         let _serial = self.start_lock.lock().await;
+        self.start_locked(order, is_primary).await
+    }
+
+    /// [`Self::start`], under `start_lock`.
+    async fn start_locked(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
         let answer = self.decide_and_launch(&order, is_primary).await;
         match &answer.refused {
             None => info!(
                 session = %order.session_id, account = ?answer.account, caller = %order.caller,
                 "hive: session started"
             ),
-            Some(r) => info!(
-                session = %order.session_id, refused = r.as_str(), detail = ?answer.detail,
-                caller = %order.caller, "hive: session start refused"
-            ),
+            Some(r) => {
+                info!(
+                    session = %order.session_id, refused = r.as_str(), detail = ?answer.detail,
+                    caller = %order.caller, "hive: session start refused"
+                );
+                // P1d-2 — a session refused here does not run here: nothing
+                // of it is left to resume.
+                if !self.holds_live(order.session_id) {
+                    self.hosted_remove(order.session_id);
+                }
+            }
         }
         answer
     }
@@ -504,12 +584,36 @@ impl Supervisor {
                 "this device is about to restart for an update — start the session again in a minute",
             );
         }
+        // P1d-2 — or stopping, for any reason.
+        if self.going_down() {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "this device is restarting — start the session again in a minute",
+            );
+        }
         let account = match gates::account_for(&self.cfg, &order.user_id, &order.user_email) {
             Ok(a) => a,
             Err(r) => {
                 return Answer::refused(r, "no hive_accounts entry maps you to a local account");
             }
         };
+        // P1d-2 — a session this device hosted resumes as the account it ran
+        // as, or not at all: its history is in that account's home, and a
+        // remapped starter must not carry it into another.
+        if let Some(ran_as) = self
+            .hosted_get(order.session_id)
+            .filter(|h| h.fence == order.fence)
+            .map(|h| h.account)
+            && ran_as != account
+        {
+            return Answer::refused(
+                HiveRefusal::NoAccount,
+                format!(
+                    "hive_accounts now maps the starter to {account}, and the session ran as \
+                     {ran_as}, whose home holds its history"
+                ),
+            );
+        }
         let folder = match gates::folder_for(&self.cfg, &order.folder) {
             Ok(f) => f,
             Err(r) => {
@@ -612,6 +716,11 @@ impl Supervisor {
                 "this device is about to restart for an update — ask again in a minute".into(),
             );
         }
+        // P1d-2 — it is stopping: a turn begun now would be cut, and its
+        // number would not reach what the next daemon resumes.
+        if self.going_down() {
+            return Err("this device is restarting — ask again in a minute".into());
+        }
         let (input, waiting) = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             live.get(&session)
@@ -656,6 +765,17 @@ impl Supervisor {
                     warn!(session = %session, "hive: stop could not reach the session task");
                 }
             }
+            // P1d-2 — hosted by the previous daemon and not resumed yet: it
+            // ends here, without a launch.
+            None if self.take_from_resume(session, fence) => {
+                self.hosted_remove(session);
+                self.report(
+                    session,
+                    fence,
+                    HiveRunState::Ended,
+                    Some(format!("stopped ({reason}) before it resumed")),
+                );
+            }
             None => self.report(
                 session,
                 fence,
@@ -663,6 +783,16 @@ impl Supervisor {
                 Some("not running on this device".into()),
             ),
         }
+    }
+
+    /// P1d-2 — take `session` out of what waits to resume, when it waits
+    /// there at `fence` or an older one.
+    fn take_from_resume(&self, session: ObjectId, fence: u64) -> bool {
+        let sid = session.to_hex();
+        let mut q = self.to_resume.lock().unwrap_or_else(|e| e.into_inner());
+        let before = q.len();
+        q.retain(|h| !(h.session == sid && h.fence <= fence));
+        q.len() != before
     }
 
     pub(crate) fn connected(self: &Arc<Self>, tx: mpsc::Sender<ClientMsg>) {
@@ -714,12 +844,36 @@ impl Supervisor {
                 detail: r.detail,
             });
         }
+        // Reports go here from now on — a resumed session's among them.
+        *self.reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
         // P1b — and every session this device RUNS, now: the server ends the
         // ones it holds as running here that the list leaves out. A daemon
         // that restarted holds no replay of what it ran, so this is the only
         // way the server learns those sessions are over (finding 7).
-        let manifest: Vec<HiveManifestEntry> = self
-            .live
+        //
+        // P1d-2 — but only once what the previous daemon hosted has resumed:
+        // a manifest sent first would leave those sessions out, and the
+        // server would end every one of them. The resume runs in a task of
+        // its own, so the manifest's bound on waiting never cancels it
+        // halfway through a session.
+        let me = Arc::clone(self);
+        let resume = tokio::spawn(async move { me.resume_once().await });
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            if tokio::time::timeout(RESUME_BUDGET, resume).await.is_err() {
+                warn!(
+                    "hive: the hosted sessions are still resuming — the manifest goes without them"
+                );
+            }
+            let _ = tx.try_send(ClientMsg::HiveManifest {
+                sessions: me.manifest(),
+            });
+        });
+    }
+
+    /// The sessions this device runs now, as the manifest names them.
+    fn manifest(&self) -> Vec<HiveManifestEntry> {
+        self.live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -727,9 +881,183 @@ impl Supervisor {
                 session_id: *session_id,
                 fence: l.fence,
             })
-            .collect();
-        let _ = tx.try_send(ClientMsg::HiveManifest { sessions: manifest });
-        *self.reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+            .collect()
+    }
+
+    /// P1d-2 — resume what the previous daemon hosted: once, at the first
+    /// connection of the primary enrollment, so a device that never comes
+    /// back online launches nothing. A second connection waits for the same
+    /// run.
+    async fn resume_once(self: &Arc<Self>) {
+        self.resumed
+            .get_or_init(|| async {
+                let n = self
+                    .to_resume
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                if n > 0 {
+                    info!(
+                        sessions = n,
+                        "hive: resuming what this device hosted before it restarted"
+                    );
+                }
+                loop {
+                    let next = {
+                        let mut q = self.to_resume.lock().unwrap_or_else(|e| e.into_inner());
+                        if q.is_empty() {
+                            break;
+                        }
+                        q.remove(0)
+                    };
+                    self.resume(next).await;
+                }
+            })
+            .await;
+    }
+
+    /// P1d-2 — one hosted session, through every gate a start passes, as the
+    /// device is configured NOW: a device owner who turned sessions off,
+    /// remapped the starter or moved `hive_roots`, then restarted, does not
+    /// find the session back. One the gates refuse is reported ended, with
+    /// the reason.
+    async fn resume(self: &Arc<Self>, mut h: HostedSession) {
+        let (Ok(session), Ok(starter)) = (
+            ObjectId::parse_str(&h.session),
+            ObjectId::parse_str(&h.starter),
+        ) else {
+            warn!(session = %h.session, "hive: a hosted session with an unreadable id — not resumed");
+            self.hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&h.session);
+            return;
+        };
+        // Under the start lock from here to the launch: a start the server
+        // re-sent may launch the session first, and its entry is then the
+        // live one's to keep.
+        let _serial = self.start_lock.lock().await;
+        if self.holds_live(session) {
+            return;
+        }
+        let now = unix_now();
+        let quick = match h.resumed_at {
+            Some(at) if now.saturating_sub(at) < RESUME_STABLE.as_secs() => h.quick_resumes + 1,
+            _ => 0,
+        };
+        if quick >= MAX_QUICK_RESUMES {
+            self.not_resumed(
+                session,
+                h.fence,
+                format!(
+                    "the daemon restarted {quick} times within {} s of resuming it",
+                    RESUME_STABLE.as_secs()
+                ),
+            );
+            return;
+        }
+        // Counted BEFORE the launch: a resume that takes the daemon down is
+        // the one the bound is for.
+        h.resumed_at = Some(now);
+        h.quick_resumes = quick;
+        self.hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(h.clone());
+        let order = StartOrder {
+            session_id: session,
+            harness: h.harness,
+            harness_session: h.harness_session,
+            fence: h.fence,
+            folder: h.folder,
+            user_id: starter,
+            user_email: h.starter_email,
+            caller: "this device's resume".into(),
+            // Decided by the history on disk, as for every launch.
+            resume: false,
+        };
+        let answer = self.start_locked(order, true).await;
+        if answer.refused.is_some() {
+            self.not_resumed(
+                session,
+                h.fence,
+                answer.detail.unwrap_or_else(|| "refused".into()),
+            );
+        }
+    }
+
+    /// P1d-2 — a hosted session will not resume: forgotten, and reported
+    /// ended with why.
+    fn not_resumed(&self, session: ObjectId, fence: u64, why: String) {
+        info!(session = %session, %why, "hive: a hosted session was not resumed");
+        self.hosted_remove(session);
+        self.report(
+            session,
+            fence,
+            HiveRunState::Ended,
+            Some(format!("not resumed after the device restarted: {why}")),
+        );
+    }
+
+    // ─── What the device hosts (P1d-2, `super::hosted`) ─────────────────
+
+    fn hosted_get(&self, session: ObjectId) -> Option<HostedSession> {
+        self.hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.to_hex())
+            .cloned()
+    }
+
+    /// ⚠️ From [`Self::begin_shutdown`] on, what the device hosts is FROZEN:
+    /// the teardown cuts turns and withdraws approvals, and the frames saying
+    /// so go into connections that are closing. Recorded here, they would be
+    /// lost twice — once on the wire, and again because the next daemon
+    /// would find nothing left to report (field, 2026-10-08: an approval the
+    /// teardown withdrew stayed "needed" on the server).
+    fn hosted_update(&self, session: ObjectId, f: impl FnOnce(&mut HostedSession)) {
+        if self.going_down() {
+            return;
+        }
+        self.hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(&session.to_hex(), f);
+    }
+
+    fn hosted_remove(&self, session: ObjectId) {
+        if self.going_down() {
+            return;
+        }
+        self.hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session.to_hex());
+    }
+
+    /// P1d-2 — the daemon is stopping (see the module-level
+    /// [`begin_shutdown`]).
+    pub(crate) fn begin_shutdown(&self) {
+        if !self.going_down.swap(true, Ordering::SeqCst) {
+            info!(
+                sessions = self.live_count(),
+                "hive: the daemon is stopping — its sessions are kept for the next start"
+            );
+        }
+    }
+
+    fn going_down(&self) -> bool {
+        self.going_down.load(Ordering::SeqCst)
+    }
+
+    /// P1d-2 — whether a harness that ended without being stopped went down
+    /// with the daemon: told so now, or within [`SETTLE`].
+    async fn went_down_with_daemon(&self) -> bool {
+        if self.going_down() {
+            return true;
+        }
+        tokio::time::sleep(SETTLE).await;
+        self.going_down()
     }
 
     /// Record and send an approval's frame (`rc:hive.approval`), like
@@ -1017,8 +1345,91 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session);
+        // P1d-2 — over, so nothing to resume.
+        self.hosted_remove(session);
         info!(session = %session, %detail, "hive: session ended");
         self.report(session, fence, HiveRunState::Ended, Some(detail));
+    }
+
+    /// P1d-2 — a session resumed after its daemon went down. A turn the
+    /// restart cut is reported interrupted, naming who asked; the approvals
+    /// it left open are recorded and reported withdrawn; the transcript says
+    /// what happened. The file forgets them only once all that is sent.
+    fn report_resumed(&self, session: ObjectId, fence: u64, store: &StoreHandle, r: &Resumed) {
+        let sid = session.to_hex();
+        let mut words = vec!["The device restarted, and this session resumed".to_string()];
+        if !r.history {
+            words.push(
+                "Claude Code's own history of it was not found, so the model starts afresh"
+                    .to_string(),
+            );
+        }
+        let cut_turn = r.cut.as_ref().map(|c| c.turn);
+        if let Some(cut) = &r.cut {
+            self.report_turn(
+                session,
+                ClientMsg::HiveTurn {
+                    session_id: session,
+                    fence,
+                    turn: cut.turn,
+                    status: Some(HiveTurnStatus::Interrupted),
+                    prompted_by: cut
+                        .prompted_by
+                        .as_deref()
+                        .and_then(|u| ObjectId::parse_str(u).ok()),
+                    steps: 0,
+                    duration_ms: None,
+                    cost_usd: None,
+                },
+            );
+            words.push(format!(
+                "turn {} was cut by the restart — ask again to go on",
+                cut.turn
+            ));
+        }
+        for id in &r.approvals {
+            store.append(
+                &sid,
+                fence,
+                resolved(id.clone(), toolbelt::Ended::Withdrawn),
+            );
+            self.report_approval(
+                session,
+                ClientMsg::HiveApproval {
+                    session_id: session,
+                    fence,
+                    approval_id: id.clone(),
+                    turn: cut_turn,
+                    status: Some(HiveApprovalStatus::Withdrawn),
+                    answered_by: None,
+                },
+            );
+        }
+        store.append(
+            &sid,
+            fence,
+            TranscriptEvent::Note {
+                text: format!("{}.", words.join("; ")),
+            },
+        );
+        self.hosted_update(session, |h| {
+            h.running = None;
+            h.approvals.clear();
+        });
+    }
+
+    /// P1d-2 — the session's harness went down with the daemon: let go of
+    /// it here and say nothing, exactly as a daemon killed outright would.
+    /// What the device hosts keeps it, and the next daemon resumes it.
+    fn let_go(&self, session: ObjectId, token: Option<&str>) {
+        if let Some(token) = token {
+            self.tokens.revoke(token);
+        }
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
+        info!(session = %session, "hive: the session went down with the daemon — kept for the next start");
     }
 
     fn launch(
@@ -1029,11 +1440,16 @@ impl Supervisor {
         store: StoreHandle,
         sidecar: Option<u16>,
     ) -> Result<(), (HiveRefusal, String)> {
+        // P1d-2 — a session this device hosted goes on where it stood.
+        let prior = self
+            .hosted_get(order.session_id)
+            .filter(|h| h.fence == order.fence);
         let (approvals_tx, approvals_rx) = mpsc::channel(APPROVAL_QUEUE);
         let Spawned {
             child,
             token,
             toolbelt,
+            history,
         } = self.spawn(order, account, folder, sidecar, approvals_tx)?;
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
@@ -1048,8 +1464,43 @@ impl Supervisor {
                 approvals: toolbelt.pending(),
             },
         );
+        let resumed = match prior {
+            Some(h) => Some(Resumed {
+                turns: h.turns,
+                cut: h.running,
+                approvals: h.approvals,
+                history,
+            }),
+            None => {
+                self.hosted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(HostedSession {
+                        session: order.session_id.to_hex(),
+                        fence: order.fence,
+                        harness: order.harness.clone(),
+                        harness_session: order.harness_session.clone(),
+                        folder: order.folder.clone(),
+                        account: account.to_string(),
+                        starter: order.user_id.to_hex(),
+                        starter_email: order.user_email.clone(),
+                        turns: 0,
+                        running: None,
+                        approvals: Vec::new(),
+                        resumed_at: None,
+                        quick_resumes: 0,
+                    });
+                None
+            }
+        };
         // Up and waiting for its first prompt.
         self.report(order.session_id, order.fence, HiveRunState::Idle, None);
+        // P1d-2 — and what its last daemon left behind, here, before the
+        // launch returns: a connection's manifest goes out once the resume
+        // has, and follows all of it.
+        if let Some(r) = &resumed {
+            self.report_resumed(order.session_id, order.fence, &store, r);
+        }
         let sup = Arc::clone(self);
         let (session, fence) = (order.session_id, order.fence);
         tokio::spawn(async move {
@@ -1059,8 +1510,10 @@ impl Supervisor {
                 approvals: approvals_rx,
                 toolbelt,
             };
-            let detail = run(&sup, session, fence, child, inputs, store).await;
-            sup.finish(session, fence, token.as_deref(), detail);
+            match run(&sup, session, fence, child, inputs, store, resumed).await {
+                Some(detail) => sup.finish(session, fence, token.as_deref(), detail),
+                None => sup.let_go(session, token.as_deref()),
+            }
         });
         Ok(())
     }
@@ -1158,7 +1611,7 @@ impl Supervisor {
                 format!("writing the session's MCP config: {e}"),
             )
         })?;
-        let spec = LaunchSpec {
+        let mut spec = LaunchSpec {
             session: order.harness_session.clone(),
             harness,
             folder: folder.to_path_buf(),
@@ -1173,6 +1626,12 @@ impl Supervisor {
         };
         spec.validate()
             .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
+        // P1d-2 — the session's own history decides, for every launch (a
+        // resume, and a start the server re-sent after a crash): Claude Code
+        // refuses `--session-id` for an id whose history exists, and
+        // `--resume` for one without. The daemon only looks at the entry,
+        // never reads or follows it; the harness reads it as the account.
+        spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
 
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.arg("-c")
@@ -1220,6 +1679,7 @@ impl Supervisor {
                 child,
                 token,
                 toolbelt,
+                history: spec.resume,
             }),
             // The toolbelt goes with the failed start: dropping it removes
             // its socket.
@@ -1363,8 +1823,13 @@ struct Task<'a> {
     queued: std::collections::VecDeque<(Option<Author>, String)>,
     /// `Live::waiting`: a prompt's place is given back when it BEGINS.
     waiting: Arc<AtomicUsize>,
-    /// The harness process's running cost at its last turn's end.
-    spent: f64,
+    /// The harness process's running cost at its last turn's end. `None`
+    /// until a resumed process's first turn ends (P1d-2): Claude Code takes
+    /// its running total back from the history's last `cost-state`, which
+    /// only a clean exit writes, so where that process starts counting is
+    /// not known here, and its first turn reports no cost rather than a
+    /// wrong one.
+    spent: Option<f64>,
     /// P1a — the approvals open now, in the order the toolbelt reported
     /// them: the task's own view, so the run state follows the transcript.
     open_approvals: Vec<String>,
@@ -1404,6 +1869,7 @@ impl Task<'_> {
     /// events are, in their order; the server hears THAT it did (P1a-2,
     /// `rc:hive.approval`, no tool, no arguments); the run state follows.
     fn on_approval(&mut self, ev: ApprovalEvent) {
+        let opened = matches!(ev, ApprovalEvent::Opened { .. });
         let (event, id, status, answered_by) = match ev {
             ApprovalEvent::Opened {
                 id,
@@ -1426,13 +1892,28 @@ impl Task<'_> {
                 (resolved(id.clone(), ended), id, status, by)
             }
         };
+        // P1d-2 — an approval is on disk before the server hears it opened,
+        // and comes off after it hears how it ended: lost in between, the
+        // resume withdraws it again, which the server applies only to one
+        // still open.
+        if opened {
+            self.save_open_approvals();
+        }
         self.store.append(&self.sid, self.fence, event);
         self.report_approval(id, status, answered_by);
+        if !opened {
+            self.save_open_approvals();
+        }
         self.settle_state();
         let _ = self
             .sup
             .approvals
             .send((self.session, self.open_approvals.clone()));
+    }
+
+    fn save_open_approvals(&self) {
+        let open = self.open_approvals.clone();
+        self.sup.hosted_update(self.session, |h| h.approvals = open);
     }
 
     /// The session is ending with approvals still open: each is recorded as
@@ -1499,6 +1980,15 @@ impl Task<'_> {
         }
         self.count += 1;
         let prompted_by = author.as_ref().map(|a| a.user_id);
+        // P1d-2 — the turn's number is on disk before its stub goes out.
+        let n = self.count;
+        self.sup.hosted_update(self.session, |h| {
+            h.turns = n;
+            h.running = Some(RunningTurn {
+                turn: n,
+                prompted_by: prompted_by.map(|u| u.to_hex()),
+            });
+        });
         self.store.append(
             &self.sid,
             self.fence,
@@ -1528,14 +2018,15 @@ impl Task<'_> {
         // every `result` carries all the turns before it too (field,
         // 2026-10-07: turn 3 read $0.33 for a turn that cost $0.16). The
         // transcript and the stub both say what THIS turn cost.
-        if let TranscriptEvent::Turn {
-            cost_usd: Some(total),
-            ..
-        } = &mut ev
+        if let TranscriptEvent::Turn { cost_usd, .. } = &mut ev
+            && let Some(total) = *cost_usd
         {
-            let this_turn = ((*total - self.spent) * 1e6).round() / 1e6;
-            self.spent = *total;
-            *total = this_turn.max(0.0);
+            debug!(session = %self.session, total, base = ?self.spent, "hive: the harness's running cost");
+            *cost_usd = self
+                .spent
+                .map(|base| ((total - base) * 1e6).round() / 1e6)
+                .map(|this_turn| this_turn.max(0.0));
+            self.spent = Some(total);
         }
         let end = match &ev {
             TranscriptEvent::Turn {
@@ -1556,6 +2047,10 @@ impl Task<'_> {
                 HiveTurnStatus::Error
             };
             let duration_ms = duration_ms.or_else(|| self.elapsed_ms());
+            // P1d-2 — over before its stub says so: the server edits a stub
+            // to whatever comes last, so a resume must never report a turn
+            // that finished as cut.
+            self.sup.hosted_update(self.session, |h| h.running = None);
             self.turn_report(status, duration_ms, cost_usd);
             self.current = None;
             match self.queued.pop_front() {
@@ -1631,7 +2126,9 @@ fn resolved(id: String, ended: toolbelt::Ended) -> TranscriptEvent {
     }
 }
 
-/// Own the session until its harness exits; return the `ended` detail.
+/// Own the session until its harness exits; return the `ended` detail —
+/// or `None` when the harness went down with the daemon (P1d-2), and the
+/// session is the next daemon's to resume.
 async fn run(
     sup: &Supervisor,
     session: ObjectId,
@@ -1639,7 +2136,8 @@ async fn run(
     mut child: Child,
     inputs: Inputs,
     store: StoreHandle,
-) -> String {
+    resumed: Option<Resumed>,
+) -> Option<String> {
     let Inputs {
         rx: mut input,
         waiting,
@@ -1647,7 +2145,7 @@ async fn run(
         toolbelt,
     } = inputs;
     let Some(stdout) = child.stdout.take() else {
-        return "the harness has no stdout".into();
+        return Some("the harness has no stdout".into());
     };
     let stderr = child
         .stderr
@@ -1661,11 +2159,18 @@ async fn run(
         store,
         stdin: child.stdin.take(),
         state: HiveRunState::Idle,
-        count: 0,
+        // P1d-2 — a resumed session counts on from its last turn: the
+        // server ignores a stub for a turn older than its newest.
+        count: resumed.as_ref().map_or(0, |r| r.turns),
         current: None,
         queued: Default::default(),
         waiting,
-        spent: 0.0,
+        // A process with no history counts from zero; one that resumed its
+        // history, from wherever that history's last `cost-state` puts it.
+        spent: match &resumed {
+            Some(r) if r.history => None,
+            _ => Some(0.0),
+        },
         open_approvals: Vec::new(),
     };
     let mut lines = LineReader::new(BufReader::new(stdout), MAX_LINE);
@@ -1704,8 +2209,15 @@ async fn run(
                 }
             },
             // P1a — after stdout, so the `tool_use` the harness printed is
-            // recorded before the approval it asked for.
-            Some(ev) = approvals.recv() => task.on_approval(ev),
+            // recorded before the approval it asked for. P1d-2 — not once the
+            // daemon is stopping: the harness letting go then is the teardown,
+            // and the next daemon records and reports the end of each
+            // approval it cut, exactly once.
+            Some(ev) = approvals.recv() => {
+                if !sup.going_down() {
+                    task.on_approval(ev);
+                }
+            }
             cmd = input.recv() => match cmd {
                 Some(Input::Prompt { author, text }) => task.prompt(author, text).await,
                 Some(Input::Stop { reason }) => {
@@ -1721,6 +2233,16 @@ async fn run(
         }
     }
 
+    // P1d-2 — a harness that ended without being stopped may have gone down
+    // with the daemon: systemd stops the whole unit, the daemon first and the
+    // harness a moment later. Then the session is not over; it is the next
+    // daemon's to resume, and this one says nothing — no `ended`, no cut
+    // turn, no withdrawn approval — exactly as if it had been killed
+    // outright. The next daemon reports all of it from what the device
+    // hosts.
+    if stopped.is_none() && sup.went_down_with_daemon().await {
+        return None;
+    }
     task.withdraw_open_approvals();
     task.interrupt();
     // EOF on stdin ends a stream-json harness; the signals cover one that
@@ -1762,7 +2284,14 @@ async fn run(
             },
         );
     }
-    describe_end(stopped.as_deref(), status, said)
+    Some(describe_end(stopped.as_deref(), status, said))
+}
+
+/// Seconds since the epoch, for what the device hosts.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The last [`STDERR_TAIL`] characters a harness wrote to stderr, on one line.
@@ -1841,16 +2370,44 @@ pub(crate) mod tests {
     /// which is how a test keeps a turn running while it asks for an
     /// approval. Its `total_cost_usd`, like Claude Code's, is the PROCESS's
     /// running total: 0.25 more at every turn. Its argv is kept in the
-    /// folder's `.argv`, one argument a line, and every line it reads on
-    /// stdin in `.stdin` — what reached the harness (P1c-2).
+    /// folder's `.argv`, one argument a line, every line it reads on stdin
+    /// in `.stdin` — what reached the harness (P1c-2) — and its pid in
+    /// `.pid`.
+    ///
+    /// P1d-2 — like Claude Code it keeps the session's history, from the
+    /// first prompt on, at the path `LaunchSpec::history_path` names, and
+    /// refuses the same two ways: `--session-id` for an id whose history
+    /// exists, `--resume` for one without. `recall` answers with how many
+    /// prompts its history holds, so a test sees what a resumed process
+    /// remembers.
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$PWD/.argv"
+echo $$ > "$PWD/.pid"
+mode=""; sid=""; prev=""
+for a in "$@"; do
+  case "$prev" in --session-id|--resume) mode="$prev"; sid="$a" ;; esac
+  prev="$a"
+done
+hist="$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/$sid.jsonl"
+if [ "$mode" = "--session-id" ] && [ -e "$hist" ]; then
+  echo "Error: Session ID $sid is already in use." >&2; exit 1
+fi
+if [ "$mode" = "--resume" ] && [ ! -e "$hist" ]; then
+  echo "No conversation found with session ID: $sid" >&2; exit 1
+fi
 first=1
 spent=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$PWD/.stdin"
+  mkdir -p "${hist%/*}" && printf '%s\n' "$line" >> "$hist"
   case "$line" in
     *crash*) echo "boom" >&2; exit 3 ;;
+  esac
+  case "$line" in
+    *recall*)
+      n=$(wc -l < "$hist" | tr -d ' ')
+      echo '{"type":"assistant","message":{"content":[{"type":"text","text":"history: '"$n"'"}]}}'
+      ;;
   esac
   if [ "$first" = 1 ]; then
     echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
@@ -1919,6 +2476,7 @@ done
             root.path().join("run"),
             Launcher::AsDaemon { home },
             Ok(store.clone()),
+            Hosted::load(root.path().join(HOSTED_FILE), TEST_AGENT),
         )));
         let (tx, reports) = mpsc::channel(64);
         sup.connected(tx);
@@ -1929,6 +2487,155 @@ done
             root,
             user,
         }
+    }
+
+    /// The enrollment every rig's hosted file belongs to.
+    const TEST_AGENT: &str = "agent-test";
+
+    /// P1d-2 — the rig's daemon goes down the way systemd stops it: told
+    /// first, then every harness stopped by the same signal a moment later.
+    async fn go_down(r: &Rig, sid: ObjectId) {
+        r.sup.begin_shutdown();
+        // A turn can be `running` before the harness ran a line: the prompt
+        // waits in its stdin, and an approval goes through the daemon's own
+        // toolbelt.
+        let pid_file = r.root.path().join("work").join(".pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the harness never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // SAFETY: a signal to the fake harness's own process group.
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while r.sup.holds_live(sid) {
+            assert!(Instant::now() < deadline, "the session never let go");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P1d-2 — the next daemon on the rig's device: the same hosted file,
+    /// store, runtime and accounts, with `cfg_with` applied to the config.
+    /// Not connected yet ([`connect`]).
+    fn next_daemon(r: &mut Rig, cfg_with: impl FnOnce(&mut HiveConfig)) {
+        let mut cfg = r.sup.cfg.clone();
+        cfg_with(&mut cfg);
+        r.sup = Arc::new(Supervisor::new(
+            cfg,
+            r.root.path().join("run"),
+            r.sup.launcher.clone(),
+            Ok(r.store.clone()),
+            Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT),
+        ));
+    }
+
+    /// A new connection of the rig's daemon; its reports replace the old.
+    fn connect(r: &mut Rig) {
+        let (tx, reports) = mpsc::channel(64);
+        r.sup.connected(tx);
+        r.reports = reports;
+    }
+
+    /// [`next_daemon`], then its first connection — which resumes what the
+    /// last one hosted.
+    fn restart(r: &mut Rig, cfg_with: impl FnOnce(&mut HiveConfig)) {
+        next_daemon(r, cfg_with);
+        connect(r);
+    }
+
+    /// Every report up to the connection's manifest, and the manifest.
+    async fn until_manifest(r: &mut Rig) -> (Vec<ClientMsg>, Vec<(ObjectId, u64)>) {
+        let mut seen = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("a manifest within 10 s")
+                .expect("the connection is open");
+            if let ClientMsg::HiveManifest { sessions } = &msg {
+                let m = sessions.iter().map(|e| (e.session_id, e.fence)).collect();
+                return (seen, m);
+            }
+            seen.push(msg);
+        }
+    }
+
+    /// Nothing reported for `sid` in the next moment: what a daemon that
+    /// went down says about a session.
+    async fn silent_about(r: &mut Rig, sid: ObjectId) {
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(400), r.reports.recv()).await
+        {
+            let about = match &msg {
+                ClientMsg::HiveState { session_id, .. }
+                | ClientMsg::HiveTurn { session_id, .. }
+                | ClientMsg::HiveApproval { session_id, .. } => *session_id == sid,
+                _ => false,
+            };
+            assert!(!about, "a daemon going down reports nothing: {msg:?}");
+        }
+    }
+
+    /// P1d-2 — a hosted entry for `sid` on the rig's device, as a daemon
+    /// that went down left it: the rig's starter, mapped to `dev`.
+    fn host(r: &Rig, sid: ObjectId, f: impl FnOnce(&mut HostedSession)) {
+        let o = order(r);
+        let mut h = HostedSession {
+            session: sid.to_hex(),
+            fence: 1,
+            harness: o.harness,
+            harness_session: o.harness_session,
+            folder: o.folder,
+            account: "dev".into(),
+            starter: r.user.to_hex(),
+            starter_email: o.user_email,
+            turns: 0,
+            running: None,
+            approvals: Vec::new(),
+            resumed_at: None,
+            quick_resumes: 0,
+        };
+        f(&mut h);
+        Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT).put(h);
+    }
+
+    /// Before a launch whose argv a test reads: the last one's goes. (Not a
+    /// modification time: the kernel stamps files from its coarse clock,
+    /// which can run behind the test's `SystemTime::now()`.)
+    fn forget_argv(r: &Rig) {
+        let _ = std::fs::remove_file(r.root.path().join("work").join(".argv"));
+    }
+
+    /// The fake harness's argv from the launch after [`forget_argv`].
+    async fn next_argv(r: &Rig) -> Vec<String> {
+        let file = r.root.path().join("work").join(".argv");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::metadata(&file).is_ok_and(|m| m.len() > 0) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return std::fs::read_to_string(&file)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+            }
+            assert!(Instant::now() < deadline, "the harness never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// What the rig's hosted file holds now, by session.
+    fn hosted_on_disk(r: &Rig) -> Vec<HostedSession> {
+        Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT)
+            .sessions()
+            .to_vec()
     }
 
     pub(crate) fn order(r: &Rig) -> StartOrder {
@@ -2098,6 +2805,10 @@ done
             Some("stopped (owner)")
         );
         assert_eq!(r.sup.live_count(), 0);
+        assert!(
+            hosted_on_disk(&r).is_empty(),
+            "a stop leaves nothing to resume"
+        );
 
         let events = r.store.events(&sid.to_hex());
         let kinds: Vec<&str> = events.iter().map(TranscriptEvent::kind).collect();
@@ -2155,6 +2866,9 @@ done
             notes.iter().any(|n| n.contains("boom")),
             "the stderr tail explains it, on the device: {notes:?}"
         );
+        // P1d-2 — a harness that ends while the daemon runs ends its
+        // session: there is nothing to resume.
+        assert!(hosted_on_disk(&r).is_empty());
     }
 
     /// A turn is reported when its prompt goes in and when its result comes
@@ -2971,6 +3685,350 @@ done
         assert!(
             r.sup.drives_here(ObjectId::new(), r.user, None).is_err(),
             "a session this device does not run"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    // ─── P1d-2 — a restart resumes what the device hosted ───────────────
+
+    /// The whole arc: a session runs a turn; the daemon goes down the way
+    /// systemd stops it and reports nothing; the next daemon's first
+    /// connection relaunches it with `--resume`, before a manifest that
+    /// names it; the history is the harness's own; the turns count on; the
+    /// first turn of the resumed process costs what nobody here can know,
+    /// the next one what it cost; a stop forgets it.
+    #[tokio::test]
+    async fn a_restarted_daemon_resumes_what_it_hosted_and_counts_on() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let (sid, uuid) = (o.session_id, o.harness_session.clone());
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert!(turns.iter().all(|t| t.turn == 1), "{turns:?}");
+        let on_disk = hosted_on_disk(&r);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!((on_disk[0].turns, on_disk[0].running.as_ref()), (1, None));
+
+        go_down(&r, sid).await;
+        silent_about(&mut r, sid).await;
+        assert_eq!(hosted_on_disk(&r).len(), 1, "kept for the next daemon");
+
+        forget_argv(&r);
+        restart(&mut r, |_| {});
+        let (seen, manifest) = until_manifest(&mut r).await;
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveState { session_id, state: Some(HiveRunState::Idle), .. }
+                    if *session_id == sid)),
+            "resumed before the manifest: {seen:?}"
+        );
+        assert_eq!(manifest, [(sid, 1)], "the manifest names it");
+        let argv = next_argv(&r).await;
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--resume" && w[1] == uuid),
+            "{argv:?}"
+        );
+        assert!(
+            argv.contains(&"--mcp-config".to_string()) && argv.contains(&"--settings".to_string()),
+            "rebuilt in full: {argv:?}"
+        );
+
+        r.sup.prompt(sid, dev(&r), "recall".into()).unwrap();
+        let (turns, _, raw) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert!(
+            !turns.is_empty() && turns.iter().all(|t| t.turn == 2),
+            "counts on: {turns:?}"
+        );
+        let cost_of = |raw: &[ClientMsg]| {
+            raw.iter().find_map(|m| match m {
+                ClientMsg::HiveTurn {
+                    status: Some(HiveTurnStatus::Ok),
+                    cost_usd,
+                    ..
+                } => Some(*cost_usd),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            cost_of(&raw),
+            Some(None),
+            "a resumed process's first turn: no cost rather than a wrong one"
+        );
+        let events = r.store.events(&sid.to_hex());
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TranscriptEvent::AssistantText { text, .. } if text == "history: 2")
+            ),
+            "the resumed harness has both prompts in its history: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, TranscriptEvent::Note { text } if text.starts_with("The device restarted, and this session resumed"))),
+            "{events:?}"
+        );
+
+        r.sup.prompt(sid, dev(&r), "again".into()).unwrap();
+        let (_, _, raw) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert_eq!(cost_of(&raw), Some(Some(0.25)), "then what each turn cost");
+
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        assert!(hosted_on_disk(&r).is_empty(), "over, so nothing to resume");
+    }
+
+    /// A restart in the middle of a turn that waits at an approval: the
+    /// daemon going down says nothing; the next one reports the turn
+    /// interrupted, naming who asked, and the approval withdrawn — in the
+    /// transcript too — and the next prompt is the next turn.
+    #[tokio::test]
+    async fn a_turn_the_restart_cut_is_reported_and_its_approval_withdrawn() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        let harness = harness_asks(&r, sid, 2, "make").await;
+        let approval = until_awaiting(&mut r, sid).await;
+        let on_disk = hosted_on_disk(&r);
+        assert_eq!(
+            on_disk[0].running,
+            Some(RunningTurn {
+                turn: 1,
+                prompted_by: Some(r.user.to_hex())
+            }),
+            "on disk before the server heard"
+        );
+        assert_eq!(on_disk[0].approvals, std::slice::from_ref(&approval));
+
+        // The teardown as the field saw it: the daemon is stopping, and the
+        // harness's MCP connection goes first, so the toolbelt withdraws the
+        // approval while the session task still runs.
+        r.sup.begin_shutdown();
+        drop(harness);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        go_down(&r, sid).await;
+        silent_about(&mut r, sid).await;
+        assert_eq!(
+            hosted_on_disk(&r)[0].approvals,
+            std::slice::from_ref(&approval),
+            "frozen from the shutdown on: the next daemon withdraws it"
+        );
+
+        restart(&mut r, |_| {});
+        let (seen, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)]);
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveTurn { session_id, turn: 1, status: Some(HiveTurnStatus::Interrupted), prompted_by, .. }
+                    if *session_id == sid && *prompted_by == Some(r.user))),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveApproval { approval_id, status: Some(HiveApprovalStatus::Withdrawn), turn: Some(1), .. }
+                    if *approval_id == approval)),
+            "{seen:?}"
+        );
+        let resolutions: Vec<TranscriptEvent> = approval_events(&r, sid)
+            .into_iter()
+            .filter(|e| matches!(e, TranscriptEvent::ApprovalResolved { .. }))
+            .collect();
+        assert!(
+            matches!(
+                resolutions.as_slice(),
+                [TranscriptEvent::ApprovalResolved { id, outcome, .. }]
+                    if *id == approval && outcome == approval_outcome::WITHDRAWN
+            ),
+            "withdrawn exactly once, by the next daemon: {resolutions:?}"
+        );
+        let events = r.store.events(&sid.to_hex());
+        assert!(
+            events.iter().any(|e| matches!(e, TranscriptEvent::Note { text } if text.contains("turn 1 was cut by the restart"))),
+            "{events:?}"
+        );
+        let on_disk = hosted_on_disk(&r);
+        assert!(on_disk[0].running.is_none() && on_disk[0].approvals.is_empty());
+
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert!(
+            !turns.is_empty() && turns.iter().all(|t| t.turn == 2),
+            "{turns:?}"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// A daemon that is stopping takes no new turn and no new session: the
+    /// turn would be cut with a number the next daemon never learns, and the
+    /// session would not outlive its launch.
+    #[tokio::test]
+    async fn a_stopping_daemon_takes_no_new_prompt_or_start() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.begin_shutdown();
+        let err = r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap_err();
+        assert!(err.contains("restarting"), "{err}");
+        let refused = r.sup.start(order(&r), true).await;
+        assert_eq!(refused.refused, Some(HiveRefusal::Other));
+        assert!(refused.detail.unwrap_or_default().contains("restarting"));
+        assert_eq!(r.sup.live_count(), 1);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// The next daemon's gates are the ones configured NOW. Each refusal
+    /// ends the session with its reason, forgets it, and launches nothing;
+    /// so does a session that keeps taking the daemon down with it.
+    #[tokio::test]
+    async fn a_resume_passes_every_gate_again_as_the_device_is_configured_now() {
+        async fn resumed_with(
+            hosted: impl FnOnce(&mut HostedSession),
+            cfg_with: impl FnOnce(&mut HiveConfig, ObjectId),
+        ) -> String {
+            let mut r = rig(true, 4);
+            let sid = ObjectId::new();
+            host(&r, sid, hosted);
+            let user = r.user;
+            restart(&mut r, |c| cfg_with(c, user));
+            let (seen, manifest) = until_manifest(&mut r).await;
+            assert!(manifest.is_empty(), "{manifest:?}");
+            assert!(hosted_on_disk(&r).is_empty(), "forgotten");
+            assert_eq!(r.sup.live_count(), 0);
+            assert!(
+                !r.root.path().join("work").join(".argv").exists(),
+                "nothing launched"
+            );
+            seen.into_iter()
+                .find_map(|m| match m {
+                    ClientMsg::HiveState {
+                        session_id,
+                        state: Some(HiveRunState::Ended),
+                        detail,
+                        ..
+                    } if session_id == sid => detail,
+                    _ => None,
+                })
+                .expect("reported ended")
+        }
+        let why = resumed_with(|_| {}, |c, _| c.enabled = false).await;
+        assert!(
+            why.starts_with("not resumed after the device restarted: ")
+                && why.contains("hive_enabled"),
+            "{why}"
+        );
+        let why = resumed_with(
+            |_| {},
+            |c, user| {
+                c.accounts.insert(user.to_hex(), "ops".into());
+            },
+        )
+        .await;
+        assert!(why.contains("whose home holds its history"), "{why}");
+        let why = resumed_with(|_| {}, |c, _| c.roots = vec![PathBuf::from("/nowhere")]).await;
+        assert!(why.contains("hive_roots"), "{why}");
+        let why = resumed_with(
+            |h| {
+                h.resumed_at = Some(unix_now());
+                h.quick_resumes = MAX_QUICK_RESUMES - 1;
+            },
+            |_, _| {},
+        )
+        .await;
+        assert!(why.contains("restarted 3 times within 120 s"), "{why}");
+    }
+
+    /// Capacity holds across a restart: what the device now allows resumes,
+    /// in the order it was hosted, and the rest end saying why.
+    #[tokio::test]
+    async fn a_resume_counts_against_capacity_as_configured_now() {
+        let mut r = rig(true, 4);
+        let (first, second) = (ObjectId::new(), ObjectId::new());
+        host(&r, first, |_| {});
+        host(&r, second, |_| {});
+        restart(&mut r, |c| c.max_sessions = 1);
+        let (seen, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(first, 1)]);
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveState { session_id, state: Some(HiveRunState::Ended), detail: Some(d), .. }
+                    if *session_id == second && d.contains("hive_max_sessions"))),
+            "{seen:?}"
+        );
+        let on_disk = hosted_on_disk(&r);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].session, first.to_hex());
+        r.sup.stop(first, 1, "owner".into());
+        until_ended(&mut r, first).await;
+    }
+
+    /// A stop that reaches the next daemon before its first connection
+    /// resumed the session ends it there, with no launch at all.
+    #[tokio::test]
+    async fn a_stop_before_the_resume_ends_the_session_without_a_launch() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |_| {});
+        next_daemon(&mut r, |_| {});
+        r.sup.stop(sid, 1, "owner".into());
+        connect(&mut r);
+        let (seen, manifest) = until_manifest(&mut r).await;
+        assert!(manifest.is_empty());
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveState { session_id, state: Some(HiveRunState::Ended), detail: Some(d), .. }
+                    if *session_id == sid && d == "stopped (owner) before it resumed")),
+            "{seen:?}"
+        );
+        assert!(hosted_on_disk(&r).is_empty());
+        assert!(
+            !r.root.path().join("work").join(".argv").exists(),
+            "nothing launched"
+        );
+    }
+
+    /// The server re-sends a start whose answer the last daemon never
+    /// delivered, and it reaches the next daemon before the resume does: it
+    /// IS the resume — `--resume` because the history exists, where a
+    /// `--session-id` would be refused "already in use" — and the resume
+    /// that follows leaves it alone.
+    #[tokio::test]
+    async fn a_start_the_server_re_sends_for_a_hosted_session_resumes_it() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        host(&r, sid, |h| h.turns = 2);
+        let history = r
+            .root
+            .path()
+            .join("home/.roomler/hive")
+            .join(sid.to_hex())
+            .join("claude/projects")
+            .join(format!("hive-{}", o.harness_session))
+            .join(format!("{}.jsonl", o.harness_session));
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(&history, "{}\n{}\n").unwrap();
+
+        next_daemon(&mut r, |_| {});
+        forget_argv(&r);
+        assert_eq!(r.sup.start(o.clone(), true).await, Answer::accepted("dev"));
+        let argv = next_argv(&r).await;
+        assert!(argv.contains(&"--resume".to_string()), "{argv:?}");
+        connect(&mut r);
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)]);
+        assert_eq!(r.sup.live_count(), 1, "one harness, not two");
+
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert!(
+            !turns.is_empty() && turns.iter().all(|t| t.turn == 3),
+            "{turns:?}"
         );
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
