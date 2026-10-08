@@ -515,6 +515,62 @@ async fn a_session_token_opens_inference_and_token_counting_and_nothing_else() {
     r.sup.stop(sid, 1, "owner".into());
 }
 
+/// A key not scoped to a workspace needs `anthropic-workspace-id` on every
+/// call (field, 2026-10-07: `400 This API key is not scoped to a
+/// workspace`). The device's setting supplies it; whatever the session sent
+/// is replaced, and without the setting nothing is added.
+#[tokio::test]
+async fn the_devices_workspace_travels_with_the_key_and_the_sessions_does_not() {
+    for (configured, sent_by_session, expected) in [
+        (
+            Some("wrkspc_device"),
+            Some("wrkspc_session"),
+            Some("wrkspc_device"),
+        ),
+        (None, None, None),
+    ] {
+        let p = provider().await;
+        let helper = format!("printf '{DEVICE_KEY}\\n'");
+        let upstream = p.url.clone();
+        let mut r = rig_with(
+            true,
+            4,
+            move |cfg| {
+                cfg.api_key_helper = Some(helper);
+                cfg.api_workspace_id = configured.map(str::to_string);
+            },
+            move |sup| sup.with_sidecar(upstream, OFFLINE_GRACE),
+        );
+        std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
+        let (sid, base, token) = started(&mut r).await;
+        p.go.notify_one();
+        let mut req = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", &token)
+            .header("anthropic-version", "2023-06-01")
+            .body("{}");
+        if let Some(w) = sent_by_session {
+            req = req.header("anthropic-workspace-id", w);
+        }
+        let resp = tokio::time::timeout(WAIT, req.send())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        drop(resp);
+        let seen = p.seen.lock().await.clone();
+        assert_eq!(
+            seen[0]
+                .headers
+                .get("anthropic-workspace-id")
+                .map(String::as_str),
+            expected,
+            "configured {configured:?}, sent by the session {sent_by_session:?}"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+    }
+}
+
 #[test]
 fn only_inference_and_token_counting_are_forwarded() {
     use hyper::Method;

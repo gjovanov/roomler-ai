@@ -402,6 +402,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - a command the DAEMON runs (as SYSTEM/root) to print the model API key. Sessions never see it: each gets a per-session token for the loopback model sidecar. Empty = no model credential, and sessions' model calls fail.",
     },
     KeyMeta {
+        key: "hive_api_workspace_id",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 - the provider workspace for a model key that is not scoped to one: the sidecar sends it as anthropic-workspace-id with every model call. Empty = no header (right for a workspace-scoped key).",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1671,6 +1679,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_max_sessions" => cfg.hive_max_sessions.map(|n| n.to_string()),
         "hive_harness" => cfg.hive_harness.clone(),
         "hive_api_key_helper" => cfg.hive_api_key_helper.clone(),
+        "hive_api_workspace_id" => cfg.hive_api_workspace_id.clone(),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -1913,6 +1922,23 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 None => None,
                 Some(v) if v.chars().any(char::is_control) => {
                     return Err("hive_api_key_helper must be one line".into());
+                }
+                Some(v) => Some(v.to_string()),
+            }
+        }
+        // An identifier, sent as a header: letters, digits, `_` and `-` only.
+        "hive_api_workspace_id" => {
+            cfg.hive_api_workspace_id = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v)
+                    if v.len() > 128
+                        || !v
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+                {
+                    return Err(
+                        "hive_api_workspace_id is a workspace id (letters, digits, _ and -)".into(),
+                    );
                 }
                 Some(v) => Some(v.to_string()),
             }
@@ -3812,6 +3838,17 @@ mod tests {
         apply(&mut cfg, "hive_max_sessions", Some("2")).unwrap();
         assert_eq!(cfg.hive_max_sessions, Some(2));
         assert!(apply(&mut cfg, "hive_api_key_helper", Some("a\nb")).is_err());
+        // A header value: an identifier, nothing that could smuggle another.
+        for bad in ["wrkspc 1", "wrkspc\r\nx-api-key: k", "a:b"] {
+            assert!(
+                apply(&mut cfg, "hive_api_workspace_id", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        apply(&mut cfg, "hive_api_workspace_id", Some("wrkspc_01Ab-9")).unwrap();
+        assert_eq!(cfg.hive_api_workspace_id.as_deref(), Some("wrkspc_01Ab-9"));
+        apply(&mut cfg, "hive_api_workspace_id", None).unwrap();
+        assert_eq!(cfg.hive_api_workspace_id, None);
     }
 
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
