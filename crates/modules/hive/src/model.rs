@@ -131,7 +131,8 @@ pub struct AgentSession {
     pub refusal: Option<String>,
     /// How it ended (or will end, once `stopping` completes): `stopped`,
     /// `exited`, `member_removed`, `device_removed`, `tenant_archived`,
-    /// `never_answered`, `device_unsupported`.
+    /// `never_answered`, `device_unsupported`, `not_on_device` (P1b: its
+    /// device reconnected without it — a restart, or an end it never told).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     /// The device's last few words about it (a refusal's or an exit's), capped.
