@@ -47,7 +47,7 @@
       >
         {{ $t('hive.viewer.empty') }}
       </div>
-      <div v-for="e in shown" :key="e.seq" class="hive-event mb-2" :data-kind="e.event.kind">
+      <div v-for="e in visible" :key="e.seq" class="hive-event mb-2" :data-kind="e.event.kind">
         <template v-if="e.event.kind === 'user_message'">
           <div class="text-caption text-medium-emphasis">{{ asText(e.event.author) || $t('hive.viewer.someone') }}</div>
           <div class="hive-prompt pa-2 rounded">{{ asText(e.event.text) }}</div>
@@ -58,14 +58,20 @@
           <summary class="text-caption">{{ $t('hive.viewer.thinking') }}</summary>
           <div class="hive-pre">{{ asText(e.event.summary) }}</div>
         </details>
-        <div v-else-if="e.event.kind === 'tool_use'">
-          <div class="text-caption"><v-icon size="x-small">mdi-wrench</v-icon> {{ asText(e.event.name) }}</div>
-          <pre class="hive-pre">{{ pretty(e.event.input) }}</pre>
-        </div>
-        <div v-else-if="e.event.kind === 'tool_result'">
-          <pre class="hive-pre" :class="{ 'hive-error': e.event.ok === false }">{{ asText(e.event.output) }}</pre>
-          <div v-if="e.event.truncated" class="text-caption text-medium-emphasis">{{ $t('hive.viewer.truncated') }}</div>
-        </div>
+        <!-- FR-90 P1f — a call by its tool, its result folded under it. -->
+        <hive-tool-call
+          v-else-if="e.event.kind === 'tool_use'"
+          :name="asText(e.event.name)"
+          :input="e.event.input"
+          :result="resultOf(e.event.id)"
+        />
+        <!-- A result on its own: after the approval that let its call run,
+             or with its call before the loaded window. -->
+        <hive-tool-result
+          v-else-if="e.event.kind === 'tool_result'"
+          :name="callName(e.event.tool_use_id)"
+          :result="{ ok: e.event.ok !== false, output: asText(e.event.output), truncated: e.event.truncated === true }"
+        />
         <div v-else-if="e.event.kind === 'turn'" class="text-caption text-medium-emphasis hive-turn">
           {{ turnLine(e.event) }}
         </div>
@@ -85,7 +91,7 @@
             <v-icon size="small" color="warning">mdi-shield-key</v-icon>
             {{ $t('hive.viewer.approval.asks', { tool: asText(e.event.tool_name) }) }}
           </div>
-          <pre class="hive-pre mt-1">{{ pretty(e.event.input) }}</pre>
+          <hive-tool-input class="mt-1" :name="asText(e.event.tool_name)" :input="e.event.input" />
           <template v-if="isOpen(e.event.id)">
             <div v-if="viewer.mayAnswer.value" class="d-flex flex-wrap align-center ga-2 mt-2">
               <v-btn
@@ -186,11 +192,59 @@ import { useI18n } from 'vue-i18n'
 import { renderMarkdown } from '@/composables/useMarkdown'
 import { useHiveViewer, withoutRepeatedInits } from '@/composables/useHiveViewer'
 import HiveParticipants from '@/components/hive/HiveParticipants.vue'
+import HiveToolCall from '@/components/hive/HiveToolCall.vue'
+import HiveToolInput from '@/components/hive/HiveToolInput.vue'
+import HiveToolResult from '@/components/hive/HiveToolResult.vue'
 
 const props = defineProps<{ sessionId: string; tenantId?: string }>()
 const { t } = useI18n()
 const viewer = useHiveViewer()
 const shown = computed(() => withoutRepeatedInits(viewer.events.value))
+
+// P1f — tool calls and their results, matched by the call's id. A call an
+// approval names is drawn by its approval card (the input the answer applies
+// to), and its result after the answer; any other call has its result drawn
+// under it. A result whose call is not among the events shown stands alone.
+type ToolResult = { ok: boolean; output: string; truncated?: boolean }
+const tools = computed(() => {
+  const names = new Map<string, string>()
+  const results = new Map<string, ToolResult>()
+  const approved = new Set<string>()
+  for (const e of viewer.events.value) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ev = e.event as any
+    if (ev.kind === 'tool_use') names.set(asText(ev.id), asText(ev.name))
+    else if (ev.kind === 'tool_result') {
+      results.set(asText(ev.tool_use_id), { ok: ev.ok !== false, output: asText(ev.output), truncated: ev.truncated === true })
+    } else if (ev.kind === 'approval_requested' && ev.tool_use_id) approved.add(asText(ev.tool_use_id))
+  }
+  return { names, results, approved }
+})
+const visible = computed(() => {
+  const { approved } = tools.value
+  const drawn = new Set<string>()
+  for (const e of shown.value) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const id = asText((e.event as any).id)
+    if (e.event.kind === 'tool_use' && !approved.has(id)) drawn.add(id)
+  }
+  return shown.value.filter((e) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ev = e.event as any
+    if (ev.kind === 'tool_use') return !approved.has(asText(ev.id))
+    if (ev.kind === 'tool_result') return !drawn.has(asText(ev.tool_use_id))
+    return true
+  })
+})
+
+function resultOf(id: unknown): ToolResult | null {
+  return tools.value.results.get(asText(id)) ?? null
+}
+
+/** The tool a result came from; empty when its call is not loaded. */
+function callName(id: unknown): string {
+  return tools.value.names.get(asText(id)) ?? ''
+}
 
 const listRef = ref<HTMLElement | null>(null)
 const nearBottom = ref(true)
@@ -268,14 +322,6 @@ function asText(v: unknown): string {
   return typeof v === 'string' ? v : v == null ? '' : String(v)
 }
 
-function pretty(v: unknown): string {
-  try {
-    return JSON.stringify(v, null, 2)
-  } catch {
-    return String(v)
-  }
-}
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function turnLine(e: any): string {
   const parts = [e.ok === false ? t('hive.viewer.turnError') : t('hive.viewer.turnDone')]
@@ -326,6 +372,10 @@ watch(
 .hive-transcript {
   height: 100%;
   min-height: 0;
+}
+.hive-assistant :deep(ol),
+.hive-assistant :deep(ul) {
+  padding-left: 1.5rem;
 }
 .hive-prompt {
   white-space: pre-wrap;
