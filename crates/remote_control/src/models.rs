@@ -5316,6 +5316,10 @@ mod tests {
             "hive_api_workspace_id",
             "hive_max_sessions",
             "hive_update_wait_secs",
+            // FR-90 P1e — the one gate on server-authored text reaching a
+            // session's model; a server that could set it would vouch for
+            // itself.
+            "hive_core_memory",
         ] {
             assert!(
                 !keys.contains(&forbidden),
