@@ -5,6 +5,8 @@
 #   scripts/public-site-smoke.sh <base-url> [<repo-dir> [<git-rev>]]
 #   scripts/public-site-smoke.sh http://localhost:8080 .           # the hosted-image smoke
 #   scripts/public-site-smoke.sh https://roomler.ai . <deployed-sha> # production, after a roll
+#   scripts/public-site-smoke.sh --blog https://roomler.ai           # the blog lane (FR-91),
+#                                                                    # after every publish
 #
 #   With <repo-dir> (a clone with FULL history), every docs page's sitemap
 #   <lastmod> is also compared with `git log -1 --format=%cs` for its file at
@@ -31,8 +33,19 @@
 
 set -u
 
+# FR-91 (#1880): `--blog <base-url> [<docs-base-url>]` checks the blog lane —
+# the `roomler-blog` server that `bun docs/build.ts --blog-only` feeds — instead
+# of the whole site. In production both arguments are https://roomler.ai (the
+# edge routes /blog/ to the lane and /docs/ to the pod); against two local
+# servers, the second names the one that serves /docs/.
+BLOG_MODE=0
+if [ "${1:-}" = "--blog" ]; then
+  BLOG_MODE=1
+  shift
+fi
+
 BASE="${1:-}"
-[ -n "$BASE" ] || { echo "usage: $0 <base-url> [<repo-dir> [<git-rev>]]" >&2; exit 2; }
+[ -n "$BASE" ] || { echo "usage: $0 <base-url> [<repo-dir> [<git-rev>]]  |  $0 --blog <base-url> [<docs-base-url>]" >&2; exit 2; }
 BASE="${BASE%/}"
 REPO="${2:-}"
 REV="${3:-HEAD}"
@@ -62,6 +75,114 @@ redirect() {
 # so the comparison is order-independent; values compared verbatim.
 SEC='content-security-policy|strict-transport-security|x-frame-options|x-content-type-options|referrer-policy|permissions-policy|x-xss-protection'
 secset() { headers "$1" | grep -Ei "^($SEC):" | sort; }
+
+# ── FR-91: the blog lane ────────────────────────────────────────────────────
+# What a publisher runs after every publish, against the SERVED site: the lane
+# must be the blog FR-87 built — same headers, same caching, same URLs, real
+# 404s — and must load nothing from the image's /docs/assets/, whose hashed
+# names change with every image the lane does not follow.
+if [ "$BLOG_MODE" = "1" ]; then
+  DOCS_BASE="${2:-$BASE}"
+  DOCS_BASE="${DOCS_BASE%/}"
+  echo "public-site smoke (blog lane) against $BASE, docs at $DOCS_BASE"
+
+  code="$(status "$BASE/blog/")"
+  [ "$code" = "200" ] && ok "/blog/ -> 200" || bad "/blog/ -> $code (want 200)"
+
+  read -r code loc <<< "$(redirect "$BASE/blog")"
+  if [ "$code" = "301" ] && [ "$loc" = "/blog/" ]; then
+    ok "/blog -> 301 Location: $loc (relative, slash form)"
+  else
+    bad "/blog -> $code Location: '${loc:-none}' (want 301 to '/blog/', relative)"
+  fi
+
+  sm="$(curl -ksS -m 15 "$BASE/sitemap-blog.xml" 2>/dev/null | tr -d '\r')"
+  if printf '%s' "$sm" | grep -q '<urlset' && printf '%s' "$sm" | grep -q '/blog/</loc>'; then
+    ok "/sitemap-blog.xml is a urlset naming /blog/"
+  else
+    bad "/sitemap-blog.xml is not the blog's urlset"
+  fi
+  # A post to look at: the first one the sitemap names.
+  post="$(printf '%s\n' "$sm" | grep -oE '<loc>[^<]+/blog/[^<]+/</loc>' | head -1 | sed -E 's#</?loc>##g; s#^https?://[^/]+##')"
+  if [ -z "$post" ]; then
+    bad "/sitemap-blog.xml names no post"
+  else
+    html="$(curl -ksS -m 15 "$BASE$post" 2>/dev/null)"
+    if [ "$(status "$BASE$post")" = "200" ] && printf '%s' "$html" | grep -q "<link rel=\"canonical\" href=\"https://roomler.ai$post\">" \
+       && printf '%s' "$html" | grep -q '"@type":"BlogPosting"'; then
+      ok "$post -> 200, its own canonical, BlogPosting JSON-LD"
+    else
+      bad "$post -> not a published post (status, canonical or BlogPosting missing)"
+    fi
+  fi
+
+  ct="$(header "$BASE/blog/feed.xml" content-type)"
+  case "$ct" in
+    application/atom+xml*) ok "/blog/feed.xml Content-Type: $ct" ;;
+    *) bad "/blog/feed.xml Content-Type: '${ct:-none}' (want application/atom+xml)" ;;
+  esac
+
+  path=/blog/fr91-smoke-missing/
+  code="$(status "$BASE$path")"
+  if [ "$code" != "404" ]; then
+    bad "$path -> $code (want 404; a 200 here is a soft 404)"
+  elif curl -ksS -m 15 "$BASE$path" 2>/dev/null | grep -q '<h1 class="page-title">Page not found'; then
+    ok "$path -> 404, the site's 404 page"
+  else
+    bad "$path -> 404, but not the site's 404 page (is blog/404.html missing?)"
+  fi
+
+  for p in /blog/ ${post:-}; do
+    cc="$(header "$BASE$p" cache-control)"
+    case "$cc" in
+      *no-cache*) ok "$p Cache-Control: $cc" ;;
+      *) bad "$p Cache-Control: '${cc:-none}' (want no-cache)" ;;
+    esac
+  done
+
+  # The security headers, byte for byte as the docs send them: one include
+  # (files/security-headers.conf) on two servers can still drift if either
+  # server stops including it or a location declares an `add_header`.
+  DOCS_SET="$(secset "$DOCS_BASE/docs/")"
+  if [ -z "$DOCS_SET" ]; then
+    bad "$DOCS_BASE/docs/ carries none of the security headers — cannot compare"
+  else
+    for p in /blog/ ${post:-} /blog/feed.xml; do
+      got="$(secset "$BASE$p")"
+      if [ "$got" = "$DOCS_SET" ]; then
+        ok "$p security headers == /docs/ ($(printf '%s\n' "$got" | wc -l | tr -d ' ') headers)"
+      else
+        bad "$p security headers differ from /docs/:"
+        diff <(printf '%s\n' "$DOCS_SET") <(printf '%s\n' "$got") | sed 's/^/      /'
+      fi
+    done
+  fi
+
+  # Every asset the lane's pages load is its own, content-hashed and loading.
+  for p in /blog/ ${post:-}; do
+    html="$(curl -ksS -m 20 "$BASE$p" 2>/dev/null)"
+    foreign="$(printf '%s' "$html" | grep -oE '(href|src|data-search-index)="/docs/assets/[^"]+"' | head -3 | tr '\n' ' ')"
+    refs="$(printf '%s' "$html" | grep -oE '(href|src|data-search-index)="/blog/assets/[^"]+"' | sed -E 's/^[^"]+"//; s/"$//' | sort -u)"
+    n="$(printf '%s\n' "$refs" | grep -c .)"
+    plain="$(printf '%s\n' "$refs" | grep -vE '\.[0-9a-f]{10}\.[a-z0-9]+$' | grep . | tr '\n' ' ')"
+    missing=""
+    for r in $refs; do [ "$(status "$BASE$r")" = "200" ] || missing="$missing $r"; done
+    if [ -n "$foreign" ]; then
+      bad "$p loads files from the image's /docs/assets/: $foreign"
+    elif [ "$n" -lt 3 ]; then
+      bad "$p names only $n /blog/assets/ files (want the theme's css + js + search index at least)"
+    elif [ -n "$plain" ]; then
+      bad "$p names unhashed assets: $plain"
+    elif [ -n "$missing" ]; then
+      bad "$p names assets that do not load:$missing"
+    else
+      ok "$p: $n assets, all under /blog/assets/, content-hashed and loading"
+    fi
+  done
+
+  if [ "$FAIL" = "0" ]; then echo "public-site smoke (blog lane): all checks passed"; else echo "public-site smoke (blog lane): FAILED"; fi
+  exit "$FAIL"
+fi
 
 echo "public-site smoke against $BASE"
 
