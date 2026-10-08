@@ -45,6 +45,7 @@ function makeViewer(events: any[], pending: string[], mayAnswer: boolean) {
     prompt: vi.fn(() => Promise.resolve({ ok: true })),
     answer: vi.fn(() => Promise.resolve({ ok: true })),
     loadEarlier: vi.fn(),
+    trimEarlier: vi.fn(),
   }
 }
 
@@ -193,6 +194,34 @@ describe('HiveTranscript — tool calls (FR-90 P1f)', () => {
     const alone = w.findAll('.hive-event[data-kind="tool_result"]')
     expect(alone).toHaveLength(1)
     expect(alone[0].text()).toContain('from earlier')
+  })
+})
+
+describe('HiveTranscript — a long session (FR-90 P1f-2)', () => {
+  const note = (n: number) => ({ kind: 'note', text: `n${n}` })
+
+  it('keeps a bounded page while it follows the newest, never while someone reads further up', async () => {
+    hoisted.viewer = makeViewer([note(1), note(2)], [], true)
+    const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
+    const w = mount(HiveTranscript, { props: { sessionId: 's1', keep: 5 }, global: { plugins: [vuetify, i18n] } })
+    await flushPromises()
+    const live = (n: number) => {
+      hoisted.viewer.events.value = Array.from({ length: n }, (_, i) => ({ seq: i + 1, ts: i, fence: 1, event: note(i + 1) }))
+    }
+    live(3)
+    await flushPromises()
+    expect(hoisted.viewer.trimEarlier).toHaveBeenLastCalledWith(5)
+
+    // Scrolled up, reading: the page is left alone.
+    hoisted.viewer.trimEarlier.mockClear()
+    const list = w.find('.overflow-y-auto').element as HTMLElement
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 2000 })
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 })
+    list.scrollTop = 0
+    await w.find('.overflow-y-auto').trigger('scroll')
+    live(4)
+    await flushPromises()
+    expect(hoisted.viewer.trimEarlier).not.toHaveBeenCalled()
   })
 })
 
