@@ -232,6 +232,20 @@ export function isRetryableTerminateReason(reason: unknown): boolean {
 }
 
 /**
+ * FR-27 P10 - the `rc:terminate` reason that means the PERSON AT THE DEVICE
+ * ended the session (the banner's or the badge's Disconnect). Terminal like
+ * every deliberate ending, and the one the viewer says out loud and offers
+ * an explicit Reconnect for: re-asking a host that just sent you away is not
+ * a retry, it is a new request, and it goes through consent like any other.
+ * Only the device may claim it (the hub records a controller's claim as
+ * `controller_hangup`), and pre-P10 agents never sent it, so a `true` here
+ * is always the host's own word.
+ */
+export function endedByHost(reason: unknown): boolean {
+  return reason === 'host_disconnect'
+}
+
+/**
  * `rc:error` codes that advance the reconnect ladder instead of
  * killing it. Only honoured while a reconnect cycle is active Ã¢ÂÂ a
  * user-initiated first connect hitting `agent_offline` should fail
@@ -3769,6 +3783,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  release. Consumed by disconnect(). */
   let requestSent = false
   const reconnectAttempt = ref(0)
+  /**
+   * FR-27 P10 - who ended the last session when it was not this viewer:
+   * `'host'` after a `host_disconnect` (the person at the device clicked
+   * Disconnect on their screen). The view renders it as a notice with an
+   * explicit Reconnect; cleared by the next user-initiated connect().
+   */
+  const endedBy = ref<'host' | null>(null)
   /** FR-22 - ms from `rc:session.request` to the first painted frame on
    *  the attempt that succeeded. Null until one does. Exposed so the
    *  viewer HUD and the field can read a NUMBER instead of an anecdote:
@@ -7104,6 +7125,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         return
       }
       phase.value = 'closed'
+      if (endedByHost(msg.reason)) {
+        // FR-27 P10 - the person at the device ended it. Said as such (the
+        // view renders `endedBy`), never as an error, and never retried on
+        // its own: teardown() below closes the channels with the phase
+        // already 'closed', so the control DC's onclose (the fast reconnect
+        // path) stays quiet, and the ladder is left with nothing to replay.
+        // Reconnect is the operator's explicit act from here, through
+        // consent like any new session.
+        console.info('[rc] session ended by the person at the device - not reconnecting')
+        endedBy.value = 'host'
+        cancelReconnect()
+        lastConnectArgs = null
+      }
       if (msg.reason) {
         // FR-27 - a non-nominal end gets a sentence, not the enum name. The
         // mapping returns null for every nominal reason, so the set of
@@ -7485,6 +7519,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // the right args from the original user click.
     if (!isReconnect) {
       lastConnectArgs = { agentId, permissions, orgId }
+      // FR-27 P10 - a fresh request is the operator's answer to "the person
+      // at the device ended it"; the notice has done its job.
+      endedBy.value = null
       // New user-initiated connect - a later retry in THIS cycle must not
       // inherit "the session worked once" from the previous one.
       sessionEverPainted = false
@@ -10972,6 +11009,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     phase,
     error,
     notice,
+    /** FR-27 P10 - `'host'` when the person at the device ended the last session. */
+    endedBy,
     sessionId,
     overrideReason,
     remoteStream,
