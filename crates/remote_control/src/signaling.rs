@@ -741,6 +741,39 @@ pub enum ClientMsg {
         cost_usd: Option<f64>,
     },
 
+    /// FR-90 P1a-2 — an approval opened or ended in a session: the server's
+    /// stub in the session's room and its `agent_approvals` record.
+    ///
+    /// ⚠️ METADATA ONLY, and the field set is LOCKED by test: which tool and
+    /// what it would do travel device-to-browser over the viewer peer, so a
+    /// `tool`, `input` or `command` field here would put them in a room's
+    /// message store.
+    #[serde(rename = "rc:hive.approval")]
+    HiveApproval {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The device's id for the approval.
+        approval_id: String,
+        /// The turn it came up in, when one runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u32>,
+        /// `None` = a word this build cannot name; decoded leniently.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::approval_status_lenient"
+        )]
+        status: Option<crate::hive::HiveApprovalStatus>,
+        /// The driver who answered, when one did.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "option_oid_hex"
+        )]
+        answered_by: Option<ObjectId>,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1516,6 +1549,7 @@ impl ClientMsg {
             ClientMsg::HiveStartAck { .. } => "rc:hive.start_ack",
             ClientMsg::HiveState { .. } => "rc:hive.state",
             ClientMsg::HiveTurn { .. } => "rc:hive.turn",
+            ClientMsg::HiveApproval { .. } => "rc:hive.approval",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1610,6 +1644,7 @@ impl ClientMsg {
             ClientMsg::HiveStartAck { .. }
             | ClientMsg::HiveState { .. }
             | ClientMsg::HiveTurn { .. }
+            | ClientMsg::HiveApproval { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1640,6 +1675,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.start_ack", Owner::Hive),
     ("rc:hive.state", Owner::Hive),
     ("rc:hive.turn", Owner::Hive),
+    ("rc:hive.approval", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -3774,6 +3810,58 @@ mod tests {
                 prompted_by,
                 ..
             } => assert_eq!((status, steps, prompted_by), (None, 0, None)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// FR-90 P1a-2 — an approval's frame says THAT a session waits for a
+    /// driver, and how it ended — never which tool or what it would do. The
+    /// field set is spelled out so a `tool`, `input` or `command` field is a
+    /// deliberate edit here (AC5: the server's stub holds no tool arguments).
+    #[test]
+    fn hive_approval_is_a_stub_and_carries_no_tool_or_arguments() {
+        use crate::hive::HiveApprovalStatus;
+
+        let (sid, who) = (ObjectId::new(), ObjectId::new());
+        let m = ClientMsg::HiveApproval {
+            session_id: sid,
+            fence: 1,
+            approval_id: "0f1e2d3c4b5a6978".into(),
+            turn: Some(2),
+            status: Some(HiveApprovalStatus::Denied),
+            answered_by: Some(who),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "answered_by",
+                "approval_id",
+                "fence",
+                "session_id",
+                "status",
+                "t",
+                "turn",
+            ]
+        );
+        assert_eq!(v["t"], "rc:hive.approval");
+        assert_eq!(v["answered_by"], who.to_hex());
+        assert_eq!(m.namespace(), Owner::Hive);
+
+        // A newer device's word keeps the frame; an open one needs no more.
+        let newer = serde_json::json!({
+            "t": "rc:hive.approval", "session_id": sid.to_hex(), "fence": 1,
+            "approval_id": "a1", "status": "delegated"
+        });
+        match serde_json::from_value::<ClientMsg>(newer).expect("the frame must still parse") {
+            ClientMsg::HiveApproval {
+                status,
+                turn,
+                answered_by,
+                ..
+            } => assert_eq!((status, turn, answered_by), (None, None, None)),
             other => panic!("wrong variant: {other:?}"),
         }
     }

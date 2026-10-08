@@ -34,7 +34,7 @@ use axum::{
     routing::{get, post},
 };
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
+use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique};
 use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_mod_fleet::FleetState;
 use roomler_core::{
@@ -63,6 +63,8 @@ pub struct HiveState {
     /// Stateless, so re-created here rather than taken as a dependency.
     pub chat: BoundChat,
     pub sessions: Arc<dao::AgentSessionDao>,
+    /// P1a-2 — every approval a session asked a driver for.
+    pub approvals: Arc<dao::AgentApprovalDao>,
     pub audit: Arc<dao::HiveAuditDao>,
     /// Start requests waiting for their device's answer (pod-local).
     pub start_acks: Arc<acks::StartAcks>,
@@ -100,6 +102,7 @@ impl Module for HiveState {
         let db = &core.db;
         let state = Self {
             sessions: Arc::new(dao::AgentSessionDao::new(db)),
+            approvals: Arc::new(dao::AgentApprovalDao::new(db)),
             audit: Arc::new(dao::HiveAuditDao::new(db)),
             start_acks: Arc::new(acks::StartAcks::new()),
             start_limiter: Arc::new(RateLimiter::new()),
@@ -168,6 +171,17 @@ impl Module for HiveState {
                     index(bson::doc! { "tenant_id": 1, "location.device_id": 1, "status": 1 }),
                     // An org's live sessions: archive.
                     index(bson::doc! { "tenant_id": 1, "status": 1 }),
+                ],
+            },
+            // P1a-2 — approvals: one record per (session, approval), so a
+            // replayed frame posts no second stub; 90 days, like the audit.
+            IndexSet {
+                collection: model::AgentApproval::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "session_id": 1, "approval_id": 1 }),
+                    index(bson::doc! { "tenant_id": 1, "requested_at": -1 }),
+                    index_ttl(bson::doc! { "requested_at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },
             // The server's decisions — 90-day retention, like the exec and

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HARNESS_CLAUDE_CODE, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits,
+    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::launch::{
@@ -78,6 +78,8 @@ const STDERR_TAIL: usize = 400;
 /// The toolbelt's channel to its session task: an approval opening and
 /// closing is two messages, and a session holds few open at once.
 const APPROVAL_QUEUE: usize = 32;
+/// Approvals per session whose newest frame a reconnect replays.
+const APPROVAL_REPLAY: usize = 16;
 
 /// What `rc:hive.start` asks for, as the supervisor uses it.
 #[derive(Debug, Clone)]
@@ -191,6 +193,10 @@ pub struct Supervisor {
     reports: Mutex<HashMap<ObjectId, Report>>,
     /// The newest `rc:hive.turn` per session, replayed with the states.
     turns: Mutex<HashMap<ObjectId, ClientMsg>>,
+    /// P1a-2 — the newest `rc:hive.approval` of each of a session's recent
+    /// approvals, replayed with the states: an end lost in a dying socket
+    /// would leave the room's stub saying "needs approval" for ever.
+    approval_frames: Mutex<HashMap<ObjectId, Vec<(String, ClientMsg)>>>,
     reporter: Mutex<Option<mpsc::Sender<ClientMsg>>>,
     /// Every state as it is reported, for the viewers of that session.
     states: broadcast::Sender<(ObjectId, HiveRunState)>,
@@ -352,6 +358,7 @@ impl Supervisor {
             live: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            approval_frames: Mutex::new(HashMap::new()),
             reporter: Mutex::new(None),
             states: broadcast::channel(64).0,
             approvals: broadcast::channel(64).0,
@@ -551,9 +558,20 @@ impl Supervisor {
             turns.retain(|s, _| replay.iter().any(|(r, _)| r == s));
             turns.values().cloned().collect()
         };
-        // Each session's newest turn, then its state: the server applies
-        // them in order, and a stub before the state is how they happened.
-        for t in turns {
+        let approvals: Vec<ClientMsg> = {
+            let mut all = self
+                .approval_frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            all.retain(|s, _| replay.iter().any(|(r, _)| r == s));
+            all.values()
+                .flat_map(|l| l.iter().map(|(_, m)| m.clone()))
+                .collect()
+        };
+        // Each session's newest turn and approvals, then its state: the
+        // server applies them in order, and a stub before the state is how
+        // they happened.
+        for t in turns.into_iter().chain(approvals) {
             let _ = tx.try_send(t);
         }
         for (session_id, r) in replay {
@@ -565,6 +583,35 @@ impl Supervisor {
             });
         }
         *self.reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Record and send an approval's frame (`rc:hive.approval`), like
+    /// [`Self::report_turn`]: the newest of each of the session's last
+    /// [`APPROVAL_REPLAY`] approvals is replayed on the next connection.
+    fn report_approval(&self, session: ObjectId, msg: ClientMsg) {
+        let ClientMsg::HiveApproval { approval_id, .. } = &msg else {
+            return;
+        };
+        {
+            let mut all = self
+                .approval_frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let list = all.entry(session).or_default();
+            list.retain(|(a, _)| a != approval_id);
+            list.push((approval_id.clone(), msg.clone()));
+            if list.len() > APPROVAL_REPLAY {
+                list.remove(0);
+            }
+        }
+        let tx = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(msg);
+        }
     }
 
     /// Record and send a turn's stub (`rc:hive.turn`), like [`Self::report`].
@@ -882,20 +929,22 @@ impl Supervisor {
         sidecar: Option<u16>,
         approvals: mpsc::Sender<ApprovalEvent>,
     ) -> Result<Spawned, (HiveRefusal, String)> {
-        // The account the session runs as: its home, and the ids its
-        // toolbelt socket is handed to (`None`: it runs as the daemon).
-        let (home, owner, uid) = match &self.launcher {
+        // The account the session runs as: its home, the ids its toolbelt
+        // socket is handed to (`None`: it runs as the daemon), and its
+        // groups — what the kernel checks when the harness starts the relay.
+        let (home, owner, uid, groups) = match &self.launcher {
             Launcher::AsMappedAccount => {
                 let home =
                     crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
-                let (uid, gid, _) =
+                let (uid, gid, mut groups) =
                     crate::exec::account_ids(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
-                (home, Some((uid, gid)), uid)
+                groups.push(gid);
+                (home, Some((uid, gid)), uid, Some(groups))
             }
             #[cfg(any(test, feature = "hive-test-launcher"))]
             Launcher::AsDaemon { home } => {
                 // SAFETY: getuid reads our own credentials.
-                (home.clone(), None, unsafe { libc::getuid() })
+                (home.clone(), None, unsafe { libc::getuid() }, None)
             }
         };
         let harness = resolve_harness(&self.cfg, &home).ok_or_else(|| {
@@ -914,7 +963,24 @@ impl Supervisor {
             )
         })?;
         // P1a — the toolbelt, whose `approve` is the session's permission
-        // tool: every tool call that needs one waits for a driver.
+        // tool: every tool call that needs one waits for a driver. Its relay
+        // is this binary, started by the harness AS THE SESSION'S ACCOUNT:
+        // one that account cannot run leaves the session without its
+        // permission tool, and its first tool call ends it ("MCP tool …
+        // not found") — far from the cause. Refused here, in words (field,
+        // 2026-10-08: a daemon run from a 0750 home).
+        let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        if let Some(groups) = &groups
+            && !executable_by(Path::new(&relay), uid, groups)
+        {
+            return Err((
+                HiveRefusal::LaunchFailed,
+                format!(
+                    "{account} cannot run {relay}, the session's toolbelt relay — install \
+                     roomlerd where every account may execute it"
+                ),
+            ));
+        }
         let dir = self.runtime.join(&sid);
         let toolbelt = toolbelt::open(
             &dir,
@@ -930,7 +996,6 @@ impl Supervisor {
                 format!("opening the session's toolbelt: {e}"),
             )
         })?;
-        let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
         let mcp = toolbelt_mcp_config(
             &relay,
             &[
@@ -1081,6 +1146,33 @@ fn write_doc(dir: &Path, name: &str, doc: &serde_json::Value) -> Result<PathBuf,
     Ok(path)
 }
 
+/// Whether the account `uid` (with `groups`) may execute `path`: `x` on the
+/// file and on every directory above it — by the owner's bits when it owns
+/// the entry, else the group's when one of its groups does, else everyone's;
+/// the kernel's order. (A POSIX ACL that grants more is not read: refusing a
+/// start it would have allowed is the safe mistake.)
+fn executable_by(path: &Path, uid: u32, groups: &[u32]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut entry = Some(path);
+    while let Some(p) = entry {
+        let Ok(m) = std::fs::metadata(p) else {
+            return false;
+        };
+        let bit = if m.uid() == uid {
+            0o100
+        } else if groups.contains(&m.gid()) {
+            0o010
+        } else {
+            0o001
+        };
+        if m.mode() & bit == 0 {
+            return false;
+        }
+        entry = p.parent();
+    }
+    true
+}
+
 /// The daemon's own binary, which the session's MCP config names as the
 /// toolbelt's relay. After a package upgrade replaced it under a running
 /// daemon, Linux names the old inode `<path> (deleted)`; the path itself
@@ -1161,9 +1253,10 @@ impl Task<'_> {
     }
 
     /// P1a — an approval opened or closed: recorded where the session's
-    /// events are, in their order, and the run state follows.
+    /// events are, in their order; the server hears THAT it did (P1a-2,
+    /// `rc:hive.approval`, no tool, no arguments); the run state follows.
     fn on_approval(&mut self, ev: ApprovalEvent) {
-        let event = match ev {
+        let (event, id, status, answered_by) = match ev {
             ApprovalEvent::Opened {
                 id,
                 tool_name,
@@ -1171,19 +1264,22 @@ impl Task<'_> {
                 input,
             } => {
                 self.open_approvals.push(id.clone());
-                TranscriptEvent::ApprovalRequested {
-                    id,
+                let event = TranscriptEvent::ApprovalRequested {
+                    id: id.clone(),
                     tool_name,
                     tool_use_id,
                     input,
-                }
+                };
+                (event, id, HiveApprovalStatus::Open, None)
             }
             ApprovalEvent::Closed { id, ended } => {
                 self.open_approvals.retain(|a| *a != id);
-                resolved(id, ended)
+                let (status, by) = approval_outcome_of(&ended);
+                (resolved(id.clone(), ended), id, status, by)
             }
         };
         self.store.append(&self.sid, self.fence, event);
+        self.report_approval(id, status, answered_by);
         self.settle_state();
         let _ = self
             .sup
@@ -1199,10 +1295,31 @@ impl Task<'_> {
             self.store.append(
                 &self.sid,
                 self.fence,
-                resolved(id, toolbelt::Ended::Withdrawn),
+                resolved(id.clone(), toolbelt::Ended::Withdrawn),
             );
+            self.report_approval(id, HiveApprovalStatus::Withdrawn, None);
         }
         let _ = self.sup.approvals.send((self.session, Vec::new()));
+    }
+
+    fn report_approval(
+        &self,
+        approval_id: String,
+        status: HiveApprovalStatus,
+        answered_by: Option<ObjectId>,
+    ) {
+        let turn = self.current.as_ref().map(|_| self.count);
+        self.sup.report_approval(
+            self.session,
+            ClientMsg::HiveApproval {
+                session_id: self.session,
+                fence: self.fence,
+                approval_id,
+                turn,
+                status: Some(status),
+                answered_by,
+            },
+        );
     }
 
     async fn prompt(&mut self, author: Option<Author>, text: String) {
@@ -1325,6 +1442,19 @@ impl Task<'_> {
                 cost_usd,
             },
         );
+    }
+}
+
+/// How an approval ended, as the server hears it: the word, and who
+/// answered — never what was asked or what the driver said.
+fn approval_outcome_of(ended: &toolbelt::Ended) -> (HiveApprovalStatus, Option<ObjectId>) {
+    match ended {
+        toolbelt::Ended::Answered(a) => match a.decision {
+            toolbelt::Decision::Allow => (HiveApprovalStatus::Allowed, Some(a.by.user_id)),
+            toolbelt::Decision::Deny { .. } => (HiveApprovalStatus::Denied, Some(a.by.user_id)),
+        },
+        toolbelt::Ended::Expired => (HiveApprovalStatus::Expired, None),
+        toolbelt::Ended::Withdrawn => (HiveApprovalStatus::Withdrawn, None),
     }
 }
 
@@ -2245,6 +2375,119 @@ done
         );
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+
+    /// The relay check reads permissions as the kernel will for the session's
+    /// account: a 0750 directory on the way stops anyone outside its group,
+    /// whatever the binary's own bits say (field, 2026-10-08).
+    #[test]
+    fn a_relay_the_account_cannot_reach_is_not_executable_by_it() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let bin = home.join("roomlerd");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let me = std::fs::metadata(&bin).unwrap();
+        let (uid, gid) = (me.uid(), me.gid());
+        let other = uid.wrapping_add(1);
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(executable_by(&bin, uid, &[]), "the owner");
+        assert!(
+            executable_by(&bin, other, &[gid]),
+            "the group, through 0750"
+        );
+        assert!(
+            !executable_by(&bin, other, &[]),
+            "anyone else is stopped at the 0750 home"
+        );
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(executable_by(&bin, other, &[]), "a 0755 path is everyone's");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            !executable_by(&bin, other, &[]),
+            "the binary's own bits still count"
+        );
+        assert!(!executable_by(&home.join("absent"), uid, &[]));
+    }
+
+    /// The next `rc:hive.approval` reported for `sid`.
+    async fn next_approval_frame(r: &mut Rig, sid: ObjectId) -> ClientMsg {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("a report within 10 s")
+                .expect("the reporter is open");
+            if matches!(&msg, ClientMsg::HiveApproval { session_id, .. } if *session_id == sid) {
+                return msg;
+            }
+        }
+    }
+
+    /// P1a-2 — the server hears THAT an approval waits, how it ended and who
+    /// answered — never the tool or what it would run — and a reconnect
+    /// hears it again, so a lost end cannot leave the room's stub open.
+    #[tokio::test]
+    async fn the_server_hears_that_an_approval_waits_and_how_it_ended_never_what() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        let mut c = harness_asks(&r, sid, 2, "cat /etc/canary-secret").await;
+        let opened = next_approval_frame(&mut r, sid).await;
+        let ClientMsg::HiveApproval {
+            ref approval_id,
+            turn,
+            status,
+            answered_by,
+            ..
+        } = opened
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (turn, status, answered_by),
+            (Some(1), Some(HiveApprovalStatus::Open), None)
+        );
+        let id = approval_id.clone();
+        let by = Author {
+            user_id: r.user,
+            name: "Dev".into(),
+        };
+        r.sup
+            .answer_approval(sid, &id, toolbelt::Decision::Allow, by)
+            .unwrap();
+        c.verdict(2).await;
+        let ended = next_approval_frame(&mut r, sid).await;
+        let wire = serde_json::to_string(&ended).unwrap();
+        for word in ["canary-secret", "Bash", "command"] {
+            assert!(!wire.contains(word), "the frame names {word:?}: {wire}");
+        }
+        assert!(matches!(
+            &ended,
+            ClientMsg::HiveApproval { approval_id, status: Some(HiveApprovalStatus::Allowed), answered_by: Some(u), .. }
+                if *approval_id == id && *u == r.user
+        ));
+
+        let (tx, mut again) = mpsc::channel(64);
+        r.sup.connected(tx);
+        let mut replayed = None;
+        while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(2), again.recv()).await {
+            if let ClientMsg::HiveApproval { status, .. } = m {
+                replayed = status;
+            }
+        }
+        assert_eq!(
+            replayed,
+            Some(HiveApprovalStatus::Allowed),
+            "its newest word, again"
+        );
+        release(&r);
+        r.sup.stop(sid, 1, "owner".into());
     }
 
     /// Nobody answering: the model is told so, the transcript says

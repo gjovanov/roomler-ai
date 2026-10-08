@@ -75,6 +75,12 @@ enum Report {
         fence: u64,
         report: room::TurnReport,
     },
+    /// P1a-2 — an approval opened or ended (`rc:hive.approval`).
+    Approval {
+        session_id: ObjectId,
+        fence: u64,
+        report: room::ApprovalReport,
+    },
     /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
     /// the device's answer must reach the browser before its candidates.
     View(ClientMsg),
@@ -154,6 +160,23 @@ impl AgentMsgHandler for HiveAgentSocket {
                     steps,
                     duration_ms,
                     cost_usd,
+                },
+            },
+            ClientMsg::HiveApproval {
+                session_id,
+                fence,
+                approval_id,
+                turn,
+                status,
+                answered_by,
+            } => Report::Approval {
+                session_id,
+                fence,
+                report: room::ApprovalReport {
+                    approval_id,
+                    turn,
+                    status,
+                    answered_by,
                 },
             },
             view @ (ClientMsg::HiveViewGrantAck { .. }
@@ -297,6 +320,9 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                             && let Ok(Some(s)) = state.sessions.find(session_id).await
                         {
                             room::note(state, &s, room::ended_note(&s)).await;
+                            // The device withdraws its own open approvals as
+                            // it ends; this covers a frame of theirs it lost.
+                            room::withdraw_approvals(state, &s).await;
                         }
                     }
                     Ok(false) => {
@@ -344,6 +370,31 @@ async fn apply_reports(state: &HiveState, device_id: ObjectId, mut rx: mpsc::Rec
                         "hive: a turn report for no session of this device at that fence"
                     ),
                     Err(e) => warn!(session = %session_id, %e, "hive: a turn report was not read"),
+                }
+            }
+            Report::Approval {
+                session_id,
+                fence,
+                report,
+            } => {
+                // The ownership rule again: only the session's own device, at
+                // its current fence. An opening in a session that is over is
+                // refused by `room::approval`; an end always applies, so a
+                // stub cannot be left saying "needs approval".
+                match state.sessions.find(session_id).await {
+                    Ok(Some(s))
+                        if s.location.device_id == device_id
+                            && u64::try_from(s.fence).ok() == Some(fence) =>
+                    {
+                        room::approval(state, &s, report).await;
+                    }
+                    Ok(_) => debug!(
+                        session = %session_id, device = %device_id, fence,
+                        "hive: an approval report for no session of this device at that fence"
+                    ),
+                    Err(e) => {
+                        warn!(session = %session_id, %e, "hive: an approval report was not read")
+                    }
                 }
             }
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,

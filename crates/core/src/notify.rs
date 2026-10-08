@@ -274,3 +274,33 @@ pub async fn notify_call_started(
 
     spawn_push_for_offline(state, offline_ids, params.title, params.body, params.link);
 }
+
+/// Who also gets a web push, beyond the in-app notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushTo {
+    /// Only the users with no socket anywhere — a mention, a call.
+    Offline,
+    /// Everyone notified: for a notification whose whole point is reaching
+    /// a person away from the screen (FR-90's approvals — a desk with the
+    /// app open is not a phone in a pocket).
+    Everyone,
+}
+
+/// Notify `users` in the app and over their sockets, and by web push as
+/// `push` says. No email: what needs a person NOW is not an email.
+pub async fn notify_users(state: &Core, params: &NotifyParams, users: &[ObjectId], push: PushTo) {
+    let mut pushed = Vec::new();
+    for user_id in users {
+        create_and_send_notification(state, params, *user_id).await;
+        if push == PushTo::Everyone || !user_online_anywhere(state, user_id).await {
+            pushed.push(*user_id);
+        }
+    }
+    spawn_push_for_offline(
+        state,
+        pushed,
+        params.title.clone(),
+        params.body.clone(),
+        params.link.clone(),
+    );
+}

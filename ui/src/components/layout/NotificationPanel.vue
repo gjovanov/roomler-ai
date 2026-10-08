@@ -69,6 +69,8 @@ function iconFor(type: string): string {
     case 'reaction': return 'mdi-emoticon'
     case 'invite': return 'mdi-account-plus'
     case 'call': return 'mdi-phone'
+    // FR-90 — an agent session waits for a driver.
+    case 'approval_request': return 'mdi-shield-key'
     default: return 'mdi-bell'
   }
 }
