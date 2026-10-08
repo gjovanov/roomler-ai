@@ -40,6 +40,14 @@
 //! driver, who answers over the viewer peer. Claude Code reaches it through
 //! `roomlerd hive-mcp <socket>` ([`relay`]), started as the session's
 //! account.
+//!
+//! # Updates (P1d-1)
+//!
+//! An update restarts the daemon, and with it every session's harness, so the
+//! updater asks [`turns_running`] first and waits for those turns, at most
+//! [`update_wait`] (`hive_update_wait_secs`). Once it goes ahead,
+//! [`begin_update`] holds new prompts and starts so none begins in the gap;
+//! [`end_update`] releases them when no restart came after all.
 
 pub mod framing;
 pub mod gates;
@@ -53,7 +61,8 @@ pub mod view;
 #[cfg(feature = "hive-test-launcher")]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
-    Author, StartOrder, Supervisor, global, handle_start, handle_stop, init, on_connected,
+    Author, StartOrder, Supervisor, begin_update, end_update, global, handle_start, handle_stop,
+    init, on_connected, turns_running, update_wait,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{

@@ -428,6 +428,13 @@ pub struct AgentConfig {
     /// Unset = no header — right for a workspace-scoped key.
     #[serde(default)]
     pub hive_api_workspace_id: Option<String>,
+    /// FR-90 P1d-1 (AC7) — how long an update waits for running agent turns
+    /// before it restarts the daemon, which cuts every session's turn, in
+    /// seconds. A turn is a person's work in progress, so the wait holds a
+    /// server-pushed update too; it is bounded, so a busy session cannot hold
+    /// the device's updates back. `None` = 1800 (30 min); `0` = never wait.
+    #[serde(default)]
+    pub hive_update_wait_secs: Option<u32>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2201,6 +2208,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_harness: None,
         hive_api_key_helper: None,
         hive_api_workspace_id: None,
+        hive_update_wait_secs: None,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

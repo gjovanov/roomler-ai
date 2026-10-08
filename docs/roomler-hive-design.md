@@ -490,7 +490,9 @@ every agent mid-turn.
 - Everywhere: ⚠️ **the updater defers while a turn is running**, bounded at 30 minutes,
   and logs the deferral. A running agent turn counts as someone using the machine. Each
   update path needs it — the Windows MSI flow, Linux self-update, the macOS update
-  helper.
+  helper. *As built (FR-90 P1d-1): the daemon's own updater — the periodic check and a
+  pushed update — waits on Linux, bounded by the device's `hive_update_wait_secs`, and
+  holds new prompts and starts once it goes ahead.*
 
 Adapters: `claude` in P0, `codex` later (`codex resume`, a custom `model_providers`
 base URL, MCP; its rollout files under `~/.codex/sessions` have no officially documented

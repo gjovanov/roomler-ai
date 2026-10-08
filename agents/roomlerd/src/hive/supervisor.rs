@@ -220,9 +220,40 @@ pub struct Supervisor {
     offline_since: Mutex<Option<Instant>>,
     upstream: String,
     offline_grace: Duration,
+    /// P1d-1 — an update is about to restart the daemon: new prompts and
+    /// starts are refused, so no turn begins in the gap before the installer
+    /// runs ([`Supervisor::begin_update`]).
+    updating: std::sync::atomic::AtomicBool,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
+
+/// FR-90 P1d-1 (AC7) — the sessions mid-turn on this daemon: what an update
+/// waits for. Empty where no supervisor was set up.
+pub fn turns_running() -> Vec<ObjectId> {
+    global().map(|s| s.turns_running()).unwrap_or_default()
+}
+
+/// FR-90 P1d-1 — how long an update waits for [`turns_running`]: the
+/// device's `hive_update_wait_secs`.
+pub fn update_wait() -> Duration {
+    global().map_or(gates::DEFAULT_UPDATE_WAIT, |s| s.update_wait())
+}
+
+/// FR-90 P1d-1 — the update is going ahead: hold new prompts and starts.
+pub fn begin_update() {
+    if let Some(s) = global() {
+        s.begin_update();
+    }
+}
+
+/// FR-90 P1d-1 — the update did not happen (the installer did not start):
+/// take prompts and starts again.
+pub fn end_update() {
+    if let Some(s) = global() {
+        s.end_update();
+    }
+}
 
 /// Build the daemon's supervisor from its config. Called once at start; a
 /// second call is a no-op. Built even with `hive_enabled = false`, so a start
@@ -374,12 +405,55 @@ impl Supervisor {
             offline_since: Mutex::new(None),
             upstream: super::sidecar::DEFAULT_UPSTREAM.to_string(),
             offline_grace: super::sidecar::OFFLINE_GRACE,
+            updating: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Sessions running now.
     pub fn live_count(&self) -> usize {
         self.live.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// P1d-1 (AC7) — the sessions mid-turn now: running, or waiting for an
+    /// approval (a person answering is part of the turn).
+    pub(crate) fn turns_running(&self) -> Vec<ObjectId> {
+        let live: Vec<ObjectId> = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        live.into_iter()
+            .filter(|sid| {
+                matches!(
+                    reports.get(sid).map(|r| r.state),
+                    Some(HiveRunState::Running | HiveRunState::AwaitingApproval)
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn update_wait(&self) -> Duration {
+        self.cfg.update_wait
+    }
+
+    /// P1d-1 — the update is going ahead: refuse new prompts and starts
+    /// until it has, or [`Self::end_update`] says it did not. A prompt
+    /// already admitted still runs; the updater waits for it.
+    pub(crate) fn begin_update(&self) {
+        self.updating
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_update(&self) {
+        self.updating
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn updating(&self) -> bool {
+        self.updating.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) async fn start(self: &Arc<Self>, order: StartOrder, is_primary: bool) -> Answer {
@@ -421,6 +495,14 @@ impl Supervisor {
         // whose answer was lost.
         if let Some(account) = self.running(order.session_id, order.fence) {
             return Answer::accepted(&account);
+        }
+        // P1d-1 — the daemon is about to restart for an update: a session
+        // launched now would be cut at once.
+        if self.updating() {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "this device is about to restart for an update — start the session again in a minute",
+            );
         }
         let account = match gates::account_for(&self.cfg, &order.user_id, &order.user_email) {
             Ok(a) => a,
@@ -523,6 +605,13 @@ impl Supervisor {
         author: Option<Author>,
         text: String,
     ) -> Result<(), String> {
+        // P1d-1 — the daemon is about to restart for an update: a turn begun
+        // now would be cut.
+        if self.updating() {
+            return Err(
+                "this device is about to restart for an update — ask again in a minute".into(),
+            );
+        }
         let (input, waiting) = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             live.get(&session)
@@ -1821,6 +1910,7 @@ done
             harness: Some(harness),
             api_key_helper: None,
             api_workspace_id: None,
+            update_wait: super::gates::DEFAULT_UPDATE_WAIT,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -2779,6 +2869,54 @@ done
             ],
             "the transcript keeps what was typed"
         );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P1d-1 (AC7) — what an update waits for: a session mid-turn is in
+    /// `turns_running`, an idle one is not. Once the update goes ahead, a new
+    /// prompt and a new start are refused, while the turn already admitted
+    /// runs to its end; an update that did not happen takes prompts again.
+    #[tokio::test]
+    async fn an_update_waits_for_turns_and_holds_new_ones() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(r.sup.turns_running().is_empty(), "idle is not a turn");
+
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(r.sup.turns_running(), [sid]);
+
+        r.sup.begin_update();
+        let refused = r.sup.prompt(sid, dev(&r), "another".into()).unwrap_err();
+        assert!(
+            refused.contains("about to restart for an update"),
+            "{refused}"
+        );
+        let start = r.sup.start(order(&r), true).await;
+        assert_eq!(start.refused, Some(HiveRefusal::Other));
+        assert!(
+            start
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("update"),
+            "{start:?}"
+        );
+
+        // The admitted turn still finishes, and is waited for no more.
+        release(&r);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(r.sup.turns_running().is_empty());
+
+        // The update did not happen: prompts are taken again.
+        r.sup.end_update();
+        r.sup.prompt(sid, dev(&r), "after".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
     }
