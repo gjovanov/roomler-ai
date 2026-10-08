@@ -2422,6 +2422,10 @@ impl OverlayRuntime {
             None
         };
         let mut last_route_wave: Option<Instant> = None;
+        // #1282 — set by the event arm's trailing edge, consumed by the tick it
+        // pulled forward, so a wave an EVENT caused is not read as the blind
+        // tick's (`evidence::ROUTE_WAVES_PULLED`).
+        let mut tick_pulled = false;
         // netstate PR-2 — after a MAJOR change's inline forced sweep, walk
         // install_peers on EVERY fallback tick inside this window (instead of
         // the ~30 s reupgrade cadence) so re-selection lands right behind the
@@ -3173,6 +3177,7 @@ impl OverlayRuntime {
                     // limiter / trailing edge (P4 demotion — both arms share
                     // one wave clock).
                     last_route_wave = Some(Instant::now());
+                    let pulled = std::mem::take(&mut tick_pulled);
                     // rc.206 — DETACH the per-peer /32 re-assert (the head-of-line
                     // bulk on Windows: N peers × `route`/`netsh` delete-then-add,
                     // ~0.3–2 s each) off the select! loop. Awaiting it INLINE
@@ -3195,6 +3200,10 @@ impl OverlayRuntime {
                         // #1282 — attribute the wave to the TICK arm.
                         crate::evidence::ROUTE_WAVES_TICK
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if pulled {
+                            crate::evidence::ROUTE_WAVES_PULLED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         tokio::spawn(async move {
                             let _guard = guard;
                             run_defense_wave(tun2, set).await;
@@ -3388,11 +3397,13 @@ impl OverlayRuntime {
                                 }
                                 // The heartbeat counts from the last wave.
                                 route_guard.reset();
+                                tick_pulled = false;
                             } else {
                                 // Trailing edge: pull the next tick to the due
                                 // boundary so an erase inside the quiet window
                                 // waits ≤ ROUTE_WAVE_MIN_INTERVAL, not a full
                                 // heartbeat.
+                                tick_pulled = true;
                                 let elapsed = last_route_wave
                                     .map(|t| t.elapsed())
                                     .unwrap_or_default();

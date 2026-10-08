@@ -250,6 +250,15 @@ pub struct NodeStatus {
     /// healthy host, and zero on every non-Windows host (the guard is a no-op).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_yields: Option<u64>,
+    /// #1282 — TICK-arm waves an EVENT pulled forward
+    /// (`tunnel_core::evidence::ROUTE_WAVES_PULLED`), cumulative.
+    ///
+    /// Its own scalar for the same compatibility reason as `route_wave_arms`.
+    /// Read it against `route_wave_arms.0`: `pulled ≈ tick` is a guard whose
+    /// own route writes keep re-arming it (the macOS and Windows 3 s loops of
+    /// #1856 / #1282). `None` from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_wave_pulls: Option<u64>,
     /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
     /// (`tunnel_core::evidence::DISCO_ANSWERED`). Nonzero on every node is the C1
     /// field gate: the fleet can answer, so a prober may ship next. `None`
@@ -3884,6 +3893,7 @@ mod tests {
                 route_guard: None,
                 route_wave_arms: None,
                 route_yields: None,
+                route_wave_pulls: None,
                 disco_answered: None,
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),
