@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) in review · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain, AC8) designed · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -360,6 +360,58 @@ tool-less model call — runs on a replica, never on the server, and sends disti
 session card. Improvement is counted: corrections per session, per-skill correction rates, eval
 sessions that run each skill's acceptance test.
 
+**P1e, core memory from a hand-curated brain (AC8), as designed.** People write facts; the learning
+loop that proposes them is P5.
+
+What Claude Code does with the files, probed 2026-10-08 against a fake Messages API (2.1.293, no
+model spend):
+- `$CLAUDE_CONFIG_DIR/CLAUDE.md` reaches the model in the first turn as "the user's private global
+  instructions for all projects". It comes under "These instructions OVERRIDE any default behavior
+  and you MUST follow them exactly as written".
+- `$CLAUDE_CONFIG_DIR/projects/<pinned name>/memory/MEMORY.md` reaches it as "user's auto-memory,
+  persists across conversations". Its topic files reach it only when the model opens them.
+- Both files are inside the session's own config directory. No settings change is needed.
+
+⚠️ **Core memory would be the first server-authored text a session's model reads, and it reads it
+as overriding instructions.** Today a compromised server cannot put one word in front of the model:
+prompts come only from drivers, over the peer. Approvals still gate every tool that changes
+something. But read-only tools run unasked, and the server can mint itself a view grant (§3c). So
+an injected "read X and show it" becomes a path. Hence a gate that belongs to the device.
+
+```mermaid
+sequenceDiagram
+    participant A as an admin, the user, a device manager
+    participant S as server (hive module)
+    participant D as roomlerd
+    participant W as the wrapper, as the account
+    A->>S: a fact, inside its scope's budget (or 409 over_budget)
+    Note over S: brain_rev += 1
+    S->>S: a session starts: pin brain_rev, render the snapshot, store it
+    S->>D: rc:hive.memory (to a device that advertises hive-memory)
+    S->>D: rc:hive.start (metadata only, as before)
+    D->>D: hive_core_memory on? files into its own runtime dir
+    D->>W: launch
+    W->>W: copy each file into the session's config dir, only if not there yet
+```
+
+| Rule | Why |
+|---|---|
+| Three scopes: **org**; **user** (the session's starter); **device** (the device the session runs on). Project waits for a project identity (knowhow, P4) | the starter is whose account the session runs as |
+| A fact is a record: `brain_facts {tenant_id, scope, owner_id (the user or the device; none for org), text, kind, status: active or archived, version, created_by, created_at, updated_by, updated_at}` | versions now; evidence, review and supersession come with P5 |
+| Budgets: org 3,000, user 1,500, device 800 characters of active text per scope instance (design §10.3). They are held in one counter document per instance, and changed by one conditional update (`$inc` under `used ≤ budget − n`), so two concurrent writes cannot both fit | "fails visibly": a write that does not fit is `409 over_budget`, with what is used, the budget and the size asked. Nothing is evicted; a person consolidates |
+| Who writes: org, `ADMINISTRATOR`; user, that user, with `HIVE_RUN`; device, `MANAGE_AGENTS`. Every write is audited (`hive_audit`, `brain`) | an org fact reaches every session in the org as an instruction |
+| `brain_rev` per org, incremented by every write. A session pins it at creation. The server renders the snapshot then and stores it (`hive_session_memory`, by session): org and user into `CLAUDE.md`, device into the auto-memory `MEMORY.md` | frozen: a later fact never changes a running session (AC8), and a re-sent start carries the same snapshot |
+| Delivery: `rc:hive.memory {session_id, fence, brain_rev, files}` immediately before `rc:hive.start`, and before its re-send on connect, to a device that advertises `hive-memory` | `rc:hive.start` stays metadata only, its field set locked; one socket keeps the order |
+| The device's gate: `hive_core_memory`, a device key, **default off**, never pushable. Off, the frame is dropped, and the session's transcript says the device takes no core memory | the gate that survives a compromised server, like `hive_accounts` |
+| The daemon writes the files into its own runtime directory (`<runtime>/<sid>/memory/`, `0644`). The wrapper, running as the account, copies each into the session's config directory **only if it is not there yet** | the daemon never writes into a tree the account owns. A resume (P1d-2) keeps what the session has, its own edits included. Frozen across restarts |
+| No frame (an older server, or a lost one): the session runs without core memory, and its transcript says so | memory is an enhancement, never a single point of failure |
+
+AC8's test is a CI test with the in-process device, its harness writing out the two files.
+- An org fact is added, and session A starts: A's `CLAUDE.md` holds the fact.
+- A second fact is added: A's file does not change, and session B's holds both.
+- A write past the budget is refused `409 over_budget`, with the numbers.
+- With the device's gate off, B's config directory holds neither file.
+
 ### 3g. Gates
 
 Running a session is remote code execution on a device, so it gets exec's and SSH's four gates:
@@ -395,7 +447,12 @@ device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hi
 | P1c-2b | AC6's capture test, end to end (`crates/tests/tests/hive_drivers.rs`, a test binary of its own): a real server and a real in-process device; a reader's message in the room and a prompt over their own peer never reach the harness (its stdin captured), while the owner's and a named driver's do, each labelled `[Name] …`. The canary's scaffolding is shared as `tests/hive_support`. A reader's approval answer is the device's unit test's (`a_driver_answers_an_approval_over_the_peer_and_a_reader_cannot`) | a test | **merged** #1866 `4d3958bd6` |
 | P1c-3 | drivers, the UI: `HiveParticipants`, the transcript's **People** dialog (the owner adds an org member as a reader or a driver, changes their part, takes them out; anyone else sees who takes part; a refusal shown in the server's words); the composer's two modes ("ask the agent" in the transcript for drivers, the room's own composer for everyone, which never reaches the agent); a reader told they read and talk, a named driver the device keeps read only told why in the device's words; a view reopened on `role_changed` | the SPA shows nothing until the server names the module | **merged** #1865 `1a05041e7` |
 | P1d-1 | the updater waits for running agent turns (AC7, §3d "Updates and restarts"): ≤ `hive_update_wait_secs` (device key, 30 min; 0 never waits), the periodic check AND a pushed update; logged when it starts and once a minute; new prompts and starts held once it goes ahead; a debug build's `ROOMLERD_UPDATE_DRY_RUN` waits exactly as a real update and installs nothing — and refuses every installer spawn, the crash-loop rollback included (the field check) | `hive_update_wait_secs = 0` | **merged** #1869 `8da45c3d6` |
-| P1d-2 | a restart resumes what the device hosted (AC20, §3d "P1d-2, the resume, as built"): `hosted.json` beside the store; `begin_shutdown` the moment any shutdown is signalled, so a harness that dies with the daemon is kept, not ended, and from then on the record is frozen and the toolbelt ignored (the field run's finding: an approval the teardown withdrew stayed "needed"); the resume at the first connection, before the manifest, through every gate as configured now (the same account, or none); `--resume` exactly when Claude Code's history exists, for every launch; the turn count carried on, a cut turn reported interrupted, its approvals withdrawn; a resumed process's first turn reports no cost; a stop before the resume launches nothing; 3 quick resumes in a row end the session | delete `hosted.json` (nothing resumes; P1b ends what it hosted); device `hive_enabled = false` | PR open |
+| P1d-2 | a restart resumes what the device hosted (AC20, §3d "P1d-2, the resume, as built"): `hosted.json` beside the store; `begin_shutdown` the moment any shutdown is signalled, so a harness that dies with the daemon is kept, not ended, and from then on the record is frozen and the toolbelt ignored (the field run's finding: an approval the teardown withdrew stayed "needed"); the resume at the first connection, before the manifest, through every gate as configured now (the same account, or none); `--resume` exactly when Claude Code's history exists, for every launch; the turn count carried on, a cut turn reported interrupted, its approvals withdrawn; a resumed process's first turn reports no cost; a stop before the resume launches nothing; 3 quick resumes in a row end the session | delete `hosted.json` (nothing resumes; P1b ends what it hosted); device `hive_enabled = false` | **merged** #1870 `8238be712` |
+| P1e-0 | core memory's design (§3f "P1e … as designed"): the zero-spend probe of what Claude Code does with `CLAUDE.md` and the auto-memory index, the device gate it calls for, scopes, budgets, the pinned snapshot, delivery, and AC8's test | docs only | in progress |
+| P1e-1 | core memory, the server: `brain_facts`, the budget counters, `brain_rev`, the routes under `/tenant/{tid}/hive/brain`, the snapshot rendered and stored per session, `rc:hive.memory` and `RpcCap::HiveMemory`, the audit | `[modules] hive = false` | — |
+| P1e-2 | core memory, the device: `hive_core_memory` (default off, never pushable), the frame, the runtime files, the wrapper's copy, a resume keeping what the session has | device `hive_core_memory = false`, the default | — |
+| P1e-3 | core memory, the UI: the Brain page (facts by scope, budget meters, add, edit, archive, a refusal shown in the server's words) | the SPA shows nothing until the server names the module | — |
+| P1e-4 | AC8 end to end in CI, and the field run | a test | — |
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset: replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` | — |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
@@ -568,9 +625,15 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
    acts only when the device's own `hive_accounts` maps them to the session's account. Driving runs
    code there as that account, since a driver answers approvals too, and the account map is the
    device owner's own statement of who may act as whom. The cost is that sharing a session on a
-   personal laptop takes one config line (`"alice@example.com" = "goran"`). The alternative,
+   personal laptop takes one config line (`"alice@example.com" = "bob"`). The alternative,
    trusting the server's list alone, would make a wrong or compromised server enough to hand any
    org member the device owner's account. Revisit only if field use shows the line is a burden.
+9. **Whether a device takes core memory by default** (P1e) — designed default OFF
+   (`hive_core_memory`, device-owned, never pushable). Claude Code reads `CLAUDE.md` as the user's
+   own overriding instructions, so core memory is the first server-authored text a session's model
+   obeys (§3f). The cost: an org's brain reaches only the devices whose owners turned it on. The
+   alternative is to make it pushable like `hive_enabled`, only to devices that opted into remote
+   config. Revisit once orgs use the brain.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
