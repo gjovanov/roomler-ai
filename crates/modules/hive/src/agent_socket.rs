@@ -47,7 +47,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use bson::{DateTime, oid::ObjectId};
+use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
     hive::{HiveManifestEntry, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits},
@@ -227,7 +227,11 @@ impl AgentSocketLifecycle for HiveAgentSocket {
         let state = self.state.clone();
         let (tenant_id, device_id) = (ctx.tenant_id, ctx.agent_id);
         tokio::spawn(async move {
-            reconcile_on_connect(&state, tenant_id, device_id).await;
+            if state.scope.serves(tenant_id) {
+                reconcile_on_connect(&state, tenant_id, device_id).await;
+            } else {
+                end_unserved(&state, tenant_id, device_id).await;
+            }
             apply_reports(&state, tenant_id, device_id, rx).await;
         });
     }
@@ -503,6 +507,31 @@ async fn stop_if_over(state: &HiveState, session_id: ObjectId, device_id: Object
         ),
         Err(e) => {
             debug!(session = %session_id, %e, "hive: a stop for a session that is over was not sent")
+        }
+    }
+}
+
+/// P1g — agent sessions no longer serve this device's organization (it left
+/// `hive.tenants`): nothing is re-sent, and what the device still runs for it
+/// ends and is told to stop. The device's manifest, read next, stops anything
+/// the push did not reach.
+async fn end_unserved(state: &HiveState, tenant_id: ObjectId, device_id: ObjectId) {
+    match crate::hooks::end_and_tell(
+        state,
+        doc! { "tenant_id": tenant_id, "location.device_id": device_id },
+        "hive_not_enabled",
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(ended) => info!(
+            tenant = %tenant_id,
+            device = %device_id,
+            ended,
+            "hive: the organization is not served — its sessions on the device ended"
+        ),
+        Err(e) => {
+            warn!(device = %device_id, %e, "hive: an unserved organization's sessions were not ended")
         }
     }
 }

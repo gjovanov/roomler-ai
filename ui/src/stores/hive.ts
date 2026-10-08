@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 
 /**
  * FR-90 — agent sessions: the server's RECORD of each, never what is in one.
@@ -209,6 +209,41 @@ export const useHiveStore = defineStore('hive', () => {
     return api.delete<HiveParticipants>(`${base(tenantId)}/${sessionId}/participant/${userId}`)
   }
 
+  /** P1g — whether agent sessions serve each organization, as the server
+   *  answered (`GET …/hive`); absent until it has. */
+  const served = ref<Record<string, boolean>>({})
+  const servedAsks = new Map<string, Promise<boolean>>()
+
+  /**
+   * P1g — ask once per organization. `200` is served and `404` is not, both
+   * kept; anything else is no answer — not served for now, and asked again
+   * next time — because the module is hidden everywhere until the server
+   * names it.
+   */
+  function checkServed(tenantId: string): Promise<boolean> {
+    if (tenantId in served.value) return Promise.resolve(served.value[tenantId])
+    const asked = servedAsks.get(tenantId)
+    if (asked) return asked
+    const ask = api
+      .get<{ enabled?: boolean }>(`/tenant/${tenantId}/hive`)
+      .then((r) => {
+        const on = r.enabled === true
+        served.value = { ...served.value, [tenantId]: on }
+        return on
+      })
+      .catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 404) {
+          served.value = { ...served.value, [tenantId]: false }
+        } else {
+          console.warn('[hive] could not ask whether agent sessions serve this organization', e)
+        }
+        return false
+      })
+      .finally(() => servedAsks.delete(tenantId))
+    servedAsks.set(tenantId, ask)
+    return ask
+  }
+
   function brainBase(tenantId: string): string {
     return `/tenant/${tenantId}/hive/brain`
   }
@@ -257,6 +292,8 @@ export const useHiveStore = defineStore('hive', () => {
     fetchParticipants,
     setParticipant,
     removeParticipant,
+    served,
+    checkServed,
     fetchBrain,
     keepFact,
     editFact,

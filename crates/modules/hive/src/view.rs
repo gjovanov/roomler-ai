@@ -203,9 +203,10 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         Ok(sid) => state.sessions.find(sid).await.ok().flatten(),
         Err(_) => None,
     };
-    // Not readable and not there answer alike: a non-member learns nothing.
+    // Not readable, not there, and not served (P1g) answer alike: nobody
+    // learns from the answer what they could not read.
     let s = match session {
-        Some(s) if may_read(state, &s, user).await => s,
+        Some(s) if state.scope.serves(s.tenant_id) && may_read(state, &s, user).await => s,
         _ => return refuse("not_found", None).await,
     };
     let Some(sid) = s.id else {

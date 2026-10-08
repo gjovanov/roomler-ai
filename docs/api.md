@@ -304,8 +304,16 @@ before it leaves the host.
 
 ### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true`)
 
+FR-90 P1g — and only for the organizations in `hive.tenants` (`ROOMLER__HIVE__TENANTS`,
+comma-separated ids; empty or `*` is every organization). A member of any other organization gets
+**404** on every route below (`agent sessions are not available to this organization`), the viewer
+answers `not_found`, and its devices are told to stop what they still run for it when they connect.
+Membership is checked first, so someone outside an organization learns nothing about whether it is
+served.
+
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `…/hive` | P1g — whether agent sessions serve this organization: `{enabled: true}`, or **404** where they do not. The SPA asks before it shows any of the module's pages |
 | POST | `…/hive/session` | `{device_id, folder, title?}` — start an agent session on a device. Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit` |
 | GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
 | GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it |

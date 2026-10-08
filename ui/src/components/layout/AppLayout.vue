@@ -130,14 +130,14 @@
              is switched off unless an operator turns it on (the capability
              gate fails CLOSED for it). -->
         <v-list-item
-          v-if="caps.has('hive')"
+          v-if="caps.has('hive') && hiveServed"
           :to="`/tenant/${tenantId}/sessions`"
           prepend-icon="mdi-robot-outline"
           :title="$t('nav.agentSessions')"
           data-testid="nav-agent-sessions"
         />
         <v-list-item
-          v-if="caps.has('hive')"
+          v-if="caps.has('hive') && hiveServed"
           :to="`/tenant/${tenantId}/memory`"
           prepend-icon="mdi-brain"
           :title="$t('nav.agentMemory')"
@@ -626,6 +626,7 @@ import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
 import { useWsStore } from '@/stores/ws'
 import { useCapabilitiesStore } from '@/stores/capabilities'
+import { useHiveStore } from '@/stores/hive'
 import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
@@ -866,6 +867,18 @@ function joinCallFromSnackbar() {
 // store still says A used to point every sidebar target at A.
 const tenantId = computed(
   () => (route.params.tenantId as string | undefined) || tenantStore.current?.id || '',
+)
+
+// FR-90 P1g — agent sessions may serve some organizations and not others:
+// their pages show only where the server says they do.
+const hive = useHiveStore()
+const hiveServed = computed(() => hive.served[tenantId.value] === true)
+watch(
+  [tenantId, () => caps.has('hive')],
+  ([tid, on]) => {
+    if (tid && on) void hive.checkServed(tid)
+  },
+  { immediate: true },
 )
 
 // Route → store sync: keep tenantStore.current on the org the URL names

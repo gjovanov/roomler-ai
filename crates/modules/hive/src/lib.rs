@@ -57,6 +57,7 @@ pub mod model;
 pub mod participants;
 pub mod room;
 pub mod routes;
+pub mod scope;
 pub mod view;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -84,6 +85,8 @@ pub struct HiveState {
     pub view_limiter: Arc<RateLimiter>,
     /// P1e — core memory: facts, budgets, revisions, session snapshots.
     pub brain: Arc<brain::BrainDao>,
+    /// P1g — the organizations agent sessions serve (`hive.tenants`).
+    pub scope: Arc<scope::TenantScope>,
 }
 
 impl std::ops::Deref for HiveState {
@@ -108,8 +111,10 @@ impl Module for HiveState {
     /// stateless and re-created ([`BoundChat::new`], FR-69 rule 5).
     type Deps = FleetState;
 
-    async fn init(core: Core, _settings: &Settings, fleet: FleetState) -> anyhow::Result<Self> {
+    async fn init(core: Core, settings: &Settings, fleet: FleetState) -> anyhow::Result<Self> {
         let db = &core.db;
+        let scope = scope::TenantScope::parse(&settings.hive.tenants);
+        scope.log();
         let state = Self {
             sessions: Arc::new(dao::AgentSessionDao::new(db)),
             approvals: Arc::new(dao::AgentApprovalDao::new(db)),
@@ -119,6 +124,7 @@ impl Module for HiveState {
             view_grants: Arc::new(view::ViewGrants::new()),
             view_limiter: Arc::new(RateLimiter::new()),
             brain: Arc::new(brain::BrainDao::new(db)),
+            scope: Arc::new(scope),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -161,6 +167,8 @@ impl Module for HiveState {
             .route("/", get(brain::list).post(brain::create))
             .route("/{fact_id}", put(brain::edit).delete(brain::archive));
         Router::new()
+            // P1g — whether agent sessions serve this organization.
+            .route("/tenant/{tenant_id}/hive", get(routes::serves))
             .nest("/tenant/{tenant_id}/hive/session", session)
             .nest("/tenant/{tenant_id}/hive/brain", brain)
             .with_state(self.clone())
