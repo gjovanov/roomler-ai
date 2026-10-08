@@ -733,6 +733,19 @@ mod system {
             }
         }
 
+        /// #1282 — is our `dest/plen` on `luid` installed at exactly `metric`?
+        /// One in-memory `Get`, and unlike [`ensure`] no #1328 strike
+        /// bookkeeping: a caller that re-asserts every wave uses it to skip a
+        /// write that would change nothing, because every write is a
+        /// route-change event the route guard reacts to.
+        pub fn is_installed(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> bool {
+            let mut probe = make_row(luid, dest, plen, 0);
+            // SAFETY: GetIpForwardEntry2 matches on LUID + prefix + next-hop
+            // and fills the row on success.
+            let rc = unsafe { GetIpForwardEntry2(&mut probe) };
+            rc == NO_ERROR && probe.Metric == metric
+        }
+
         /// Delete our `dest/plen` route on `luid` (best-effort — a missing route
         /// is fine).
         pub fn del(luid: u64, dest: IpAddr, plen: u8) {
@@ -3572,6 +3585,19 @@ mod system {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr")
                 })?;
                 let luid = self.dev.tun_luid();
+                // #1282 — leave a route that is already ours alone. The wave
+                // re-asserts the block floors (and an exit client's /1s) every
+                // time, and this delete-then-add rewrote them every time: each
+                // write is a `NotifyRouteChange2` event, the event arms the next
+                // wave 3 s later, and that was the ~20 waves/min per adapter.
+                // Field, NEO16 on 0.4.119: every floor /24's route Age read
+                // 0–2 s, while the peer /32s that `ensure` leaves alone read 6 h.
+                // Deliberately NOT `ensure`: its #1328 strike/yield would stop
+                // re-asserting an exit /1 that a VPN keeps deleting; a route that
+                // is missing or wrong still gets the same delete-then-add as before.
+                if winroute::is_installed(luid, addr, plen, 1) {
+                    return Ok(());
+                }
                 winroute::del(luid, addr, plen);
                 winroute::add(luid, addr, plen, 1)
             }
@@ -5432,5 +5458,93 @@ mod macos_kernel_tests {
 
         tun.del_cidr_route("10.66.0.0/16").await;
         tun.del_peer_route(peer).await;
+    }
+
+    /// #1856 follow-up — route(8) prints ANY all-zeros destination as
+    /// `default`, which is how an exit client's `0.0.0.0/1` reads back. A real
+    /// `/1` would capture half of the runner's traffic, so this uses
+    /// `0.0.0.0/8` ("this network", never routed): the same `default`
+    /// destination, with a mask that tells it apart from the real default
+    /// route. Proves the parser's `default` mapping on a real kernel, which
+    /// the `/16` above cannot.
+    #[tokio::test]
+    async fn an_all_zeros_prefix_reads_back_as_ours_and_is_not_rewritten() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        tun.add_cidr_route("0.0.0.0/8")
+            .await
+            .expect("all-zeros route");
+        let got = sh(
+            "route",
+            &["-n", "get", "-net", "0.0.0.0", "-prefixlen", "8"],
+        );
+        assert!(
+            got.lines().any(|l| l.trim() == "destination: default"),
+            "route(8) prints an all-zeros destination as `default`, the case the parser maps:\n{got}"
+        );
+        assert!(
+            got.lines()
+                .any(|l| l.trim() == format!("interface: {iface}")),
+            "the all-zeros route must be ours on {iface}:\n{got}"
+        );
+
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.add_cidr_route("0.0.0.0/8")
+                .await
+                .expect("re-assert all-zeros route");
+        }
+        // Positive control, as above.
+        sh(
+            "route",
+            &["-n", "add", "-inet", "100.65.0.251", "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", "100.65.0.251"]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let is_write = |block: &str| {
+            let kind = block.lines().find(|l| l.starts_with("RTM_")).unwrap_or("");
+            kind.starts_with("RTM_ADD")
+                || kind.starts_with("RTM_DELETE")
+                || kind.starts_with("RTM_CHANGE")
+        };
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| is_write(b) && mentions(b, "100.65.0.251")),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        // A write to a `default`-printed destination on OUR utun can only be
+        // the 0.0.0.0/8 re-assert: the runner's real default is on en0.
+        let writes: Vec<&str> = blocks
+            .iter()
+            .copied()
+            .filter(|b| is_write(b) && b.contains("default") && b.contains(&iface))
+            .collect();
+        assert!(
+            writes.is_empty(),
+            "re-asserting an all-zeros prefix that is already ours must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        tun.del_cidr_route("0.0.0.0/8").await;
     }
 }

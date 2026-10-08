@@ -831,6 +831,9 @@ mod backend {
     #[cfg(not(windows))]
     pub(super) use unix::{BackendGuard, spawn};
 
+    #[cfg(all(test, not(windows)))]
+    pub(super) use unix::supervise;
+
     #[cfg(windows)]
     mod win {
         use super::RawSignal;
@@ -978,11 +981,14 @@ mod backend {
     mod unix {
         use super::RawSignal;
         use std::process::Stdio;
+        use std::time::Duration;
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::sync::mpsc::UnboundedSender;
 
+        /// Owns the supervising reader task, which owns the monitor child.
+        /// Dropping the guard aborts the task, and dropping the task's
+        /// `Child` (`kill_on_drop`) kills the monitor.
         pub(in super::super) struct BackendGuard {
-            _child: tokio::process::Child,
             reader: tokio::task::JoinHandle<()>,
         }
 
@@ -1009,49 +1015,126 @@ mod backend {
             super::super::classify_bsd_monitor_line(line)
         }
 
-        pub(in super::super) fn spawn(
-            tx: UnboundedSender<(RawSignal, String)>,
-        ) -> Option<BackendGuard> {
-            // PR-3 — full class coverage: routes + addresses + links on
-            // Linux (`notify_regather` and the LAN-set rebuild key on the
-            // addr/iface classes, which the route-only child never fired);
-            // `route -n monitor` on macOS (PF_ROUTE's socket, one line per
-            // kernel routing message).
+        /// PR-3 — full class coverage: routes + addresses + links on Linux
+        /// (`notify_regather` and the LAN-set rebuild key on the addr/iface
+        /// classes, which the route-only child never fired); `route -n
+        /// monitor` on macOS (PF_ROUTE's socket, one block per kernel routing
+        /// message).
+        fn monitor_command() -> tokio::process::Command {
             #[cfg(target_os = "macos")]
-            let mut cmd = {
+            {
                 let mut c = tokio::process::Command::new("route");
                 c.args(["-n", "monitor"]);
                 c
-            };
+            }
             #[cfg(not(target_os = "macos"))]
-            let mut cmd = {
+            {
                 let mut c = tokio::process::Command::new("ip");
                 c.args(["-o", "monitor", "route", "addr", "link"]);
                 c
-            };
-            let mut child = cmd
+            }
+        }
+
+        pub(in super::super) fn spawn(
+            tx: UnboundedSender<(RawSignal, String)>,
+        ) -> Option<BackendGuard> {
+            supervise(
+                monitor_command,
+                tx,
+                Duration::from_millis(250),
+                Duration::from_secs(30),
+            )
+        }
+
+        fn start(make: fn() -> tokio::process::Command) -> Option<tokio::process::Child> {
+            make()
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .spawn()
-                .ok()?;
-            let stdout = child.stdout.take()?;
+                .ok()
+        }
+
+        /// #1867 — run the monitor child and RESPAWN it whenever it exits.
+        ///
+        /// It used to run once: when the child died (killed by an over-broad
+        /// `pkill`, crashed, OOM-reaped) the reader hit EOF, the channel
+        /// closed, and the monitor stopped for the life of the process. The
+        /// broadcast sender lives on in the process-wide handle, so the
+        /// runtime never even saw `Closed` and never fell back to its 2 s
+        /// tick. It just ran without an OS change feed until the next restart
+        /// (field: MacBook-1, 2026-10-08, 10:35Z until an update restarted it).
+        ///
+        /// The FIRST spawn must succeed. `None` tells the caller there is no
+        /// subscription at all, which keeps the runtime on its blind tick.
+        /// After that, a dead child is respawned with a capped backoff (reset
+        /// after a long healthy run). Each respawn sends one synthetic Route
+        /// signal, so the monitor re-samples whatever changed while nothing was
+        /// watching and the route guard re-asserts against it.
+        pub(in super::super) fn supervise(
+            make: fn() -> tokio::process::Command,
+            tx: UnboundedSender<(RawSignal, String)>,
+            first: Duration,
+            max: Duration,
+        ) -> Option<BackendGuard> {
+            let child = start(make)?;
             let reader = tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Some(signal) = classify(&line) else {
-                        continue;
-                    };
-                    if tx.send((signal, line)).is_err() {
-                        break;
+                let mut child = child;
+                let mut backoff = first;
+                loop {
+                    let started = tokio::time::Instant::now();
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut lines = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let Some(signal) = classify(&line) else {
+                                continue;
+                            };
+                            if tx.send((signal, line)).is_err() {
+                                return; // the monitor is gone: nobody to feed
+                            }
+                        }
                     }
+                    // EOF: the child is gone or going. Reap it, or kill one that
+                    // closed its stdout without exiting.
+                    let status =
+                        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                            Ok(s) => s.ok(),
+                            Err(_) => {
+                                let _ = child.kill().await;
+                                None
+                            }
+                        };
+                    if started.elapsed() >= max {
+                        backoff = first; // it ran for a while: a new failure, not a loop
+                    }
+                    tracing::warn!(
+                        ?status,
+                        retry_in_ms = backoff.as_millis() as u64,
+                        "netstate: the OS route monitor exited — respawning it (#1867); until it \
+                         is back the route guard runs on its heartbeat alone"
+                    );
+                    loop {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max);
+                        if tx.is_closed() {
+                            return;
+                        }
+                        if let Some(c) = start(make) {
+                            child = c;
+                            break;
+                        }
+                    }
+                    if tx
+                        .send((RawSignal::Route, "netstate: backend respawned".into()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tracing::info!("netstate: OS route monitor respawned");
                 }
             });
-            Some(BackendGuard {
-                _child: child,
-                reader,
-            })
+            Some(BackendGuard { reader })
         }
 
         impl Drop for BackendGuard {
@@ -1305,6 +1388,53 @@ sockaddrs: <DST,GATEWAY>
         ] {
             assert_eq!(classify_bsd_monitor_line(&hdr(kind)), want, "{kind}");
         }
+    }
+
+    /// #1867 — a monitor child that dies is respawned, and every respawn wakes
+    /// the monitor. The fake prints one line and exits at once, so the
+    /// supervisor has to keep bringing it back.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_dead_monitor_child_is_respawned_and_wakes_the_monitor() {
+        fn fake_monitor() -> tokio::process::Command {
+            let mut c = tokio::process::Command::new("sh");
+            // `RTM_ADD:` is a Route signal for both the Linux and BSD classifiers.
+            c.args(["-c", "echo 'RTM_ADD: fake route'"]);
+            c
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let guard = backend::supervise(
+            fake_monitor,
+            tx,
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        )
+        .expect("the first spawn must succeed");
+        let (mut lines, mut respawns) = (0, 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (lines < 3 || respawns < 2) && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((RawSignal::Route, d))) if d.contains("fake route") => lines += 1,
+                Ok(Some((RawSignal::Route, d))) if d.contains("respawned") => respawns += 1,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            lines >= 3 && respawns >= 2,
+            "a dead monitor must be brought back, and each return must wake the monitor: \
+             lines={lines} respawns={respawns}"
+        );
+        // Dropping the guard stops it: the channel drains, then closes.
+        drop(guard);
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "dropping the guard must stop the supervisor and close the feed"
+        );
     }
 
     /// The sampler runs on the host without privileges and produces a

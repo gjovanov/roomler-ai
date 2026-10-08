@@ -642,8 +642,15 @@ server. Detail and the negative-control test:
   wave re-asserts every peer, so a write that changes nothing still costs
   two things. It emits a route-change event, which arms the next wave
   through the trailing edge above and keeps the guard driving itself. And
-  wherever the write is not atomic, it opens a hole. Windows
-  (`winroute::ensure`) and Linux (`ip route replace`) skip a matching route.
+  wherever the write is not atomic, it opens a hole. Linux
+  (`ip route replace`) skips a matching route. Windows did for peer `/32`s
+  (`winroute::ensure`) but **not** for prefixes: `add_cidr_route` deleted and
+  re-added the four block-floor prefixes per adapter on every wave (field,
+  NEO16: their route Age never passed 2 s while the peer `/32`s were 6 h old),
+  and those writes are what ran the Windows guard at ~20 waves/min per adapter
+  (#1282). Every write was also a brief hole in an exit client's `/1`s. It now
+  checks `winroute::is_installed` first: no #1328 strike bookkeeping, so a VPN
+  that keeps deleting an exit `/1` is still fought exactly as before.
   macOS has no idempotent `route` write: a re-assert is `route -n get`, and
   only a route that is missing or foreign gets the delete-then-add. A wave
   that wrote anyway left each peer's `/32` absent for 2.5–3.0 ms every 3 s,
@@ -660,7 +667,19 @@ server. Detail and the negative-control test:
 > subscription".** An event inside the quiet window does not run a wave. It
 > pulls the TICK arm forward, and the tick counts the wave. A guard that feeds
 > itself therefore reads as tick-driven: the MacBook showed tick 22512, event
-> 8, with its monitor demonstrably live (#1282).
+> 8, with its monitor demonstrably live (#1282). `roomler status` now prints
+> `pulled=N` inside the arms bracket (`ROUTE_WAVES_PULLED`): the tick waves an
+> event pulled forward. `pulled ≈ tick` is a guard re-arming itself, and
+> `tick − pulled` is the real heartbeat.
+
+* **The OS change feed survives its own monitor dying** (#1867). On Linux and
+  macOS, netstate's feed is a child process (`ip -o monitor`, `route -n
+  monitor`). When that child exited, netstate used to stop for the life of the
+  process. The runtime never even saw the feed close, so it ran on the 30 s
+  heartbeat alone until a restart. The child is now supervised: it is respawned
+  with a capped backoff (250 ms → 30 s), and each respawn sends one synthetic
+  wake-up, so whatever changed while nothing was watching is re-sampled and
+  re-asserted.
 
 ---
 

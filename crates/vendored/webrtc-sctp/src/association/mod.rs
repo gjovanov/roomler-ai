@@ -545,7 +545,10 @@ impl Association {
                                 if let Some((dropped, over)) =
                                     send_failures.sent(std::time::Instant::now())
                                 {
-                                    log::info!(
+                                    // roomler (#1867): warn, like the failure line it
+                                    // closes. The agent keeps `webrtc_sctp` at warn, so
+                                    // at info the field saw failures and never this.
+                                    log::warn!(
                                         "[{}] net_conn sends recovered — {} packet(s) dropped over {:?}, retransmitted by SCTP",
                                         name2,
                                         dropped,
