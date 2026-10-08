@@ -405,6 +405,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/brain",
       "methods": "GET,HEAD,POST"
     },

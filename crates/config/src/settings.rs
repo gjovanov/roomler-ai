@@ -44,9 +44,28 @@ pub struct Settings {
     /// exactly today's server.
     #[serde(default)]
     pub modules: ModulesSettings,
+    /// FR-90 P1g — which organizations agent sessions serve once
+    /// `[modules] hive` is on. Absent ⇒ every one.
+    #[serde(default)]
+    pub hive: HiveSettings,
     /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
     #[serde(default)]
     pub diag: DiagSettings,
+}
+
+/// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HiveSettings {
+    /// The organizations agent sessions serve, as comma-separated ids
+    /// (`ROOMLER__HIVE__TENANTS=<id>,<id>`). Empty — the default — or `*` is
+    /// every organization; a list is only those, and every other one is
+    /// answered as if the module were not there for it. A hosted server opens
+    /// the pillar to a test organization this way before anyone else.
+    ///
+    /// ⚠️ `String`, not `Vec<String>`, for the reason on
+    /// [`JwtSettings::previous_secrets`]: an env var cannot become a sequence.
+    #[serde(default)]
+    pub tenants: String,
 }
 
 /// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.
