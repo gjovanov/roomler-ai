@@ -304,6 +304,135 @@ async fn the_module_is_off_by_default_and_serves_nothing() {
     assert_eq!(resp.status().as_u16(), 404, "not mounted ⇒ no route");
 }
 
+// ─── P1g — the organizations agent sessions serve (`hive.tenants`) ─────────
+
+/// A second server over `first`'s database with the module on, serving only
+/// the organizations listed — as `first` restarted with `hive.tenants` set.
+async fn serving_only(first: &TestApp, tenants: &str) -> TestApp {
+    let db = first.db.name().to_string();
+    let tenants = tenants.to_string();
+    TestApp::spawn_with_settings(move |s| {
+        s.database.name = db;
+        s.modules.hive = true;
+        s.hive.tenants = tenants;
+        // Polls, like `hive_app_polling`: the default limiter answers a
+        // poll loop 429 before the condition it waits for.
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// `hive.tenants` set: its organizations get every route; any other is
+/// answered as if the module were not there for it, and someone outside an
+/// organization learns nothing about whether it is served.
+#[tokio::test]
+async fn an_organization_hive_does_not_serve_sees_none_of_it() {
+    let first = hive_app().await;
+    let a = first.seed_tenant("hiveserved").await;
+    let b = first.seed_tenant("hiveunserved").await;
+    let app = serving_only(&first, &a.tenant_id).await;
+    let get = |tid: &str, path: &str, token: &str| {
+        let url = format!("/api/tenant/{tid}/hive{path}");
+        app.auth_get(&url, token).send()
+    };
+
+    // A — served: the question, the list, the brain.
+    let (code, body) =
+        status_and_json(get(&a.tenant_id, "", &a.admin.access_token).await.unwrap()).await;
+    assert_eq!(
+        (code, body["enabled"].clone()),
+        (200, json!(true)),
+        "{body}"
+    );
+    for path in ["/session", "/brain"] {
+        let resp = get(&a.tenant_id, path, &a.admin.access_token)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+    }
+
+    // B — not served: every route, read or write, is not found, in words.
+    let (code, body) =
+        status_and_json(get(&b.tenant_id, "", &b.admin.access_token).await.unwrap()).await;
+    assert_eq!(code, 404, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("not available"),
+        "{body}"
+    );
+    for path in ["/session", "/brain"] {
+        let resp = get(&b.tenant_id, path, &b.admin.access_token)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "{path}");
+    }
+    let start = app
+        .auth_post(
+            &format!("/api/tenant/{}/hive/session", b.tenant_id),
+            &b.admin.access_token,
+        )
+        .json(&json!({ "device_id": ObjectId::new().to_hex(), "folder": "/srv" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status().as_u16(), 404, "no start for an unserved org");
+    let keep = app
+        .auth_post(
+            &format!("/api/tenant/{}/hive/brain", b.tenant_id),
+            &b.admin.access_token,
+        )
+        .json(&json!({ "scope": "org", "text": "kept nowhere" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keep.status().as_u16(), 404, "no fact for an unserved org");
+
+    // Outside A: the answer is about membership, never about the gate.
+    let (code, body) =
+        status_and_json(get(&a.tenant_id, "", &b.admin.access_token).await.unwrap()).await;
+    assert_eq!(
+        (code, body["error"].clone()),
+        (403, json!("not_a_member")),
+        "{body}"
+    );
+}
+
+/// An organization taken out of `hive.tenants`: when one of its devices
+/// connects, what it still runs for that organization ends — the device is
+/// told to stop, the record says why, and nothing of it can be read.
+#[tokio::test]
+async fn a_device_of_an_organization_no_longer_served_is_told_to_stop() {
+    let first = hive_app_polling().await;
+    let a = first.seed_tenant("hivestays").await;
+    let b = first.seed_tenant("hiveleaves").await;
+    let (tid, token) = (b.tenant_id.clone(), b.admin.access_token.clone());
+    let mut dev = device(&first, &b, "hive-leaves", RUNS_HIVE).await;
+    let sid = started_session(&first, &tid, &token, &mut dev).await;
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+    )
+    .await;
+    wait_status(&first, &tid, &token, &sid, "idle").await;
+    drop(dev.ws);
+    wait_offline(&first, &b, &dev.agent_id).await;
+
+    // The server restarted without B in the list; B's device comes back.
+    let app = serving_only(&first, &a.tenant_id).await;
+    let mut ws = connect(&app, &dev.token, &dev.machine, RUNS_HIVE).await;
+    let order = read_until(&mut ws, "rc:hive.stop")
+        .await
+        .expect("the device is told to stop what it runs for an unserved org");
+    assert_eq!(order["session_id"], sid);
+    assert_eq!(order["reason"], "hive_not_enabled");
+
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_str("status").unwrap(), "ended");
+    assert_eq!(s.get_str("end_reason").unwrap(), "hive_not_enabled");
+    let (code, _) = get_session(&app, &tid, &token, &sid).await;
+    assert_eq!(code, 404, "an unserved org's session cannot be read");
+}
+
 /// The whole round trip. The caller is answered only after the device
 /// decided (held for [`HOLD`]); the start carries metadata and names no
 /// account; the device's run states move the record; a stop reaches the

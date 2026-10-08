@@ -81,7 +81,9 @@ async fn scenario() {
         reached(&app, &seeded, &sid_a, "idle").await,
         "A never came up"
     );
-    let a_claude = until_file(&dev.work_a, ".claude_md").await;
+    // Both copies are made before `.launched`: read neither before it.
+    until_file(&dev.work_a, ".launched").await;
+    let a_claude = std::fs::read_to_string(dev.work_a.join(".claude_md")).ok();
     let a_memory = std::fs::read_to_string(dev.work_a.join(".memory_md")).ok();
 
     // ── A second org fact, while A runs ──────────────────────────────────────
@@ -97,7 +99,8 @@ async fn scenario() {
         .send(json!({"op": "prompt", "id": "a1", "text": "the next turn"}))
         .await;
     assert_eq!(viewer.recv_op("prompt").await["ok"], true);
-    let a_turn = until_file(&dev.work_a, ".claude_md.turn").await;
+    until_file(&dev.work_a, ".turned").await;
+    let a_turn = std::fs::read_to_string(dev.work_a.join(".claude_md.turn")).ok();
     viewer.close(&mut ws).await;
 
     // ── Session B starts after the second fact ───────────────────────────────
@@ -107,7 +110,8 @@ async fn scenario() {
         reached(&app, &seeded, &sid_b, "idle").await,
         "B never came up"
     );
-    let b_claude = until_file(&dev.work_b, ".claude_md").await;
+    until_file(&dev.work_b, ".launched").await;
+    let b_claude = std::fs::read_to_string(dev.work_b.join(".claude_md")).ok();
 
     // ── Past the org's budget ────────────────────────────────────────────────
     // Facts of the longest kind until one does not fit.

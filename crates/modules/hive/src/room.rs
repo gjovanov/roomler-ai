@@ -130,6 +130,7 @@ pub(crate) fn ended_note(s: &AgentSession) -> String {
         Some("member_removed") => "its starter left the organization",
         Some("device_removed") => "its device was removed",
         Some("tenant_archived") => "the organization was archived",
+        Some("hive_not_enabled") => "agent sessions are no longer available to the organization",
         Some("never_answered") => "the device never answered",
         Some("not_on_device") => "its device no longer runs it",
         _ => "ended",

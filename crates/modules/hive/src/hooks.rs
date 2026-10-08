@@ -33,7 +33,7 @@ impl HiveHooks {
 }
 
 /// End every live session matching `filter`, telling each connected device.
-async fn end_and_tell(
+pub(crate) async fn end_and_tell(
     state: &HiveState,
     filter: Document,
     reason: &'static str,

@@ -222,6 +222,13 @@ impl Audit {
     }
 }
 
+/// P1g — what a member of an organization agent sessions do not serve is
+/// told, on every route of the module.
+pub(crate) const NOT_SERVED: &str = "agent sessions are not available to this organization";
+
+/// The organization a route names, once the caller is shown to be in it and
+/// agent sessions serve it (P1g). Membership first: someone outside the org
+/// learns nothing about whether the pillar is open to it.
 pub(crate) async fn member_tenant(
     state: &HiveState,
     tenant_id: &str,
@@ -231,7 +238,23 @@ pub(crate) async fn member_tenant(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::NotAMember);
     }
+    if !state.scope.serves(tid) {
+        return Err(ApiError::NotFound(NOT_SERVED.into()));
+    }
     Ok(tid)
+}
+
+/// P1g — `GET /api/tenant/{tenant_id}/hive`: whether agent sessions serve
+/// this organization. The SPA asks before it shows any of the module's pages;
+/// an organization they do not serve is answered `404`, as every other route
+/// here answers it.
+pub async fn serves(
+    State(state): State<HiveState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    member_tenant(&state, &tenant_id, &auth).await?;
+    Ok(Json(serde_json::json!({ "enabled": true })))
 }
 
 pub(crate) fn parse_oid(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
