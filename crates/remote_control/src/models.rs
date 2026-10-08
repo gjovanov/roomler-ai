@@ -5280,6 +5280,7 @@ mod tests {
             "hive_api_key_helper",
             "hive_api_workspace_id",
             "hive_max_sessions",
+            "hive_update_wait_secs",
         ] {
             assert!(
                 !keys.contains(&forbidden),
