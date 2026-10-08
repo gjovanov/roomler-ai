@@ -34,9 +34,11 @@
 //!
 //! One DataChannel, `hive`, opened by the browser. Each message is a JSON
 //! object carried in [`super::framing`] frames. The browser asks — `hello`,
-//! `page`, `follow`, `unfollow`, `prompt` — and the device answers and pushes
-//! `events` and `state`. A prompt is taken only from a grant that may prompt,
-//! and is attributed to its viewer in the transcript and on the turn's stub.
+//! `page`, `follow`, `unfollow`, `prompt`, `answer` — and the device answers
+//! and pushes `events`, `state` and `approvals`. A prompt is taken only from a
+//! grant that may prompt, and is attributed to its viewer in the transcript
+//! and on the turn's stub; that grant is a DRIVER's, and only a driver
+//! answers an approval (P1a).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -64,6 +66,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use super::framing::{self, Bounds, Reassembler};
 use super::supervisor::{Author, Supervisor, global};
+use super::toolbelt::Decision;
 
 /// The only DataChannel a viewer peer serves.
 pub const CHANNEL: &str = "hive";
@@ -89,6 +92,8 @@ const INBOUND: Bounds = Bounds {
     max_in_flight: 4,
 };
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
+/// What a driver may tell the model with a denial.
+const MAX_ANSWER_MESSAGE: usize = 2000;
 /// A viewer's request id echoed back, capped.
 const MAX_REQUEST_ID: usize = 64;
 
@@ -342,6 +347,7 @@ async fn run(
     // newest `seq` it has been sent.
     let mut follow: Option<(broadcast::Receiver<Arc<EventEnvelope>>, u64)> = None;
     let mut states = sup.subscribe_states();
+    let mut approvals = sup.subscribe_approvals();
 
     let end = loop {
         tokio::select! {
@@ -415,6 +421,25 @@ async fn run(
                     && session == grant.session_id
                     && let Some(ch) = channel.as_mut()
                     && let Err(e) = ch.send(&json!({"op": "state", "state": state.as_str()})).await
+                {
+                    break End::Device(e);
+                }
+            }
+            // P1a — which approvals are open: a card is answerable only
+            // while its id is in the latest list.
+            open = approvals.recv() => {
+                let pending = match open {
+                    Ok((session, ids)) if session == grant.session_id => Some(ids),
+                    Ok(_) => None,
+                    // Behind: say what is open NOW rather than nothing.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Some(sup.pending_approvals(grant.session_id))
+                    }
+                    Err(broadcast::error::RecvError::Closed) => None,
+                };
+                if let Some(ids) = pending
+                    && let Some(ch) = channel.as_mut()
+                    && let Err(e) = ch.send(&json!({"op": "approvals", "pending": ids})).await
                 {
                     break End::Device(e);
                 }
@@ -690,6 +715,10 @@ async fn on_request(
                 "live": sup.holds_live(grant.session_id),
                 "state": state,
                 "may_prompt": grant.may_prompt,
+                // A driver is who answers (design §4.5): the grant that may
+                // prompt is the one that may answer.
+                "may_answer": grant.may_prompt,
+                "approvals": sup.pending_approvals(grant.session_id),
             }))
             .await
         }
@@ -754,6 +783,59 @@ async fn on_request(
                 }
                 Some(error) => {
                     ch.send(&json!({"op": "prompt", "id": id, "ok": false, "error": error}))
+                        .await
+                }
+            }
+        }
+        // P1a — a driver's answer to an open approval.
+        "answer" => {
+            let id: String = req
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(MAX_REQUEST_ID)
+                .collect();
+            let approval: String = req
+                .get("approval")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(MAX_REQUEST_ID)
+                .collect();
+            let message = req
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.chars().take(MAX_ANSWER_MESSAGE).collect::<String>());
+            let decision = match req.get("decision").and_then(Value::as_str) {
+                Some("allow") => Some(Decision::Allow),
+                Some("deny") => Some(Decision::Deny { message }),
+                _ => None,
+            };
+            let refused = if !grant.may_prompt {
+                Some("read_only: only a driver answers an approval".to_string())
+            } else {
+                match decision {
+                    None => Some("a decision is allow or deny".to_string()),
+                    Some(decision) => {
+                        let by = Author {
+                            user_id: grant.user_id,
+                            name: grant.user_name.clone(),
+                        };
+                        sup.answer_approval(grant.session_id, &approval, decision, by)
+                            .err()
+                    }
+                }
+            };
+            match refused {
+                None => {
+                    ch.send(&json!({"op": "answer", "id": id, "ok": true}))
+                        .await
+                }
+                Some(error) => {
+                    ch.send(&json!({"op": "answer", "id": id, "ok": false, "error": error}))
                         .await
                 }
             }
