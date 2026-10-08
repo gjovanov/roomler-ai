@@ -86,6 +86,44 @@ pub enum TranscriptEvent {
     },
     /// Something Hive itself says into the transcript — a resume note, a move.
     Note { text: String },
+    /// FR-90 P1a — a tool call waiting for a person. `input` is what the
+    /// harness will run if it is allowed: the permission tool's own copy,
+    /// which is what an answer applies to, whatever the model's `tool_use`
+    /// said.
+    ApprovalRequested {
+        /// The device's id for this approval — what an answer names.
+        id: String,
+        tool_name: String,
+        #[serde(default)]
+        tool_use_id: Option<String>,
+        input: serde_json::Value,
+    },
+    /// How an approval ended ([`approval_outcome`]). A word this build does
+    /// not know is kept as it is, never refused: an older member stores what
+    /// a newer one records.
+    ApprovalResolved {
+        id: String,
+        outcome: String,
+        /// The driver who answered, by name; absent when nobody did.
+        #[serde(default)]
+        by: Option<String>,
+        /// What the driver told the model, if anything.
+        #[serde(default)]
+        message: Option<String>,
+    },
+}
+
+/// How an approval ends ([`TranscriptEvent::ApprovalResolved`]).
+pub mod approval_outcome {
+    /// A driver allowed it: the tool ran.
+    pub const ALLOWED: &str = "allowed";
+    /// A driver denied it: the model was told so, and why.
+    pub const DENIED: &str = "denied";
+    /// Nobody answered in time; the model was told it did not run.
+    pub const EXPIRED: &str = "expired";
+    /// The harness stopped waiting, or the session ended, before anyone
+    /// answered.
+    pub const WITHDRAWN: &str = "withdrawn";
 }
 
 impl TranscriptEvent {
@@ -101,6 +139,8 @@ impl TranscriptEvent {
             Self::Turn { .. } => "turn",
             Self::Compaction { .. } => "compaction",
             Self::Note { .. } => "note",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalResolved { .. } => "approval_resolved",
         }
     }
 
@@ -125,7 +165,13 @@ impl TranscriptEvent {
             Self::ToolUse { name, input, .. } => format!("{name} {input}"),
             Self::ToolResult { output, .. } => output.clone(),
             Self::Note { text } => text.clone(),
-            Self::SessionInit { .. } | Self::Turn { .. } | Self::Compaction { .. } => return None,
+            // What a driver told the model; the call itself is the
+            // `tool_use` before it, indexed there.
+            Self::ApprovalResolved { message, .. } => message.clone().unwrap_or_default(),
+            Self::SessionInit { .. }
+            | Self::Turn { .. }
+            | Self::Compaction { .. }
+            | Self::ApprovalRequested { .. } => return None,
         };
         (!text.trim().is_empty()).then_some(text)
     }
@@ -188,6 +234,18 @@ mod tests {
                 pre_tokens: None,
             },
             TranscriptEvent::Note { text: "t".into() },
+            TranscriptEvent::ApprovalRequested {
+                id: "a".into(),
+                tool_name: "Bash".into(),
+                tool_use_id: Some("toolu_1".into()),
+                input: serde_json::json!({"command": "whoami"}),
+            },
+            TranscriptEvent::ApprovalResolved {
+                id: "a".into(),
+                outcome: approval_outcome::ALLOWED.into(),
+                by: Some("Dev".into()),
+                message: None,
+            },
         ];
         for ev in all {
             let v: serde_json::Value = serde_json::from_str(&ev.to_json()).unwrap();
@@ -199,8 +257,37 @@ mod tests {
     fn an_unknown_kind_is_not_an_error_just_not_a_view() {
         // A newer daemon's event: an older member must still store it.
         assert_eq!(
-            TranscriptEvent::from_json(r#"{"kind":"approval","tool":"Bash"}"#),
+            TranscriptEvent::from_json(r#"{"kind":"checkpoint","tree":"ab12"}"#),
             None
+        );
+    }
+
+    /// An outcome is a word, not an enum: a newer member's word still reads
+    /// as a resolved approval here, and an older event without the optional
+    /// fields still reads.
+    #[test]
+    fn an_approval_outcome_this_build_does_not_know_still_reads() {
+        assert_eq!(
+            TranscriptEvent::from_json(
+                r#"{"kind":"approval_resolved","id":"a1","outcome":"delegated"}"#
+            ),
+            Some(TranscriptEvent::ApprovalResolved {
+                id: "a1".into(),
+                outcome: "delegated".into(),
+                by: None,
+                message: None,
+            })
+        );
+        assert_eq!(
+            TranscriptEvent::from_json(
+                r#"{"kind":"approval_requested","id":"a1","tool_name":"Write","input":{}}"#
+            ),
+            Some(TranscriptEvent::ApprovalRequested {
+                id: "a1".into(),
+                tool_name: "Write".into(),
+                tool_use_id: None,
+                input: serde_json::json!({}),
+            })
         );
     }
 

@@ -35,17 +35,22 @@ use roomler_ai_remote_control::hive::{
     HARNESS_CLAUDE_CODE, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
-use roomler_hive_node::TranscriptEvent;
-use roomler_hive_node::launch::{LaunchSpec, SettingsSpec, unix_base_env, user_input_line};
+use roomler_hive_node::launch::{
+    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, toolbelt_mcp_config,
+    unix_base_env, user_input_line,
+};
 use roomler_hive_node::stream_json::{Limits, parse_line};
+use roomler_hive_node::{TranscriptEvent, approval_outcome};
 use roomler_node_core::config::AgentConfig;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use super::gates::{self, HiveConfig};
+use super::lines::LineReader;
 use super::store::StoreHandle;
+use super::toolbelt::{self, ApprovalEvent, Toolbelt};
 
 /// How long an `ended` report is replayed on reconnect: long enough to cross
 /// a control-WS flap, short enough not to replay history forever.
@@ -70,6 +75,9 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// How much of a failed harness's stderr its transcript note keeps — on the
 /// device; the `ended` detail, which the server stores, never carries it.
 const STDERR_TAIL: usize = 400;
+/// The toolbelt's channel to its session task: an approval opening and
+/// closing is two messages, and a session holds few open at once.
+const APPROVAL_QUEUE: usize = 32;
 
 /// What `rc:hive.start` asks for, as the supervisor uses it.
 #[derive(Debug, Clone)]
@@ -137,6 +145,17 @@ struct Live {
     /// Prompts admitted and not yet begun — shared with the session task,
     /// which holds them while a turn runs (see `Task::prompt`).
     waiting: Arc<AtomicUsize>,
+    /// P1a — the session's open approvals, which a driver answers.
+    approvals: Arc<toolbelt::Pending>,
+}
+
+/// What a launch hands the session task.
+struct Spawned {
+    child: Child,
+    /// The model token this run holds, with the sidecar.
+    token: Option<String>,
+    /// P1a — owned by the task, so it ends exactly when the session does.
+    toolbelt: Toolbelt,
 }
 
 #[derive(Clone)]
@@ -175,6 +194,11 @@ pub struct Supervisor {
     reporter: Mutex<Option<mpsc::Sender<ClientMsg>>>,
     /// Every state as it is reported, for the viewers of that session.
     states: broadcast::Sender<(ObjectId, HiveRunState)>,
+    /// P1a — a session's open approvals each time they change, for its
+    /// viewers: a driver's card shows its buttons only while it is open.
+    approvals: broadcast::Sender<(ObjectId, Vec<String>)>,
+    /// How long an approval waits for a person (shorter in the tests).
+    approval_timing: toolbelt::Timing,
     /// The viewer peers this device serves (P0d-2).
     viewers: super::view::Viewers,
     /// P0e — the model sidecar: its port once bound, the session tokens it
@@ -330,6 +354,8 @@ impl Supervisor {
             turns: Mutex::new(HashMap::new()),
             reporter: Mutex::new(None),
             states: broadcast::channel(64).0,
+            approvals: broadcast::channel(64).0,
+            approval_timing: toolbelt::Timing::default(),
             viewers: Default::default(),
             sidecar_port: tokio::sync::OnceCell::new(),
             tokens: Default::default(),
@@ -623,6 +649,44 @@ impl Supervisor {
         self.states.subscribe()
     }
 
+    /// P1a — every change to any session's open approvals, from now on.
+    pub(crate) fn subscribe_approvals(&self) -> broadcast::Receiver<(ObjectId, Vec<String>)> {
+        self.approvals.subscribe()
+    }
+
+    /// The approvals open in `session` now; none for a session not live here.
+    pub(crate) fn pending_approvals(&self, session: ObjectId) -> Vec<String> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|l| l.approvals.ids())
+            .unwrap_or_default()
+    }
+
+    /// A driver's answer to one of `session`'s open approvals. The viewer
+    /// peer calls this for a grant that may drive, and nothing else does.
+    pub(crate) fn answer_approval(
+        &self,
+        session: ObjectId,
+        approval: &str,
+        decision: toolbelt::Decision,
+        by: Author,
+    ) -> Result<(), String> {
+        let pending = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|l| Arc::clone(&l.approvals))
+            .ok_or("no such session on this device")?;
+        if pending.answer(approval, toolbelt::Answer { decision, by }) {
+            Ok(())
+        } else {
+            Err("that approval is not waiting (answered, expired or withdrawn)".into())
+        }
+    }
+
     pub(crate) fn viewers(&self) -> &super::view::Viewers {
         &self.viewers
     }
@@ -743,6 +807,13 @@ impl Supervisor {
         self
     }
 
+    /// Tests only: an approval that expires in a test's lifetime.
+    #[cfg(test)]
+    pub(crate) fn with_approval_timing(mut self, timing: toolbelt::Timing) -> Self {
+        self.approval_timing = timing;
+        self
+    }
+
     fn finish(&self, session: ObjectId, fence: u64, token: Option<&str>, detail: String) {
         // Its model access ends with it.
         if let Some(token) = token {
@@ -764,7 +835,12 @@ impl Supervisor {
         store: StoreHandle,
         sidecar: Option<u16>,
     ) -> Result<(), (HiveRefusal, String)> {
-        let (child, token) = self.spawn(order, account, folder, sidecar)?;
+        let (approvals_tx, approvals_rx) = mpsc::channel(APPROVAL_QUEUE);
+        let Spawned {
+            child,
+            token,
+            toolbelt,
+        } = self.spawn(order, account, folder, sidecar, approvals_tx)?;
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -774,6 +850,7 @@ impl Supervisor {
                 account: account.to_string(),
                 input: input_tx,
                 waiting: Arc::clone(&waiting),
+                approvals: toolbelt.pending(),
             },
         );
         // Up and waiting for its first prompt.
@@ -784,6 +861,8 @@ impl Supervisor {
             let inputs = Inputs {
                 rx: input_rx,
                 waiting,
+                approvals: approvals_rx,
+                toolbelt,
             };
             let detail = run(&sup, session, fence, child, inputs, store).await;
             sup.finish(session, fence, token.as_deref(), detail);
@@ -792,20 +871,32 @@ impl Supervisor {
     }
 
     /// Spawn the harness as the session's account, through the wrapper; with
-    /// the sidecar, also the model token this run holds.
+    /// the sidecar, also the model token this run holds; and the session's
+    /// toolbelt, bound before the harness starts because the harness
+    /// connects to it as it starts.
     fn spawn(
         &self,
         order: &StartOrder,
         account: &str,
         folder: &Path,
         sidecar: Option<u16>,
-    ) -> Result<(Child, Option<String>), (HiveRefusal, String)> {
-        let home = match &self.launcher {
+        approvals: mpsc::Sender<ApprovalEvent>,
+    ) -> Result<Spawned, (HiveRefusal, String)> {
+        // The account the session runs as: its home, and the ids its
+        // toolbelt socket is handed to (`None`: it runs as the daemon).
+        let (home, owner, uid) = match &self.launcher {
             Launcher::AsMappedAccount => {
-                crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?
+                let home =
+                    crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
+                let (uid, gid, _) =
+                    crate::exec::account_ids(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
+                (home, Some((uid, gid)), uid)
             }
             #[cfg(any(test, feature = "hive-test-launcher"))]
-            Launcher::AsDaemon { home } => home.clone(),
+            Launcher::AsDaemon { home } => {
+                // SAFETY: getuid reads our own credentials.
+                (home.clone(), None, unsafe { libc::getuid() })
+            }
         };
         let harness = resolve_harness(&self.cfg, &home).ok_or_else(|| {
             (
@@ -822,16 +913,50 @@ impl Supervisor {
                 format!("writing the session settings: {e}"),
             )
         })?;
+        // P1a — the toolbelt, whose `approve` is the session's permission
+        // tool: every tool call that needs one waits for a driver.
+        let dir = self.runtime.join(&sid);
+        let toolbelt = toolbelt::open(
+            &dir,
+            owner,
+            uid,
+            order.session_id,
+            approvals,
+            self.approval_timing,
+        )
+        .map_err(|e| {
+            (
+                HiveRefusal::LaunchFailed,
+                format!("opening the session's toolbelt: {e}"),
+            )
+        })?;
+        let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        let mcp = toolbelt_mcp_config(
+            &relay,
+            &[
+                toolbelt::RELAY_SUBCOMMAND.to_string(),
+                toolbelt.socket().to_string_lossy().into_owned(),
+            ],
+            toolbelt::TOOL_TIMEOUT_MS,
+        );
+        let mcp_config = write_doc(&dir, "mcp.json", &mcp).map_err(|e| {
+            (
+                HiveRefusal::LaunchFailed,
+                format!("writing the session's MCP config: {e}"),
+            )
+        })?;
         let spec = LaunchSpec {
             session: order.harness_session.clone(),
             harness,
             folder: folder.to_path_buf(),
             state_dir: home.join(".roomler").join("hive").join(&sid),
             settings,
-            mcp_config: None,
+            mcp_config: Some(mcp_config),
             sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
             resume: order.resume,
-            permission_prompt_tool: None,
+            permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
+            permission_mode: Some(PERMISSION_MODE.to_string()),
+            disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
         };
         spec.validate()
             .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
@@ -878,7 +1003,13 @@ impl Supervisor {
             cmd.env("ANTHROPIC_API_KEY", token);
         }
         match cmd.spawn() {
-            Ok(child) => Ok((child, token)),
+            Ok(child) => Ok(Spawned {
+                child,
+                token,
+                toolbelt,
+            }),
+            // The toolbelt goes with the failed start: dropping it removes
+            // its socket.
             Err(e) => {
                 if let Some(token) = &token {
                     self.tokens.revoke(token);
@@ -934,8 +1065,15 @@ fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
         extra_read_denies: Vec::new(),
     }
     .to_json();
-    let path = dir.join("settings.json");
-    let tmp = dir.join("settings.json.tmp");
+    write_doc(&dir, "settings.json", &doc)
+}
+
+/// `dir/name`, written whole (a temporary, then a rename) and `0644`: the
+/// session reads it, and only the daemon writes it. `dir` is
+/// [`write_settings`]'s, already made and checked.
+fn write_doc(dir: &Path, name: &str, doc: &serde_json::Value) -> Result<PathBuf, String> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
     std::fs::write(&tmp, doc.to_string()).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
         .map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -943,68 +1081,20 @@ fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Lines from a harness's stdout, bounded and CANCEL-SAFE: everything
-/// consumed from the stream stays in `self` until a whole line is handed out,
-/// so a prompt winning the `select!` mid-line costs nothing. A line longer
-/// than [`MAX_LINE`] is consumed and handed out empty — a harness printing a
-/// gigabyte without a newline cannot exhaust memory.
-struct LineReader<R> {
-    inner: R,
-    buf: Vec<u8>,
-    overlong: bool,
-}
-
-impl<R: AsyncBufRead + Unpin> LineReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            overlong: false,
-        }
+/// The daemon's own binary, which the session's MCP config names as the
+/// toolbelt's relay. After a package upgrade replaced it under a running
+/// daemon, Linux names the old inode `<path> (deleted)`; the path itself
+/// holds the new binary, and a relay is a relay in every version.
+fn own_exe() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating the daemon's binary: {e}"))?;
+    let path = exe
+        .to_str()
+        .ok_or("the daemon's binary has a path that is not UTF-8")?;
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    if !Path::new(path).is_file() {
+        return Err(format!("the daemon's binary is not at {path} any more"));
     }
-
-    /// The next line without its newline; `None` at the end of the stream.
-    async fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        loop {
-            // The only await. Nothing is consumed before it returns, and
-            // everything after it up to the next loop is synchronous.
-            let chunk = self.inner.fill_buf().await?;
-            if chunk.is_empty() {
-                if self.buf.is_empty() && !self.overlong {
-                    return Ok(None);
-                }
-                return Ok(Some(self.take()));
-            }
-            let (used, done) = match chunk.iter().position(|b| *b == b'\n') {
-                Some(i) => (i + 1, true),
-                None => (chunk.len(), false),
-            };
-            if !self.overlong {
-                let body = &chunk[..if done { used - 1 } else { used }];
-                if self.buf.len() + body.len() > MAX_LINE {
-                    self.overlong = true;
-                    self.buf = Vec::new();
-                } else {
-                    self.buf.extend_from_slice(body);
-                }
-            }
-            self.inner.consume(used);
-            if done {
-                return Ok(Some(self.take()));
-            }
-        }
-    }
-
-    fn take(&mut self) -> Vec<u8> {
-        let line = if self.overlong {
-            Vec::new()
-        } else {
-            std::mem::take(&mut self.buf)
-        };
-        self.buf.clear();
-        self.overlong = false;
-        line
-    }
+    Ok(path.to_string())
 }
 
 /// The turn in progress.
@@ -1035,12 +1125,18 @@ struct Task<'a> {
     waiting: Arc<AtomicUsize>,
     /// The harness process's running cost at its last turn's end.
     spent: f64,
+    /// P1a — the approvals open now, in the order the toolbelt reported
+    /// them: the task's own view, so the run state follows the transcript.
+    open_approvals: Vec<String>,
 }
 
 /// What a session task is fed, and the count of prompts it holds.
 struct Inputs {
     rx: mpsc::Receiver<Input>,
     waiting: Arc<AtomicUsize>,
+    /// P1a — the toolbelt's approvals as they open and close.
+    approvals: mpsc::Receiver<ApprovalEvent>,
+    toolbelt: Toolbelt,
 }
 
 impl Task<'_> {
@@ -1049,6 +1145,64 @@ impl Task<'_> {
             self.state = state;
             self.sup.report(self.session, self.fence, state, None);
         }
+    }
+
+    /// The state the session is in, from what it is doing: an open approval
+    /// outranks a running turn, which outranks waiting for a prompt.
+    fn settle_state(&mut self) {
+        let state = if !self.open_approvals.is_empty() {
+            HiveRunState::AwaitingApproval
+        } else if self.current.is_some() {
+            HiveRunState::Running
+        } else {
+            HiveRunState::Idle
+        };
+        self.set_state(state);
+    }
+
+    /// P1a — an approval opened or closed: recorded where the session's
+    /// events are, in their order, and the run state follows.
+    fn on_approval(&mut self, ev: ApprovalEvent) {
+        let event = match ev {
+            ApprovalEvent::Opened {
+                id,
+                tool_name,
+                tool_use_id,
+                input,
+            } => {
+                self.open_approvals.push(id.clone());
+                TranscriptEvent::ApprovalRequested {
+                    id,
+                    tool_name,
+                    tool_use_id,
+                    input,
+                }
+            }
+            ApprovalEvent::Closed { id, ended } => {
+                self.open_approvals.retain(|a| *a != id);
+                resolved(id, ended)
+            }
+        };
+        self.store.append(&self.sid, self.fence, event);
+        self.settle_state();
+        let _ = self
+            .sup
+            .approvals
+            .send((self.session, self.open_approvals.clone()));
+    }
+
+    /// The session is ending with approvals still open: each is recorded as
+    /// withdrawn, here, because the toolbelt's own word arrives after the
+    /// task that would record it is gone.
+    fn withdraw_open_approvals(&mut self) {
+        for id in std::mem::take(&mut self.open_approvals) {
+            self.store.append(
+                &self.sid,
+                self.fence,
+                resolved(id, toolbelt::Ended::Withdrawn),
+            );
+        }
+        let _ = self.sup.approvals.send((self.session, Vec::new()));
     }
 
     async fn prompt(&mut self, author: Option<Author>, text: String) {
@@ -1089,7 +1243,7 @@ impl Task<'_> {
             started: Instant::now(),
         });
         self.turn_report(HiveTurnStatus::Running, None, None);
-        self.set_state(HiveRunState::Running);
+        self.settle_state();
     }
 
     /// Record one event; a `result` closes the turn and lets the next queued
@@ -1136,7 +1290,7 @@ impl Task<'_> {
             self.current = None;
             match self.queued.pop_front() {
                 Some((author, text)) => self.begin(author, text).await,
-                None => self.set_state(HiveRunState::Idle),
+                None => self.settle_state(),
             }
         }
     }
@@ -1174,6 +1328,26 @@ impl Task<'_> {
     }
 }
 
+/// How an approval ended, as the transcript records it.
+fn resolved(id: String, ended: toolbelt::Ended) -> TranscriptEvent {
+    let (outcome, by, message) = match ended {
+        toolbelt::Ended::Answered(a) => match a.decision {
+            toolbelt::Decision::Allow => (approval_outcome::ALLOWED, Some(a.by.name), None),
+            toolbelt::Decision::Deny { message } => {
+                (approval_outcome::DENIED, Some(a.by.name), message)
+            }
+        },
+        toolbelt::Ended::Expired => (approval_outcome::EXPIRED, None, None),
+        toolbelt::Ended::Withdrawn => (approval_outcome::WITHDRAWN, None, None),
+    };
+    TranscriptEvent::ApprovalResolved {
+        id,
+        outcome: outcome.to_string(),
+        by,
+        message,
+    }
+}
+
 /// Own the session until its harness exits; return the `ended` detail.
 async fn run(
     sup: &Supervisor,
@@ -1186,6 +1360,8 @@ async fn run(
     let Inputs {
         rx: mut input,
         waiting,
+        mut approvals,
+        toolbelt,
     } = inputs;
     let Some(stdout) = child.stdout.take() else {
         return "the harness has no stdout".into();
@@ -1207,8 +1383,9 @@ async fn run(
         queued: Default::default(),
         waiting,
         spent: 0.0,
+        open_approvals: Vec::new(),
     };
-    let mut lines = LineReader::new(BufReader::new(stdout));
+    let mut lines = LineReader::new(BufReader::new(stdout), MAX_LINE);
     let limits = Limits::default();
     let mut stopped: Option<String> = None;
 
@@ -1243,6 +1420,9 @@ async fn run(
                     break;
                 }
             },
+            // P1a — after stdout, so the `tool_use` the harness printed is
+            // recorded before the approval it asked for.
+            Some(ev) = approvals.recv() => task.on_approval(ev),
             cmd = input.recv() => match cmd {
                 Some(Input::Prompt { author, text }) => task.prompt(author, text).await,
                 Some(Input::Stop { reason }) => {
@@ -1258,6 +1438,7 @@ async fn run(
         }
     }
 
+    task.withdraw_open_approvals();
     task.interrupt();
     // EOF on stdin ends a stream-json harness; the signals cover one that
     // does not listen, and the tools it started.
@@ -1272,6 +1453,8 @@ async fn run(
             child.wait().await.ok()
         }
     };
+    // The harness is gone; its toolbelt goes with it.
+    drop(toolbelt);
     // The process is gone, so its stderr is at EOF: wait for the tail.
     let tail = match stderr {
         Some(task) => tokio::time::timeout(Duration::from_secs(2), task)
@@ -1370,10 +1553,14 @@ pub(crate) mod tests {
     /// the headless harness reading stream-json input, it says `init` once
     /// its first prompt arrives, then answers each prompt with a text block
     /// and a turn result. A prompt containing `crash` exits 3 with a word on
-    /// stderr; `slow` takes a second; `tool` makes one tool call first. Its
-    /// `total_cost_usd`, like Claude Code's, is the PROCESS's running total:
-    /// 0.25 more at every turn.
+    /// stderr; `slow` takes a second; `tool` makes one tool call first;
+    /// `hold` waits until the folder holds a `.release` file (and takes it),
+    /// which is how a test keeps a turn running while it asks for an
+    /// approval. Its `total_cost_usd`, like Claude Code's, is the PROCESS's
+    /// running total: 0.25 more at every turn. Its argv is kept in the
+    /// folder's `.argv`, one argument a line.
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
+printf '%s\n' "$@" > "$PWD/.argv"
 first=1
 spent=0
 while IFS= read -r line; do
@@ -1386,6 +1573,7 @@ while IFS= read -r line; do
   fi
   case "$line" in
     *slow*) sleep 1 ;;
+    *hold*) while [ ! -e "$PWD/.release" ]; do sleep 0.05; done; rm -f "$PWD/.release" ;;
   esac
   case "$line" in
     *tool*)
@@ -1944,30 +2132,250 @@ done
         r.sup.stop(sid, 1, "owner".into());
     }
 
-    /// Lines are split on newlines, an overlong one comes back empty, and a
-    /// read cancelled mid-line loses nothing.
-    #[tokio::test]
-    async fn the_line_reader_is_bounded_and_cancel_safe() {
-        let mut data: Vec<u8> = b"one\ntwo\n".to_vec();
-        data.extend(std::iter::repeat_n(b'x', MAX_LINE + 10));
-        data.extend(b"\nthree");
-        let mut r = LineReader::new(BufReader::new(&data[..]));
-        let mut got = Vec::new();
-        while let Some(line) = r.next_line().await.unwrap() {
-            got.push(String::from_utf8(line).unwrap());
-        }
-        assert_eq!(got, ["one", "two", "", "three"]);
+    // ─── P1a — approvals ────────────────────────────────────────────────
 
-        // Half a line, a cancelled read, then the rest: one whole line.
-        let (mut w, rd) = tokio::io::duplex(64);
-        let mut r = LineReader::new(BufReader::new(rd));
-        w.write_all(b"{\"type\":").await.unwrap();
-        let cancelled = tokio::time::timeout(Duration::from_millis(50), r.next_line()).await;
-        assert!(cancelled.is_err(), "no newline yet");
-        w.write_all(b"\"x\"}\n").await.unwrap();
+    use super::super::toolbelt::tests::{Client, call};
+    use serde_json::json;
+
+    pub(crate) fn toolbelt_socket(r: &Rig, sid: ObjectId) -> PathBuf {
+        r.root
+            .path()
+            .join("run")
+            .join(sid.to_hex())
+            .join("toolbelt.sock")
+    }
+
+    /// Let a `hold` turn go on.
+    pub(crate) fn release(r: &Rig) {
+        std::fs::write(r.root.path().join("work").join(".release"), b"").unwrap();
+    }
+
+    /// Claude Code asking for one approval, as it does at a tool call: the
+    /// toolbelt's handshake, then the permission prompt.
+    pub(crate) async fn harness_asks(r: &Rig, sid: ObjectId, id: u64, command: &str) -> Client {
+        let mut c = Client::at(&toolbelt_socket(r, sid)).await;
+        c.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25"}}))
+            .await;
+        assert_eq!(c.recv().await["id"], 0);
+        c.send(call(id, "Bash", json!({"command": command}))).await;
+        c
+    }
+
+    /// The one approval open in `sid`, once the session reports it waits.
+    pub(crate) async fn until_awaiting(r: &mut Rig, sid: ObjectId) -> String {
+        loop {
+            if next_state(r, sid).await.0 == HiveRunState::AwaitingApproval {
+                break;
+            }
+        }
+        let open = r.sup.pending_approvals(sid);
+        assert_eq!(open.len(), 1, "{open:?}");
+        open[0].clone()
+    }
+
+    fn approval_events(r: &Rig, sid: ObjectId) -> Vec<TranscriptEvent> {
+        r.store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter(|e| e.kind().starts_with("approval_"))
+            .collect()
+    }
+
+    /// A turn that needs approval waits for a driver, `awaiting_approval`;
+    /// the answer goes back to the harness; the transcript says what was
+    /// asked and who answered; and the session is back at its turn.
+    #[tokio::test]
+    async fn an_approval_waits_for_a_driver_and_the_transcript_says_who_answered() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+
+        let mut seen = r.sup.subscribe_approvals();
+        let mut c = harness_asks(&r, sid, 2, "whoami").await;
+        let approval = until_awaiting(&mut r, sid).await;
+        assert_eq!(seen.recv().await.unwrap(), (sid, vec![approval.clone()]));
+
+        let by = Author {
+            user_id: r.user,
+            name: "Dev".into(),
+        };
+        r.sup
+            .answer_approval(sid, &approval, toolbelt::Decision::Allow, by.clone())
+            .unwrap();
         assert_eq!(
-            r.next_line().await.unwrap().unwrap(),
-            b"{\"type\":\"x\"}".to_vec()
+            c.verdict(2).await,
+            json!({"behavior": "allow", "updatedInput": {"command": "whoami"}})
         );
+        assert_eq!(
+            next_state(&mut r, sid).await.0,
+            HiveRunState::Running,
+            "back to the turn, which still runs"
+        );
+        assert_eq!(seen.recv().await.unwrap(), (sid, vec![]));
+        assert!(
+            r.sup
+                .answer_approval(sid, &approval, toolbelt::Decision::Allow, by)
+                .is_err(),
+            "an approval is answered once"
+        );
+
+        release(&r);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert_eq!(
+            approval_events(&r, sid),
+            [
+                TranscriptEvent::ApprovalRequested {
+                    id: approval.clone(),
+                    tool_name: "Bash".into(),
+                    tool_use_id: Some("toolu_01FAKE".into()),
+                    input: json!({"command": "whoami"}),
+                },
+                TranscriptEvent::ApprovalResolved {
+                    id: approval,
+                    outcome: approval_outcome::ALLOWED.into(),
+                    by: Some("Dev".into()),
+                    message: None,
+                },
+            ]
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// Nobody answering: the model is told so, the transcript says
+    /// `expired`, and the session is back at its turn.
+    #[tokio::test]
+    async fn an_unanswered_approval_expires_into_a_denial() {
+        let mut r = rig_with(
+            true,
+            4,
+            |_| {},
+            |s| {
+                s.with_approval_timing(toolbelt::Timing {
+                    timeout: Duration::from_millis(300),
+                    progress_every: Duration::from_secs(30),
+                })
+            },
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        let mut c = harness_asks(&r, sid, 3, "make deploy").await;
+        let approval = until_awaiting(&mut r, sid).await;
+        let v = c.verdict(3).await;
+        assert_eq!(v["behavior"], "deny");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Nobody answered"),
+            "{v}"
+        );
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        release(&r);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(matches!(
+            approval_events(&r, sid).last(),
+            Some(TranscriptEvent::ApprovalResolved { id, outcome, by: None, .. })
+                if *id == approval && outcome == approval_outcome::EXPIRED
+        ));
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// An approval still open when the session stops is withdrawn — in the
+    /// transcript too — and the toolbelt goes with the session.
+    #[tokio::test]
+    async fn an_approval_open_at_a_stop_is_withdrawn_and_the_toolbelt_goes() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        let _harness = harness_asks(&r, sid, 2, "make").await;
+        let approval = until_awaiting(&mut r, sid).await;
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        assert!(
+            matches!(
+                approval_events(&r, sid).last(),
+                Some(TranscriptEvent::ApprovalResolved { id, outcome, by: None, .. })
+                    if *id == approval && outcome == approval_outcome::WITHDRAWN
+            ),
+            "{:?}",
+            approval_events(&r, sid)
+        );
+        assert!(!toolbelt_socket(&r, sid).exists(), "the socket went too");
+        assert!(r.sup.pending_approvals(sid).is_empty());
+    }
+
+    /// The harness is told who decides: the permission mode pinned, the
+    /// toolbelt its only MCP config, its permission tool the toolbelt's
+    /// `approve`; and the MCP config names the daemon's relay and the
+    /// session's socket, which only the session's account may open.
+    #[tokio::test]
+    async fn the_launch_makes_the_toolbelt_the_one_that_decides() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        let argv_file = r.root.path().join("work").join(".argv");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !argv_file.exists() {
+            assert!(Instant::now() < deadline, "the harness never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let argv: Vec<String> = std::fs::read_to_string(&argv_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let pair = |a: &str, b: &str| argv.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("--permission-mode", "default"), "{argv:?}");
+        assert!(
+            pair("--permission-prompt-tool", "mcp__roomler__approve"),
+            "{argv:?}"
+        );
+        assert!(
+            argv.contains(&"--strict-mcp-config".to_string()),
+            "{argv:?}"
+        );
+        assert!(pair("--disallowedTools", "AskUserQuestion"), "{argv:?}");
+
+        let mcp_path = r
+            .root
+            .path()
+            .join("run")
+            .join(sid.to_hex())
+            .join("mcp.json");
+        assert!(pair("--mcp-config", mcp_path.to_str().unwrap()), "{argv:?}");
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let server = &mcp["mcpServers"]["roomler"];
+        assert_eq!(
+            server["args"],
+            json!(["hive-mcp", toolbelt_socket(&r, sid).to_str().unwrap()])
+        );
+        assert!(Path::new(server["command"].as_str().unwrap()).is_file());
+        let mode = std::fs::metadata(&mcp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the session reads it; only the daemon writes it"
+        );
+        let mode = std::fs::metadata(toolbelt_socket(&r, sid))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
     }
 }

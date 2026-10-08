@@ -293,6 +293,57 @@ describe('useHiveViewer', () => {
     }
   })
 
+  it('knows which approvals are open, answers one by id, and forgets them with the peer', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-appr')
+    const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+    serverSays('hive:view.ready', { ref, grant_id: 'g-appr', ice_servers: [], ttl_secs: 600, may_prompt: true })
+    await flush()
+    const ch = FakePeer.last!.channel
+    ch.open()
+    await flush()
+    ch.deliver({
+      op: 'hello',
+      v: 1,
+      tip: 0,
+      live: true,
+      state: 'awaiting_approval',
+      may_prompt: true,
+      may_answer: true,
+      approvals: ['a1'],
+    })
+    await flush()
+    expect(viewer.mayAnswer.value).toBe(true)
+    expect(viewer.pendingApprovals.value).toEqual(['a1'])
+
+    // A denial carries the driver's words; the answer is matched by id.
+    const answered = viewer.answer('a1', 'deny', 'not now')
+    await flush()
+    const req = ch.requests().find((r) => r.op === 'answer')!
+    expect(req).toEqual({ op: 'answer', id: req.id, approval: 'a1', decision: 'deny', message: 'not now' })
+    ch.deliver({ op: 'answer', id: req.id, ok: true })
+    await expect(answered).resolves.toEqual({ ok: true, error: undefined })
+
+    // The device's list is the truth: what it no longer names is closed.
+    ch.deliver({ op: 'approvals', pending: [] })
+    await flush()
+    expect(viewer.pendingApprovals.value).toEqual([])
+    ch.deliver({ op: 'approvals', pending: ['a2'] })
+    await flush()
+    expect(viewer.pendingApprovals.value).toEqual(['a2'])
+
+    // An answer still waiting when the peer goes is told so, and nothing is
+    // answerable any more.
+    const waiting = viewer.answer('a2', 'allow')
+    await flush()
+    expect(ch.requests().filter((r) => r.op === 'answer').at(-1)).toMatchObject({ approval: 'a2', decision: 'allow' })
+    expect(ch.requests().filter((r) => r.op === 'answer').at(-1)).not.toHaveProperty('message')
+    serverSays('hive:view.closed', { grant_id: 'g-appr', reason: 'expired' })
+    await expect(waiting).resolves.toEqual({ ok: false, error: 'closed' })
+    expect(viewer.pendingApprovals.value).toEqual([])
+    unmount()
+  })
+
   it('shows a session announcement once, not at every turn', async () => {
     const { withoutRepeatedInits } = await import('@/composables/useHiveViewer')
     const init = (seq: number, model = 'm') => ({
