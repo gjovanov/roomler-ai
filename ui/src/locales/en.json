@@ -229,6 +229,26 @@
       "started": "Session started — model {model}, in {cwd}",
       "compacted": "The agent compacted its context.",
       "unknownKind": "An event this version cannot show ({kind}).",
+      "tool": {
+        "background": "Runs in the background",
+        "replaceAll": "Every occurrence",
+        "unchanged": "Unchanged lines: {count}",
+        "tooLong": "Too long to compare line by line.",
+        "before": "Before",
+        "after": "After",
+        "writes": "Lines written: {count}",
+        "moreLines": "More lines not shown: {count}",
+        "lines": "lines {from}–{to}",
+        "fromLine": "from line {from}",
+        "output": "Output · lines: {count}",
+        "subagent": "Sub-agent: {agent}",
+        "prompt": "Its instructions",
+        "todo": {
+          "pending": "To do",
+          "in_progress": "In progress",
+          "completed": "Done"
+        }
+      },
       "askPlaceholder": "Ask the agent…",
       "askFailed": "The prompt did not reach the agent.",
       "readOnly": "You can read this session and talk in its room. Only its drivers can prompt the agent.",
