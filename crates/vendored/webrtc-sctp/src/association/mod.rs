@@ -63,6 +63,43 @@ pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
 /// other constants
 pub(crate) const ACCEPT_CH_SIZE: usize = 16;
 
+/// roomler (#1856): while sends keep failing, log at most this often.
+const SEND_FAILURE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// roomler (#1856): a run of consecutive failed `net_conn` sends. The write
+/// loop drops the packet and lets SCTP retransmit it; this only decides what
+/// gets logged: the first failure of a run, then at most one line per
+/// [`SEND_FAILURE_LOG_EVERY`], and one line when sends recover.
+#[derive(Debug, Default)]
+struct SendFailureRun {
+    dropped: u64,
+    since: Option<std::time::Instant>,
+    last_log: Option<std::time::Instant>,
+}
+
+impl SendFailureRun {
+    /// Count one failed send; `true` when this one should be logged.
+    fn failed(&mut self, now: std::time::Instant) -> bool {
+        self.dropped += 1;
+        self.since.get_or_insert(now);
+        let log = self
+            .last_log
+            .is_none_or(|t| now.duration_since(t) >= SEND_FAILURE_LOG_EVERY);
+        if log {
+            self.last_log = Some(now);
+        }
+        log
+    }
+
+    /// A send went out. `Some((dropped, how long))` when it ended a run.
+    fn sent(&mut self, now: std::time::Instant) -> Option<(u64, std::time::Duration)> {
+        let since = self.since.take()?;
+        let dropped = std::mem::take(&mut self.dropped);
+        self.last_log = None;
+        Some((dropped, now.duration_since(since)))
+    }
+}
+
 /// association state enums
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum AssociationState {
@@ -464,6 +501,7 @@ impl Association {
         log::debug!("[{}] write_loop entered", name);
         let done = Arc::new(AtomicBool::new(false));
         let name = Arc::new(name);
+        let mut send_failures = SendFailureRun::default();
 
         'outer: while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
@@ -476,7 +514,6 @@ impl Association {
             let net_conn = Arc::clone(&net_conn);
             let bytes_sent = Arc::clone(&bytes_sent);
             let name2 = Arc::clone(&name);
-            let done2 = Arc::clone(&done);
             let mut buffer = None;
             for raw in packets {
                 let mut buf = buffer
@@ -492,11 +529,40 @@ impl Association {
                 {
                     Ok(Ok(mut buf)) => {
                         let raw = buf.as_ref();
-                        if let Err(err) = net_conn.send(raw.as_ref()).await {
-                            log::warn!("[{}] failed to write packets on net_conn: {}", name2, err);
-                            done2.store(true, Ordering::Relaxed)
-                        } else {
-                            bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                        // roomler (#1856): a failed send is a LOST PACKET, not a
+                        // dead association. Upstream ended the loop here, which
+                        // closed the association and every stream on it, so one
+                        // datagram a route change bounced (EHOSTUNREACH on a
+                        // socket bound to an address whose route was briefly
+                        // absent; ENOBUFS; an interface going away under a
+                        // roam) killed a whole remote-desktop session. SCTP
+                        // retransmits what was dropped, the way libwebrtc does.
+                        // A transport that is really gone is still caught: its
+                        // `recv` fails, and the read loop closes the association.
+                        match net_conn.send(raw.as_ref()).await {
+                            Ok(_) => {
+                                bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                                if let Some((dropped, over)) =
+                                    send_failures.sent(std::time::Instant::now())
+                                {
+                                    log::info!(
+                                        "[{}] net_conn sends recovered — {} packet(s) dropped over {:?}, retransmitted by SCTP",
+                                        name2,
+                                        dropped,
+                                        over
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                if send_failures.failed(std::time::Instant::now()) {
+                                    log::warn!(
+                                        "[{}] failed to write packets on net_conn: {} — dropped, not fatal: SCTP retransmits ({} in this run)",
+                                        name2,
+                                        err,
+                                        send_failures.dropped
+                                    );
+                                }
+                            }
                         }
 
                         // Reuse allocation. Have to use options, since spawn blocking can't borrow, has to take ownership.

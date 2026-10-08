@@ -790,6 +790,36 @@ fn route_lookup(_dest_ip: IpAddr) -> Option<DefaultRoute> {
     None
 }
 
+/// macOS — classify one line of `route -n monitor`; `None` for every line that
+/// is not a routing-table CHANGE (#1856).
+///
+/// `route -n monitor` prints a six-line block per routing message: a blank, a
+/// `got message of size … on <date>` banner, the `RTM_…:` header, then
+/// `locks:`, `sockaddrs:` and the addresses. Every line used to count as a
+/// signal, `RTM_GET` included, and an `RTM_GET` is only somebody's LOOKUP:
+/// ours too. `sample_snapshot` runs `route -n get` after every burst, and the
+/// route guard re-asserts after every delta, so on macOS the monitor fed
+/// itself. The field MacBook ran a route wave every 3 s for as long as it was
+/// up (tick 22512 / event 8 over 18 h), each one a delete-then-add of every
+/// peer `/32`.
+#[cfg(any(target_os = "macos", test))]
+fn classify_bsd_monitor_line(line: &str) -> Option<RawSignal> {
+    let kind = line.split(':').next()?.trim();
+    if !kind.starts_with("RTM_") {
+        return None;
+    }
+    match kind {
+        // A lookup's answer, a failed lookup, and TCP's "this route may be
+        // failing" advisory: none of them changes the table.
+        "RTM_GET" | "RTM_GET2" | "RTM_GET_SILENT" | "RTM_GET_EXT" | "RTM_MISS" | "RTM_LOSING" => {
+            None
+        }
+        "RTM_NEWADDR" | "RTM_DELADDR" => Some(RawSignal::Addr),
+        "RTM_IFINFO" | "RTM_IFINFO2" | "RTM_IFANNOUNCE" => Some(RawSignal::Iface),
+        _ => Some(RawSignal::Route),
+    }
+}
+
 /// The OS raw-signal backends — the `route_events` registrations, moved here
 /// verbatim with the sender retyped to `(RawSignal, detail)`.
 mod backend {
@@ -957,24 +987,26 @@ mod backend {
         }
 
         /// PR-3 — classify a monitor line. Linux `ip -o monitor route addr
-        /// link` labels sections `[ROUTE]`/`[ADDR]`/`[LINK]` when watching
-        /// multiple objects; macOS `route -n monitor` prints RTM message
-        /// names (`RTM_NEWADDR`, `RTM_IFINFO`, …). Unrecognized ⇒ Route —
-        /// the snapshot diff carries the real information either way.
-        fn classify(line: &str) -> RawSignal {
-            if line.contains("[ADDR]")
-                || line.contains("RTM_NEWADDR")
-                || line.contains("RTM_DELADDR")
-            {
+        /// link` prints ONE line per message and labels sections
+        /// `[ROUTE]`/`[ADDR]`/`[LINK]` when watching multiple objects.
+        /// Unrecognized ⇒ Route — the snapshot diff carries the real
+        /// information either way. macOS has its own classifier
+        /// (`classify_bsd_monitor_line`): its monitor prints several lines
+        /// per message, and lookups among them.
+        #[cfg(not(target_os = "macos"))]
+        fn classify(line: &str) -> Option<RawSignal> {
+            Some(if line.contains("[ADDR]") {
                 RawSignal::Addr
-            } else if line.contains("[LINK]")
-                || line.contains("RTM_IFINFO")
-                || line.contains("RTM_IFANNOUNCE")
-            {
+            } else if line.contains("[LINK]") {
                 RawSignal::Iface
             } else {
                 RawSignal::Route
-            }
+            })
+        }
+
+        #[cfg(target_os = "macos")]
+        fn classify(line: &str) -> Option<RawSignal> {
+            super::super::classify_bsd_monitor_line(line)
         }
 
         pub(in super::super) fn spawn(
@@ -1008,7 +1040,10 @@ mod backend {
             let reader = tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send((classify(&line), line)).is_err() {
+                    let Some(signal) = classify(&line) else {
+                        continue;
+                    };
+                    if tx.send((signal, line)).is_err() {
                         break;
                     }
                 }
@@ -1217,6 +1252,59 @@ mod tests {
 
         // Identical ⇒ None (the burst was our own route re-asserts).
         assert!(diff(&home, &home.clone(), false, false).is_none());
+    }
+
+    /// #1856 — macOS `route -n monitor`, verbatim from the field MacBook (its
+    /// en0 link-layer address replaced): two
+    /// lookups (one of them is what `sample_snapshot` runs after every burst)
+    /// and then a route guard re-assert of one peer. Only the re-assert's two
+    /// headers are changes; the other ten lines must not signal at all.
+    #[test]
+    fn bsd_monitor_signals_only_on_change_headers() {
+        let monitor = "
+got message of size 164 on Thu Oct  8 13:48:53 2026
+RTM_GET: Report Metrics: len 164, pid: 67311, seq 1, errno 0, flags:<UP,HOST,DONE,STATIC>
+locks:  inits:
+sockaddrs: <DST,GATEWAY,IFP,IFA>
+ 100.65.4.2 index: 24 utun0 index: 24 utun0 100.65.4.34
+
+got message of size 164 on Thu Oct  8 13:48:53 2026
+RTM_GET: Report Metrics: len 164, pid: 67312, seq 1, errno 0, flags:<UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+locks:  inits:
+sockaddrs: <DST,GATEWAY,NETMASK,IFP,IFA>
+ default 192.168.8.1 default index: 15 en0:2.0.0.0.0.1 192.168.8.108
+
+got message of size 128 on Thu Oct  8 13:56:57 2026
+RTM_DELETE: Delete Route: len 128, pid: 70821, seq 1, errno 0, flags:<HOST,DONE,STATIC,CONDEMNED>
+locks:  inits:
+sockaddrs: <DST,GATEWAY>
+ 100.65.4.14 index: 24 utun0
+
+got message of size 128 on Thu Oct  8 13:56:57 2026
+RTM_ADD: Add Route: len 128, pid: 70825, seq 1, errno 0, flags:<UP,HOST,DONE,STATIC>
+locks:  inits:
+sockaddrs: <DST,GATEWAY>
+ 100.65.4.14 index: 24 utun0
+";
+        let signals: Vec<RawSignal> = monitor
+            .lines()
+            .filter_map(classify_bsd_monitor_line)
+            .collect();
+        assert_eq!(signals, vec![RawSignal::Route, RawSignal::Route]);
+
+        // The address/interface classes still reach the roam lanes.
+        let hdr = |kind: &str| format!("{kind}: x: len 1, pid: 1, seq 1, errno 0, flags:<UP>");
+        for (kind, want) in [
+            ("RTM_NEWADDR", Some(RawSignal::Addr)),
+            ("RTM_DELADDR", Some(RawSignal::Addr)),
+            ("RTM_IFINFO", Some(RawSignal::Iface)),
+            ("RTM_CHANGE", Some(RawSignal::Route)),
+            ("RTM_REDIRECT", Some(RawSignal::Route)),
+            ("RTM_MISS", None),
+            ("RTM_LOSING", None),
+        ] {
+            assert_eq!(classify_bsd_monitor_line(&hdr(kind)), want, "{kind}");
+        }
     }
 
     /// The sampler runs on the host without privileges and produces a

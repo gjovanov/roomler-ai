@@ -629,7 +629,8 @@ server. Detail and the negative-control test:
   hard-denying, so every tier retries eventually — lockout is impossible by
   construction.
 * **Route erasure** — the route guard reacts to OS route-change events
-  (Windows `NotifyRouteChange2`, Linux `ip monitor route`) with an immediate
+  (Windows `NotifyRouteChange2`, Linux `ip monitor route`, macOS
+  `route -n monitor`) with an immediate
   re-assert of the per-peer `/32`s and any exit `/1`s (waves rate-limited to
   ≥3 s apart; an event inside the quiet window pulls the next tick to the
   due boundary, so no erase waits longer than that). The blind tick is a
@@ -637,6 +638,29 @@ server. Detail and the negative-control test:
   (`…_ROUTE_TICK_SECS` to override; `2` = the pre-demotion cadence) and
   drops back to 2 s automatically whenever the subscription is unavailable
   or dies.
+* **A re-assert must not write a route that is already ours** (#1856). Every
+  wave re-asserts every peer, so a write that changes nothing still costs
+  two things. It emits a route-change event, which arms the next wave
+  through the trailing edge above and keeps the guard driving itself. And
+  wherever the write is not atomic, it opens a hole. Windows
+  (`winroute::ensure`) and Linux (`ip route replace`) skip a matching route.
+  macOS has no idempotent `route` write: a re-assert is `route -n get`, and
+  only a route that is missing or foreign gets the delete-then-add. A wave
+  that wrote anyway left each peer's `/32` absent for 2.5–3.0 ms every 3 s,
+  and macOS answers a socket **bound to the overlay address** with
+  `EHOSTUNREACH` in that hole instead of falling through to the default
+  route. That socket is WebRTC's host candidate whenever the controller's
+  browser runs on an overlay node, so remote desktop to a Mac broke a few
+  seconds into every session. The macOS monitor (`route -n monitor`) also
+  counts only change headers: an `RTM_GET` is somebody's lookup, including
+  netstate's own snapshot, and once counted it kept the monitor awake by
+  itself.
+
+> ⚠️ **`ROUTE_WAVES_TICK` ≫ `ROUTE_WAVES_EVENT` does not mean "no live
+> subscription".** An event inside the quiet window does not run a wave. It
+> pulls the TICK arm forward, and the tick counts the wave. A guard that feeds
+> itself therefore reads as tick-driven: the MacBook showed tick 22512, event
+> 8, with its monitor demonstrably live (#1282).
 
 ---
 

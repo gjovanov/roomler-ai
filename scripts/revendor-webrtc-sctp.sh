@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Consolidation invariant I5 — the vendored `crates/vendored/webrtc-sctp`
-# is pristine upstream + ONE canonical patch (`crates/vendored/webrtc-sctp.patch`,
-# the FORWARD-TSN parse fix: a chunk bundled after a FORWARD-TSN no longer
-# fails the whole packet — see src/chunk/chunk_forward_tsn.rs).
+# is pristine upstream + ONE canonical patch (`crates/vendored/webrtc-sctp.patch`:
+# the FORWARD-TSN parse fix, where a chunk bundled after a FORWARD-TSN no longer
+# fails the whole packet — see src/chunk/chunk_forward_tsn.rs; and #1856, where a
+# failed send is a lost packet rather than a closed association — see
+# src/association/mod.rs).
 # This script makes that relationship mechanical:
 #
 #   scripts/revendor-webrtc-sctp.sh [version]           rebuild the vendored tree
