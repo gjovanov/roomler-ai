@@ -4,7 +4,8 @@
 //! real device in-process (`roomlerd`'s signalling loop), a browser's user
 //! socket and its viewer peer, and the harness's side of a toolbelt. Each
 //! binary is its own process because the device's Hive supervisor is
-//! process-global (`hive_canary.rs`, `hive_drivers.rs`).
+//! process-global (`hive_canary.rs`, `hive_drivers.rs`, `hive_memory.rs`,
+//! `hive_memory_off.rs`).
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -539,4 +540,171 @@ pub async fn until_room_message(
 
 pub fn text_of(e: &Value) -> String {
     e["event"].to_string()
+}
+
+// ─── Core memory (P1e) ──────────────────────────────────────────────────────
+
+/// A stand-in for Claude Code that records its core memory: what it finds
+/// where Claude Code reads it — `$CLAUDE_CONFIG_DIR/CLAUDE.md`, and the
+/// auto-memory `MEMORY.md` under the pinned project name — copied to
+/// `.claude_md` / `.memory_md` in the session's folder when it starts (then
+/// `.launched`), and to `.claude_md.turn` / `.memory_md.turn` at each turn.
+/// What a model would have been given, not what the server meant to send.
+pub const MEMORY_HARNESS: &str = r#"#!/bin/sh
+mem() {
+  if [ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ]; then cp "$CLAUDE_CONFIG_DIR/CLAUDE.md" "$PWD/.claude_md$1"; fi
+  m="$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md"
+  if [ -f "$m" ]; then cp "$m" "$PWD/.memory_md$1"; fi
+}
+mem ""
+touch "$PWD/.launched"
+while IFS= read -r line; do
+  mem ".turn"
+  echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.0}'
+done
+"#;
+
+/// Poll until `folder/name` exists: its content, or `None` when it never
+/// came.
+pub async fn until_file(folder: &Path, name: &str) -> Option<String> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(folder.join(name)) {
+            return Some(s);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// `POST …/hive/brain` as `token`: the status and the answer.
+pub async fn keep_fact(app: &TestApp, tid: &str, token: &str, body: Value) -> (u16, Value) {
+    let resp = app
+        .auth_post(&format!("/api/tenant/{tid}/hive/brain"), token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// A device in-process whose sessions run [`MEMORY_HARNESS`] in `roots/a` or
+/// `roots/b` as the seeded admin, with its owner's `hive_core_memory` as
+/// given. Online when returned.
+pub struct MemoryDevice {
+    pub dir: tempfile::TempDir,
+    pub work_a: PathBuf,
+    pub work_b: PathBuf,
+    pub home: PathBuf,
+    pub id: String,
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+pub async fn memory_device(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    core_memory: bool,
+) -> MemoryDevice {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let roots = dir.path().join("roots");
+    let (work_a, work_b) = (roots.join("a"), roots.join("b"));
+    let home = dir.path().join("home");
+    for d in [&work_a, &work_b, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let harness = dir.path().join("claude");
+    std::fs::write(&harness, MEMORY_HARNESS).unwrap();
+    std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = enrol(app, seeded, "hive-memory").await;
+    cfg.hive_enabled = true;
+    cfg.hive_accounts
+        .insert(seeded.admin.id.clone(), "memory".into());
+    cfg.hive_roots = vec![roots.display().to_string()];
+    cfg.hive_harness = Some(harness.display().to_string());
+    cfg.hive_core_memory = core_memory;
+    roomlerd::hive::init_as_daemon(
+        &cfg,
+        &dir.path().join("hive.db"),
+        &dir.path().join("run"),
+        &home,
+    )
+    .expect("the test launcher");
+    let id = cfg.agent_id.clone();
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let task = spawn_device(cfg, stop_rx);
+    wait_online(app, seeded, &id).await;
+    MemoryDevice {
+        dir,
+        work_a,
+        work_b,
+        home,
+        id,
+        stop,
+        task,
+    }
+}
+
+impl MemoryDevice {
+    /// The session's own config directory: where Claude Code reads
+    /// `CLAUDE.md`, and under `projects/` the auto-memory index.
+    pub fn config_dir(&self, sid: &str) -> PathBuf {
+        self.home.join(".roomler/hive").join(sid).join("claude")
+    }
+
+    /// The daemon's own copy of a session's core memory, which the account
+    /// copies in.
+    pub fn runtime_memory(&self, sid: &str) -> PathBuf {
+        self.dir.path().join("run").join(sid).join("memory")
+    }
+
+    pub async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.task).await;
+        drop(self.dir);
+    }
+}
+
+/// Every file named `name` under `dir`, at any depth.
+pub fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            found.extend(files_named(&p, name));
+        } else if p.file_name().is_some_and(|n| n == name) {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// The session's first transcript note that starts with `prefix`, reading
+/// its transcript from the start. The viewer must be fresh: nothing else is
+/// awaited on it first.
+pub async fn transcript_note(viewer: &mut Browser, prefix: &str) -> Option<String> {
+    viewer.send(json!({"op": "hello"})).await;
+    viewer.recv_op("hello").await;
+    viewer.send(json!({"op": "follow", "after": 0})).await;
+    let is_it = |e: &Value| {
+        e["event"]["kind"] == "note"
+            && e["event"]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with(prefix))
+    };
+    viewer
+        .events_until(is_it)
+        .await
+        .iter()
+        .find(|e| is_it(e))
+        .and_then(|e| e["event"]["text"].as_str().map(str::to_string))
 }
