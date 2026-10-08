@@ -459,4 +459,38 @@ describe('useHiveViewer', () => {
     expect(sent.filter((s) => s.type === 'hive:view.open').length).toBe(opens + 1)
     unmount()
   })
+  it('keeps a bounded page while it follows, the rest one page away (P1f-2)', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-trim')
+    const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+    serverSays('hive:view.ready', { ref, grant_id: 'gt', ice_servers: [], ttl_secs: 600, may_prompt: true })
+    await flush()
+    const ch = FakePeer.last!.channel
+    ch.open()
+    await flush()
+    ch.deliver({ op: 'hello', v: 1, tip: 3, live: true, state: 'idle', may_prompt: true })
+    await flush()
+    const ev = (seq: number) => ({ seq, ts: seq, fence: 1, event: { kind: 'note', text: `n${seq}` } })
+    ch.deliver({ op: 'page', after: 0, events: [ev(1), ev(2), ev(3)], more: false, tip: 3 })
+    await flush()
+    ch.deliver({ op: 'events', events: [4, 5, 6, 7, 8, 9, 10].map(ev) })
+    await flush()
+    expect(viewer.hasEarlier.value).toBe(false)
+
+    viewer.trimEarlier(4)
+    expect(viewer.events.value.map((e: { seq: number }) => e.seq)).toEqual([7, 8, 9, 10])
+    expect(viewer.hasEarlier.value).toBe(true)
+    viewer.trimEarlier(4)
+    expect(viewer.events.value).toHaveLength(4)
+
+    // What was dropped is asked for again, exactly.
+    const asked = viewer.loadEarlier()
+    await flush()
+    expect(ch.requests().filter((r) => r.op === 'page').pop()).toEqual({ op: 'page', after: 0, limit: 6 })
+    ch.deliver({ op: 'page', after: 0, events: [1, 2, 3, 4, 5, 6].map(ev), more: false, tip: 10 })
+    await asked
+    expect(viewer.events.value.map((e: { seq: number }) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    expect(viewer.hasEarlier.value).toBe(false)
+    unmount()
+  })
 })

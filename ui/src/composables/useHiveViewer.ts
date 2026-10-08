@@ -416,6 +416,18 @@ export function useHiveViewer() {
     ws.send('hive:view.open', { session_id: sessionId, ref: reference })
   }
 
+  /**
+   * P1f-2 — keep at most `keep` events, the newest: a session followed for
+   * hours stays a bounded page. What is dropped is still on the device, one
+   * "load earlier" away.
+   */
+  function trimEarlier(keep: number): void {
+    const have = events.value
+    if (have.length <= keep) return
+    events.value = have.slice(have.length - keep)
+    hasEarlier.value = true
+  }
+
   /** The events before the first one shown. */
   async function loadEarlier(): Promise<void> {
     const first = events.value.length ? events.value[0].seq : 0
@@ -499,5 +511,6 @@ export function useHiveViewer() {
     prompt,
     answer,
     loadEarlier,
+    trimEarlier,
   }
 }
