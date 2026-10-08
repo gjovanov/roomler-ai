@@ -4799,6 +4799,96 @@ mod tests {
         }
     }
 
+    // ─── FR-27 P10: the host's Disconnect on the wire ─────────────────
+
+    /// The device's Disconnect ends a session as `host_disconnect`, in both
+    /// directions, under the unchanged `rc:terminate` tag. The spelling is a
+    /// compatibility surface: the viewer keys its "the person at the device
+    /// ended the session" notice on it, and the audit stores it.
+    #[test]
+    fn host_disconnect_rides_rc_terminate_both_ways() {
+        let sid = ObjectId::new();
+        let up = ClientMsg::Terminate {
+            session_id: sid,
+            reason: EndReason::HostDisconnect,
+        };
+        let s = serde_json::to_string(&up).unwrap();
+        assert!(s.contains(r#""t":"rc:terminate""#), "{s}");
+        assert!(s.contains(r#""reason":"host_disconnect""#), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::Terminate { session_id, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(reason, EndReason::HostDisconnect);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let down = ServerMsg::Terminate {
+            session_id: sid,
+            reason: EndReason::HostDisconnect,
+        };
+        let s = serde_json::to_string(&down).unwrap();
+        assert!(s.contains(r#""reason":"host_disconnect""#), "{s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::Terminate { reason, .. } => assert_eq!(reason, EndReason::HostDisconnect),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The version matrix's "new agent, old server" cell, documented the way
+    /// `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fires` does it:
+    /// a pre-P10 `EndReason` has no `host_disconnect`, so a pre-P10 server
+    /// fails to decode the WHOLE frame and its
+    /// `Err(e) => debug!(…, "ignoring non-rc:* message on agent socket")`
+    /// arm drops it — the socket stays up, the session ends when the peer
+    /// closes, and the viewer reconnects as it did before P10. Degraded,
+    /// never broken. If this ever started decoding, the cell would have
+    /// changed shape and the matrix in the FR-27 spec would be stale.
+    #[test]
+    fn pre_p10_end_reason_rejects_host_disconnect_so_old_servers_drop_the_frame() {
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreP10EndReason {
+            ControllerHangup,
+            AgentHangup,
+            UserDenied,
+            ConsentTimeout,
+            NoPromptSurface,
+            AgentDisconnect,
+            AdminTerminated,
+            IdleTimeout,
+            Error,
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "t")]
+        #[allow(dead_code)]
+        enum PreP10ClientMsg {
+            #[serde(rename = "rc:terminate")]
+            Terminate {
+                session_id: String,
+                reason: PreP10EndReason,
+            },
+        }
+        let frame = serde_json::to_string(&ClientMsg::Terminate {
+            session_id: ObjectId::new(),
+            reason: EndReason::HostDisconnect,
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_str::<PreP10ClientMsg>(&frame).is_err(),
+            "a pre-P10 decoder must reject the frame whole: {frame}"
+        );
+        // And the same decoder still takes what a pre-P10 agent sends, so the
+        // test proves the VARIANT is the difference, not the shape.
+        let old = serde_json::to_string(&ClientMsg::Terminate {
+            session_id: ObjectId::new(),
+            reason: EndReason::AgentHangup,
+        })
+        .unwrap();
+        assert!(serde_json::from_str::<PreP10ClientMsg>(&old).is_ok());
+    }
+
     // ─── rc:tunnel.* wire-format locks (T2.1) ─────────────────────────
     //
     // Every new variant gets a roundtrip test AND a discriminator-pin

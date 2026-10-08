@@ -2052,7 +2052,18 @@ impl Hub {
                 self.check_session_party(ctx, session_id)?;
                 self.forward_ice(role, session_id, candidate)
             }
-            (_, ClientMsg::Terminate { session_id, reason }) => {
+            (role, ClientMsg::Terminate { session_id, reason }) => {
+                // FR-27 P10 — `HostDisconnect` is a claim only the DEVICE can
+                // make ("the person at this screen ended it"): it is what the
+                // viewer shows as such and does not auto-reconnect from, and
+                // the audit records it as the host's decision. A controller
+                // saying it about its own hangup is recorded as what it is.
+                // (It also keeps the echo away from a pre-P10 agent, which
+                // cannot decode the variant.)
+                let reason = match (role, reason) {
+                    (Role::Controller, EndReason::HostDisconnect) => EndReason::ControllerHangup,
+                    (_, r) => r,
+                };
                 // Terminate stays IDEMPOTENT on an already-gone session (the
                 // agent's overlay-badge disconnect and teardown races rely on
                 // it) — only a live session enforces the party check.
@@ -2582,6 +2593,106 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// FR-27 P10 — `host_disconnect` reaches the controller as the DEVICE's
+    /// word only. The agent's Terminate carries it through unchanged (the
+    /// viewer keys its notice on it); the same reason from the controller's
+    /// own socket is recorded as `controller_hangup`, so the audit's "the
+    /// person at the device ended it" cannot be written by the viewer.
+    #[tokio::test]
+    async fn host_disconnect_is_the_devices_claim_only() {
+        async fn ended_as(
+            hub: &Hub,
+            ctl_rx: &mut mpsc::Receiver<ServerMsg>,
+            sid: ObjectId,
+        ) -> EndReason {
+            loop {
+                match ctl_rx.recv().await.expect("the controller hears the end") {
+                    ServerMsg::Terminate { session_id, reason } if session_id == sid => {
+                        return reason;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        let open = |hub: &Hub, agent_id: ObjectId, owner: ObjectId, ctl_tx: ClientTx| {
+            hub.create_session(
+                agent_id,
+                owner,
+                "Owner".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        let owner = ObjectId::new();
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
+        let ctx_for = |role: Role, user: Option<ObjectId>, agent: Option<ObjectId>| DispatchCtx {
+            role,
+            user_id: user,
+            agent_id: agent,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+        };
+        let device = ctx_for(Role::Agent, None, Some(agent_id));
+        let viewer = ctx_for(Role::Controller, Some(owner), None);
+
+        // The device's Disconnect: the reason goes through as it is.
+        let sid = open(&hub, agent_id, owner, ctl_tx.clone());
+        hub.dispatch(
+            &device,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::HostDisconnect,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ended_as(&hub, &mut ctl_rx, sid).await,
+            EndReason::HostDisconnect
+        );
+
+        // The same words from the viewer are recorded as its own hangup.
+        let sid = open(&hub, agent_id, owner, ctl_tx.clone());
+        hub.dispatch(
+            &viewer,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::HostDisconnect,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ended_as(&hub, &mut ctl_rx, sid).await,
+            EndReason::ControllerHangup
+        );
     }
 
     /// FR-85 P3 — RECORD is kept only when BOTH gates say yes: the
