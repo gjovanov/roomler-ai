@@ -70,6 +70,70 @@
           {{ $t('hive.viewer.started', { model: asText(e.event.model) || '—', cwd: asText(e.event.cwd) || '—' }) }}
         </div>
         <div v-else-if="e.event.kind === 'note'" class="text-caption text-medium-emphasis">{{ asText(e.event.text) }}</div>
+        <!-- FR-90 P1a — a tool call waiting for a driver. The input is the
+             model's: text, never markup. -->
+        <div
+          v-else-if="e.event.kind === 'approval_requested'"
+          class="hive-approval pa-2 rounded"
+          :data-approval="asText(e.event.id)"
+          data-testid="hive-approval"
+        >
+          <div class="text-body-2 font-weight-medium">
+            <v-icon size="small" color="warning">mdi-shield-key</v-icon>
+            {{ $t('hive.viewer.approval.asks', { tool: asText(e.event.tool_name) }) }}
+          </div>
+          <pre class="hive-pre mt-1">{{ pretty(e.event.input) }}</pre>
+          <template v-if="isOpen(e.event.id)">
+            <div v-if="viewer.mayAnswer.value" class="d-flex flex-wrap align-center ga-2 mt-2">
+              <v-btn
+                size="small"
+                color="success"
+                variant="flat"
+                prepend-icon="mdi-check"
+                :loading="answering === asText(e.event.id)"
+                :disabled="answering !== null"
+                data-testid="hive-approve"
+                @click="answer(asText(e.event.id), 'allow')"
+              >
+                {{ $t('hive.viewer.approval.allow') }}
+              </v-btn>
+              <v-btn
+                size="small"
+                color="error"
+                variant="tonal"
+                prepend-icon="mdi-close"
+                :disabled="answering !== null"
+                data-testid="hive-deny"
+                @click="answer(asText(e.event.id), 'deny')"
+              >
+                {{ $t('hive.viewer.approval.deny') }}
+              </v-btn>
+              <v-text-field
+                v-model="denyNote"
+                :placeholder="$t('hive.viewer.approval.denyPlaceholder')"
+                density="compact"
+                variant="outlined"
+                hide-details
+                class="hive-deny-note"
+                data-testid="hive-deny-note"
+              />
+            </div>
+            <div v-else class="text-caption text-medium-emphasis mt-1">{{ $t('hive.viewer.approval.waiting') }}</div>
+          </template>
+          <div v-else-if="!resolvedIds.has(asText(e.event.id))" class="text-caption text-medium-emphasis mt-1">
+            {{ $t('hive.viewer.approval.unanswered') }}
+          </div>
+          <div v-if="answerError && answerErrorFor === asText(e.event.id)" class="text-caption text-error mt-1">
+            {{ answerError }}
+          </div>
+        </div>
+        <div
+          v-else-if="e.event.kind === 'approval_resolved'"
+          class="text-caption hive-approval-end"
+          data-testid="hive-approval-end"
+        >
+          {{ resolvedLine(e.event) }}
+        </div>
         <div v-else-if="e.event.kind === 'compaction'" class="text-caption text-medium-emphasis">
           {{ $t('hive.viewer.compacted') }}
         </div>
@@ -123,6 +187,58 @@ const nearBottom = ref(true)
 const draft = ref('')
 const asking = ref(false)
 const askError = ref<string | null>(null)
+// P1a — approvals.
+const answering = ref<string | null>(null)
+const answerError = ref<string | null>(null)
+const answerErrorFor = ref<string | null>(null)
+const denyNote = ref('')
+
+/** Approvals the transcript already records an end for. */
+const resolvedIds = computed(() => {
+  const ids = new Set<string>()
+  for (const e of viewer.events.value) {
+    if (e.event.kind === 'approval_resolved') ids.add(asText((e.event as { id?: unknown }).id))
+  }
+  return ids
+})
+
+function isOpen(id: unknown): boolean {
+  return viewer.pendingApprovals.value.includes(asText(id))
+}
+
+async function answer(id: string, decision: 'allow' | 'deny'): Promise<void> {
+  if (answering.value) return
+  answering.value = id
+  answerError.value = null
+  const note = decision === 'deny' ? denyNote.value.trim() || undefined : undefined
+  const res = await viewer.answer(id, decision, note)
+  answering.value = null
+  if (res.ok) {
+    denyNote.value = ''
+  } else {
+    answerError.value = res.error ?? t('hive.viewer.approval.failed')
+    answerErrorFor.value = id
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function resolvedLine(e: any): string {
+  const by = asText(e.by) || t('hive.viewer.someone')
+  switch (e.outcome) {
+    case 'allowed':
+      return `✅ ${t('hive.viewer.approval.allowed', { by })}`
+    case 'denied':
+      return e.message
+        ? `⛔ ${t('hive.viewer.approval.deniedWith', { by, message: asText(e.message) })}`
+        : `⛔ ${t('hive.viewer.approval.denied', { by })}`
+    case 'expired':
+      return `⌛ ${t('hive.viewer.approval.expired')}`
+    case 'withdrawn':
+      return `⏹ ${t('hive.viewer.approval.withdrawn')}`
+    default:
+      return t('hive.viewer.approval.other', { outcome: asText(e.outcome) })
+  }
+}
 
 const statusColor = computed(() => {
   switch (viewer.status.value) {
@@ -224,5 +340,16 @@ watch(
 .hive-turn {
   border-top: 1px dashed rgba(var(--v-theme-on-surface), 0.2);
   padding-top: 0.25rem;
+}
+.hive-approval {
+  border: 1px solid rgba(var(--v-theme-warning), 0.6);
+  background: rgba(var(--v-theme-warning), 0.06);
+}
+.hive-approval-end {
+  padding-left: 0.5rem;
+}
+.hive-deny-note {
+  min-width: 12rem;
+  flex: 1 1 12rem;
 }
 </style>

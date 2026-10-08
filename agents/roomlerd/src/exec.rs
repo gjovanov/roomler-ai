@@ -831,6 +831,15 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// comes from the same lookup that refuses uid 0. Gated to its one consumer.
 #[cfg(all(target_os = "linux", feature = "hive"))]
 pub(crate) use unix_priv::account_home;
+/// The recorder's, and FR-90's toolbelt, whose socket is handed to the
+/// session's account — gated to exactly those two.
+#[cfg(all(target_os = "linux", any(feature = "recording", feature = "hive")))]
+pub(crate) use unix_priv::account_ids;
+/// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
+/// too, so there is one way an account becomes ids (and uid 0 is refused).
+/// Gated to its one consumer, like the drop above.
+#[cfg(all(target_os = "linux", feature = "recording"))]
+pub(crate) use unix_priv::account_name;
 /// Unix privilege drop.
 ///
 /// Split into a "resolve everything first, then apply" shape for one specific
@@ -856,11 +865,6 @@ pub(crate) use unix_priv::account_home;
 /// the platform alone. Both callers are Linux-only, so no other lane sees it.
 #[cfg(target_os = "linux")]
 pub(crate) use unix_priv::drop_to_std;
-/// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
-/// too, so there is one way an account becomes ids (and uid 0 is refused).
-/// Gated to its one consumer, like the drop above.
-#[cfg(all(target_os = "linux", feature = "recording"))]
-pub(crate) use unix_priv::{account_ids, account_name};
 
 #[cfg(unix)]
 mod unix_priv {
@@ -973,7 +977,7 @@ mod unix_priv {
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
     /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
-    #[cfg(all(target_os = "linux", feature = "recording"))]
+    #[cfg(all(target_os = "linux", any(feature = "recording", feature = "hive")))]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
