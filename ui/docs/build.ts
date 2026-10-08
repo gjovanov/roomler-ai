@@ -40,6 +40,7 @@ import {
   BASE,
   BLOG_BASE,
   BLOG_DESCRIPTION,
+  BLOG_LANE,
   BLOG_TITLE,
   DOCS_FRONTMATTER_KEYS,
   INSTALL_PAGES,
@@ -49,6 +50,7 @@ import {
   MIN_OG_IMAGE_WIDTH,
   MIN_PAGES_PER_TAG_INDEX,
   MIN_POSTS_PER_TAG_INDEX,
+  OG_IMAGE_META,
   POSTS_PER_PAGE,
   SEARCH_INDEX_MAX_GZIP_BYTES,
   SECTIONS,
@@ -85,21 +87,63 @@ import {
   sortPosts,
   type Post,
 } from './theme/posts.ts'
-import { FEED_URL, fitTitle, type ShellNav } from './theme/shell.ts'
-import { atomFeed, feedHtml, newest, robotsTxt, sitemapIndex, urlset, type UrlEntry } from './theme/xml.ts'
+import { FEED_URL, fitTitle, type OgImage, type ShellNav } from './theme/shell.ts'
+import { atomFeed, feedHtml, robotsTxt, sitemapChildren, sitemapIndex, urlset, type UrlEntry } from './theme/xml.ts'
+
+// ── invocation (FR-91) ──────────────────────────────────────────────────
+// `bun docs/build.ts` builds the whole static site into ui/dist, exactly as it
+// always has. Three flags exist for the blog's own publishing lane, which puts
+// a post live without rebuilding the server image:
+//   --blog-only       every gate runs as usual, but ONLY the blog is written:
+//                     /blog/** (with its own /blog/assets/ and /blog/404.html),
+//                     the feed and /sitemap-blog.xml. Nothing under /docs/.
+//   --out <dir>       the output root instead of ui/dist.
+//   --blog-dir <dir>  posts from <dir>/posts and their assets from <dir>/assets
+//                     instead of ui/blog (a publisher's staging copy).
+
+interface Invocation {
+  blogOnly: boolean
+  out?: string
+  blogDir?: string
+}
+
+function parseInvocation(argv: string[]): Invocation {
+  const inv: Invocation = { blogOnly: false }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!
+    if (a === '--blog-only') inv.blogOnly = true
+    else if (a === '--out' || a === '--blog-dir') {
+      const v = argv[++i]
+      if (!v || v.startsWith('--')) {
+        console.error(`[docs] ${a} needs a directory`)
+        process.exit(2)
+      }
+      if (a === '--out') inv.out = v
+      else inv.blogDir = v
+    } else {
+      console.error(`[docs] unknown argument "${a}". Known: --blog-only, --out <dir>, --blog-dir <dir>`)
+      process.exit(2)
+    }
+  }
+  return inv
+}
+
+const INVOCATION = parseInvocation(process.argv.slice(2))
+const BLOG_ONLY = INVOCATION.blogOnly
 
 const DOCS_ROOT = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const UI_ROOT = resolve(DOCS_ROOT, '..')
 const REPO_ROOT = resolve(UI_ROOT, '..')
 const CONTENT_DIR = join(DOCS_ROOT, 'content')
 const THEME_DIR = join(DOCS_ROOT, 'theme')
-const DIST = join(UI_ROOT, 'dist')
+const DIST = INVOCATION.out ? resolve(INVOCATION.out) : join(UI_ROOT, 'dist')
 const OUT = join(DIST, 'docs')
 const OUT_ASSETS = join(OUT, 'assets')
 // FR-87 P4: the blog. Published posts only; drafts live in the private promo repo.
-const BLOG_DIR = join(UI_ROOT, 'blog')
+const BLOG_DIR = INVOCATION.blogDir ? resolve(INVOCATION.blogDir) : join(UI_ROOT, 'blog')
 const POSTS_DIR = join(BLOG_DIR, 'posts')
 const OUT_BLOG = join(DIST, 'blog')
+const OUT_BLOG_ASSETS = join(OUT_BLOG, 'assets')
 
 /**
  * Where a frontmatter `hero:` / inline image name is looked up, in order.
@@ -177,6 +221,17 @@ function slugToUrl(slug: string): string {
 // ── assets ──────────────────────────────────────────────────────────────
 
 const assets = new AssetEmitter(OUT_ASSETS, `${BASE}/assets`, LEGACY_UNHASHED_ASSETS)
+/**
+ * FR-91: the blog lane's own assets. A `--blog-only` tree is served by a
+ * separate server, so every file one of its pages loads must be in that tree:
+ * nothing it references may live under the image's `/docs/assets/`, whose
+ * hashed names change with every image. The full build never uses this
+ * emitter, so its output is what it always was.
+ */
+const blogAssets = new AssetEmitter(OUT_BLOG_ASSETS, `${BLOG_BASE}/assets`, false)
+/** Where a post's images are published: the shared docs assets in the full
+ *  build, the blog's own in a `--blog-only` build. */
+const postAssets = BLOG_ONLY ? blogAssets : assets
 
 function findAsset(name: string, where: string, paths: string[]): string | null {
   const bare = name.replace(/^.*\//, '')
@@ -193,7 +248,7 @@ function findAsset(name: string, where: string, paths: string[]): string | null 
 
 /** A hero or markdown image: found, size-checked, measured, and published
  *  under its hashed name. Null after reporting why it cannot be. */
-function publishImage(name: string, where: string, paths = ASSET_SEARCH_PATHS): ResolvedImage | null {
+function publishImage(name: string, where: string, paths = ASSET_SEARCH_PATHS, emitter = assets): ResolvedImage | null {
   const file = findAsset(name, where, paths)
   if (!file) return null
   const bytes = readFileSync(file)
@@ -205,7 +260,7 @@ function publishImage(name: string, where: string, paths = ASSET_SEARCH_PATHS): 
     return null
   }
   try {
-    return { url: assets.publishFile(file), ...imageSize(bytes) }
+    return { url: emitter.publishFile(file), ...imageSize(bytes) }
   } catch (err) {
     fail(`${where} — image "${name}": ${err instanceof Error ? err.message : String(err)}`)
     return null
@@ -450,17 +505,17 @@ function loadPost(file: string, now: Date): Post | null {
   if (!meta) return null
 
   const { html, headings } = renderMarkdown(md, body, rel, {
-    resolveImage: (src) => publishImage(src, rel, BLOG_ASSET_SEARCH_PATHS),
+    resolveImage: (src) => publishImage(src, rel, BLOG_ASSET_SEARCH_PATHS, postAssets),
     fail,
   })
-  const heroImage = meta.hero ? publishImage(meta.hero, rel, BLOG_ASSET_SEARCH_PATHS) : undefined
+  const heroImage = meta.hero ? publishImage(meta.hero, rel, BLOG_ASSET_SEARCH_PATHS, postAssets) : undefined
   if (heroImage === null) return null
 
   // The share image: `ogImage`, else the hero when it is raster. That one of
   // them exists and is raster is `readPostMeta`'s contract; its WIDTH needs
   // the file, so it is checked here.
   const ogName = meta.ogImage ?? meta.hero!
-  const og = ogName === meta.hero ? heroImage : publishImage(ogName, rel, BLOG_ASSET_SEARCH_PATHS)
+  const og = ogName === meta.hero ? heroImage : publishImage(ogName, rel, BLOG_ASSET_SEARCH_PATHS, postAssets)
   if (!og) return null
   if (og.width < MIN_OG_IMAGE_WIDTH) {
     fail(`${rel} — the share image "${ogName}" is ${og.width} px wide; Google and social platforms want at least ${MIN_OG_IMAGE_WIDTH}`)
@@ -661,7 +716,10 @@ function main(): void {
     ...renderable.map((p) => ({ id: idOf(p), url: p.url, html: p.html })),
     ...posts.map((p) => ({ id: p.sourceFile, url: p.url, html: p.html })),
   ]
-  for (const e of installPageErrors(rendered, INSTALL_PAGES)) fail(e)
+  // FR-91: a post that declares `installCopy` is an install page for this
+  // build. Without the key, a post that shows an install command still fails.
+  const installPages = [...INSTALL_PAGES, ...posts.filter((p) => p.installCopy).map((p) => p.url)]
+  for (const e of installPageErrors(rendered, installPages)) fail(e)
 
   if (errors.length) {
     console.error(`\n[docs] BUILD FAILED — ${errors.length} problem(s):\n`)
@@ -671,8 +729,19 @@ function main(): void {
   }
 
   // ── emit ──────────────────────────────────────────────────────────────
-  rmSync(OUT, { recursive: true, force: true })
-  mkdirSync(OUT_ASSETS, { recursive: true })
+  // FR-91: a blog-only build clears and writes `/blog/` alone. It never
+  // touches `/docs/`, the homepage, the link hub or the site-root files; their
+  // gates belong to the image build that publishes them.
+  if (BLOG_ONLY) {
+    if (!hasBlog) {
+      console.error(`\n[docs] BUILD FAILED — --blog-only, but ${relative(REPO_ROOT, POSTS_DIR) || POSTS_DIR} has no posts.\n`)
+      process.exit(1)
+    }
+    rmSync(OUT_BLOG, { recursive: true, force: true })
+  } else {
+    rmSync(OUT, { recursive: true, force: true })
+    mkdirSync(OUT_ASSETS, { recursive: true })
+  }
 
   // Search index. Built BEFORE the pages are rendered: its name is
   // content-hashed, and every page carries that name.
@@ -721,86 +790,98 @@ function main(): void {
     process.exit(1)
   }
 
+  // The theme's files go where the pages that load them will be served from:
+  // `/docs/assets/` in the full build, `/blog/assets/` in a blog-only one.
+  const emitter = BLOG_ONLY ? blogAssets : assets
   const siteAssets: SiteAssets = {
-    css: assets.publishFile(join(THEME_DIR, 'docs.css')),
-    js: assets.publishFile(join(THEME_DIR, 'docs.js')),
-    search: assets.publishFile(join(THEME_DIR, 'search.js')),
-    osPreference: assets.publishFile(join(THEME_DIR, 'os-preference.js')),
-    searchIndex: assets.publishBytes('search-index.json', indexJson),
+    css: emitter.publishFile(join(THEME_DIR, 'docs.css')),
+    js: emitter.publishFile(join(THEME_DIR, 'docs.js')),
+    search: emitter.publishFile(join(THEME_DIR, 'search.js')),
+    osPreference: emitter.publishFile(join(THEME_DIR, 'os-preference.js')),
+    searchIndex: emitter.publishBytes('search-index.json', indexJson),
     // Published only with a post, so a site without one ships the same bytes.
-    blogCss: hasBlog ? assets.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
-    homeCss: assets.publishFile(join(THEME_DIR, 'home.css')),
-    homeJs: assets.publishFile(join(THEME_DIR, 'home.js')),
+    blogCss: hasBlog ? emitter.publishFile(join(THEME_DIR, 'blog.css')) : undefined,
+    // The homepage is not part of the blog lane.
+    homeCss: BLOG_ONLY ? undefined : assets.publishFile(join(THEME_DIR, 'home.css')),
+    homeJs: BLOG_ONLY ? undefined : assets.publishFile(join(THEME_DIR, 'home.js')),
     // FR-88: the carry script, on every page, with the install pages written
     // in; the SPA's kill switch drops it.
     attribution: ATTRIBUTION_ENABLED
-      ? assets.publishBytes('attribution.js', carryScript(readFileSync(join(THEME_DIR, 'attribution.js'), 'utf8'), INSTALL_PAGES))
+      ? emitter.publishBytes('attribution.js', carryScript(readFileSync(join(THEME_DIR, 'attribution.js'), 'utf8'), installPages))
       : undefined,
   }
 
-  // Reading order for prev/next is the sidebar order: sections in declared
-  // order, pages within them in `order` then title.
-  const flow: DocPage[] = [
-    ...(home ? [home] : []),
-    ...nav.flatMap(({ section, pages }) => {
-      const idx = allPages.find((p) => p.url === `${BASE}/${section.dir}/`)
-      return idx ? [idx, ...pages] : pages
-    }),
-  ]
-
   const site: ShellNav = { current: 'docs', hasBlog }
-  const backlinks = docsBacklinks(posts, BASE)
-  for (const page of renderable) {
-    const i = flow.indexOf(page)
-    const html = renderPage(
-      {
-        nav,
-        page,
-        assets: siteAssets,
-        site,
-        onTheBlog: backlinks.get(page.url)?.map((p) => ({ url: p.url, title: p.title })),
-        prev: i > 0 ? flow[i - 1] : undefined,
-        next: i >= 0 && i < flow.length - 1 ? flow[i + 1] : undefined,
-      },
-      tagIndexed,
-    )
-    write(join(OUT, page.outFile), html)
-  }
-  write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets, site }, tagIndexed))
+  if (!BLOG_ONLY) {
+    // Reading order for prev/next is the sidebar order: sections in declared
+    // order, pages within them in `order` then title.
+    const flow: DocPage[] = [
+      ...(home ? [home] : []),
+      ...nav.flatMap(({ section, pages }) => {
+        const idx = allPages.find((p) => p.url === `${BASE}/${section.dir}/`)
+        return idx ? [idx, ...pages] : pages
+      }),
+    ]
 
-  // The static homepage (P6): nginx serves it at `/` to a request without the
-  // session cookie, and `/home/` itself is internal (files/nginx-pod.conf).
-  const homeHtml = renderHome({ assets: siteAssets, nav: { current: 'home', hasBlog }, hero: homeHero! })
-  const homeLinks = checkLinks(
-    [...linkPages, { id: 'the static homepage', url: '/', html: homeHtml, anchors: new Set([...homeHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
-    owns,
-  ).filter((e) => e.startsWith('the static homepage'))
-  if (homeLinks.length) {
-    console.error(`\n[docs] BUILD FAILED — the homepage links nowhere:\n${homeLinks.map((e) => `  • ${e}`).join('\n')}\n`)
-    process.exit(1)
-  }
-  write(join(DIST, 'home', 'index.html'), homeHtml)
+    const backlinks = docsBacklinks(posts, BASE)
+    for (const page of renderable) {
+      const i = flow.indexOf(page)
+      const html = renderPage(
+        {
+          nav,
+          page,
+          assets: siteAssets,
+          site,
+          onTheBlog: backlinks.get(page.url)?.map((p) => ({ url: p.url, title: p.title })),
+          prev: i > 0 ? flow[i - 1] : undefined,
+          next: i >= 0 && i < flow.length - 1 ? flow[i + 1] : undefined,
+        },
+        tagIndexed,
+      )
+      write(join(OUT, page.outFile), html)
+    }
+    write(join(OUT, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets, site }, tagIndexed))
 
-  // FR-88 P2: the link hub, which nginx serves at `/links/` and each channel's
-  // short path redirects to. Held to the homepage's gate: a hub whose links go
-  // nowhere is the one page a visitor from a profile sees.
-  const linksHtml = renderLinks({ assets: siteAssets, nav: { current: 'links', hasBlog } })
-  const hubLinks = checkLinks(
-    [...linkPages, { id: 'the link hub', url: LINKS_URL, html: linksHtml, anchors: new Set([...linksHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
-    owns,
-  ).filter((e) => e.startsWith('the link hub'))
-  if (hubLinks.length) {
-    console.error(`\n[docs] BUILD FAILED — the link hub links nowhere:\n${hubLinks.map((e) => `  • ${e}`).join('\n')}\n`)
-    process.exit(1)
+    // The static homepage (P6): nginx serves it at `/` to a request without the
+    // session cookie, and `/home/` itself is internal (files/nginx-pod.conf).
+    const homeHtml = renderHome({ assets: siteAssets, nav: { current: 'home', hasBlog }, hero: homeHero! })
+    const homeLinks = checkLinks(
+      [...linkPages, { id: 'the static homepage', url: '/', html: homeHtml, anchors: new Set([...homeHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
+      owns,
+    ).filter((e) => e.startsWith('the static homepage'))
+    if (homeLinks.length) {
+      console.error(`\n[docs] BUILD FAILED — the homepage links nowhere:\n${homeLinks.map((e) => `  • ${e}`).join('\n')}\n`)
+      process.exit(1)
+    }
+    write(join(DIST, 'home', 'index.html'), homeHtml)
+
+    // FR-88 P2: the link hub, which nginx serves at `/links/` and each channel's
+    // short path redirects to. Held to the homepage's gate: a hub whose links go
+    // nowhere is the one page a visitor from a profile sees.
+    const linksHtml = renderLinks({ assets: siteAssets, nav: { current: 'links', hasBlog } })
+    const hubLinks = checkLinks(
+      [...linkPages, { id: 'the link hub', url: LINKS_URL, html: linksHtml, anchors: new Set([...linksHtml.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!)) }],
+      owns,
+    ).filter((e) => e.startsWith('the link hub'))
+    if (hubLinks.length) {
+      console.error(`\n[docs] BUILD FAILED — the link hub links nowhere:\n${hubLinks.map((e) => `  • ${e}`).join('\n')}\n`)
+      process.exit(1)
+    }
+    write(join(DIST, 'links', 'index.html'), linksHtml)
   }
-  write(join(DIST, 'links', 'index.html'), linksHtml)
 
   // The blog. Cleared first, so a post removed since the last build does
-  // not survive as a stale page.
-  rmSync(OUT_BLOG, { recursive: true, force: true })
+  // not survive as a stale page (a blog-only build cleared it above).
+  if (!BLOG_ONLY) rmSync(OUT_BLOG, { recursive: true, force: true })
+  // FR-91: a blog-only tree names its own copy of the site's share card, so
+  // a listing page never points into the image's `/docs/assets/`. Absent in
+  // the full build, where the default is that same card's /docs/ URL.
+  const blogOgImage: OgImage | undefined = BLOG_ONLY
+    ? { url: `${SITE_ORIGIN}${BLOG_BASE}/assets/social-preview.png`, ...OG_IMAGE_META }
+    : undefined
   const blogUrls: UrlEntry[] = []
   if (hasBlog) {
-    const ctx = { assets: siteAssets, nav: { current: 'blog', hasBlog } as ShellNav, tagIndexed: blogTagIndexed }
+    const ctx = { assets: siteAssets, nav: { current: 'blog', hasBlog } as ShellNav, tagIndexed: blogTagIndexed, ogImage: blogOgImage }
     for (const [i, post] of posts.entries()) {
       const related = post.related.map((r) => pagesByUrl.get(r.endsWith('/') ? r : `${r}/`)!).filter(Boolean)
       write(join(OUT_BLOG, post.outFile), renderPost({ ...ctx, post, newer: posts[i - 1], older: posts[i + 1], related }))
@@ -842,8 +923,15 @@ function main(): void {
     for (const p of posts) blogUrls.push({ loc: `${SITE_ORIGIN}${p.url}`, lastmod: lastTouched(p).slice(0, 10) })
   }
 
+  // FR-91: the blog lane's server answers a missing `/blog/` URL with its own
+  // copy of the docs 404 (`error_page 404 /blog/404.html` in
+  // files/nginx-blog.conf); the image's `/docs/404.html` is not in its tree.
+  if (BLOG_ONLY) {
+    write(join(OUT_BLOG, '404.html'), renderPage({ nav, page: makeNotFoundPage(nav), assets: siteAssets, site, ogImage: blogOgImage }, tagIndexed))
+  }
+
   // Every hashed file planned above — theme, search index, heroes, images.
-  assets.flush()
+  emitter.flush()
 
   // ⚠️ The OG image must live INSIDE `ui/`. The Docker UI stage is
   // `COPY ui/ .` and nothing else, so a card read from the repo's
@@ -864,7 +952,18 @@ function main(): void {
     )
     process.exit(1)
   }
-  cpSync(social, join(OUT_ASSETS, 'social-preview.png'))
+  cpSync(social, join(BLOG_ONLY ? OUT_BLOG_ASSETS : OUT_ASSETS, 'social-preview.png'))
+
+  if (BLOG_ONLY) {
+    // The blog's urlset is the lane's; the index, the docs urlset and
+    // robots.txt stay the image's (they are served at the site root by it).
+    write(join(DIST, 'sitemap-blog.xml'), urlset(blogUrls))
+    console.log(
+      `[docs] blog only · ${posts.length} blog post${posts.length === 1 ? '' : 's'} · ${records.length} search records · ` +
+        `index ${(gz / 1024).toFixed(1)} KB gz · ${blogAssets.names().length} assets → ${DIST} · ${Date.now() - t0} ms`,
+    )
+    return
+  }
 
   // Site-root SEO files.
   //
@@ -882,13 +981,10 @@ function main(): void {
   // no single source file is its content.
   const docsUrls = [{ loc: `${SITE_ORIGIN}/` }, ...docsUrlEntries(allPages)]
   write(join(DIST, 'sitemap-docs.xml'), urlset(docsUrls))
-  const children: UrlEntry[] = [{ loc: `${SITE_ORIGIN}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]
   rmSync(join(DIST, 'sitemap-blog.xml'), { force: true })
-  if (hasBlog) {
-    write(join(DIST, 'sitemap-blog.xml'), urlset(blogUrls))
-    children.push({ loc: `${SITE_ORIGIN}/sitemap-blog.xml`, lastmod: newest(blogUrls) })
-  }
-  write(join(DIST, 'sitemap.xml'), sitemapIndex(children))
+  if (hasBlog) write(join(DIST, 'sitemap-blog.xml'), urlset(blogUrls))
+  // FR-91: with `BLOG_LANE` on, the blog child is listed undated and always.
+  write(join(DIST, 'sitemap.xml'), sitemapIndex(sitemapChildren(SITE_ORIGIN, docsUrls, blogUrls, { hasBlog, blogLane: BLOG_LANE })))
   write(join(DIST, 'robots.txt'), robotsTxt(SITE_ORIGIN))
 
   const ms = Date.now() - t0

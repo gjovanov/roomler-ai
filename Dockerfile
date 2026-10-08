@@ -131,6 +131,10 @@ COPY --from=builder /app/target/release/roomler-ai-api /usr/local/bin/
 COPY --from=builder /app/target/release/derp-relay /usr/local/bin/
 COPY --from=ui-builder /app/ui/dist /var/www/roomler-ai
 COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
+# FR-91: the security headers live in one file that the pod nginx and the blog
+# lane's server both include. Outside conf.d/ on purpose: nginx.conf includes
+# conf.d/*.conf at http level, and this file belongs at server level only.
+COPY files/security-headers.conf /etc/nginx/snippets/security-headers.conf
 # Operator-supplied GeoIP database for the user analytics. The directory
 # always exists (README + .gitignore keep the licensed .mmdb out of git);
 # the build host drops the file in before `docker build`. Absent ⇒ the
