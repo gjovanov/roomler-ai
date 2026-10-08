@@ -549,7 +549,7 @@ mod tests {
     /// same VNI and secret, and traffic flows to the new address.
     #[tokio::test]
     async fn a_member_rebinds_from_a_new_source_and_keeps_the_session() {
-        let (relay, _) = relay_with_session([[1; 32], [2; 32]]).await;
+        let (relay, stats) = relay_with_session([[1; 32], [2; 32]]).await;
         let sa = BindSecret::from_bytes([1; 32]);
         let sb = BindSecret::from_bytes([2; 32]);
         let a_old = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -566,6 +566,18 @@ mod tests {
         bind(&a_new, relay, VNI, GEN, &sa, Duration::from_secs(5))
             .await
             .expect("re-bind under a valid tag1 from a new source");
+        // #1859 — `bind` returns once the Answer is SENT, not once the relay
+        // has applied it, and loopback does not order datagrams across
+        // sockets: b's frame could reach the relay first and go to a's OLD
+        // source, a 5 s timeout about one run in five. Wait until the relay has
+        // counted the third bind (a_old, b, a_new) before sending.
+        let applied = timeout(Duration::from_secs(5), async {
+            while stats.snapshot().bound < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(applied.is_ok(), "the relay never applied the re-bind");
         let a = OrgRelayConn::new(a_new, relay, VNI, "r".into());
         let b = OrgRelayConn::new(b_sock, relay, VNI, "r".into());
         b.send_to(b"to the new address", b.synth_peer())
