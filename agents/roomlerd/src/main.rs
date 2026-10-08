@@ -1094,7 +1094,7 @@ async fn daemon_main() -> Result<()> {
     // embedded CLI it runs none of the setup below, and it EXITS rather than
     // returns: the runtime's shutdown would wait on a stdin read the harness
     // may hold open.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     if let Some(socket) = roomlerd::hive::relay_args() {
         let code = match roomlerd::hive::relay(&socket).await {
             Ok(()) => 0,
@@ -3554,7 +3554,7 @@ async fn run_cmd(
     // FR-90 — the agent-session supervisor, from this start's `hive_*` keys
     // (restart-required). Built with every gate closed too, so a start is
     // answered with the device's actual refusal rather than silence.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     {
         roomlerd::hive::init(&cfg);
         // FR-90 P1d-2 — every way the daemon stops signals this first (an
@@ -4257,7 +4257,7 @@ async fn run_cmd(
             // FR-90 P1d-2 — first, on every way out: a harness that ends from
             // here on went down with the daemon, and its session is resumed
             // by the next one instead of being ended.
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             roomlerd::hive::begin_shutdown();
             // FR-84 D3 — an accepted restart leaves through the graceful door
             // whatever the signalling loop did on its way out (an error, even
@@ -4294,7 +4294,7 @@ async fn run_cmd(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             roomlerd::hive::begin_shutdown();
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
@@ -4309,7 +4309,7 @@ async fn run_cmd(
         _ = terminate_signal(stop_event) => {
             // Under systemd the same stop reaches every harness a moment
             // after this (`KillMode=control-group`).
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             roomlerd::hive::begin_shutdown();
             tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
@@ -4342,6 +4342,14 @@ async fn run_cmd(
     // `_virtual_desktop` and by `exit_for_requested_restart`.
     #[cfg(target_os = "linux")]
     virtual_desktop::teardown();
+    // FR-90 P1h — the same for the agent sessions this daemon launched: each
+    // harness leads its own process group, which a service manager reaches
+    // only when it kills a whole cgroup (systemd's `KillMode=control-group`).
+    // launchd does not, and nothing does for an unsupervised daemon, so the
+    // daemon takes them down itself — after `begin_shutdown`, so each session
+    // is kept for the next daemon to resume. Bounded.
+    #[cfg(hive_host)]
+    roomlerd::hive::wind_down().await;
     // On graceful shutdown, mark the config so the next startup
     // doesn't count this run as a crash. Reload-then-save again to
     // avoid clobbering any concurrent writes (clean_run_task may
