@@ -224,6 +224,14 @@ const routes: RouteRecordRaw[] = [
             meta: { module: 'hive' },
           },
           {
+            // FR-90 P1e — the facts people keep for the org's agent
+            // sessions (core memory).
+            path: 'memory',
+            name: 'hive-memory',
+            component: () => import('@/views/hive/HiveMemoryView.vue'),
+            meta: { module: 'hive' },
+          },
+          {
             // S4 pivot — the overlay/tunnel network group, promoted out
             // of Admin (Tailscale-style IA). Sections stay child routes
             // (bookmarkable, back/forward-friendly), same pattern as
