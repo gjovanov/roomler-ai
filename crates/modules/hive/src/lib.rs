@@ -25,6 +25,11 @@
 //! which connections advertise `hive`. And on `chat` (`hive → chat`, P0d): a
 //! session is a `Secret` room bound to it, where the session posts a stub per
 //! turn ([`room`]).
+//!
+//! The one thing here a session's model reads is the [`brain`]'s core memory
+//! (P1e): facts people curate, rendered into a frozen snapshot per session
+//! and sent with its start — curated text, never a session's content, and
+//! shown to a session only where the device's own `hive_core_memory` allows.
 
 use std::sync::Arc;
 
@@ -45,6 +50,7 @@ use roomler_core::{
 pub mod access;
 pub mod acks;
 pub mod agent_socket;
+pub mod brain;
 pub mod dao;
 pub mod hooks;
 pub mod model;
@@ -76,6 +82,8 @@ pub struct HiveState {
     pub view_grants: Arc<view::ViewGrants>,
     /// The per-(user, session) view-open ceiling.
     pub view_limiter: Arc<RateLimiter>,
+    /// P1e — core memory: facts, budgets, revisions, session snapshots.
+    pub brain: Arc<brain::BrainDao>,
 }
 
 impl std::ops::Deref for HiveState {
@@ -110,6 +118,7 @@ impl Module for HiveState {
             start_limiter: Arc::new(RateLimiter::new()),
             view_grants: Arc::new(view::ViewGrants::new()),
             view_limiter: Arc::new(RateLimiter::new()),
+            brain: Arc::new(brain::BrainDao::new(db)),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -147,8 +156,13 @@ impl Module for HiveState {
                 "/{session_id}/participant/{user_id}",
                 put(participants::set).delete(participants::remove),
             );
+        // P1e — core memory, the facts people keep for the org's sessions.
+        let brain = Router::new()
+            .route("/", get(brain::list).post(brain::create))
+            .route("/{fact_id}", put(brain::edit).delete(brain::archive));
         Router::new()
             .nest("/tenant/{tenant_id}/hive/session", session)
+            .nest("/tenant/{tenant_id}/hive/brain", brain)
             .with_state(self.clone())
     }
 
@@ -202,6 +216,32 @@ impl Module for HiveState {
                     index(bson::doc! { "session_id": 1, "at": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
+            },
+            // P1e — a scope instance's facts, in the order they render.
+            IndexSet {
+                collection: brain::BrainFact::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index(bson::doc! {
+                    "tenant_id": 1, "scope": 1, "owner_id": 1, "status": 1, "created_at": 1
+                })],
+            },
+            // P1e — ONE spend counter per scope instance: the unique index is
+            // what turns a write that does not fit into a refusal.
+            IndexSet {
+                collection: brain::BrainBudget::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index_unique(
+                    bson::doc! { "tenant_id": 1, "scope": 1, "owner_id": 1 },
+                )],
+            },
+            // P1e — a session's snapshot, kept for its start's re-send.
+            IndexSet {
+                collection: brain::SessionMemory::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index_ttl(
+                    bson::doc! { "created_at": 1 },
+                    brain::SessionMemory::TTL_SECS,
+                )],
             },
         ]
     }

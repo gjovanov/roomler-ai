@@ -313,9 +313,17 @@ before it leaves the host.
 | GET | `…/hive/session/{sid}/participant` | FR-90 P1c — who takes part: `items[{user_id, display_name, role}]`, `role` `owner` · `driver` · `reader`, and `may_manage` (the owner alone). For anyone who may read the session |
 | PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400** |
 | DELETE | `…/hive/session/{sid}/participant/{user_id}` | The owner takes someone out: out of the room, driving nothing, their views ended (`removed`). Idempotent |
+| GET | `…/hive/brain?device_id=` | FR-90 P1e — core memory the caller may read: the org's facts, their own, and with `device_id` that device's (a live device of this org; 404 otherwise). `{brain_rev, facts[{id, scope, owner_id?, text, kind, version, created_by, created_at, updated_by, updated_at}], budgets[{scope, owner_id?, used, budget}]}` |
+| POST | `…/hive/brain` | `{scope: "org" \| "user" \| "device", owner_id?, text, kind?}` — keep a fact: one line, at most 500 characters, `kind` one of `preference` · `convention` (the default) · `path` · `gotcha` · `decision` · `warning`. Org needs `ADMINISTRATOR`; user is the caller's own (`owner_id` defaults to them), with `HIVE_RUN`; device names a live device of this org, with `MANAGE_AGENTS` (**403** otherwise). A fact that does not fit its scope's budget (org 3,000, user 1,500, device 800 characters) is **409** `{error: "over_budget", message, scope, used, budget, needed}`; nothing is evicted |
+| PUT | `…/hive/brain/{fact_id}` | `{text, kind?, version}` — change a fact at the version read: **409** `conflict` when it changed or was archived since, **409** `over_budget` when it grows past the budget. Someone else's user fact is a **404** |
+| DELETE | `…/hive/brain/{fact_id}` | Archive a fact: out of every future snapshot and out of its budget, kept as a record. `{archived}` — `false` when it was not active |
 
 Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
-output — see [the design](roomler-hive-design.md) §3.3.
+output — see [the design](roomler-hive-design.md) §3.3. Core memory is the one exception by design:
+curated facts, never a session's content. Every write is audited (`hive_audit`, `action: brain`),
+and every write bumps the org's `brain_rev`. A session pins it when it starts and gets a frozen
+snapshot of it (`rc:hive.memory`, sent just before `rc:hive.start` to a device that advertises
+`hive-memory`).
 
 **Reading a session (P0d-2) is not a route.** A member of the session's room sends
 `hive:view.open {session_id}` on the user WebSocket ([real-time.md](real-time.md)). The server

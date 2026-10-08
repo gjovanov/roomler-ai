@@ -45,7 +45,7 @@ use roomler_ai_remote_control::{
 use roomler_ai_services::dao::base::PaginationParams;
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::parse_tid};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::model::{
     AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionStatus, SessionView,
@@ -209,7 +209,7 @@ impl Audit {
             tenant_id: self.tenant_id,
             user_id: self.user_id,
             target_id: self.target_id,
-            device_id: self.device_id,
+            device_id: Some(self.device_id),
             session_id: self.session_id,
             action: self.action.to_string(),
             outcome: self.outcome.to_string(),
@@ -366,6 +366,30 @@ pub async fn start(
     let user = state.users.base.find_by_id(auth.user_id).await?;
     let now = DateTime::now();
     let sid = ObjectId::new();
+    // P1e — core memory, rendered now and frozen with the session: a fact
+    // written later reaches the next session, never this one. Only for a
+    // device that understands it; one that cannot be rendered is logged and
+    // the session runs without it — memory never blocks a start.
+    let memory = if state.fleet.rc_hub.agent_supports_hive_memory(device_id) == Some(true) {
+        match state
+            .brain
+            .snapshot(
+                tid,
+                sid,
+                (auth.user_id, &user.display_name),
+                (device_id, &device.name),
+            )
+            .await
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!(session = %sid, %e, "hive: core memory not rendered — the session starts without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // The session's room first (P0d): the record names it, and a session
     // nobody could see is no session.
     let room_id = room::open(&state, tid, sid, &title, auth.user_id).await?;
@@ -396,10 +420,22 @@ pub async fn start(
         created_at: now,
         updated_at: now,
         ended_at: None,
+        brain_rev: memory.as_ref().map(|m| m.brain_rev),
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.
     state.sessions.create(&session).await?;
+    // P1e — the snapshot, kept for a re-send of the start, then sent ahead
+    // of it on the same socket, so the device holds it when the launch comes.
+    if let Some(m) = &memory {
+        if let Err(e) = state.brain.store_snapshot(m).await {
+            warn!(session = %sid, %e, "hive: core memory not stored — a re-sent start goes without it");
+        }
+        let frame = memory_frame(m, 1);
+        if let Err(e) = state.fleet.rc_hub.push_hive_memory(device_id, tid, frame) {
+            debug!(session = %sid, %e, "hive: core memory not sent");
+        }
+    }
 
     // And the waiter before the push, for the same reason.
     let pending = state.start_acks.expect(sid, device_id);
@@ -450,6 +486,17 @@ pub async fn start(
         .await?
         .ok_or_else(|| ApiError::Internal("the session record vanished".into()))?;
     Ok(Json(StartResponse::from_record(&s)))
+}
+
+/// P1e — `rc:hive.memory` for a session's stored snapshot, at `fence`.
+pub(crate) fn memory_frame(m: &crate::brain::SessionMemory, fence: u64) -> ServerMsg {
+    ServerMsg::HiveMemory {
+        session_id: m.session_id,
+        fence,
+        brain_rev: u64::try_from(m.brain_rev).unwrap_or_default(),
+        claude_md: m.claude_md.clone(),
+        memory_md: m.memory_md.clone(),
+    }
 }
 
 /// `GET /api/tenant/{tenant_id}/hive/session` — the caller's sessions,
