@@ -76,13 +76,13 @@ property these gates exist for.
 | `forward_acl` | empty | SSH port-forward destinations. **Empty means nowhere** |
 | `ssh_activity_log` | off | Whether this machine reports what its SSH sessions did |
 | `ssh_exec_streaming` | on | Stream a one-shot command's output as it is produced, with no 1 MiB ceiling and no time limit; the command ends when the SSH channel does. Off restores the buffered path. Restart required |
-| `hive_enabled` | off | Run AI agent sessions here when an org member starts one (builds with the `hive` feature; Linux) |
+| `hive_enabled` | off | Run AI agent sessions here when an org member starts one (builds with the `hive` feature; Linux). A session survives a restart of the agent: it resumes with its history once the agent is back online, if this machine's settings still allow it then |
 | `hive_accounts` | empty | Which local account each member's sessions run as, `{"<user id or email>": "<account>"}`. **Empty means nobody**; never root |
 | `hive_roots` | empty | Folders sessions may run in, checked on the resolved path. **Empty means nowhere** |
 | `hive_max_sessions` | `4` | Sessions this machine runs at once |
 | `hive_api_key_helper` | unset | A command **the daemon** runs (as SYSTEM/root) to print the model API key. Sessions never see the key: each gets a token for this machine's loopback model sidecar, good only for that session's model calls while it runs here — not for anything else the key opens, such as files or batches. Unset means sessions have no model access |
 | `hive_api_workspace_id` | unset | For a model key that is not scoped to a workspace: the workspace its calls are made in. The sidecar sends it as `anthropic-workspace-id` with every call, alongside the key; sessions never set it. Leave unset for a workspace-scoped key |
-| `hive_update_wait_secs` | `1800` | How long an update waits for running agent turns before it restarts the daemon, which cuts every session's turn (0–7200 seconds; `0` never waits). It holds a server-pushed update too. While it waits, the log says so once a minute; once it goes ahead, new prompts are held until the restart |
+| `hive_update_wait_secs` | `1800` | How long an update waits for running agent turns before it restarts the daemon (0–7200 seconds; `0` never waits). The sessions resume after the restart, but a turn still running is cut. It holds a server-pushed update too. While it waits, the log says so once a minute; once it goes ahead, new prompts are held until the restart |
 
 :::danger These are the gates the server cannot write
 Every one of the settings above is device-owned. That is the property that makes
