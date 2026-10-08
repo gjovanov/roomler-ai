@@ -2484,3 +2484,640 @@ async fn a_member_who_leaves_the_org_drives_nothing() {
         "the OWNER's session runs on — only the member's own end"
     );
 }
+
+// ─── P1e — core memory, the brain's first layer ─────────────────────────
+
+/// What a build that understands core memory advertises.
+const TAKES_MEMORY: &[&str] = &["exec", "hive", "hive-memory"];
+
+fn brain_url(tid: &str, fact: Option<&str>) -> String {
+    match fact {
+        Some(f) => format!("/api/tenant/{tid}/hive/brain/{f}"),
+        None => format!("/api/tenant/{tid}/hive/brain"),
+    }
+}
+
+/// `POST …/hive/brain`.
+async fn keep(app: &TestApp, tid: &str, token: &str, body: Value) -> (u16, Value) {
+    status_and_json(
+        app.auth_post(&brain_url(tid, None), token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// `PUT …/hive/brain/{fact}`.
+async fn edit_fact(app: &TestApp, tid: &str, token: &str, fact: &str, body: Value) -> (u16, Value) {
+    status_and_json(
+        app.auth_put(&brain_url(tid, Some(fact)), token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// `DELETE …/hive/brain/{fact}`.
+async fn archive_fact(app: &TestApp, tid: &str, token: &str, fact: &str) -> (u16, Value) {
+    status_and_json(
+        app.auth_delete(&brain_url(tid, Some(fact)), token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// `GET …/hive/brain`, with a device's facts too when one is named.
+async fn brain(app: &TestApp, tid: &str, token: &str, device: Option<&str>) -> Value {
+    let url = match device {
+        Some(d) => format!("{}?device_id={d}", brain_url(tid, None)),
+        None => brain_url(tid, None),
+    };
+    let (code, body) = status_and_json(app.auth_get(&url, token).send().await.unwrap()).await;
+    assert_eq!(code, 200, "{body}");
+    body
+}
+
+fn budget_of(view: &Value, scope: &str) -> Value {
+    view["budgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["scope"] == scope)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {scope} budget in {view}"))
+}
+
+/// The brain's audit rows, by outcome.
+async fn brain_audit(app: &TestApp) -> Vec<Document> {
+    let mut cursor = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "action": "brain" })
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next().await {
+        rows.push(row.unwrap());
+    }
+    rows
+}
+
+/// AC8's second half: a write past its scope's budget fails VISIBLY — the
+/// numbers in the answer, nothing evicted — and the budget follows every
+/// add, edit and archive.
+#[tokio::test]
+async fn core_memory_keeps_facts_inside_their_budgets_and_says_so() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainbudget").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+
+    let first = "Deploys go through the release branch.";
+    let (code, f) = keep(&app, &tid, &admin, json!({"scope": "org", "text": first})).await;
+    assert_eq!(code, 200, "{f}");
+    assert_eq!(f["scope"], "org");
+    assert_eq!(f["kind"], "convention", "the default kind");
+    assert_eq!(f["version"], 1);
+    assert!(f.get("owner_id").is_none(), "an org fact has no owner: {f}");
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(view["brain_rev"], 1);
+    assert_eq!(budget_of(&view, "org")["used"], first.len());
+    assert_eq!(budget_of(&view, "org")["budget"], 3000);
+
+    let big = "x".repeat(500);
+    for _ in 0..5 {
+        let (code, b) = keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "text": big, "kind": "gotcha"}),
+        )
+        .await;
+        assert_eq!(code, 200, "{b}");
+    }
+    let used = first.len() as i64 + 2_500;
+    let (code, refused) = keep(&app, &tid, &admin, json!({"scope": "org", "text": big})).await;
+    assert_eq!(code, 409, "{refused}");
+    assert_eq!(refused["error"], "over_budget");
+    assert_eq!(refused["scope"], "org");
+    assert_eq!(refused["used"], used);
+    assert_eq!(refused["budget"], 3000);
+    assert_eq!(refused["needed"], 500);
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("archive a fact"),
+        "the refusal names the way out: {refused}"
+    );
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(
+        view["facts"].as_array().unwrap().len(),
+        6,
+        "nothing evicted"
+    );
+    assert_eq!(budget_of(&view, "org")["used"], used);
+    assert_eq!(view["brain_rev"], 6, "a refusal is no revision");
+
+    // One character more, so growing the first fact to the longest a fact
+    // may be no longer fits (without it, it would fit exactly).
+    let (code, z) = keep(&app, &tid, &admin, json!({"scope": "org", "text": "z"})).await;
+    assert_eq!(code, 200, "{z}");
+    let others = 2_501_i64;
+
+    // An edit that grows a fact past the budget is refused the same way;
+    // one that fits is the next version; a stale one is a conflict.
+    let fid = f["id"].as_str().unwrap().to_string();
+    let (code, e) = edit_fact(
+        &app,
+        &tid,
+        &admin,
+        &fid,
+        json!({"text": "y".repeat(500), "version": 1}),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (409, Some("over_budget")),
+        "{e}"
+    );
+    let shorter = "Deploys go through `release`.";
+    let (code, e) = edit_fact(
+        &app,
+        &tid,
+        &admin,
+        &fid,
+        json!({"text": shorter, "version": 1}),
+    )
+    .await;
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(e["version"], 2);
+    let (code, e) = edit_fact(
+        &app,
+        &tid,
+        &admin,
+        &fid,
+        json!({"text": "again", "version": 1}),
+    )
+    .await;
+    assert_eq!(
+        (code, e["error"].as_str()),
+        (409, Some("conflict")),
+        "stale: {e}"
+    );
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(
+        budget_of(&view, "org")["used"],
+        shorter.len() as i64 + others
+    );
+
+    // Archiving gives the room back.
+    let (code, a) = archive_fact(&app, &tid, &admin, &fid).await;
+    assert_eq!((code, a["archived"].as_bool()), (200, Some(true)), "{a}");
+    let (code, a) = archive_fact(&app, &tid, &admin, &fid).await;
+    assert_eq!(
+        (code, a["archived"].as_bool()),
+        (200, Some(false)),
+        "once: {a}"
+    );
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(budget_of(&view, "org")["used"], others);
+    assert!(
+        view["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["id"] != fid.as_str())
+    );
+    let fits = "w".repeat(499);
+    let (code, b) = keep(&app, &tid, &admin, json!({"scope": "org", "text": fits})).await;
+    assert_eq!(code, 200, "now it fits, exactly: {b}");
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(budget_of(&view, "org")["used"], 3_000);
+
+    let rows = brain_audit(&app).await;
+    let count = |outcome: &str| {
+        rows.iter()
+            .filter(|r| r.get_str("outcome").ok() == Some(outcome))
+            .count()
+    };
+    assert_eq!(
+        (
+            count("added"),
+            count("refused"),
+            count("edited"),
+            count("archived")
+        ),
+        (8, 2, 1, 1),
+        "every write audited: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| !r.contains_key("device_id")),
+        "an org fact concerns no device"
+    );
+}
+
+/// The org's memory is its administrators'; a person's is theirs, with
+/// `HIVE_RUN`; a device's is whoever manages devices'. Someone else's user
+/// memory answers like a bogus id.
+#[tokio::test]
+async fn who_keeps_which_memory() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainwho").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let member = seeded.member.access_token.clone();
+    let dev = device(&app, &seeded, "brain-who", TAKES_MEMORY).await;
+
+    assert_eq!(
+        keep(&app, &tid, &member, json!({"scope": "org", "text": "t"}))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        keep(&app, &tid, &member, json!({"scope": "user", "text": "t"}))
+            .await
+            .0,
+        403,
+        "no HIVE_RUN, no memory for agent sessions"
+    );
+    grant_hive_run_to_member(&app, &seeded).await;
+    let (code, mine) = keep(
+        &app,
+        &tid,
+        &member,
+        json!({"scope": "user", "text": "Small commits.", "kind": "preference"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{mine}");
+    assert_eq!(mine["owner_id"], seeded.member.id, "their own by default");
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &member,
+            json!({"scope": "user", "owner_id": seeded.admin.id, "text": "t"})
+        )
+        .await
+        .0,
+        403,
+        "never someone else's"
+    );
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &member,
+            json!({"scope": "device", "owner_id": dev.agent_id, "text": "t"})
+        )
+        .await
+        .0,
+        403
+    );
+    let (code, d) = keep(
+        &app,
+        &tid,
+        &admin,
+        json!({"scope": "device", "owner_id": dev.agent_id, "text": "Datasets in /data.", "kind": "path"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{d}");
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "device", "owner_id": ObjectId::new().to_hex(), "text": "t"})
+        )
+        .await
+        .0,
+        404,
+        "a device not in this org answers like a bogus id"
+    );
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "owner_id": seeded.admin.id, "text": "t"})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        keep(&app, &tid, &admin, json!({"scope": "project", "text": "t"}))
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        keep(&app, &tid, &admin, json!({"scope": "org", "text": " \n "}))
+            .await
+            .0,
+        400
+    );
+
+    let mid = mine["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        archive_fact(&app, &tid, &admin, &mid).await.0,
+        404,
+        "not even an admin's"
+    );
+    let view = brain(&app, &tid, &admin, None).await;
+    assert!(
+        view["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["id"] != mid.as_str())
+    );
+    let view = brain(&app, &tid, &member, Some(&dev.agent_id)).await;
+    let scopes: Vec<&str> = view["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["scope"].as_str().unwrap())
+        .collect();
+    assert_eq!(scopes, ["user", "device"], "{view}");
+    assert_eq!(budget_of(&view, "device")["budget"], 800);
+
+    let rows = brain_audit(&app).await;
+    let device_row = rows
+        .iter()
+        .find(|r| r.get_str("outcome").ok() == Some("added") && r.contains_key("device_id"))
+        .expect("a device fact's audit names the device");
+    assert_eq!(
+        device_row.get_object_id("device_id").unwrap().to_hex(),
+        dev.agent_id
+    );
+}
+
+/// Two writes racing for the last room: ONE conditional update decides, so
+/// exactly one fits.
+#[tokio::test]
+async fn two_writes_racing_for_the_last_room_cannot_both_fit() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainrace").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let big = "x".repeat(500);
+    for _ in 0..5 {
+        assert_eq!(
+            keep(&app, &tid, &admin, json!({"scope": "org", "text": big}))
+                .await
+                .0,
+            200
+        );
+    }
+    let (a, b) = tokio::join!(
+        keep(&app, &tid, &admin, json!({"scope": "org", "text": big})),
+        keep(&app, &tid, &admin, json!({"scope": "org", "text": big})),
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort_unstable();
+    assert_eq!(codes, [200, 409], "{a:?} {b:?}");
+    let view = brain(&app, &tid, &admin, None).await;
+    assert_eq!(budget_of(&view, "org")["used"], 3_000);
+    assert_eq!(view["facts"].as_array().unwrap().len(), 6);
+}
+
+/// AC8's first half, on the server: a session's core memory is rendered when
+/// it is created, reaches the device BEFORE its start, and is FROZEN — a fact
+/// written afterwards is in the next session's snapshot and never in this one.
+#[tokio::test]
+async fn a_sessions_core_memory_comes_before_its_start_and_is_frozen() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainsnap").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "brain-snap", TAKES_MEMORY).await;
+    for (scope, text, owner) in [
+        ("org", "ORG-FACT-ONE", None),
+        ("user", "MY-FACT", None),
+        ("device", "DEVICE-FACT", Some(dev.agent_id.clone())),
+    ] {
+        let mut body = json!({"scope": scope, "text": text});
+        if let Some(o) = owner {
+            body["owner_id"] = json!(o);
+        }
+        assert_eq!(keep(&app, &tid, &admin, body).await.0, 200);
+    }
+
+    let caller = start(&app, &tid, &admin, &dev.agent_id, "/srv");
+    let target = async {
+        // In order: the memory, THEN the start (a start first would be
+        // skipped by the first wait, and the second would time out).
+        let memory = read_until(&mut dev.ws, "rc:hive.memory")
+            .await
+            .expect("the memory");
+        let start = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("then the start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": start["session_id"], "fence": 1, "account": "dev"}),
+        )
+        .await;
+        (memory, start)
+    };
+    let (body, (memory, start_frame)) = tokio::join!(caller, target);
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(memory["session_id"], sid.as_str());
+    assert_eq!(start_frame["session_id"], sid.as_str());
+    assert_eq!(memory["fence"], 1);
+    assert_eq!(memory["brain_rev"], 3);
+    assert_eq!(body["session"]["brain_rev"], 3, "pinned on the record");
+    let claude_md = memory["claude_md"].as_str().unwrap();
+    assert!(
+        claude_md.contains("ORG-FACT-ONE") && claude_md.contains("MY-FACT"),
+        "{claude_md}"
+    );
+    assert!(!claude_md.contains("DEVICE-FACT"), "{claude_md}");
+    assert!(
+        memory["memory_md"]
+            .as_str()
+            .unwrap()
+            .contains("DEVICE-FACT"),
+        "{memory}"
+    );
+    for absent in ["prompt", "transcript", "account"] {
+        assert!(memory.get(absent).is_none(), "`{absent}` in {memory}");
+    }
+
+    // A fact written now is not this session's…
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "text": "ORG-FACT-TWO"})
+        )
+        .await
+        .0,
+        200
+    );
+    let stored = app
+        .db
+        .collection::<Document>("hive_session_memory")
+        .find_one(doc! { "_id": ObjectId::parse_str(&sid).unwrap() })
+        .await
+        .unwrap()
+        .expect("the snapshot is kept for a re-send");
+    assert!(
+        !stored
+            .get_str("claude_md")
+            .unwrap()
+            .contains("ORG-FACT-TWO"),
+        "frozen: {stored}"
+    );
+    assert_eq!(stored.get_i64("brain_rev").unwrap(), 3);
+
+    // …and is the next one's.
+    let caller = start(&app, &tid, &admin, &dev.agent_id, "/srv");
+    let target = async {
+        let memory = read_until(&mut dev.ws, "rc:hive.memory")
+            .await
+            .expect("the memory");
+        let start = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("then the start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": start["session_id"], "fence": 1, "account": "dev"}),
+        )
+        .await;
+        memory
+    };
+    let (_, next) = tokio::join!(caller, target);
+    assert_eq!(next["brain_rev"], 4);
+    let claude_md = next["claude_md"].as_str().unwrap();
+    assert!(
+        claude_md.contains("ORG-FACT-ONE") && claude_md.contains("ORG-FACT-TWO"),
+        "{claude_md}"
+    );
+}
+
+/// A device that does not advertise `hive-memory` is never sent core memory
+/// — and its session starts all the same.
+#[tokio::test]
+async fn a_device_without_hive_memory_gets_none_and_still_starts() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainnone").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "brain-none", RUNS_HIVE).await;
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "text": "ORG-FACT"})
+        )
+        .await
+        .0,
+        200
+    );
+
+    let caller = start(&app, &tid, &admin, &dev.agent_id, "/srv");
+    let target = async {
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout(Duration::from_millis(100), dev.ws.next()).await
+            else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let t = v["t"].as_str().unwrap_or_default().to_string();
+            let is_start = t == "rc:hive.start";
+            seen.push(t);
+            if is_start {
+                send(
+                    &mut dev.ws,
+                    json!({"t": "rc:hive.start_ack", "session_id": v["session_id"], "fence": 1, "account": "dev"}),
+                )
+                .await;
+                break;
+            }
+        }
+        seen
+    };
+    let (body, seen) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    assert!(seen.iter().any(|t| t == "rc:hive.start"), "{seen:?}");
+    assert!(!seen.iter().any(|t| t == "rc:hive.memory"), "{seen:?}");
+    assert!(body["session"].get("brain_rev").is_none(), "{body}");
+}
+
+/// A start re-sent on connect carries the SAME frozen snapshot ahead of it,
+/// even when the brain moved on in between.
+#[tokio::test]
+async fn a_re_sent_start_carries_the_same_snapshot_first() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("brainresend").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "brain-resend", TAKES_MEMORY).await;
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "text": "ORG-FACT-ONE"})
+        )
+        .await
+        .0,
+        200
+    );
+
+    let caller = start(&app, &tid, &admin, &dev.agent_id, "/srv");
+    let target = async { read_until(&mut dev.ws, "rc:hive.memory").await.unwrap() };
+    let (body, first) = tokio::join!(caller, target);
+    assert_eq!(
+        body["outcome"], "pending",
+        "the device stayed silent: {body}"
+    );
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        keep(
+            &app,
+            &tid,
+            &admin,
+            json!({"scope": "org", "text": "ORG-FACT-TWO"})
+        )
+        .await
+        .0,
+        200
+    );
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let mut ws = connect(&app, &dev.token, &dev.machine, TAKES_MEMORY).await;
+    let again = read_until(&mut ws, "rc:hive.memory")
+        .await
+        .expect("the memory again");
+    let start = read_until(&mut ws, "rc:hive.start")
+        .await
+        .expect("then the start again");
+    assert_eq!(again["session_id"], sid.as_str());
+    assert_eq!(start["session_id"], sid.as_str());
+    assert_eq!(again["claude_md"], first["claude_md"], "the same snapshot");
+    assert_eq!(again["brain_rev"], first["brain_rev"]);
+    assert!(
+        !again["claude_md"]
+            .as_str()
+            .unwrap()
+            .contains("ORG-FACT-TWO")
+    );
+}

@@ -55,6 +55,12 @@ pub mod hive_limits {
     /// FR-90 P1b — entries one `rc:hive.manifest` may carry. A device runs
     /// `hive_max_sessions`, a handful; a longer list is not a device's.
     pub const MAX_MANIFEST: usize = 256;
+    /// FR-90 P1e — the most one rendered core-memory document (`CLAUDE.md`,
+    /// the auto-memory `MEMORY.md`) may hold in `rc:hive.memory`. The
+    /// budgets — 4,500 characters into `CLAUDE.md`, 800 into `MEMORY.md` —
+    /// fit with room for headings even at four bytes a character; a larger
+    /// one is no snapshot this server rendered, and the device drops it.
+    pub const MAX_CORE_MEMORY_BYTES: usize = 32 * 1024;
 }
 
 /// FR-90 P1b — one session a device runs, in `rc:hive.manifest`: its id and
