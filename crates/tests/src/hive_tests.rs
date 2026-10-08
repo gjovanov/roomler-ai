@@ -2203,6 +2203,10 @@ async fn the_owner_names_who_reads_and_who_drives() {
         .expect("a reader may view");
     assert_eq!(grant["user_id"], mid);
     assert_eq!(grant["may_prompt"], false, "a reader does not prompt");
+    assert!(
+        grant.get("user_email").is_none(),
+        "a reader's address never leaves the server (P1c-2): {grant}"
+    );
     let gid = grant["grant_id"].as_str().unwrap().to_string();
     send(
         &mut dev.ws,
@@ -2260,6 +2264,10 @@ async fn the_owner_names_who_reads_and_who_drives() {
         .await
         .expect("reopened");
     assert_eq!(grant["may_prompt"], true, "a driver prompts a live session");
+    assert_eq!(
+        grant["user_email"], seeded.member.email,
+        "a driver's address goes with the grant, for the device's own hive_accounts"
+    );
     send(
         &mut dev.ws,
         json!({"t": "rc:hive.view.grant_ack", "grant_id": grant["grant_id"]}),

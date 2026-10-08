@@ -38,7 +38,9 @@
 //! and pushes `events`, `state` and `approvals`. A prompt is taken only from a
 //! grant that may prompt, and is attributed to its viewer in the transcript
 //! and on the turn's stub; that grant is a DRIVER's, and only a driver
-//! answers an approval (P1a).
+//! answers an approval (P1a). The server names drivers; this device decides
+//! itself whether one who did not start the session may act here as its
+//! account (P1c-2, [`Supervisor::drives_here`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -104,7 +106,15 @@ pub struct ViewGrant {
     pub session_id: ObjectId,
     pub user_id: ObjectId,
     pub user_name: String,
+    /// What the SERVER says; the device may take it away (P1c-2,
+    /// [`Supervisor::drives_here`]) and never adds it.
     pub may_prompt: bool,
+    /// A driver's address, for the device's own `hive_accounts` (P1c-2).
+    pub user_email: Option<String>,
+    /// Why THIS device does not let a viewer the server named a driver act
+    /// as the session's account — set by the device's gate, never by the
+    /// server; the viewer is told in `hello`.
+    pub driving_refused: Option<String>,
     pub ttl_secs: u32,
 }
 
@@ -312,6 +322,20 @@ impl Supervisor {
             );
             rx
         };
+        // P1c-2 — the server names drivers; THIS device decides whom it lets
+        // act as one of its accounts.
+        let mut grant = grant;
+        if grant.may_prompt
+            && let Err(why) =
+                self.drives_here(grant.session_id, grant.user_id, grant.user_email.as_deref())
+        {
+            info!(
+                grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
+                %why, "hive: a driver the server named may not drive here — read only"
+            );
+            grant.may_prompt = false;
+            grant.driving_refused = Some(why);
+        }
         info!(
             grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
             may_prompt = grant.may_prompt, "hive: view granted"
@@ -718,6 +742,9 @@ async fn on_request(
                 // A driver is who answers (design §4.5): the grant that may
                 // prompt is the one that may answer.
                 "may_answer": grant.may_prompt,
+                // P1c-2 — why this device keeps a driver the server named
+                // read only; null when it does not.
+                "driving_refused": grant.driving_refused,
                 "approvals": sup.pending_approvals(grant.session_id),
             }))
             .await

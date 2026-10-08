@@ -37,8 +37,8 @@ use roomler_ai_remote_control::hive::{
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::launch::{
-    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, toolbelt_mcp_config,
-    unix_base_env, user_input_line,
+    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, attributed_prompt,
+    toolbelt_mcp_config, unix_base_env, user_input_line,
 };
 use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_hive_node::{TranscriptEvent, approval_outcome};
@@ -144,6 +144,9 @@ enum Input {
 struct Live {
     fence: u64,
     account: String,
+    /// Who started it — the one driver this device knows without the server
+    /// saying so (P1c-2, [`Supervisor::drives_here`]).
+    starter: ObjectId,
     input: mpsc::Sender<Input>,
     /// Prompts admitted and not yet begun — shared with the session task,
     /// which holds them while a turn runs (see `Task::prompt`).
@@ -461,6 +464,45 @@ impl Supervisor {
         match self.launch(order, &account, &folder, store, sidecar) {
             Ok(()) => Answer::accepted(&account),
             Err((r, detail)) => Answer::refused(r, detail),
+        }
+    }
+
+    /// P1c-2 — the DEVICE's gate on a driver. The server names who drives a
+    /// session; THIS device decides whom it lets act as one of its accounts:
+    /// the session's starter (whom the start mapped), or someone its own
+    /// `hive_accounts` maps to the account the session runs as. The gate that
+    /// survives a wrong server, as `hive_accounts` already is for a start —
+    /// a driver answers approvals too, so driving IS running code here as
+    /// that account. `Err` says why, in words the viewer is shown.
+    ///
+    /// ⚠️ The starter is recognised by id, from the start order, never by the
+    /// map: a server older than P1c-2 sends no address, and an account mapped
+    /// by address must not lock the starter out of their own session.
+    pub(crate) fn drives_here(
+        &self,
+        session: ObjectId,
+        user: ObjectId,
+        email: Option<&str>,
+    ) -> Result<(), String> {
+        let (starter, account) = {
+            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            match live.get(&session) {
+                Some(l) => (l.starter, l.account.clone()),
+                None => return Err("the session does not run on this device now".to_string()),
+            }
+        };
+        if user == starter {
+            return Ok(());
+        }
+        match gates::account_for(&self.cfg, &user, email.unwrap_or("")) {
+            Ok(mapped) if mapped == account => Ok(()),
+            Ok(_) => Err(format!(
+                "this device's hive_accounts maps you to another account than {account}, \
+                 which the session runs as — here you may read it, not drive it"
+            )),
+            Err(_) => Err("this device's hive_accounts maps you to no account — \
+                 here you may read the session, not drive it"
+                .to_string()),
         }
     }
 
@@ -911,6 +953,7 @@ impl Supervisor {
             Live {
                 fence: order.fence,
                 account: account.to_string(),
+                starter: order.user_id,
                 input: input_tx,
                 waiting: Arc::clone(&waiting),
                 approvals: toolbelt.pending(),
@@ -1354,7 +1397,12 @@ impl Task<'_> {
             .waiting
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         let Some(w) = self.stdin.as_mut() else { return };
-        let mut out = user_input_line(&text);
+        // P1c-2 — the model is told who asked (`[Name] …`); the transcript
+        // below keeps the prompt as typed, its author beside it.
+        let mut out = user_input_line(&attributed_prompt(
+            author.as_ref().map(|a| a.name.as_str()),
+            &text,
+        ));
         out.push('\n');
         if w.write_all(out.as_bytes()).await.is_err() || w.flush().await.is_err() {
             warn!(session = %self.session, "hive: the harness stopped reading prompts");
@@ -1704,12 +1752,14 @@ pub(crate) mod tests {
     /// which is how a test keeps a turn running while it asks for an
     /// approval. Its `total_cost_usd`, like Claude Code's, is the PROCESS's
     /// running total: 0.25 more at every turn. Its argv is kept in the
-    /// folder's `.argv`, one argument a line.
+    /// folder's `.argv`, one argument a line, and every line it reads on
+    /// stdin in `.stdin` — what reached the harness (P1c-2).
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$PWD/.argv"
 first=1
 spent=0
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$PWD/.stdin"
   case "$line" in
     *crash*) echo "boom" >&2; exit 3 ;;
   esac
@@ -2681,6 +2731,109 @@ done
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P1c-2 — the model is told who asked: the harness reads `[Name] …`,
+    /// while the transcript keeps the prompt as typed, its author beside it.
+    /// A slash command reaches the harness as typed.
+    #[tokio::test]
+    async fn a_prompt_reaches_the_harness_labelled_with_its_driver() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        for text in ["say hello", "/compact"] {
+            r.sup.prompt(sid, dev(&r), text.into()).unwrap();
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        }
+        let read: Vec<String> = std::fs::read_to_string(r.root.path().join("work").join(".stdin"))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(read, ["[Dev] say hello", "/compact"]);
+        let typed: Vec<(Option<String>, String)> = r
+            .store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::UserMessage { author, text } => Some((author, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            typed,
+            [
+                (Some("Dev".to_string()), "say hello".to_string()),
+                (Some("Dev".to_string()), "/compact".to_string()),
+            ],
+            "the transcript keeps what was typed"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P1c-2 — the device's own gate on a driver: the session's starter, or
+    /// someone THIS device's `hive_accounts` maps to the account the session
+    /// runs as; by id or by a proven address, never by an unproven one.
+    #[tokio::test]
+    async fn a_driver_acts_here_only_as_an_account_this_device_maps_them_to() {
+        let same = ObjectId::new();
+        let elsewhere = ObjectId::new();
+        let mut r = rig_with(
+            true,
+            4,
+            |c| {
+                c.accounts.insert(same.to_hex(), "dev".into());
+                c.accounts.insert("carol@example.com".into(), "dev".into());
+                c.accounts
+                    .insert("mallory@unverified.invalid".into(), "dev".into());
+                c.accounts.insert(elsewhere.to_hex(), "ops".into());
+            },
+            |s| s,
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+
+        // The starter, by id from the start — even with no address at all,
+        // as from a server before P1c-2.
+        assert!(r.sup.drives_here(sid, r.user, None).is_ok());
+        assert!(r.sup.drives_here(sid, same, None).is_ok(), "mapped by id");
+        assert!(
+            r.sup
+                .drives_here(sid, ObjectId::new(), Some("Carol@Example.com"))
+                .is_ok(),
+            "mapped by a proven address"
+        );
+        assert!(
+            r.sup
+                .drives_here(sid, ObjectId::new(), Some("mallory@unverified.invalid"))
+                .is_err(),
+            "an unproven address maps nobody"
+        );
+        let other = r.sup.drives_here(sid, elsewhere, None).unwrap_err();
+        assert!(other.contains("another account than dev"), "{other}");
+        let nobody = r
+            .sup
+            .drives_here(sid, ObjectId::new(), Some("dave@example.com"))
+            .unwrap_err();
+        assert!(nobody.contains("no account"), "{nobody}");
+        assert!(
+            r.sup.drives_here(ObjectId::new(), r.user, None).is_err(),
+            "a session this device does not run"
+        );
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
     }
