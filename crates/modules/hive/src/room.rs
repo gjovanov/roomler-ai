@@ -13,13 +13,14 @@
 //! Everything here is best-effort past the room's creation: a note that fails
 //! to post is logged, never a reason to refuse a start or drop a report.
 
-use bson::oid::ObjectId;
-use roomler_ai_db::models::Binding;
-use roomler_ai_remote_control::hive::HiveTurnStatus;
+use bson::{DateTime, oid::ObjectId};
+use roomler_ai_db::models::{Binding, NotificationSource, NotificationType};
+use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveTurnStatus};
+use roomler_core::notify::{NotifyParams, PushTo};
 use tracing::{debug, warn};
 
 use crate::HiveState;
-use crate::model::{AgentSession, TurnStub};
+use crate::model::{AgentApproval, AgentSession, TurnStub};
 
 /// The module id rooms and stubs are bound to.
 const MODULE: &str = "hive";
@@ -77,7 +78,10 @@ pub(crate) async fn note(state: &HiveState, s: &AgentSession, text: String) {
 /// gets one note.
 pub(crate) async fn note_ended(state: &HiveState, sid: ObjectId) {
     match state.sessions.find(sid).await {
-        Ok(Some(s)) => note(state, &s, ended_note(&s)).await,
+        Ok(Some(s)) => {
+            note(state, &s, ended_note(&s)).await;
+            withdraw_approvals(state, &s).await;
+        }
         Ok(None) => {}
         Err(e) => warn!(session = %sid, %e, "hive: the ended session was not read for its note"),
     }
@@ -202,6 +206,289 @@ pub(crate) async fn turn_stub(state: &HiveState, s: &AgentSession, r: TurnReport
                 Err(e) => warn!(session = %sid, %e, "hive: a turn stub was not posted"),
             }
         }
+    }
+}
+
+/// FR-90 P1a-2 — what an `rc:hive.approval` says, as its stub uses it.
+pub(crate) struct ApprovalReport {
+    pub approval_id: String,
+    pub turn: Option<u32>,
+    pub status: Option<HiveApprovalStatus>,
+    pub answered_by: Option<ObjectId>,
+}
+
+/// Longest device approval id kept; the device's are 16 hex characters.
+const MAX_APPROVAL_ID: usize = 64;
+
+/// An approval opened or ended in `s`: its record in `agent_approvals` and
+/// its stub in the room — posted and pushed to the session's drivers when it
+/// opens, edited when it ends. Never which tool or what it would do: the
+/// frame cannot carry them (AC5).
+pub(crate) async fn approval(state: &HiveState, s: &AgentSession, r: ApprovalReport) {
+    let (Some(sid), Some(room)) = (s.id, s.room_id) else {
+        return;
+    };
+    let Some(status) = r.status else {
+        debug!(session = %sid, "hive: an approval status this build cannot name");
+        return;
+    };
+    let approval_id: String = r
+        .approval_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(MAX_APPROVAL_ID)
+        .collect();
+    if approval_id.is_empty() {
+        return;
+    }
+    // In P1 the starter is the one driver, and only a driver's answer is
+    // taken on the device — so a device naming anyone else is not believed,
+    // and no stub says that person allowed anything.
+    let answered_by = r.answered_by.filter(|by| {
+        let driver = *by == s.owner_id;
+        if !driver {
+            warn!(session = %sid, by = %by, "hive: an approval answered by someone who is not a driver — the claim is dropped");
+        }
+        driver
+    });
+    if status == HiveApprovalStatus::Open {
+        open_approval(state, s, sid, room, approval_id, r.turn).await;
+    } else {
+        end_approval(
+            state,
+            s,
+            sid,
+            room,
+            approval_id,
+            r.turn,
+            status,
+            answered_by,
+        )
+        .await;
+    }
+}
+
+async fn open_approval(
+    state: &HiveState,
+    s: &AgentSession,
+    sid: ObjectId,
+    room: ObjectId,
+    approval_id: String,
+    turn: Option<u32>,
+) {
+    // Nothing opens in a session that is over.
+    if s.status.is_terminal() {
+        return;
+    }
+    let record = AgentApproval {
+        id: None,
+        tenant_id: s.tenant_id,
+        session_id: sid,
+        device_id: s.location.device_id,
+        approval_id: approval_id.clone(),
+        turn,
+        status: HiveApprovalStatus::Open.as_str().to_string(),
+        message_id: None,
+        answered_by: None,
+        requested_at: DateTime::now(),
+        resolved_at: None,
+    };
+    match state.approvals.insert(&record).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return debug!(session = %sid, %approval_id, "hive: an approval already recorded");
+        }
+        Err(e) => return warn!(session = %sid, %e, "hive: an approval was not recorded"),
+    }
+    post_approval_stub(
+        state,
+        s,
+        sid,
+        room,
+        &approval_id,
+        approval_text(HiveApprovalStatus::Open, turn, None),
+    )
+    .await;
+    notify_approval(state, s, sid, room).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn end_approval(
+    state: &HiveState,
+    s: &AgentSession,
+    sid: ObjectId,
+    room: ObjectId,
+    approval_id: String,
+    turn: Option<u32>,
+    status: HiveApprovalStatus,
+    answered_by: Option<ObjectId>,
+) {
+    let name = match answered_by {
+        Some(uid) => state
+            .users
+            .find_display_names(&[uid])
+            .await
+            .ok()
+            .and_then(|m| m.get(&uid).cloned()),
+        None => None,
+    };
+    let ended = state
+        .approvals
+        .resolve(sid, &approval_id, status, answered_by)
+        .await;
+    match ended {
+        Ok(Some(a)) => {
+            let text = approval_text(status, a.turn.or(turn), name.as_deref());
+            match a.message_id {
+                Some(message_id) => edit_approval_stub(state, s, room, message_id, text).await,
+                None => post_approval_stub(state, s, sid, room, &approval_id, text).await,
+            }
+        }
+        // Not open: ended already (a replayed frame) — or its opening never
+        // arrived, and then it is recorded, and stubbed, as it ended.
+        Ok(None) => match state.approvals.find(sid, &approval_id).await {
+            Ok(Some(_)) => {}
+            // Never recorded, in a session that is over: it opened after the
+            // end, and was refused then — nothing to say now either.
+            Ok(None) if s.status.is_terminal() => {}
+            Ok(None) => {
+                let record = AgentApproval {
+                    id: None,
+                    tenant_id: s.tenant_id,
+                    session_id: sid,
+                    device_id: s.location.device_id,
+                    approval_id: approval_id.clone(),
+                    turn,
+                    status: status.as_str().to_string(),
+                    message_id: None,
+                    answered_by,
+                    requested_at: DateTime::now(),
+                    resolved_at: Some(DateTime::now()),
+                };
+                if let Ok(true) = state.approvals.insert(&record).await {
+                    let text = approval_text(status, turn, name.as_deref());
+                    post_approval_stub(state, s, sid, room, &approval_id, text).await;
+                }
+            }
+            Err(e) => warn!(session = %sid, %e, "hive: an approval was not read"),
+        },
+        Err(e) => warn!(session = %sid, %e, "hive: an approval's end was not recorded"),
+    }
+}
+
+async fn post_approval_stub(
+    state: &HiveState,
+    s: &AgentSession,
+    sid: ObjectId,
+    room: ObjectId,
+    approval_id: &str,
+    text: String,
+) {
+    let posted = state
+        .chat
+        .post_agent_message(
+            s.tenant_id,
+            room,
+            sid,
+            s.author_display(),
+            Binding::new(MODULE, format!("{}!{approval_id}", sid.to_hex())),
+            text,
+        )
+        .await;
+    match posted {
+        Ok(message_id) => {
+            if let Err(e) = state
+                .approvals
+                .set_message(sid, approval_id, message_id)
+                .await
+            {
+                warn!(session = %sid, %e, "hive: an approval's stub was not recorded");
+            }
+        }
+        Err(e) => warn!(session = %sid, %e, "hive: an approval's stub was not posted"),
+    }
+}
+
+async fn edit_approval_stub(
+    state: &HiveState,
+    s: &AgentSession,
+    room: ObjectId,
+    message_id: ObjectId,
+    text: String,
+) {
+    match state
+        .chat
+        .update_agent_message(s.tenant_id, room, message_id, text)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => debug!(message = %message_id, "hive: an approval's stub is gone"),
+        Err(e) => warn!(message = %message_id, %e, "hive: an approval's stub was not updated"),
+    }
+}
+
+/// The session is over: whatever it still had open is withdrawn, on the
+/// record and in the room. A device that ends a session withdraws its own
+/// first; this covers the ends it never heard of.
+pub(crate) async fn withdraw_approvals(state: &HiveState, s: &AgentSession) {
+    let (Some(sid), Some(room)) = (s.id, s.room_id) else {
+        return;
+    };
+    match state.approvals.withdraw_open(sid).await {
+        Ok(ended) => {
+            for a in ended {
+                if let Some(message_id) = a.message_id {
+                    let text = approval_text(HiveApprovalStatus::Withdrawn, a.turn, None);
+                    edit_approval_stub(state, s, room, message_id, text).await;
+                }
+            }
+        }
+        Err(e) => warn!(session = %sid, %e, "hive: a session's open approvals were not withdrawn"),
+    }
+}
+
+/// Tell the session's drivers — in P1 its starter — that it waits for them.
+/// By web push too, wherever they are: a desk with the app open is not a
+/// phone in a pocket. It names the session, never the call.
+async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, room: ObjectId) {
+    let params = NotifyParams {
+        tenant_id: s.tenant_id,
+        notification_type: NotificationType::ApprovalRequest,
+        title: format!("{} needs approval", s.author_display()),
+        body: format!("“{}” is waiting for a driver to answer.", s.title),
+        link: format!("/tenant/{}/room/{}", s.tenant_id.to_hex(), room.to_hex()),
+        source: NotificationSource {
+            entity_type: "agent_session".to_string(),
+            entity_id: sid,
+            actor_id: None,
+        },
+        ws_type_label: "approval_request",
+    };
+    roomler_core::notify::notify_users(&state.core, &params, &[s.owner_id], PushTo::Everyone).await;
+}
+
+/// The approval's stub as markdown: THAT the session waits for a driver, and
+/// how it ended. Only a word, a number and an escaped display name go in.
+pub(crate) fn approval_text(
+    status: HiveApprovalStatus,
+    turn: Option<u32>,
+    by: Option<&str>,
+) -> String {
+    let at = turn.map(|t| format!(" · turn {t}")).unwrap_or_default();
+    let by = by
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!(" by **{}**", md_escape(n)))
+        .unwrap_or_default();
+    match status {
+        HiveApprovalStatus::Open => {
+            format!("🔐 **Approval needed**{at} — open the session to answer")
+        }
+        HiveApprovalStatus::Allowed => format!("🔐 **Approval**{at} — ✅ allowed{by}"),
+        HiveApprovalStatus::Denied => format!("🔐 **Approval**{at} — ⛔ denied{by}"),
+        HiveApprovalStatus::Expired => {
+            format!("🔐 **Approval**{at} — ⌛ nobody answered in time")
+        }
+        HiveApprovalStatus::Withdrawn => format!("🔐 **Approval**{at} — ⏹ withdrawn"),
     }
 }
 
@@ -331,6 +618,34 @@ mod tests {
         assert!(!text.contains("![img]("), "{text}");
         assert!(!text.contains('\n'), "{text}");
         assert!(text.contains(r"\*\*bold\*\*"), "{text}");
+    }
+
+    /// An approval's stub says that the session waits and how it ended —
+    /// nothing else can go in: its inputs are a word, a turn number and a
+    /// display name, and the name is text, not markdown.
+    #[test]
+    fn an_approval_stub_says_that_it_waits_and_how_it_ended() {
+        use HiveApprovalStatus::*;
+        assert_eq!(
+            approval_text(Open, Some(2), None),
+            "🔐 **Approval needed** · turn 2 — open the session to answer"
+        );
+        assert_eq!(
+            approval_text(Allowed, Some(2), Some("Alice")),
+            "🔐 **Approval** · turn 2 — ✅ allowed by **Alice**"
+        );
+        assert_eq!(
+            approval_text(Denied, None, Some("[x](javascript:1)")),
+            r"🔐 **Approval** — ⛔ denied by **\[x\]\(javascript:1\)**"
+        );
+        assert_eq!(
+            approval_text(Expired, None, Some("ignored")),
+            "🔐 **Approval** — ⌛ nobody answered in time"
+        );
+        assert_eq!(
+            approval_text(Withdrawn, Some(1), None),
+            "🔐 **Approval** · turn 1 — ⏹ withdrawn"
+        );
     }
 
     #[test]

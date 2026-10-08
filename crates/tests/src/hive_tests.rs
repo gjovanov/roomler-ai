@@ -766,6 +766,183 @@ async fn a_session_is_a_secret_room_its_device_writes_stubs_into() {
 /// Gate 4 (`HIVE_RUN`) for a plain member: a 200 carrying the reason, no
 /// session created, nothing sent — and an audit row, because a refusal is
 /// the interesting decision.
+/// P1a-2 — an approval is ONE stub in the session's room, however often its
+/// opening is replayed, edited to say how it ended; who answered is named
+/// only when that is a driver; the driver is notified, naming the session
+/// and never the call; and a session that ends with one open withdraws it.
+#[tokio::test]
+async fn an_approval_is_one_stub_that_says_how_it_ended() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveappr").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-appr", RUNS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut dev).await;
+    let (_, s) = get_session(&app, &tid, &token, &sid).await;
+    let room = s["room_id"].as_str().expect("a room").to_string();
+    let approval = |id: &str, status: &str, by: Option<&str>| {
+        let mut f = json!({"t": "rc:hive.approval", "session_id": sid, "fence": 1,
+                           "approval_id": id, "turn": 1, "status": status});
+        if let Some(by) = by {
+            f["answered_by"] = json!(by);
+        }
+        f
+    };
+    let record = |id: &'static str| {
+        let db = app.db.clone();
+        async move {
+            db.collection::<Document>("agent_approvals")
+                .find_one(doc! { "approval_id": id })
+                .await
+                .unwrap()
+                .expect("on the record")
+        }
+    };
+    let content = |items: &[Value], reference: &str| -> Vec<String> {
+        items
+            .iter()
+            .filter(|m| bound_to(m, reference))
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Opened — and said again, as a reconnect replays it.
+    let a1 = format!("{sid}!a1");
+    send(&mut dev.ws, approval("a1", "open", None)).await;
+    send(&mut dev.ws, approval("a1", "open", None)).await;
+    wait_messages(&app, &tid, &token, &room, "the approval's stub", |items| {
+        items.iter().any(|m| bound_to(m, &a1))
+    })
+    .await;
+    // Past the replay: a stub for a frame it carried would be there by now.
+    send(&mut dev.ws, approval("amarker", "open", None)).await;
+    let items = wait_messages(&app, &tid, &token, &room, "the marker", |items| {
+        items.iter().any(|m| bound_to(m, &format!("{sid}!amarker")))
+    })
+    .await;
+    assert_eq!(
+        content(&items, &a1),
+        ["🔐 **Approval needed** · turn 1 — open the session to answer"],
+        "one stub, however often it is said"
+    );
+    assert_eq!(record("a1").await.get_str("status").unwrap(), "open");
+    let notes = app.db.collection::<Document>("notifications");
+    let n = notes
+        .find_one(doc! { "notification_type": "approval_request" })
+        .await
+        .unwrap()
+        .expect("the driver was notified");
+    assert_eq!(
+        n.get_object_id("user_id").unwrap().to_hex(),
+        seeded.admin.id
+    );
+    assert_eq!(
+        n.get_str("link").unwrap(),
+        format!("/tenant/{tid}/room/{room}")
+    );
+    assert!(
+        n.get_str("title").unwrap().ends_with("needs approval"),
+        "{n}"
+    );
+    assert_eq!(
+        notes
+            .count_documents(doc! { "notification_type": "approval_request" })
+            .await
+            .unwrap(),
+        2,
+        "one per approval (a1 and the marker), none for the replay"
+    );
+
+    // Answered by someone who is not a driver: the end is taken, the name
+    // is not — no stub says a person allowed what they could not have.
+    send(
+        &mut dev.ws,
+        approval("a1", "allowed", Some(&seeded.member.id)),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "a1 allowed", |items| {
+        content(items, &a1).iter().any(|c| c.contains("allowed"))
+    })
+    .await;
+    assert_eq!(
+        content(&items, &a1),
+        ["🔐 **Approval** · turn 1 — ✅ allowed"]
+    );
+    let r1 = record("a1").await;
+    assert_eq!(r1.get_str("status").unwrap(), "allowed");
+    assert!(r1.get("answered_by").is_none(), "{r1}");
+    assert!(r1.get("resolved_at").is_some(), "{r1}");
+
+    // Denied by the driver: named. An end said again changes nothing.
+    let a2 = format!("{sid}!a2");
+    send(&mut dev.ws, approval("a2", "open", None)).await;
+    send(
+        &mut dev.ws,
+        approval("a2", "denied", Some(&seeded.admin.id)),
+    )
+    .await;
+    send(&mut dev.ws, approval("a2", "expired", None)).await;
+    let items = wait_messages(&app, &tid, &token, &room, "a2 denied", |items| {
+        content(items, &a2).iter().any(|c| c.contains("denied by"))
+    })
+    .await;
+    let said = content(&items, &a2);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("🔐 **Approval** · turn 1 — ⛔ denied by **"),
+        "{said:?}"
+    );
+    let r2 = record("a2").await;
+    assert_eq!(
+        r2.get_str("status").unwrap(),
+        "denied",
+        "the late `expired` changed nothing"
+    );
+    assert_eq!(
+        r2.get_object_id("answered_by").unwrap().to_hex(),
+        seeded.admin.id
+    );
+
+    // An end whose opening never arrived is recorded, and stubbed, as it ended.
+    let a3 = format!("{sid}!a3");
+    send(&mut dev.ws, approval("a3", "expired", None)).await;
+    wait_messages(&app, &tid, &token, &room, "a3 expired", |items| {
+        content(items, &a3) == ["🔐 **Approval** · turn 1 — ⌛ nobody answered in time"]
+    })
+    .await;
+
+    // Still open when the session ends: withdrawn, on the record and in the
+    // room. (The marker is that one.)
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "ended",
+               "detail": "the harness exited"}),
+    )
+    .await;
+    let marker = format!("{sid}!amarker");
+    wait_messages(
+        &app,
+        &tid,
+        &token,
+        &room,
+        "the open one withdrawn",
+        |items| content(items, &marker) == ["🔐 **Approval** · turn 1 — ⏹ withdrawn"],
+    )
+    .await;
+    assert_eq!(
+        record("amarker").await.get_str("status").unwrap(),
+        "withdrawn"
+    );
+
+    // Nothing opens in a session that is over — nor ends there, unrecorded.
+    send(&mut dev.ws, approval("a4", "open", None)).await;
+    send(&mut dev.ws, approval("a5", "withdrawn", None)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, items) = room_messages(&app, &tid, &token, &room).await;
+    assert!(content(&items, &format!("{sid}!a4")).is_empty());
+    assert!(content(&items, &format!("{sid}!a5")).is_empty());
+}
+
 #[tokio::test]
 async fn a_member_without_hive_run_is_refused_and_audited() {
     let app = hive_app().await;

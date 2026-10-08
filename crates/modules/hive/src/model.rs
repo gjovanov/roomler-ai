@@ -229,6 +229,40 @@ impl From<&AgentSession> for SessionView {
     }
 }
 
+/// FR-90 P1a-2 — one approval in a session (`agent_approvals`): that a tool
+/// call waited for a driver, how it ended, who answered and when — and never
+/// which tool or what it would do, which the device's frame cannot carry.
+///
+/// ⚠️ `answered_by` is the DEVICE's report of the grant whose answer it took:
+/// the answer travels over the viewer peer, so no server decision stands
+/// behind it the way one stands behind `hive_audit` (the `ssh_activity` rule).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentApproval {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub session_id: ObjectId,
+    pub device_id: ObjectId,
+    /// The device's id for it — unique within the session.
+    pub approval_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    /// [`roomler_ai_remote_control::hive::HiveApprovalStatus::as_str`].
+    pub status: String,
+    /// The stub in the session's room, edited when it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<ObjectId>,
+    pub requested_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime>,
+}
+
+impl AgentApproval {
+    pub const COLLECTION: &'static str = "agent_approvals";
+}
+
 /// One server decision about a session (`hive_audit`): every start ATTEMPT,
 /// refused or sent, and every stop. Written by the server from its own
 /// decision — authoritative, unlike what a device reports. 90-day TTL.
