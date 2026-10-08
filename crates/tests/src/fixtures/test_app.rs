@@ -490,6 +490,8 @@ fn test_settings() -> Settings {
         // cost therefore reads "not priced" rather than 0.00.
         relay_costs: roomler_ai_config::RelayCosts::default(),
         modules: roomler_ai_config::ModulesSettings::default(),
+        // FR-90 P1g — every organization, as a deployment without `[hive]`.
+        hive: roomler_ai_config::HiveSettings::default(),
         // #1731 — inert here: the stall watchdog is armed by the binary's
         // `main`, which these in-process servers never run.
         diag: roomler_ai_config::DiagSettings::default(),
