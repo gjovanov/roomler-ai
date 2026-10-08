@@ -435,6 +435,15 @@ pub struct AgentConfig {
     /// the device's updates back. `None` = 1800 (30 min); `0` = never wait.
     #[serde(default)]
     pub hive_update_wait_secs: Option<u32>,
+    /// FR-90 P1e — show the org's core memory to the sessions on this device:
+    /// the snapshot the server sends with a start, written into the session's
+    /// own config dir as `CLAUDE.md` and the auto-memory `MEMORY.md`. Default
+    /// OFF, and never pushable: Claude Code reads `CLAUDE.md` as the user's
+    /// own OVERRIDING instructions, so this is the one place server-authored
+    /// text reaches a session's model, and whether it may is the device
+    /// owner's call alone.
+    #[serde(default)]
+    pub hive_core_memory: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2209,6 +2218,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_api_key_helper: None,
         hive_api_workspace_id: None,
         hive_update_wait_secs: None,
+        hive_core_memory: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

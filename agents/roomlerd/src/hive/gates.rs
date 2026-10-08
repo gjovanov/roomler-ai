@@ -34,6 +34,8 @@ pub struct HiveConfig {
     pub api_workspace_id: Option<String>,
     /// P1d-1 (AC7) — how long an update waits for running turns.
     pub update_wait: std::time::Duration,
+    /// P1e — whether a session here is shown the org's core memory.
+    pub core_memory: bool,
 }
 
 impl HiveConfig {
@@ -53,6 +55,7 @@ impl HiveConfig {
                 .hive_update_wait_secs
                 .map(|s| std::time::Duration::from_secs(u64::from(s)))
                 .unwrap_or(DEFAULT_UPDATE_WAIT),
+            core_memory: cfg.hive_core_memory,
         }
     }
 
@@ -67,6 +70,7 @@ impl HiveConfig {
             api_key_helper: None,
             api_workspace_id: None,
             update_wait: DEFAULT_UPDATE_WAIT,
+            core_memory: false,
         }
     }
 }
