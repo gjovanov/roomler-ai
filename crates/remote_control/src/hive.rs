@@ -231,6 +231,65 @@ impl HiveTurnStatus {
     }
 }
 
+/// FR-90 P1a-2 — how an approval stands, as its device reports it in
+/// `rc:hive.approval`. Which tool and what it would do are not here and
+/// cannot be: they travel device-to-browser over the viewer peer.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveApprovalStatus {
+    /// Waiting for a driver.
+    Open,
+    /// A driver allowed it.
+    Allowed,
+    /// A driver denied it.
+    Denied,
+    /// Nobody answered in time.
+    Expired,
+    /// The harness let go, or the session ended, first.
+    Withdrawn,
+}
+
+impl HiveApprovalStatus {
+    /// The spelling on the wire and in `agent_approvals`. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveApprovalStatus; 5] = [
+        Self::Open,
+        Self::Allowed,
+        Self::Denied,
+        Self::Expired,
+        Self::Withdrawn,
+    ];
+}
+
+/// Lenient decoder for `rc:hive.approval`'s `status`, as
+/// [`turn_status_lenient`]: a word this build cannot name is `None`, and the
+/// stub keeps what it said.
+pub(crate) fn approval_status_lenient<'de, D>(de: D) -> Result<Option<HiveApprovalStatus>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(None);
+    };
+    Ok(HiveApprovalStatus::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .ok())
+}
+
 /// Lenient decoder for `rc:hive.start_ack`'s `refused`. Only an absent or
 /// `null` value means accepted; anything present that is not a known word —
 /// an unknown string, a number, an object from some future shape — is
@@ -315,6 +374,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIRE LOCK — the approval words, and a newer device's word is unnamed,
+    /// never an error that drops the frame.
+    #[test]
+    fn approval_status_words_are_locked_and_unknown_ones_are_unnamed() {
+        let words: Vec<&str> = HiveApprovalStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(words, ["open", "allowed", "denied", "expired", "withdrawn"]);
+        for s in HiveApprovalStatus::ALL {
+            assert_eq!(
+                serde_json::to_value(s).unwrap(),
+                serde_json::Value::String(s.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct A {
+            #[serde(default, deserialize_with = "approval_status_lenient")]
+            status: Option<HiveApprovalStatus>,
+        }
+        let a = |j: &str| serde_json::from_str::<A>(j).unwrap().status;
+        assert_eq!(a(r#"{"status":"open"}"#), Some(HiveApprovalStatus::Open));
+        assert_eq!(a(r#"{"status":"delegated"}"#), None);
+        assert_eq!(a(r#"{"status":1}"#), None);
+        assert_eq!(a("{}"), None);
+    }
 
     #[test]
     fn turn_status_words_are_locked_and_unknown_ones_are_unnamed() {

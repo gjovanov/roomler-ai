@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! `agent_sessions` and `hive_audit`.
+//! `agent_sessions`, `agent_approvals` and `hive_audit`.
 //!
 //! Every transition a DEVICE drives is a compare-and-set on three things the
 //! frame cannot choose: the session's device (the authenticated socket's, not
@@ -11,10 +11,12 @@
 
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_remote_control::hive::HiveRunState;
-use roomler_ai_services::dao::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveRunState};
+use roomler_ai_services::dao::base::{
+    BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams,
+};
 
-use crate::model::{AgentSession, HiveAuditEvent, SessionStatus};
+use crate::model::{AgentApproval, AgentSession, HiveAuditEvent, SessionStatus};
 
 fn statuses(set: &[SessionStatus]) -> Bson {
     let words: Vec<Bson> = set.iter().map(|s| Bson::from(s.as_str())).collect();
@@ -351,6 +353,111 @@ impl AgentSessionDao {
                 Some(doc! { "created_at": 1 }),
             )
             .await
+    }
+}
+
+/// FR-90 P1a-2 — `agent_approvals`. One record per (session, approval id),
+/// held to that by a unique index, so a replayed frame makes no second
+/// record and no second stub.
+pub struct AgentApprovalDao {
+    pub base: BaseDao<AgentApproval>,
+}
+
+impl AgentApprovalDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, AgentApproval::COLLECTION),
+        }
+    }
+
+    /// Record an approval. `false` when it is recorded already — a replayed
+    /// frame, or an end that arrived before its opening.
+    pub async fn insert(&self, a: &AgentApproval) -> DaoResult<bool> {
+        match self.base.insert_one(a).await {
+            Ok(_) => Ok(true),
+            Err(DaoError::DuplicateKey(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn find(
+        &self,
+        session_id: ObjectId,
+        approval_id: &str,
+    ) -> DaoResult<Option<AgentApproval>> {
+        self.base
+            .find_one(doc! { "session_id": session_id, "approval_id": approval_id })
+            .await
+    }
+
+    /// The stub the approval's room message is.
+    pub async fn set_message(
+        &self,
+        session_id: ObjectId,
+        approval_id: &str,
+        message_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "session_id": session_id, "approval_id": approval_id },
+                doc! { "$set": { "message_id": message_id } },
+            )
+            .await
+    }
+
+    /// End an OPEN approval: the record as it now stands, or `None` when it
+    /// is not open — ended already (a replay), or never recorded here.
+    pub async fn resolve(
+        &self,
+        session_id: ObjectId,
+        approval_id: &str,
+        status: HiveApprovalStatus,
+        answered_by: Option<ObjectId>,
+    ) -> DaoResult<Option<AgentApproval>> {
+        let mut set = doc! { "status": status.as_str(), "resolved_at": DateTime::now() };
+        if let Some(by) = answered_by {
+            set.insert("answered_by", by);
+        }
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "session_id": session_id,
+                    "approval_id": approval_id,
+                    "status": HiveApprovalStatus::Open.as_str(),
+                },
+                doc! { "$set": set },
+            )
+            .return_document(mongodb::options::ReturnDocument::After)
+            .await?)
+    }
+
+    /// The session is over: every approval still open in it is withdrawn,
+    /// and returned so their stubs can say so.
+    pub async fn withdraw_open(&self, session_id: ObjectId) -> DaoResult<Vec<AgentApproval>> {
+        let open = self
+            .base
+            .find_many(
+                doc! { "session_id": session_id, "status": HiveApprovalStatus::Open.as_str() },
+                None,
+            )
+            .await?;
+        let mut ended = Vec::new();
+        for a in open {
+            if let Some(a) = self
+                .resolve(
+                    session_id,
+                    &a.approval_id,
+                    HiveApprovalStatus::Withdrawn,
+                    None,
+                )
+                .await?
+            {
+                ended.push(a);
+            }
+        }
+        Ok(ended)
     }
 }
 
