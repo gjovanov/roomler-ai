@@ -70,6 +70,11 @@ impl SessionStatus {
         Self::Running,
         Self::AwaitingApproval,
     ];
+
+    /// The live statuses only a device's own run-state report sets — its
+    /// word that it launched the session, as good as its answer to the
+    /// start: the state usually lands first, and the answer can be lost.
+    pub const LAUNCHED: [SessionStatus; 3] = [Self::Idle, Self::Running, Self::AwaitingApproval];
 }
 
 /// The harness a session runs, and its own id for the conversation.
@@ -131,7 +136,8 @@ pub struct AgentSession {
     pub refusal: Option<String>,
     /// How it ended (or will end, once `stopping` completes): `stopped`,
     /// `exited`, `member_removed`, `device_removed`, `tenant_archived`,
-    /// `never_answered`, `device_unsupported`.
+    /// `never_answered`, `device_unsupported`, `not_on_device` (P1b: its
+    /// device reconnected without it — a restart, or an end it never told).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     /// The device's last few words about it (a refusal's or an exit's), capped.
@@ -337,6 +343,19 @@ mod tests {
         for s in SessionStatus::REPORTABLE {
             assert!(SessionStatus::LIVE.contains(&s));
         }
+    }
+
+    /// What counts as the device's word that it launched a session: only
+    /// statuses its own report sets. Never `starting` (the server's, when it
+    /// sends the start) nor `stopping` (the server's, when it orders the
+    /// stop) — a start the device has said nothing about stays reconcile's.
+    #[test]
+    fn launched_is_what_only_a_device_report_sets() {
+        for s in SessionStatus::LAUNCHED {
+            assert!(SessionStatus::REPORTABLE.contains(&s), "{s:?}");
+        }
+        assert!(!SessionStatus::LAUNCHED.contains(&SessionStatus::Starting));
+        assert!(!SessionStatus::LAUNCHED.contains(&SessionStatus::Stopping));
     }
 
     #[test]
