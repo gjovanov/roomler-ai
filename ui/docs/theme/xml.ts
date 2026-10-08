@@ -51,6 +51,27 @@ export function newest(urls: UrlEntry[]): string | undefined {
   return urls.reduce<string | undefined>((max, u) => (u.lastmod && (!max || u.lastmod > max) ? u.lastmod : max), undefined)
 }
 
+/**
+ * The index's children: the docs urlset always, dated by its newest page; the
+ * blog's once a post exists, dated the same way.
+ *
+ * FR-91: with the blog lane on (`BLOG_LANE`), the blog is published without
+ * this image, so the image cannot know the blog's newest date. The child is
+ * then listed unconditionally and WITHOUT a `lastmod`: a stale date teaches a
+ * crawler to distrust the field, and none is honest.
+ */
+export function sitemapChildren(
+  origin: string,
+  docsUrls: UrlEntry[],
+  blogUrls: UrlEntry[],
+  opts: { hasBlog: boolean; blogLane: boolean },
+): UrlEntry[] {
+  const children: UrlEntry[] = [{ loc: `${origin}/sitemap-docs.xml`, lastmod: newest(docsUrls) }]
+  if (opts.blogLane) children.push({ loc: `${origin}/sitemap-blog.xml` })
+  else if (opts.hasBlog) children.push({ loc: `${origin}/sitemap-blog.xml`, lastmod: newest(blogUrls) })
+  return children
+}
+
 export function sitemapIndex(children: UrlEntry[]): string {
   return `${HEADER}<sitemapindex xmlns="${NS}">\n${children.map((c) => entry('sitemap', c)).join('\n')}\n</sitemapindex>\n`
 }

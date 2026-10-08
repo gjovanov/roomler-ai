@@ -109,6 +109,16 @@ describe('readPostMeta', () => {
     // draft, description, author, tags, the bare date, the missing share image
     expect(meta(['title: T', 'draft: true', 'date: 2026-09-25']).errors.length).toBeGreaterThanOrEqual(6)
   })
+
+  // FR-91: a post that shows an install command declares it, and joins
+  // INSTALL_PAGES for the build (build.ts). Absent means no; only a real
+  // boolean is accepted, so `installCopy: yes` cannot silently mean false.
+  it('reads `installCopy` as a boolean, false when absent', () => {
+    expect(meta(VALID).meta?.installCopy).toBe(false)
+    expect(meta([...VALID, 'installCopy: true']).meta?.installCopy).toBe(true)
+    expect(meta([...VALID, 'installCopy: false']).meta?.installCopy).toBe(false)
+    expect(meta([...VALID, 'installCopy: "yes"']).errors.join('\n')).toMatch(/`installCopy` must be `true` or `false`/)
+  })
 })
 
 describe('ordering and paging', () => {
