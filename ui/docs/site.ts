@@ -159,7 +159,20 @@ export const BLOG_FRONTMATTER_KEYS = [
   'related',
   'syndication',
   'canonical',
+  // FR-91: a post that shows an install command joins `INSTALL_PAGES` for the
+  // build, so the install-page gate passes and the carry reaches its links.
+  'installCopy',
 ] as const
+
+/**
+ * FR-91 (#1880): the blog is served by its own lane (`roomler-blog`, routed at
+ * the edge for `/blog/` and `/sitemap-blog.xml`) and published without this
+ * image. While true, the sitemap index lists `sitemap-blog.xml` WITHOUT a
+ * `lastmod` and whether or not this image has posts: the image cannot know the
+ * blog's newest date, and a stale one is worse than none. Flip it in the same
+ * change that routes the edge, never before.
+ */
+export const BLOG_LANE = false
 
 export interface Author {
   name: string

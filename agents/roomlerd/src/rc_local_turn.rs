@@ -839,9 +839,12 @@ mod tests {
     }
 
     /// The browser can only reach these ports if the SPA's `Content-Security-
-    /// Policy` permits them, and that policy lives in `files/nginx-pod.conf` —
-    /// a different language, a different crate, a different deploy artifact.
-    /// This test is the only thing joining them.
+    /// Policy` permits them, and that policy lives in `files/security-headers.conf`,
+    /// which `files/nginx-pod.conf` includes (FR-91 moved it there so the blog
+    /// lane's server sends the same headers) — a different language, a different
+    /// crate, a different deploy artifact. This test is the only thing joining
+    /// them, so it also checks the include and the Dockerfile line that installs
+    /// the file: a CSP in a file nginx never reads protects nothing.
     ///
     /// It matters because the failure is SILENT. A `fetch` to a CSP-blocked
     /// port does not error visibly: the probe just fails, the viewer falls
@@ -855,15 +858,31 @@ mod tests {
     /// source of truth outward.
     #[test]
     fn the_deployed_csp_permits_every_port_we_serve_on() {
-        let conf_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../files/nginx-pod.conf");
-        let conf = std::fs::read_to_string(&conf_path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", conf_path.display()));
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            let p = repo.join(rel);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        };
+        const INSTALLED_AT: &str = "/etc/nginx/snippets/security-headers.conf";
+        assert!(
+            read("files/nginx-pod.conf")
+                .lines()
+                .any(|l| l.trim() == format!("include {INSTALLED_AT};")),
+            "files/nginx-pod.conf no longer includes {INSTALLED_AT}: the CSP below \
+             would not be served at all"
+        );
+        assert!(
+            read("Dockerfile")
+                .lines()
+                .any(|l| l.trim() == format!("COPY files/security-headers.conf {INSTALLED_AT}")),
+            "the Dockerfile no longer installs files/security-headers.conf at {INSTALLED_AT}"
+        );
+        let conf = read("files/security-headers.conf");
 
         let csp = conf
             .lines()
             .find(|l| l.contains("add_header Content-Security-Policy"))
-            .expect("no Content-Security-Policy in files/nginx-pod.conf");
+            .expect("no Content-Security-Policy in files/security-headers.conf");
         let connect_src = csp
             .split_once("connect-src ")
             .and_then(|(_, rest)| rest.split_once(';'))
@@ -875,7 +894,7 @@ mod tests {
                 let want = format!("http://{host}:{port}");
                 assert!(
                     connect_src.split_whitespace().any(|s| s == want),
-                    "files/nginx-pod.conf connect-src is missing {want}. The loopback \
+                    "files/security-headers.conf connect-src is missing {want}. The loopback \
                      probe to that port would be blocked — silently — and the viewer \
                      would fall back to the far coturn. Change the CSP together with \
                      PROBE_PORT / PROBE_PORT_FALLBACK / PROBE_PORT_BAND here and \
