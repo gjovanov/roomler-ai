@@ -86,6 +86,46 @@ interface ListResponse {
   total_pages: number
 }
 
+/**
+ * P1e — core memory: facts people keep for the org's agent sessions. A session
+ * gets a frozen snapshot of them when it starts — and only on a device whose
+ * owner turned on `hive_core_memory`, because Claude Code reads them as the
+ * user's own instructions.
+ */
+export type BrainScope = 'org' | 'user' | 'device'
+export type FactKind = 'preference' | 'convention' | 'path' | 'gotcha' | 'decision' | 'warning'
+export const FACT_KINDS: FactKind[] = ['convention', 'preference', 'path', 'gotcha', 'decision', 'warning']
+/** The longest fact, in characters (`MAX_FACT_CHARS`, `brain.rs`). */
+export const MAX_FACT_CHARS = 500
+
+/** `FactView` — `crates/modules/hive/src/brain.rs`. */
+export interface BrainFact {
+  id: string
+  scope: BrainScope
+  owner_id?: string
+  text: string
+  kind: FactKind
+  version: number
+  created_by: string
+  created_at: string
+  updated_by: string
+  updated_at: string
+}
+
+export interface BrainBudget {
+  scope: BrainScope
+  owner_id?: string
+  used: number
+  budget: number
+}
+
+/** `GET …/hive/brain`. */
+export interface BrainView {
+  brain_rev: number
+  facts: BrainFact[]
+  budgets: BrainBudget[]
+}
+
 /** A session that can still change. */
 export function isLive(s: Pick<HiveSession, 'status'>): boolean {
   return !['ended', 'refused', 'lost'].includes(s.status)
@@ -169,6 +209,41 @@ export const useHiveStore = defineStore('hive', () => {
     return api.delete<HiveParticipants>(`${base(tenantId)}/${sessionId}/participant/${userId}`)
   }
 
+  function brainBase(tenantId: string): string {
+    return `/tenant/${tenantId}/hive/brain`
+  }
+
+  /** P1e — the facts the caller may read: the org's, their own, and with
+   *  `deviceId` that device's, each scope with its budget. */
+  function fetchBrain(tenantId: string, deviceId?: string): Promise<BrainView> {
+    const q = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''
+    return api.get<BrainView>(`${brainBase(tenantId)}${q}`)
+  }
+
+  /** P1e — keep a fact. A 403 (who may write which scope) and a 409
+   *  (`over_budget`, with the numbers) come back in the server's words. */
+  function keepFact(
+    tenantId: string,
+    body: { scope: BrainScope; owner_id?: string; text: string; kind?: FactKind },
+  ): Promise<BrainFact> {
+    return api.post<BrainFact>(brainBase(tenantId), body)
+  }
+
+  /** P1e — change a fact at the version read; a stale one is a 409. */
+  function editFact(
+    tenantId: string,
+    factId: string,
+    body: { text: string; kind?: FactKind; version: number },
+  ): Promise<BrainFact> {
+    return api.put<BrainFact>(`${brainBase(tenantId)}/${factId}`, body)
+  }
+
+  /** P1e — archive a fact: out of every future session's memory and out of
+   *  its budget, kept as a record. */
+  function archiveFact(tenantId: string, factId: string): Promise<{ archived: boolean }> {
+    return api.delete<{ archived: boolean }>(`${brainBase(tenantId)}/${factId}`)
+  }
+
   return {
     sessions,
     total,
@@ -182,5 +257,9 @@ export const useHiveStore = defineStore('hive', () => {
     fetchParticipants,
     setParticipant,
     removeParticipant,
+    fetchBrain,
+    keepFact,
+    editFact,
+    archiveFact,
   }
 })
