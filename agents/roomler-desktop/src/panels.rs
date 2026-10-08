@@ -305,6 +305,13 @@ fn show<R: Runtime>(
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(focus)
+        // #1852 — a panel shown WITHOUT focus must take its first click, or
+        // that click is spent making the window key and the button under it
+        // does nothing: on macOS the banner's Disconnect and Stop recording
+        // needed two clicks (FR-27 P9 field check, 2026-10-08). The consent
+        // prompt is shown focused and keeps the default — a click-through on
+        // an approval surface is not wanted. macOS only; a no-op elsewhere.
+        .accept_first_mouse(takes_first_click(focus))
         .visible(false)
         .build();
     let win = match built {
@@ -324,6 +331,16 @@ fn show<R: Runtime>(
     exclude_from_capture(&win);
     position_top_centre(&win, w);
     present(&win, focus);
+}
+
+/// Whether a panel's webview takes the FIRST click while its window is
+/// inactive (`accept_first_mouse`). Derived from how the panel is shown, so
+/// the two cannot drift apart: a panel brought up without focus — the session
+/// banner, `show_without_focus` — is one the person clicks INTO from another
+/// app, so its first click must act; a panel brought up focused — the consent
+/// prompt — already has the keyboard and must not be click-through (#1852).
+fn takes_first_click(focus: bool) -> bool {
+    !focus
 }
 
 /// Show a panel. A focused one takes the keyboard (a question needs it); an
@@ -640,5 +657,20 @@ mod tests {
         }
         let mut hidden = Reveal::default();
         assert_eq!(hidden.step(t0, None, false), Some(true));
+    }
+
+    #[test]
+    fn the_unfocused_banner_takes_its_first_click_the_consent_prompt_does_not() {
+        // #1852: an inactive macOS window spends its first click on activation
+        // unless its view accepts first mouse. The banner is shown without
+        // focus (P9), so Disconnect / Stop recording must fire on ONE click;
+        // the consent prompt is shown focused and must not be click-through.
+        // The builder itself needs a live Tauri runtime, so the decision is
+        // what this pins.
+        assert!(takes_first_click(false), "the banner (shown without focus)");
+        assert!(
+            !takes_first_click(true),
+            "the consent prompt (shown focused)"
+        );
     }
 }
