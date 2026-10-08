@@ -14,15 +14,16 @@
 //! taking chat's state as its `Module::Deps` (FR-69 rule 5: only a live object
 //! is a dependency; `remote`'s Hub is one, a DAO is not).
 //!
-//! None of this is reachable from a route: no user can bind a room or post as
-//! an agent.
+//! None of this is reachable from a chat route: no user can bind a room or
+//! post as an agent. Who belongs in a bound room is the binding module's
+//! decision (P1c), made behind that module's own gated routes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bson::oid::ObjectId;
 use roomler_ai_db::models::{Binding, Message, Room};
-use roomler_ai_services::dao::base::DaoResult;
+use roomler_ai_services::dao::base::{DaoError, DaoResult};
 use roomler_ai_services::dao::message::MessageDao;
 use roomler_ai_services::dao::room::RoomDao;
 use roomler_core::Core;
@@ -58,6 +59,63 @@ impl BoundChat {
         self.rooms
             .create_bound(tenant_id, name, path, owner, binding)
             .await
+    }
+
+    /// FR-90 P1c — make `user` a member of a room bound to `module`. The
+    /// module owns who belongs in ITS rooms: chat's own `join` refuses a
+    /// Secret room to anyone not already in it, and no route reaches this.
+    /// `Ok(false)` = already a member (the unique `{room_id, user_id}` index
+    /// decides, so two concurrent adds make one row). A room that is not
+    /// bound to `module` is [`DaoError::NotFound`]: a module manages its own
+    /// rooms and nobody else's.
+    pub async fn add_bound_member(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        module: &str,
+        user: ObjectId,
+    ) -> DaoResult<bool> {
+        self.bound_room(tenant_id, room_id, module).await?;
+        match self.rooms.join(tenant_id, room_id, user).await {
+            Ok(_) => Ok(true),
+            Err(DaoError::DuplicateKey(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// FR-90 P1c — remove `user` from a room bound to `module`. `Ok(false)`
+    /// = they were not a member.
+    pub async fn remove_bound_member(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        module: &str,
+        user: ObjectId,
+    ) -> DaoResult<bool> {
+        self.bound_room(tenant_id, room_id, module).await?;
+        self.rooms.leave(tenant_id, room_id, user).await
+    }
+
+    /// FR-90 P1c — who is in `room_id`, as user ids.
+    pub async fn member_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
+        self.rooms.find_member_user_ids(room_id).await
+    }
+
+    async fn bound_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        module: &str,
+    ) -> DaoResult<Room> {
+        match self
+            .rooms
+            .base
+            .find_one(bson::doc! { "_id": room_id, "tenant_id": tenant_id })
+            .await?
+        {
+            Some(room) if room.binding.as_ref().is_some_and(|b| b.module == module) => Ok(room),
+            _ => Err(DaoError::NotFound),
+        }
     }
 
     /// Whether `user` is a member of `room_id` in `tenant_id` — chat's own

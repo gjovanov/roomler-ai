@@ -33,7 +33,9 @@
 //!
 //! The grant ends when the browser closes it or its socket closes, when the
 //! device reports it closed, when a renewal finds the viewer no longer in the
-//! room, or when the viewer's membership, the device or the org is removed.
+//! room, when the viewer's membership, the device or the org is removed, or
+//! when the session's owner changes the viewer's part in it (P1c,
+//! `role_changed`: a grant carries `may_prompt` as minted).
 
 use std::time::Duration;
 
@@ -48,7 +50,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::HiveState;
-use crate::model::AgentSession;
+use crate::access::may_read;
 use crate::routes::Audit;
 
 /// Open grants one browser connection may hold.
@@ -176,21 +178,6 @@ fn tell_device_closed(state: &HiveState, grant_id: ObjectId, g: &Grant, reason: 
     }
 }
 
-/// May `user` read `s`? In the org, and in the session's room — chat's own
-/// membership rule. A session from before rooms (P0b/P0c) is its owner's.
-async fn may_read(state: &HiveState, s: &AgentSession, user: ObjectId) -> bool {
-    if !matches!(state.tenants.is_member(s.tenant_id, user).await, Ok(true)) {
-        return false;
-    }
-    match s.room_id {
-        Some(room) => matches!(
-            state.chat.is_member(s.tenant_id, room, user).await,
-            Ok(true)
-        ),
-        None => s.owner_id == user,
-    }
-}
-
 async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
     let reference: Option<String> = data
         .get("ref")
@@ -228,6 +215,7 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
     let audit = |outcome: &'static str, reason: Option<&'static str>| Audit {
         tenant_id: s.tenant_id,
         user_id: user,
+        target_id: None,
         device_id,
         session_id: Some(sid),
         action: "view",
@@ -260,8 +248,11 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         return refuse(reason, None).await;
     }
 
-    // The starter drives a live session; everyone else reads (P1: drivers).
-    let may_prompt = user == s.owner_id && !s.status.is_terminal();
+    // A driver prompts a live session; every other member reads (P1c). The
+    // grant keeps what it was minted with: a change of who drives ends the
+    // person's grants (`end_session_grants_of`), and the view they reopen is
+    // minted afresh.
+    let may_prompt = crate::access::drives_now(&s, user);
     let user_name = match state.users.base.find_by_id(user).await {
         Ok(u) => u.display_name,
         Err(_) => String::new(),
@@ -591,6 +582,31 @@ pub(crate) async fn end_grants(
     let gone = state
         .view_grants
         .take_where(|g| !which(&g.tenant_id, &g.user_id, &g.device_id));
+    end_taken(state, gone, reason, tell_device).await
+}
+
+/// P1c — end `user`'s grants on ONE session: their part in it changed (they
+/// now drive it, or no longer do, or left it), so what a grant says about
+/// whether they may prompt is stale. A browser told `role_changed` opens the
+/// view again and is granted afresh.
+pub(crate) async fn end_session_grants_of(
+    state: &HiveState,
+    session_id: ObjectId,
+    user: ObjectId,
+    reason: &str,
+) -> usize {
+    let gone = state
+        .view_grants
+        .take_where(|g| !(g.session_id == session_id && g.user_id == user));
+    end_taken(state, gone, reason, true).await
+}
+
+async fn end_taken(
+    state: &HiveState,
+    gone: Vec<(ObjectId, Grant)>,
+    reason: &str,
+    tell_device: bool,
+) -> usize {
     let n = gone.len();
     for (grant_id, g) in gone {
         if tell_device {

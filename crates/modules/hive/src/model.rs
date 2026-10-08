@@ -110,8 +110,15 @@ pub struct AgentSession {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
-    /// Who started it — in P0 the only person who may see or stop it.
+    /// Who started it: always a driver, and the only one who may stop it or
+    /// change who else drives.
     pub owner_id: ObjectId,
+    /// FR-90 P1c — who ELSE drives it (may prompt it and answer its
+    /// approvals): members of its room the owner named, each holding
+    /// `HIVE_RUN` when named. The owner is never listed. At most
+    /// [`MAX_DRIVERS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drivers: Vec<ObjectId>,
     pub title: String,
     /// The session's room (P0d): `Secret`, bound to this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,8 +156,25 @@ pub struct AgentSession {
     pub ended_at: Option<DateTime>,
 }
 
+/// The most drivers a session may have besides its owner.
+pub const MAX_DRIVERS: usize = 16;
+
 impl AgentSession {
     pub const COLLECTION: &'static str = "agent_sessions";
+
+    /// Whether `user` drives this session: its owner, or one the owner named.
+    /// ⚠️ Not enough to prompt it: the session must be live and the driver
+    /// still able to read it ([`crate::access`]).
+    pub fn drives(&self, user: ObjectId) -> bool {
+        user == self.owner_id || self.drivers.contains(&user)
+    }
+
+    /// Everyone who drives it: the owner first.
+    pub fn all_drivers(&self) -> Vec<ObjectId> {
+        let mut all = vec![self.owner_id];
+        all.extend(self.drivers.iter().filter(|d| **d != self.owner_id));
+        all
+    }
 
     /// How the session authors its room's messages.
     pub fn author_display(&self) -> String {
@@ -177,6 +201,8 @@ pub struct TurnStub {
 pub struct SessionView {
     pub id: String,
     pub owner_id: String,
+    /// P1c — who else drives it (hex), the owner not listed.
+    pub drivers: Vec<String>,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
@@ -214,6 +240,7 @@ impl From<&AgentSession> for SessionView {
         Self {
             id: s.id.map(|i| i.to_hex()).unwrap_or_default(),
             owner_id: s.owner_id.to_hex(),
+            drivers: s.drivers.iter().map(|d| d.to_hex()).collect(),
             title: s.title.clone(),
             room_id: s.room_id.map(|r| r.to_hex()),
             harness: s.harness.id.clone(),
@@ -270,8 +297,9 @@ impl AgentApproval {
 }
 
 /// One server decision about a session (`hive_audit`): every start ATTEMPT,
-/// refused or sent, and every stop. Written by the server from its own
-/// decision — authoritative, unlike what a device reports. 90-day TTL.
+/// refused or sent, every stop, every view, and every change of who takes
+/// part. Written by the server from its own decision — authoritative, unlike
+/// what a device reports. 90-day TTL.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HiveAuditEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -279,13 +307,18 @@ pub struct HiveAuditEvent {
     pub tenant_id: ObjectId,
     /// The acting user.
     pub user_id: ObjectId,
+    /// Whom the action was about, when not the actor: the participant added,
+    /// changed or removed (P1c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<ObjectId>,
     pub device_id: ObjectId,
     /// Absent for a start refused before a session was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
-    /// `start` | `stop`.
+    /// `start` | `stop` | `view` | `participant`.
     pub action: String,
-    /// `sent` | `queued` | `refused`.
+    /// `sent` | `queued` | `refused`; for `participant`, the role given —
+    /// `driver` | `reader` — or `removed`.
     pub outcome: String,
     /// Why, for `refused` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -365,6 +398,7 @@ mod tests {
             id: Some(ObjectId::new()),
             tenant_id: ObjectId::new(),
             owner_id: ObjectId::new(),
+            drivers: Vec::new(),
             title: "t".into(),
             room_id: None,
             last_turn: None,
@@ -394,9 +428,44 @@ mod tests {
         assert_eq!(v["device_id"], s.location.device_id.to_hex());
         assert_eq!(v["fence"], 1);
         assert!(v.get("accepted_at").is_none(), "absent, not null: {v}");
+        assert_eq!(v["drivers"], serde_json::json!([]), "always a list: {v}");
         assert_eq!(s.author_display(), "Claude · mars");
         let mut nameless = s.clone();
         nameless.location.device_name.clear();
         assert_eq!(nameless.author_display(), "Claude");
+    }
+
+    /// The owner always drives and is never stored as a driver; an older
+    /// record with no `drivers` field reads as "the owner alone".
+    #[test]
+    fn the_owner_always_drives_and_others_only_when_named() {
+        let owner = ObjectId::new();
+        let named = ObjectId::new();
+        let stranger = ObjectId::new();
+        let raw = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "owner_id": owner,
+            "title": "t",
+            "harness": { "id": "claude-code", "session": "u" },
+            "location": { "device_id": ObjectId::new(), "folder": "/src" },
+            "status": "idle",
+            "fence": 1_i64,
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut s: AgentSession = bson::from_document(raw).expect("a P0 record still reads");
+        assert!(s.drivers.is_empty());
+        assert!(s.drives(owner));
+        assert!(!s.drives(named));
+        assert_eq!(s.all_drivers(), vec![owner]);
+
+        s.drivers.push(named);
+        assert!(s.drives(named));
+        assert!(!s.drives(stranger));
+        assert_eq!(s.all_drivers(), vec![owner, named]);
+
+        // An owner listed by mistake is not counted twice.
+        s.drivers.push(owner);
+        assert_eq!(s.all_drivers(), vec![owner, named]);
     }
 }
