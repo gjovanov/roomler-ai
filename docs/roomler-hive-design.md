@@ -1288,6 +1288,24 @@ trained on. During the session it edits that directory as usual; at each turn en
 `hive-host` diffs it against the snapshot and turns every change into a proposal
 (§10.5). Codex gets the same scopes rendered into `AGENTS.md`.
 
+*As built (P1e, FR-90 spec §3f):*
+- *The **server** renders the snapshot when a session is created, pins its `brain_rev`
+  and stores it (`hive_session_memory`), so a re-sent start carries the same one. It
+  reaches the device as `rc:hive.memory`, just before `rc:hive.start`, and only where
+  the device advertises `hive-memory`.*
+- *⚠️ A gate this section did not have: the device's own `hive_core_memory`, default
+  off and never pushable. Claude Code reads `CLAUDE.md` as the user's own overriding
+  instructions, so this is the one place server-authored text reaches a session's model,
+  and only the device's owner can allow it.*
+- *The daemon writes the files into its own runtime directory, each `0600` and the
+  account's. The wrapper copies them, as the account, only into an empty place, so a
+  resume keeps the session's copy and its edits.*
+- *The device scope goes into the auto-memory `MEMORY.md` index under the pinned
+  project name (no `autoMemoryDirectory` setting, no topic files).*
+- *Three scopes so far: project waits for a project identity (P4). `/refresh-memory`,
+  and the turn-end diff into proposals (§10.5), wait for P5. The facts are kept on the
+  **Agent memory** page (`hive/HiveMemoryView`).*
+
 A fact is a record, not a line in a file:
 
 ```
