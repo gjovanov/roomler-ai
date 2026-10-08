@@ -4150,6 +4150,7 @@ async fn handle_server_msg(
             user_id,
             user_name,
             may_prompt,
+            user_email,
             ttl_secs,
         } => {
             #[cfg(all(feature = "hive", target_os = "linux"))]
@@ -4160,6 +4161,8 @@ async fn handle_server_msg(
                     user_id,
                     user_name,
                     may_prompt,
+                    user_email,
+                    driving_refused: None,
                     ttl_secs,
                 },
                 ctx.is_primary,
@@ -4167,7 +4170,14 @@ async fn handle_server_msg(
             );
             #[cfg(not(all(feature = "hive", target_os = "linux")))]
             {
-                let _ = (session_id, user_id, &user_name, may_prompt, ttl_secs);
+                let _ = (
+                    session_id,
+                    user_id,
+                    &user_name,
+                    may_prompt,
+                    &user_email,
+                    ttl_secs,
+                );
                 debug!(grant = %grant_id, "rc:hive.view.grant ignored — this build does not serve agent sessions");
             }
         }
