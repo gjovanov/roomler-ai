@@ -548,7 +548,10 @@ pub fn text_of(e: &Value) -> String {
 /// where Claude Code reads it — `$CLAUDE_CONFIG_DIR/CLAUDE.md`, and the
 /// auto-memory `MEMORY.md` under the pinned project name — copied to
 /// `.claude_md` / `.memory_md` in the session's folder when it starts (then
-/// `.launched`), and to `.claude_md.turn` / `.memory_md.turn` at each turn.
+/// `.launched`), and to `.claude_md.turn` / `.memory_md.turn` at each turn
+/// (then `.turned`). ⚠️ Read a copy only once its marker is there: `cp`
+/// writes the first file before the second exists, and a file while it is
+/// being written (CI lost that race once, reading `.memory_md` too early).
 /// What a model would have been given, not what the server meant to send.
 pub const MEMORY_HARNESS: &str = r#"#!/bin/sh
 mem() {
@@ -560,6 +563,7 @@ mem ""
 touch "$PWD/.launched"
 while IFS= read -r line; do
   mem ".turn"
+  touch "$PWD/.turned"
   echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.0}'
