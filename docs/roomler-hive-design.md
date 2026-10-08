@@ -392,6 +392,12 @@ hive_harnesses    = ["claude"]
 ⚠️ An empty `hive_roots` means **nowhere**, never "anywhere" — the overlay ACL's
 `Some([])`-means-deny lesson, applied before anyone ships the other reading.
 
+⚠️ `hive_accounts` also decides who may **drive** a session here (as built, FR-90 P1c-2a). A
+driver the owner named who is not the session's starter prompts and answers approvals only
+when this map sends them to the account the session runs as. Driving runs code here as that
+account, so the device owner's map, not the server's list, is the last word. To share a
+session started as `goran`: `"alice@example.com" = "goran"`.
+
 Spawning reuses the one privilege path the daemon has, `RunAs` + `apply_run_as`
 (`agents/roomlerd/src/exec.rs:436,491`), which exec, the PTY, sftp and the portal helper
 already share. No second spawn path.

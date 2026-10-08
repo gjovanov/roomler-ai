@@ -32,6 +32,8 @@ fn grant(session: ObjectId, user: ObjectId, may_prompt: bool, ttl_secs: u32) -> 
         user_id: user,
         user_name: "Viewer".into(),
         may_prompt,
+        user_email: None,
+        driving_refused: None,
         ttl_secs,
     }
 }
@@ -412,6 +414,62 @@ async fn a_read_only_viewer_cannot_prompt() {
         "{reason}"
     );
     wait_viewers(&r, 0).await;
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// P1c-2 — a viewer the SERVER names a driver, whom this device's own
+/// `hive_accounts` does not map to the session's account, reads but does not
+/// drive here — told why in `hello`, and nothing it sends reaches the harness.
+#[tokio::test]
+async fn a_driver_this_device_does_not_map_reads_and_is_told_why() {
+    let mut r = rig(true, 4);
+    let sid = session_with_a_turn(&mut r).await;
+    let g = ViewGrant {
+        user_email: Some("dave@example.com".into()),
+        ..grant(sid, ObjectId::new(), true, 60)
+    };
+    let gid = g.grant_id;
+    r.sup.view_grant(g, true).await.unwrap();
+    let mut b = dial(&mut r, gid).await;
+
+    b.send(json!({"op": "hello"})).await;
+    let hello = b.recv_op("hello").await;
+    assert_eq!(hello["may_prompt"], false, "{hello}");
+    assert_eq!(hello["may_answer"], false, "{hello}");
+    assert!(
+        hello["driving_refused"]
+            .as_str()
+            .is_some_and(|w| w.contains("hive_accounts")),
+        "{hello}"
+    );
+    let tip = hello["tip"].as_u64().unwrap();
+    b.send(json!({"op": "prompt", "id": "x", "text": "rm -rf"}))
+        .await;
+    let ack = b.recv_op("prompt").await;
+    assert_eq!(ack["ok"], false, "{ack}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        r.store.tip(&sid.to_hex()).await,
+        Some(tip),
+        "nothing reached the harness"
+    );
+
+    // The starter's own grant is the server's word, untouched.
+    let own = grant(sid, r.user, true, 60);
+    let oid = own.grant_id;
+    r.sup.view_grant(own, true).await.unwrap();
+    let mut o = dial(&mut r, oid).await;
+    o.send(json!({"op": "hello"})).await;
+    let hello = o.recv_op("hello").await;
+    assert_eq!(hello["may_prompt"], true, "{hello}");
+    assert!(hello["driving_refused"].is_null(), "{hello}");
+
+    for g in [gid, oid] {
+        r.sup.viewers().command(g, Cmd::Close("test".into()));
+    }
+    wait_viewers(&r, 0).await;
+    let _ = b.pc.close().await;
+    let _ = o.pc.close().await;
     r.sup.stop(sid, 1, "owner".into());
 }
 
