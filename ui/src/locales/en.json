@@ -79,6 +79,7 @@
     "dashboard": "Dashboard",
     "devices": "Devices",
     "agentSessions": "Agent sessions",
+    "agentMemory": "Agent memory",
     "network": "Network",
     "tunnelAcl": "ACL",
     "subnetRoutes": "Overlay routes",
@@ -262,6 +263,38 @@
       "addReader": "Add as reader",
       "addDriver": "Add as driver",
       "remove": "Take them out of the session"
+    },
+    "memory": {
+      "title": "Agent memory",
+      "revision": "Revision {rev}",
+      "about": "Facts kept here reach agent sessions as standing instructions. A session gets a copy when it starts and keeps that copy: a fact added later reaches the next session, not a running one. Only devices whose owner turned on hive_core_memory pass them to the agent.",
+      "scope": {
+        "org": "Organization",
+        "user": "Yours",
+        "device": "A device"
+      },
+      "scopeHint": {
+        "org": "Every session in the organization. Its administrators keep these.",
+        "user": "Only sessions you start.",
+        "device": "Only sessions on that device. Device managers keep these."
+      },
+      "device": "Device",
+      "budget": "{used} of {budget} characters",
+      "empty": "No facts here yet.",
+      "newFact": "A fact the agent should know",
+      "kindLabel": "Kind",
+      "kind": {
+        "preference": "Preference",
+        "convention": "Convention",
+        "path": "Path",
+        "gotcha": "Gotcha",
+        "decision": "Decision",
+        "warning": "Warning"
+      },
+      "add": "Keep it",
+      "edit": "Edit",
+      "editTitle": "Edit the fact",
+      "archive": "Archive — out of every future session's memory"
     }
   }
 }
