@@ -17,6 +17,9 @@ use roomler_node_core::config::AgentConfig;
 /// `hive_max_sessions` when unset.
 pub const DEFAULT_MAX_SESSIONS: usize = 4;
 
+/// `hive_update_wait_secs` when unset: AC7's bound, 30 minutes.
+pub const DEFAULT_UPDATE_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// The `hive_*` keys, read once at daemon start — they are restart-required
 /// on the config surface, so a snapshot is the truth until the next start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +32,8 @@ pub struct HiveConfig {
     pub api_key_helper: Option<String>,
     /// Sent as `anthropic-workspace-id` with the key (P0g).
     pub api_workspace_id: Option<String>,
+    /// P1d-1 (AC7) — how long an update waits for running turns.
+    pub update_wait: std::time::Duration,
 }
 
 impl HiveConfig {
@@ -44,6 +49,10 @@ impl HiveConfig {
             harness: cfg.hive_harness.as_deref().map(PathBuf::from),
             api_key_helper: cfg.hive_api_key_helper.clone(),
             api_workspace_id: cfg.hive_api_workspace_id.clone(),
+            update_wait: cfg
+                .hive_update_wait_secs
+                .map(|s| std::time::Duration::from_secs(u64::from(s)))
+                .unwrap_or(DEFAULT_UPDATE_WAIT),
         }
     }
 
@@ -57,6 +66,7 @@ impl HiveConfig {
             harness: None,
             api_key_helper: None,
             api_workspace_id: None,
+            update_wait: DEFAULT_UPDATE_WAIT,
         }
     }
 }

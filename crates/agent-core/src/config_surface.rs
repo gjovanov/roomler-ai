@@ -410,6 +410,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - the provider workspace for a model key that is not scoped to one: the sidecar sends it as anthropic-workspace-id with every model call. Empty = no header (right for a workspace-scoped key).",
     },
     KeyMeta {
+        key: "hive_update_wait_secs",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 - how long an update waits for running agent turns before it restarts the daemon (0-7200 seconds; 0 = never wait). It holds a server-pushed update too. Empty = built-in default (1800, 30 minutes).",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1680,6 +1688,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_harness" => cfg.hive_harness.clone(),
         "hive_api_key_helper" => cfg.hive_api_key_helper.clone(),
         "hive_api_workspace_id" => cfg.hive_api_workspace_id.clone(),
+        "hive_update_wait_secs" => cfg.hive_update_wait_secs.map(|n| n.to_string()),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -1942,6 +1951,11 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 }
                 Some(v) => Some(v.to_string()),
             }
+        }
+        // FR-90 P1d-1 — clearing restores the built-in 30 minutes; 0 is an
+        // owner's choice to let updates cut turns at once.
+        "hive_update_wait_secs" => {
+            cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
         // FR-89 — clearing restores the built-in ON: this is a kill switch
         // for a data-path shape, not a gate, so OFF is an owner's choice.
@@ -3849,6 +3863,14 @@ mod tests {
         assert_eq!(cfg.hive_api_workspace_id.as_deref(), Some("wrkspc_01Ab-9"));
         apply(&mut cfg, "hive_api_workspace_id", None).unwrap();
         assert_eq!(cfg.hive_api_workspace_id, None);
+        // P1d-1 — 0 is a real choice (never wait), the ceiling is two hours,
+        // and a clear goes back to the built-in 30 minutes.
+        apply(&mut cfg, "hive_update_wait_secs", Some("0")).unwrap();
+        assert_eq!(cfg.hive_update_wait_secs, Some(0));
+        assert!(apply(&mut cfg, "hive_update_wait_secs", Some("7201")).is_err());
+        assert!(apply(&mut cfg, "hive_update_wait_secs", Some("-1")).is_err());
+        apply(&mut cfg, "hive_update_wait_secs", None).unwrap();
+        assert_eq!(cfg.hive_update_wait_secs, None);
     }
 
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
