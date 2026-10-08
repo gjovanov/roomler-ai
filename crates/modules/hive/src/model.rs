@@ -154,6 +154,11 @@ pub struct AgentSession {
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime>,
+    /// FR-90 P1e — the org's brain revision the session's core memory was
+    /// rendered from, pinned when it was created: a fact written later
+    /// reaches the next session, never this one. Absent before P1e.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_rev: Option<i64>,
 }
 
 /// The most drivers a session may have besides its owner.
@@ -229,6 +234,9 @@ pub struct SessionView {
     pub accepted_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
+    /// P1e — the brain revision its core memory was rendered from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain_rev: Option<i64>,
 }
 
 fn rfc3339(t: DateTime) -> String {
@@ -258,6 +266,7 @@ impl From<&AgentSession> for SessionView {
             updated_at: rfc3339(s.updated_at),
             accepted_at: s.accepted_at.map(rfc3339),
             ended_at: s.ended_at.map(rfc3339),
+            brain_rev: s.brain_rev,
         }
     }
 }
@@ -308,17 +317,21 @@ pub struct HiveAuditEvent {
     /// The acting user.
     pub user_id: ObjectId,
     /// Whom the action was about, when not the actor: the participant added,
-    /// changed or removed (P1c).
+    /// changed or removed (P1c); the fact written (P1e).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<ObjectId>,
-    pub device_id: ObjectId,
+    /// The device a session event concerns, or a device-scope fact's device.
+    /// Absent for an org or a user fact (P1e), which concern none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<ObjectId>,
     /// Absent for a start refused before a session was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
-    /// `start` | `stop` | `view` | `participant`.
+    /// `start` | `stop` | `view` | `participant` | `brain`.
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
-    /// `driver` | `reader` — or `removed`.
+    /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
+    /// `archived` | `refused`.
     pub outcome: String,
     /// Why, for `refused` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,6 +434,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             ended_at: None,
+            brain_rev: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");

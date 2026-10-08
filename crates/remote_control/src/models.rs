@@ -634,6 +634,15 @@ pub enum RpcCap {
     /// so a server that read `hive-view` out of `hive` would leave the viewer
     /// waiting out its bound on every open. Equality-matched, locked by test.
     HiveView,
+    /// FR-90 P1e — `rc:hive.memory`: the agent understands a session's
+    /// core-memory snapshot, sent just before its start. Advertising it says
+    /// the frame is UNDERSTOOD; the device's own `hive_core_memory` (default
+    /// off) still decides whether a session ever sees it, because the model
+    /// reads core memory as the user's own overriding instructions.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: an agent before P1e
+    /// drops the frame at `debug!`. Equality-matched, locked by test.
+    HiveMemory,
 }
 
 impl RpcCap {
@@ -656,11 +665,12 @@ impl RpcCap {
             Self::SshGrantAck => "ssh-grant-ack",
             Self::Hive => "hive",
             Self::HiveView => "hive-view",
+            Self::HiveMemory => "hive-memory",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 11] = [
+    pub const ALL: [RpcCap; 12] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -672,6 +682,7 @@ impl RpcCap {
         Self::SshGrantAck,
         Self::Hive,
         Self::HiveView,
+        Self::HiveMemory,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4407,6 +4418,7 @@ mod tests {
         assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
         assert_eq!(RpcCap::Hive.wire(), "hive");
         assert_eq!(RpcCap::HiveView.wire(), "hive-view");
+        assert_eq!(RpcCap::HiveMemory.wire(), "hive-memory");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4424,7 +4436,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 4] = [
+        const KNOWN: [(RpcCap, RpcCap); 5] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4434,6 +4446,9 @@ mod tests {
             // FR-90 P0d-2 — "runs sessions" is not "serves them to a
             // browser". Locked by `hive_does_not_imply_hive_view`.
             (RpcCap::Hive, RpcCap::HiveView),
+            // FR-90 P1e — nor "understands core memory". Locked by
+            // `hive_does_not_imply_hive_memory`.
+            (RpcCap::Hive, RpcCap::HiveMemory),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -4664,6 +4679,26 @@ mod tests {
         assert_eq!(RpcCap::HiveView.wire(), "hive-view");
         assert_eq!(RpcCap::from_wire("hive-view"), Some(RpcCap::HiveView));
         assert!(RpcCap::from_wire("hive-views").is_none());
+    }
+
+    /// FR-90 P1e — a device that runs sessions may still drop the core-memory
+    /// frame (every build before P1e does), so `hive` never implies it, and
+    /// `hive-memory` alone says nothing about running sessions.
+    #[test]
+    fn hive_does_not_imply_hive_memory() {
+        let runs = AgentCaps {
+            rpc: vec!["hive".into(), "hive-view".into()],
+            ..Default::default()
+        };
+        assert!(!runs.has_rpc(RpcCap::HiveMemory));
+        let understands = AgentCaps {
+            rpc: vec!["hive-memory".into()],
+            ..Default::default()
+        };
+        assert!(understands.has_rpc(RpcCap::HiveMemory));
+        assert!(!understands.has_rpc(RpcCap::Hive));
+        assert_eq!(RpcCap::from_wire("hive-memory"), Some(RpcCap::HiveMemory));
+        assert!(RpcCap::from_wire("hive-memories").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

@@ -591,6 +591,22 @@ pub(crate) async fn reconcile_on_connect(
                     warn!(session = %sid, "hive: start not re-sent — its owner could not be read");
                     continue;
                 };
+                // P1e — its core memory first, the same frozen snapshot the
+                // first start carried; a device without `hive-memory` gets
+                // none, as it got none then.
+                match state.brain.snapshot_of(sid).await {
+                    Ok(Some(m)) => {
+                        let frame = crate::routes::memory_frame(&m, fence);
+                        let _ = state
+                            .fleet
+                            .rc_hub
+                            .push_hive_memory(device_id, tenant_id, frame);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!(session = %sid, %e, "hive: core memory not re-sent")
+                    }
+                }
                 // Idempotent on the device by session id + fence: one that
                 // launched it and lost only the answer says `accepted` again.
                 let msg = ServerMsg::HiveStart {
