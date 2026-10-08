@@ -5278,6 +5278,7 @@ mod tests {
             "hive_roots",
             "hive_harness",
             "hive_api_key_helper",
+            "hive_api_workspace_id",
             "hive_max_sessions",
         ] {
             assert!(

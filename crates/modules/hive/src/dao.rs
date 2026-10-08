@@ -78,9 +78,16 @@ impl AgentSessionDao {
     }
 
     /// The device answered the start: accepted. Only an UNANSWERED start
-    /// moves (a duplicate answer — the device saw the start twice after a
-    /// reconnect — changes nothing), and a stop already ordered stays
-    /// ordered: the status is left as it is.
+    /// moves (`accepted_at` unset — a duplicate answer, the device having
+    /// seen the start twice after a reconnect, changes nothing), and a stop
+    /// already ordered stays ordered: the status is left as it is.
+    ///
+    /// ⚠️ ANY live status takes the answer, not only `starting`: the daemon
+    /// reports `idle` the moment its harness is up and answers the start
+    /// right after, so the state usually lands FIRST. Field, 2026-10-07:
+    /// with `starting` alone every start lost its answer — the caller waited
+    /// out the whole bound, the account was never recorded and the room got
+    /// no started note. A terminal session still takes nothing.
     pub async fn accept(
         &self,
         id: ObjectId,
@@ -101,7 +108,13 @@ impl AgentSessionDao {
                     "_id": id,
                     "location.device_id": device_id,
                     "fence": fence,
-                    "status": statuses(&[SessionStatus::Starting, SessionStatus::Stopping]),
+                    "status": statuses(&[
+                        SessionStatus::Starting,
+                        SessionStatus::Idle,
+                        SessionStatus::Running,
+                        SessionStatus::AwaitingApproval,
+                        SessionStatus::Stopping,
+                    ]),
                     "accepted_at": Bson::Null,
                 },
                 doc! { "$set": set },
