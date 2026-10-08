@@ -2614,3 +2614,149 @@ async fn test_association_handle_packet_before_init() -> Result<()> {
 
     Ok(())
 }
+
+/// roomler (#1856) — delegates to `inner`, failing the next N sends the way a
+/// UDP socket does when its route vanishes underneath it.
+struct FailNextSends {
+    inner: Arc<dyn Conn + Send + Sync>,
+    fail_next: AtomicUsize,
+    failed: AtomicUsize,
+}
+
+impl FailNextSends {
+    fn new(inner: Arc<dyn Conn + Send + Sync>) -> Self {
+        FailNextSends {
+            inner,
+            fail_next: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Conn for FailNextSends {
+    async fn connect(&self, addr: SocketAddr) -> UResult<()> {
+        self.inner.connect(addr).await
+    }
+
+    async fn recv(&self, b: &mut [u8]) -> UResult<usize> {
+        self.inner.recv(b).await
+    }
+
+    async fn recv_from(&self, b: &mut [u8]) -> UResult<(usize, SocketAddr)> {
+        self.inner.recv_from(b).await
+    }
+
+    async fn send(&self, b: &[u8]) -> UResult<usize> {
+        if self
+            .fail_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            return Err(io::Error::from(io::ErrorKind::HostUnreachable).into());
+        }
+        self.inner.send(b).await
+    }
+
+    async fn send_to(&self, b: &[u8], target: SocketAddr) -> UResult<usize> {
+        self.inner.send_to(b, target).await
+    }
+
+    fn local_addr(&self) -> UResult<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.remote_addr()
+    }
+
+    async fn close(&self) -> UResult<()> {
+        self.inner.close().await
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+/// roomler (#1856): one failed send is a lost packet, not a dead association.
+/// A remote-desktop peer whose overlay route vanished for ~3 ms got a single
+/// `EHOSTUNREACH`; the write loop treated it as fatal, closed the association
+/// and every data channel on it, and the session died. The dropped DATA chunk
+/// must instead arrive by retransmission, on an association still established.
+#[tokio::test]
+async fn test_assoc_survives_a_failed_send() -> Result<()> {
+    const SI: u16 = 1;
+    static MSG: Bytes = Bytes::from_static(b"after the hole");
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let flaky = Arc::new(FailNextSends::new(Arc::new(ca)));
+    let (a0, mut a1) = create_new_association_pair(
+        &br,
+        Arc::clone(&flaky) as Arc<dyn Conn + Send + Sync>,
+        Arc::new(cb),
+        AckMode::NoDelay,
+        0,
+    )
+    .await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+    flaky.fail_next.store(1, Ordering::SeqCst);
+    s0.write_sctp(&MSG, PayloadProtocolIdentifier::Binary)
+        .await?;
+
+    // Keep the bridge moving until the T3 retransmission lands (RTO >= 1 s).
+    let mut buf = vec![0u8; 64];
+    let read = async {
+        loop {
+            br.tick().await;
+            if let Ok(r) =
+                tokio::time::timeout(Duration::from_millis(10), s1.read_sctp(&mut buf)).await
+            {
+                break r;
+            }
+        }
+    };
+    let (n, ppi) = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .map_err(|_| Error::Other("the dropped message was never retransmitted".to_owned()))??;
+
+    assert_eq!(
+        flaky.failed.load(Ordering::SeqCst),
+        1,
+        "the injected send failure must have fired, or this proves nothing"
+    );
+    assert_eq!(&buf[..n], &MSG[..], "retransmitted payload");
+    assert_eq!(ppi, PayloadProtocolIdentifier::Binary);
+    assert_eq!(a0.get_state(), AssociationState::Established);
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
+#[test]
+fn test_send_failure_run_logs_first_then_rate_limited_then_recovery() {
+    let t0 = std::time::Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut run = SendFailureRun::default();
+
+    // A send with no failures before it reports nothing.
+    assert_eq!(run.sent(at(0)), None);
+
+    // The first failure of a run is logged; the next ones only every 5 s.
+    assert!(run.failed(at(0)));
+    assert!(!run.failed(at(1)));
+    assert!(!run.failed(at(4_999)));
+    assert!(run.failed(at(5_000)));
+    assert_eq!(run.dropped, 4);
+
+    // The first success ends the run and reports it once.
+    assert_eq!(run.sent(at(5_500)), Some((4, Duration::from_millis(5_500))));
+    assert_eq!(run.sent(at(5_600)), None);
+
+    // A new run logs its first failure again, whatever the last log's age.
+    assert!(run.failed(at(6_000)));
+    assert_eq!(run.dropped, 1);
+}

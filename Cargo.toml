@@ -138,8 +138,12 @@ exclude = [
 # packet is a lost acknowledgement and the outbound video stalls on an
 # RTO. Field 2026-09-02: 549 drops on one host in a day, 523 of them in
 # one 4-minute LAN session that ran 3-4 s behind. Our vendored copy
-# bounds the loop by the chunk. One canonical diff:
-# crates/vendored/webrtc-sctp.patch (scripts/revendor-webrtc-sctp.sh).
+# bounds the loop by the chunk. Second delta (#1856): upstream's write
+# loop closed the association on ANY failed send, so one EHOSTUNREACH
+# (a route absent for 3 ms) killed every DataChannel of a remote-desktop
+# session; ours drops the packet and lets SCTP retransmit it. One
+# canonical diff: crates/vendored/webrtc-sctp.patch
+# (scripts/revendor-webrtc-sctp.sh).
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
