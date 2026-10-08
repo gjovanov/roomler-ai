@@ -943,6 +943,140 @@ async fn an_approval_is_one_stub_that_says_how_it_ended() {
     assert!(content(&items, &format!("{sid}!a5")).is_empty());
 }
 
+/// P1b — a device that says it no longer runs a session ends it (finding 7:
+/// a restarted daemon runs none of what it ran, and nothing else would ever
+/// say so). What its manifest names stays; a start still in flight is
+/// reconcile's, not the manifest's; another device's list changes nothing
+/// of this one's.
+#[tokio::test]
+async fn a_device_that_no_longer_runs_a_session_ends_it() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivemani").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-mani", RUNS_HIVE).await;
+    let mut stranger = device(&app, &seeded, "hive-mani-x", RUNS_HIVE).await;
+    let gone = started_session(&app, &tid, &token, &mut dev).await;
+    let kept = started_session(&app, &tid, &token, &mut dev).await;
+    for sid in [&gone, &kept] {
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+        )
+        .await;
+        wait_status(&app, &tid, &token, sid, "idle").await;
+    }
+
+    // Another device's empty list is about that device only.
+    send(
+        &mut stranger.ws,
+        json!({"t": "rc:hive.manifest", "sessions": []}),
+    )
+    .await;
+
+    // A start in flight: sent, not yet answered.
+    let caller = start(&app, &tid, &token, &dev.agent_id, "/srv/third");
+    let device_side = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        let pending = f["session_id"].as_str().unwrap().to_string();
+        // The device lists only `kept`: `gone` is over; the unanswered
+        // start is not "running" yet.
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.manifest", "sessions": [{"session_id": kept, "fence": 1}]}),
+        )
+        .await;
+        wait_status(&app, &tid, &token, &gone, "ended").await;
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": pending, "fence": 1, "account": "dev"}),
+        )
+        .await;
+        pending
+    };
+    let (body, pending) = tokio::join!(caller, device_side);
+    assert_eq!(
+        body["outcome"], "accepted",
+        "the start in flight survived: {body}"
+    );
+
+    let (_, g) = get_session(&app, &tid, &token, &gone).await;
+    assert_eq!(g["end_reason"], "not_on_device", "{g}");
+    let (_, k) = get_session(&app, &tid, &token, &kept).await;
+    assert_eq!(k["status"], "idle", "what the list names stays: {k}");
+    let (_, p) = get_session(&app, &tid, &token, &pending).await;
+    assert_ne!(p["status"], "ended", "{p}");
+    let room = g["room_id"].as_str().unwrap();
+    wait_messages(&app, &tid, &token, room, "the ended note", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("its device no longer runs it"))
+        })
+    })
+    .await;
+}
+
+/// P1b — the state usually lands BEFORE the answer (P0g), so a socket that
+/// drops between the two leaves the session `idle` with no `accepted_at`.
+/// Reconcile never re-sends it — it is not `starting` — so the manifest is
+/// the only word that it is over: a run state is the device's own word that
+/// it launched the session, as good as its answer. Field, 2026-10-08: the one
+/// record the first P1b run left `idle`.
+#[tokio::test]
+async fn a_session_whose_answer_was_lost_still_ends() {
+    // It polls the record and the device's row, past the default limiter.
+    let app = TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await;
+    let seeded = app.seed_tenant("hivelostack").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-lostack", RUNS_HIVE).await;
+    let agent_id = dev.agent_id.clone();
+
+    // The caller is held for the answer that never comes; the device's side
+    // runs meanwhile.
+    let caller = start(&app, &tid, &token, &agent_id, "/srv");
+    let device_side = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        let sid = f["session_id"].as_str().unwrap().to_string();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+        )
+        .await;
+        wait_status(&app, &tid, &token, &sid, "idle").await;
+        // The socket drops before the answer, and the daemon restarts.
+        drop(dev.ws);
+        wait_offline(&app, &seeded, &dev.agent_id).await;
+        let mut ws = connect(&app, &dev.token, &dev.machine, RUNS_HIVE).await;
+        send(&mut ws, json!({"t": "rc:hive.manifest", "sessions": []})).await;
+        let s = wait_status(&app, &tid, &token, &sid, "ended").await;
+        assert!(
+            read_until(&mut ws, "rc:hive.start").await.is_none(),
+            "reconcile re-sent it: the manifest is not the only word"
+        );
+        (sid, s)
+    };
+    let (_, (sid, s)) = tokio::join!(caller, device_side);
+    assert_eq!(s["end_reason"], "not_on_device", "{s}");
+    assert!(s["accepted_at"].is_null(), "the answer never landed: {s}");
+    let room = s["room_id"].as_str().unwrap();
+    wait_messages(&app, &tid, &token, room, "the ended note", |items| {
+        items.iter().any(|m| {
+            bound_to(m, &sid)
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("its device no longer runs it"))
+        })
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_member_without_hive_run_is_refused_and_audited() {
     let app = hive_app().await;
