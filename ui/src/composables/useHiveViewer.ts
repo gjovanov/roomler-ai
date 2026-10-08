@@ -121,6 +121,10 @@ export function useHiveViewer() {
   const mayPrompt = ref(false)
   /** A driver answers approvals (P1a): the device says whether we are one. */
   const mayAnswer = ref(false)
+  /** P1c-2 — why THIS device keeps a driver the server named read only (its
+   *  own `hive_accounts` does not map us to the session's account), in its
+   *  words; null when it does not. */
+  const drivingRefused = ref<string | null>(null)
   /** The approval ids open now, as the device last said. */
   const pendingApprovals = ref<string[]>([])
   const live = ref(false)
@@ -217,6 +221,7 @@ export function useHiveViewer() {
     answerWaiters.clear()
     // Nothing is answerable through a peer that is gone.
     pendingApprovals.value = []
+    drivingRefused.value = null
   }
 
   function merge(incoming: HiveEvent[], where: 'append' | 'prepend'): void {
@@ -282,6 +287,7 @@ export function useHiveViewer() {
     }
     mayPrompt.value = !!hello.may_prompt
     mayAnswer.value = !!hello.may_answer
+    drivingRefused.value = typeof hello.driving_refused === 'string' ? hello.driving_refused : null
     pendingApprovals.value = Array.isArray(hello.approvals) ? hello.approvals.map(String) : []
     live.value = !!hello.live
     runState.value = hello.state ?? null
@@ -316,6 +322,9 @@ export function useHiveViewer() {
         break
       case 'hive:view.closed':
         finish('closed', f.reason ?? 'closed', false)
+        // P1c — our part in the session changed (we drive it now, or no
+        // longer do): the grant said otherwise, so ask for a fresh one.
+        if (f.reason === 'role_changed' && sessionId) open(sessionId)
         break
       case 'hive:view.renewed':
         break
@@ -481,6 +490,7 @@ export function useHiveViewer() {
     runState,
     mayPrompt,
     mayAnswer,
+    drivingRefused,
     pendingApprovals,
     live,
     hasEarlier,

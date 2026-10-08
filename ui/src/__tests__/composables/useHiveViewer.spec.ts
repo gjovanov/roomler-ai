@@ -369,6 +369,66 @@ describe('useHiveViewer', () => {
     unmount()
   })
 
+  it('asks for a fresh grant when its part in the session changes (P1c)', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-role')
+    const first = sent.find((s) => s.type === 'hive:view.open')!.data
+    serverSays('hive:view.ready', { ref: first.ref, grant_id: 'g-reader', ice_servers: [], ttl_secs: 600, may_prompt: false })
+    await flush()
+    const reader = FakePeer.last!
+    reader.channel.open()
+    await flush()
+    reader.channel.deliver({ op: 'hello', v: 1, tip: 0, live: true, state: 'idle', may_prompt: false })
+    await flush()
+    expect(viewer.mayPrompt.value).toBe(false)
+
+    // The owner made us a driver: the server ended the grant that said
+    // "read only", and we ask again — the new grant says what is true now.
+    serverSays('hive:view.closed', { grant_id: 'g-reader', reason: 'role_changed' })
+    await flush()
+    expect(reader.closed).toBe(true)
+    const opens = sent.filter((s) => s.type === 'hive:view.open')
+    expect(opens.length).toBe(2)
+    expect(opens[1].data.session_id).toBe('sess-role')
+    expect(opens[1].data.ref).not.toBe(first.ref)
+    serverSays('hive:view.ready', { ref: opens[1].data.ref, grant_id: 'g-driver', ice_servers: [], ttl_secs: 600, may_prompt: true })
+    await flush()
+    expect(viewer.mayPrompt.value).toBe(true)
+
+    // Any other end is not a cue to come back.
+    serverSays('hive:view.closed', { grant_id: 'g-driver', reason: 'removed' })
+    await flush()
+    expect(sent.filter((s) => s.type === 'hive:view.open').length).toBe(2)
+    expect(viewer.status.value).toBe('closed')
+    unmount()
+  })
+
+  it("keeps the device's reason when it will not let a named driver act (P1c-2)", async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-unmapped')
+    const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+    serverSays('hive:view.ready', { ref, grant_id: 'g-unmapped', ice_servers: [], ttl_secs: 600, may_prompt: true })
+    await flush()
+    const ch = FakePeer.last!.channel
+    ch.open()
+    await flush()
+    ch.deliver({
+      op: 'hello',
+      v: 1,
+      tip: 0,
+      live: true,
+      state: 'idle',
+      may_prompt: false,
+      may_answer: false,
+      driving_refused: "this device's hive_accounts maps you to no account",
+    })
+    await flush()
+    expect(viewer.mayPrompt.value, "the device's word wins over the server's").toBe(false)
+    expect(viewer.drivingRefused.value).toBe("this device's hive_accounts maps you to no account")
+    unmount()
+    expect(viewer.drivingRefused.value, 'forgotten with the peer').toBeNull()
+  })
+
   it('closes the peer when the device ends the grant, and a new open replaces the old peer', async () => {
     const { viewer, unmount } = await mountViewer()
     viewer.open('sess-4')
