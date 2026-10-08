@@ -189,6 +189,81 @@ is why it is sequenced last, behind its own feature and the probe.
   the hub keeps its 300 s window: a host timeout no longer kills the owner's
   emailed link, while an explicit host **Deny** still ends the session.
 
+### P10 — the host's Disconnect ends the session for good
+
+**The requirement** (operator, 2026-10-09): *"If 'Disconnect' is clicked on the
+viewed remote desktop, it should stop the reconnect mechanism and notify the
+viewer that he/she was disconnected."*
+
+**What was wrong, measured on 0.4.119** (the #1852 log below): one click on
+the banner's Disconnect → `viewee requested disconnect via overlay badge` →
+`session terminated … reason=ControllerHangup` → the viewer back in a fresh
+session within ~3 s. The cause is an ORDER, not a missing feature. The agent's
+`kill_rx` arm (`signaling.rs`, the one arm every host-side Disconnect reaches:
+the Windows badge, the companion banner over LocalAPI `RcDisconnect`) **closed
+the peer first** (up to `PEER_CLOSE_BUDGET`, 5 s) and told the server after.
+The browser's control data-channel `onclose` fired within milliseconds of the
+close, read it as an ordinary drop, hung the old session up itself
+(`rc:terminate controller_hangup` — hence the audit) and scheduled the ladder.
+The agent's own `AgentHangup` arrived at a session the hub had already removed:
+an idempotent no-op, so the viewer never heard who ended it. Every piece was
+working as designed; they ran in the wrong order.
+
+**Where the reason is created.** The same `kill_rx` arm, which now **says it
+first**: `ClientMsg::Terminate { reason: HostDisconnect }` — a new `EndReason`,
+wire `host_disconnect` (`models.rs`) — goes out before anything closes; on a
+supervised Mac (FR-43) it rides the delegation link the session's answer and
+ICE took (`reply_for_session`), so the worker speaks through the daemon's WS.
+The peer is then closed in a task of its own after a grace
+(`ROOMLERD_HOST_DISCONNECT_GRACE_MS`, default 1000 ms, capped at the close
+budget; a failed send closes at once — nothing to wait for on a dead WS). The
+banner comes down immediately; the stream is dead within the grace.
+
+**How it crosses the wire.** `rc:terminate`, unchanged: no new wire name, no
+route, the composition baseline is untouched. The hub passes the reason through
+as it always did, with one guard: a **controller** claiming `host_disconnect`
+is recorded as `controller_hangup` — only the device may say the person at its
+screen ended it, so the audit's word is the host's, and a pre-P10 agent can
+never be echoed a variant it cannot decode. `Hub::terminate` sends the
+Terminate to the controller **before** it echoes it to the agent and audits
+`SessionEnded { reason }`, which is the ordering the viewer relies on.
+
+**How the viewer decides not to reconnect.** `isRetryableTerminateReason` is an
+allowlist (`agent_disconnect`, `error`), so `host_disconnect` was terminal on
+day one, fail-safe. P10 adds `endedByHost(reason)` and an `endedBy` ref: the
+`rc:terminate` handler sets `phase = 'closed'`, `endedBy = 'host'`, cancels the
+ladder and drops `lastConnectArgs` (nothing to replay), then `teardown()`
+closes the channels — with the phase already `closed`, the control DC's
+`onclose` (the fast reconnect path) stays quiet. The view renders a notice,
+"The person at the device ended the session.", with an explicit **Reconnect**
+(`startSession`: a fresh request, through consent like any new session).
+Ordinary drops are untouched: the ladder still runs on `agent_disconnect`,
+`error`, a failed/disconnected peer and a closed control channel mid-session.
+
+**Version matrix** (agent = the device, server = the hosted image, viewer = the
+SPA in that image):
+
+| viewer | server | agent | what happens |
+|---|---|---|---|
+| new | new | new | the notice, no auto-reconnect, audit + agent log `host_disconnect` |
+| old | new | new | the viewer gets `host_disconnect`, unknown → terminal `closed`, no notice, **no reconnect** (better than today) |
+| new | old | new | the old server cannot decode the frame and drops it at debug (socket stays up); the peer closes after the grace; the viewer reconnects **as today**; audit `controller_hangup` as today |
+| new | new | old | the old agent closes first and says `agent_hangup` after: the browser's `onclose` wins the race **as today** |
+| any | any | old + old | as today |
+
+Locked by `pre_p10_end_reason_rejects_host_disconnect_so_old_servers_drop_the_frame`
+(the "new agent, old server" cell, the way the rc.53 `Goodbye` lock documents
+its own cell) and the hub's `host_disconnect_is_the_devices_claim_only`.
+
+**Kill switch.** `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` closes the peer at once
+(the pre-P10 timing; the reason still goes out). The viewer needs none: an
+unknown or missing reason is terminal by the allowlist's default.
+
+**Known limit.** A viewer whose own signalling socket is down at the moment of
+the click cannot be told anything; it sees the peer die after the grace and
+rides the ladder, which asks the device again when signalling returns — the
+pre-P10 behaviour, for the one case where the reason has no path to travel.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -203,6 +278,7 @@ is why it is sequenced last, behind its own feature and the probe.
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
+| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **implemented** — RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z (the #1852 log; the deploy tag re-checked unchanged on 2026-10-09); GREEN owed after the next agent release AND a hosted promote (the viewer ships in the image) |
 
 ## Acceptance criteria
 
@@ -292,6 +368,16 @@ Ticked only where a run is recorded in the field log below.
       diagram of how one session's consent is resolved, and is linked from
       `docs/README.md` (the docs-before-close rule). The field-result half of
       phase 6 lives in this spec's log.
+- [ ] **P10** — one click on the host's Disconnect (the companion banner on
+      macOS/Linux, the Windows badge) ends the session for good: the viewer
+      shows that the person at the device ended it and stays disconnected for
+      ≥ 60 s with no new session in the agent log; Reconnect is an explicit
+      click that goes through consent; an ordinary drop (the viewer offline
+      ~10 s) still auto-reconnects; the agent log and the session audit record
+      `host_disconnect`, not `controller_hangup`. Ticked per surface as the
+      log records it — the Mac's banner from the demo harness, the Windows
+      badge only with a person at that machine (it is capture-excluded).
+      Docs: `docs/remote-control.md` §11.5 and `docs/desktop-companion.md` §12.
 
 ## Deviations (accepted, recorded up front)
 
@@ -603,3 +689,34 @@ too. A **direct** one-click Stop-recording run on the Mac is still owed: two
 attempts were lost, the first to the pre-#1858 every-few-seconds RC drop while
 the Mac was mid-update, the second to the device owner's own live session on the
 Mac. **#1852 stays open** for that one direct demonstration.
+
+### 2026-10-09 — P10: the host's Disconnect must end the session for good (RED on record)
+
+**The requirement** came from the operator on 2026-10-09: a Disconnect clicked on the
+viewed desktop has to stop the reconnect mechanism and tell the viewer they were
+disconnected.
+
+**RED — the current deploy.** The measurement is the #1852 GREEN run above, read for
+what it ALSO showed: agent **0.4.119**, the Mac, **2026-10-08 14:38:43Z**, one click on
+the banner's Disconnect → `viewee requested disconnect via overlay badge` →
+`session terminated … reason=ControllerHangup` → the harness viewer auto-reconnected
+to a fresh session within ~3 s (and the same on 0.4.118 at 14:18:42Z). The hosted image
+serving the viewer then was `hosted-20261005-d2dc0ef` (promoted 2026-10-05 22:41Z);
+re-checked on 2026-10-09 against the deploy repo's `newTag`: **unchanged, nothing
+promoted since**, so that run was taken on exactly today's deploy and is the RED for
+P10. The audit's `ControllerHangup` is the viewer's own hangup from its reconnect
+ladder, sent when the control data-channel closed under it — the ordering explained
+in the P10 design above.
+
+**GREEN — owed.** Needs BOTH halves deployed: the agent (the reason, said first) and the
+hosted image (the hub's guard, the viewer's notice). The checks, on the Mac from the
+demo harness (`ROOMLER_DEMO_STEPS`: fullscreen → a top-edge `move` to reveal the banner
+→ `move` onto Disconnect → `click` → a long `wait`), and on a Windows laptop only with a
+person at it (the badge is capture-excluded):
+
+| check | evidence to record |
+|---|---|
+| one click on Disconnect → the viewer shows the notice and stays disconnected ≥ 60 s | the take's frames after `click1`; the agent log: no new `session` after the `host_disconnect` line |
+| Reconnect works when chosen | a session after an explicit click on the viewer's Reconnect |
+| an ordinary drop still auto-reconnects | Playwright `context.setOffline(true)` ~10 s, back online → `reconnecting` → `connected` |
+| the reason is recorded truthfully | agent log `reason=HostDisconnect`; the session row's `end_reason: host_disconnect` |
