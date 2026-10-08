@@ -2850,6 +2850,14 @@ pub enum ServerMsg {
         /// read only; a prompt over the peer is refused on the device.
         #[serde(default)]
         may_prompt: bool,
+        /// FR-90 P1c-2 — the viewer's address as `users.email` holds it (a
+        /// PROVEN one, or the `.invalid` placeholder), sent ONLY with
+        /// `may_prompt`: the device lets a driver other than the session's
+        /// starter act only when its own `hive_accounts` maps them to the
+        /// account the session runs as, and that map may name people by
+        /// address. A reader's address never leaves the server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_email: Option<String>,
         ttl_secs: u32,
     },
 
@@ -3943,6 +3951,7 @@ mod tests {
             user_id: user,
             user_name: "Alice".into(),
             may_prompt: true,
+            user_email: Some("alice@example.com".into()),
             ttl_secs: 600,
         })
         .unwrap();
@@ -3956,10 +3965,37 @@ mod tests {
                 "session_id",
                 "t",
                 "ttl_secs",
+                "user_email",
                 "user_id",
                 "user_name"
             ]
         );
+        // A reader's grant carries no address at all — not even a null.
+        let reader = serde_json::to_value(ServerMsg::HiveViewGrant {
+            grant_id: grant,
+            session_id: sid,
+            user_id: user,
+            user_name: "Bob".into(),
+            may_prompt: false,
+            user_email: None,
+            ttl_secs: 600,
+        })
+        .unwrap();
+        assert!(reader.get("user_email").is_none(), "{reader}");
+        // And a grant from a server before P1c-2 still reads.
+        let older: ServerMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:hive.view.grant", "grant_id": grant.to_hex(),
+            "session_id": sid.to_hex(), "user_id": user.to_hex(),
+            "user_name": "Carol", "may_prompt": true, "ttl_secs": 600,
+        }))
+        .unwrap();
+        assert!(matches!(
+            older,
+            ServerMsg::HiveViewGrant {
+                user_email: None,
+                ..
+            }
+        ));
 
         let offer = serde_json::to_value(ServerMsg::HiveViewOffer {
             grant_id: grant,

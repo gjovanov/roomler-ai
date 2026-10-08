@@ -253,9 +253,12 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
     // person's grants (`end_session_grants_of`), and the view they reopen is
     // minted afresh.
     let may_prompt = crate::access::drives_now(&s, user);
-    let user_name = match state.users.base.find_by_id(user).await {
-        Ok(u) => u.display_name,
-        Err(_) => String::new(),
+    // The address goes with a DRIVER's grant only (P1c-2): the device maps a
+    // driver who is not the starter through its own `hive_accounts`, which
+    // may name people by address. A reader's never leaves the server.
+    let (user_name, user_email) = match state.users.base.find_by_id(user).await {
+        Ok(u) => (u.display_name, may_prompt.then_some(u.email)),
+        Err(_) => (String::new(), None),
     };
     let grant_id = ObjectId::new();
     let ice_servers = ice_servers_for_session_with_ttl(
@@ -286,6 +289,7 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         user_id: user,
         user_name,
         may_prompt,
+        user_email,
         ttl_secs: view_limits::GRANT_TTL_SECS,
     };
     if let Err(e) = state
