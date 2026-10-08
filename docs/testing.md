@@ -55,6 +55,16 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 > test's own account and refuses to run as root. Its log checks run under a
 > thread-default subscriber around a current-thread runtime, so they see
 > every task of the server and the device without `RUST_LOG`.
+>
+> **`tests/hive_drivers.rs` is a third, for the same reason** (FR-90 P1c-2b,
+> AC6): a reader's message in the session's room and a prompt over their own
+> viewer peer must reach no harness, while the owner's and a named driver's
+> do, each labelled `[Name] …`. Its harness writes every line it reads on
+> stdin to a file — what a model would be sent — and the test reads that
+> file. The scaffolding both binaries share (the server, the in-process
+> device, a browser's socket and viewer peer, the harness's side of a
+> toolbelt) is `tests/hive_support/mod.rs`, a module each includes, not a
+> test target of its own.
 
 ## Frontend tests
 
