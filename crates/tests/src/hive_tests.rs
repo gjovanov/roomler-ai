@@ -21,6 +21,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::{enroll_agent, read_until, wait_agent_online};
+use roomler_ai_remote_control::hive::hive_limits;
 
 type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -456,6 +457,76 @@ async fn a_start_reaches_the_device_and_the_caller_hears_the_device() {
         actions.contains(&("stop".into(), "sent".into())),
         "{actions:?}"
     );
+}
+
+/// The REAL daemon's order: it reports `idle` the moment its harness is up
+/// and answers the start right after, so the state lands first. The answer
+/// must still be heard — the caller woken by it, its account recorded, the
+/// room told. Field, 2026-10-07: every start lost its answer this way; the
+/// caller waited out the whole bound and the account and note never came.
+#[tokio::test]
+async fn a_state_that_beats_the_devices_answer_does_not_lose_it() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveorder").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-order", RUNS_HIVE).await;
+
+    let caller = async {
+        let asked = Instant::now();
+        let body = start(&app, &tid, &token, &dev.agent_id, "/home/dev/src/app").await;
+        (body, asked.elapsed())
+    };
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives rc:hive.start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.state", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "state": "idle"}),
+        )
+        .await;
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+    };
+    let ((body, waited), ()) = tokio::join!(caller, target);
+
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let s = &body["session"];
+    assert_eq!(s["account"], "dev", "the device's answer was heard: {s}");
+    assert!(
+        waited < Duration::from_secs(hive_limits::START_ACK_TIMEOUT_SECS / 2),
+        "the caller waited {waited:?}: the answer was dropped and only the bound released it"
+    );
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert!(
+        matches!(
+            stored(&app, &sid).await.get("accepted_at"),
+            Some(bson::Bson::DateTime(_))
+        ),
+        "the answer is on the record"
+    );
+    let room = s["room_id"].as_str().unwrap().to_string();
+    wait_messages(
+        &app,
+        &tid,
+        &token,
+        &room,
+        "the start note, with the account",
+        |items| {
+            items.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Started on") && c.contains("**dev**"))
+            })
+        },
+    )
+    .await;
 }
 
 /// The device's gate is the caller's answer: which gate, in its own word,

@@ -387,6 +387,23 @@ async fn handle(
             ));
         }
     }
+    // A key not scoped to a workspace needs this on every call (P0g, field
+    // 2026-10-07). It travels with the key: the device's, never the
+    // session's — whatever the session sent is replaced.
+    if let Some(workspace) = sup.model_workspace() {
+        match HeaderValue::from_str(workspace) {
+            Ok(v) => {
+                headers.insert("anthropic-workspace-id", v);
+            }
+            Err(_) => {
+                return refusal(Refusal::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "hive_api_workspace_id is not a workspace id",
+                ));
+            }
+        }
+    }
     let method = req.method().clone();
     let body = match Limited::new(req.into_body(), MAX_REQUEST_BYTES)
         .collect()

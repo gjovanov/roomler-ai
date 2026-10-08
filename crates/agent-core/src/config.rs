@@ -420,6 +420,14 @@ pub struct AgentConfig {
     /// (a per-session config directory holds no login of its own).
     #[serde(default)]
     pub hive_api_key_helper: Option<String>,
+    /// FR-90 P0g — the provider workspace the model calls are made in, for
+    /// a key that is not scoped to one: the API then requires an
+    /// `anthropic-workspace-id` header on every call. The sidecar adds it
+    /// with the key; a session never sets it (field, 2026-10-07: such a key
+    /// answered every call `400 This API key is not scoped to a workspace`).
+    /// Unset = no header — right for a workspace-scoped key.
+    #[serde(default)]
+    pub hive_api_workspace_id: Option<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2192,6 +2200,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_max_sessions: None,
         hive_harness: None,
         hive_api_key_helper: None,
+        hive_api_workspace_id: None,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

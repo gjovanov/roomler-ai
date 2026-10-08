@@ -39,6 +39,7 @@
 //! and is attributed to its viewer in the transcript and on the turn's stub.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -384,7 +385,7 @@ async fn run(
                         let _ = dc.close().await;
                         continue;
                     }
-                    channel = Some(Channel::attach(dc, events_tx.clone()));
+                    channel = Some(Channel::attach(dc));
                 }
                 Some(PeerEvent::Frame(frame)) => {
                     let Some(ch) = channel.as_mut() else { continue };
@@ -500,7 +501,19 @@ async fn answer(
     }
     {
         let ev = events;
+        let claimed = Arc::new(AtomicBool::new(false));
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            // The handlers go on HERE, not when the actor gets to the
+            // channel: webrtc-rs awaits this callback and only then starts
+            // the channel's read loop, which drops a frame that arrives with
+            // no handler set — and the browser sends `hello` the moment its
+            // side opens. Field, 2026-10-07: a viewer whose `hello` was lost
+            // never asked for the history, and a whole turn never reached
+            // the panel. Only the first `hive` channel is wired; the actor
+            // closes any other.
+            if dc.label() == CHANNEL && !claimed.swap(true, AtomicOrdering::AcqRel) {
+                Channel::wire(&dc, ev.clone());
+            }
             let ev = ev.clone();
             Box::pin(async move {
                 let _ = ev.send(PeerEvent::Channel(dc)).await;
@@ -577,8 +590,9 @@ struct Channel {
 }
 
 impl Channel {
-    /// Take the channel: its frames and its close go to the actor.
-    fn attach(dc: Arc<RTCDataChannel>, events: mpsc::Sender<PeerEvent>) -> Self {
+    /// Send the channel's frames and its close to the actor. Called from
+    /// `on_data_channel` itself, before webrtc-rs starts reading the channel.
+    fn wire(dc: &Arc<RTCDataChannel>, events: mpsc::Sender<PeerEvent>) {
         {
             let ev = events.clone();
             dc.on_message(Box::new(move |msg| {
@@ -595,6 +609,10 @@ impl Channel {
                 let _ = ev.send(PeerEvent::ChannelClosed).await;
             })
         }));
+    }
+
+    /// Take the channel [`Self::wire`] already pointed at the actor.
+    fn attach(dc: Arc<RTCDataChannel>) -> Self {
         Self {
             dc,
             next_id: 0,

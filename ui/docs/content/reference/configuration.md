@@ -81,6 +81,7 @@ property these gates exist for.
 | `hive_roots` | empty | Folders sessions may run in, checked on the resolved path. **Empty means nowhere** |
 | `hive_max_sessions` | `4` | Sessions this machine runs at once |
 | `hive_api_key_helper` | unset | A command **the daemon** runs (as SYSTEM/root) to print the model API key. Sessions never see the key: each gets a token for this machine's loopback model sidecar, good only for that session's model calls while it runs here — not for anything else the key opens, such as files or batches. Unset means sessions have no model access |
+| `hive_api_workspace_id` | unset | For a model key that is not scoped to a workspace: the workspace its calls are made in. The sidecar sends it as `anthropic-workspace-id` with every call, alongside the key; sessions never set it. Leave unset for a workspace-scoped key |
 
 :::danger These are the gates the server cannot write
 Every one of the settings above is device-owned. That is the property that makes
