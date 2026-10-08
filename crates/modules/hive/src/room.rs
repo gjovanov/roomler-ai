@@ -23,7 +23,7 @@ use crate::HiveState;
 use crate::model::{AgentApproval, AgentSession, TurnStub};
 
 /// The module id rooms and stubs are bound to.
-const MODULE: &str = "hive";
+pub(crate) const MODULE: &str = "hive";
 
 /// The room's path: unique by construction (the session id), so a session
 /// named like an existing room cannot collide with it.
@@ -157,13 +157,19 @@ pub(crate) async fn turn_stub(state: &HiveState, s: &AgentSession, r: TurnReport
     let (Some(sid), Some(room)) = (s.id, s.room_id) else {
         return;
     };
+    // Who asked is the DEVICE's word, like who answered an approval: only a
+    // driver's prompt is taken, so a stub never names anyone else (P1c).
     let asked_by = match r.prompted_by {
-        Some(uid) => state
+        Some(uid) if s.drives(uid) => state
             .users
             .find_display_names(&[uid])
             .await
             .ok()
             .and_then(|m| m.get(&uid).cloned()),
+        Some(uid) => {
+            warn!(session = %sid, by = %uid, "hive: a turn asked by someone who is not a driver — the claim is dropped");
+            None
+        }
         None => None,
     };
     let text = stub_text(&r, asked_by.as_deref());
@@ -242,11 +248,11 @@ pub(crate) async fn approval(state: &HiveState, s: &AgentSession, r: ApprovalRep
     if approval_id.is_empty() {
         return;
     }
-    // In P1 the starter is the one driver, and only a driver's answer is
-    // taken on the device — so a device naming anyone else is not believed,
-    // and no stub says that person allowed anything.
+    // Only a driver's answer is taken on the device — so a device naming
+    // anyone else is not believed, and no stub says that person allowed
+    // anything (P1c: the owner, or a driver the owner named).
     let answered_by = r.answered_by.filter(|by| {
-        let driver = *by == s.owner_id;
+        let driver = s.drives(*by);
         if !driver {
             warn!(session = %sid, by = %by, "hive: an approval answered by someone who is not a driver — the claim is dropped");
         }
@@ -448,10 +454,20 @@ pub(crate) async fn withdraw_approvals(state: &HiveState, s: &AgentSession) {
     }
 }
 
-/// Tell the session's drivers — in P1 its starter — that it waits for them.
-/// By web push too, wherever they are: a desk with the app open is not a
-/// phone in a pocket. It names the session, never the call.
+/// Tell the session's drivers that it waits for them — each one still in its
+/// room (P1c: one who left it answers nothing). By web push too, wherever
+/// they are: a desk with the app open is not a phone in a pocket. It names
+/// the session, never the call.
 async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, room: ObjectId) {
+    let mut drivers = Vec::new();
+    for d in s.all_drivers() {
+        if matches!(state.chat.is_member(s.tenant_id, room, d).await, Ok(true)) {
+            drivers.push(d);
+        }
+    }
+    if drivers.is_empty() {
+        return;
+    }
     let params = NotifyParams {
         tenant_id: s.tenant_id,
         notification_type: NotificationType::ApprovalRequest,
@@ -465,7 +481,7 @@ async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, roo
         },
         ws_type_label: "approval_request",
     };
-    roomler_core::notify::notify_users(&state.core, &params, &[s.owner_id], PushTo::Everyone).await;
+    roomler_core::notify::notify_users(&state.core, &params, &drivers, PushTo::Everyone).await;
 }
 
 /// The approval's stub as markdown: THAT the session waits for a driver, and

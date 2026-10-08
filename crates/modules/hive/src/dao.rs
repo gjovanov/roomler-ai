@@ -79,6 +79,60 @@ impl AgentSessionDao {
         self.base.find_one(doc! { "_id": id }).await
     }
 
+    /// One session of `tenant_id`, whoever started it — for a route that then
+    /// decides who may see it ([`crate::access`]). Another org's id is
+    /// `NotFound`.
+    pub async fn find_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<AgentSession> {
+        self.base
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
+            .await?
+            .ok_or(DaoError::NotFound)
+    }
+
+    /// FR-90 P1c — name `user` a driver of a session `owner_id` started, or
+    /// stop them driving it. Adding is held to [`crate::model::MAX_DRIVERS`]
+    /// by the filter itself, so two owners' tabs racing cannot pass the cap.
+    /// `false` = no such session of the owner's, or the cap is reached.
+    pub async fn set_driver(
+        &self,
+        tenant_id: ObjectId,
+        owner_id: ObjectId,
+        id: ObjectId,
+        user: ObjectId,
+        drives: bool,
+    ) -> DaoResult<bool> {
+        let mut filter = doc! { "_id": id, "tenant_id": tenant_id, "owner_id": owner_id };
+        let update = if drives {
+            filter.insert(
+                format!("drivers.{}", crate::model::MAX_DRIVERS - 1),
+                doc! { "$exists": false },
+            );
+            doc! { "$addToSet": { "drivers": user } }
+        } else {
+            doc! { "$pull": { "drivers": user } }
+        };
+        self.base.update_one(filter, update).await
+    }
+
+    /// FR-90 P1c — `user` drives nothing in `tenant_id` any more: they left
+    /// or were removed from the org. Returns how many sessions named them.
+    pub async fn drop_driver_everywhere(
+        &self,
+        tenant_id: ObjectId,
+        user: ObjectId,
+    ) -> DaoResult<u64> {
+        self.base
+            .update_many(
+                doc! { "tenant_id": tenant_id, "drivers": user },
+                doc! { "$pull": { "drivers": user } },
+            )
+            .await
+    }
+
     /// The device answered the start: accepted. Only an UNANSWERED start
     /// moves (`accepted_at` unset — a duplicate answer, the device having
     /// seen the start twice after a reconnect, changes nothing), and a stop
