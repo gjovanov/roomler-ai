@@ -210,6 +210,231 @@ pub(crate) fn floor_safe(
     !non_overlay_v4.iter().copied().any(inside) && !orig_gateway_v4.is_some_and(inside)
 }
 
+/// macOS — one `route -n get` answer, reduced to the three fields a re-assert
+/// decides on. BSD `route` prints `key: value` lines; a host route has no
+/// `mask:` line, a lookup that fell through prints the COVERING route
+/// (`destination: default`), and one that matched nothing at all prints no
+/// `destination:` (`not in table`) ⇒ `None`.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BsdRouteGet {
+    pub(crate) destination: String,
+    pub(crate) mask: Option<String>,
+    pub(crate) interface: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_bsd_route_get(out: &str) -> Option<BsdRouteGet> {
+    let (mut destination, mut mask, mut interface) = (None, None, None);
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("destination:") {
+            destination = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("mask:") {
+            mask = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("interface:") {
+            interface = Some(v.trim().to_string());
+        }
+    }
+    destination.map(|destination| BsdRouteGet {
+        destination,
+        mask,
+        interface,
+    })
+}
+
+/// Is the route a `route -n get` for `dest/plen` matched EXACTLY our route on
+/// `if_name` — same destination, same prefix length, same interface?
+///
+/// #1856 — BSD `route` has no idempotent write: re-asserting a route meant
+/// delete-then-add, two processes apart, and the guard did that for every
+/// peer on every wave. Between the two the `/32` does not exist, and a socket
+/// BOUND to the overlay address (WebRTC's host candidate on the utun) gets
+/// `EHOSTUNREACH` from macOS's interface-scoped route lookup instead of
+/// falling through to the default route. Measured on the MacBook (0.4.117):
+/// a 2.5–3.0 ms hole in every peer's route every 3 s — and each hole's
+/// RTM_DELETE/RTM_ADD fed `route -n monitor`, which armed the next wave.
+/// Remote-desktop sessions riding the overlay died a few seconds in, over and
+/// over. Skipping a route that is already ours is what Linux's
+/// `ip route replace` and Windows' `winroute::ensure` already do.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn bsd_route_is_ours(
+    got: Option<&BsdRouteGet>,
+    dest: std::net::IpAddr,
+    plen: u8,
+    if_name: &str,
+) -> bool {
+    let Some(got) = got else {
+        return false;
+    };
+    if got.destination.parse::<std::net::IpAddr>().ok() != Some(dest) {
+        return false;
+    }
+    let host_plen = if dest.is_ipv4() { 32 } else { 128 };
+    let got_plen = match got.mask.as_deref() {
+        // `route -n get` prints no mask for a host route.
+        None => Some(host_plen),
+        Some(m) => m
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|m| m.is_ipv4() == dest.is_ipv4())
+            .and_then(mask_plen),
+    };
+    got_plen == Some(plen) && got.interface.as_deref() == Some(if_name)
+}
+
+/// The prefix length of a contiguous netmask; `None` for a non-contiguous one.
+#[cfg(any(target_os = "macos", test))]
+fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
+    let (ones, total) = match mask {
+        std::net::IpAddr::V4(m) => {
+            let bits = u32::from(m);
+            (bits.leading_ones(), bits.count_ones())
+        }
+        std::net::IpAddr::V6(m) => {
+            let bits = u128::from(m);
+            (bits.leading_ones(), bits.count_ones())
+        }
+    };
+    (ones == total).then_some(ones as u8)
+}
+
+#[cfg(test)]
+mod bsd_route_tests {
+    use super::{BsdRouteGet, bsd_route_is_ours, parse_bsd_route_get};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The answers below are verbatim `route -n get` output from the field
+    /// MacBook (macOS 27.0.1), recvpipe table omitted.
+    const OURS_HOST: &str = "   route to: 100.65.4.2
+destination: 100.65.4.2
+  interface: utun0
+      flags: <UP,HOST,DONE,STATIC>
+";
+    const FELL_TO_DEFAULT: &str = "   route to: 100.65.4.99
+destination: default
+       mask: default
+    gateway: 192.168.8.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+";
+    const LAN_NET: &str = "   route to: 192.168.8.0
+destination: 192.168.8.0
+       mask: 255.255.255.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>
+";
+    const OURS_V6_NET: &str = "   route to: fd72:6f6f:6d6c::6441:400
+destination: fd72:6f6f:6d6c::6441:400
+       mask: ffff:ffff:ffff:ffff:ffff:ffff:ffff:fc00
+  interface: utun0
+      flags: <UP,DONE,PRCLONING>
+";
+
+    #[test]
+    fn parses_host_net_and_not_in_table() {
+        assert_eq!(
+            parse_bsd_route_get(OURS_HOST),
+            Some(BsdRouteGet {
+                destination: "100.65.4.2".into(),
+                mask: None,
+                interface: Some("utun0".into()),
+            })
+        );
+        let lan = parse_bsd_route_get(LAN_NET).unwrap();
+        assert_eq!(lan.mask.as_deref(), Some("255.255.255.0"));
+        assert_eq!(lan.interface.as_deref(), Some("en0"));
+        // `route: writing to routing socket: not in table` goes to stderr;
+        // stdout is empty.
+        assert_eq!(parse_bsd_route_get(""), None);
+    }
+
+    /// The case the fix exists for: our `/32` already on our utun ⇒ leave it
+    /// alone. Every other shape must still be (re-)installed.
+    #[test]
+    fn only_our_exact_route_is_left_alone() {
+        let ours = parse_bsd_route_get(OURS_HOST);
+        assert!(bsd_route_is_ours(
+            ours.as_ref(),
+            ip("100.65.4.2"),
+            32,
+            "utun0"
+        ));
+        // Same /32 on ANOTHER interface — a competing VPN route, or our own
+        // from a utun the daemon has since replaced.
+        assert!(!bsd_route_is_ours(
+            ours.as_ref(),
+            ip("100.65.4.2"),
+            32,
+            "utun5"
+        ));
+        // The lookup for an absent peer falls through to the default route.
+        let fell = parse_bsd_route_get(FELL_TO_DEFAULT);
+        assert!(!bsd_route_is_ours(
+            fell.as_ref(),
+            ip("100.65.4.99"),
+            32,
+            "utun0"
+        ));
+        // Nothing matched at all.
+        assert!(!bsd_route_is_ours(None, ip("100.65.4.99"), 32, "utun0"));
+    }
+
+    #[test]
+    fn net_routes_compare_destination_and_prefix_length() {
+        let v6 = parse_bsd_route_get(OURS_V6_NET);
+        let net = ip("fd72:6f6f:6d6c::6441:400");
+        assert!(bsd_route_is_ours(v6.as_ref(), net, 118, "utun0"));
+        // A covering route with the same network address is not this prefix.
+        assert!(!bsd_route_is_ours(v6.as_ref(), net, 96, "utun0"));
+        let lan = parse_bsd_route_get(LAN_NET);
+        assert!(bsd_route_is_ours(
+            lan.as_ref(),
+            ip("192.168.8.0"),
+            24,
+            "en0"
+        ));
+        assert!(!bsd_route_is_ours(
+            lan.as_ref(),
+            ip("192.168.8.0"),
+            16,
+            "en0"
+        ));
+        // A host route is not our net route of the same address.
+        let host = parse_bsd_route_get(OURS_HOST);
+        assert!(!bsd_route_is_ours(
+            host.as_ref(),
+            ip("100.65.4.2"),
+            24,
+            "utun0"
+        ));
+        // A garbage or non-contiguous mask never reads as ours.
+        let odd = BsdRouteGet {
+            destination: "10.66.0.0".into(),
+            mask: Some("255.0.255.0".into()),
+            interface: Some("utun0".into()),
+        };
+        assert!(!bsd_route_is_ours(Some(&odd), ip("10.66.0.0"), 16, "utun0"));
+        // A split-default half: `0.0.0.0/1` must not match the default route
+        // even though macOS could print its destination as `0.0.0.0`.
+        let default_as_zero = BsdRouteGet {
+            destination: "0.0.0.0".into(),
+            mask: Some("0.0.0.0".into()),
+            interface: Some("utun0".into()),
+        };
+        assert!(!bsd_route_is_ours(
+            Some(&default_as_zero),
+            ip("0.0.0.0"),
+            1,
+            "utun0"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod floor_tests {
     use std::net::Ipv4Addr;
@@ -3098,10 +3323,33 @@ mod system {
             }
             #[cfg(target_os = "macos")]
             {
+                // #1856 — every wave re-asserts every peer, and the
+                // delete-then-add below leaves the `/32` absent for ~3 ms in
+                // between. A socket bound to our overlay address gets
+                // EHOSTUNREACH in that hole, and the write itself feeds the
+                // route monitor that arms the next wave. A route that is
+                // already ours is left alone.
+                if super::bsd_route_is_ours(
+                    bsd_route_get(vec![
+                        "-n".into(),
+                        "get".into(),
+                        "-inet".into(),
+                        peer.to_string(),
+                    ])
+                    .await
+                    .as_ref(),
+                    std::net::IpAddr::V4(peer),
+                    32,
+                    &self.if_name,
+                ) {
+                    return Ok(());
+                }
                 // BSD `route` has no idempotent form: `add` fails once the
                 // entry exists. Delete-then-add is the portable equivalent
                 // of `ip route replace`, and the delete is expected to fail
                 // on the first call — its result is deliberately ignored.
+                // A hole here costs nothing: this peer's traffic was not
+                // reaching the overlay anyway.
                 let _ = run_cmd(
                     "route",
                     vec![
@@ -3272,6 +3520,24 @@ mod system {
                 // reason as the peer `/32`s: `add` is not idempotent.
                 let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
                 let family = if v6 { "-inet6" } else { "-inet" };
+                // #1856 — and skipped for the same reason as the peer `/32`s:
+                // the exit `/1`s are re-asserted on every wave, and a hole in
+                // them sends that instant's egress out the physical uplink.
+                if let (Ok(dest), Ok(len)) = (net.parse::<std::net::IpAddr>(), plen.parse::<u8>()) {
+                    let got = bsd_route_get(vec![
+                        "-n".into(),
+                        "get".into(),
+                        family.into(),
+                        "-net".into(),
+                        net.into(),
+                        "-prefixlen".into(),
+                        plen.into(),
+                    ])
+                    .await;
+                    if super::bsd_route_is_ours(got.as_ref(), dest, len, &self.if_name) {
+                        return Ok(());
+                    }
+                }
                 let mut del: Vec<String> = vec![
                     "-n".into(),
                     "delete".into(),
@@ -4138,6 +4404,23 @@ mod system {
         .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 
+    /// macOS — run one `route -n get …` and parse what it matched. `None` on
+    /// any failure, which every caller reads as "not ours" and so falls back
+    /// to the write it always did. A lookup is never a table change (#1856).
+    #[cfg(target_os = "macos")]
+    async fn bsd_route_get(args: Vec<String>) -> Option<super::BsdRouteGet> {
+        tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new("route")
+                .args(&args)
+                .output()
+                .ok()?;
+            super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// The host's original default route — the gateway + interface that carried
     /// its traffic BEFORE the overlay installed any route. Captured once in
     /// [`SystemTun::up`]; used to pin exit-node exemption `/32`s via the real
@@ -4967,5 +5250,110 @@ mod macos_kernel_tests {
             !mentions(&routes, "100.65.0.9"),
             "a deleted peer route must be gone:\n{routes}"
         );
+    }
+
+    /// #1856 — the route guard re-asserts every installed route on every
+    /// wave. Re-asserting a route that is already ours must not WRITE: the
+    /// old delete-then-add left the `/32` absent for ~3 ms per wave (an
+    /// overlay-bound socket gets EHOSTUNREACH in that hole), and each write
+    /// fed `route -n monitor`, which armed the next wave, every 3 s forever.
+    /// Watches the routing socket while the guard re-asserts, and then
+    /// checks that a route that is NOT ours is still repaired.
+    #[tokio::test]
+    async fn reasserting_our_routes_writes_nothing_and_still_repairs_foreign_ones() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let peer = Ipv4Addr::new(100, 65, 0, 9);
+        tun.add_peer_route(peer).await.expect("peer route");
+        tun.add_cidr_route("10.66.0.0/16")
+            .await
+            .expect("cidr route");
+
+        // Our own child, killed by its own handle — never by pattern: the
+        // daemon's netstate backend is a `route -n monitor` too.
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.add_peer_route(peer)
+                .await
+                .expect("re-assert peer route");
+            tun.add_cidr_route("10.66.0.0/16")
+                .await
+                .expect("re-assert cidr route");
+        }
+        // Positive control: a write the monitor MUST see, so the absence
+        // asserted below cannot come from a monitor that saw nothing.
+        sh(
+            "route",
+            &["-n", "add", "-inet", "100.65.0.250", "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", "100.65.0.250"]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        // One block per routing message, opened by its `got message` banner.
+        let is_write = |block: &str| {
+            let kind = block.lines().find(|l| l.starts_with("RTM_")).unwrap_or("");
+            kind.starts_with("RTM_ADD")
+                || kind.starts_with("RTM_DELETE")
+                || kind.starts_with("RTM_CHANGE")
+        };
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| is_write(b) && mentions(b, "100.65.0.250")),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        // Only our two destinations count: the runner's own ARP churn is
+        // not ours to judge.
+        let writes: Vec<&str> = blocks
+            .iter()
+            .copied()
+            .filter(|b| {
+                is_write(b)
+                    && (mentions(b, "100.65.0.9")
+                        || mentions(b, "10.66.0.0")
+                        || mentions(b, "10.66"))
+            })
+            .collect();
+        assert!(
+            writes.is_empty(),
+            "re-asserting routes that are already ours must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        // A route that is NOT ours is still taken back: the same /32, but
+        // via loopback, as a competing product's capture would look.
+        sh("route", &["-n", "delete", "-inet", "100.65.0.9"]);
+        sh(
+            "route",
+            &["-n", "add", "-inet", "100.65.0.9", "-interface", "lo0"],
+        );
+        tun.add_peer_route(peer).await.expect("repair peer route");
+        let got = sh("route", &["-n", "get", "100.65.0.9"]);
+        assert!(
+            got.lines()
+                .any(|l| l.trim() == format!("interface: {iface}")),
+            "a foreign /32 must be repointed at {iface}:\n{got}"
+        );
+
+        tun.del_cidr_route("10.66.0.0/16").await;
+        tun.del_peer_route(peer).await;
     }
 }
