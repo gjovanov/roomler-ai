@@ -20,6 +20,7 @@ import {
   renderHead,
   renderSearchDialog,
   renderTopbar,
+  type OgImage,
   type ShellNav,
   type SiteAssets,
 } from './shell.ts'
@@ -30,6 +31,10 @@ export interface BlogCtx {
   nav: ShellNav
   /** Tags with a listing page (at MIN_POSTS_PER_TAG_INDEX or more posts). */
   tagIndexed: Set<string>
+  /** The share image of a listing page (index, tag). Absent = the site's
+   *  default under `/docs/assets/`; FR-91's blog-only build names its own copy
+   *  under `/blog/assets/`, so the lane never depends on the image's assets. */
+  ogImage?: OgImage
 }
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
@@ -284,7 +289,7 @@ export function renderBlogIndex(ctx: IndexCtx): string {
     description: BLOG_DESCRIPTION,
     canonical: self,
     noindex: false,
-    og: { type: 'website', title: BLOG_TITLE },
+    og: { type: 'website', title: BLOG_TITLE, image: ctx.ogImage },
     jsonLd: graph([
       organization(),
       blog({
@@ -330,7 +335,7 @@ export function renderBlogTag(ctx: TagCtx): string {
     description: `Every post on the ${BLOG_TITLE} tagged “${ctx.tag}”.`,
     canonical: `${SITE_ORIGIN}${url}`,
     noindex: false,
-    og: { type: 'website', title: `Posts tagged “${ctx.tag}”` },
+    og: { type: 'website', title: `Posts tagged “${ctx.tag}”`, image: ctx.ogImage },
     jsonLd: graph([organization(), breadcrumbList(crumbs)]),
     assets: ctx.assets,
     feed: true,

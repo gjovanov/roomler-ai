@@ -4,7 +4,7 @@
  * FR-87 (#1776) — the sitemap index, its urlsets, robots.txt.
  */
 import { describe, expect, it } from 'vitest'
-import { atomFeed, feedHtml, newest, robotsTxt, sitemapIndex, urlset, xmlEscape, type FeedInput } from '../theme/xml.ts'
+import { atomFeed, feedHtml, newest, robotsTxt, sitemapChildren, sitemapIndex, urlset, xmlEscape, type FeedInput } from '../theme/xml.ts'
 
 /** Parsed by a real XML parser (jsdom's), so "well-formed" is checked, not assumed. */
 function parseXml(xml: string): Document {
@@ -104,6 +104,35 @@ describe('sitemapIndex', () => {
 
   it('leaves a child undated when none of its pages is dated', () => {
     expect(newest([{ loc: 'x' }, { loc: 'y' }])).toBeUndefined()
+  })
+})
+
+// FR-91 (#1880): with the blog lane on, the image no longer knows the blog's
+// newest date, so the index lists the blog child UNDATED and unconditionally.
+describe('sitemapChildren', () => {
+  const O = 'https://roomler.ai'
+  const docs = [{ loc: `${O}/`, lastmod: '2026-10-01' }, { loc: `${O}/docs/`, lastmod: '2026-10-05' }]
+  const blog = [{ loc: `${O}/blog/`, lastmod: '2026-09-29' }]
+
+  it('lane off, no posts: the docs child only (what the site was before the blog)', () => {
+    expect(sitemapChildren(O, docs, [], { hasBlog: false, blogLane: false })).toEqual([
+      { loc: `${O}/sitemap-docs.xml`, lastmod: '2026-10-05' },
+    ])
+  })
+
+  it('lane off, with posts: the blog child dated by its newest post (FR-87, unchanged)', () => {
+    expect(sitemapChildren(O, docs, blog, { hasBlog: true, blogLane: false })).toEqual([
+      { loc: `${O}/sitemap-docs.xml`, lastmod: '2026-10-05' },
+      { loc: `${O}/sitemap-blog.xml`, lastmod: '2026-09-29' },
+    ])
+  })
+
+  it('lane on: the blog child is listed WITHOUT a lastmod, posts or not', () => {
+    for (const hasBlog of [true, false]) {
+      const children = sitemapChildren(O, docs, hasBlog ? blog : [], { hasBlog, blogLane: true })
+      expect(children).toEqual([{ loc: `${O}/sitemap-docs.xml`, lastmod: '2026-10-05' }, { loc: `${O}/sitemap-blog.xml` }])
+      expect(sitemapIndex(children)).toContain('<loc>https://roomler.ai/sitemap-blog.xml</loc>\n  </sitemap>')
+    }
   })
 })
 
