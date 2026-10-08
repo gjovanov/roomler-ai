@@ -91,7 +91,8 @@ describe('HiveTranscript — approvals (FR-90 P1a)', () => {
     const w = await render()
     const card = w.find('[data-approval="a1"]')
     expect(card.text()).toContain('Bash needs approval to run')
-    expect(card.text()).toContain('"command": "whoami"')
+    // P1f — the command the driver is asked about, as a command line.
+    expect(card.find('[data-testid="hive-command"]').text()).toBe('$ whoami')
     await button(w, 'hive-approve').trigger('click')
     await flushPromises()
     expect(hoisted.viewer.answer).toHaveBeenCalledWith('a1', 'allow', undefined)
@@ -146,6 +147,52 @@ describe('HiveTranscript — approvals (FR-90 P1a)', () => {
     const card = w.find('[data-approval="a1"]')
     expect(card.find('img').exists()).toBe(false)
     expect(card.text()).toContain('<img src=x onerror=')
+  })
+})
+
+describe('HiveTranscript — tool calls (FR-90 P1f)', () => {
+  const edit = { file_path: '/w/notes.txt', old_string: 'beta', new_string: 'BETA' }
+
+  it('draws a call that waited for an approval by its approval card, its result after the answer', async () => {
+    hoisted.viewer = makeViewer(
+      [
+        { kind: 'tool_use', id: 't1', name: 'Edit', input: edit },
+        { kind: 'approval_requested', id: 'a1', tool_name: 'Edit', tool_use_id: 't1', input: edit },
+        { kind: 'approval_resolved', id: 'a1', outcome: 'allowed', by: 'Olga' },
+        { kind: 'tool_result', tool_use_id: 't1', ok: true, output: 'The file /w/notes.txt has been updated.' },
+      ],
+      [],
+      true,
+    )
+    const w = await render()
+    // One card for the call: the approval's, with the edit as a diff.
+    expect(w.findAll('[data-testid="hive-tool"]')).toHaveLength(0)
+    const rows = w.findAll('[data-approval="a1"] .hive-diff-row')
+    expect(rows.map((r) => r.attributes('data-kind'))).toEqual(['del', 'add'])
+    // In the order it happened: the card, the answer, then what the edit said.
+    const kinds = w.findAll('.hive-event').map((e) => e.attributes('data-kind'))
+    expect(kinds).toEqual(['approval_requested', 'approval_resolved', 'tool_result'])
+    expect(w.find('[data-testid="hive-tool-line"]').text()).toBe('The file /w/notes.txt has been updated.')
+  })
+
+  it('draws any other call with its result under it, once', async () => {
+    hoisted.viewer = makeViewer(
+      [
+        { kind: 'tool_use', id: 't2', name: 'Bash', input: { command: 'echo hi' } },
+        { kind: 'tool_result', tool_use_id: 't2', ok: true, output: 'hi\n' },
+        { kind: 'tool_result', tool_use_id: 'before-the-window', ok: true, output: 'from earlier\n' },
+      ],
+      [],
+      true,
+    )
+    const w = await render()
+    const card = w.find('[data-testid="hive-tool"]')
+    expect(card.find('[data-testid="hive-command"]').text()).toBe('$ echo hi')
+    expect(card.find('[data-testid="hive-ansi"]').text()).toBe('hi')
+    // Only the result whose call is not loaded stands alone.
+    const alone = w.findAll('.hive-event[data-kind="tool_result"]')
+    expect(alone).toHaveLength(1)
+    expect(alone[0].text()).toContain('from earlier')
   })
 })
 
