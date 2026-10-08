@@ -21,7 +21,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tunnel_core::env::node_env;
 
 /// GitHub "Releases" repo slug. Centralised here so a fork can redirect
@@ -189,6 +189,149 @@ pub fn decide_defer(active: usize, net_transition: bool, consecutive_defers: u32
         DeferDecision::ForceAfterDefers
     } else {
         DeferDecision::DeferOnce
+    }
+}
+
+/// FR-90 P1d-1 (AC7) — what the updater does about running agent turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWait {
+    /// No turn running: go ahead.
+    Proceed,
+    /// Turns running and time left: wait.
+    Wait,
+    /// Turns still running after the whole wait: go ahead, cutting them.
+    Cut,
+}
+
+/// Decide about `running` agent turns after `waited` of at most `max`. Pure
+/// — tested directly. `max` zero cuts at once: the owner's choice.
+pub fn decide_turn_wait(running: usize, waited: Duration, max: Duration) -> TurnWait {
+    if running == 0 {
+        TurnWait::Proceed
+    } else if waited >= max {
+        TurnWait::Cut
+    } else {
+        TurnWait::Wait
+    }
+}
+
+/// How often the updater looks again while agent turns run.
+const TURN_POLL: Duration = Duration::from_secs(5);
+/// How often a deferral for agent turns is logged while it lasts.
+const TURN_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// The agent sessions mid-turn (ids), as the Hive supervisor sees them; none
+/// in a build without agent sessions.
+fn agent_turns_running() -> Vec<String> {
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    {
+        crate::hive::turns_running()
+            .into_iter()
+            .map(|s| s.to_hex())
+            .collect()
+    }
+    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// The device's `hive_update_wait_secs`; zero without agent sessions.
+fn agent_turn_wait() -> Duration {
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    {
+        crate::hive::update_wait()
+    }
+    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    {
+        Duration::ZERO
+    }
+}
+
+/// Hold (or release) new agent prompts and starts around an install.
+fn hold_agent_prompts(hold: bool) {
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    {
+        if hold {
+            crate::hive::begin_update();
+        } else {
+            crate::hive::end_update();
+        }
+    }
+    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    {
+        let _ = hold;
+    }
+}
+
+/// FR-90 P1d-1 (AC7) — wait for running agent turns before an installer
+/// restarts the daemon, and with it every session's harness: at most the
+/// device's `hive_update_wait_secs` (30 min by default), the deferral logged
+/// when it starts and once a minute while it lasts. A turn is a person's work
+/// in progress, so this holds a PUSHED update too — unlike a transfer — and
+/// it is bounded, so a busy session cannot hold the device's updates back.
+///
+/// Once no turn runs, new prompts and starts are refused
+/// ([`crate::hive::begin_update`]) BEFORE a last look, so none begins in the
+/// gap; a prompt admitted before that still runs, and is waited for.
+/// `false` = the daemon is shutting down instead.
+async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    let max = agent_turn_wait();
+    let started = Instant::now();
+    let mut logged: Option<Instant> = None;
+    let mut held = false;
+    loop {
+        let running = agent_turns_running();
+        if running.is_empty() && !held {
+            // Hold new prompts first, then look once more: a prompt that
+            // arrived between the two looks began a turn to wait for.
+            hold_agent_prompts(true);
+            held = true;
+            continue;
+        }
+        let waited = started.elapsed();
+        match decide_turn_wait(running.len(), waited, max) {
+            TurnWait::Proceed => {
+                if logged.is_some() {
+                    tracing::info!(
+                        waited_secs = waited.as_secs(),
+                        "auto-updater: the agent turns are done — installing"
+                    );
+                }
+                return true;
+            }
+            TurnWait::Cut => {
+                hold_agent_prompts(true);
+                tracing::warn!(
+                    waited_secs = waited.as_secs(),
+                    turns = running.len(),
+                    sessions = ?running,
+                    "auto-updater: agent turns still running after the whole wait — installing anyway, which cuts them"
+                );
+                return true;
+            }
+            TurnWait::Wait => {
+                if logged.is_none_or(|t| t.elapsed() >= TURN_LOG_EVERY) {
+                    tracing::info!(
+                        turns = running.len(),
+                        sessions = ?running,
+                        waited_secs = waited.as_secs(),
+                        max_secs = max.as_secs(),
+                        "auto-updater: update deferred — agent turns running"
+                    );
+                    logged = Some(Instant::now());
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(TURN_POLL) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    hold_agent_prompts(false);
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1174,6 +1317,18 @@ pub fn spawn_installer_with_watch(
     installer_path: &std::path::Path,
     expected_version: Option<&str>,
 ) -> Result<()> {
+    // FR-90 P1d-1 — a DEBUG build under ROOMLERD_UPDATE_DRY_RUN installs
+    // nothing by ANY path. The periodic and pushed updates stop earlier, in
+    // `act_on_outcome`; this also covers the crash-loop rollback and the CLI.
+    // Its field checks run on workstations whose packaged daemon must not be
+    // replaced. Not compiled into a release build.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ROOMLERD_UPDATE_DRY_RUN").is_some() {
+        bail!(
+            "ROOMLERD_UPDATE_DRY_RUN is set: this debug build installs nothing ({})",
+            installer_path.display()
+        );
+    }
     // Touch the cooldown marker BEFORE spawning the installer. The
     // run_periodic loop in any newly-spawned sibling worker (typical
     // under SCM supervision) reads this marker on its first iteration
@@ -2242,6 +2397,21 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
             latest,
             installer_path,
         } => {
+            // FR-90 P1d-1 — a DEBUG build's field check of the wait: it
+            // downloads and waits exactly as a real update does, then installs
+            // nothing (a debug daemon on a workstation must not replace the
+            // packaged one there). Not compiled into a release build.
+            #[cfg(debug_assertions)]
+            if std::env::var_os("ROOMLERD_UPDATE_DRY_RUN").is_some() {
+                tracing::warn!(
+                    current = %current,
+                    latest = %latest,
+                    path = %installer_path.display(),
+                    "auto-updater: DRY RUN — would spawn the installer now; nothing installed"
+                );
+                hold_agent_prompts(false);
+                return false;
+            }
             tracing::warn!(
                 current = %current,
                 latest = %latest,
@@ -2250,6 +2420,8 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
             );
             if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
                 tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
+                // FR-90 P1d-1 — no restart is coming: take agent prompts again.
+                hold_agent_prompts(false);
                 // A failed install is otherwise INVISIBLE: the version the
                 // server sees simply never moves, which reads as "the update
                 // button does nothing". Raise the same operator sentinel the
@@ -2379,6 +2551,14 @@ pub async fn run_periodic(
                 None => check_once().await,
             };
             let retry = recheck_after(&outcome, &mut transport_failures, interval);
+            // FR-90 P1d-1 — even a pushed update waits for running agent
+            // turns (bounded): a person asked for the update, not for their
+            // agent to be cut mid-step.
+            if matches!(outcome, CheckOutcome::UpdateReady { .. })
+                && !wait_for_agent_turns(&mut shutdown).await
+            {
+                return;
+            }
             if act_on_outcome(outcome, &shutdown_tx) {
                 return;
             }
@@ -2432,6 +2612,12 @@ pub async fn run_periodic(
 
         let outcome = check_once().await;
         let retry = recheck_after(&outcome, &mut transport_failures, interval);
+        // FR-90 P1d-1 — AC7: the installer waits for running agent turns.
+        if matches!(outcome, CheckOutcome::UpdateReady { .. })
+            && !wait_for_agent_turns(&mut shutdown).await
+        {
+            return;
+        }
         if act_on_outcome(outcome, &shutdown_tx) {
             return;
         }
@@ -3958,6 +4144,29 @@ mod tests {
         );
         // Both gates at once still just defers once per cycle.
         assert_eq!(decide_defer(2, true, 0), DeferDecision::DeferOnce);
+    }
+
+    /// FR-90 P1d-1 (AC7) — running agent turns hold an install, bounded: no
+    /// turn goes at once, a turn within the wait waits, a turn past it is
+    /// cut; a wait of zero (the owner's choice) cuts at once.
+    #[test]
+    fn decide_turn_wait_waits_for_turns_within_the_bound() {
+        let max = Duration::from_secs(1800);
+        assert_eq!(decide_turn_wait(0, Duration::ZERO, max), TurnWait::Proceed);
+        assert_eq!(
+            decide_turn_wait(0, Duration::from_secs(5000), max),
+            TurnWait::Proceed
+        );
+        assert_eq!(decide_turn_wait(1, Duration::ZERO, max), TurnWait::Wait);
+        assert_eq!(
+            decide_turn_wait(3, Duration::from_secs(1799), max),
+            TurnWait::Wait
+        );
+        assert_eq!(decide_turn_wait(1, max, max), TurnWait::Cut);
+        assert_eq!(
+            decide_turn_wait(1, Duration::ZERO, Duration::ZERO),
+            TurnWait::Cut
+        );
     }
 
     #[test]
