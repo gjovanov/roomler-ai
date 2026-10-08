@@ -196,7 +196,15 @@ import HiveToolCall from '@/components/hive/HiveToolCall.vue'
 import HiveToolInput from '@/components/hive/HiveToolInput.vue'
 import HiveToolResult from '@/components/hive/HiveToolResult.vue'
 
-const props = defineProps<{ sessionId: string; tenantId?: string }>()
+const props = withDefaults(
+  defineProps<{
+    sessionId: string
+    tenantId?: string
+    /** P1f-2 — how many events the transcript keeps while it follows the newest. */
+    keep?: number
+  }>(),
+  { tenantId: undefined, keep: 1000 },
+)
 const { t } = useI18n()
 const viewer = useHiveViewer()
 const shown = computed(() => withoutRepeatedInits(viewer.events.value))
@@ -340,6 +348,9 @@ watch(
   () => viewer.events.value.length,
   async () => {
     if (!nearBottom.value) return
+    // P1f-2 — following the newest, the page stays bounded: the oldest go
+    // back to the device. Never while someone reads further up.
+    viewer.trimEarlier(props.keep)
     await nextTick()
     const el = listRef.value
     if (el) el.scrollTop = el.scrollHeight
