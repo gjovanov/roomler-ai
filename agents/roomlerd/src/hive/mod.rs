@@ -59,6 +59,17 @@
 //! calls [`begin_shutdown`] the moment its shutdown is signalled: a harness
 //! that ends after that went down with it, its session is kept rather than
 //! ended, and what the device hosts is frozen for the next daemon to report.
+//!
+//! # Core memory (P1e)
+//!
+//! The server sends a session's core memory — facts people keep in the org's
+//! brain, rendered when the session was created — in `rc:hive.memory`, just
+//! before its start ([`handle_memory`]). It reaches the session only where
+//! the device's own `hive_core_memory` allows (default off): Claude Code
+//! reads `CLAUDE.md` as the user's own overriding instructions. The daemon
+//! writes the files into its own runtime directory, and the wrapper copies
+//! each one into the session's config directory AS THE ACCOUNT, only when
+//! nothing is there yet — so a resume keeps what the session has.
 
 pub mod framing;
 pub mod gates;
@@ -73,8 +84,8 @@ pub mod view;
 #[cfg(feature = "hive-test-launcher")]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
-    Author, StartOrder, Supervisor, begin_shutdown, begin_update, end_update, global, handle_start,
-    handle_stop, init, on_connected, turns_running, update_wait,
+    Author, CoreMemory, StartOrder, Supervisor, begin_shutdown, begin_update, end_update, global,
+    handle_memory, handle_start, handle_stop, init, on_connected, turns_running, update_wait,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{

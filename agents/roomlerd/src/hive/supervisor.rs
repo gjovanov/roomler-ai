@@ -67,7 +67,18 @@ const MAX_WAITING: usize = INPUT_QUEUE / 2;
 /// the daemon never writes into a tree that account owns), enters the folder,
 /// then becomes the harness. Arguments are positional — no value is ever
 /// interpolated into the script.
-const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && cd -- "$2" && shift 2 && exec "$@""#;
+///
+/// P1e — `$3`, when set, is the daemon-owned directory holding the session's
+/// core memory, and `$4` the session's auto-memory directory: each file is
+/// copied in AS THE ACCOUNT, and only when nothing is there yet — so a
+/// resume keeps what the session has (its own edits included). A copy that
+/// fails is skipped: memory never stops a session.
+const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then if [ -f "$3/CLAUDE.md" ] && [ ! -e "$1/CLAUDE.md" ] && [ ! -L "$1/CLAUDE.md" ]; then cp -- "$3/CLAUDE.md" "$1/CLAUDE.md" 2>/dev/null; fi; if [ -f "$3/MEMORY.md" ] && [ ! -e "$4/MEMORY.md" ] && [ ! -L "$4/MEMORY.md" ]; then mkdir -p -- "$4" 2>/dev/null && cp -- "$3/MEMORY.md" "$4/MEMORY.md" 2>/dev/null; fi; fi; true; } && cd -- "$2" && shift 4 && exec "$@""#;
+/// P1e — how long a session's core memory waits for its start's launch,
+/// and how many snapshots wait at once: the server sends one right before
+/// each start, so anything older or more is not waiting for anything.
+const MEMORY_WAIT: Duration = Duration::from_secs(10 * 60);
+const MEMORY_PENDING: usize = 64;
 /// Longest stdout line kept; a longer one is consumed and skipped, never
 /// buffered whole.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -113,6 +124,18 @@ pub struct StartOrder {
     pub user_email: String,
     pub caller: String,
     pub resume: bool,
+}
+
+/// FR-90 P1e — a session's core memory, as `rc:hive.memory` carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMemory {
+    pub session_id: ObjectId,
+    pub fence: u64,
+    pub brain_rev: u64,
+    /// The org's facts, then the starter's.
+    pub claude_md: Option<String>,
+    /// The device's facts, for the auto-memory index.
+    pub memory_md: Option<String>,
 }
 
 /// The device's answer to a start.
@@ -268,9 +291,24 @@ pub struct Supervisor {
     /// ends from now on went down with it, and its session is the next
     /// daemon's to resume.
     going_down: AtomicBool,
+    /// P1e — core memory waiting for its start's launch, by (session, fence).
+    memory: Mutex<HashMap<(ObjectId, u64), (CoreMemory, Instant)>>,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
+
+/// FR-90 P1e — `rc:hive.memory`: kept for its start's launch. The primary
+/// enrollment's only, like every Hive frame.
+pub fn handle_memory(m: CoreMemory, is_primary: bool) {
+    if !is_primary {
+        warn!(session = %m.session_id, "hive: rc:hive.memory ignored — not the primary enrollment");
+        return;
+    }
+    match global() {
+        Some(sup) => sup.receive_memory(m),
+        None => debug!(session = %m.session_id, "hive: rc:hive.memory with no supervisor"),
+    }
+}
 
 /// FR-90 P1d-2 — the daemon is stopping: an OS stop, a restart it asked for,
 /// or an update's. Called first thing on the way out. What its harnesses do
@@ -474,7 +512,43 @@ impl Supervisor {
             to_resume: Mutex::new(to_resume),
             resumed: tokio::sync::OnceCell::new(),
             going_down: AtomicBool::new(false),
+            memory: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// P1e — keep a session's core memory for its start's launch. A document
+    /// larger than any snapshot the server renders is no snapshot: dropped,
+    /// and said so.
+    pub(crate) fn receive_memory(&self, m: CoreMemory) {
+        use roomler_ai_remote_control::hive::hive_limits::MAX_CORE_MEMORY_BYTES;
+        let too_big = [&m.claude_md, &m.memory_md]
+            .iter()
+            .any(|d| d.as_ref().is_some_and(|s| s.len() > MAX_CORE_MEMORY_BYTES));
+        if too_big {
+            warn!(session = %m.session_id, "hive: core memory larger than any snapshot — dropped");
+            return;
+        }
+        let mut pending = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, (_, at)| at.elapsed() < MEMORY_WAIT);
+        if pending.len() >= MEMORY_PENDING
+            && let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| *k)
+        {
+            pending.remove(&oldest);
+        }
+        debug!(session = %m.session_id, rev = m.brain_rev, "hive: core memory received");
+        pending.insert((m.session_id, m.fence), (m, Instant::now()));
+    }
+
+    /// P1e — the core memory that came for this start, once.
+    fn take_memory(&self, session: ObjectId, fence: u64) -> Option<CoreMemory> {
+        self.memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(session, fence))
+            .map(|(m, _)| m)
     }
 
     /// Sessions running now.
@@ -1444,13 +1518,26 @@ impl Supervisor {
         let prior = self
             .hosted_get(order.session_id)
             .filter(|h| h.fence == order.fence);
+        // P1e — the core memory this start came with: shown to the session
+        // only where the device's owner allows it (`hive_core_memory`).
+        let memory = self.take_memory(order.session_id, order.fence);
+        let shown = memory.as_ref().filter(|_| self.cfg.core_memory);
         let (approvals_tx, approvals_rx) = mpsc::channel(APPROVAL_QUEUE);
         let Spawned {
             child,
             token,
             toolbelt,
             history,
-        } = self.spawn(order, account, folder, sidecar, approvals_tx)?;
+        } = self.spawn(order, account, folder, sidecar, approvals_tx, shown)?;
+        if let Some(m) = &memory {
+            store.append(
+                &order.session_id.to_hex(),
+                order.fence,
+                TranscriptEvent::Note {
+                    text: memory_note(m, self.cfg.core_memory),
+                },
+            );
+        }
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -1529,6 +1616,7 @@ impl Supervisor {
         folder: &Path,
         sidecar: Option<u16>,
         approvals: mpsc::Sender<ApprovalEvent>,
+        memory: Option<&CoreMemory>,
     ) -> Result<Spawned, (HiveRefusal, String)> {
         // The account the session runs as: its home, the ids its toolbelt
         // socket is handed to (`None`: it runs as the daemon), and its
@@ -1634,11 +1722,27 @@ impl Supervisor {
         spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
 
         let mut cmd = tokio::process::Command::new("/bin/sh");
+        // P1e — the core memory, into the daemon's own directory; the wrapper
+        // copies it in as the account. One that cannot be written is said
+        // in the log, and the session starts without it.
+        let memory_dir = memory.and_then(|m| match write_memory(&dir, m, owner) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!(session = %order.session_id, %e, "hive: core memory not written — the session starts without it");
+                None
+            }
+        });
         cmd.arg("-c")
             .arg(WRAPPER)
             .arg("roomler-hive")
             .arg(spec.config_dir())
             .arg(&spec.folder)
+            .arg(
+                memory_dir
+                    .as_deref()
+                    .map_or_else(Default::default, |d| d.as_os_str().to_os_string()),
+            )
+            .arg(spec.auto_memory_dir())
             .arg(&spec.harness)
             .args(spec.args());
         // A clean environment: none of the daemon's (root's, with its
@@ -1752,6 +1856,106 @@ fn write_doc(dir: &Path, name: &str, doc: &serde_json::Value) -> Result<PathBuf,
         .map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// P1e — `<runtime>/<sid>/memory/`, daemon-owned: the snapshot's files, each
+/// `0600` and handed to the session's account (`owner`; `None`: the session
+/// runs as the daemon), in a `0755` directory the account cannot change. The
+/// account reads them to copy them in; no other local account can, since a
+/// session's `CLAUDE.md` carries its starter's own facts. A document the
+/// snapshot does not carry is removed, so a file left by an earlier run can
+/// never be copied for this one. A link in its place is refused, never
+/// followed.
+fn write_memory(dir: &Path, m: &CoreMemory, owner: Option<(u32, u32)>) -> Result<PathBuf, String> {
+    let mem = dir.join("memory");
+    match std::fs::symlink_metadata(&mem) {
+        Ok(md) if !md.file_type().is_dir() => {
+            return Err(format!("{} is not a plain directory", mem.display()));
+        }
+        Ok(_) => {}
+        Err(_) => std::fs::create_dir(&mem).map_err(|e| format!("{}: {e}", mem.display()))?,
+    }
+    std::fs::set_permissions(&mem, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("{}: {e}", mem.display()))?;
+    for (name, body) in [("CLAUDE.md", &m.claude_md), ("MEMORY.md", &m.memory_md)] {
+        match body {
+            Some(text) => {
+                write_private_text(&mem, name, text, owner)?;
+            }
+            None => match std::fs::remove_file(mem.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", mem.join(name).display())),
+            },
+        }
+    }
+    Ok(mem)
+}
+
+/// `dir/name`, whole: written to a temporary name created afresh at `0600`
+/// (never through a link, nor into a file an earlier run left there),
+/// handed to `owner` through the open file, then renamed into place — so it
+/// is never readable by anyone else, not even while it is being written.
+fn write_private_text(
+    dir: &Path,
+    name: &str,
+    text: &str,
+    owner: Option<(u32, u32)>,
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let failed = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(failed(&tmp, e)),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| failed(&tmp, e))?;
+    f.write_all(text.as_bytes()).map_err(|e| failed(&tmp, e))?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| failed(&tmp, e))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(|e| failed(&tmp, e))?;
+    }
+    drop(f);
+    std::fs::rename(&tmp, &path).map_err(|e| failed(&path, e))?;
+    Ok(path)
+}
+
+/// P1e — what the transcript says about the core memory a start came with.
+fn memory_note(m: &CoreMemory, shown: bool) -> String {
+    if !shown {
+        return format!(
+            "This start came with the organization's core memory (brain revision {}); this \
+             device shows none to its sessions (hive_core_memory is off).",
+            m.brain_rev
+        );
+    }
+    let mut files = Vec::new();
+    if m.claude_md.is_some() {
+        files.push("CLAUDE.md");
+    }
+    if m.memory_md.is_some() {
+        files.push("the auto-memory MEMORY.md");
+    }
+    if files.is_empty() {
+        return format!(
+            "Core memory: brain revision {}, with nothing in it for this session.",
+            m.brain_rev
+        );
+    }
+    format!(
+        "Core memory from the organization's brain, revision {}: {}.",
+        m.brain_rev,
+        files.join(" and ")
+    )
 }
 
 /// Whether the account `uid` (with `groups`) may execute `path`: `x` on the
@@ -2374,6 +2578,11 @@ pub(crate) mod tests {
     /// in `.stdin` — what reached the harness (P1c-2) — and its pid in
     /// `.pid`.
     ///
+    /// P1e — before anything else, it copies the core memory it finds where
+    /// Claude Code reads it (`$CLAUDE_CONFIG_DIR/CLAUDE.md`, the auto-memory
+    /// `MEMORY.md`) to the folder's `.claude_md` and `.memory_md`: what this
+    /// harness was given.
+    ///
     /// P1d-2 — like Claude Code it keeps the session's history, from the
     /// first prompt on, at the path `LaunchSpec::history_path` names, and
     /// refuses the same two ways: `--session-id` for an id whose history
@@ -2381,6 +2590,8 @@ pub(crate) mod tests {
     /// prompts its history holds, so a test sees what a resumed process
     /// remembers.
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
+[ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ] && cp "$CLAUDE_CONFIG_DIR/CLAUDE.md" "$PWD/.claude_md"
+[ -f "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" ] && cp "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" "$PWD/.memory_md"
 printf '%s\n' "$@" > "$PWD/.argv"
 echo $$ > "$PWD/.pid"
 mode=""; sid=""; prev=""
@@ -2468,6 +2679,7 @@ done
             api_key_helper: None,
             api_workspace_id: None,
             update_wait: super::gates::DEFAULT_UPDATE_WAIT,
+            core_memory: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -4030,6 +4242,196 @@ done
             !turns.is_empty() && turns.iter().all(|t| t.turn == 3),
             "{turns:?}"
         );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    // ─── P1e — core memory ──────────────────────────────────────────────
+
+    fn memory_for(o: &StartOrder, claude: Option<&str>, auto: Option<&str>) -> CoreMemory {
+        CoreMemory {
+            session_id: o.session_id,
+            fence: o.fence,
+            brain_rev: 7,
+            claude_md: claude.map(str::to_string),
+            memory_md: auto.map(str::to_string),
+        }
+    }
+
+    /// What the fake harness found where Claude Code reads `name`'s memory,
+    /// once the launch after [`forget_argv`] has run (it copies before it
+    /// writes its argv).
+    async fn given(r: &Rig, name: &str) -> Option<String> {
+        next_argv(r).await;
+        std::fs::read_to_string(r.root.path().join("work").join(name)).ok()
+    }
+
+    fn notes(r: &Rig, sid: ObjectId) -> Vec<String> {
+        r.store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Note { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn config_claude_md(r: &Rig, sid: ObjectId) -> PathBuf {
+        r.root
+            .path()
+            .join("home/.roomler/hive")
+            .join(sid.to_hex())
+            .join("claude/CLAUDE.md")
+    }
+
+    /// The device's own gate decides: allowed, both files are where Claude
+    /// Code reads them, the account's own copies; off, neither is, and the
+    /// transcript says why; no memory, nothing is placed or said.
+    #[tokio::test]
+    async fn core_memory_reaches_a_session_only_where_the_device_allows_it() {
+        let mut r = rig_with(true, 4, |c| c.core_memory = true, |s| s);
+        let o = order(&r);
+        let sid = o.session_id;
+        r.sup.receive_memory(memory_for(
+            &o,
+            Some("# Organization memory\n\n- (warning) ORG-FACT\n"),
+            Some("# Device memory: d\n\n- (path) DEVICE-FACT\n"),
+        ));
+        forget_argv(&r);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert!(
+            given(&r, ".claude_md").await.unwrap().contains("ORG-FACT"),
+            "CLAUDE.md, where Claude Code reads the user's instructions"
+        );
+        assert!(
+            std::fs::read_to_string(r.root.path().join("work/.memory_md"))
+                .unwrap()
+                .contains("DEVICE-FACT"),
+            "the auto-memory index"
+        );
+        let mode = std::fs::metadata(config_claude_md(&r, sid))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "copied in by the account, under its umask");
+        // The daemon's own copy, which the account reads to copy in, is the
+        // account's alone too: it carries the starter's own facts.
+        for name in ["CLAUDE.md", "MEMORY.md"] {
+            let own = r
+                .root
+                .path()
+                .join("run")
+                .join(sid.to_hex())
+                .join("memory")
+                .join(name);
+            let mode = std::fs::metadata(&own).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", own.display());
+        }
+        assert!(
+            notes(&r, sid)
+                .iter()
+                .any(|n| n.contains("revision 7") && n.contains("CLAUDE.md")),
+            "{:?}",
+            notes(&r, sid)
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+
+        // Off — the default.
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        r.sup
+            .receive_memory(memory_for(&o, Some("ORG-FACT"), Some("DEVICE-FACT")));
+        forget_argv(&r);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(given(&r, ".claude_md").await, None);
+        assert!(!r.root.path().join("work/.memory_md").exists());
+        assert!(!config_claude_md(&r, sid).exists());
+        assert!(
+            notes(&r, sid)
+                .iter()
+                .any(|n| n.contains("hive_core_memory is off")),
+            "{:?}",
+            notes(&r, sid)
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+
+        // None came.
+        let mut r = rig_with(true, 4, |c| c.core_memory = true, |s| s);
+        let o = order(&r);
+        let sid = o.session_id;
+        forget_argv(&r);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(given(&r, ".claude_md").await, None);
+        assert!(
+            !notes(&r, sid)
+                .iter()
+                .any(|n| n.to_lowercase().contains("core memory")),
+            "{:?}",
+            notes(&r, sid)
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// A resume (P1d-2) keeps the session's own copy, its own edits
+    /// included: no memory comes with it, and the wrapper copies only into
+    /// an empty place.
+    #[tokio::test]
+    async fn a_resume_keeps_the_sessions_own_core_memory() {
+        let mut r = rig_with(true, 4, |c| c.core_memory = true, |s| s);
+        let o = order(&r);
+        let sid = o.session_id;
+        r.sup
+            .receive_memory(memory_for(&o, Some("ORG-FACT v1\n"), None));
+        forget_argv(&r);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            given(&r, ".claude_md").await.as_deref(),
+            Some("ORG-FACT v1\n")
+        );
+        // A turn, so there is a history to resume; and the session's own note.
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        reports_until(&mut r, sid, HiveRunState::Idle).await;
+        let own = "ORG-FACT v1\n- a note the session kept\n";
+        std::fs::write(config_claude_md(&r, sid), own).unwrap();
+
+        go_down(&r, sid).await;
+        std::fs::remove_file(r.root.path().join("work/.claude_md")).unwrap();
+        forget_argv(&r);
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)]);
+        assert_eq!(
+            given(&r, ".claude_md").await.as_deref(),
+            Some(own),
+            "the resumed harness has the session's own copy"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// A snapshot larger than the server ever renders is dropped; one for
+    /// another start (another fence) is not this start's.
+    #[tokio::test]
+    async fn core_memory_too_large_or_for_another_start_is_not_used() {
+        use roomler_ai_remote_control::hive::hive_limits::MAX_CORE_MEMORY_BYTES;
+        let mut r = rig_with(true, 4, |c| c.core_memory = true, |s| s);
+        let o = order(&r);
+        let sid = o.session_id;
+        let big = "x".repeat(MAX_CORE_MEMORY_BYTES + 1);
+        r.sup.receive_memory(memory_for(&o, Some(&big), None));
+        let mut other = memory_for(&o, Some("ANOTHER-FENCE"), None);
+        other.fence = 2;
+        r.sup.receive_memory(other);
+        forget_argv(&r);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(given(&r, ".claude_md").await, None);
+        assert!(!config_claude_md(&r, sid).exists());
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
     }

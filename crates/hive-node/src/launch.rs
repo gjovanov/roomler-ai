@@ -128,6 +128,17 @@ impl LaunchSpec {
             .join(format!("{}.jsonl", self.session))
     }
 
+    /// Where Claude Code keeps this session's auto-memory, under the pinned
+    /// project name: its index `MEMORY.md` reaches the model as "user's
+    /// auto-memory" with no settings change (2.1.293, probed 2026-10-08).
+    /// FR-90 P1e writes a device's core memory there.
+    pub fn auto_memory_dir(&self) -> PathBuf {
+        self.config_dir()
+            .join("projects")
+            .join(self.project_dir_name())
+            .join("memory")
+    }
+
     /// Refuse a spec the harness or the daemon would misread.
     pub fn validate(&self) -> Result<(), LaunchError> {
         if uuid::Uuid::parse_str(&self.session).is_err() {
@@ -497,6 +508,11 @@ mod tests {
                 .join("projects")
                 .join(format!("hive-{}", s.session))
                 .join(format!("{}.jsonl", s.session))
+        );
+        // P1e — and its auto-memory, beside the history.
+        assert_eq!(
+            s.auto_memory_dir(),
+            s.history_path().parent().unwrap().join("memory")
         );
     }
 

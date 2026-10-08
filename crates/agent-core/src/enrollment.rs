@@ -137,6 +137,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_api_key_helper: None,
         hive_api_workspace_id: None,
         hive_update_wait_secs: None,
+        hive_core_memory: false,
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
