@@ -1257,7 +1257,7 @@ async fn connect_once(
     // FR-90 — the primary enrollment's connection carries this device's Hive
     // state reports: point the supervisor at THIS one, which also replays
     // the latest state of every session a dropped connection may have lost.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     if ctx.is_primary {
         crate::hive::on_connected(outbound_tx.clone());
     }
@@ -4087,7 +4087,7 @@ async fn handle_server_msg(
             caller,
             resume,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_start(
                 crate::hive::StartOrder {
                     session_id,
@@ -4105,7 +4105,7 @@ async fn handle_server_msg(
             );
             // No ack from this build: it does not advertise `hive`, so no
             // server sends it a start or waits on one.
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = (
                     &harness,
@@ -4130,9 +4130,9 @@ async fn handle_server_msg(
             fence,
             reason,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_stop(session_id, fence, reason, ctx.is_primary);
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = (fence, &reason);
                 debug!(session = %session_id, "rc:hive.stop ignored — this build does not run agent sessions");
@@ -4149,7 +4149,7 @@ async fn handle_server_msg(
             claude_md,
             memory_md,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_memory(
                 crate::hive::CoreMemory {
                     session_id,
@@ -4160,7 +4160,7 @@ async fn handle_server_msg(
                 },
                 ctx.is_primary,
             );
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = (fence, brain_rev, &claude_md, &memory_md);
                 debug!(session = %session_id, "rc:hive.memory ignored — this build does not run agent sessions");
@@ -4181,7 +4181,7 @@ async fn handle_server_msg(
             user_email,
             ttl_secs,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_view_grant(
                 crate::hive::ViewGrant {
                     grant_id,
@@ -4196,7 +4196,7 @@ async fn handle_server_msg(
                 ctx.is_primary,
                 outbound_tx.clone(),
             );
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = (
                     session_id,
@@ -4214,9 +4214,9 @@ async fn handle_server_msg(
             sdp,
             ice_servers,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_view_offer(grant_id, sdp, ice_servers, ctx.is_primary);
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = (&sdp, &ice_servers);
                 debug!(grant = %grant_id, "rc:hive.view.offer ignored");
@@ -4226,27 +4226,27 @@ async fn handle_server_msg(
             grant_id,
             candidate,
         } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_view_ice(grant_id, candidate, ctx.is_primary);
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = &candidate;
                 debug!(grant = %grant_id, "rc:hive.view.ice ignored");
             }
         }
         ServerMsg::HiveViewRenew { grant_id, ttl_secs } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_view_renew(grant_id, ttl_secs, ctx.is_primary);
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = ttl_secs;
                 debug!(grant = %grant_id, "rc:hive.view.renew ignored");
             }
         }
         ServerMsg::HiveViewClose { grant_id, reason } => {
-            #[cfg(all(feature = "hive", target_os = "linux"))]
+            #[cfg(hive_host)]
             crate::hive::handle_view_close(grant_id, reason, ctx.is_primary);
-            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            #[cfg(not(hive_host))]
             {
                 let _ = &reason;
                 debug!(grant = %grant_id, "rc:hive.view.close ignored");

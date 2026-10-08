@@ -75,6 +75,7 @@ pub mod framing;
 pub mod gates;
 mod hosted;
 mod lines;
+mod procs;
 mod sidecar;
 mod store;
 mod supervisor;
@@ -86,6 +87,7 @@ pub use supervisor::init_as_daemon;
 pub use supervisor::{
     Author, CoreMemory, StartOrder, Supervisor, begin_shutdown, begin_update, end_update, global,
     handle_memory, handle_start, handle_stop, init, on_connected, turns_running, update_wait,
+    wind_down,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{
