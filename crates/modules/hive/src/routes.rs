@@ -23,8 +23,9 @@
 //! `hive_enabled`, `hive_accounts`, `hive_roots` — and answers in
 //! `rc:hive.start_ack`, which lands on the session record.
 //!
-//! In P0 a session is visible to, and stoppable by, the member who started it
-//! and nobody else; another member's session id is a 404. Stopping needs no
+//! A session is visible to its room's members — the owner, and whoever the
+//! owner added (P1c, [`crate::participants`]) — and stoppable by its owner
+//! alone; anyone else's read of its id is a 404. Stopping needs no
 //! permission: ending one's own session must never be the thing a role
 //! change blocks.
 
@@ -192,6 +193,8 @@ pub struct StopResponse {
 pub(crate) struct Audit {
     pub(crate) tenant_id: ObjectId,
     pub(crate) user_id: ObjectId,
+    /// Whom it was about, when not the actor (P1c's participant changes).
+    pub(crate) target_id: Option<ObjectId>,
     pub(crate) device_id: ObjectId,
     pub(crate) session_id: Option<ObjectId>,
     pub(crate) action: &'static str,
@@ -205,6 +208,7 @@ impl Audit {
             id: None,
             tenant_id: self.tenant_id,
             user_id: self.user_id,
+            target_id: self.target_id,
             device_id: self.device_id,
             session_id: self.session_id,
             action: self.action.to_string(),
@@ -218,7 +222,7 @@ impl Audit {
     }
 }
 
-async fn member_tenant(
+pub(crate) async fn member_tenant(
     state: &HiveState,
     tenant_id: &str,
     auth: &AuthUser,
@@ -230,7 +234,7 @@ async fn member_tenant(
     Ok(tid)
 }
 
-fn parse_oid(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
+pub(crate) fn parse_oid(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("Invalid {what}")))
 }
 
@@ -338,6 +342,7 @@ pub async fn start(
         |session_id: Option<ObjectId>, outcome: &'static str, reason: Option<&'static str>| Audit {
             tenant_id: tid,
             user_id,
+            target_id: None,
             device_id,
             session_id,
             action: "start",
@@ -368,6 +373,7 @@ pub async fn start(
         id: Some(sid),
         tenant_id: tid,
         owner_id: auth.user_id,
+        drivers: Vec::new(),
         title,
         room_id: Some(room_id),
         last_turn: None,
@@ -468,7 +474,8 @@ pub async fn list(
     }))
 }
 
-/// `GET /api/tenant/{tenant_id}/hive/session/{session_id}`.
+/// `GET /api/tenant/{tenant_id}/hive/session/{session_id}` — for anyone who
+/// may read it (P1c: its room's members, not only its owner).
 pub async fn get_one(
     State(state): State<HiveState>,
     auth: AuthUser,
@@ -476,7 +483,7 @@ pub async fn get_one(
 ) -> Result<Json<SessionView>, ApiError> {
     let tid = member_tenant(&state, &tenant_id, &auth).await?;
     let sid = parse_oid(&session_id, "session_id")?;
-    let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
+    let s = crate::participants::readable(&state, tid, sid, auth.user_id).await?;
     Ok(Json(SessionView::from(&s)))
 }
 
@@ -536,6 +543,7 @@ pub async fn stop(
     Audit {
         tenant_id: tid,
         user_id: auth.user_id,
+        target_id: None,
         device_id,
         session_id: Some(sid),
         action: "stop",
