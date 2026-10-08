@@ -12,6 +12,14 @@
 #     Field 2026-09-02: 549 such drops in one day on one host, each a
 #     lost acknowledgement that stalled the outbound video on an RTO.
 #   - src/chunk/chunk_test.rs: the regression tests for that shape.
+#   - src/association/mod.rs (#1856): the write loop treats a failed
+#     `net_conn.send` as a LOST PACKET (SCTP retransmits it) instead of
+#     closing the association and every stream on it. Upstream ended the
+#     loop on any send error, so one EHOSTUNREACH from a route that was
+#     absent for 3 ms killed a remote-desktop session outright. A transport
+#     that is really closed is still detected by the read loop.
+#   - src/association/association_test.rs: the regression test (a send
+#     that fails once; the message must arrive by retransmission).
 
 [package]
 edition = "2021"
