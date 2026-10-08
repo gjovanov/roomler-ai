@@ -156,13 +156,8 @@ impl StartResponse {
         // could only report for a session it launched. A session stopped (by
         // another tab) or lost before either is still unanswered.
         let answered = s.accepted_at.is_some()
-            || matches!(
-                s.status,
-                SessionStatus::Idle
-                    | SessionStatus::Running
-                    | SessionStatus::AwaitingApproval
-                    | SessionStatus::Ended
-            );
+            || s.status == SessionStatus::Ended
+            || SessionStatus::LAUNCHED.contains(&s.status);
         Self {
             outcome: if answered { "accepted" } else { "pending" },
             reason: None,
