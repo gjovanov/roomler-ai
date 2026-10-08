@@ -334,8 +334,16 @@ impl AgentSessionDao {
     }
 
     /// FR-90 P1b — the sessions the server holds as running on `device_id`:
-    /// live, and accepted by it. An UNANSWERED start is not here — the device
-    /// may not have launched it yet, and reconcile owns it.
+    /// live, and launched there on the device's own word — its answer to the
+    /// start, or a run state only it reports ([`SessionStatus::LAUNCHED`]).
+    /// A start it has said nothing about is not here — it may not be launched
+    /// yet, and reconcile owns it.
+    ///
+    /// ⚠️ Not `accepted_at` alone. The state usually lands BEFORE the answer
+    /// ([`Self::accept`]), so a socket that drops between the two leaves the
+    /// session `idle` with no `accepted_at` — which reconcile never re-sends,
+    /// being no longer `starting`, and which would then outlive its harness
+    /// for ever. Field, 2026-10-08: the one record the first P1b run left.
     pub async fn running_on_device(
         &self,
         tenant_id: ObjectId,
@@ -347,7 +355,10 @@ impl AgentSessionDao {
                     "tenant_id": tenant_id,
                     "location.device_id": device_id,
                     "status": statuses(&SessionStatus::LIVE),
-                    "accepted_at": { "$type": "date" },
+                    "$or": [
+                        { "accepted_at": { "$type": "date" } },
+                        { "status": statuses(&SessionStatus::LAUNCHED) },
+                    ],
                 },
                 None,
             )
