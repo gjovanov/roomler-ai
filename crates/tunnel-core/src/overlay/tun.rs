@@ -267,16 +267,30 @@ pub(crate) fn bsd_route_is_ours(
     let Some(got) = got else {
         return false;
     };
-    if got.destination.parse::<std::net::IpAddr>().ok() != Some(dest) {
+    // route(8) prints ANY all-zeros address as `default`, whatever its mask:
+    // the exit split-default half `0.0.0.0/1` reads back as `destination:
+    // default` with `mask: 128.0.0.0`, and the real default route as
+    // `default` / `default`. Only the mask tells them apart.
+    let unspecified = if dest.is_ipv4() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    let addr = |s: &str| {
+        if s == "default" {
+            Some(unspecified)
+        } else {
+            s.parse::<std::net::IpAddr>().ok()
+        }
+    };
+    if addr(&got.destination) != Some(dest) {
         return false;
     }
     let host_plen = if dest.is_ipv4() { 32 } else { 128 };
     let got_plen = match got.mask.as_deref() {
         // `route -n get` prints no mask for a host route.
         None => Some(host_plen),
-        Some(m) => m
-            .parse::<std::net::IpAddr>()
-            .ok()
+        Some(m) => addr(m)
             .filter(|m| m.is_ipv4() == dest.is_ipv4())
             .and_then(mask_plen),
     };
@@ -419,16 +433,79 @@ destination: fd72:6f6f:6d6c::6441:400
             interface: Some("utun0".into()),
         };
         assert!(!bsd_route_is_ours(Some(&odd), ip("10.66.0.0"), 16, "utun0"));
-        // A split-default half: `0.0.0.0/1` must not match the default route
-        // even though macOS could print its destination as `0.0.0.0`.
-        let default_as_zero = BsdRouteGet {
+        // A /0 is never one of the /1 halves, however its address prints.
+        let zero_net = BsdRouteGet {
             destination: "0.0.0.0".into(),
             mask: Some("0.0.0.0".into()),
             interface: Some("utun0".into()),
         };
         assert!(!bsd_route_is_ours(
-            Some(&default_as_zero),
+            Some(&zero_net),
             ip("0.0.0.0"),
+            1,
+            "utun0"
+        ));
+    }
+
+    /// The exit split-default halves. route(8) prints any all-zeros address
+    /// as `default`, so `0.0.0.0/1` and `::/1` read back with
+    /// `destination: default`, and only the mask separates them from the
+    /// real default route (`mask: default`, verbatim from the field Mac when
+    /// no `/1` is installed).
+    #[test]
+    fn split_default_halves_read_back_as_default_with_a_mask() {
+        let real_default = parse_bsd_route_get(FELL_TO_DEFAULT);
+        assert!(!bsd_route_is_ours(
+            real_default.as_ref(),
+            ip("0.0.0.0"),
+            1,
+            "utun0"
+        ));
+        // …and that answer IS the default route, /0, on en0.
+        assert!(bsd_route_is_ours(
+            real_default.as_ref(),
+            ip("0.0.0.0"),
+            0,
+            "en0"
+        ));
+
+        let our_low_half = BsdRouteGet {
+            destination: "default".into(),
+            mask: Some("128.0.0.0".into()),
+            interface: Some("utun0".into()),
+        };
+        assert!(bsd_route_is_ours(
+            Some(&our_low_half),
+            ip("0.0.0.0"),
+            1,
+            "utun0"
+        ));
+        let our_high_half = BsdRouteGet {
+            destination: "128.0.0.0".into(),
+            mask: Some("128.0.0.0".into()),
+            interface: Some("utun0".into()),
+        };
+        assert!(bsd_route_is_ours(
+            Some(&our_high_half),
+            ip("128.0.0.0"),
+            1,
+            "utun0"
+        ));
+        let our_v6_low_half = BsdRouteGet {
+            destination: "default".into(),
+            mask: Some("8000::".into()),
+            interface: Some("utun0".into()),
+        };
+        assert!(bsd_route_is_ours(
+            Some(&our_v6_low_half),
+            ip("::"),
+            1,
+            "utun0"
+        ));
+        // A v4 `default` never satisfies a v6 prefix, and vice versa.
+        assert!(!bsd_route_is_ours(
+            Some(&our_low_half),
+            ip("::"),
             1,
             "utun0"
         ));
