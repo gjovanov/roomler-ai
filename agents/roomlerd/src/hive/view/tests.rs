@@ -18,7 +18,9 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
-use super::super::supervisor::tests::{Rig, dev, next_state, order, rig};
+use super::super::supervisor::tests::{
+    Rig, dev, harness_asks, next_state, order, release, rig, until_awaiting,
+};
 use super::*;
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -441,5 +443,82 @@ async fn a_viewer_cannot_send_unbounded_or_garbage_messages() {
     r.sup.viewers().command(gid, Cmd::Close("test".into()));
     wait_viewers(&r, 0).await;
     let _ = b.pc.close().await;
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// An approval over the peer (P1a): every viewer sees which are open; a
+/// reader cannot answer one; a driver can, and the harness gets the answer
+/// with the driver's words; then every viewer hears it is closed.
+#[tokio::test]
+async fn a_driver_answers_an_approval_over_the_peer_and_a_reader_cannot() {
+    let mut r = rig(true, 4);
+    let sid = session_with_a_turn(&mut r).await;
+    r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+    let mut harness = harness_asks(&r, sid, 2, "whoami").await;
+    let approval = until_awaiting(&mut r, sid).await;
+
+    let reader = grant(sid, ObjectId::new(), false, 60);
+    let rid = reader.grant_id;
+    r.sup.view_grant(reader, true).await.unwrap();
+    let mut reader = dial(&mut r, rid).await;
+    reader.send(json!({"op": "hello"})).await;
+    let hello = reader.recv_op("hello").await;
+    assert_eq!(hello["approvals"], json!([approval]), "{hello}");
+    assert_eq!(hello["may_answer"], false);
+    assert_eq!(hello["state"], "awaiting_approval");
+    reader
+        .send(json!({"op": "answer", "id": "r1", "approval": approval, "decision": "allow"}))
+        .await;
+    let ack = reader.recv_op("answer").await;
+    assert_eq!(ack["ok"], false);
+    assert!(
+        ack["error"].as_str().unwrap().starts_with("read_only"),
+        "{ack}"
+    );
+    assert_eq!(
+        r.sup.pending_approvals(sid),
+        std::slice::from_ref(&approval),
+        "a reader's answer changed nothing"
+    );
+
+    let driver = grant(sid, r.user, true, 60);
+    let did = driver.grant_id;
+    r.sup.view_grant(driver, true).await.unwrap();
+    let mut driver = dial(&mut r, did).await;
+    driver.send(json!({"op": "hello"})).await;
+    assert_eq!(driver.recv_op("hello").await["may_answer"], true);
+    driver
+        .send(json!({"op": "answer", "id": "d0", "approval": approval, "decision": "maybe"}))
+        .await;
+    assert_eq!(driver.recv_op("answer").await["ok"], false);
+    driver
+        .send(
+            json!({"op": "answer", "id": "d1", "approval": approval, "decision": "deny",
+            "message": "  not on this box  "}),
+        )
+        .await;
+    assert_eq!(
+        driver.recv_op("answer").await,
+        json!({"op": "answer", "id": "d1", "ok": true})
+    );
+    assert_eq!(
+        harness.verdict(2).await,
+        json!({"behavior": "deny", "message": "Viewer denied this: not on this box"})
+    );
+    assert_eq!(driver.recv_op("approvals").await["pending"], json!([]));
+    assert_eq!(reader.recv_op("approvals").await["pending"], json!([]));
+    driver
+        .send(json!({"op": "answer", "id": "d2", "approval": approval, "decision": "allow"}))
+        .await;
+    let again = driver.recv_op("answer").await;
+    assert_eq!(again["ok"], false, "answered once: {again}");
+
+    release(&r);
+    for gid in [rid, did] {
+        r.sup.viewers().command(gid, Cmd::Close("test".into()));
+    }
+    wait_viewers(&r, 0).await;
+    let _ = reader.pc.close().await;
+    let _ = driver.pc.close().await;
     r.sup.stop(sid, 1, "owner".into());
 }

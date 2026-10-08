@@ -50,6 +50,50 @@ pub struct LaunchSpec {
     pub resume: bool,
     /// The MCP tool that answers permission prompts.
     pub permission_prompt_tool: Option<String>,
+    /// The permission mode the harness starts in (`--permission-mode`).
+    ///
+    /// ⚠️ The daemon always sets it. Left unset, a `-p` run that fetches no
+    /// feature flags — every run behind the sidecar — starts in `auto`, where
+    /// a classifier, not a person, decides what runs (Claude Code's
+    /// permission-modes docs; seen in FR-90 P1a's contract probe, 2026-10-08).
+    pub permission_mode: Option<String>,
+    /// Tools taken out of the model's context (`--disallowedTools`).
+    pub disallowed_tools: Vec<String>,
+}
+
+/// The toolbelt's MCP server name: its tools are `mcp__roomler__<tool>`.
+pub const TOOLBELT_SERVER: &str = "roomler";
+
+/// The permission-prompt tool on the toolbelt (FR-90 P1a): Claude Code calls
+/// it, and waits, before every tool call nothing else allowed.
+pub const APPROVE_TOOL: &str = "mcp__roomler__approve";
+
+/// The permission mode a Hive session runs in: `default`, Manual in Claude
+/// Code's UI — reads run, everything else asks [`APPROVE_TOOL`], and so a
+/// person.
+pub const PERMISSION_MODE: &str = "default";
+
+/// Tools a Hive session's model never sees. `AskUserQuestion` would reach the
+/// permission tool as a "tool call" whose answer must carry the person's
+/// choices; until the surface can ask structured questions, the model asks
+/// in its reply instead.
+pub const DISALLOWED_TOOLS: [&str; 1] = ["AskUserQuestion"];
+
+/// The `--mcp-config` document for a session's toolbelt: one stdio server,
+/// [`TOOLBELT_SERVER`], which Claude Code starts as the session's account.
+/// `timeout_ms` is the server's tool-call timeout: an approval waits for a
+/// person, and the stdio default (30 min) must not be what decides.
+pub fn toolbelt_mcp_config(command: &str, args: &[String], timeout_ms: u64) -> Value {
+    json!({
+        "mcpServers": {
+            TOOLBELT_SERVER: {
+                "type": "stdio",
+                "command": command,
+                "args": args,
+                "timeout": timeout_ms,
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -122,10 +166,22 @@ impl LaunchSpec {
         if let Some(p) = &self.mcp_config {
             a.push("--mcp-config".into());
             a.push(p.clone().into_os_string());
+            // The toolbelt is the ONLY MCP config: a repository's `.mcp.json`
+            // must not be able to shadow `roomler`, and with it the tool that
+            // decides what runs.
+            a.push("--strict-mcp-config".into());
         }
         if let Some(t) = &self.permission_prompt_tool {
             a.push("--permission-prompt-tool".into());
             a.push(t.clone().into());
+        }
+        if let Some(m) = &self.permission_mode {
+            a.push("--permission-mode".into());
+            a.push(m.clone().into());
+        }
+        if !self.disallowed_tools.is_empty() {
+            a.push("--disallowedTools".into());
+            a.push(self.disallowed_tools.join(",").into());
         }
         a
     }
@@ -266,7 +322,9 @@ mod tests {
             mcp_config: Some(root().join("mcp.json")),
             sidecar_base_url: Some("http://127.0.0.1:47000/s/6f1c".into()),
             resume,
-            permission_prompt_tool: Some("mcp__roomler__approve".into()),
+            permission_prompt_tool: Some(APPROVE_TOOL.into()),
+            permission_mode: Some(PERMISSION_MODE.into()),
+            disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
         }
     }
 
@@ -300,6 +358,54 @@ mod tests {
                     .any(|w| w == ["--output-format", "stream-json"])
             );
         }
+    }
+
+    /// The three flags that make a person the one who decides: the mode is
+    /// pinned (unset, a run behind the sidecar starts in `auto`), the
+    /// toolbelt is the only MCP config, and a question the surface cannot
+    /// show is not a tool the model has.
+    #[test]
+    fn a_session_asks_a_person_and_nothing_else_can_answer_for_them() {
+        let a = strings(&spec(false).args());
+        assert!(
+            a.windows(2).any(|w| w == ["--permission-mode", "default"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--permission-prompt-tool", "mcp__roomler__approve"]),
+            "{a:?}"
+        );
+        assert!(a.contains(&"--strict-mcp-config".to_string()), "{a:?}");
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--disallowedTools", "AskUserQuestion"]),
+            "{a:?}"
+        );
+        // Without a toolbelt there is nothing to be strict about.
+        let mut bare = spec(false);
+        bare.mcp_config = None;
+        assert!(!strings(&bare.args()).contains(&"--strict-mcp-config".to_string()));
+    }
+
+    #[test]
+    fn the_toolbelt_config_is_one_stdio_server_with_its_own_timeout() {
+        let doc = toolbelt_mcp_config(
+            "/usr/bin/roomlerd",
+            &[
+                "hive-mcp".into(),
+                "/run/roomler-hive/s/toolbelt.sock".into(),
+            ],
+            1_800_000,
+        );
+        let servers = doc["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1);
+        let s = &servers[TOOLBELT_SERVER];
+        assert_eq!(s["type"], "stdio");
+        assert_eq!(s["command"], "/usr/bin/roomlerd");
+        assert_eq!(s["args"][0], "hive-mcp");
+        assert_eq!(s["timeout"], 1_800_000);
+        assert!(APPROVE_TOOL.starts_with(&format!("mcp__{TOOLBELT_SERVER}__")));
     }
 
     #[test]
