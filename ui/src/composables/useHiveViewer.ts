@@ -56,6 +56,9 @@ export type ViewerStatus = 'idle' | 'opening' | 'connecting' | 'open' | 'closed'
 
 /** The latest this many events on open; earlier ones on request. */
 const HISTORY = 300
+/** `hello` is asked again this often, this many times, until it is answered. */
+const HELLO_RETRY_MS = 1500
+const HELLO_ATTEMPTS = 4
 /** What we accept from the device: pages are ≤ 1 MiB plus framing. */
 const INBOUND = { maxMessageBytes: 4 * 1024 * 1024, maxInFlight: 4 }
 
@@ -86,6 +89,22 @@ function newRef(): string {
   return Math.random().toString(36).slice(2, 12)
 }
 
+/** The events worth showing: Claude Code on stream-json announces its
+ *  session again at EVERY prompt, so a `session_init` that repeats the one
+ *  before it (same harness session, model and folder) is a turn boundary,
+ *  not news. A changed one — a resume elsewhere, another model — still shows. */
+export function withoutRepeatedInits(events: HiveEvent[]): HiveEvent[] {
+  let last: string | null = null
+  return events.filter((e) => {
+    if (e.event.kind !== 'session_init') return true
+    const ev = e.event as { harness_session_id?: unknown; model?: unknown; cwd?: unknown }
+    const key = JSON.stringify([ev.harness_session_id, ev.model, ev.cwd])
+    const repeat = key === last
+    last = key
+    return !repeat
+  })
+}
+
 export function useHiveViewer() {
   const ws = useWsStore()
 
@@ -114,6 +133,8 @@ export function useHiveViewer() {
   let helloWaiter: ((m: Frame) => void) | null = null
   let pageWaiter: ((m: Frame) => void) | null = null
   const promptWaiters = new Map<string, (m: Frame) => void>()
+  // An open asked for before the socket was up, sent once it is.
+  let openPending = false
 
   function send(message: unknown): void {
     if (!dc || dc.readyState !== 'open') return
@@ -126,6 +147,23 @@ export function useHiveViewer() {
       else pageWaiter = resolve
       send(message)
     })
+  }
+
+  /** `hello`, asked again until the device answers. A device that wired its
+   *  channel a moment after it opened dropped the very first frame — field,
+   *  2026-10-07: the history was never asked for and a whole turn never
+   *  reached the panel. Fixed on the device too; a viewer must still not
+   *  hang on one lost frame, and `hello` is idempotent. */
+  async function askHello(myGen: number): Promise<Frame | null> {
+    for (let attempt = 0; attempt < HELLO_ATTEMPTS; attempt++) {
+      const answer = await Promise.race([
+        ask('hello', { op: 'hello' }),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), HELLO_RETRY_MS)),
+      ])
+      if (myGen !== gen) return null
+      if (answer && answer.op === 'hello') return answer
+    }
+    return null
   }
 
   function teardown(sayClose: boolean): void {
@@ -151,6 +189,7 @@ export function useHiveViewer() {
     pc = null
     grantId = null
     reference = null
+    openPending = false
     remoteSet = false
     offerSent = false
     pendingRemoteIce.length = 0
@@ -211,8 +250,12 @@ export function useHiveViewer() {
 
   async function onChannelOpen(myGen: number): Promise<void> {
     status.value = 'open'
-    const hello = await ask('hello', { op: 'hello' })
+    const hello = await askHello(myGen)
     if (myGen !== gen) return
+    if (!hello) {
+      finish('closed', 'no_hello')
+      return
+    }
     mayPrompt.value = !!hello.may_prompt
     live.value = !!hello.live
     runState.value = hello.state ?? null
@@ -324,7 +367,18 @@ export function useHiveViewer() {
       }
       void dial(f, myGen).catch((e) => finish('closed', (e as Error).message))
     })
-    ws.send('hive:view.open', { session_id: session, ref: reference })
+    // The socket may not be up yet — a cold load of the room mounts this
+    // before the socket's first `connected` — and the store DROPS a frame it
+    // cannot send. Ask once it is (field, 2026-10-07: "Asking the device…"
+    // for ever).
+    if (ws.connectionId) sendOpen()
+    else openPending = true
+  }
+
+  function sendOpen(): void {
+    if (!sessionId || !reference) return
+    openPending = false
+    ws.send('hive:view.open', { session_id: sessionId, ref: reference })
   }
 
   /** The events before the first one shown. */
@@ -356,12 +410,22 @@ export function useHiveViewer() {
     reason.value = null
   }
 
-  // The socket redialled: the server ended our grant with the old
-  // connection, so ask again on the new one.
   watch(
     () => ws.connectionId,
     (now, before) => {
-      if (now && before && now !== before && sessionId && (status.value === 'open' || status.value === 'connecting')) {
+      if (!now || !sessionId) return
+      // The socket is up: send the open that had to wait for it.
+      if (openPending) {
+        sendOpen()
+        return
+      }
+      // The socket redialled: the server ended our grant — or forgot our
+      // request — with the old connection, so ask again on the new one.
+      if (
+        before &&
+        now !== before &&
+        (status.value === 'open' || status.value === 'connecting' || status.value === 'opening')
+      ) {
         open(sessionId)
       }
     },
