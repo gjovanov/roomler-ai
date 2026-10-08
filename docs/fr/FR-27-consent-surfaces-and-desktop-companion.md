@@ -249,10 +249,12 @@ Ticked only where a run is recorded in the field log below.
       capture-excluded during a session; **the macOS half is done — the Mac,
       0.4.117, 2026-10-08**: the banner reads "Being viewed by «owner name»" and
       clicking its Disconnect logged `viewee requested disconnect via overlay
-      badge` → `session terminated … reason=ControllerHangup`. ⚠️ The banner
-      window is not key, so the first click only activates the companion and a
-      following click triggers Disconnect — it has no `acceptsFirstMouse`. The
-      Windows reveal-on-hover badge and the Linux X11 panel are still untested.)
+      badge` → `session terminated … reason=ControllerHangup`. ⚠️ On 0.4.117 the
+      banner window was not key, so the first click only activated the companion
+      and a following click triggered Disconnect (no `accept_first_mouse`); **#1852
+      fixed that (#1854, agent 0.4.118, carried by 0.4.119)** — one click on
+      0.4.119, 2026-10-08 (the log below). The Windows reveal-on-hover badge and
+      the Linux X11 panel are still untested.)
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
@@ -556,8 +558,9 @@ session terminated by server session_id=… reason=ControllerHangup
 
 ⚠️ The banner window is not key, so the FIRST click only activates the companion
 (the menu bar went from TextEdit to Roomler) and a following click fired the
-button — the webview has no `acceptsFirstMouse`. A real user's clicks behave the
-same; worth an `acceptsFirstMouse` follow-up, not a blocker.
+button — the webview has no `accept_first_mouse`. **Filed as #1852 and fixed in
+#1854** (agent 0.4.118, carried by 0.4.119); the GREEN re-run is the
+2026-10-08 (#1852) log at the end.
 
 **macOS "Check for updates".** The companion's button runs `<daemon> self-update
 --check-only` (`cmd_check_update`, via `agent_exe_path`, which on macOS resolves
@@ -567,3 +570,36 @@ on the latest release.
 
 Everything restored: the test recording deleted, the uploaded census script
 removed; the device's remote-recording gate was left ON as found.
+
+### 2026-10-08 — #1852: the banner's buttons take their first click (0.4.117 RED → 0.4.119 GREEN)
+
+The two-click nit the P9 run above found — the banner is shown without focus
+(P9, `orderFrontRegardless`), so its window is not key and an inactive macOS
+window spends its first click on activation unless its view accepts first mouse.
+**#1854** adds `.accept_first_mouse(…)` to the banner's window builder
+(`panels.rs`), derived from the show-without-focus path so it cannot drift; the
+consent prompt is shown focused and keeps the default (a click-through on an
+approval surface is not wanted). Shipped in agent **0.4.118** and carried by
+**0.4.119** (the fix commit is an ancestor of both tags; the Mac took 0.4.119,
+which also carries #1858 "remote desktop to a Mac no longer drops every few
+seconds").
+
+| check | 0.4.117 (RED) | 0.4.119 (GREEN) |
+|---|---|---|
+| one click on Disconnect | the first click only activated the companion (menu bar TextEdit → Roomler); the session kept running (`31s`), and a following click produced the `viewee requested disconnect` line (the P9 run above needed a multi-click sequence) | ONE click → `viewee requested disconnect via overlay badge` → `session terminated … ControllerHangup`, then the viewer auto-reconnected to a fresh session. Seen twice: 0.4.118 at 14:18:42Z and **0.4.119 at 14:38:43Z** (click and log line simultaneous within the +11.1 s Mac↔box clock skew) |
+
+The 0.4.119 Disconnect run re-confirmed the P9 clauses on the shipped build
+(frame detector over the banner box and the four screen-edge strips): banner up
+at +1.7 s **without taking focus**, down at +4.6 s, back up at +6.8 s on a
+top-edge rest, and the **red frame on every frame until the disconnect** at
++11.3 s, then gone. The fix is additive and does not touch the reveal watch, and
+P9's next-click-acts and stays-while-recording clauses (verified on 0.4.117
+earlier this day) are unaffected.
+
+⚠️ **One-click Stop recording is the SAME banner window** — both buttons live in
+its one webview, and `accept_first_mouse` is a per-window attribute, so the
+Disconnect run proves the window now takes its first click for Stop recording
+too. A **direct** one-click Stop-recording run on the Mac is still owed: two
+attempts were lost, the first to the pre-#1858 every-few-seconds RC drop while
+the Mac was mid-update, the second to the device owner's own live session on the
+Mac. **#1852 stays open** for that one direct demonstration.
