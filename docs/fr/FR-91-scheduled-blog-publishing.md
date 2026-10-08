@@ -152,7 +152,7 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | Claim: issue #1880, this spec, the ledger row | Docs only | this PR |
-| P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | — |
+| P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | PR open #1883 |
 | P2 | The deploy repo: `roomler-blog` Deployment + Service, bucket + scoped users, the edge vhost committed and then routed; one promote for P1 | Remove the two edge locations | — |
 | P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | — |
 | P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | — |

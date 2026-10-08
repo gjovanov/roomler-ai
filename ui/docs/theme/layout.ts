@@ -22,6 +22,7 @@ import {
   renderHead,
   renderSearchDialog,
   renderTopbar,
+  type OgImage,
   type ShellNav,
   type SiteAssets,
 } from './shell.ts'
@@ -84,6 +85,9 @@ export interface LayoutCtx {
   onTheBlog?: Array<{ url: string; title: string }>
   prev?: DocPage
   next?: DocPage
+  /** The page's share image. Absent = the site's default under `/docs/assets/`;
+   *  FR-91's blog lane renders its 404 page with its own copy. */
+  ogImage?: OgImage
 }
 
 function onTheBlogHtml(posts: Array<{ url: string; title: string }> | undefined): string {
@@ -284,7 +288,7 @@ export function renderPage(ctx: LayoutCtx, tagIndexed: Set<string>): string {
     description: page.description,
     canonical: page.notFound ? undefined : canonical,
     noindex: page.noindex,
-    og: { type: listing || page.notFound ? 'website' : 'article', title: page.title },
+    og: { type: listing || page.notFound ? 'website' : 'article', title: page.title, image: ctx.ogImage },
     article: listing || page.notFound ? undefined : { published: page.created, modified: page.lastmod, tags: page.tags },
     jsonLd: page.notFound ? undefined : structuredData(page, canonical, crumbs),
     assets,

@@ -55,6 +55,10 @@ export interface PostMeta {
   syndication?: string
   /** Only for a post whose ORIGINAL lives elsewhere. */
   canonical?: string
+  /** FR-91: the post shows an install command, so it is an install page
+   *  (`INSTALL_PAGES`) for this build: the gate passes and the carry reaches it.
+   *  Absent means no (`readPostMeta` always sets it). */
+  installCopy?: boolean
 }
 
 export interface Post extends PostMeta {
@@ -149,6 +153,11 @@ export function readPostMeta(
   const related = list('related', false)
   const syndication = str('syndication', false)
   const canonical = str('canonical', false)
+  const installCopyRaw = data.installCopy
+  if (installCopyRaw !== undefined && typeof installCopyRaw !== 'boolean') {
+    err('frontmatter `installCopy` must be `true` or `false`')
+  }
+  const installCopy = installCopyRaw === true
 
   if (seoTitle && seoTitle.length > MAX_TITLE_CHARS) {
     err(`frontmatter \`seoTitle\` is ${seoTitle.length} chars; the limit is ${MAX_TITLE_CHARS}`)
@@ -208,6 +217,7 @@ export function readPostMeta(
       related,
       syndication,
       canonical,
+      installCopy,
     },
   }
 }
