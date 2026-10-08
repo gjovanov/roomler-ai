@@ -216,6 +216,20 @@ but the recorder skipped would only be a courtesy.
 | Fallback | `%USERPROFILE%\Roomler Recordings` | same rule | same rule |
 | Last resort | the recorder's data dir (`%LOCALAPPDATA%\…\recordings`, never roaming) | `~/Library/Application Support/…/recordings` | `~/.local/share/roomler/recordings` |
 
+**The write rule** — which identity writes where, and the fallback:
+
+```mermaid
+flowchart TD
+    BYTES["a recording's first bytes"] --> WHO{"who runs the recorder?"}
+    WHO -->|"the person at the console<br/>— the recorder IS that user"| PROBE{"the chosen folder survives a real<br/>create + write + delete probe?"}
+    WHO -->|"nobody signed in<br/>— SYSTEM / root, unattended"| SVC["the daemon's OWN data dir,<br/>locked down: a protected DACL<br/>(SYSTEM + Administrators) or mode 0700.<br/>Never record_dir"]
+    PROBE -->|"yes"| INFOLDER["stage in &lt;folder&gt;/.roomler-partial/,<br/>create_new, no reparse / no symlink,<br/>rename into place on finish"]
+    PROBE -->|"no — OneDrive, Controlled Folder<br/>Access, or a read-only unit sandbox"| SPOOL["stage in the recorder's OWN data dir<br/>(same uid), reason named<br/>(onedrive / cfa / sandboxed);<br/>roomler-desktop, the same uid, moves it in"]
+    INFOLDER --> SIDE["the &lt;name&gt;.roomler.json sidecar beside it"]
+    SPOOL --> SIDE
+    SVC --> SIDE
+```
+
 - ⚠️ **The probe is a real write.** Defender's Controlled Folder Access lets
   `metadata()` succeed and then blocks the write. OneDrive's Known Folder Move
   would upload gigabytes of screen recordings by default.
