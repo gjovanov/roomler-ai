@@ -48,3 +48,37 @@ _Avoid_: caps detection, capability scan, encoder test
 **Probe cache**:
 The remembered answer of the last probe, kept only under the build, hardware, drivers and settings that produced it; a change in any of them re-probes, and an answer that found no hardware is never remembered.
 _Avoid_: caps cache file, cached capabilities, hardware cache
+
+### Remote desktop — recording (FR-85)
+
+**Recording**:
+A screen captured to a local file by roomler's own pipeline, at native resolution — never a copy of the rate-controlled live stream. Encoded at the source, in a pipeline of its own.
+_Avoid_: capture, screen grab, screencast, session recording
+
+**Recorder**:
+The `roomlerd record` child process that captures, paces and encodes one recording. It runs as the person at the device, never SYSTEM/root while a console user exists.
+_Avoid_: capturer (the recorder owns a capturer; they are not the same), encoder, recording engine
+
+**Local recording**:
+A recording a person starts at the device, of their own screen.
+_Avoid_: self recording, own recording
+
+**Remote recording**:
+A recording a controller starts from the browser viewer. The file is written on the controlled device and downloaded on demand over the session's P2P channel; the server never carries it.
+_Avoid_: cloud recording, server recording, stream recording
+
+**Recording profile**:
+The encoder settings a recording uses — constant quality, a real GOP, native resolution — as opposed to the live stream's network-fit plan.
+_Avoid_: quality preset, HQ mode, bitrate ladder (when the recording's own settings are meant)
+
+**Sidecar**:
+The `<name>.roomler.json` beside a recording: its initiator, device, encoder, dimensions, audio sources, events (locks, gaps, drops) and stop reason. Never content.
+_Avoid_: metadata file, manifest, json
+
+**Edit list**:
+The `<name>.edit.json` a roomler-desktop edit is saved as — contiguous keep / cut / speed-up segments over a recording, read by `roomlerd media export`. Non-destructive.
+_Avoid_: EDL (except in code), timeline, project file
+
+**Recording activity**:
+What a device **claims** about a recording (prompt outcome, started, stopped, downloaded), stored server-side as facts only, never content; distinct from the server's own authorization decision.
+_Avoid_: recording audit, recording log
