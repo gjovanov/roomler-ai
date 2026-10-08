@@ -3,6 +3,8 @@
 <!--
   FR-90 P0d-3 — an agent session's transcript, read from the device over a
   viewer peer, with the "ask the agent" composer for a viewer that may drive.
+  The room's own composer is "message the room": ordinary chat, which never
+  reaches the agent. Who drives is the owner's call (P1c, `HiveParticipants`).
 
   Assistant text is markdown through the SAME pipeline as chat messages
   (`renderMarkdown`: markdown-it, then DOMPurify — the one XSS boundary for
@@ -22,6 +24,7 @@
         {{ viewer.reason.value }}
       </span>
       <v-spacer />
+      <hive-participants v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" />
       <v-btn
         v-if="viewer.status.value === 'closed' || viewer.status.value === 'refused'"
         size="small"
@@ -165,8 +168,14 @@
     <div
       v-else-if="viewer.status.value === 'open' && !viewer.mayPrompt.value"
       class="px-3 py-2 text-caption text-medium-emphasis"
+      data-testid="hive-read-only"
     >
-      {{ $t('hive.viewer.readOnly') }}
+      <!-- P1c-2 — the server named us a driver, the device does not let us
+           act as its account: say so, in the device's words. -->
+      <template v-if="viewer.drivingRefused.value">
+        {{ $t('hive.viewer.drivingRefused', { why: viewer.drivingRefused.value }) }}
+      </template>
+      <template v-else>{{ $t('hive.viewer.readOnly') }}</template>
     </div>
   </div>
 </template>
@@ -176,8 +185,9 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { renderMarkdown } from '@/composables/useMarkdown'
 import { useHiveViewer, withoutRepeatedInits } from '@/composables/useHiveViewer'
+import HiveParticipants from '@/components/hive/HiveParticipants.vue'
 
-const props = defineProps<{ sessionId: string }>()
+const props = defineProps<{ sessionId: string; tenantId?: string }>()
 const { t } = useI18n()
 const viewer = useHiveViewer()
 const shown = computed(() => withoutRepeatedInits(viewer.events.value))

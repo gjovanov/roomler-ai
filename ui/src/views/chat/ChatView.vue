@@ -108,7 +108,7 @@
       <!-- FR-90 — an agent session's room: its transcript, streamed from the
            device over a viewer peer (the server holds only the stubs above). -->
       <div v-if="hiveSessionId && showTranscript" class="chat-side-panel hive-panel border-s d-flex flex-column">
-        <hive-transcript :session-id="hiveSessionId" />
+        <hive-transcript :tenant-id="tenantId" :session-id="hiveSessionId" />
       </div>
 
       <!-- Thread panel -->
