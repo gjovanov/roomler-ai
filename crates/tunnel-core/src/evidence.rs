@@ -117,6 +117,19 @@ pub static ROUTE_YIELDS: AtomicU64 = AtomicU64::new(0);
 pub static ROUTE_WAVES_TICK: AtomicU64 = AtomicU64::new(0);
 pub static ROUTE_WAVES_EVENT: AtomicU64 = AtomicU64::new(0);
 
+/// #1282 — TICK-arm waves that an EVENT pulled forward.
+///
+/// An event inside the 3 s quiet window does not run a wave. It resets the
+/// tick to the window's end, and the tick runs and counts the wave. So a guard
+/// whose own route writes keep re-arming it reads as `tick` ≫ `event`, which
+/// is exactly what #1282 first misread as "no live subscription". The real
+/// causes, found in #1856, were a delete-then-add per wave on macOS (every
+/// peer /32) and on Windows (the block floors).
+/// `pulled ≈ tick` is a self-feeding guard; on a healthy host `tick − pulled`
+/// is the heartbeat (or the 2 s blind tick when there is no subscription) and
+/// `pulled` stays near 0.
+pub static ROUTE_WAVES_PULLED: AtomicU64 = AtomicU64::new(0);
+
 /// FR-68 — carrier revalidations forced by a network change ("forced rekey
 /// poke"). Each one re-keys every peer and can demote a healthy direct
 /// carrier, so this is the counter that turns "the mesh feels unstable" into
