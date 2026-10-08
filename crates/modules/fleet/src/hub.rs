@@ -138,6 +138,10 @@ pub struct ConnectedAgent {
     /// grant with `rc:hive.view.grant_ack` and serves a viewer peer. Per
     /// connection, for the same reason; `hive` does NOT imply it.
     pub supports_hive_view: bool,
+    /// FR-90 P1e — the agent advertises `hive-memory`: it understands a
+    /// session's core-memory snapshot (`rc:hive.memory`). Per connection, for
+    /// the same reason; `hive` does NOT imply it.
+    pub supports_hive_memory: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -416,6 +420,9 @@ impl Hub {
             // FR-90 P0d-2 — set by `set_agent_hive_view_support`; `false` = no
             // view grant is ever pushed to this connection.
             supports_hive_view: false,
+            // FR-90 P1e — set by `set_agent_hive_memory_support`; `false` = no
+            // core memory is ever pushed to this connection.
+            supports_hive_memory: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1650,6 +1657,50 @@ impl Hub {
             .agents
             .get(&agent_id)
             .map(|a| a.supports_hive_view)
+    }
+
+    /// FR-90 P1e — record whether this connection understands core memory
+    /// (`hive-memory`), right after registration.
+    pub fn set_agent_hive_memory_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_memory = supports;
+        }
+    }
+
+    /// FR-90 P1e — whether a connected agent advertises `hive-memory`.
+    /// `None` = not online on this pod.
+    pub fn agent_supports_hive_memory(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.supports_hive_memory)
+    }
+
+    /// FR-90 P1e — push a session's core memory (`rc:hive.memory`), checked
+    /// in the lookup that sends it, as [`Self::push_hive`]: offline or another
+    /// tenant's is [`Error::AgentOffline`]; a connection without `hive-memory`
+    /// is [`Error::ExecUnsupported`] and receives nothing — its session runs
+    /// without core memory, which is never a reason to refuse the start.
+    pub fn push_hive_memory(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive_memory {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
     }
 
     /// FR-90 P0d-2 — push a viewer-peer frame (`rc:hive.view.*`), checked in

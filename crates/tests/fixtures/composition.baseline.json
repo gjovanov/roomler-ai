@@ -405,6 +405,14 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/brain",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/hive/brain/{fact_id}",
+      "methods": "DELETE,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/session",
       "methods": "GET,HEAD,POST"
     },
@@ -950,6 +958,33 @@
         ]
       },
       {
+        "collection": "brain_budgets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "scope": 1,
+              "owner_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "brain_facts",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "scope": 1,
+              "owner_id": 1,
+              "status": 1,
+              "created_at": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "call_sessions",
         "indexes": [
           {
@@ -1159,6 +1194,17 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "hive_session_memory",
+        "indexes": [
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 86400
           }
         ]
       },
@@ -2454,6 +2500,33 @@
         ]
       },
       {
+        "collection": "brain_budgets",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "scope": 1,
+              "owner_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "brain_facts",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "scope": 1,
+              "owner_id": 1,
+              "status": 1,
+              "created_at": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "call_sessions",
         "indexes": [
           {
@@ -2663,6 +2736,17 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "hive_session_memory",
+        "indexes": [
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 86400
           }
         ]
       },
@@ -3888,6 +3972,7 @@
     "rc:relay.derp_ticket",
     "rc:hive.start",
     "rc:hive.stop",
+    "rc:hive.memory",
     "rc:hive.view.grant",
     "rc:hive.view.renew",
     "rc:hive.view.offer",
