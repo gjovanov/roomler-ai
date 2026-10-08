@@ -136,6 +136,13 @@
           :title="$t('nav.agentSessions')"
           data-testid="nav-agent-sessions"
         />
+        <v-list-item
+          v-if="caps.has('hive')"
+          :to="`/tenant/${tenantId}/memory`"
+          prepend-icon="mdi-brain"
+          :title="$t('nav.agentMemory')"
+          data-testid="nav-agent-memory"
+        />
         <!-- Devices-first (2026-08-26): the flat Devices item became a
              collapsible group listing the fleet's AGENTS (a tap lands in the
              remote view; tunnel clients have none, so they live only on the
