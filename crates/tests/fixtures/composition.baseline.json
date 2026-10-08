@@ -784,6 +784,30 @@
         ]
       },
       {
+        "collection": "agent_approvals",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "approval_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "agent_crashes",
         "indexes": [
           {
@@ -2260,6 +2284,30 @@
               "valid_to": 1
             },
             "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "agent_approvals",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "approval_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -3742,6 +3790,7 @@
     "rc:hive.start_ack",
     "rc:hive.state",
     "rc:hive.turn",
+    "rc:hive.approval",
     "rc:hive.view.grant_ack",
     "rc:hive.view.answer",
     "rc:hive.view.ice",
@@ -3846,6 +3895,7 @@
     "rc:agent.key_rotated": "network",
     "rc:consent": "fleet",
     "rc:consent.pending": "fleet",
+    "rc:hive.approval": "hive",
     "rc:hive.start_ack": "hive",
     "rc:hive.state": "hive",
     "rc:hive.turn": "hive",
