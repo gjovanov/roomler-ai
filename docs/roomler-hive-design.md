@@ -436,8 +436,16 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
        --permission-prompt-tool mcp__roomler__approve --permission-mode default \
        --disallowedTools AskUserQuestion
 env:   ANTHROPIC_BASE_URL=http://127.0.0.1:<sidecar>/s/<sid>
-       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
 ```
+
+> **Not `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`** (FR-90 P1a-3, measured). On Linux it makes
+> every command run sandboxed, and the sandbox needs bubblewrap and socat: without them
+> Bash refuses everything ("Sandbox is required but failed to initialize"). That was why
+> P0's sessions could not run `whoami`. The one credential it would strip is the session's
+> own token, which is good only on loopback, for one run, at one fence. Sandboxing returns
+> with the egress proxy below, on hosts that can run it. Whatever turns a sandbox on, the
+> settings keep `sandbox.autoAllowBashIfSandboxed: false`: by default a sandboxed command
+> is approved automatically in any mode, which would take Bash out of the approvals.
 
 `settings.json` is written by the daemon into a directory the user can read but not
 write. It carries `apiKeyHelper` → `roomler hive token` (the fence-bound session
