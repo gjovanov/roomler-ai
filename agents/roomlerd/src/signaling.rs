@@ -4139,6 +4139,34 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P1e — a session's core memory, just ahead of its start. Kept
+        // for that start's launch; whether the session sees it is the
+        // device's own `hive_core_memory`.
+        ServerMsg::HiveMemory {
+            session_id,
+            fence,
+            brain_rev,
+            claude_md,
+            memory_md,
+        } => {
+            #[cfg(all(feature = "hive", target_os = "linux"))]
+            crate::hive::handle_memory(
+                crate::hive::CoreMemory {
+                    session_id,
+                    fence,
+                    brain_rev,
+                    claude_md,
+                    memory_md,
+                },
+                ctx.is_primary,
+            );
+            #[cfg(not(all(feature = "hive", target_os = "linux")))]
+            {
+                let _ = (fence, brain_rev, &claude_md, &memory_md);
+                debug!(session = %session_id, "rc:hive.memory ignored — this build does not run agent sessions");
+            }
+        }
+
         // FR-90 P0d-2 — the viewer peer. A grant is answered with
         // `rc:hive.view.grant_ack` on THIS connection, from a task (it reads
         // the replica store); the rest feeds the grant's own actor. A build

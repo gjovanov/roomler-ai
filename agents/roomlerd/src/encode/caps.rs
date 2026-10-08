@@ -1622,6 +1622,11 @@ fn rpc_caps() -> Vec<String> {
     // viewer peer: answers `rc:hive.view.grant` before the browser dials.
     #[cfg(all(feature = "hive", target_os = "linux"))]
     caps.push(RpcCap::HiveView);
+    // FR-90 P1e — and understands a session's core memory (`rc:hive.memory`).
+    // A property of the BUILD: whether a session ever sees it is the device's
+    // own `hive_core_memory`, default off.
+    #[cfg(all(feature = "hive", target_os = "linux"))]
+    caps.push(RpcCap::HiveMemory);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
