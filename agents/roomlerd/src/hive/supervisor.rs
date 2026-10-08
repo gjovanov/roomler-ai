@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits,
+    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveManifestEntry, HiveRefusal, HiveRunState,
+    HiveTurnStatus, hive_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::launch::{
@@ -582,6 +583,21 @@ impl Supervisor {
                 detail: r.detail,
             });
         }
+        // P1b — and every session this device RUNS, now: the server ends the
+        // ones it holds as running here that the list leaves out. A daemon
+        // that restarted holds no replay of what it ran, so this is the only
+        // way the server learns those sessions are over (finding 7).
+        let manifest: Vec<HiveManifestEntry> = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(session_id, l)| HiveManifestEntry {
+                session_id: *session_id,
+                fence: l.fence,
+            })
+            .collect();
+        let _ = tx.try_send(ClientMsg::HiveManifest { sessions: manifest });
         *self.reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
@@ -2260,6 +2276,53 @@ done
             other => panic!("expected a replayed state, got {other:?}"),
         }
         r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// The `rc:hive.manifest` a connection is sent, as (session, fence).
+    async fn manifest_on(rx: &mut mpsc::Receiver<ClientMsg>) -> Vec<(ObjectId, u64)> {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a manifest within 10 s")
+                .expect("the connection is open");
+            if let ClientMsg::HiveManifest { sessions } = msg {
+                return sessions.iter().map(|e| (e.session_id, e.fence)).collect();
+            }
+        }
+    }
+
+    /// P1b — every connection hears which sessions run here, and only
+    /// those: a session that ended is not in the list, so the server can end
+    /// what a restart ended (finding 7).
+    #[tokio::test]
+    async fn a_new_connection_hears_which_sessions_run_here() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+
+        let (tx, mut second) = mpsc::channel(64);
+        r.sup.connected(tx);
+        assert_eq!(manifest_on(&mut second).await, [(sid, 1)]);
+
+        r.sup.stop(sid, 1, "owner".into());
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), second.recv())
+                .await
+                .expect("the stop's end within 10 s")
+                .expect("open");
+            if matches!(msg, ClientMsg::HiveState { session_id, state: Some(HiveRunState::Ended), .. } if session_id == sid)
+            {
+                break;
+            }
+        }
+        let (tx, mut third) = mpsc::channel(64);
+        r.sup.connected(tx);
+        assert!(
+            manifest_on(&mut third).await.is_empty(),
+            "an ended session is not run here"
+        );
     }
 
     // ─── P1a — approvals ────────────────────────────────────────────────

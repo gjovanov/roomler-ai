@@ -333,6 +333,57 @@ impl AgentSessionDao {
             .await
     }
 
+    /// FR-90 P1b — the sessions the server holds as running on `device_id`:
+    /// live, and accepted by it. An UNANSWERED start is not here — the device
+    /// may not have launched it yet, and reconcile owns it.
+    pub async fn running_on_device(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "location.device_id": device_id,
+                    "status": statuses(&SessionStatus::LIVE),
+                    "accepted_at": { "$type": "date" },
+                },
+                None,
+            )
+            .await
+    }
+
+    /// FR-90 P1b — end a session its device says it does not run: still
+    /// live, still this device's, still at `fence`. A session being stopped
+    /// ends `stopped` (its harness is gone either way); any other,
+    /// `not_on_device`.
+    pub async fn end_not_on_device(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        fence: i64,
+        stopping: bool,
+    ) -> DaoResult<bool> {
+        let reason = if stopping { "stopped" } else { "not_on_device" };
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "location.device_id": device_id,
+                    "fence": fence,
+                    "status": statuses(&SessionStatus::LIVE),
+                },
+                doc! { "$set": {
+                    "status": SessionStatus::Ended.as_str(),
+                    "end_reason": reason,
+                    "detail": "the device reconnected without it",
+                    "ended_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
     /// What a device must be told when it connects: stops it has not
     /// confirmed, and starts it never answered.
     pub async fn needing_delivery(
