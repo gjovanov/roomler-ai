@@ -660,6 +660,66 @@ async fn upload_probe(app: &TestApp, s: &SeededTenant, content: &str) {
     assert_eq!(resp.status().as_u16(), 200, "the probe upload");
 }
 
+/// FR-90 P1a-2 — the harness's side of a session's toolbelt: what Claude
+/// Code sends through its relay, played by the test.
+struct Harness {
+    rd: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+    wr: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl Harness {
+    async fn connect(socket: &Path) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let s = tokio::net::UnixStream::connect(socket)
+            .await
+            .unwrap_or_else(|e| panic!("the session's toolbelt at {}: {e}", socket.display()));
+        let (rd, wr) = s.into_split();
+        Self {
+            rd: tokio::io::BufReader::new(rd).lines(),
+            wr,
+        }
+    }
+
+    async fn send(&mut self, v: Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut line = v.to_string();
+        line.push('\n');
+        self.wr.write_all(line.as_bytes()).await.unwrap();
+    }
+
+    /// The answer to request `id`, skipping progress.
+    async fn answer(&mut self, id: u64) -> Value {
+        loop {
+            let line = tokio::time::timeout(WAIT, self.rd.next_line())
+                .await
+                .expect("the toolbelt answered in time")
+                .unwrap()
+                .expect("the toolbelt is open");
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == id {
+                return v;
+            }
+        }
+    }
+}
+
+/// Whether a message in `room` matches `pred` within the test's patience.
+async fn until_room_message(
+    app: &TestApp,
+    s: &SeededTenant,
+    room: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> bool {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        if room_messages(app, s, room).await.iter().any(&pred) {
+            return true;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    false
+}
+
 fn text_of(e: &Value) -> String {
     e["event"].to_string()
 }
@@ -695,9 +755,18 @@ async fn scenario(watch: Watch) {
     let prompt_canary = random("canaryprompt");
     let tool_canary = random("canarytool");
     let stderr_canary = random("canarystderr");
+    // P1a-2 — what an approval would run, and what a driver told the model.
+    let approval_canary = random("canaryapproval");
+    let deny_canary = random("canarydeny");
     let title_probe = random("probetitle");
     let file_probe = random("probefile");
-    for c in [&prompt_canary, &tool_canary, &stderr_canary] {
+    for c in [
+        &prompt_canary,
+        &tool_canary,
+        &stderr_canary,
+        &approval_canary,
+        &deny_canary,
+    ] {
         watch.watch(c);
     }
 
@@ -784,6 +853,50 @@ async fn scenario(watch: Watch) {
             tokio::time::sleep(POLL).await;
         }
     }
+    // ── An approval in session 1 (P1a-2): the test plays the harness ────────
+    // asking, through the session's toolbelt as Claude Code would, and the
+    // browser is the driver who answers.
+    let socket = dir.path().join("run").join(&sid1).join("toolbelt.sock");
+    let mut harness = Harness::connect(&socket).await;
+    harness
+        .send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25"}}))
+        .await;
+    let _ = harness.answer(0).await;
+    harness
+        .send(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "approve",
+                "arguments": {"tool_name": "Bash", "tool_use_id": "toolu_canary",
+                              "input": {"command": format!("echo {approval_canary}")}},
+            }}),
+        )
+        .await;
+    let open = b.recv_op("approvals").await;
+    let approval = open["pending"][0].as_str().unwrap_or_default().to_string();
+    let approval_ref = format!("{sid1}!{approval}");
+    let stub_opened = until_room_message(&app, &seeded, &room1, |m| {
+        m["binding"]["ref"] == approval_ref.as_str()
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Approval needed"))
+    })
+    .await;
+    b.send(
+        json!({"op": "answer", "id": "a1", "approval": approval, "decision": "deny",
+        "message": format!("not now, {deny_canary}")}),
+    )
+    .await;
+    let answered = b.recv_op("answer").await;
+    let verdict = harness.answer(1).await;
+    let stub_denied = until_room_message(&app, &seeded, &room1, |m| {
+        m["binding"]["ref"] == approval_ref.as_str()
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("denied by"))
+    })
+    .await;
+
     b.send(json!({"op": "page", "after": 0, "limit": 500}))
         .await;
     let stored1 = b.recv_op("page").await;
@@ -850,6 +963,8 @@ async fn scenario(watch: Watch) {
         ("the prompt", &prompt_canary),
         ("the tool's output", &tool_canary),
         ("the harness's stderr", &stderr_canary),
+        ("what an approval would run", &approval_canary),
+        ("what a driver told the model", &deny_canary),
     ] {
         for hit in in_mongo(&app.db, canary).await {
             leaks.push(format!("{what} is in Mongo: {hit}"));
@@ -894,6 +1009,66 @@ async fn scenario(watch: Watch) {
         "the device's store holds both: {stored1}"
     );
     assert!(stub_done, "the server stubbed the turn as done");
+
+    // P1a-2 — the approval: the driver's answer reached the harness, with
+    // the driver's words; the server knew only THAT it waited, and how it
+    // ended, and who answered.
+    assert!(
+        !approval.is_empty(),
+        "the viewer was told an approval is open: {open}"
+    );
+    assert_eq!(
+        answered["ok"], true,
+        "the device took the driver's answer: {answered}"
+    );
+    let said: Value = serde_json::from_str(
+        verdict["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("{}"),
+    )
+    .unwrap_or_default();
+    assert_eq!(said["behavior"], "deny", "{verdict}");
+    assert!(
+        said["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(deny_canary.as_str())),
+        "the harness read the driver's reason: {said}"
+    );
+    assert!(
+        stub_opened,
+        "the room's stub said the session needs approval"
+    );
+    assert!(stub_denied, "and then how it ended");
+    let record = app
+        .db
+        .collection::<Document>("agent_approvals")
+        .find_one(doc! { "approval_id": &approval })
+        .await
+        .unwrap()
+        .expect("the approval is on the record");
+    assert_eq!(record.get_str("status").unwrap(), "denied", "{record}");
+    assert_eq!(
+        record.get_object_id("answered_by").unwrap().to_hex(),
+        seeded.admin.id,
+        "who answered: {record}"
+    );
+    let notified = app
+        .db
+        .collection::<Document>("notifications")
+        .find_one(doc! { "notification_type": "approval_request" })
+        .await
+        .unwrap()
+        .expect("the driver was notified");
+    assert!(
+        notified
+            .get_str("link")
+            .is_ok_and(|l| l.ends_with(&format!("/room/{room1}"))),
+        "the notification leads to the session's room: {notified}"
+    );
+    assert!(
+        stored1.contains(approval_canary.as_str()) && stored1.contains(deny_canary.as_str()),
+        "the device's store holds what was asked and what the driver said: {stored1}"
+    );
     assert!(stopped1, "session 1 ended on its stop");
     assert!(up2, "session 2 came up");
     assert!(
