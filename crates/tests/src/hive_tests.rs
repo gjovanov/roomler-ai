@@ -2047,3 +2047,432 @@ async fn removing_a_member_closes_their_views() {
     assert_eq!(close["grant_id"], gid);
     assert_eq!(close["reason"], "member_removed");
 }
+
+// ─── P1c — who takes part, and who drives ────────────────────────────────
+
+/// A hive app that a polling test cannot run into the default limiter with.
+async fn hive_app_polling() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+fn participant_url(tid: &str, sid: &str, user: Option<&str>) -> String {
+    match user {
+        Some(u) => format!("/api/tenant/{tid}/hive/session/{sid}/participant/{u}"),
+        None => format!("/api/tenant/{tid}/hive/session/{sid}/participant"),
+    }
+}
+
+async fn status_and_json(resp: reqwest::Response) -> (u16, Value) {
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// `PUT …/participant/{user}` `{role}` as `token`.
+async fn set_part(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    user: &str,
+    role: &str,
+) -> (u16, Value) {
+    let resp = app
+        .auth_put(&participant_url(tid, sid, Some(user)), token)
+        .json(&json!({ "role": role }))
+        .send()
+        .await
+        .unwrap();
+    status_and_json(resp).await
+}
+
+async fn remove_part(app: &TestApp, tid: &str, token: &str, sid: &str, user: &str) -> (u16, Value) {
+    let resp = app
+        .auth_delete(&participant_url(tid, sid, Some(user)), token)
+        .send()
+        .await
+        .unwrap();
+    status_and_json(resp).await
+}
+
+async fn parts(app: &TestApp, tid: &str, token: &str, sid: &str) -> (u16, Value) {
+    let resp = app
+        .auth_get(&participant_url(tid, sid, None), token)
+        .send()
+        .await
+        .unwrap();
+    status_and_json(resp).await
+}
+
+/// Whether a stored session names no driver: the field absent, or emptied.
+fn no_drivers(s: &Document) -> bool {
+    s.get_array("drivers").map(|d| d.is_empty()).unwrap_or(true)
+}
+
+/// Whom every `approval_request` notification went to, sorted.
+async fn approval_pushes(app: &TestApp) -> Vec<String> {
+    let mut to: Vec<String> = Vec::new();
+    let mut cur = app
+        .db
+        .collection::<Document>("notifications")
+        .find(doc! { "notification_type": "approval_request" })
+        .await
+        .unwrap();
+    while cur.advance().await.unwrap() {
+        let n = cur.deserialize_current().unwrap();
+        to.push(n.get_object_id("user_id").unwrap().to_hex());
+    }
+    to.sort();
+    to
+}
+
+/// `user`'s role in a participants answer, if listed.
+fn role_of(body: &Value, user: &str) -> Option<String> {
+    body["items"]
+        .as_array()?
+        .iter()
+        .find(|p| p["user_id"] == user)
+        .and_then(|p| p["role"].as_str().map(str::to_string))
+}
+
+/// P1c — the owner decides who takes part: a READER joins the session's
+/// Secret room and reads it; a DRIVER also prompts it. Naming a driver needs
+/// `HIVE_RUN` (driving runs code on the device as the session's account);
+/// every change ends the person's open views, because a grant carries
+/// `may_prompt` as it was minted; and nobody but the owner changes anything.
+#[tokio::test]
+async fn the_owner_names_who_reads_and_who_drives() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hiveparts").await;
+    let tid = seeded.tenant_id.clone();
+    let owner = seeded.admin.access_token.clone();
+    let member = seeded.member.access_token.clone();
+    let mid = seeded.member.id.clone();
+    let mut dev = device(&app, &seeded, "hive-parts", VIEWS_HIVE).await;
+    let sid = started_session(&app, &tid, &owner, &mut dev).await;
+    let room = get_session(&app, &tid, &owner, &sid).await.1["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Before: the member learns nothing, and changes nothing.
+    assert_eq!(get_session(&app, &tid, &member, &sid).await.0, 404);
+    assert_eq!(parts(&app, &tid, &member, &sid).await.0, 404);
+    assert_eq!(
+        set_part(&app, &tid, &member, &sid, &mid, "reader").await.0,
+        404
+    );
+
+    // A reader: in the room, reading — not prompting.
+    let (code, body) = set_part(&app, &tid, &owner, &sid, &mid, "reader").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(role_of(&body, &seeded.admin.id).as_deref(), Some("owner"));
+    assert_eq!(role_of(&body, &mid).as_deref(), Some("reader"));
+    assert_eq!(body["may_manage"], true);
+    let (code, s) = get_session(&app, &tid, &member, &sid).await;
+    assert_eq!(code, 200, "a reader reads the session: {s}");
+    assert_eq!(s["drivers"], json!([]), "{s}");
+    let (code, theirs) = parts(&app, &tid, &member, &sid).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        theirs["may_manage"], false,
+        "only the owner manages: {theirs}"
+    );
+    assert_eq!(
+        set_part(&app, &tid, &member, &sid, &mid, "driver").await.0,
+        404,
+        "a reader cannot make themselves a driver"
+    );
+    wait_messages(&app, &tid, &owner, &room, "the room is told", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Member** joined to read"))
+        })
+    })
+    .await;
+
+    let mut mws = user_ws(&app, &member).await;
+    user_send(&mut mws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant")
+        .await
+        .expect("a reader may view");
+    assert_eq!(grant["user_id"], mid);
+    assert_eq!(grant["may_prompt"], false, "a reader does not prompt");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+    )
+    .await;
+    assert_eq!(
+        user_read(&mut mws, "hive:view.ready").await.unwrap()["may_prompt"],
+        false
+    );
+
+    // A driver needs HIVE_RUN: refused, audited, nothing changed.
+    let (code, body) = set_part(&app, &tid, &owner, &sid, &mid, "driver").await;
+    assert_eq!(code, 403, "{body}");
+    assert!(
+        body.to_string().contains("HIVE_RUN"),
+        "the refusal names what is missing: {body}"
+    );
+    let refused = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find_one(doc! { "action": "participant", "outcome": "refused" })
+        .await
+        .unwrap()
+        .expect("the refusal is audited");
+    assert_eq!(refused.get_str("reason").unwrap(), "no_permission");
+    assert_eq!(refused.get_object_id("target_id").unwrap().to_hex(), mid);
+    assert!(
+        !device_hears(
+            &mut dev.ws,
+            "rc:hive.view.close",
+            Duration::from_millis(300)
+        )
+        .await,
+        "a refused change ends no view"
+    );
+
+    // Granted it, the member is named a driver; their view says otherwise
+    // now, so it ends, and the one they reopen may prompt.
+    grant_hive_run_to_member(&app, &seeded).await;
+    let (code, body) = set_part(&app, &tid, &owner, &sid, &mid, "driver").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(role_of(&body, &mid).as_deref(), Some("driver"));
+    let close = read_until(&mut dev.ws, "rc:hive.view.close")
+        .await
+        .expect("the device closes the stale grant");
+    assert_eq!(close["grant_id"], gid);
+    assert_eq!(close["reason"], "role_changed");
+    assert_eq!(
+        user_read(&mut mws, "hive:view.closed").await.unwrap()["reason"],
+        "role_changed"
+    );
+    user_send(&mut mws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant")
+        .await
+        .expect("reopened");
+    assert_eq!(grant["may_prompt"], true, "a driver prompts a live session");
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": grant["grant_id"]}),
+    )
+    .await;
+    assert_eq!(
+        user_read(&mut mws, "hive:view.ready").await.unwrap()["may_prompt"],
+        true
+    );
+    assert_eq!(
+        get_session(&app, &tid, &owner, &sid).await.1["drivers"],
+        json!([mid]),
+    );
+    // Saying it again changes nothing, and ends nothing.
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &mid, "driver").await.0,
+        200
+    );
+    assert!(
+        !device_hears(
+            &mut dev.ws,
+            "rc:hive.view.close",
+            Duration::from_millis(300)
+        )
+        .await,
+        "no change, no ended view"
+    );
+
+    // What is not a participant change.
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &seeded.admin.id, "reader")
+            .await
+            .0,
+        400,
+        "the owner always drives"
+    );
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &mid, "admin").await.0,
+        400
+    );
+    assert_eq!(
+        set_part(
+            &app,
+            &tid,
+            &owner,
+            &sid,
+            &ObjectId::new().to_hex(),
+            "reader"
+        )
+        .await
+        .0,
+        404,
+        "a stranger's id answers like a bogus one"
+    );
+
+    // Taken out: out of the room, driving nothing, reading nothing.
+    let (code, body) = remove_part(&app, &tid, &owner, &sid, &mid).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(role_of(&body, &mid), None);
+    assert_eq!(
+        read_until(&mut dev.ws, "rc:hive.view.close").await.unwrap()["reason"],
+        "removed"
+    );
+    assert_eq!(get_session(&app, &tid, &member, &sid).await.0, 404);
+    assert!(no_drivers(&stored(&app, &sid).await));
+    // Again: nothing to do, nothing said.
+    assert_eq!(remove_part(&app, &tid, &owner, &sid, &mid).await.0, 200);
+    let audit = app.db.collection::<Document>("hive_audit");
+    for (outcome, n) in [("reader", 1), ("driver", 1), ("removed", 1)] {
+        assert_eq!(
+            audit
+                .count_documents(doc! { "action": "participant", "outcome": outcome })
+                .await
+                .unwrap(),
+            n,
+            "{outcome}"
+        );
+    }
+}
+
+/// P1c — what a device says about WHO acted is believed only when it names
+/// a driver: who answered an approval, who asked a turn. A device naming a
+/// reader is not believed — no stub says a person did what they could not
+/// have. And an approval is pushed to every driver still in the room.
+#[tokio::test]
+async fn a_drivers_word_is_believed_and_a_readers_is_not() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hivewho").await;
+    let tid = seeded.tenant_id.clone();
+    let owner = seeded.admin.access_token.clone();
+    let mid = seeded.member.id.clone();
+    grant_hive_run_to_member(&app, &seeded).await;
+    let mut dev = device(&app, &seeded, "hive-who", RUNS_HIVE).await;
+    let sid = started_session(&app, &tid, &owner, &mut dev).await;
+    let room = get_session(&app, &tid, &owner, &sid).await.1["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &mid, "reader").await.0,
+        200
+    );
+
+    let turn = |n: u32, by: &str| {
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": n,
+               "status": "ok", "prompted_by": by, "steps": 0})
+    };
+    let approval = |id: &str, status: &str, by: Option<&str>| {
+        let mut f = json!({"t": "rc:hive.approval", "session_id": sid, "fence": 1,
+                           "approval_id": id, "turn": 1, "status": status});
+        if let Some(by) = by {
+            f["answered_by"] = json!(by);
+        }
+        f
+    };
+    let stub = |items: &[Value], reference: &str| -> String {
+        items
+            .iter()
+            .find(|m| bound_to(m, reference))
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // As a reader: neither claim is believed.
+    send(&mut dev.ws, turn(1, &mid)).await;
+    send(&mut dev.ws, approval("r1", "open", None)).await;
+    send(&mut dev.ws, approval("r1", "allowed", Some(&mid))).await;
+    let (t1, r1) = (format!("{sid}#1"), format!("{sid}!r1"));
+    let items = wait_messages(&app, &tid, &owner, &room, "the reader's claims", |items| {
+        items.iter().any(|m| bound_to(m, &t1)) && stub(items, &r1).contains("allowed")
+    })
+    .await;
+    assert!(
+        !stub(&items, &t1).contains("asked by"),
+        "{}",
+        stub(&items, &t1)
+    );
+    assert_eq!(stub(&items, &r1), "🔐 **Approval** · turn 1 — ✅ allowed");
+    assert_eq!(
+        approval_pushes(&app).await,
+        std::slice::from_ref(&seeded.admin.id),
+        "a reader is not asked to answer"
+    );
+
+    // As a driver: both are, and the push reaches them too.
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &mid, "driver").await.0,
+        200
+    );
+    send(&mut dev.ws, turn(2, &mid)).await;
+    send(&mut dev.ws, approval("d1", "open", None)).await;
+    send(&mut dev.ws, approval("d1", "denied", Some(&mid))).await;
+    let (t2, d1) = (format!("{sid}#2"), format!("{sid}!d1"));
+    let items = wait_messages(&app, &tid, &owner, &room, "the driver's claims", |items| {
+        stub(items, &t2).contains("asked by") && stub(items, &d1).contains("denied by")
+    })
+    .await;
+    assert!(
+        stub(&items, &t2).contains("Member"),
+        "asked by the driver: {}",
+        stub(&items, &t2)
+    );
+    assert!(
+        stub(&items, &d1).contains("denied by **hivewho Member**"),
+        "{}",
+        stub(&items, &d1)
+    );
+    let mut want = vec![
+        seeded.admin.id.clone(),
+        seeded.admin.id.clone(),
+        mid.clone(),
+    ];
+    want.sort();
+    assert_eq!(
+        approval_pushes(&app).await,
+        want,
+        "r1 to the owner; d1 to the owner AND the driver"
+    );
+}
+
+/// P1c — a member who leaves the org drives nobody's session any more: a
+/// seat nobody re-offered must not come back if they rejoin.
+#[tokio::test]
+async fn a_member_who_leaves_the_org_drives_nothing() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hivegone").await;
+    let tid = seeded.tenant_id.clone();
+    let owner = seeded.admin.access_token.clone();
+    let mid = seeded.member.id.clone();
+    grant_hive_run_to_member(&app, &seeded).await;
+    let mut dev = device(&app, &seeded, "hive-gone", RUNS_HIVE).await;
+    let sid = started_session(&app, &tid, &owner, &mut dev).await;
+    assert_eq!(
+        set_part(&app, &tid, &owner, &sid, &mid, "driver").await.0,
+        200
+    );
+    assert_eq!(
+        stored(&app, &sid).await.get_array("drivers").unwrap().len(),
+        1
+    );
+
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/member/{mid}"), &owner)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {:?}", resp.status());
+    let s = stored(&app, &sid).await;
+    assert!(no_drivers(&s), "dropped from the drivers: {s}");
+    assert_ne!(
+        s.get_str("status").unwrap(),
+        "ended",
+        "the OWNER's session runs on — only the member's own end"
+    );
+}

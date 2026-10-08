@@ -413,6 +413,14 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/participant",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/participant/{user_id}",
+      "methods": "DELETE,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/stop",
       "methods": "POST"
     },

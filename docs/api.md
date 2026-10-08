@@ -308,8 +308,11 @@ before it leaves the host.
 |---|---|---|
 | POST | `…/hive/session` | `{device_id, folder, title?}` — start an agent session on a device. Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit` |
 | GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
-| GET | `…/hive/session/{sid}` | One of the caller's sessions — anyone else's id is a **404**, the answer a bogus one gets |
-| POST | `…/hive/session/{sid}/stop` | Stop it: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
+| GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it |
+| POST | `…/hive/session/{sid}/stop` | Stop it — the owner only: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
+| GET | `…/hive/session/{sid}/participant` | FR-90 P1c — who takes part: `items[{user_id, display_name, role}]`, `role` `owner` · `driver` · `reader`, and `may_manage` (the owner alone). For anyone who may read the session |
+| PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400** |
+| DELETE | `…/hive/session/{sid}/participant/{user_id}` | The owner takes someone out: out of the room, driving nothing, their views ended (`removed`). Idempotent |
 
 Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
 output — see [the design](roomler-hive-design.md) §3.3.
