@@ -25,6 +25,8 @@ export type HiveSessionStatus =
 export interface HiveSession {
   id: string
   owner_id: string
+  /** P1c — who besides the owner drives it; absent from an older server. */
+  drivers?: string[]
   title: string
   /** The session's secret chat room (P0d-1); absent on an older record. */
   room_id?: string
@@ -57,6 +59,23 @@ export interface HiveStartResult {
 export interface HiveStopResult {
   outcome: 'stopping' | 'queued' | 'ended'
   session: HiveSession
+}
+
+/** P1c — someone's part in a session: its owner, a driver (prompts it and
+ *  answers its approvals), or a reader (reads it and talks in its room). */
+export type HiveRole = 'owner' | 'driver' | 'reader'
+
+export interface HiveParticipant {
+  user_id: string
+  display_name: string
+  role: HiveRole
+}
+
+/** `GET/PUT/DELETE …/hive/session/{id}/participant[/{user}]`. */
+export interface HiveParticipants {
+  items: HiveParticipant[]
+  /** Only the owner changes who takes part. */
+  may_manage: boolean
 }
 
 interface ListResponse {
@@ -129,5 +148,39 @@ export const useHiveStore = defineStore('hive', () => {
     return res
   }
 
-  return { sessions, total, loading, error, fetchSessions, fetchSession, start, stop, upsert }
+  /** P1c — who takes part in a session; anyone who may read it may ask. */
+  function fetchParticipants(tenantId: string, sessionId: string): Promise<HiveParticipants> {
+    return api.get<HiveParticipants>(`${base(tenantId)}/${sessionId}/participant`)
+  }
+
+  /** P1c — the owner names someone a driver or a reader. A driver needs
+   *  "Run agent sessions" (HIVE_RUN): the server says so with a 403. */
+  function setParticipant(
+    tenantId: string,
+    sessionId: string,
+    userId: string,
+    role: Exclude<HiveRole, 'owner'>,
+  ): Promise<HiveParticipants> {
+    return api.put<HiveParticipants>(`${base(tenantId)}/${sessionId}/participant/${userId}`, { role })
+  }
+
+  /** P1c — the owner takes someone out: out of the room, driving nothing. */
+  function removeParticipant(tenantId: string, sessionId: string, userId: string): Promise<HiveParticipants> {
+    return api.delete<HiveParticipants>(`${base(tenantId)}/${sessionId}/participant/${userId}`)
+  }
+
+  return {
+    sessions,
+    total,
+    loading,
+    error,
+    fetchSessions,
+    fetchSession,
+    start,
+    stop,
+    upsert,
+    fetchParticipants,
+    setParticipant,
+    removeParticipant,
+  }
 })
