@@ -3,7 +3,7 @@
 *Design doc · v0.4 · 2026-10-07 · supersedes v0.3 (same day) and v0.2 (2026-09-03).
 Anchors are `path:line` on `origin/master` `d2dc0efa6`. Status: **design approved
 2026-10-07, tracked as [FR-90](fr/FR-90-hive-agent-sessions.md); being built — P0a (the device core),
-P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test) are in, and on 2026-10-07 a browser drove a real Claude Code session on a Linux device end to end — AC1, on a throwaway stack (FR-90 spec §8)** (§17). Decisions are in §0.1; the review that produced v0.3 is
+P0b (the server module), P0c (the device supervisor) and P0d-1 (the session room and its turn stubs) are in, P0d-2a and P0d-2b (the viewer peer, device and server), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test) are in, and on 2026-10-07 a browser drove a real Claude Code session on a Linux device end to end — AC1, on a throwaway stack (FR-90 spec §8); P1a (approvals through the toolbelt's `approve`) is being built against Claude Code's contract as measured (FR-90 spec §3e)** (§17). Decisions are in §0.1; the review that produced v0.3 is
 [Appendix A](#appendix-a--review-of-v02).*
 
 > **What changed.** v0.2 kept Hive outside Roomler: a separate product behind a new
@@ -432,8 +432,9 @@ The daemon regenerates the launch every time, because a resume restores neither
 claude -p --input-format stream-json --output-format stream-json --verbose \
        --include-partial-messages --resume <sid> \
        --settings   <daemon-owned dir>/<sid>/settings.json \
-       --mcp-config <daemon-owned dir>/<sid>/mcp.json \
-       --permission-prompt-tool mcp__roomler__approve
+       --mcp-config <daemon-owned dir>/<sid>/mcp.json --strict-mcp-config \
+       --permission-prompt-tool mcp__roomler__approve --permission-mode default \
+       --disallowedTools AskUserQuestion
 env:   ANTHROPIC_BASE_URL=http://127.0.0.1:<sidecar>/s/<sid>
        CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
 ```
@@ -879,6 +880,17 @@ interactive user and most verbs trust the pipe alone (`lib.rs:1073-1075`).
 
 Sensitive tools set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks
 even under allow rules. Because that is UX, the daemon asks again where it matters.
+
+> **As built in P1a** (FR-90 spec §3e has the measured contract). The stdio shim is
+> `roomlerd hive-mcp <socket>` — the daemon's own binary, short-circuited before any of
+> its start-up, because Claude Code starts it as the session's account and nothing of
+> the daemon's may run there. The endpoint is `<runtime>/<sid>/toolbelt.sock`: the
+> account's, `0600`, in the daemon's `0755` directory beside the session's
+> `settings.json` and `mcp.json` (a directory the account owned could rename
+> `settings.json` from under the daemon); every peer's uid is checked again. The launch
+> pins `--permission-mode default`: with nothing setting a mode, a `-p` run behind a proxy
+> starts in `auto`, where a classifier decides instead of a person. `--strict-mcp-config`
+> keeps a repository's `.mcp.json` from shadowing `roomler`.
 
 ### 7.2 Reaching org resources without root and without touching routes
 
