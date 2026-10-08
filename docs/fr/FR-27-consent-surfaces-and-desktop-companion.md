@@ -202,7 +202,7 @@ is why it is sequenced last, behind its own feature and the probe.
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
-| 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **implemented** (2026-10-06, the record-demo PR) — the reveal logic has 6 unit tests; field pending on a Mac |
+| 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
 
 ## Acceptance criteria
 
@@ -234,18 +234,35 @@ Ticked only where a run is recorded in the field log below.
 - [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
       ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
       `DEFAULT_ADMIN` — an operator grant, not a code change.
-- [ ] P9, on a Mac: a session start brings the banner up without taking focus (the
+- [x] P9, on a Mac: a session start brings the banner up without taking focus (the
       next click into the person's own window acts), it hides 2.5 s after the
       pointer leaves (after its 4 s first show), returns after a 1.2 s rest at the
       top edge, stays while a recording runs, and a red frame surrounds the screen
-      for exactly the session's duration.
+      for exactly the session's duration — **the Mac, agent 0.4.117, 2026-10-08**,
+      every clause (see the log): banner up at +1.7 s, hidden at +6.2 s, back at
+      +14.5 s (and again at +24.9 s) on a top-edge rest; the window census read the
+      banner on-screen through a recording with the pointer away; the red frame on
+      every frame of the session and gone from the census afterwards; and the next
+      click into TextEdit after a fresh banner landed its keystrokes.
 - [ ] A live session shows "Being viewed by «name»" with a working Disconnect on
       Windows, macOS and a Linux X11 desktop. (Windows border confirmed visible +
-      capture-excluded during a session; the reveal-on-hover badge and the other
-      two OSes are untested.)
+      capture-excluded during a session; **the macOS half is done — the Mac,
+      0.4.117, 2026-10-08**: the banner reads "Being viewed by «owner name»" and
+      clicking its Disconnect logged `viewee requested disconnect via overlay
+      badge` → `session terminated … reason=ControllerHangup`. ⚠️ The banner
+      window is not key, so the first click only activates the companion and a
+      following click triggers Disconnect — it has no `acceptsFirstMouse`. The
+      Windows reveal-on-hover badge and the Linux X11 panel are still untested.)
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
+      **"Check for updates" verified — the Mac, 0.4.117, 2026-10-08**: the button
+      runs `<daemon> self-update --check-only` (`cmd_check_update`, via
+      `agent_exe_path`), replicated as the console user → `Up to date (current:
+      0.4.117, latest: agent-v0.4.117)`, exit 0. "Apply update" has **nothing to
+      apply** (the Mac is on the latest release), so its success cannot be shown
+      here; the macOS update MECHANISM itself was proven end to end by the 0.4.109
+      canary install (the FR-85 log). Left unticked until an update is pending.
 - [~] The Devices grid shows the companion version alongside the agent version.
       (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
       **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
@@ -499,3 +516,54 @@ day): a Mac ran a 0.4.92 companion under a 0.4.101 daemon for 17 days while this
 field read `0.4.101` throughout. The grid can only ever surface a skew the
 companion's *files* have; a stale *process* needs the companion to report
 itself (over LocalAPI) — a follow-up, not this FR's phase 2d.
+
+### 2026-10-08 — 0.4.117 on the Mac: P9, the banner's Disconnect, Check-for-updates
+
+Agent 0.4.117 (the P9 code shipped in #1819). The controller is the device's
+owner (`auto_grant_session`), so every session auto-granted. Sessions were
+driven from the demo harness (`scripts/record-demo.sh` + its scripted scene),
+which captures the viewer's own frames; on macOS the banner and the red frame
+are IN the `CGDisplayStream` capture (a recorded deviation), so the frames show
+them. The two things the stream cannot show were read straight off the Mac's
+window server with a read-only `osascript` **window census**
+(`CGWindowListCopyWindowInfo`, on-screen windows owned by a Roomler process):
+whether the banner and frame were present, and that they were gone once the
+session ended.
+
+**P9, clause by clause** — one scripted fullscreen session, the pointer moved by
+the new `move` step; frames read by a detector over the banner box and the four
+screen-edge strips:
+
+| clause | observed |
+|---|---|
+| shown at session start, no focus taken | banner up from +1.7 s; the census during the session had the banner at window layer 5 (a non-activating panel) while the menu bar stayed on the person's own app (TextEdit) throughout |
+| hides 2.5 s after the pointer leaves, after the 4 s first show | banner down at +6.2 s (pointer away since the fullscreen click) |
+| returns after a 1.2 s rest at the top edge | back up at +14.5 s after a top-edge `move` at +13.6 s, and again at +24.9 s after a second one at +24.0 s; hidden whenever the pointer was elsewhere |
+| stays while a recording runs | in a second session a remote recording ran ~87 s (`h264_videotoolbox`, native 3024×1964); the census had the banner on-screen at 0:03, 0:38 and 1:21 with the pointer parked at the top-right menu — far from the banner and well past the 4 s + 2.5 s window. It had auto-hidden and the recording brought it back (`tray::recording_now`). The A/B is the first session, which auto-hid at +6.2 s with no recording |
+| red frame for exactly the session's duration | the red frame was on every fullscreen frame until teardown (+40.2 s; session end +41.1 s); the census found four 2 px strips (`1512×2` top & bottom, `2×982` left & right) during the session and **zero** Roomler windows 60 s after it ended — the "gone after" the stream cannot show |
+| the next click into the person's window acts | after a fresh banner reveal, one click into TextEdit placed the cursor and the typed "XY" appeared (then removed with two Backspaces). The banner did not steal focus |
+
+**"Being viewed by «name»" + a working Disconnect (macOS).** The banner reads
+"Being viewed by «owner name» · keyboard + mouse · «org» · «elapsed»". Clicking
+its Disconnect — in the stream, which maps to the real banner window on the Mac
+— logged, on the device:
+
+```
+viewee requested disconnect via overlay badge session_id=…
+PC state change session=… state=Closed
+session terminated by server session_id=… reason=ControllerHangup
+```
+
+⚠️ The banner window is not key, so the FIRST click only activates the companion
+(the menu bar went from TextEdit to Roomler) and a following click fired the
+button — the webview has no `acceptsFirstMouse`. A real user's clicks behave the
+same; worth an `acceptsFirstMouse` follow-up, not a blocker.
+
+**macOS "Check for updates".** The companion's button runs `<daemon> self-update
+--check-only` (`cmd_check_update`, via `agent_exe_path`, which on macOS resolves
+to the installed daemon). Replicated as the console user: `Up to date (current:
+0.4.117, latest: agent-v0.4.117)`, exit 0. "Apply update" has nothing to apply
+on the latest release.
+
+Everything restored: the test recording deleted, the uploaded census script
+removed; the device's remote-recording gate was left ON as found.
