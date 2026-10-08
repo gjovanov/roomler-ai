@@ -198,9 +198,15 @@ impl LaunchSpec {
                 "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
                 self.project_dir_name().into(),
             ),
-            // Strip credentials from every subprocess the harness starts, not
-            // just sandboxed Bash.
-            ("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "1".into()),
+            // ⚠️ NOT `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`: on Linux it makes
+            // every command run sandboxed, and the sandbox needs bubblewrap
+            // and socat — without them, Bash refuses everything ("Sandbox is
+            // required but failed to initialize"; FR-90 P1a's field run, and
+            // the real reason P0's sessions could not run `whoami`). The one
+            // credential it would strip here is the session's own token,
+            // good only on loopback, for this run, at this fence.
+            // Sandboxing comes back with the egress proxy (P3), on hosts that
+            // can run it.
             // Headless: nothing reads a terminal.
             ("TERM".into(), "dumb".into()),
         ];
@@ -290,11 +296,15 @@ impl SettingsSpec {
         if let Some(dir) = &self.auto_memory_directory {
             doc["autoMemoryDirectory"] = json!(dir.to_string_lossy());
         }
+        // A sandboxed command is auto-approved by default
+        // (`autoAllowBashIfSandboxed`), whatever the permission mode — so a
+        // sandbox that comes on, ours or the user's, would take Bash out of
+        // the approvals. In a Hive session a person decides.
+        doc["sandbox"] = json!({"autoAllowBashIfSandboxed": false});
         if let Some(p) = self.sandbox_proxy {
-            doc["sandbox"] = json!({
-                "enabled": true,
-                "network": {"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port},
-            });
+            doc["sandbox"]["enabled"] = json!(true);
+            doc["sandbox"]["network"] =
+                json!({"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port});
         }
         doc
     }
@@ -426,8 +436,9 @@ mod tests {
             Some(format!("hive-{}", s.session))
         );
         assert_eq!(
-            get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB").as_deref(),
-            Some("1")
+            get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"),
+            None,
+            "on Linux it forces the sandbox, and without bubblewrap and socat no command runs"
         );
         assert_eq!(
             get("ANTHROPIC_BASE_URL").as_deref(),
@@ -493,7 +504,10 @@ mod tests {
         assert_eq!(deny.len(), 2);
         assert_eq!(doc["sandbox"]["network"]["socksProxyPort"], 47002);
         assert!(doc["autoMemoryDirectory"].is_string());
-        // No sandbox block at all where there is no sandbox (native Windows).
+        assert_eq!(doc["sandbox"]["enabled"], true);
+        assert_eq!(doc["sandbox"]["autoAllowBashIfSandboxed"], false);
+        // No sandbox where we set none (P1; native Windows) — and should one
+        // come on anyway, a sandboxed command still asks a person.
         let bare = SettingsSpec {
             api_key_helper: None,
             auto_memory_directory: None,
@@ -501,7 +515,11 @@ mod tests {
             extra_read_denies: vec![],
         }
         .to_json();
-        assert!(bare.get("sandbox").is_none());
+        assert_eq!(
+            bare["sandbox"],
+            json!({"autoAllowBashIfSandboxed": false}),
+            "{bare}"
+        );
         // No helper until the sidecar issues tokens: the key is absent, never
         // an empty command the harness would try to run.
         assert!(bare.get("apiKeyHelper").is_none());
