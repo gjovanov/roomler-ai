@@ -62,6 +62,14 @@ pub struct HiveSettings {
     /// answered as if the module were not there for it. A hosted server opens
     /// the pillar to a test organization this way before anyone else.
     ///
+    /// ⚠️ A list switches the module ON by itself ([`Settings::hive_on`]),
+    /// with no `ROOMLER__MODULES__HIVE`. That is the form a hosted server
+    /// uses, because it fails safe: no older image reads a list as the
+    /// switch, so promoting one leaves the pillar off — where
+    /// `modules.hive = true` on an image from before P1g, which never reads
+    /// the list, would open it to every organization. Clearing the list is
+    /// the kill switch.
+    ///
     /// ⚠️ `String`, not `Vec<String>`, for the reason on
     /// [`JwtSettings::previous_secrets`]: an env var cannot become a sequence.
     #[serde(default)]
@@ -135,7 +143,9 @@ pub struct ModulesSettings {
     /// FR-90 — agent sessions. **Default OFF**, the only module that is: it
     /// is the P0 kill switch while the pillar is built, so a roll that ships
     /// the code exposes nothing until an operator turns it on
-    /// (`ROOMLER__MODULES__HIVE=true`). Listed in [`Self::DEFAULT_OFF`].
+    /// (`ROOMLER__MODULES__HIVE=true`, or a `hive.tenants` list — read
+    /// [`Settings::hive_on`], never this field alone). Listed in
+    /// [`Self::DEFAULT_OFF`].
     #[serde(default)]
     pub hive: bool,
 }
@@ -167,6 +177,10 @@ impl ModulesSettings {
     /// The module ids an operator has switched off, in the composition order
     /// of `roomler_core::graph::MODULES` — including a default-off module
     /// nobody switched on, so `modules = compiled − switched_off` holds.
+    ///
+    /// ⚠️ It cannot see a `hive.tenants` list, which also switches `hive`
+    /// on; the boot log and `/api/capabilities` read
+    /// [`Settings::switched_off`].
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
         if !self.saas {
@@ -829,6 +843,25 @@ pub struct RelayCosts {
 }
 
 impl Settings {
+    /// FR-90 P1g — whether agent sessions are on: `[modules] hive`, or a
+    /// `hive.tenants` list (see [`HiveSettings::tenants`] for why a list alone
+    /// is enough).
+    pub fn hive_on(&self) -> bool {
+        self.modules.hive || !self.hive.tenants.trim().is_empty()
+    }
+
+    /// [`ModulesSettings::switched_off`], with `hive` on wherever
+    /// [`Self::hive_on`] says it is — what boot logs and
+    /// `GET /api/capabilities` report, so `modules = compiled − switched_off`
+    /// still holds.
+    pub fn switched_off(&self) -> Vec<&'static str> {
+        let mut off = self.modules.switched_off();
+        if self.hive_on() {
+            off.retain(|m| *m != "hive");
+        }
+        off
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
         let config = Config::builder()
             .add_source(File::with_name("config/default").required(false))
