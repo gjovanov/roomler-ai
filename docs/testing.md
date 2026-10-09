@@ -99,7 +99,9 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 The load-bearing ones: `remote_control` locks the **wire format** (every `rc:*`
 tag pinned, ObjectId-as-hex, pipe-separated `Permissions`) so a rename is a
 deliberate break; agent-side crates cover encoder cascades, config migration,
-ACLs, and overlay internals under their feature flags.
+ACLs, and overlay internals under their feature flags. `roomlerd`'s Hive
+supervisor tests (`--features hive -- hive::`) run twice: on Linux in the agent job, and on macOS
+in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor for a Mac.
 
 ## CI & special lanes
 

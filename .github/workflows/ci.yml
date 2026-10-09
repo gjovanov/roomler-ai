@@ -887,6 +887,17 @@ jobs:
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
         run: cargo check -p roomlerd --bins --features scrap-capture
 
+      # FR-90 P1h — agent sessions on macOS (`cfg(hive_host)`): the launcher,
+      # the harness's paths, its process lifetime (`hive/procs.rs` calls
+      # `proc_pidinfo`, which exists only here) and main.rs's `wind_down` arm.
+      # Then the supervisor's own tests, which need nothing a Mac runner lacks:
+      # a fake harness, a Unix socket and a loopback sidecar. Before this, the
+      # supervisor had never compiled for a Mac at all.
+      - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
+        run: |
+          cargo check -p roomlerd --lib --bins --features hive
+          cargo test -p roomlerd --lib --features hive -- hive::
+
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
       # canaries). Still named, so the recorder's macOS arms (the unix

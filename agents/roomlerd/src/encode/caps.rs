@@ -1616,16 +1616,16 @@ fn rpc_caps() -> Vec<String> {
     // reports with `rc:hive.state`. A property of the BUILD, like `ssh`: the
     // device still refuses unless its owner switched `hive_enabled` on, and
     // says so in the ack. Linux only in P0.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     caps.push(RpcCap::Hive);
     // FR-90 P0d-2 — and serves a session's transcript to a browser over a
     // viewer peer: answers `rc:hive.view.grant` before the browser dials.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     caps.push(RpcCap::HiveView);
     // FR-90 P1e — and understands a session's core memory (`rc:hive.memory`).
     // A property of the BUILD: whether a session ever sees it is the device's
     // own `hive_core_memory`, default off.
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     caps.push(RpcCap::HiveMemory);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
