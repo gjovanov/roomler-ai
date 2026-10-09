@@ -3176,6 +3176,11 @@ pub async fn serve_person_socket(
         path = %path.display(), uid = owner_uid,
         "localapi: person-at-the-device socket up (FR-27 P11)"
     );
+    // ⚠️ Connections are held HERE, not detached: when the person at the seat
+    // changes this listener is stopped, and a connection the previous person
+    // still holds open must not keep answering consent for the new person's
+    // screen. Stopping aborts every one of them.
+    let mut conns = tokio::task::JoinSet::new();
     let served = loop {
         tokio::select! {
             biased;
@@ -3184,6 +3189,7 @@ pub async fn serve_person_socket(
                     break Ok(());
                 }
             }
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accept = listener.accept() => match accept {
                 Ok((stream, _addr)) => {
                     let peer = ClientPeer {
@@ -3198,7 +3204,7 @@ pub async fn serve_person_socket(
                         continue;
                     }
                     let st = state.clone();
-                    tokio::spawn(async move {
+                    conns.spawn(async move {
                         if let Err(e) = serve_connection_scoped(stream, &*st, peer, Scope::Person).await {
                             tracing::debug!(error = %e, "localapi: person-socket client ended");
                         }
@@ -3211,6 +3217,7 @@ pub async fn serve_person_socket(
             }
         }
     };
+    conns.shutdown().await;
     if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
         let _ = std::fs::remove_file(&path);
     }
@@ -5932,8 +5939,8 @@ mod tests {
         wr.write_all(b"{\"t\":\"config_get\"}\n").await.unwrap();
         let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert!(is_person_refusal(&r), "{r:?}");
-        drop(wr);
-        drop(lines);
+        // This connection stays OPEN across the stop below, having just been
+        // served twice: the stop must cut it.
 
         // A second server at the same path must not take the live one over.
         let (_tx2, rx2) = watch::channel(false);
@@ -5942,10 +5949,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
 
-        // Stop: the file it bound goes with it.
+        // Stop: the file it bound goes with it, and so does every connection
+        // it was serving — a person switched away keeps nothing open.
         tx.send(true).unwrap();
         srv.await.unwrap().unwrap();
         assert!(!path.exists(), "the person socket removes its own file");
+        let _ = wr.write_all(b"{\"t\":\"status\"}\n").await;
+        let after =
+            tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line()).await;
+        assert!(
+            matches!(after, Ok(Ok(None)) | Ok(Err(_))),
+            "a connection held across the stop is cut, not served: {after:?}"
+        );
 
         // A dir the person does not own is refused before anything is
         // created in it (skipped as root, where `/` would be "owned").
