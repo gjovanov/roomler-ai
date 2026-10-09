@@ -48,7 +48,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::model::{
-    AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionStatus, SessionView,
+    AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionOrigin, SessionStatus,
+    SessionView,
 };
 use crate::{HiveState, room};
 
@@ -444,6 +445,7 @@ pub async fn start(
         updated_at: now,
         ended_at: None,
         brain_rev: memory.as_ref().map(|m| m.brain_rev),
+        origin: SessionOrigin::Started,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.

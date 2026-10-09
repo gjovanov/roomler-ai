@@ -108,6 +108,20 @@ pub(crate) fn started_note(s: &AgentSession) -> String {
     t
 }
 
+/// P1j — "Adopted": a terminal session mirrored here, read-only.
+pub(crate) fn adopted_note(s: &AgentSession) -> String {
+    let mut t = format!(
+        "📎 Adopted from a terminal on {} in {}",
+        device_label(s),
+        md_escape(&s.location.folder)
+    );
+    if let Some(account) = &s.location.account {
+        t.push_str(&format!(" as **{}**", md_escape(account)));
+    }
+    t.push_str(" — read-only: it runs in the terminal, so nobody drives it from here");
+    t
+}
+
 /// "Refused" — which of the device's gates said no, in plain words.
 pub(crate) fn refused_note(s: &AgentSession) -> String {
     let word = s.refusal.as_deref().unwrap_or("other");
@@ -133,6 +147,7 @@ pub(crate) fn ended_note(s: &AgentSession) -> String {
         Some("hive_not_enabled") => "agent sessions are no longer available to the organization",
         Some("never_answered") => "the device never answered",
         Some("not_on_device") => "its device no longer runs it",
+        Some("attribution_changed") => "its terminal's account now names someone else",
         _ => "ended",
     };
     let mut t = format!("⏹ Session ended — {why}");

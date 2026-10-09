@@ -318,10 +318,10 @@ off instead of open to every organization.
 | GET | `…/hive` | P1g — whether agent sessions serve this organization: `{enabled: true}`, or **404** where they do not. The SPA asks before it shows any of the module's pages |
 | POST | `…/hive/session` | `{device_id, folder, title?}` — start an agent session on a device. Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit` |
 | GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
-| GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it |
+| GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it. `origin` is `started` or, for a terminal session its owner adopted (P1j), `adopted` |
 | POST | `…/hive/session/{sid}/stop` | Stop it — the owner only: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
 | GET | `…/hive/session/{sid}/participant` | FR-90 P1c — who takes part: `items[{user_id, display_name, role}]`, `role` `owner` · `driver` · `reader`, and `may_manage` (the owner alone). For anyone who may read the session |
-| PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400** |
+| PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400**. An adopted session (P1j) takes readers only: a driver is a **409**, because the terminal holds the harness |
 | DELETE | `…/hive/session/{sid}/participant/{user_id}` | The owner takes someone out: out of the room, driving nothing, their views ended (`removed`). Idempotent |
 | GET | `…/hive/brain?device_id=` | FR-90 P1e — core memory the caller may read: the org's facts, their own, and with `device_id` that device's (a live device of this org; 404 otherwise). `{brain_rev, facts[{id, scope, owner_id?, text, kind, version, created_by, created_at, updated_by, updated_at}], budgets[{scope, owner_id?, used, budget}]}` |
 | POST | `…/hive/brain` | `{scope: "org" \| "user" \| "device", owner_id?, text, kind?}` — keep a fact: one line, at most 500 characters, `kind` one of `preference` · `convention` (the default) · `path` · `gotcha` · `decision` · `warning`. Org needs `ADMINISTRATOR`; user is the caller's own (`owner_id` defaults to them), with `HIVE_RUN`; device names a live device of this org, with `MANAGE_AGENTS` (**403** otherwise). A fact that does not fit its scope's budget (org 3,000, user 1,500, device 800 characters) is **409** `{error: "over_budget", message, scope, used, budget, needed}`; nothing is evicted |
@@ -345,6 +345,19 @@ who said no: the server's `not_found` · `device_offline` · `device_unsupported
 `at_capacity`. The transcript itself flows browser ⇄ device over the peer and never through the
 server. The starter of a live session may prompt it; everyone else reads. Every open is in
 `hive_audit` (`action: view`).
+
+**Adopted sessions (P1j) are not started by a route either.** A person adopts the Claude Code
+sessions they run in a terminal (`roomler hive adopt`, on a device whose owner allows it:
+`hive_adopt`, advertised as `hive-adopt`). The device offers each one with `rc:hive.adopt
+{adopt_id, harness_session, keys, account, folder}`. The answer is `rc:hive.adopt_ack {adopt_id,
+session_id, fence}`, or `{adopt_id, refused}`: `hive_not_enabled` · `rate_limited` · `no_account`
+· `ambiguous_account` · `not_a_member` · `at_capacity`. The keys are the device's `hive_accounts` keys
+for that account. The server adopts only when they name exactly one person, a member of the org:
+an account two people share is refused, never attributed by guess. The record reads like any
+session's, with `origin: "adopted"`. It is its owner's alone, readers by name, no drivers. It is
+named after its folder, because a terminal's first prompt is content. An offer for a terminal
+session already held is answered with the same record. Every adoption is in `hive_audit`
+(`action: adopt`).
 
 ### Observability
 

@@ -33,7 +33,7 @@ use roomler_core::{ApiError, extractors::auth::AuthUser};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::model::{AgentSession, MAX_DRIVERS};
+use crate::model::{AgentSession, MAX_DRIVERS, SessionOrigin};
 use crate::routes::{Audit, member_tenant, parse_oid};
 use crate::{HiveState, access, room, view};
 
@@ -214,6 +214,18 @@ pub async fn set(
         return Err(ApiError::NotFound("Resource not found".to_string()));
     }
     let was_driver = s.drivers.contains(&target);
+    // P1j — an adopted session has no drivers: the terminal holds the harness,
+    // and nothing typed here could reach it (decision 11). Readers it may have.
+    if drives && s.origin == SessionOrigin::Adopted {
+        audit("refused", Some("adopted_no_drivers"))
+            .write(&state)
+            .await;
+        return Err(ApiError::Conflict(
+            "an adopted session runs in a terminal, so nobody drives it from here — \
+             add them as a reader"
+                .into(),
+        ));
+    }
     if drives && !was_driver {
         let perms = state.tenants.get_member_permissions(tid, target).await?;
         if !permissions::has(perms, permissions::HIVE_RUN) {
