@@ -1845,6 +1845,12 @@ pub struct CapturedChild {
 ///   [`CapturedChild::stdin`]. The child sees end-of-input only once that
 ///   handle drops, so a caller that keeps it past the child's life leaks
 ///   nothing, but one that never drops it leaves a reader waiting.
+/// * #1908 — inheritance is bounded to those three handles by a handle list.
+///   `bInheritHandles` alone hands the child EVERY inheritable handle this
+///   process holds at that moment, and a daemon making other children at the
+///   same time holds theirs: a command started beside a long-running one would
+///   keep that one's pipe ends open, and its reader would not see end-of-file
+///   until both ended (the hang `pty/windows.rs` measured for its own spawn).
 ///
 /// # Safety
 ///
@@ -1893,8 +1899,9 @@ pub unsafe fn spawn_in_session_captured(
         (nul, None)
     };
 
-    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // #1908 — the three handles, and only those, reach the child.
+    let mut startup = InheritOnly::new(vec![child_in.raw(), out_w.raw(), err_w.raw()])?;
+    let si = &mut startup.si.StartupInfo;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = child_in.raw();
     si.hStdOutput = out_w.raw();
@@ -1914,9 +1921,10 @@ pub unsafe fn spawn_in_session_captured(
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // SAFETY: every buffer outlives the call; out-params are valid; the flags
-    // and the TRUE inherit-handles argument are exactly what the pipe wiring
-    // above requires.
+    // SAFETY: every buffer (the attribute list and the handle array it points
+    // at among them) outlives the call; out-params are valid; the flags and the
+    // TRUE inherit-handles argument are exactly what the pipe wiring above
+    // requires, and the handle list bounds it.
     let ok = unsafe {
         CreateProcessAsUserW(
             token,
@@ -1925,10 +1933,10 @@ pub unsafe fn spawn_in_session_captured(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             TRUE, // inherit handles — required for the pipes to reach the child
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
             env.raw,
             cwd_ptr,
-            &si,
+            &startup.si.StartupInfo,
             &mut pi,
         )
     };
@@ -3331,5 +3339,40 @@ mod tests {
             child.process.wait_for_exit(Duration::from_secs(10)),
             "closing the job's last handle must end its processes"
         );
+    }
+
+    /// #1908 — a console-user command holds no handle it was not given. The
+    /// inheritable pipe end this test keeps stands in for another command's,
+    /// made at the same moment in a busy daemon: its reader sees end-of-file
+    /// the moment this process lets go of it, not when the command started
+    /// meanwhile exits.
+    #[test]
+    fn a_captured_child_inherits_its_own_three_handles_and_nothing_else() {
+        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = TRUE;
+        // `make_pipe` de-inherits the read end; the write end stays inheritable,
+        // as another spawn's child ends are until that spawn drops them.
+        let (other_r, other_w) = unsafe { make_pipe(&mut sa) }.unwrap();
+        // A token this (non-SYSTEM) process may start a process with: the
+        // restricted, Medium copy of its own.
+        let token = crate::win_token::restricted_medium_copy().unwrap();
+        // SAFETY: `token` is a live primary token, alive across the call.
+        let child = unsafe {
+            spawn_in_session_captured(token.raw(), &cmd("ping -n 6 127.0.0.1 >NUL"), None, false)
+        }
+        .unwrap();
+        drop(other_w);
+        let started = Instant::now();
+        let budget = std::sync::atomic::AtomicU64::new(1024);
+        let _ = read_pipe_to_end(&other_r, &budget);
+        let waited = started.elapsed();
+        let still_running = child.process.try_wait().unwrap().is_none();
+        child.process.terminate();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the command kept another's pipe open for {waited:?}"
+        );
+        assert!(still_running, "and it was still running then");
     }
 }
