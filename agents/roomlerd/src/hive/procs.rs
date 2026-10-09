@@ -25,6 +25,11 @@ pub(crate) fn started(pid: u32) -> Option<String> {
     imp::started(pid)
 }
 
+/// P1j — the parent of `pid`: an adopt hook's is the Claude Code that ran it.
+pub(crate) fn parent(pid: u32) -> Option<u32> {
+    imp::parent(pid)
+}
+
 /// Signal `pid`'s process group (the group a harness leads).
 pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -92,6 +97,20 @@ mod imp {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
         Some(format!("{}:{ticks}", boot.trim()))
     }
+
+    pub(super) fn parent(pid: u32) -> Option<u32> {
+        // Field 4, the parent pid: the first after the command's closing
+        // parenthesis is field 3 (the state).
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let ppid: u32 = stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        (ppid > 1).then_some(ppid)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -118,6 +137,23 @@ mod imp {
             "{}",
             info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
         ))
+    }
+
+    pub(super) fn parent(pid: u32) -> Option<u32> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        // SAFETY: as in `started`: a zeroed buffer this frame owns, with its size.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (n == size && info.pbi_ppid > 1).then_some(info.pbi_ppid)
     }
 }
 

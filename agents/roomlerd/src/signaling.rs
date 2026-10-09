@@ -4249,6 +4249,26 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P1j — the server's word on a terminal session this device
+        // offered. Only a build that adopts sends offers.
+        ServerMsg::HiveAdoptAck {
+            adopt_id,
+            session_id,
+            fence,
+            refused,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_adopt_ack(&adopt_id, session_id, fence, refused, ctx.is_primary);
+            #[cfg(not(hive_host))]
+            {
+                let _ = (session_id, fence, refused);
+                debug!(
+                    adopt_id,
+                    "rc:hive.adopt_ack ignored — this build does not adopt"
+                );
+            }
+        }
+
         // FR-90 P0d-2 — the viewer peer. A grant is answered with
         // `rc:hive.view.grant_ack` on THIS connection, from a task (it reads
         // the replica store); the rest feeds the grant's own actor. A build
