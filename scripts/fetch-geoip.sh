@@ -44,11 +44,12 @@
 #   the image smoke boots it and requires "geoip database loaded".
 #
 # A MISSING DATABASE IS A SUPPORTED STATE
-#   Every failure here (DB-IP unreachable, a release not yet published, a file
-#   that is not what it claims) stages NOTHING and exits 0 with a warning. A
-#   database an earlier run staged is kept. Without one the image reports
-#   `country: unknown` and `geoip: false`, as designed: a build must never
-#   fail because a third party's download did.
+#   Every failure here (DB-IP unreachable or stalled, a release not yet
+#   published, a file that is not what it claims) stages NOTHING and exits 0
+#   with a warning, within about five minutes at worst. A database an earlier
+#   run staged is kept. Without one the image reports `country: unknown` and
+#   `geoip: false`, as designed: a build must never fail because a third
+#   party's download did.
 #
 # Exit 0 = staged, or warned and skipped. Exit 2 = usage error.
 # Under GitHub Actions it also sets step outputs: present=true|false,
@@ -106,18 +107,28 @@ else
 fi
 
 # fetch <YYYY-MM>: 0 with a verified database at $WORK/db, else 1 (and why).
+#
+# ⚠️ Every wait is bounded, because a download that HANGS must not fail the
+# build either: the hosted job has a 60-minute timeout. One attempt may take
+# 90 s, and no retry starts after 60 s, so each URL costs at most about two and
+# a half minutes, and the script about five. (The release is 4 MB compressed;
+# a runner fetches it in about a second.)
 fetch() {
   local rel="$1" url="$BASE_URL/$NAME-$1.mmdb.gz" size
   rm -f "$WORK/db.gz" "$WORK/db"
-  if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 5 \
-      --connect-timeout 15 --max-time 300 -o "$WORK/db.gz" "$url"; then
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \
+      --retry 2 --retry-delay 5 --retry-max-time 60 --max-filesize $((64 * 1024 * 1024)) \
+      -o "$WORK/db.gz" "$url"; then
     echo "  $rel: download failed ($url)"
     return 1
   fi
-  if ! gzip -t "$WORK/db.gz" 2>/dev/null || ! gzip -dc "$WORK/db.gz" > "$WORK/db"; then
+  if ! gzip -t "$WORK/db.gz" 2>/dev/null; then
     echo "  $rel: not a valid gzip stream"
     return 1
   fi
+  # Decompressed through `head -c`, so nothing can write more than the size
+  # limit below to disk; anything that big is then refused by that limit.
+  gzip -dc "$WORK/db.gz" 2>/dev/null | head -c $((MAX_BYTES + 1)) > "$WORK/db"
   size=$(bytes "$WORK/db")
   if [ "$size" -lt "$MIN_BYTES" ] || [ "$size" -gt "$MAX_BYTES" ]; then
     echo "  $rel: $size bytes, outside the range a country database can have"
