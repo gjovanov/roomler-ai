@@ -30,7 +30,7 @@
 #![cfg(target_os = "windows")]
 
 use anyhow::{Context, Result, anyhow, bail};
-use std::ffi::{OsStr, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -51,11 +51,20 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Sentinel for "no console session is currently attached" — what
@@ -204,6 +213,17 @@ impl EnvBlock {
             bail!("CreateEnvironmentBlock failed (err {err})");
         }
         Ok(Self { raw: env })
+    }
+
+    /// The block's `NAME=value` entries (FR-90 P1i: the user's own
+    /// environment, which a Hive session's variables are laid over).
+    pub(crate) fn entries(&self) -> Vec<Vec<u16>> {
+        if self.raw.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: a block `CreateEnvironmentBlock` returned, alive as long as
+        // `self`.
+        unsafe { env_entries(self.raw as *const u16) }
     }
 }
 
@@ -2104,6 +2124,471 @@ pub fn read_pipe_streamed(pipe: &OwnedHandle, mut deliver: impl FnMut(Vec<u8>) -
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// A process started into a Job Object (FR-90 P1i — agent sessions on Windows)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A Job Object whose processes are killed when its last handle closes: the
+/// Windows counterpart of the process group a Hive harness leads on Unix.
+///
+/// A process started into it stays in it, and so does everything it starts,
+/// because the limit that would let a descendant break away is not set. So
+/// ending the job ends the tools a harness started, not only the harness. A
+/// daemon that dies takes its jobs' processes with it: the kernel closes the
+/// last handle.
+///
+/// ⚠️ A job is a take-down boundary, not a sandbox. A process inside can still
+/// ask something outside to start a program for it (the Task Scheduler, WMI, an
+/// out-of-process COM server), exactly as a Unix tool can `setsid` out of its
+/// group.
+pub struct JobObject(OwnedHandle);
+
+impl JobObject {
+    /// An unnamed job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Its handle is
+    /// not inheritable, so no child can hold it open past the daemon.
+    pub fn kill_on_close() -> Result<Self> {
+        // SAFETY: an unnamed job object with default security; the handle is
+        // owned below.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        let Some(job) = OwnedHandle::new(job) else {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("CreateJobObjectW failed (err {err})");
+        };
+        // SAFETY: all-zero is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+        // no limit set.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `info` matches the class being set and outlives the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed (err {err})");
+        }
+        Ok(Self(job))
+    }
+
+    pub fn raw(&self) -> HANDLE {
+        self.0.raw()
+    }
+
+    /// End every process in the job. Asynchronous, like `TerminateProcess`:
+    /// wait on a process, or poll [`active_processes`](Self::active_processes),
+    /// to see them gone.
+    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+        // SAFETY: a live job handle we own, opened with all access.
+        if unsafe { TerminateJobObject(self.0.raw(), exit_code) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("TerminateJobObject failed (err {err})");
+        }
+        Ok(())
+    }
+
+    /// How many processes are in the job now.
+    pub fn active_processes(&self) -> Result<u32> {
+        // SAFETY: all-zero is a valid out-buffer for this class.
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is exactly the size passed and outlives the call.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.0.raw(),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION as *mut c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("QueryInformationJobObject(accounting) failed (err {err})");
+        }
+        Ok(info.ActiveProcesses)
+    }
+
+    /// Whether `process` is in this job.
+    pub fn contains(&self, process: &OwnedProcess) -> Result<bool> {
+        let mut inside = FALSE;
+        // SAFETY: both handles are live; `inside` is a valid out-param.
+        if unsafe { IsProcessInJob(process.process.raw(), self.0.raw(), &mut inside) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("IsProcessInJob failed (err {err})");
+        }
+        Ok(inside != FALSE)
+    }
+}
+
+/// Who a process started into a job runs as.
+#[derive(Clone, Copy)]
+pub enum SpawnAs {
+    /// The user whose primary token this is: for Hive, the console user's
+    /// ([`query_user_token`]). The process gets that user's own environment.
+    User(HANDLE),
+    /// This process's own identity and environment. Tests only: on a device a
+    /// session never runs as the daemon, which is SYSTEM, so no build that
+    /// ships can ask for it.
+    #[cfg(test)]
+    Daemon,
+}
+
+/// Start `cmdline` into `job`, with its stdout and stderr piped back (and its
+/// stdin with `with_stdin`), and `env` laid over the identity's own environment
+/// (FR-90 P1i: a Hive harness, and its preparation, as the console user).
+///
+/// The process is created SUSPENDED and joins the job before its first
+/// instruction runs. A process assigned after it started may already have
+/// started children outside the job, and those a stop could not reach. One
+/// that cannot join is ended and never resumed.
+///
+/// Inheritance is bounded by a handle list to the child's three standard
+/// handles (see `pty/windows.rs`, `AttachedStartupInfo`, for what unbounded
+/// inheritance does in a daemon full of other sessions' pipes). Which pipe end
+/// is whose, and why the parent drops its copies, is as in
+/// [`spawn_in_session_captured`].
+///
+/// # Safety
+/// `SpawnAs::User` must carry a live primary token, kept alive across the call.
+pub unsafe fn spawn_into_job(
+    who: SpawnAs,
+    cmdline: &str,
+    cwd: Option<&Path>,
+    env: &[(OsString, OsString)],
+    with_stdin: bool,
+    job: &JobObject,
+) -> Result<CapturedChild> {
+    let base = match who {
+        SpawnAs::User(token) => EnvBlock::for_token(token)
+            .context("CreateEnvironmentBlock")?
+            .entries(),
+        #[cfg(test)]
+        SpawnAs::Daemon => {
+            use windows_sys::Win32::System::Environment::{
+                FreeEnvironmentStringsW, GetEnvironmentStringsW,
+            };
+            // SAFETY: no preconditions; the block is freed below.
+            let block = unsafe { GetEnvironmentStringsW() };
+            if block.is_null() {
+                bail!("GetEnvironmentStringsW failed");
+            }
+            // SAFETY: this process's own block, well formed.
+            let entries = unsafe { env_entries(block) };
+            // SAFETY: the pointer GetEnvironmentStringsW returned, freed once.
+            unsafe { FreeEnvironmentStringsW(block) };
+            entries
+        }
+    };
+    let env_block = merge_env_block(base, env)?;
+
+    // Inheritable by default; each parent end is de-inherited by its maker.
+    let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = std::ptr::null_mut();
+
+    let (out_r, out_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stdout)")?;
+    let (err_r, err_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stderr)")?;
+    let (child_in, parent_in) = if with_stdin {
+        let (r, w) = unsafe { make_stdin_pipe(&mut sa) }.context("CreatePipe (stdin)")?;
+        (r, Some(w))
+    } else {
+        let nul_w = encode_wide(OsStr::new("NUL"));
+        // SAFETY: documented CreateFileW call; the wide string outlives it.
+        let nul = unsafe {
+            CreateFileW(
+                nul_w.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &sa,
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        let nul = OwnedHandle::new(nul).ok_or_else(|| anyhow!("opening NUL for stdin failed"))?;
+        (nul, None)
+    };
+
+    let mut startup = InheritOnly::new(vec![child_in.raw(), out_w.raw(), err_w.raw()])?;
+    let si = &mut startup.si.StartupInfo;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = child_in.raw();
+    si.hStdOutput = out_w.raw();
+    si.hStdError = err_w.raw();
+    // The interactive desktop, as every console-user spawn here: a process
+    // started into another session with no desktop named inherits the
+    // daemon's session-0 one, and anything that loads user32 dies with
+    // 0xC0000142.
+    let mut desktop_w = encode_wide(OsStr::new("winsta0\\default"));
+    si.lpDesktop = desktop_w.as_mut_ptr();
+
+    let mut cmdline_w = encode_wide(OsStr::new(cmdline));
+    let cwd_w = cwd.map(|p| encode_wide(p.as_os_str()));
+    let cwd_ptr = cwd_w
+        .as_ref()
+        .map(|w| w.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let flags = CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | CREATE_NO_WINDOW
+        | EXTENDED_STARTUPINFO_PRESENT;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every buffer (the command line, the environment block, the
+    // directory, the desktop name, the attribute list and the handle array it
+    // points at) outlives the call; out-params are valid; inheritance is on
+    // because the pipes must reach the child, and the handle list bounds it.
+    let ok = match who {
+        SpawnAs::User(token) => unsafe {
+            CreateProcessAsUserW(
+                token,
+                std::ptr::null(),
+                cmdline_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                TRUE,
+                flags,
+                env_block.as_ptr() as *const c_void,
+                cwd_ptr,
+                &startup.si.StartupInfo,
+                &mut pi,
+            )
+        },
+        #[cfg(test)]
+        SpawnAs::Daemon => unsafe {
+            windows_sys::Win32::System::Threading::CreateProcessW(
+                std::ptr::null(),
+                cmdline_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                TRUE,
+                flags,
+                env_block.as_ptr() as *const c_void,
+                cwd_ptr,
+                &startup.si.StartupInfo,
+                &mut pi,
+            )
+        },
+    };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("starting the process failed (err {err})");
+    }
+    // Owned from here, so every return below closes both handles.
+    let process = OwnedProcess::from_raw_parts(pi.hProcess, pi.hThread, pi.dwProcessId);
+
+    // SAFETY: both handles are live and ours.
+    if unsafe { AssignProcessToJobObject(job.raw(), process.process.raw()) } == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        process.terminate();
+        let _ = process.wait_for_exit(TERMINATE_WAIT);
+        bail!("the process could not join its job (err {err}), so it was ended before it ran");
+    }
+    // SAFETY: the primary thread's handle, which CreateProcess opened with
+    // THREAD_SUSPEND_RESUME among its rights.
+    if unsafe { ResumeThread(process.thread.raw()) } == u32::MAX {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        process.terminate();
+        let _ = process.wait_for_exit(TERMINATE_WAIT);
+        bail!("ResumeThread failed (err {err}), so the process was ended");
+    }
+
+    // OUR write ends and our copy of the child's stdin go NOW, or the readers
+    // never see end-of-file (the note on `spawn_in_session_captured`).
+    drop(out_w);
+    drop(err_w);
+    drop(child_in);
+
+    Ok(CapturedChild {
+        process,
+        stdout: out_r,
+        stderr: err_r,
+        stdin: parent_in,
+    })
+}
+
+/// A `STARTUPINFOEXW` whose handle list bounds inheritance to the handles
+/// given, and only those.
+struct InheritOnly {
+    si: STARTUPINFOEXW,
+    // `si.lpAttributeList` points into this.
+    _attrs: Vec<u8>,
+    // The handle-list attribute points at this.
+    _handles: Box<[HANDLE]>,
+}
+
+impl InheritOnly {
+    fn new(handles: Vec<HANDLE>) -> Result<Self> {
+        let mut bytes: usize = 0;
+        // SAFETY: the sizing call, DOCUMENTED to fail and write the size.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };
+        if bytes == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("InitializeProcThreadAttributeList (sizing) failed (err {err})");
+        }
+        let mut attrs = vec![0u8; bytes];
+        let list = attrs.as_mut_ptr() as *mut c_void;
+        // SAFETY: the buffer is exactly the size the sizing call asked for.
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut bytes) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("InitializeProcThreadAttributeList failed (err {err})");
+        }
+        // SAFETY: all-zero is a valid STARTUPINFOEXW to fill in.
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.lpAttributeList = list;
+        // Owned from here, so an early return below deletes the list.
+        let this = Self {
+            si,
+            _attrs: attrs,
+            _handles: handles.into_boxed_slice(),
+        };
+        // SAFETY: the array is owned by `this` (on the heap, so it does not
+        // move with it) and outlives the CreateProcess call made with `si`.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                this._handles.as_ptr() as *const c_void,
+                std::mem::size_of::<HANDLE>() * this._handles.len(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("UpdateProcThreadAttribute(HANDLE_LIST) failed (err {err})");
+        }
+        Ok(this)
+    }
+}
+
+impl Drop for InheritOnly {
+    fn drop(&mut self) {
+        // SAFETY: initialised in `new` before `self` existed; deleted once.
+        unsafe { DeleteProcThreadAttributeList(self.si.lpAttributeList) };
+    }
+}
+
+/// The entries of an environment block (`NAME=value`, each NUL-terminated, the
+/// block ending in an empty one), without their terminators.
+///
+/// # Safety
+/// `block` must point at a well-formed block, as `CreateEnvironmentBlock` and
+/// `GetEnvironmentStringsW` return.
+unsafe fn env_entries(block: *const u16) -> Vec<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut p = block;
+    loop {
+        let mut len = 0usize;
+        // SAFETY: inside the block, per the caller: every entry ends in a NUL.
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            return out;
+        }
+        // SAFETY: `len` units were just read from `p`.
+        out.push(unsafe { std::slice::from_raw_parts(p, len) }.to_vec());
+        // SAFETY: just past this entry's terminator, still inside the block.
+        p = unsafe { p.add(len + 1) };
+    }
+}
+
+/// An entry's name: up to its first `=`, not counting a leading one, which
+/// the per-drive current directories (`=C:=C:\work`) start with.
+fn env_name(entry: &[u16]) -> &[u16] {
+    let eq = u16::from(b'=');
+    let end = entry
+        .iter()
+        .skip(1)
+        .position(|&c| c == eq)
+        .map_or(entry.len(), |i| i + 1);
+    &entry[..end]
+}
+
+/// A name as Windows compares it: case-insensitively, unit by unit.
+fn env_key(entry: &[u16]) -> Vec<u16> {
+    env_name(entry)
+        .iter()
+        .map(|&c| {
+            char::from_u32(u32::from(c))
+                .and_then(|ch| {
+                    let mut up = ch.to_uppercase();
+                    match (up.next(), up.next()) {
+                        (Some(u), None) => u16::try_from(u32::from(u)).ok(),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(c)
+        })
+        .collect()
+}
+
+/// `base` with `overrides` laid over it, as the block `CreateProcess*W` takes
+/// with `CREATE_UNICODE_ENVIRONMENT`:
+///
+/// * an override replaces the base entry of its name, compared
+///   case-insensitively, as Windows compares them (`Path` and `PATH` are one
+///   variable, and a block holding both gives the child either);
+/// * entries are sorted by name, case-insensitively, as the documentation asks
+///   of a block;
+/// * the block ends in an empty entry, so an empty one is two NULs.
+///
+/// An override whose name is empty or holds `=` or a NUL, or whose value holds
+/// a NUL, is refused: a NUL inside an entry would end it there, and whatever
+/// followed would read as entries of its own.
+pub(crate) fn merge_env_block(
+    base: Vec<Vec<u16>>,
+    overrides: &[(OsString, OsString)],
+) -> Result<Vec<u16>> {
+    let mut entries: Vec<(Vec<u16>, Vec<u16>)> =
+        base.into_iter().map(|e| (env_key(&e), e)).collect();
+    for (name, value) in overrides {
+        let name: Vec<u16> = name.encode_wide().collect();
+        let value: Vec<u16> = value.encode_wide().collect();
+        if name.is_empty() || name.contains(&u16::from(b'=')) || name.contains(&0) {
+            bail!("an environment variable's name must be non-empty, with no '=' or NUL");
+        }
+        if value.contains(&0) {
+            bail!("an environment variable's value must hold no NUL");
+        }
+        let mut entry = name;
+        entry.push(u16::from(b'='));
+        entry.extend(value);
+        let key = env_key(&entry);
+        entries.retain(|(k, _)| *k != key);
+        entries.push((key, entry));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut block = Vec::new();
+    for (_, entry) in entries {
+        block.extend_from_slice(&entry);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,6 +3132,196 @@ mod tests {
             HEALTHY_UPTIME_THRESHOLD <= RESPAWN_BACKOFF_CAP,
             "HEALTHY_UPTIME_THRESHOLD must be below backoff cap so the \
              reset path can fire before a healthy worker is even possible"
+        );
+    }
+
+    // ── FR-90 P1i: a process started into a Job Object ──────────────────
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    fn entries_of(block: &[u16]) -> Vec<String> {
+        // SAFETY: a block `merge_env_block` built, so it is well formed.
+        unsafe { env_entries(block.as_ptr()) }
+            .iter()
+            .map(|e| String::from_utf16_lossy(e))
+            .collect()
+    }
+
+    /// `cmd.exe` running `script`: `/d` so no AutoRun of the runner's runs
+    /// first, the script in quotes so its `&` and `>` are cmd's.
+    fn cmd(script: &str) -> String {
+        let comspec =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        format!("\"{comspec}\" /d /c \"{script}\"")
+    }
+
+    fn eventually(within: Duration, mut holds: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            if holds() {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A session's variables replace the user's own of the same name however
+    /// either is cased (`Path` and `PATH` are one variable to Windows, and a
+    /// block holding both hands the child either), and the block is sorted
+    /// as the documentation asks.
+    #[test]
+    fn a_sessions_variables_replace_the_users_and_the_block_is_sorted() {
+        let base = vec![
+            wide(r"Path=C:\Windows"),
+            wide(r"=C:=C:\work"),
+            wide("TERM=xterm"),
+            wide("b=1"),
+            wide(r"APPDATA=C:\Users\u\AppData\Roaming"),
+        ];
+        let over = [
+            (OsString::from("PATH"), OsString::from(r"D:\tools")),
+            (OsString::from("term"), OsString::from("dumb")),
+            (
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                OsString::from(r"C:\cfg"),
+            ),
+        ];
+        let block = merge_env_block(base, &over).unwrap();
+        assert_eq!(
+            &block[block.len() - 2..],
+            &[0, 0],
+            "a block ends in an empty entry"
+        );
+        assert_eq!(
+            entries_of(&block),
+            [
+                r"=C:=C:\work",
+                r"APPDATA=C:\Users\u\AppData\Roaming",
+                "b=1",
+                r"CLAUDE_CONFIG_DIR=C:\cfg",
+                r"PATH=D:\tools",
+                "term=dumb",
+            ]
+        );
+    }
+
+    /// A NUL inside an entry ends it there, and what follows reads as an entry
+    /// of its own: refused, never written.
+    #[test]
+    fn an_empty_block_is_two_nuls_and_a_nul_cannot_smuggle_in_a_variable() {
+        assert_eq!(merge_env_block(Vec::new(), &[]).unwrap(), vec![0, 0]);
+        for (name, value) in [("", "1"), ("A=B", "1"), ("A\0B", "1"), ("A", "x\0EVIL=1")] {
+            assert!(
+                merge_env_block(Vec::new(), &[(name.into(), value.into())]).is_err(),
+                "{name:?}={value:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-90 P1i — the process is in its job, and sees the session's variable
+    /// over the identity's own environment.
+    #[test]
+    fn a_process_started_into_a_job_runs_inside_it_with_the_sessions_variables() {
+        let job = JobObject::kill_on_close().unwrap();
+        let env = [(
+            OsString::from("ROOMLER_HIVE_PROBE"),
+            OsString::from("from-the-launcher"),
+        )];
+        // `set /p` waits on stdin, so the process is alive to be asked about.
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("set /p L=& echo %ROOMLER_HIVE_PROBE%"),
+                None,
+                &env,
+                true,
+                &job,
+            )
+        }
+        .unwrap();
+        assert!(
+            job.contains(&child.process).unwrap(),
+            "the process must be in its job"
+        );
+        let CapturedChild {
+            process,
+            stdout,
+            stderr,
+            stdin,
+        } = child;
+        // End of input: `set /p` returns, and the echo runs.
+        drop(stdin);
+        let budget = std::sync::atomic::AtomicU64::new(64 * 1024);
+        let (out, _) = read_pipe_to_end(&stdout, &budget);
+        drop(stderr);
+        assert!(process.wait_for_exit(Duration::from_secs(10)));
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "from-the-launcher");
+    }
+
+    /// FR-90 P1i — a stop ends the job, and with it what the harness started:
+    /// the tools, not only the harness.
+    #[test]
+    fn ending_the_job_ends_what_its_process_started() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                false,
+                &job,
+            )
+        }
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                job.active_processes().unwrap_or(0) >= 2
+            }),
+            "the process and what it started must be in the job"
+        );
+        job.terminate(1).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                job.active_processes().unwrap_or(1) == 0
+            }),
+            "ending the job must end every process in it"
+        );
+        assert!(child.process.wait_for_exit(Duration::from_secs(5)));
+    }
+
+    /// FR-90 P1i — the job's last handle closing (a daemon that died, a session
+    /// dropped) ends its processes.
+    #[test]
+    fn closing_the_job_ends_its_processes() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                false,
+                &job,
+            )
+        }
+        .unwrap();
+        assert!(
+            child.process.try_wait().unwrap().is_none(),
+            "running before the job closes"
+        );
+        drop(job);
+        assert!(
+            child.process.wait_for_exit(Duration::from_secs(10)),
+            "closing the job's last handle must end its processes"
         );
     }
 }
