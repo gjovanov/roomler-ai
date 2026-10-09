@@ -3603,7 +3603,15 @@ done
     #[test]
     fn a_relay_the_account_cannot_reach_is_not_executable_by_it() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap();
+        // Under /tmp, opened up: the walk reads EVERY directory to the root,
+        // and macOS's $TMPDIR is a 0700 per-user directory, which no other
+        // account passes whatever the bits below it say (P1h-1, measured on
+        // the macOS runner).
+        let root = tempfile::Builder::new()
+            .prefix("hive")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
         let bin = home.join("roomlerd");
