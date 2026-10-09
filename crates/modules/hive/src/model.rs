@@ -159,6 +159,40 @@ pub struct AgentSession {
     /// reaches the next session, never this one. Absent before P1e.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brain_rev: Option<i64>,
+    /// FR-90 P1j — how the session came to be. Absent = started from Roomler
+    /// (every record before P1j).
+    #[serde(default, skip_serializing_if = "SessionOrigin::is_started")]
+    pub origin: SessionOrigin,
+}
+
+/// FR-90 P1j — how a session came to be.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    /// Its owner started it from Roomler, through every start gate.
+    #[default]
+    Started,
+    /// A terminal session its owner adopted on a device (`roomler hive
+    /// adopt`, decision 11). Read-only: the terminal holds the harness, so
+    /// nobody drives it from here, the owner included, and it passed none of
+    /// the start gates.
+    Adopted,
+}
+
+impl SessionOrigin {
+    /// The spelling in the database and on the wire. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Adopted => "adopted",
+        }
+    }
+
+    /// Serde's `skip_serializing_if`: a started session stores no origin, so
+    /// its record reads as every record before P1j did.
+    pub fn is_started(&self) -> bool {
+        *self == Self::Started
+    }
 }
 
 /// The most drivers a session may have besides its owner.
@@ -237,6 +271,8 @@ pub struct SessionView {
     /// P1e — the brain revision its core memory was rendered from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brain_rev: Option<i64>,
+    /// P1j — `started` or `adopted` (read-only: nobody prompts it).
+    pub origin: SessionOrigin,
 }
 
 fn rfc3339(t: DateTime) -> String {
@@ -267,6 +303,7 @@ impl From<&AgentSession> for SessionView {
             accepted_at: s.accepted_at.map(rfc3339),
             ended_at: s.ended_at.map(rfc3339),
             brain_rev: s.brain_rev,
+            origin: s.origin,
         }
     }
 }
@@ -435,6 +472,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             brain_rev: None,
+            origin: SessionOrigin::Started,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
@@ -481,5 +519,46 @@ mod tests {
         // An owner listed by mistake is not counted twice.
         s.drivers.push(owner);
         assert_eq!(s.all_drivers(), vec![owner, named]);
+    }
+
+    /// FR-90 P1j — the origin is stored only for an adopted session, so every
+    /// started record reads as before; and an adopted one is driven by
+    /// nobody, its owner included: the terminal holds the harness.
+    #[test]
+    fn an_adopted_session_is_driven_by_nobody_and_a_started_one_stores_no_origin() {
+        let owner = ObjectId::new();
+        let raw = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "owner_id": owner,
+            "title": "t",
+            "harness": { "id": "claude-code", "session": "u" },
+            "location": { "device_id": ObjectId::new(), "folder": "/src" },
+            "status": "idle",
+            "fence": 1_i64,
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut s: AgentSession = bson::from_document(raw).expect("a record before P1j reads");
+        assert_eq!(s.origin, SessionOrigin::Started);
+        assert!(
+            !bson::to_document(&s).unwrap().contains_key("origin"),
+            "a started session stores no origin"
+        );
+        assert!(crate::access::drives_now(&s, owner));
+
+        s.origin = SessionOrigin::Adopted;
+        assert_eq!(
+            bson::to_document(&s).unwrap().get_str("origin").unwrap(),
+            "adopted"
+        );
+        assert!(
+            !crate::access::drives_now(&s, owner),
+            "its owner does not drive an adopted session"
+        );
+        assert_eq!(
+            SessionView::from(&s).origin,
+            SessionOrigin::Adopted,
+            "and the UI is told"
+        );
     }
 }

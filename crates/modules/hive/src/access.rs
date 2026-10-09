@@ -15,11 +15,15 @@
 //! is ordinary chat — but nothing they write reaches the harness: a
 //! multi-user room would otherwise be a prompt-injection channel with a seat
 //! for every member (design §4.5).
+//!
+//! ⚠️ P1j — an ADOPTED session has no drivers at all, its owner included:
+//! it runs in a terminal, which holds the harness, so nothing typed here could
+//! reach it. Its owner reads it and names readers; the rest of the table holds.
 
 use bson::oid::ObjectId;
 
 use crate::HiveState;
-use crate::model::AgentSession;
+use crate::model::{AgentSession, SessionOrigin};
 
 /// May `user` read `s`? In the org, and its owner or in the session's room —
 /// chat's own membership rule. The owner reads it even out of its room: a
@@ -46,5 +50,5 @@ pub(crate) async fn may_read(state: &HiveState, s: &AgentSession, user: ObjectId
 /// the room or the org drives nothing) — prompt it and answer its approvals
 /// NOW: a driver, and the session still live.
 pub(crate) fn drives_now(s: &AgentSession, user: ObjectId) -> bool {
-    s.drives(user) && !s.status.is_terminal()
+    s.origin != SessionOrigin::Adopted && s.drives(user) && !s.status.is_terminal()
 }

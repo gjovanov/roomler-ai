@@ -49,6 +49,7 @@ use roomler_core::{
 
 pub mod access;
 pub mod acks;
+mod adopt;
 pub mod agent_socket;
 pub mod brain;
 pub mod dao;
@@ -83,6 +84,8 @@ pub struct HiveState {
     pub view_grants: Arc<view::ViewGrants>,
     /// The per-(user, session) view-open ceiling.
     pub view_limiter: Arc<RateLimiter>,
+    /// P1j — the per-device adopt-offer ceiling.
+    pub adopt_limiter: Arc<RateLimiter>,
     /// P1e — core memory: facts, budgets, revisions, session snapshots.
     pub brain: Arc<brain::BrainDao>,
     /// P1g — the organizations agent sessions serve (`hive.tenants`).
@@ -123,6 +126,7 @@ impl Module for HiveState {
             start_limiter: Arc::new(RateLimiter::new()),
             view_grants: Arc::new(view::ViewGrants::new()),
             view_limiter: Arc::new(RateLimiter::new()),
+            adopt_limiter: Arc::new(RateLimiter::new()),
             brain: Arc::new(brain::BrainDao::new(db)),
             scope: Arc::new(scope),
             chat: BoundChat::new(&core),
