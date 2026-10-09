@@ -984,6 +984,26 @@ mod tests {
         assert!(st.close(a).is_empty());
     }
 
+    /// FR-27 P10 — the host's Disconnect closes the session HERE at the click
+    /// (`AgentPeer::stop_serving`) while its transport lives on for the grace,
+    /// so whatever the input channel still delivers must go nowhere.
+    #[test]
+    fn a_closed_sessions_later_events_are_denied() {
+        let mut st = ArbiterState::default();
+        let a = sid();
+        let now = Instant::now();
+        st.open(a, "A".into(), true, None, now);
+        assert!(matches!(
+            st.plan(a, &click(true), now),
+            EventPlan::Inject { .. }
+        ));
+        st.close(a);
+        assert_eq!(st.plan(a, &click(false), now), EventPlan::Deny);
+        assert_eq!(st.plan(a, &key(0x04, true), now), EventPlan::Deny);
+        // A denied event is not tracked as held: nothing is left to release.
+        assert!(st.close(a).is_empty());
+    }
+
     #[test]
     fn exclusive_mode_drops_non_holder_events() {
         let mut st = ArbiterState::default();
