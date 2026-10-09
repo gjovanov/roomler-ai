@@ -288,6 +288,12 @@ impl RestartHandle {
         );
         let _ = self.inner.shutdown.send(true);
     }
+
+    /// The daemon's shutdown signal, for work that must end with the daemon:
+    /// an update hold (FR-90 P1h-2) stops waiting when the daemon stops.
+    pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown.subscribe()
+    }
 }
 
 /// Wall-clock ms since the epoch — the restart record is compared across
@@ -1332,6 +1338,25 @@ impl LocalApiState for DaemonState {
         if let Some(restart) = self.restart.as_ref() {
             restart.commit();
         }
+    }
+
+    /// FR-90 P1h-2 — the root update helper (macOS) holds this daemon before
+    /// `installer(8)` restarts it: the same wait the in-process updater runs
+    /// (P1d-1), ended early only by the daemon stopping.
+    async fn hive_update_hold(&self) -> Response {
+        // Without a restart handle (tests, a daemon built without one) the
+        // sender lives here, for as long as the wait does.
+        let (_keep, idle) = watch::channel(false);
+        let shutdown = self
+            .restart
+            .as_ref()
+            .map(RestartHandle::shutdown_rx)
+            .unwrap_or(idle);
+        crate::updater::hold_for_install(shutdown).await
+    }
+
+    fn hive_update_release(&self) {
+        crate::updater::release_install_hold();
     }
 
     /// Fleet RPC — relay an exec to another device over this daemon's own
