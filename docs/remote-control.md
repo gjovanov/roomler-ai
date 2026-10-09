@@ -201,7 +201,7 @@ This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler
 
 ### 4.4 Whether a session may ride the overlay (#1882)
 
-A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device in **Admin → Agents** ("Remote desktop over the mesh"), **off by default**.
+A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device on the **Devices** page ("Remote desktop over the mesh" on the device's row), **off by default**.
 
 **Why off.** A session on the overlay inherits the overlay's failure modes, and its carrier is invisible to rate control:
 
@@ -217,6 +217,8 @@ flowchart LR
     G --> W["Hub forward_offer:<br/>withhold the loopback-TURN<br/>relay when off"]
     H --> D["daemon: RcOverlay::resolve<br/>+ the overlay's v4 blocks"]
     D -->|"delegated (macOS GUI worker)"| S["SessionParams.rc_overlay"]
+    D -->|"OverlayFootprint frame<br/>(the worker's OWN sessions)"| R["worker's footprint<br/>registry"]
+    R --> A
     D --> A["AgentPeer::new"]
     S --> A
     A --> F1["host candidates:<br/>SettingEngine IP filter"]
@@ -236,7 +238,12 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **Never the whole `100.64.0.0/10`.** That is real CGNAT space: an LTE modem, a cloud VPC's secondary range and Tailscale all hand out addresses in it, and a CIDR rule would silently strip their candidates. The footprint registry only ever grows, so a WS reconnect or runtime restart never opens a window in which an overlay address reads as foreign.
 
-> ⚠️ **A delegated session's worker runs no overlay.** On a supervised Mac (FR-43), the GUI worker builds the peer, but it has no overlay to read blocks from. The daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:178`). A frame from an older daemon carries none and reads **off**.
+> ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
+>
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:753`, `delegate.rs:790`; the worker side is `delegate_worker.rs:341`, wired at `main.rs:3680`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+>
+> A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
 **Compatibility.** Each half defaults to off on its own, so mixed versions never turn the overlay on by accident:
 
