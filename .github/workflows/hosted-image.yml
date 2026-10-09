@@ -122,8 +122,13 @@ jobs:
       # build context (files/geoip/, which the Dockerfile COPYs), so the layer
       # is keyed by the file's content. A failed download warns and builds on:
       # an image without it reports `country: unknown`, the designed state.
+      # The script already exits 0 on every failure and bounds its own waits;
+      # `continue-on-error` + `timeout-minutes` make sure that NOTHING in this
+      # step (a hang, a bug) can fail the build. The smoke then warns.
       - name: GeoIP database (DB-IP, CC BY 4.0)
         id: geoip
+        continue-on-error: true
+        timeout-minutes: 8
         run: bash scripts/fetch-geoip.sh files/geoip
 
       - name: Build clock — start

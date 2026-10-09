@@ -146,9 +146,13 @@ jobs:
       # CC BY 4.0 "IP to Country Lite"), staged into the build context before
       # the build. A failed download warns and builds on: the image then
       # reports `country: unknown`, the designed state.
+      # Nothing in this step (a hang, a bug) may fail a release:
+      # `continue-on-error` + `timeout-minutes`, as in the hosted lane.
       - name: GeoIP database (DB-IP, CC BY 4.0)
         id: geoip
         if: steps.gate.outputs.skip != 'true'
+        continue-on-error: true
+        timeout-minutes: 8
         run: bash scripts/fetch-geoip.sh files/geoip
 
       - name: Build
