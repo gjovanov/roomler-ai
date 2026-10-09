@@ -275,7 +275,10 @@ fn hold_agent_prompts(hold: bool) {
 /// ([`crate::hive::begin_update`]) BEFORE a last look, so none begins in the
 /// gap; a prompt admitted before that still runs, and is waited for.
 /// `false` = the daemon is shutting down instead.
-async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+async fn wait_for_agent_turns(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    by: &'static str,
+) -> bool {
     let max = agent_turn_wait();
     let started = Instant::now();
     let mut logged: Option<Instant> = None;
@@ -294,6 +297,7 @@ async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>)
             TurnWait::Proceed => {
                 if logged.is_some() {
                     tracing::info!(
+                        by,
                         waited_secs = waited.as_secs(),
                         "auto-updater: the agent turns are done — installing"
                     );
@@ -303,6 +307,7 @@ async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>)
             TurnWait::Cut => {
                 hold_agent_prompts(true);
                 tracing::warn!(
+                    by,
                     waited_secs = waited.as_secs(),
                     turns = running.len(),
                     sessions = ?running,
@@ -313,6 +318,7 @@ async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>)
             TurnWait::Wait => {
                 if logged.is_none_or(|t| t.elapsed() >= TURN_LOG_EVERY) {
                     tracing::info!(
+                        by,
                         turns = running.len(),
                         sessions = ?running,
                         waited_secs = waited.as_secs(),
@@ -333,6 +339,41 @@ async fn wait_for_agent_turns(shutdown: &mut tokio::sync::watch::Receiver<bool>)
             }
         }
     }
+}
+
+/// FR-90 P1h-2 (AC7 on macOS) — the daemon's half of the root update
+/// helper's hold ([`tunnel_core::localapi::Request::HiveUpdateHold`]): the
+/// wait above, then new prompts and starts held until
+/// [`release_install_hold`]. On macOS the helper installs, never this
+/// process, so this is the only wait there.
+pub async fn hold_for_install(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tunnel_core::localapi::Response {
+    use tunnel_core::localapi::Response;
+    if !cfg!(hive_host) {
+        return Response::Error {
+            message: "this build runs no agent sessions".into(),
+        };
+    }
+    let started = Instant::now();
+    if !wait_for_agent_turns(&mut shutdown, "update-helper").await {
+        return Response::Error {
+            message: "the daemon is stopping".into(),
+        };
+    }
+    Response::HiveUpdateHeld {
+        waited_secs: started.elapsed().as_secs(),
+        cut: u32::try_from(agent_turns_running().len()).unwrap_or(u32::MAX),
+    }
+}
+
+/// FR-90 P1h-2 — the helper's connection closed and this daemon is still
+/// here, so its install did not happen: take prompts and starts again.
+pub fn release_install_hold() {
+    hold_agent_prompts(false);
+    tracing::info!(
+        "update-helper: the hold is released — agent prompts and starts are taken again"
+    );
 }
 
 /// Work an installer would cut short: file transfers in flight, plus an
@@ -2555,7 +2596,7 @@ pub async fn run_periodic(
             // turns (bounded): a person asked for the update, not for their
             // agent to be cut mid-step.
             if matches!(outcome, CheckOutcome::UpdateReady { .. })
-                && !wait_for_agent_turns(&mut shutdown).await
+                && !wait_for_agent_turns(&mut shutdown, "auto-updater").await
             {
                 return;
             }
@@ -2614,7 +2655,7 @@ pub async fn run_periodic(
         let retry = recheck_after(&outcome, &mut transport_failures, interval);
         // FR-90 P1d-1 — AC7: the installer waits for running agent turns.
         if matches!(outcome, CheckOutcome::UpdateReady { .. })
-            && !wait_for_agent_turns(&mut shutdown).await
+            && !wait_for_agent_turns(&mut shutdown, "auto-updater").await
         {
             return;
         }
@@ -2734,6 +2775,54 @@ async fn macos_forward_triggers(
     }
 }
 
+/// How long the update helper waits for the daemon's word before it installs
+/// anyway (FR-90 P1h-2). The daemon bounds its own wait by the device's
+/// `hive_update_wait_secs` (30 min by default); this is only the ceiling for
+/// a daemon that never answers.
+#[cfg(target_os = "macos")]
+const HOLD_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// What the update helper got from the daemon before installing (FR-90 P1h-2).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) enum InstallHold {
+    /// The daemon holds, for as long as the helper keeps this client: until
+    /// `installer(8)` returns.
+    Held {
+        _client: tunnel_core::localapi::Client,
+        waited_secs: u64,
+        cut: u32,
+    },
+    /// No hold, and why: no daemon here, one older than the verb, a refusal,
+    /// or no answer in time. The install goes ahead as it did before P1h-2.
+    Without(String),
+}
+
+/// FR-90 P1h-2 (AC7 on macOS) — ask the root daemon at `socket` to hold for
+/// its agent turns before the helper's `installer(8)` restarts it, and every
+/// harness with it. Fail-open by design: a missing, older or silent daemon
+/// never keeps an update from installing; it gets the install it got before.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) async fn hold_daemon_for_install(socket: PathBuf, ceiling: Duration) -> InstallHold {
+    use tunnel_core::localapi::{Request, Response, connect_unix_at};
+    let mut client = match connect_unix_at(socket).await {
+        Ok(c) => c,
+        Err(e) => return InstallHold::Without(format!("no daemon to hold ({e})")),
+    };
+    match tokio::time::timeout(ceiling, client.request(&Request::HiveUpdateHold)).await {
+        Ok(Ok(Response::HiveUpdateHeld { waited_secs, cut })) => InstallHold::Held {
+            _client: client,
+            waited_secs,
+            cut,
+        },
+        Ok(Ok(Response::Error { message })) => {
+            InstallHold::Without(format!("the daemon holds nothing: {message}"))
+        }
+        Ok(Ok(_)) => InstallHold::Without("an answer this helper does not know".into()),
+        Ok(Err(e)) => InstallHold::Without(format!("the daemon's answer was lost: {e}")),
+        Err(_) => InstallHold::Without(format!("no answer within {} s", ceiling.as_secs())),
+    }
+}
+
 /// `roomlerd update-helper` — the body of `com.roomler.update`.
 ///
 /// Root-only, single-shot: consume the wake file, honour the opt-out marker
@@ -2806,6 +2895,26 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
             latest,
             installer_path,
         } => {
+            // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent
+            // sessions, and the install restarts it with every harness: hold
+            // it for its running turns first, as the in-process updater does
+            // on Linux. The hold ends when `hold` is dropped, right after the
+            // installer returns; a failed install takes prompts again.
+            let hold =
+                hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING)
+                    .await;
+            match &hold {
+                InstallHold::Held {
+                    waited_secs, cut, ..
+                } => tracing::info!(
+                    waited_secs,
+                    cut,
+                    "update-helper: the daemon holds for its agent turns"
+                ),
+                InstallHold::Without(why) => {
+                    tracing::info!(%why, "update-helper: installing without a hold")
+                }
+            }
             record_update_attempt();
             tracing::warn!(
                 %current,
@@ -2818,7 +2927,9 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
                 .arg(&installer_path)
                 .args(["-target", "/"])
                 .status()
-                .context("running installer(8)")?;
+                .context("running installer(8)");
+            drop(hold);
+            let status = status?;
             if !status.success() {
                 // Same operator sentinel act_on_outcome raises: a failed
                 // install is otherwise invisible — the fleet version simply
@@ -2870,6 +2981,92 @@ mod tests {
             !super::request_update_now(None),
             "a push to a daemon whose updater is off must report undeliverable"
         );
+    }
+
+    /// FR-90 P1h-2 — the macOS update helper holds the daemon for exactly as
+    /// long as it keeps the hold (until `installer(8)` returns), and installs
+    /// without one when nothing holds: no daemon, a daemon older than the
+    /// verb, one that never answers. Run on every Unix: the client is not
+    /// macOS's, only its caller is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_update_helper_holds_the_daemon_while_it_installs() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        // A short path: a Unix socket's name is capped at 104 bytes on macOS.
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+
+        // A daemon that holds, and says when the helper lets go.
+        let sock = dir.path().join("hold.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let (gone_tx, mut gone_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = s.into_split();
+            let mut rd = BufReader::new(rd);
+            let mut asked = String::new();
+            rd.read_line(&mut asked).await.unwrap();
+            wr.write_all(b"{\"t\":\"hive_update_held\",\"d\":{\"waited_secs\":12,\"cut\":1}}\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = rd.read_to_end(&mut rest).await;
+            let _ = gone_tx.send(asked);
+        });
+        let hold = super::hold_daemon_for_install(sock, Duration::from_secs(5)).await;
+        let super::InstallHold::Held {
+            waited_secs, cut, ..
+        } = &hold
+        else {
+            panic!("the daemon held")
+        };
+        assert_eq!((*waited_secs, *cut), (12, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut gone_rx)
+                .await
+                .is_err(),
+            "held while the installer runs"
+        );
+        drop(hold);
+        let asked = tokio::time::timeout(Duration::from_secs(5), gone_rx)
+            .await
+            .expect("the daemon sees the hold end")
+            .unwrap();
+        assert_eq!(asked.trim_end(), r#"{"t":"hive_update_hold"}"#);
+
+        // No daemon at all.
+        let none =
+            super::hold_daemon_for_install(dir.path().join("none.sock"), Duration::from_secs(5))
+                .await;
+        assert!(matches!(&none, super::InstallHold::Without(w) if w.contains("no daemon")));
+
+        // A daemon older than the verb.
+        let old = dir.path().join("old.sock");
+        let older = tokio::net::UnixListener::bind(&old).unwrap();
+        tokio::spawn(async move {
+            let (s, _) = older.accept().await.unwrap();
+            let (rd, mut wr) = s.into_split();
+            let mut line = String::new();
+            BufReader::new(rd).read_line(&mut line).await.unwrap();
+            wr.write_all(
+                b"{\"t\":\"error\",\"d\":{\"message\":\"bad request: unknown variant `hive_update_hold`\"}}\n",
+            )
+            .await
+            .unwrap();
+        });
+        let old = super::hold_daemon_for_install(old, Duration::from_secs(5)).await;
+        assert!(matches!(&old, super::InstallHold::Without(w) if w.contains("holds nothing")));
+
+        // One that never answers: the ceiling, and the install goes ahead.
+        let silent = dir.path().join("silent.sock");
+        let mute = tokio::net::UnixListener::bind(&silent).unwrap();
+        let _mute = tokio::spawn(async move {
+            let (s, _) = mute.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let late = super::hold_daemon_for_install(silent, Duration::from_millis(300)).await;
+        assert!(matches!(&late, super::InstallHold::Without(w) if w.contains("no answer")));
     }
 
     /// #1206 — the post-install watcher must verify the INSTALL path, never
