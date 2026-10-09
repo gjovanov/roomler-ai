@@ -302,14 +302,16 @@ before it leaves the host.
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
 
-### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true`)
+### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true` or a `hive.tenants` list)
 
 FR-90 P1g — and only for the organizations in `hive.tenants` (`ROOMLER__HIVE__TENANTS`,
 comma-separated ids; empty or `*` is every organization). A member of any other organization gets
 **404** on every route below (`agent sessions are not available to this organization`), the viewer
 answers `not_found`, and its devices are told to stop what they still run for it when they connect.
 Membership is checked first, so someone outside an organization learns nothing about whether it is
-served.
+served. A list mounts the module by itself, with no `[modules] hive` (P1g-2): the form a hosted
+server uses, because no older image reads a list as the switch — promoting one leaves the module
+off instead of open to every organization.
 
 | Method | Path | Purpose |
 |---|---|---|

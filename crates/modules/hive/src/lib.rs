@@ -143,8 +143,9 @@ impl Module for HiveState {
         Ok(state)
     }
 
+    /// P1g — the module switch, or a `hive.tenants` list.
     fn enabled(settings: &Settings) -> bool {
-        settings.modules.hive
+        settings.hive_on()
     }
 
     fn capabilities(&self, _tenant: &TenantCtx) -> Capabilities {

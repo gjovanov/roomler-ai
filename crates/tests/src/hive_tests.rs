@@ -306,14 +306,15 @@ async fn the_module_is_off_by_default_and_serves_nothing() {
 
 // ─── P1g — the organizations agent sessions serve (`hive.tenants`) ─────────
 
-/// A second server over `first`'s database with the module on, serving only
-/// the organizations listed — as `first` restarted with `hive.tenants` set.
+/// A second server over `first`'s database serving only the organizations
+/// listed — as `first` restarted with `hive.tenants` set. The list alone
+/// switches the module on, with no `modules.hive`: the form a hosted server
+/// uses, so these tests hold the one prod runs.
 async fn serving_only(first: &TestApp, tenants: &str) -> TestApp {
     let db = first.db.name().to_string();
     let tenants = tenants.to_string();
     TestApp::spawn_with_settings(move |s| {
         s.database.name = db;
-        s.modules.hive = true;
         s.hive.tenants = tenants;
         // Polls, like `hive_app_polling`: the default limiter answers a
         // poll loop 429 before the condition it waits for.
@@ -386,6 +387,19 @@ async fn an_organization_hive_does_not_serve_sees_none_of_it() {
         .await
         .unwrap();
     assert_eq!(keep.status().as_u16(), 404, "no fact for an unserved org");
+
+    // The list alone switched the module on, and the server says so.
+    let caps: Value = app
+        .client
+        .get(app.url("/api/capabilities"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = |key: &str| caps[key].as_array().unwrap().iter().any(|m| m == "hive");
+    assert!(listed("modules") && !listed("switched_off"), "{caps}");
 
     // Outside A: the answer is about membership, never about the gate.
     let (code, body) =
