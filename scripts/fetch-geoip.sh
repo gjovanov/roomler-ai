@@ -145,8 +145,9 @@ fetch() {
 # ⚠️ The chmod is load-bearing. `mktemp` creates the file 0600, `cp` into it
 # and `mv` keep that, and Docker's COPY keeps the bits: the image would hold a
 # root-only file that a container running as any other user cannot read, and
-# every country would read `unknown` (measured on the first run of this
-# script; the image smokes run as root and could not see it).
+# every country would read `unknown`. (This script's first local run staged
+# exactly that, a 0600 file; the image smokes run as root and would never have
+# seen it, so they now read the file as uid 65534.)
 stage() {
   local rel="$1" sum size
   TMP_DB="$(mktemp "$DEST/.$NAME.XXXXXX")" || return 1
