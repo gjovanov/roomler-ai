@@ -2602,11 +2602,7 @@ mod tests {
     /// person at the device ended it" cannot be written by the viewer.
     #[tokio::test]
     async fn host_disconnect_is_the_devices_claim_only() {
-        async fn ended_as(
-            hub: &Hub,
-            ctl_rx: &mut mpsc::Receiver<ServerMsg>,
-            sid: ObjectId,
-        ) -> EndReason {
+        async fn ended_as(ctl_rx: &mut mpsc::Receiver<ServerMsg>, sid: ObjectId) -> EndReason {
             loop {
                 match ctl_rx.recv().await.expect("the controller hears the end") {
                     ServerMsg::Terminate { session_id, reason } if session_id == sid => {
@@ -2674,10 +2670,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            ended_as(&hub, &mut ctl_rx, sid).await,
-            EndReason::HostDisconnect
-        );
+        assert_eq!(ended_as(&mut ctl_rx, sid).await, EndReason::HostDisconnect);
 
         // The same words from the viewer are recorded as its own hangup.
         let sid = open(&hub, agent_id, owner, ctl_tx.clone());
@@ -2690,7 +2683,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ended_as(&hub, &mut ctl_rx, sid).await,
+            ended_as(&mut ctl_rx, sid).await,
             EndReason::ControllerHangup
         );
     }
