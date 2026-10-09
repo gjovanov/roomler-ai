@@ -82,7 +82,7 @@ mod supervisor;
 mod toolbelt;
 pub mod view;
 
-#[cfg(feature = "hive-test-launcher")]
+#[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
     Author, CoreMemory, StartOrder, Supervisor, adopt_enabled, begin_shutdown, begin_update,

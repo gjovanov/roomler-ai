@@ -829,16 +829,16 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 
 /// FR-90 — a Hive session's state lives under its account's home; the home
 /// comes from the same lookup that refuses uid 0. Gated to its one consumer.
-#[cfg(hive_host)]
+#[cfg(all(hive_host, unix))]
 pub(crate) use unix_priv::account_home;
 /// The recorder's, and FR-90's toolbelt, whose socket is handed to the
 /// session's account — gated to exactly those two.
-#[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
+#[cfg(any(all(target_os = "linux", feature = "recording"), all(hive_host, unix)))]
 pub(crate) use unix_priv::account_ids;
 /// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
 /// FR-90 P1j: and the adopt socket, which names the account its peer runs as.
-#[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
+#[cfg(any(all(target_os = "linux", feature = "recording"), all(hive_host, unix)))]
 pub(crate) use unix_priv::account_name;
 /// Unix privilege drop.
 ///
