@@ -135,11 +135,24 @@ COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
 # lane's server both include. Outside conf.d/ on purpose: nginx.conf includes
 # conf.d/*.conf at http level, and this file belongs at server level only.
 COPY files/security-headers.conf /etc/nginx/snippets/security-headers.conf
-# Operator-supplied GeoIP database for the user analytics. The directory
-# always exists (README + .gitignore keep the licensed .mmdb out of git);
-# the build host drops the file in before `docker build`. Absent ⇒ the
-# analytics honestly report `country: unknown` — see files/geoip/README.
+# The country database for the user analytics (#1896): DB-IP's "IP to Country
+# Lite", CC BY 4.0. That licence permits exactly what this image does, which
+# is to redistribute it publicly, given attribution: the observability
+# dashboard links DB-IP, and the provenance note travels beside the file.
+# `scripts/fetch-geoip.sh` stages it in files/geoip/ BEFORE `docker build`;
+# both image workflows run it. Nothing here downloads, so a failed fetch can
+# never fail the build or end up cached as an empty layer. Without the file
+# (a source build that skipped the script) the analytics honestly report
+# `country: unknown`, a supported state. NOT GeoLite2: MaxMind's EULA forbids
+# handing its data to third parties, and a public image does exactly that.
+# Details: files/geoip/README.md.
 COPY files/geoip/ /usr/share/roomler/geoip/
+# The image names its own database, so a deployment needs no setting for it.
+# An env value overrides it (your own .mmdb, e.g. a licensed GeoIP2), and an
+# EMPTY value turns country lookups off. ⚠️ An env var outranks the config
+# files, so `geoip_mmdb` in config/local.toml cannot override this; use the
+# variable.
+ENV ROOMLER__STATS__GEOIP_MMDB=/usr/share/roomler/geoip/dbip-country-lite.mmdb
 # FR-20 P5 - unit costs for the metered relay/SFU resources. The binary
 # resolves `config/relay-costs.toml` relative to its CWD, which is `/` here.
 # Same contract as the GeoIP directory above: absent is a supported state and

@@ -43,7 +43,9 @@ One multi-stage `Dockerfile`:
 2. `oven/bun:1` — builds the Vue SPA
 3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
    `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,
-   API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`
+   API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`, and the user
+   analytics' country database at `/usr/share/roomler/geoip/dbip-country-lite.mmdb`
+   ([below](#the-country-database-the-image-carries-1896))
 
 ## The hosted image pipeline (FR-73)
 
@@ -55,11 +57,12 @@ no longer builds or serves it ([FR-73](fr/FR-73-image-build-on-github.md)).
 flowchart LR
     M["merge to master<br/>(crates/**, ui/**, Dockerfile, files/**, config/**, Cargo.*)"]
     subgraph gha["hosted-image.yml — GitHub Actions"]
+        GE["scripts/fetch-geoip.sh<br/>DB-IP country database → files/geoip/<br/>(a failed download warns, never fails)"]
         B["docker build<br/>PROFILE=full SAAS=1<br/>registry-backed BuildKit cache<br/><i>buildcache-hosted</i>"]
         L["label check<br/>revision = the commit"]
-        S["smoke boot with Mongo + Redis<br/>/health = all six modules · device route 401 · / 200<br/>public-site smoke: redirects · 404s · headers · hashed assets · lastmod = git"]
+        S["smoke boot with Mongo + Redis<br/>/health = all six modules · device route 401 · / 200<br/>geoip database loaded (when one was staged)<br/>public-site smoke: redirects · 404s · headers · hashed assets · lastmod = git"]
         P["push hosted-&lt;date&gt;-&lt;sha7&gt;<br/>move <b>hosted</b> · attest provenance"]
-        B --> L --> S --> P
+        GE --> B --> L --> S --> P
     end
     G[("ghcr.io/gjovanov/roomler-ai<br/>public · no pull secret")]
     PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>bump newTag in the deploy repo"]
@@ -100,6 +103,84 @@ master in 9 min 38 s, pushed in 9 s, not deployed.
 ([FR-87](fr/FR-87-blog-and-google-indexing.md)). The image has no git history, so the docs' dates
 come from that manifest; without it the image publishes no dates at all. That is honest, but it
 is a regression from the lane, and `scripts/public-site-smoke.sh <url> .` reports it.
+⚠️ Run `scripts/fetch-geoip.sh` there too, for the same reason
+([#1896](#the-country-database-the-image-carries-1896)): without it the image carries no country
+database and every country reads `unknown`. Do **not** fall back to dropping
+`GeoLite2-Country.mmdb` into `files/geoip/` by hand: MaxMind's EULA forbids handing GeoLite data
+to third parties, so it must never reach an image anyone else can pull, and the image no longer
+reads that path anyway.
+
+## The country database the image carries (#1896)
+
+The platform user analytics records the **country** a browser session came from: the server
+resolves the client's address once, at the `/ws` upgrade, and then drops it, so no IP is ever
+stored (`crates/core/src/user_analytics.rs:189`). That lookup needs a MaxMind-format database.
+Until 2026-10 the build host dropped MaxMind's GeoLite2 into `files/geoip/` by hand before each
+`docker build`; the GitHub lane (FR-73) never did, so every image it built read every country
+as `unknown` (`geoip: false`), which nobody noticed until 2026-10-09.
+
+The image now carries **DB-IP's "IP to Country Lite"**, which a public image may lawfully
+carry, and names it itself, so a deployment needs no setting at all.
+
+```mermaid
+flowchart LR
+    DBIP[("download.db-ip.com<br/>dbip-country-lite-YYYY-MM.mmdb.gz<br/>CC BY 4.0, monthly")]
+    F["scripts/fetch-geoip.sh<br/>this month, else last month<br/>gzip · size · MaxMind metadata<br/>type DBIP-Country-Lite · chmod 0644"]
+    CTX["files/geoip/<br/>dbip-country-lite.mmdb<br/>+ .provenance.txt (release, sha256)"]
+    IMG["image<br/>/usr/share/roomler/geoip/<br/>ENV ROOMLER__STATS__GEOIP_MMDB"]
+    BOOT["GeoIp::open at boot<br/><i>geoip database loaded</i><br/>database=DBIP-Country-Lite built=…"]
+    WS["/ws upgrade: country resolved,<br/>address dropped → ws_sessions.country"]
+    API["GET /api/admin/stats/users<br/>geoip: true · geoip_database"]
+    UI["Countries card<br/>+ IP Geolocation by DB-IP"]
+    NONE["no file: one boot warning,<br/>geoip: false, countries read unknown"]
+    DBIP --> F --> CTX -->|"COPY files/geoip/"| IMG --> BOOT --> WS --> API --> UI
+    F -.->|"download or check failed:<br/>warn, build goes on"| NONE
+    style NONE fill:#fff4e5
+    style UI fill:#e8f0fe
+```
+
+| Piece | Where | What it guarantees |
+|---|---|---|
+| Fetch + verify | `scripts/fetch-geoip.sh:109` (`fetch`), `:150` (`stage`) | TLS from DB-IP's host; gzip CRC, 1–128 MiB, MaxMind metadata naming `DBIP-Country-Lite`. Writes the file 0644 and a provenance note with its SHA-256. **Every failure exits 0 with a warning** |
+| Both image lanes | `hosted-image.yml:125`, `publish-selfhost-image.yml:149` | Run the fetch before `docker build`, into the build context. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
+| Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
+| Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
+| Smoke | `hosted-image.yml:224`, `publish-selfhost-image.yml:255` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
+| Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
+| Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
+
+**The licence.** DB-IP licenses the Lite database under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "You are free to use this IP to
+Country Lite database in your application, provided you give attribution to DB-IP.com for the
+data. In the case of a web application, you must include a link back to DB-IP.com on pages that
+display or use results from the database"
+([db-ip.com](https://db-ip.com/db/download/ip-to-country-lite)). The dashboard carries that link;
+the notice (credit, licence, unmodified, no warranty) travels inside the image as
+`/usr/share/roomler/geoip/README.md` and the provenance note. GeoLite2 is out because its EULA
+(§6, updated 2026-02-12) forbids disclosing GeoLite data to any third party without MaxMind's
+written consent, and requires old versions destroyed within 30 days of an update, which an old
+public image tag can never honour. Full text and the operator recipes:
+[`files/geoip/README.md`](../files/geoip/README.md).
+
+> ⚠️ **An env var beats the image, and beats the config files.** k8s `envFrom` and compose
+> `environment:` override the image's `ENV`, so a deployment that still sets
+> `ROOMLER__STATS__GEOIP_MMDB` to the old `/usr/share/roomler/geoip/GeoLite2-Country.mmdb` points
+> the server at a file no image carries: one boot warning, then `unknown` everywhere. **Delete the
+> override** (or point it at `dbip-country-lite.mmdb`). And because `envFrom` is read only when a
+> container starts, a configmap change reaches a pod with its next roll, so land it with a promote.
+> `[stats] geoip_mmdb` in `config/local.toml` cannot override the image's value at all; use the
+> variable.
+
+> ⚠️ **The root-run smoke cannot see a root-only file.** `mktemp` creates files 0600 and
+> Docker's `COPY` keeps the bits, so the first version of the fetch baked a database only root
+> could read: invisible to a smoke that runs as root, fatal to any container run as another
+> user. The fetch now `chmod`s it, and the smoke reads it as uid 65534.
+
+An image's database is at most about a month old when it is built (DB-IP publishes on the 1st,
+and each build takes the newest release), and it refreshes with every rebuild, which every merge
+that touches the image triggers. Its accuracy is DB-IP's "Lite" grade (their own accuracy index:
+81, against 93 for the commercial database): enough for a per-country breakdown, and not meant
+for anything finer.
 
 ## Development stack
 
@@ -132,6 +213,7 @@ nesting), loaded via the `config` crate. The ones that matter first:
 | `ROOMLER__TURN__SHARED_SECRET` | coturn REST-auth secret (never committed) |
 | `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` | `<node_ip>=<public_ip>,…` — per-pod announced IP resolution for multi-node clusters |
 | `ROOMLER__STRIPE__*` / `ROOMLER__CLAUDE__*` / `ROOMLER__S3__*` / SMTP / OAuth | Integrations |
+| `ROOMLER__STATS__GEOIP_MMDB` | The country database for the user analytics. **The image already sets it** to the DB-IP database it carries; set it only to use your own `.mmdb`, or to empty to turn lookups off. See [the country database](#the-country-database-the-image-carries-1896) |
 
 Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
 also settings — see `crates/config/src/settings.rs` for the full surface.
