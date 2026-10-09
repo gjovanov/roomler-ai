@@ -128,6 +128,21 @@ pub enum DelegateFrame {
     /// Daemon → worker: everything the daemon resolved while answering
     /// `rc:session.request`, which the worker's `rc:sdp.offer` handler needs.
     SessionParams(Box<SessionParams>),
+    /// #1882 — daemon → worker: the overlay's v4 blocks, as the daemon's
+    /// `tunnel_core::overlay_footprint` has them.
+    ///
+    /// The worker runs no overlay (a GUI-session process cannot create a
+    /// `utun`), yet it serves its OWN enrollment's remote-desktop sessions, and
+    /// those resolve the device's `rc_overlay` against the worker's footprint.
+    /// Empty, it read the `utunN` address as foreign, and a session meant to
+    /// stay off the overlay offered it as a host candidate (field, 0.4.122:
+    /// `overlay_blocks=0`). Sent after [`DelegateFrame::Attached`] and again
+    /// with a [`DelegateFrame::Pong`] whenever the set has grown; the worker
+    /// adds what it is told, since the registry only grows. An older worker
+    /// skips the frame, as every reader here skips what it does not know.
+    OverlayFootprint {
+        v4_nets: Vec<(std::net::Ipv4Addr, u8)>,
+    },
 }
 
 /// Everything the daemon resolved for a session while answering
@@ -387,6 +402,11 @@ struct Inner {
     /// `Terminate`, because a recording outlives its session by the re-attach
     /// grace and its last claims come after.
     record_sessions: Mutex<std::collections::VecDeque<String>>,
+    /// #1882 — where the frame loop reads the overlay footprint it pushes to
+    /// an attached worker ([`DelegateFrame::OverlayFootprint`]). Set by the
+    /// daemon to `tunnel_core::overlay_footprint::v4_nets`; unset (every test
+    /// host) pushes nothing, so the frame-by-frame tests never meet the frame.
+    footprint: Mutex<Option<fn() -> Vec<(std::net::Ipv4Addr, u8)>>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -410,6 +430,25 @@ fn chown_to(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
 impl DelegateHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// #1882 — read the overlay footprint pushed to an attached worker from
+    /// `source`. The daemon passes `tunnel_core::overlay_footprint::v4_nets`;
+    /// without a source nothing is pushed.
+    pub fn set_overlay_footprint(&self, source: fn() -> Vec<(std::net::Ipv4Addr, u8)>) {
+        *self.inner.footprint.lock().expect("footprint mutex") = Some(source);
+    }
+
+    /// The footprint frame to push to the worker, if the source holds blocks
+    /// that `sent` (what this connection was last told) does not.
+    fn footprint_update(&self, sent: &mut Vec<(std::net::Ipv4Addr, u8)>) -> Option<DelegateFrame> {
+        let source = (*self.inner.footprint.lock().expect("footprint mutex"))?;
+        let now = source();
+        if now.is_empty() || now == *sent {
+            return None;
+        }
+        sent.clone_from(&now);
+        Some(DelegateFrame::OverlayFootprint { v4_nets: now })
     }
 
     /// Open (or re-open) the delegation socket for `uid` and mint the secret
@@ -711,6 +750,11 @@ impl DelegateHost {
             },
         )
         .await?;
+        // #1882 — the worker's OWN sessions need the overlay's blocks too.
+        let mut footprint_sent = Vec::new();
+        if let Some(frame) = self.footprint_update(&mut footprint_sent) {
+            write_frame(&mut wr, &frame).await?;
+        }
 
         // Bounded on purpose. An unbounded queue toward a worker that has
         // stopped reading is a memory leak that looks like a working channel;
@@ -740,7 +784,15 @@ impl DelegateHost {
                 continue;
             }
             match serde_json::from_str::<DelegateFrame>(&line) {
-                Ok(DelegateFrame::Ping) => write_frame(&mut wr, &DelegateFrame::Pong).await?,
+                Ok(DelegateFrame::Ping) => {
+                    write_frame(&mut wr, &DelegateFrame::Pong).await?;
+                    // #1882 — a grown footprint rides the worker's own liveness
+                    // cadence: the overlay may join well after the worker
+                    // attached, and this loop has no timer of its own.
+                    if let Some(frame) = self.footprint_update(&mut footprint_sent) {
+                        write_frame(&mut wr, &frame).await?;
+                    }
+                }
                 Ok(DelegateFrame::Pong) => {}
                 Ok(DelegateFrame::Attached { .. }) => {
                     // Daemon to worker only. A worker sending it is confused
@@ -756,7 +808,11 @@ impl DelegateHost {
                     );
                     *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(*caps);
                 }
-                Ok(DelegateFrame::ToWorker { .. } | DelegateFrame::SessionParams { .. }) => {
+                Ok(
+                    DelegateFrame::ToWorker { .. }
+                    | DelegateFrame::SessionParams { .. }
+                    | DelegateFrame::OverlayFootprint { .. },
+                ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
                     tracing::warn!("delegation: worker sent a daemon-only frame; ignoring");
@@ -916,6 +972,78 @@ mod tests {
         drop(cwr);
         drop(lines);
         task.await.unwrap();
+    }
+
+    /// #1882 — the source a test daemon's footprint is read from. A static,
+    /// not the process-global registry, so no other test can change what this
+    /// one sees.
+    static TEST_FOOTPRINT: std::sync::Mutex<Vec<(std::net::Ipv4Addr, u8)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn test_footprint() -> Vec<(std::net::Ipv4Addr, u8)> {
+        TEST_FOOTPRINT.lock().unwrap().clone()
+    }
+
+    /// #1882 — the daemon tells an attached worker the overlay's blocks: right
+    /// after `attached`, and again after a `pong` once they have grown — never
+    /// twice for the same set, so liveness does not turn into a broadcast.
+    #[tokio::test]
+    async fn the_daemon_pushes_its_overlay_footprint_to_the_worker() {
+        let a = (std::net::Ipv4Addr::new(100, 65, 4, 0), 22);
+        let b = (std::net::Ipv4Addr::new(100, 65, 8, 0), 22);
+        *TEST_FOOTPRINT.lock().unwrap() = vec![a];
+
+        let host = DelegateHost::new();
+        host.set_overlay_footprint(test_footprint);
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(4096);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        async fn next<R: tokio::io::AsyncBufRead + Unpin>(
+            lines: &mut tokio::io::Lines<R>,
+        ) -> DelegateFrame {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("a frame within 5 s")
+                .unwrap()
+                .expect("a frame, not EOF");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        assert!(matches!(
+            next(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        match next(&mut lines).await {
+            DelegateFrame::OverlayFootprint { v4_nets } => assert_eq!(v4_nets, [a]),
+            other => panic!("expected the footprint after attached, got {other:?}"),
+        }
+
+        // Unchanged: a ping is answered, and nothing else follows it (the
+        // next ping's pong would otherwise come second).
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
+        // Grown: the next ping's pong carries the new set behind it.
+        TEST_FOOTPRINT.lock().unwrap().push(b);
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
+        match next(&mut lines).await {
+            DelegateFrame::OverlayFootprint { v4_nets } => assert_eq!(v4_nets, [a, b]),
+            other => panic!("expected the grown footprint, got {other:?}"),
+        }
+
+        // ⚠️ Both halves: the daemon sees EOF only when the whole client
+        // stream is gone. Dropping the write half alone left this test
+        // waiting on `task` forever (measured: 10 h, on the first draft).
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
     }
 
     /// An unknown frame must not close the channel: a NEWER worker may send one,

@@ -3674,6 +3674,10 @@ async fn run_cmd(
     // needs no separate branch.
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
+    // #1882 — the worker serves its OWN sessions too, and runs no overlay, so
+    // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
+    #[cfg(target_os = "macos")]
+    delegate_host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
 
     // FR-55 — keep the device reachable instead of letting it quietly sleep.
     // Default `never`, so on a device that has not opted in this task holds
