@@ -63,6 +63,7 @@ import {
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
   friendlyEndReason,
+  endedByHost,
   isRetryableRcErrorCode,
   readyRecoveryAction,
   sessionGateAllows,
@@ -3798,6 +3799,50 @@ describe('FR-27: friendlyEndReason', () => {
     }
     expect(friendlyEndReason(undefined)).toBeNull()
     expect(friendlyEndReason('some_future_reason')).toBeNull()
+  })
+})
+
+// FR-27 P10 - the host's Disconnect. The `rc:terminate` handler takes one
+// decision per ending through these two helpers: `isRetryableTerminateReason`
+// says whether the ladder re-creates the session, `endedByHost` whether the
+// view says "the person at the device ended it" and offers an explicit
+// Reconnect. Locking both locks the behaviour the field log measured wrong
+// on 0.4.119: a banner Disconnect followed by an automatic reconnect.
+describe('FR-27 P10: the host\'s Disconnect', () => {
+  it('stops the reconnect ladder: host_disconnect is terminal and named', () => {
+    expect(isRetryableTerminateReason('host_disconnect')).toBe(false)
+    expect(endedByHost('host_disconnect')).toBe(true)
+  })
+
+  it('leaves an ordinary drop on the ladder', () => {
+    for (const r of ['agent_disconnect', 'error']) {
+      expect(isRetryableTerminateReason(r)).toBe(true)
+      expect(endedByHost(r)).toBe(false)
+    }
+  })
+
+  it('reads no other ending as the host\'s word', () => {
+    // `agent_hangup` included on purpose: older agents sent it from the same
+    // button, but the viewer has no proof of that, so it stays a quiet close.
+    for (const r of [
+      'controller_hangup',
+      'agent_hangup',
+      'user_denied',
+      'consent_timeout',
+      'no_prompt_surface',
+      'admin_terminated',
+      'idle_timeout',
+      undefined,
+      null,
+      '',
+      'some_future_reason',
+    ]) {
+      expect(endedByHost(r)).toBe(false)
+    }
+  })
+
+  it('is not an error: the sentence belongs to the view, not the error alert', () => {
+    expect(friendlyEndReason('host_disconnect')).toBeNull()
   })
 })
 

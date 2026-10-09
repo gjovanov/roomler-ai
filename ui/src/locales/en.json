@@ -46,6 +46,13 @@
         "no444Anywhere": "No 4:4:4 cell exists for this device and browser",
         "no420Anywhere": "Nothing decodes here"
       }
+    },
+    "session": {
+      "endedByHost": {
+        "title": "The person at the device ended the session.",
+        "body": "They clicked Disconnect on their screen, so this viewer stays disconnected. Reconnect asks them again, as any new session does.",
+        "reconnect": "Reconnect"
+      }
     }
   },
   "auth": {

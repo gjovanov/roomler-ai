@@ -721,10 +721,36 @@
       </v-alert>
 
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
-        <v-icon size="96" color="grey-lighten-1">mdi-desktop-classic</v-icon>
-        <p class="text-body-1 mt-2">
-          Click <strong>Connect</strong> to start a remote-control session.
-        </p>
+        <!-- FR-27 P10 - the person at the device ended the session. Said in
+             so many words, and the viewer stays put: reconnecting from here is
+             an explicit act, and it goes through consent like any new session. -->
+        <template v-if="rc.endedBy.value === 'host'">
+          <v-icon size="96" color="warning">mdi-account-off-outline</v-icon>
+          <p class="text-h6 mt-2" data-testid="rc-ended-by-host">
+            {{ t('remote.session.endedByHost.title') }}
+          </p>
+          <p class="text-body-2 text-medium-emphasis">
+            {{ t('remote.session.endedByHost.body') }}
+          </p>
+          <v-btn
+            color="primary"
+            variant="flat"
+            size="small"
+            class="mt-3"
+            prepend-icon="mdi-refresh"
+            :disabled="!canConnect"
+            data-testid="rc-ended-by-host-reconnect"
+            @click="startSession"
+          >
+            {{ t('remote.session.endedByHost.reconnect') }}
+          </v-btn>
+        </template>
+        <template v-else>
+          <v-icon size="96" color="grey-lighten-1">mdi-desktop-classic</v-icon>
+          <p class="text-body-1 mt-2">
+            Click <strong>Connect</strong> to start a remote-control session.
+          </p>
+        </template>
         <p v-if="agent && !agent.is_online" class="text-caption text-medium-emphasis">
           This agent is currently offline. The session will fail until the agent
           reconnects.
