@@ -1106,6 +1106,20 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
+    // which the daemon runs AS THE CONSOLE USER before the harness starts, as
+    // the Unix wrapper runs as the account. None of the setup below is its.
+    #[cfg(all(windows, feature = "hive"))]
+    if let Some(prep) = roomlerd::hive_win::PrepArgs::from_env() {
+        std::process::exit(match prep.and_then(|a| roomlerd::hive_win::prep(&a)) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("roomlerd hive-prep: {e}");
+                1
+            }
+        });
+    }
+
     // #1705 — the desktop companion's service probes (every 10 s) answer one
     // question about the service manager; none of the daemon setup below is
     // theirs, and its startup lines used to flood the per-user log.
