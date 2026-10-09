@@ -46,6 +46,9 @@ export interface HiveSession {
   updated_at: string
   accepted_at?: string
   ended_at?: string
+  /** P1j — `adopted`: a terminal session its owner adopted, read-only (it
+   *  runs in the terminal). Absent from an older server: started. */
+  origin?: 'started' | 'adopted'
 }
 
 /** `POST …/hive/session` — always 200 for a well-formed request. */
@@ -127,6 +130,11 @@ export interface BrainView {
 }
 
 /** A session that can still change. */
+/** P1j — a terminal session adopted on its device: nobody drives it here. */
+export function isAdopted(s?: Pick<HiveSession, 'origin'> | null): boolean {
+  return s?.origin === 'adopted'
+}
+
 export function isLive(s: Pick<HiveSession, 'status'>): boolean {
   return !['ended', 'refused', 'lost'].includes(s.status)
 }
