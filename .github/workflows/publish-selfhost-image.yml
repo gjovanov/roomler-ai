@@ -179,7 +179,12 @@ jobs:
           # architecture (and each feature set) evicting the other's layers on
           # every run.
           cache-from: type=gha,scope=${{ matrix.arch }}-${{ inputs.profile }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ inputs.profile }}
+          # #1904 — `ignore-error=true`: a cache that cannot be written (the
+          # repository's Actions cache goes read-only once its budget is used
+          # up) costs the NEXT build its speed, never this one its image.
+          # Without it the export failed the step after a good build, and no
+          # self-host image could be published at all.
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ inputs.profile }},ignore-error=true
 
       # ⚠️ The point of publishing is that someone else runs this without
       # reading the source. An image that builds but does not start is worse
