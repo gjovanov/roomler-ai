@@ -43,7 +43,7 @@ const DialogStub = {
 const owner = { user_id: 'u-owner', display_name: 'Olga', role: 'owner' }
 const reader = { user_id: 'u-reader', display_name: 'Ray', role: 'reader' }
 
-async function render(mayManage: boolean) {
+async function render(mayManage: boolean, adopted = false) {
   hoisted.fetchParticipants.mockResolvedValue({ items: [owner, reader], may_manage: mayManage })
   hoisted.apiGet.mockResolvedValue({
     items: [
@@ -54,7 +54,7 @@ async function render(mayManage: boolean) {
   })
   const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
   const w = mount(HiveParticipants, {
-    props: { tenantId: 't1', sessionId: 's1' },
+    props: { tenantId: 't1', sessionId: 's1', adopted },
     global: { plugins: [vuetify, i18n], stubs: { VDialog: DialogStub } },
   })
   await w.find('[data-testid="hive-people"]').trigger('click')
@@ -127,5 +127,15 @@ describe('HiveParticipants (FR-90 P1c)', () => {
     expect(byTestId(w, 'hive-person-remove').length).toBe(0)
     expect(byTestId(w, 'hive-people-pick').length).toBe(0)
     expect(hoisted.apiGet, "a reader does not page through the org's members").not.toHaveBeenCalled()
+  })
+
+  it('offers readers only for an adopted session (P1j): it runs in a terminal', async () => {
+    const w = await render(true, true)
+    const people = byTestId(w, 'hive-person')
+    expect(people[1].find('[data-testid="hive-person-reader"]').exists()).toBe(true)
+    expect(people[1].find('[data-testid="hive-person-driver"]').exists()).toBe(false)
+    expect(byTestId(w, 'hive-people-add-reader').length).toBe(1)
+    expect(byTestId(w, 'hive-people-add-driver').length).toBe(0)
+    expect(byTestId(w, 'hive-people-readers-only')[0].text()).toBe('It runs in a terminal, so it takes readers only.')
   })
 })

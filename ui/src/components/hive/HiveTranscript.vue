@@ -24,7 +24,7 @@
         {{ viewer.reason.value }}
       </span>
       <v-spacer />
-      <hive-participants v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" />
+      <hive-participants v-if="tenantId" :tenant-id="tenantId" :session-id="sessionId" :adopted="adopted" />
       <v-btn
         v-if="viewer.status.value === 'closed' || viewer.status.value === 'refused'"
         size="small"
@@ -178,7 +178,8 @@
     >
       <!-- P1c-2 — the server named us a driver, the device does not let us
            act as its account: say so, in the device's words. -->
-      <template v-if="viewer.drivingRefused.value">
+      <template v-if="adopted">{{ $t('hive.viewer.adoptedReadOnly') }}</template>
+      <template v-else-if="viewer.drivingRefused.value">
         {{ $t('hive.viewer.drivingRefused', { why: viewer.drivingRefused.value }) }}
       </template>
       <template v-else>{{ $t('hive.viewer.readOnly') }}</template>
@@ -202,8 +203,10 @@ const props = withDefaults(
     tenantId?: string
     /** P1f-2 — how many events the transcript keeps while it follows the newest. */
     keep?: number
+    /** P1j — a terminal session adopted on its device: read-only here. */
+    adopted?: boolean
   }>(),
-  { tenantId: undefined, keep: 1000 },
+  { tenantId: undefined, keep: 1000, adopted: false },
 )
 const { t } = useI18n()
 const viewer = useHiveViewer()
