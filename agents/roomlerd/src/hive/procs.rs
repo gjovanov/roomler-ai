@@ -25,10 +25,31 @@ pub(crate) fn started(pid: u32) -> Option<String> {
     imp::started(pid)
 }
 
-/// P1j — the parent of `pid`: an adopt hook's is the Claude Code that ran it.
-pub(crate) fn parent(pid: u32) -> Option<u32> {
-    imp::parent(pid)
+/// P1j — the Claude Code that ran an adopt hook `pid`: the hook's nearest
+/// ancestor that is not a shell. Claude Code runs a hook's command line
+/// through `/bin/sh -c`, and a shell that forks the command instead of
+/// exec'ing it stands between the two and exits with the hook — dash does
+/// (Claude Code 2.1.293 on Ubuntu's dash 0.5.12, the field run). Taken for
+/// the terminal, that shell ended every adopted session at the next sweep,
+/// and the next turn's hook offered the session again as a new record.
+/// Claude Code is never a shell, and a shell that exec'd the hook is not
+/// there at all. `None`: no such process, or more shells than any wrapper.
+pub(crate) fn hook_terminal(pid: u32) -> Option<u32> {
+    let mut p = imp::parent(pid)?;
+    for _ in 0..MAX_WRAPPING_SHELLS {
+        if !SHELLS.contains(&imp::name(p)?.as_str()) {
+            return Some(p);
+        }
+        p = imp::parent(p)?;
+    }
+    None
 }
+
+/// What a hook's command line may run under, by process name.
+const SHELLS: [&str; 8] = ["sh", "dash", "bash", "zsh", "ksh", "mksh", "ash", "fish"];
+
+/// The most shells between a hook and the Claude Code that ran it.
+const MAX_WRAPPING_SHELLS: usize = 3;
 
 /// Signal `pid`'s process group (the group a harness leads).
 pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
@@ -111,11 +132,17 @@ mod imp {
             .ok()?;
         (ppid > 1).then_some(ppid)
     }
+
+    pub(super) fn name(pid: u32) -> Option<String> {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        Some(comm.trim_end_matches('\n').to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
-    pub(super) fn started(pid: u32) -> Option<String> {
+    /// The process's BSD info: its start time, parent and name.
+    fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
         let pid = libc::c_int::try_from(pid).ok()?;
         // SAFETY: the buffer is a zeroed `proc_bsdinfo` this frame owns,
         // passed with its own size; the call writes at most that much.
@@ -130,9 +157,11 @@ mod imp {
                 size,
             )
         };
-        if n != size {
-            return None;
-        }
+        (n == size).then_some(info)
+    }
+
+    pub(super) fn started(pid: u32) -> Option<String> {
+        let info = bsdinfo(pid)?;
         Some(format!(
             "{}",
             info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
@@ -140,20 +169,19 @@ mod imp {
     }
 
     pub(super) fn parent(pid: u32) -> Option<u32> {
-        let pid = libc::c_int::try_from(pid).ok()?;
-        // SAFETY: as in `started`: a zeroed buffer this frame owns, with its size.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                size,
-            )
-        };
-        (n == size && info.pbi_ppid > 1).then_some(info.pbi_ppid)
+        let info = bsdinfo(pid)?;
+        (info.pbi_ppid > 1).then_some(info.pbi_ppid)
+    }
+
+    pub(super) fn name(pid: u32) -> Option<String> {
+        let info = bsdinfo(pid)?;
+        let bytes: Vec<u8> = info
+            .pbi_comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8(bytes).ok()
     }
 }
 
@@ -171,6 +199,48 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert_eq!(started(pid), None, "a reaped process has no start time");
+    }
+
+    #[test]
+    fn a_hook_belongs_to_its_nearest_ancestor_that_is_not_a_shell() {
+        let me = std::process::id();
+        // Run directly, as a shell that exec'd the command leaves it.
+        let mut direct = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(hook_terminal(direct.id()), Some(me));
+        direct.kill().unwrap();
+        direct.wait().unwrap();
+
+        // Run through `sh -c` by a shell that forks it, as dash runs a hook's
+        // command line for Claude Code; a background job keeps the shell
+        // between the two whatever the shell.
+        let dir = tempfile::tempdir().unwrap();
+        let said = dir.path().join("pid");
+        let mut sh = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > '{}'; wait", said.display()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let hook = loop {
+            if let Some(p) = std::fs::read_to_string(&said)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "the shell never named its job");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(imp::parent(hook), Some(sh.id()), "the shell stands between");
+        assert_eq!(hook_terminal(hook), Some(me), "and the terminal is past it");
+        // SAFETY: a plain syscall to the job this test started.
+        unsafe {
+            libc::kill(libc::pid_t::try_from(hook).unwrap(), libc::SIGKILL);
+        }
+        sh.wait().unwrap();
     }
 
     #[tokio::test]
