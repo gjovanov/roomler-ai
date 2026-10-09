@@ -368,7 +368,11 @@ impl Supervisor {
                 Ok(other) => match &said_hello {
                     None => Reply::refused(refusal::BAD_REQUEST, None),
                     Some(hs) => match other {
-                        Request::Lines { from, data } => self.adopt_lines(uid, hs, from, &data),
+                        Request::Lines {
+                            from,
+                            data,
+                            skipped,
+                        } => self.adopt_lines(uid, hs, from, &data, skipped),
                         Request::TurnEnded => self.adopt_turn_ended(uid, hs),
                         Request::End { reason } => self.adopt_end(uid, hs, reason.as_deref()),
                         Request::Hello { .. } => unreachable!("matched above"),
@@ -561,7 +565,14 @@ impl Supervisor {
     }
 
     /// `Lines`: whole transcript lines from where this copy ends.
-    pub(crate) fn adopt_lines(&self, uid: u32, hs: &str, from: u64, data: &str) -> Reply {
+    pub(crate) fn adopt_lines(
+        &self,
+        uid: u32,
+        hs: &str,
+        from: u64,
+        data: &str,
+        skipped: u64,
+    ) -> Reply {
         let mut file = self.adopted_lock();
         let Some(a) = file.get(hs).cloned() else {
             return Reply::refused(refusal::BAD_REQUEST, None);
@@ -616,7 +627,19 @@ impl Supervisor {
                 }
             }
         }
-        next.offset = a.offset + data.len() as u64;
+        // A line too long to send: its place is moved past, and marked.
+        if skipped > 0
+            && let Ok(store) = &self.store
+        {
+            store.append(
+                &a.session,
+                a.fence,
+                TranscriptEvent::Note {
+                    text: format!("A transcript line of {skipped} bytes was too long to mirror."),
+                },
+            );
+        }
+        next.offset = a.offset + data.len() as u64 + skipped;
         let offset = next.offset;
         file.put(next);
         drop(file);
@@ -1039,6 +1062,7 @@ mod tests {
         hook.ask(Request::Lines {
             from: 0,
             data: data.clone(),
+            skipped: 0,
         })
         .await;
         assert_eq!(hook.reply().await, Reply::ok(Some(data.len() as u64)));
@@ -1064,11 +1088,27 @@ mod tests {
         hook.ask(Request::Lines {
             from: 3,
             data: format!("{ASSISTANT_TEXT}\n"),
+            skipped: 0,
         })
         .await;
         assert_eq!(
             hook.reply().await,
             Reply::refused(refusal::BAD_REQUEST, Some(data.len() as u64))
+        );
+
+        // A line too long to send: the copy moves past it, and says so.
+        let at = data.len() as u64;
+        hook.ask(Request::Lines {
+            from: at,
+            data: String::new(),
+            skipped: 9_000_000,
+        })
+        .await;
+        assert_eq!(hook.reply().await, Reply::ok(Some(at + 9_000_000)));
+        let events = r.store.events(&sid.to_hex());
+        assert!(
+            matches!(events.last(), Some(TranscriptEvent::Note { text }) if text.contains("9000000 bytes")),
+            "{events:?}"
         );
 
         hook.ask(Request::TurnEnded).await;

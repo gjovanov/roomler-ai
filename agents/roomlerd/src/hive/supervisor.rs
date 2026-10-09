@@ -77,9 +77,9 @@ const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then
 /// Each session's runtime files (settings, MCP config, toolbelt socket, core
 /// memory): the daemon's own, cleared at boot.
 #[cfg(target_os = "linux")]
-const RUNTIME_DIR: &str = "/run/roomler-hive";
+const RUNTIME_DIR: &str = tunnel_core::localapi::hive_adopt::RUNTIME_DIR_LINUX;
 #[cfg(target_os = "macos")]
-const RUNTIME_DIR: &str = "/var/run/roomler-hive";
+const RUNTIME_DIR: &str = tunnel_core::localapi::hive_adopt::RUNTIME_DIR_MACOS;
 /// P1h — how long the daemon gives its harnesses to exit on SIGTERM when it
 /// leaves ([`wind_down`]) before SIGKILL: within the 5 s a service manager
 /// usually waits for a stop.
