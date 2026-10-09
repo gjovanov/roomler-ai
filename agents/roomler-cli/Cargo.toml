@@ -44,7 +44,11 @@ toml = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: `roomler hive adopt` keeps every setting it does not own
+# exactly as written (FR-90 P1j-3).
+serde_json = { workspace = true, features = ["raw_value"] }
+# ... and in the order written.
+indexmap = { version = "2", features = ["serde"] }
 base64 = { workspace = true }
 
 # Tracing
