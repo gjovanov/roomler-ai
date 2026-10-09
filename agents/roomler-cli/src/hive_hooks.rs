@@ -37,11 +37,21 @@ pub const EVENTS: [(&str, bool); 3] = [
     ("SessionEnd", false),
 ];
 
-/// What a hook entry runs: this very binary, with `hive hook`.
+/// The longest a hook entry may run before Claude Code abandons it. A
+/// version that runs it in the foreground (one that knows no `async`) waits
+/// at most this long at a turn's end.
+const HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// What a hook entry runs: this very binary, with `hive hook`, as ONE shell
+/// command line.
+///
+/// ⚠️ Shell form, never exec form (`command` + `args`). `roomlerd` with no
+/// arguments RUNS THE DAEMON, so a Claude Code that dropped an `args` list it
+/// did not know would start a daemon as the person at every hook. A command
+/// line is run whole by every version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookCommand {
     pub command: String,
-    pub args: Vec<String>,
 }
 
 impl HookCommand {
@@ -50,20 +60,28 @@ impl HookCommand {
     /// hook` directly, without the shim's hop.
     pub fn this_binary(embedded: bool) -> Result<Self> {
         let exe = std::env::current_exe().context("locating this binary")?;
-        let command = exe
-            .to_str()
-            .context("this binary's path is not UTF-8")?
-            .to_string();
-        let mut args = Vec::new();
-        if embedded {
-            args.push("cli".to_string());
+        let path = exe.to_str().context("this binary's path is not UTF-8")?;
+        Ok(Self::for_binary(path, embedded))
+    }
+
+    /// The entry for the binary at `path`.
+    pub fn for_binary(path: &str, embedded: bool) -> Self {
+        let sub = if embedded {
+            "cli hive hook"
+        } else {
+            "hive hook"
+        };
+        Self {
+            command: format!("{} {sub}", shell_quote(path)),
         }
-        args.extend(["hive".to_string(), "hook".to_string()]);
-        Ok(Self { command, args })
     }
 
     fn handler(&self, background: bool) -> Value {
-        let mut h = json!({ "type": "command", "command": self.command, "args": self.args });
+        let mut h = json!({
+            "type": "command",
+            "command": self.command,
+            "timeout": HOOK_TIMEOUT_SECS,
+        });
         if background {
             h["async"] = json!(true);
         }
@@ -71,20 +89,51 @@ impl HookCommand {
     }
 }
 
-/// Whether a hook handler is one `adopt` installed: it runs a Roomler binary
-/// with arguments ending in `hive hook`.
+/// `s` as one word for a POSIX shell: single quotes, a quote inside closed,
+/// escaped and reopened.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The first word of a shell command line, unquoted: what a hook entry runs.
+fn first_word(command: &str) -> (String, &str) {
+    let mut word = String::new();
+    let mut chars = command.trim_start().char_indices().peekable();
+    let rest_from = |i: usize| &command.trim_start()[i..];
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                for (_, q) in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    word.push(q);
+                }
+            }
+            '\\' => {
+                if let Some((_, e)) = chars.next() {
+                    word.push(e);
+                }
+            }
+            c if c.is_whitespace() => return (word, rest_from(i)),
+            c => word.push(c),
+        }
+    }
+    (word, "")
+}
+
+/// Whether a hook handler is one `adopt` installed: a command line that runs
+/// a Roomler binary with `hive hook` (or `cli hive hook`) and nothing else.
 pub fn ours(handler: &Value) -> bool {
-    let args: Vec<&str> = handler
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
     let command = handler.get("command").and_then(Value::as_str).unwrap_or("");
-    let stem = Path::new(command)
+    let (program, rest) = first_word(command);
+    let stem = Path::new(&program)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    args.ends_with(&["hive", "hook"]) && matches!(stem, "roomler" | "roomlerd" | "roomler-shim")
+    let rest: Vec<&str> = rest.split_whitespace().collect();
+    matches!(stem, "roomler" | "roomlerd" | "roomler-shim")
+        && (rest == ["hive", "hook"] || rest == ["cli", "hive", "hook"])
 }
 
 fn group_has_ours(group: &RawValue) -> bool {
@@ -530,10 +579,7 @@ mod tests {
     use super::*;
 
     fn hook() -> HookCommand {
-        HookCommand {
-            command: "/usr/bin/roomler".into(),
-            args: vec!["hive".into(), "hook".into()],
-        }
+        HookCommand::for_binary("/usr/bin/roomler", false)
     }
 
     /// A settings file as this dev box keeps it: someone else's hooks (FR-8's
@@ -590,7 +636,7 @@ mod tests {
                 .filter(|h| ours(h))
                 .collect();
             assert_eq!(mine.len(), 1, "{event}: {out}");
-            assert_eq!(mine[0]["args"], json!(["hive", "hook"]));
+            assert_eq!(mine[0]["command"], json!("'/usr/bin/roomler' hive hook"));
             assert_eq!(mine[0].get("async").is_some(), background, "{event}");
         }
         // Top-level keys stay in their order.
@@ -650,22 +696,47 @@ mod tests {
 
     #[test]
     fn only_a_roomler_hive_hook_is_ours() {
-        assert!(ours(
-            &json!({"command": "/usr/bin/roomler", "args": ["hive", "hook"]})
-        ));
-        assert!(ours(
-            &json!({"command": "/usr/bin/roomlerd", "args": ["cli", "hive", "hook"]})
-        ));
-        assert!(!ours(
-            &json!({"command": "/usr/bin/roomler", "args": ["peers"]})
-        ));
-        assert!(!ours(
-            &json!({"command": "/usr/bin/other", "args": ["hive", "hook"]})
-        ));
+        let c = |s: &str| json!({ "type": "command", "command": s });
+        assert!(ours(&c("'/usr/bin/roomler' hive hook")));
+        assert!(ours(&c("'/usr/bin/roomlerd' cli hive hook")));
+        assert!(ours(&c("/usr/local/bin/roomler hive hook")));
         assert!(
-            !ours(&json!({"command": "roomler hive hook"})),
-            "shell form is not ours"
+            ours(&c("'/opt/my apps/roomler' hive hook")),
+            "a path with a space"
         );
+        assert!(!ours(&c("'/usr/bin/roomler' peers")));
+        assert!(!ours(&c("'/usr/bin/other' hive hook")));
+        assert!(
+            !ours(&c("'/usr/bin/roomler' hive hook; rm -rf ~")),
+            "anything more is someone else's"
+        );
+        assert!(
+            !ours(&json!({"command": "/usr/bin/roomler", "args": ["hive", "hook"]})),
+            "exec form was never written"
+        );
+    }
+
+    /// The entry runs the very binary, quoted, whatever its path holds: a
+    /// `roomlerd` reached with no arguments would run the daemon.
+    #[test]
+    fn the_entry_is_one_command_line_for_this_binary() {
+        let h = HookCommand::for_binary("/opt/it's here/roomlerd", true);
+        assert_eq!(h.command, r"'/opt/it'\''s here/roomlerd' cli hive hook");
+        let (program, rest) = first_word(&h.command);
+        assert_eq!(program, "/opt/it's here/roomlerd");
+        assert_eq!(
+            rest.split_whitespace().collect::<Vec<_>>(),
+            ["cli", "hive", "hook"]
+        );
+        assert!(ours(&h.handler(true)));
+        let v = h.handler(false);
+        assert!(v.get("args").is_none(), "never exec form: {v}");
+        assert_eq!(v["timeout"], json!(HOOK_TIMEOUT_SECS));
+        assert!(
+            v.get("async").is_none(),
+            "SessionEnd runs in the foreground"
+        );
+        assert_eq!(h.handler(true)["async"], json!(true));
     }
 
     #[test]
