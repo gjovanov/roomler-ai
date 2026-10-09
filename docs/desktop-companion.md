@@ -461,6 +461,12 @@ after a reload.
 On macOS and Linux the companion IS the "Being viewed by …" indicator (Windows draws its own,
 in the daemon, `indicator/win.rs`). P9 gives it the Windows badge's manners:
 
+⚠️ **Only where the companion can reach its daemon.** On a Linux **system** install the
+daemon's LocalAPI is root-only (`/var/run/roomler`, 0700, and the socket 0600). The companion
+runs as the desktop user and reads "Service offline". There is then no banner and no
+Disconnect, and on Wayland no companion consent prompt either (measured 2026-10-09; #1911).
+A per-user install, and a supervised Mac through its worker (FR-43), do not have this problem.
+
 | | Behaviour | Where |
 |---|---|---|
 | Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:112`, `:331` |
