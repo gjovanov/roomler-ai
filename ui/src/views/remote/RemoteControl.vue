@@ -755,13 +755,20 @@
           This agent is currently offline. The session will fail until the agent
           reconnects.
         </p>
+        <!-- Not offered right after the person at the device ended the session:
+             their Disconnect is an explicit "stop", and the next step offered is
+             Reconnect, which asks them again. Break-glass stays available from a
+             fresh page, with its reason, audit and owner notice (operator,
+             2026-10-10). -->
         <v-btn
+          v-if="rc.endedBy.value !== 'host'"
           variant="text"
           size="small"
           color="warning"
           class="mt-3"
           prepend-icon="mdi-shield-key-outline"
           :disabled="!canConnect"
+          data-testid="rc-force-control"
           @click="forceDialogOpen = true"
         >
           Force control (admin break-glass)
