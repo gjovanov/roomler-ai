@@ -47,7 +47,7 @@ pub mod gpu_clock;
 /// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
 /// Linux only in P0: elsewhere the feature compiles nothing and the build
 /// does not advertise `hive`, so no server sends it a session.
-#[cfg(all(feature = "hive", target_os = "linux"))]
+#[cfg(hive_host)]
 pub mod hive;
 /// #1740 — a closed ICE agent (the vendored `webrtc-ice`) leaves nothing
 /// running behind it; black-box over the agent this daemon's sessions use.

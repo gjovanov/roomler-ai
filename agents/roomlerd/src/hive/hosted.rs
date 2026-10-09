@@ -78,6 +78,13 @@ pub(crate) struct HostedSession {
     pub resumed_at: Option<u64>,
     #[serde(default)]
     pub quick_resumes: u32,
+    /// P1h — the harness this daemon launched, by pid and [`super::procs::started`]:
+    /// how the next daemon tells a harness a crash left running from
+    /// whatever has its pid now. Absent in a file from before P1h.
+    #[serde(default)]
+    pub harness_pid: Option<u32>,
+    #[serde(default)]
+    pub harness_started: Option<String>,
 }
 
 /// A turn in progress.
@@ -242,6 +249,8 @@ mod tests {
             approvals: Vec::new(),
             resumed_at: None,
             quick_resumes: 0,
+            harness_pid: None,
+            harness_started: None,
         }
     }
 
