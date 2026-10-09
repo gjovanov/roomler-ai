@@ -757,6 +757,7 @@ sequenceDiagram
     participant S as hub (server)
     participant V as viewer (browser)
     H->>A: Disconnect (badge / banner over LocalAPI)
+    A->>A: peer.stop_serving() — no input, clipboard, files or frames
     A->>S: rc:terminate reason=host_disconnect
     S->>V: rc:terminate reason=host_disconnect
     S->>A: rc:terminate (echo, idempotent)
@@ -776,11 +777,17 @@ session up itself and scheduled the reconnect ladder — so the audit said
 
 | step | where | what holds it |
 |---|---|---|
+| control ends **at the click**: the channel handlers let go, the media pumps stop, and the input arbiter forgets the session (its next event is denied, anything it holds is released); no channel closes, so the browser sees nothing yet | `AgentPeer::stop_serving`, called by the `kill_rx` arm before it speaks; `close` repeats it | — |
 | the agent says it **first** | the `kill_rx` arm; on a supervised Mac through the delegation link, like the session's answer | `a_host_disconnect_terminates_as_host_disconnect` |
 | the hub forwards it to the controller **before** echoing it to the agent, and audits `SessionEnded { HostDisconnect }` | `Hub::terminate` | — |
 | only the **device** may claim it: a controller's `host_disconnect` is recorded as `controller_hangup` | the hub's `rc:terminate` arm | `host_disconnect_is_the_devices_claim_only` |
 | the viewer closes as "ended by the host", cancels the ladder, drops its replay args, then tears the peer down with the phase already `closed`, so the control DC's `onclose` stays quiet | `useRemoteControl.ts`, the `rc:terminate` handler | `FR-27 P10` in `useRemoteControl.spec.ts` |
-| the peer closes after a grace, off the loop | `ROOMLERD_HOST_DISCONNECT_GRACE_MS`, default 1000, `0` = the pre-P10 timing, capped at the 5 s close budget | `host_disconnect_grace_is_bounded_and_switchable` |
+| the bare connection closes after a grace, off the loop | `ROOMLERD_HOST_DISCONNECT_GRACE_MS`, default 1000, `0` = the pre-P10 timing, capped at the 5 s close budget | `host_disconnect_grace_is_bounded_and_switchable` |
+
+⚠️ The grace holds the **transport**, never the session's powers. A grace
+that kept the peer serving would hand the controller up to a second more of
+the machine its owner had just taken back, so the arm stops serving first and
+only the connection waits for the viewer to hear why.
 
 Ordinary drops are untouched: `agent_disconnect` and `error` still
 re-create the session, as do a failed peer and a control channel that closes
@@ -1542,9 +1549,10 @@ to-activate, so the browser never sees a bait-and-switch.
   auto-hiding ~2.5 s after the pointer leaves — shows the controller's
   **initials avatar + display name** and a **Disconnect** button.
   Clicking Disconnect sends the session's `ObjectId` through an
-  in-process channel to the signaling `select!`, which emits
-  `ClientMsg::Terminate {reason: HostDisconnect}` FIRST and closes the
-  peer after a grace (FR-27 P10, §11.5 — before P10 it closed first and
+  in-process channel to the signaling `select!`, which stops serving the
+  session at once (`AgentPeer::stop_serving`: no more input, clipboard,
+  files or frames), emits `ClientMsg::Terminate {reason: HostDisconnect}`
+  and closes the bare peer after a grace (FR-27 P10, §11.5 — before P10 it closed first and
   said `AgentHangup` after, and the viewer reconnected); the server
   tears the session down, notifies the browser, and echoes `Terminate`
   back (the agent handler is idempotent). The overlay label is the

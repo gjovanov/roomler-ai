@@ -1926,6 +1926,13 @@ async fn connect_once(
                 // wait for the controller to come back (a drop does wait).
                 #[cfg(feature = "recording")]
                 crate::recording::remote::host_ended(sid);
+                // Control ends at the click, not after the grace: no input,
+                // clipboard, files or frames from here on, while the bare
+                // connection waits for the viewer to hear why.
+                let peer = peers.remove(&sid);
+                if let Some(peer) = &peer {
+                    peer.stop_serving();
+                }
                 // A delegated session (a supervised Mac) speaks through the
                 // daemon's WS, the way its answer and its ICE did.
                 let grace = match reply_for_session(
@@ -1950,7 +1957,7 @@ async fn connect_once(
                     grace_ms = grace.as_millis() as u64,
                     "host disconnect: told the server; the peer closes after the grace"
                 );
-                if let Some(peer) = peers.remove(&sid) {
+                if let Some(peer) = peer {
                     tokio::spawn(async move {
                         tokio::time::sleep(grace).await;
                         close_within_budget(peer.close(), sid, "host_disconnect").await;

@@ -505,7 +505,8 @@ before P9) and `ROOMLER_DESKTOP_FRAME=0` (no frame).
 
 The banner's **Disconnect** ends every live session (`panel-viewing.js` sends one
 LocalAPI `RcDisconnect` per session, `cmd_rc_disconnect`) — and since P10 it ends them
-**for good**: the daemon tells the server `host_disconnect` before it closes the peer,
+**for good**: control ends at the click (no more input, clipboard, files or frames),
+the daemon tells the server `host_disconnect` before it closes the peer,
 the viewer is told "The person at the device ended the session." and stays
 disconnected, and coming back is an explicit Reconnect on the viewer's side, through
 consent like any new session. Before P10 the viewer read the closed peer as an ordinary

@@ -214,10 +214,17 @@ first**: `ClientMsg::Terminate { reason: HostDisconnect }` — a new `EndReason`
 wire `host_disconnect` (`models.rs`) — goes out before anything closes; on a
 supervised Mac (FR-43) it rides the delegation link the session's answer and
 ICE took (`reply_for_session`), so the worker speaks through the daemon's WS.
-The peer is then closed in a task of its own after a grace
+Control ends at the click, before the frame goes out: `AgentPeer::stop_serving`
+lets the channel handlers go, stops the media pumps and removes the session
+from the input arbiter, so its next event is denied and anything it holds is
+released. No channel closes, so the browser has nothing to react to yet. Only
+the bare connection then waits, closed in a task of its own after a grace
 (`ROOMLERD_HOST_DISCONNECT_GRACE_MS`, default 1000 ms, capped at the close
 budget; a failed send closes at once — nothing to wait for on a dead WS). The
-banner comes down immediately; the stream is dead within the grace.
+banner comes down immediately. ⚠️ The grace holds the transport, never the
+session's powers: the first cut kept the peer serving through it, which handed
+the controller up to a second more of the machine its owner had just taken back
+(found in self-review before merge).
 
 **How it crosses the wire.** `rc:terminate`, unchanged: no new wire name, no
 route, the composition baseline is untouched. The hub passes the reason through
