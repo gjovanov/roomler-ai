@@ -3863,6 +3863,16 @@ async fn run_cmd(
     #[cfg(not(unix))]
     let _ = supervised;
 
+    // FR-27 P11 — on a Linux system install, the person at the seat gets a
+    // socket of their own for the safety surface (who is viewing, Disconnect,
+    // consent): the daemon's own socket is root-only. Inert for a per-user
+    // daemon and with ROOMLERD_PERSON_SOCKET=0; exits on the shutdown watch.
+    #[cfg(target_os = "linux")]
+    let _person_socket_task = tokio::spawn(roomlerd::person_socket::run(
+        localapi_state.clone(),
+        shutdown_rx.clone(),
+    ));
+
     // FR-84 D1 — the named-pipe listener pool. `localapi_pipe_pool = 1` is
     // the pre-FR-84 single instance (the kill switch); unset = 4.
     let localapi_pipe_pool = tunnel_core::localapi::effective_pipe_pool(cfg.localapi_pipe_pool);

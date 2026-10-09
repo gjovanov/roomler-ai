@@ -222,6 +222,25 @@ healthy** — the live daemon is an unmanaged orphan. Check `pgrep -x roomlerd` 
 ⚠️ The per-host `roomlerd.service.d/config-path.conf` drop-ins used as the stopgap
 are unnecessary from rc.435 and should be removed.
 
+### The desktop user and a root daemon (FR-27 P11)
+
+A root daemon's own socket, `/var/run/roomler/roomler.sock`, is root-only. So
+`sudo roomler …` is how you administer it, and before P11 a plain `roomler …` as the
+desktop user failed with `Permission denied (os error 13)`.
+
+From P11 the daemon also gives the person at the seat a **person socket** in their
+runtime dir: `/run/user/<uid>/roomler.sock`, 0600 and theirs. Their companion uses
+it, which is how a system install gets its "Being viewed by …" banner, its
+Disconnect and its consent prompt. As that user:
+- `roomler status` answers;
+- anything administrative (`peers`, routes, `config`, …) is refused with a pointer
+  to `sudo roomler …`.
+
+The socket follows the active graphical session, so there is none over SSH or at the
+login screen. Turn it off with `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service`
+drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
+[security baseline](security-baseline.md) §4.
+
 ## macOS
 
 > **Requires macOS 15 (Sequoia) or later, on Apple silicon (arm64).** The
