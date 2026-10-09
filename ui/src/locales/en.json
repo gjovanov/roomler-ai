@@ -232,6 +232,7 @@
       "loadEarlier": "Load earlier",
       "empty": "Nothing in this session yet.",
       "someone": "Someone",
+      "inTerminal": "In the terminal",
       "thinking": "Thinking",
       "truncated": "The output was cut to the device's limit; its start and end are kept.",
       "turnDone": "Turn done",
