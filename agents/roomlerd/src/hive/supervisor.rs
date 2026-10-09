@@ -23,8 +23,10 @@
 //! socket is lost and the server would otherwise show a stale state forever.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -36,16 +38,27 @@ use roomler_ai_remote_control::hive::{
     HiveTurnStatus, hive_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
+#[cfg(unix)]
+use roomler_hive_node::launch::unix_base_env;
 use roomler_hive_node::launch::{
     APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, attributed_prompt,
-    toolbelt_mcp_config, unix_base_env, user_input_line,
+    toolbelt_mcp_config, user_input_line,
 };
 use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_hive_node::{TranscriptEvent, approval_outcome};
 use roomler_node_core::config::AgentConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, mpsc};
+
+/// P1i-2 — on Windows a harness is a [`crate::hive_win::HarnessChild`]: started
+/// into its Job Object as the console user, with the part of tokio's `Child`
+/// the session task uses, its stdin an async file over the pipe.
+#[cfg(windows)]
+use crate::hive_win::HarnessChild as Child;
+#[cfg(windows)]
+type ChildStdin = tokio::fs::File;
 use tracing::{debug, info, warn};
 
 use super::gates::{self, HiveConfig};
@@ -73,6 +86,10 @@ const MAX_WAITING: usize = INPUT_QUEUE / 2;
 /// copied in AS THE ACCOUNT, and only when nothing is there yet — so a
 /// resume keeps what the session has (its own edits included). A copy that
 /// fails is skipped: memory never stops a session.
+///
+/// P1i-2 — on Windows `roomlerd hive-prep` does this, run as the console user
+/// ([`crate::hive_win::prep`]); the harness's folder is its working directory.
+#[cfg(unix)]
 const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then if [ -f "$3/CLAUDE.md" ] && [ ! -e "$1/CLAUDE.md" ] && [ ! -L "$1/CLAUDE.md" ]; then cp -- "$3/CLAUDE.md" "$1/CLAUDE.md" 2>/dev/null; fi; if [ -f "$3/MEMORY.md" ] && [ ! -e "$4/MEMORY.md" ] && [ ! -L "$4/MEMORY.md" ]; then mkdir -p -- "$4" 2>/dev/null && cp -- "$3/MEMORY.md" "$4/MEMORY.md" 2>/dev/null; fi; fi; true; } && cd -- "$2" && shift 4 && exec "$@""#;
 /// Each session's runtime files (settings, MCP config, toolbelt socket, core
 /// memory): the daemon's own, cleared at boot.
@@ -80,6 +97,16 @@ const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then
 const RUNTIME_DIR: &str = tunnel_core::localapi::hive_adopt::RUNTIME_DIR_LINUX;
 #[cfg(target_os = "macos")]
 const RUNTIME_DIR: &str = tunnel_core::localapi::hive_adopt::RUNTIME_DIR_MACOS;
+
+/// The runtime root this daemon writes each session's files under. On Windows
+/// (P1i-2) under the daemon's machine-global directory, where nothing clears
+/// it at boot: each launch gives its session's directory its DACL again.
+fn runtime_root() -> PathBuf {
+    #[cfg(unix)]
+    return PathBuf::from(RUNTIME_DIR);
+    #[cfg(windows)]
+    return crate::hive_win::runtime_root();
+}
 /// P1h — how long the daemon gives its harnesses to exit on SIGTERM when it
 /// leaves ([`wind_down`]) before SIGKILL: within the 5 s a service manager
 /// usually waits for a stop.
@@ -247,7 +274,7 @@ struct Report {
 #[derive(Debug, Clone)]
 enum Launcher {
     AsMappedAccount,
-    #[cfg(any(test, feature = "hive-test-launcher"))]
+    #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
     AsDaemon {
         home: PathBuf,
     },
@@ -408,7 +435,7 @@ pub fn init(cfg: &AgentConfig) {
     };
     let sup = Supervisor::new(
         hive,
-        PathBuf::from(RUNTIME_DIR),
+        runtime_root(),
         Launcher::AsMappedAccount,
         store,
         hosted,
@@ -468,7 +495,7 @@ pub fn adopt_enabled() -> bool {
 /// enables — and even then refused when the daemon is root, so this can
 /// never be how a session comes to run as root. One per process, like
 /// [`init`]: a test that needs it gets a test binary of its own.
-#[cfg(feature = "hive-test-launcher")]
+#[cfg(all(unix, feature = "hive-test-launcher"))]
 pub fn init_as_daemon(
     cfg: &AgentConfig,
     store: &Path,
@@ -503,9 +530,15 @@ pub fn global() -> Option<Arc<Supervisor>> {
 /// `Ok(None)` when `wanted` says this daemon keeps no store, and then
 /// nothing is created (P1h-2).
 fn store_path(wanted: impl FnOnce(&Path) -> bool) -> Result<Option<PathBuf>, String> {
+    #[cfg(unix)]
     let dir = roomler_node_core::appdirs::project_dirs()
         .map(|p| p.data_local_dir().join("hive"))
         .ok_or("no data directory for the replica store")?;
+    // P1i-2 — on Windows the service's machine-wide directory, which both of
+    // its workers reach (SYSTEM, and the console user elevated), so the worker
+    // a controller's arrival swaps in finds what the last one kept.
+    #[cfg(windows)]
+    let dir = crate::hive_win::store_dir();
     let file = dir.join("hive.db");
     if !wanted(&file) {
         return Ok(None);
@@ -524,6 +557,7 @@ fn store_wanted(hive: &HiveConfig, store_exists: bool) -> bool {
 
 /// Create `dir` if missing and lock it to the daemon's account. A link
 /// anywhere on the path is refused, never followed.
+#[cfg(unix)]
 fn private_dir(dir: &Path) -> Result<(), String> {
     if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
         return Err(format!("{} is a symbolic link", link.display()));
@@ -531,6 +565,17 @@ fn private_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// P1i-2 — on Windows: a protected DACL of SYSTEM and Administrators, set as
+/// the directory is made (or again, on one already there), which is what
+/// `0700` is for a daemon that runs as SYSTEM.
+#[cfg(windows)]
+fn private_dir(dir: &Path) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    crate::hive_win::dir_with_dacl(dir, crate::hive_win::PRIVATE_DIR_SDDL)
 }
 
 /// `rc:hive.start` — answered on `tx`, the connection that asked, from a task
@@ -1541,7 +1586,7 @@ impl Supervisor {
     }
 
     /// Tests only: a mock provider, and a shorter `offline_grace`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_sidecar(mut self, upstream: String, offline_grace: Duration) -> Self {
         self.upstream = upstream;
         self.offline_grace = offline_grace;
@@ -1549,7 +1594,7 @@ impl Supervisor {
     }
 
     /// Tests only: an approval that expires in a test's lifetime.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_approval_timing(mut self, timing: toolbelt::Timing) -> Self {
         self.approval_timing = timing;
         self
@@ -1767,6 +1812,7 @@ impl Supervisor {
     /// the sidecar, also the model token this run holds; and the session's
     /// toolbelt, bound before the harness starts because the harness
     /// connects to it as it starts.
+    #[cfg(unix)]
     fn spawn(
         &self,
         order: &StartOrder,
@@ -1788,7 +1834,7 @@ impl Supervisor {
                 groups.push(gid);
                 (home, Some((uid, gid)), uid, Some(groups))
             }
-            #[cfg(any(test, feature = "hive-test-launcher"))]
+            #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
             Launcher::AsDaemon { home } => {
                 // SAFETY: getuid reads our own credentials.
                 (home.clone(), None, unsafe { libc::getuid() }, None)
@@ -1925,7 +1971,7 @@ impl Supervisor {
                 crate::exec::apply_run_as(&mut cmd, &crate::exec::RunAs::Named(account.to_string()))
                     .map_err(|e| (HiveRefusal::NoAccount, e))?
             }
-            #[cfg(any(test, feature = "hive-test-launcher"))]
+            #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
             Launcher::AsDaemon { .. } => {}
         }
         // The session's token, never the provider's key: good for this
@@ -1956,10 +2002,161 @@ impl Supervisor {
             }
         }
     }
+
+    /// P1i-2 — the same on Windows, as the user signed in at the console, whom
+    /// `account` must name (D2: nobody else, never SYSTEM). `roomlerd
+    /// hive-prep` does the wrapper's work as that user first. The harness then
+    /// starts SUSPENDED into a Job Object of its own and is resumed only once
+    /// it is in it, with the folder as its working directory.
+    #[cfg(windows)]
+    fn spawn(
+        &self,
+        order: &StartOrder,
+        account: &str,
+        folder: &Path,
+        sidecar: Option<u16>,
+        approvals: mpsc::Sender<ApprovalEvent>,
+        memory: Option<&CoreMemory>,
+    ) -> Result<Spawned, (HiveRefusal, String)> {
+        use crate::hive_win;
+        use crate::win_service::supervisor::{JobObject, spawn_into_job};
+        let failed = |what: &str, e: String| (HiveRefusal::LaunchFailed, format!("{what}: {e}"));
+        // The one way on Windows: as the console user. `console` holds the
+        // user's token, which `who` only borrows, until both processes run.
+        let Launcher::AsMappedAccount = &self.launcher;
+        let console = hive_win::console_user()?;
+        hive_win::check_mapping(account, &console)?;
+        let who = console.spawn_as();
+        let (home, peer, appdata) = (
+            console.profile.clone(),
+            console.sid.clone(),
+            console.appdata.clone(),
+        );
+        let harness =
+            hive_win::resolve_harness(self.cfg.harness.as_deref(), &home, appdata.as_deref())
+                .ok_or_else(|| {
+                    (
+                        HiveRefusal::HarnessMissing,
+                        "Claude Code was not found (set hive_harness, or install it with its \
+                         native installer, into %USERPROFILE%\\.local\\bin, or with npm)"
+                            .to_string(),
+                    )
+                })?;
+        let sid = order.session_id.to_hex();
+        let dir = self.runtime.join(&sid);
+        session_dir(&self.runtime, &dir, &peer)
+            .map_err(|e| failed("the session's runtime directory", e))?;
+        let settings = write_settings(&self.runtime, &sid)
+            .map_err(|e| failed("writing the session settings", e))?;
+        let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        let toolbelt = toolbelt::open(peer, order.session_id, approvals, self.approval_timing)
+            .map_err(|e| failed("opening the session's toolbelt", e))?;
+        let mcp = toolbelt_mcp_config(
+            &relay,
+            &[
+                toolbelt::RELAY_SUBCOMMAND.to_string(),
+                toolbelt.socket().to_string_lossy().into_owned(),
+            ],
+            toolbelt::TOOL_TIMEOUT_MS,
+        );
+        let mcp_config = write_doc(&dir, "mcp.json", &mcp)
+            .map_err(|e| failed("writing the session's MCP config", e))?;
+        let mut spec = LaunchSpec {
+            session: order.harness_session.clone(),
+            harness,
+            folder: folder.to_path_buf(),
+            state_dir: home.join(".roomler").join("hive").join(&sid),
+            settings,
+            mcp_config: Some(mcp_config),
+            sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
+            resume: order.resume,
+            permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
+            permission_mode: Some(PERMISSION_MODE.to_string()),
+            disallowed_tools: DISALLOWED_TOOLS.iter().map(|t| t.to_string()).collect(),
+        };
+        spec.validate()
+            .map_err(|e| (HiveRefusal::LaunchFailed, e.to_string()))?;
+        spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
+        let line = hive_win::harness_command_line(&spec.harness, &spec.args())
+            .map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        let memory_dir = memory.and_then(|m| match write_memory(&dir, m, None) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!(session = %order.session_id, %e, "hive: core memory not written — the session starts without it");
+                None
+            }
+        });
+        // The wrapper's work, as the user: the config directory, the memory
+        // copied in, the folder opened.
+        let prep = hive_win::PrepArgs {
+            config_dir: spec.config_dir(),
+            folder: spec.folder.clone(),
+            memory_dir,
+            auto_memory_dir: spec.auto_memory_dir(),
+        }
+        .command_line(Path::new(&relay))
+        .map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        // SAFETY: `console` holds the token `who` names, across the call.
+        let prepared =
+            blocking(|| unsafe { hive_win::run_prep(who, &prep, hive_win::PREP_TIMEOUT) });
+        prepared.map_err(|e| failed("preparing the session as its account", e))?;
+        let job = JobObject::kill_on_close()
+            .map_err(|e| failed("making the harness's job", format!("{e:#}")))?;
+        let token = sidecar.map(|_| self.tokens.mint(order.session_id, order.fence));
+        let mut env = spec.env_overrides();
+        if let Some(token) = &token {
+            env.push(("ANTHROPIC_API_KEY".into(), token.into()));
+        }
+        // SAFETY: `console` holds the token `who` names, across the call.
+        let started = unsafe { spawn_into_job(who, &line, Some(&spec.folder), &env, true, &job) };
+        drop(console);
+        match started {
+            Ok(child) => Ok(Spawned {
+                child: hive_win::HarnessChild::new(child, job),
+                token,
+                toolbelt,
+                history: spec.resume,
+            }),
+            Err(e) => {
+                if let Some(token) = &token {
+                    self.tokens.revoke(token);
+                }
+                Err(failed("starting the harness", format!("{e:#}")))
+            }
+        }
+    }
+}
+
+/// P1i-2 — run `f`, which blocks for as long as a short preparation takes,
+/// without stalling the other tasks of a multi-thread runtime.
+#[cfg(windows)]
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// P1i-2 — a session's runtime directory on Windows, under a root that is
+/// SYSTEM's and Administrators' alone; the session's own directory is also
+/// readable by its account (`peer`). Each launch gives each its DACL again.
+#[cfg(windows)]
+fn session_dir(runtime: &Path, dir: &Path, peer: &str) -> Result<(), String> {
+    use crate::hive_win::{PRIVATE_DIR_SDDL, dir_with_dacl, session_dir_sddl};
+    if let Some(hive) = runtime.parent() {
+        if let Some(base) = hive.parent() {
+            std::fs::create_dir_all(base).map_err(|e| format!("{}: {e}", base.display()))?;
+        }
+        dir_with_dacl(hive, PRIVATE_DIR_SDDL)?;
+    }
+    dir_with_dacl(runtime, PRIVATE_DIR_SDDL)?;
+    dir_with_dacl(dir, &session_dir_sddl(peer))
 }
 
 /// `hive_harness`, or the first default location that holds an executable
 /// file.
+#[cfg(unix)]
 fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = match &cfg.harness {
         Some(h) => vec![h.clone()],
@@ -1981,8 +2178,12 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
 
 /// `<runtime>/<sid>/settings.json`, daemon-owned: readable by the session,
 /// writable by nobody else. A link on the way is refused, never followed.
+///
+/// On Windows both directories are made first, each with its DACL
+/// ([`session_dir`]), and the file takes the session directory's.
 fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
+    #[cfg(unix)]
     for d in [runtime, dir.as_path()] {
         match std::fs::symlink_metadata(d) {
             Ok(m) if !m.file_type().is_dir() => {
@@ -2013,6 +2214,7 @@ fn write_doc(dir: &Path, name: &str, doc: &serde_json::Value) -> Result<PathBuf,
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}.tmp"));
     std::fs::write(&tmp, doc.to_string()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
         .map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -2036,6 +2238,9 @@ fn write_memory(dir: &Path, m: &CoreMemory, owner: Option<(u32, u32)>) -> Result
         Ok(_) => {}
         Err(_) => std::fs::create_dir(&mem).map_err(|e| format!("{}: {e}", mem.display()))?,
     }
+    // On Windows it takes the session directory's DACL: the daemon's, and
+    // readable by the session's account alone.
+    #[cfg(unix)]
     std::fs::set_permissions(&mem, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("{}: {e}", mem.display()))?;
     for (name, body) in [("CLAUDE.md", &m.claude_md), ("MEMORY.md", &m.memory_md)] {
@@ -2064,7 +2269,6 @@ fn write_private_text(
     owner: Option<(u32, u32)>,
 ) -> Result<PathBuf, String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}.tmp"));
     let failed = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
@@ -2073,18 +2277,27 @@ fn write_private_text(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(failed(&tmp, e)),
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| failed(&tmp, e))?;
-    f.write_all(text.as_bytes()).map_err(|e| failed(&tmp, e))?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| failed(&tmp, e))?;
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(|e| failed(&tmp, e))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts.open(&tmp).map_err(|e| failed(&tmp, e))?;
+    f.write_all(text.as_bytes()).map_err(|e| failed(&tmp, e))?;
+    #[cfg(unix)]
+    {
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| failed(&tmp, e))?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(|e| failed(&tmp, e))?;
+        }
+    }
+    // On Windows the directory's DACL is the handover: the file is the
+    // daemon's, and readable by the session's account alone.
+    #[cfg(windows)]
+    let _ = owner;
     drop(f);
     std::fs::rename(&tmp, &path).map_err(|e| failed(&path, e))?;
     Ok(path)
@@ -2124,6 +2337,7 @@ fn memory_note(m: &CoreMemory, shown: bool) -> String {
 /// the entry, else the group's when one of its groups does, else everyone's;
 /// the kernel's order. (A POSIX ACL that grants more is not read: refusing a
 /// start it would have allowed is the safe mistake.)
+#[cfg(unix)]
 fn executable_by(path: &Path, uid: u32, groups: &[u32]) -> bool {
     use std::os::unix::fs::MetadataExt;
     let mut entry = Some(path);
@@ -2660,7 +2874,7 @@ fn unix_now() -> u64 {
 }
 
 /// The last [`STDERR_TAIL`] characters a harness wrote to stderr, on one line.
-async fn read_stderr_tail(session: ObjectId, err: tokio::process::ChildStderr) -> String {
+async fn read_stderr_tail(session: ObjectId, err: impl AsyncRead + Unpin) -> String {
     let mut buf = Vec::new();
     let _ = err.take(1024 * 1024).read_to_end(&mut buf).await;
     let text = String::from_utf8_lossy(&buf);
@@ -2693,6 +2907,7 @@ async fn reap_leftover(h: &HostedSession) {
 }
 
 /// SIGTERM to the harness's process group, then SIGKILL after the grace.
+#[cfg(unix)]
 async fn terminate(child: &mut Child) {
     if let Some(pid) = child.id() {
         // SAFETY: a plain syscall on a pid this task owns; the negative pid
@@ -2713,6 +2928,19 @@ async fn terminate(child: &mut Child) {
     }
 }
 
+/// P1i-2 — on Windows no signal reaches a console-less harness. Its stdin is
+/// closed already, which ends a stream-json harness; one still there after
+/// the grace is ended with everything in its job.
+#[cfg(windows)]
+async fn terminate(child: &mut Child) {
+    if tokio::time::timeout(STOP_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+    }
+}
+
 /// The `ended` detail, which the SERVER stores and posts in the session's
 /// room: how the harness ended, never what it said — `said` only points at
 /// the transcript, where its last words are.
@@ -2721,11 +2949,18 @@ fn describe_end(
     status: Option<std::process::ExitStatus>,
     said: bool,
 ) -> String {
-    use std::os::unix::process::ExitStatusExt;
+    #[cfg(unix)]
+    let signal = |s: std::process::ExitStatus| {
+        use std::os::unix::process::ExitStatusExt;
+        s.signal()
+    };
+    // A Windows process always ends with a code, ended or not.
+    #[cfg(windows)]
+    let signal = |_: std::process::ExitStatus| None::<i32>;
     if let Some(reason) = stopped {
         return format!("stopped ({reason})");
     }
-    let mut detail = match status.map(|s| (s.code(), s.signal())) {
+    let mut detail = match status.map(|s| (s.code(), signal(s))) {
         Some((Some(0), _)) => return "the harness exited".into(),
         Some((Some(c), _)) => format!("the harness exited with code {c}"),
         Some((None, Some(sig))) => format!("the harness was killed by signal {sig}"),
@@ -2737,7 +2972,7 @@ fn describe_end(
     detail.chars().take(hive_limits::MAX_DETAIL_LEN).collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
 

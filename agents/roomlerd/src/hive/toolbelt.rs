@@ -17,6 +17,11 @@
 //! is deliberately not the LocalAPI socket: on a root daemon that one is
 //! root-only, and most of its verbs trust the socket alone.
 //!
+//! On Windows (P1i-2) it is a named pipe, `\\.\pipe\roomler-hive-<session>-<nonce>`,
+//! whose DACL admits SYSTEM and Administrators (the daemon is one or the
+//! other) and the session's account by SID, to read and write only, and whose
+//! clients' accounts are checked again by SID.
+//!
 //! # An approval
 //!
 //! `tools/call approve {tool_name, input, tool_use_id}` opens an approval:
@@ -47,6 +52,9 @@ use anyhow::Context as _;
 use bson::oid::ObjectId;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -73,6 +81,7 @@ const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 /// The relay's subcommand: `roomlerd hive-mcp <socket>`.
 pub const RELAY_SUBCOMMAND: &str = "hive-mcp";
+#[cfg(unix)]
 const SOCKET: &str = "toolbelt.sock";
 /// The MCP versions this server answers in. It uses `initialize`,
 /// `tools/list`, `tools/call`, `ping` and two notifications, which read the
@@ -189,11 +198,18 @@ impl Default for Timing {
     }
 }
 
+/// The one account a connection is taken from, the session's: its uid on
+/// Unix, its SID string on Windows (P1i-2).
+#[cfg(unix)]
+pub(crate) type PeerId = u32;
+#[cfg(windows)]
+pub(crate) type PeerId = String;
+
 /// What every connection of one session's toolbelt shares.
 struct Ctx {
     session: ObjectId,
-    /// The only uid a connection is taken from: the session's account.
-    uid: u32,
+    /// The only account a connection is taken from: the session's.
+    peer: PeerId,
     pending: Arc<Pending>,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
@@ -203,6 +219,7 @@ struct Ctx {
 /// that ends both. Dropping it is the shutdown — the session task owns it,
 /// so the toolbelt ends exactly when the session does.
 pub(crate) struct Toolbelt {
+    /// The socket's path; on Windows the pipe's name (`\\.\pipe\…`).
     socket: PathBuf,
     pending: Arc<Pending>,
     stop: CancellationToken,
@@ -222,6 +239,8 @@ impl Drop for Toolbelt {
     fn drop(&mut self) {
         self.stop.cancel();
         self.pending.withdraw_all();
+        // A pipe is gone with its last instance; a socket stays a file.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -231,6 +250,7 @@ impl Drop for Toolbelt {
 /// `owner` is the account the socket is handed to (`None` keeps the
 /// daemon's, for a session that runs as the daemon — tests only); `uid` is
 /// the one peer a connection is taken from.
+#[cfg(unix)]
 pub(crate) fn open(
     dir: &Path,
     owner: Option<(u32, u32)>,
@@ -271,7 +291,7 @@ pub(crate) fn open(
     let stop = CancellationToken::new();
     let ctx = Arc::new(Ctx {
         session,
-        uid,
+        peer: uid,
         pending: Arc::clone(&pending),
         events,
         timing,
@@ -284,6 +304,7 @@ pub(crate) fn open(
     })
 }
 
+#[cfg(unix)]
 async fn serve(listener: UnixListener, ctx: Arc<Ctx>, stop: CancellationToken) {
     loop {
         let got = tokio::select! {
@@ -292,8 +313,9 @@ async fn serve(listener: UnixListener, ctx: Arc<Ctx>, stop: CancellationToken) {
         };
         match got {
             Ok((stream, _)) => match stream.peer_cred() {
-                Ok(c) if c.uid() == ctx.uid => {
-                    tokio::spawn(connection(stream, Arc::clone(&ctx), stop.child_token()));
+                Ok(c) if c.uid() == ctx.peer => {
+                    let (rd, wr) = stream.into_split();
+                    tokio::spawn(connection(rd, wr, Arc::clone(&ctx), stop.child_token()));
                 }
                 Ok(c) => warn!(
                     session = %ctx.session, uid = c.uid(),
@@ -307,6 +329,104 @@ async fn serve(listener: UnixListener, ctx: Arc<Ctx>, stop: CancellationToken) {
                 // Out of descriptors and the like: back off rather than spin.
                 warn!(session = %ctx.session, %e, "hive: the toolbelt could not accept");
                 tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// P1i-2 — one session's toolbelt on Windows: a named pipe,
+/// `\\.\pipe\roomler-hive-<session>-<nonce>`, made with
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a name someone already holds is
+/// refused, never joined. Its DACL ([`crate::hive_win::toolbelt_pipe_sddl`])
+/// admits SYSTEM and Administrators (the daemon is one or the other), and the
+/// session's account (`peer`, a SID) to read and write, and no remote client.
+/// Each client's account is checked again, as Unix checks a uid, so an
+/// administrator connecting is taken only when it is the session's account.
+#[cfg(windows)]
+pub(crate) fn open(
+    peer: PeerId,
+    session: ObjectId,
+    events: mpsc::Sender<ApprovalEvent>,
+    timing: Timing,
+) -> Result<Toolbelt, String> {
+    let name = format!(
+        r"\\.\pipe\roomler-hive-{}-{}",
+        session.to_hex(),
+        hex::encode(rand::random::<[u8; 16]>())
+    );
+    let sddl = crate::hive_win::toolbelt_pipe_sddl(&peer);
+    let first = pipe_instance(&name, &sddl, true).map_err(|e| format!("{name}: {e}"))?;
+    let pending = Arc::new(Pending::default());
+    let stop = CancellationToken::new();
+    let ctx = Arc::new(Ctx {
+        session,
+        peer,
+        pending: Arc::clone(&pending),
+        events,
+        timing,
+    });
+    tokio::spawn(serve_pipe(first, name.clone(), sddl, ctx, stop.clone()));
+    Ok(Toolbelt {
+        socket: PathBuf::from(name),
+        pending,
+        stop,
+    })
+}
+
+/// One listening instance of a toolbelt's pipe.
+#[cfg(windows)]
+fn pipe_instance(name: &str, sddl: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+    let mut sd = crate::hive_win::Sddl::new(sddl)?;
+    // SAFETY: the attributes live in `sd` across the call, and the system
+    // copies the descriptor into the instance.
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name, sd.attributes().cast())
+    }
+}
+
+#[cfg(windows)]
+async fn serve_pipe(
+    mut server: NamedPipeServer,
+    name: String,
+    sddl: String,
+    ctx: Arc<Ctx>,
+    stop: CancellationToken,
+) {
+    use std::os::windows::io::AsRawHandle;
+    loop {
+        let got = tokio::select! {
+            _ = stop.cancelled() => return,
+            got = server.connect() => got,
+        };
+        // The next instance before this client is looked at, so a second
+        // connection always finds one listening.
+        let next = match pipe_instance(&name, &sddl, false) {
+            Ok(next) => next,
+            Err(e) => {
+                warn!(session = %ctx.session, %e, "hive: the toolbelt pipe takes no more connections");
+                return;
+            }
+        };
+        let client = std::mem::replace(&mut server, next);
+        if let Err(e) = got {
+            warn!(session = %ctx.session, %e, "hive: the toolbelt could not accept");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        match crate::hive_win::pipe_client_sid(client.as_raw_handle() as _) {
+            Ok(sid) if sid == ctx.peer => {
+                let (rd, wr) = tokio::io::split(client);
+                tokio::spawn(connection(rd, wr, Arc::clone(&ctx), stop.child_token()));
+            }
+            Ok(sid) => warn!(
+                session = %ctx.session, %sid,
+                "hive: a toolbelt connection from another account — refused"
+            ),
+            Err(e) => {
+                warn!(session = %ctx.session, %e, "hive: a toolbelt peer could not be identified — refused")
             }
         }
     }
@@ -358,8 +478,12 @@ fn initialize(params: &Value) -> Value {
 /// name one.
 type Calls = Arc<Mutex<HashMap<String, CancellationToken>>>;
 
-async fn connection(stream: UnixStream, ctx: Arc<Ctx>, stop: CancellationToken) {
-    let (rd, mut wr) = stream.into_split();
+async fn connection(
+    rd: impl AsyncRead + Unpin + Send + 'static,
+    mut wr: impl AsyncWrite + Unpin + Send + 'static,
+    ctx: Arc<Ctx>,
+    stop: CancellationToken,
+) {
     let (out, mut outbox) = mpsc::channel::<String>(64);
     let writer = tokio::spawn(async move {
         while let Some(line) = outbox.recv().await {
@@ -660,18 +784,54 @@ pub async fn relay(socket: &Path) -> anyhow::Result<()> {
     relay_io(socket, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
+/// The toolbelt's two halves for a client (the relay, a test): the socket.
+#[cfg(unix)]
+pub(crate) async fn connect(
+    socket: &Path,
+) -> std::io::Result<(
+    tokio::net::unix::OwnedReadHalf,
+    tokio::net::unix::OwnedWriteHalf,
+)> {
+    Ok(UnixStream::connect(socket).await?.into_split())
+}
+
+/// On Windows (P1i-2): the pipe, opened with exactly the access its DACL
+/// grants. The instant every instance is taken (the server makes the next one
+/// as it takes a client) is waited out, briefly.
+#[cfg(windows)]
+pub(crate) async fn connect(
+    name: &Path,
+) -> std::io::Result<(
+    tokio::io::ReadHalf<NamedPipeClient>,
+    tokio::io::WriteHalf<NamedPipeClient>,
+)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::hive_win::open_toolbelt_pipe(name) {
+            Ok(c) => return Ok(tokio::io::split(c)),
+            Err(e)
+                if e.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn relay_io(
     socket: &Path,
     mut input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let stream = UnixStream::connect(socket).await.with_context(|| {
+    let (mut rd, mut wr) = connect(socket).await.with_context(|| {
         format!(
             "the session's toolbelt at {} is unreachable",
             socket.display()
         )
     })?;
-    let (mut rd, mut wr) = stream.into_split();
     let up = async {
         let _ = tokio::io::copy(&mut input, &mut wr).await;
         let _ = wr.shutdown().await;

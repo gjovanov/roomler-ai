@@ -45,13 +45,13 @@ pub mod files;
 pub mod fp16;
 pub mod gpu_clock;
 /// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
-/// Linux and macOS (`cfg(hive_host)`, set by `build.rs`): elsewhere the
-/// feature compiles nothing here and the build does not advertise `hive`, so
-/// no server sends it a session.
+/// Linux, macOS and Windows (`cfg(hive_host)`, set by `build.rs`): elsewhere
+/// the feature compiles nothing here and the build does not advertise `hive`,
+/// so no server sends it a session.
 #[cfg(hive_host)]
 pub mod hive;
 /// FR-90 P1i — agent sessions on Windows: the console user, the harness, the
-/// session's preparation. The supervisor is wired to them in P1i-2.
+/// session's preparation, its toolbelt pipe and its directories' DACLs.
 #[cfg(all(windows, feature = "hive"))]
 pub mod hive_win;
 /// #1740 — a closed ICE agent (the vendored `webrtc-ice`) leaves nothing
@@ -152,6 +152,11 @@ pub mod win_identity;
 pub mod win_service;
 #[cfg(target_os = "windows")]
 pub mod win_timer;
+/// FR-85 / FR-90 P1i-2 — a token's identity on every Windows build: the
+/// restricted, medium copy a daemon that is not SYSTEM starts a person's
+/// processes with (a recording, an agent session).
+#[cfg(target_os = "windows")]
+pub mod win_token;
 
 /// P5 exit-node crash-safety (A2) — synchronously purge any leftover
 /// split-default routes from the overlay NIC. Called at agent startup (the

@@ -59,7 +59,10 @@ impl HiveConfig {
                 .map(|s| std::time::Duration::from_secs(u64::from(s)))
                 .unwrap_or(DEFAULT_UPDATE_WAIT),
             core_memory: cfg.hive_core_memory,
-            adopt: cfg.hive_adopt,
+            // P1i-2 — never on Windows, whatever the config says: nothing
+            // adopts there (the hooks CLI refuses), so the device must not
+            // advertise `hive-adopt` or keep a store for it.
+            adopt: cfg.hive_adopt && cfg!(unix),
         }
     }
 
@@ -129,6 +132,18 @@ mod tests {
                 .collect(),
             ..HiveConfig::closed()
         }
+    }
+
+    /// P1i-2 — nothing adopts on Windows: `hive_adopt` reads off there whatever
+    /// the config says, so the device never advertises `hive-adopt`. On Unix
+    /// it is the owner's word.
+    #[test]
+    fn hive_adopt_is_the_owners_word_on_unix_and_off_on_windows() {
+        let mut agent = crate::config::test_fixture();
+        agent.hive_adopt = true;
+        assert_eq!(HiveConfig::from_agent(&agent).adopt, cfg!(unix));
+        agent.hive_adopt = false;
+        assert!(!HiveConfig::from_agent(&agent).adopt);
     }
 
     #[test]
