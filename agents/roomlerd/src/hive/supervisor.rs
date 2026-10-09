@@ -74,6 +74,16 @@ const MAX_WAITING: usize = INPUT_QUEUE / 2;
 /// resume keeps what the session has (its own edits included). A copy that
 /// fails is skipped: memory never stops a session.
 const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then if [ -f "$3/CLAUDE.md" ] && [ ! -e "$1/CLAUDE.md" ] && [ ! -L "$1/CLAUDE.md" ]; then cp -- "$3/CLAUDE.md" "$1/CLAUDE.md" 2>/dev/null; fi; if [ -f "$3/MEMORY.md" ] && [ ! -e "$4/MEMORY.md" ] && [ ! -L "$4/MEMORY.md" ]; then mkdir -p -- "$4" 2>/dev/null && cp -- "$3/MEMORY.md" "$4/MEMORY.md" 2>/dev/null; fi; fi; true; } && cd -- "$2" && shift 4 && exec "$@""#;
+/// Each session's runtime files (settings, MCP config, toolbelt socket, core
+/// memory): the daemon's own, cleared at boot.
+#[cfg(target_os = "linux")]
+const RUNTIME_DIR: &str = "/run/roomler-hive";
+#[cfg(target_os = "macos")]
+const RUNTIME_DIR: &str = "/var/run/roomler-hive";
+/// P1h — how long the daemon gives its harnesses to exit on SIGTERM when it
+/// leaves ([`wind_down`]) before SIGKILL: within the 5 s a service manager
+/// usually waits for a stop.
+const WIND_DOWN_GRACE: Duration = Duration::from_secs(3);
 /// P1e — how long a session's core memory waits for its start's launch,
 /// and how many snapshots wait at once: the server sends one right before
 /// each start, so anything older or more is not waiting for anything.
@@ -195,6 +205,8 @@ struct Live {
     waiting: Arc<AtomicUsize>,
     /// P1a — the session's open approvals, which a driver answers.
     approvals: Arc<toolbelt::Pending>,
+    /// P1h — the harness's pid, which leads its process group.
+    pid: Option<u32>,
 }
 
 /// What a launch hands the session task.
@@ -319,6 +331,19 @@ pub fn begin_shutdown() {
     }
 }
 
+/// FR-90 P1h — the daemon is leaving: take down every harness it launched
+/// ([`super::procs`]), the way systemd's `KillMode=control-group` takes down
+/// a whole unit and the way nothing does under launchd or for an
+/// unsupervised daemon. [`begin_shutdown`] first, so each session task reads
+/// its harness's exit as going down with the daemon: the session is kept for
+/// the next daemon to resume, and nothing is reported. Bounded by
+/// [`WIND_DOWN_GRACE`].
+pub async fn wind_down() {
+    if let Some(s) = global() {
+        s.wind_down().await;
+    }
+}
+
 /// FR-90 P1d-1 (AC7) — the sessions mid-turn on this daemon: what an update
 /// waits for. Empty where no supervisor was set up.
 pub fn turns_running() -> Vec<ObjectId> {
@@ -364,7 +389,7 @@ pub fn init(cfg: &AgentConfig) {
     };
     let sup = Supervisor::new(
         hive,
-        PathBuf::from("/run/roomler-hive"),
+        PathBuf::from(RUNTIME_DIR),
         Launcher::AsMappedAccount,
         store,
         hosted,
@@ -1032,6 +1057,10 @@ impl Supervisor {
         }
         // Counted BEFORE the launch: a resume that takes the daemon down is
         // the one the bound is for.
+        // P1h — a harness the previous daemon launched and never took down
+        // (it crashed, or was killed outright) is still running on this
+        // history: it goes before the resume starts another on it.
+        reap_leftover(&h).await;
         h.resumed_at = Some(now);
         h.quick_resumes = quick;
         self.hosted
@@ -1122,6 +1151,29 @@ impl Supervisor {
 
     fn going_down(&self) -> bool {
         self.going_down.load(Ordering::SeqCst)
+    }
+
+    /// P1h — see [`wind_down`].
+    pub(crate) async fn wind_down(&self) {
+        self.begin_shutdown();
+        let pids = self.harness_pids();
+        if !pids.is_empty() {
+            info!(
+                harnesses = pids.len(),
+                "hive: taking the harnesses down with the daemon"
+            );
+            super::procs::take_down(&pids, WIND_DOWN_GRACE).await;
+        }
+    }
+
+    /// The pids of the harnesses running now.
+    fn harness_pids(&self) -> Vec<u32> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|l| l.pid)
+            .collect()
     }
 
     /// P1d-2 — whether a harness that ended without being stopped went down
@@ -1529,6 +1581,10 @@ impl Supervisor {
             toolbelt,
             history,
         } = self.spawn(order, account, folder, sidecar, approvals_tx, shown)?;
+        // P1h — who the harness is, for whoever must take it down later: this
+        // daemon when it leaves, or the next one after a crash.
+        let pid = child.id();
+        let started = pid.and_then(super::procs::started);
         if let Some(m) = &memory {
             store.append(
                 &order.session_id.to_hex(),
@@ -1549,8 +1605,15 @@ impl Supervisor {
                 input: input_tx,
                 waiting: Arc::clone(&waiting),
                 approvals: toolbelt.pending(),
+                pid,
             },
         );
+        if prior.is_some() {
+            self.hosted_update(order.session_id, |h| {
+                h.harness_pid = pid;
+                h.harness_started = started.clone();
+            });
+        }
         let resumed = match prior {
             Some(h) => Some(Resumed {
                 turns: h.turns,
@@ -1576,6 +1639,8 @@ impl Supervisor {
                         approvals: Vec::new(),
                         resumed_at: None,
                         quick_resumes: 0,
+                        harness_pid: pid,
+                        harness_started: started.clone(),
                     });
                 None
             }
@@ -1808,6 +1873,9 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
         None => vec![
             home.join(".local/bin/claude"),
             PathBuf::from("/usr/local/bin/claude"),
+            // P1h — Homebrew's prefix on Apple silicon.
+            #[cfg(target_os = "macos")]
+            PathBuf::from("/opt/homebrew/bin/claude"),
             PathBuf::from("/usr/bin/claude"),
         ],
     };
@@ -2516,6 +2584,21 @@ async fn read_stderr_tail(session: ObjectId, err: tokio::process::ChildStderr) -
     tail
 }
 
+/// P1h — the harness `h` records, if that very process is still running: the
+/// same pid AND the same start time ([`super::procs::started`]), so whatever
+/// has the pid since is never touched. A record from before P1h carries
+/// neither, and nothing is done.
+async fn reap_leftover(h: &HostedSession) {
+    let (Some(pid), Some(was)) = (h.harness_pid, h.harness_started.as_deref()) else {
+        return;
+    };
+    if super::procs::started(pid).as_deref() != Some(was) {
+        return;
+    }
+    info!(session = %h.session, pid, "hive: the previous daemon left its harness running — taken down before the resume");
+    super::procs::take_down(&[pid], STOP_GRACE).await;
+}
+
 /// SIGTERM to the harness's process group, then SIGKILL after the grace.
 async fn terminate(child: &mut Child) {
     if let Some(pid) = child.id() {
@@ -2661,7 +2744,13 @@ done
         cfg_with: impl FnOnce(&mut HiveConfig),
         sup_with: impl FnOnce(Supervisor) -> Supervisor,
     ) -> Rig {
-        let root = tempfile::tempdir().unwrap();
+        // Under /tmp, not $TMPDIR: on macOS that is /var/folders/…/T/, about
+        // 50 characters, and a session's socket (`run/<session>/toolbelt.sock`)
+        // beneath it would come within a byte of `sun_path`'s 104 (P1h-1).
+        let root = tempfile::Builder::new()
+            .prefix("hive")
+            .tempdir_in("/tmp")
+            .unwrap();
         let home = root.path().join("home");
         let work = root.path().join("work");
         std::fs::create_dir_all(&home).unwrap();
@@ -2813,6 +2902,8 @@ done
             approvals: Vec::new(),
             resumed_at: None,
             quick_resumes: 0,
+            harness_pid: None,
+            harness_started: None,
         };
         f(&mut h);
         Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT).put(h);
@@ -3512,7 +3603,15 @@ done
     #[test]
     fn a_relay_the_account_cannot_reach_is_not_executable_by_it() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap();
+        // Under /tmp, opened up: the walk reads EVERY directory to the root,
+        // and macOS's $TMPDIR is a 0700 per-user directory, which no other
+        // account passes whatever the bits below it say (P1h-1, measured on
+        // the macOS runner).
+        let root = tempfile::Builder::new()
+            .prefix("hive")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
         let bin = home.join("roomlerd");
@@ -3988,6 +4087,162 @@ done
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
         assert!(hosted_on_disk(&r).is_empty(), "over, so nothing to resume");
+    }
+
+    /// The fake harness's pid, which leads its process group, once it ran.
+    async fn fake_pid(r: &Rig) -> u32 {
+        let pid_file = r.root.path().join("work").join(".pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the harness never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Whether `pid`'s group is gone within a few seconds: its leader may be a
+    /// zombie for a moment, until whoever spawned it reaps it.
+    async fn group_gone(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::super::procs::group_alive(pid) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// P1h-1 — a daemon leaving with no service manager to end its harnesses
+    /// (launchd does not; nothing does for an unsupervised daemon): `wind_down`
+    /// ends each harness's process group itself, and the session is kept for
+    /// the next daemon, reported nowhere — the same as a stop under systemd.
+    #[tokio::test]
+    async fn wind_down_takes_the_harness_down_and_keeps_the_session() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let pid = fake_pid(&r).await;
+        assert!(super::super::procs::group_alive(pid));
+        let on_disk = hosted_on_disk(&r);
+        assert_eq!(on_disk[0].harness_pid, Some(pid), "the launch records it");
+        assert_eq!(
+            on_disk[0].harness_started,
+            super::super::procs::started(pid),
+            "with its start time"
+        );
+
+        r.sup.wind_down().await;
+        assert!(group_gone(pid).await, "the harness and its group are gone");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while r.sup.holds_live(sid) {
+            assert!(Instant::now() < deadline, "the session never let go");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        silent_about(&mut r, sid).await;
+        assert_eq!(hosted_on_disk(&r).len(), 1, "kept for the next daemon");
+    }
+
+    /// P1h-1 — a crash leaves its harness running, and nothing takes it down:
+    /// the next daemon does, before it resumes the session on the same
+    /// history, which two harnesses would both write.
+    #[tokio::test]
+    async fn a_harness_a_crash_left_running_is_taken_down_before_the_resume() {
+        use std::os::unix::process::CommandExt;
+        let mut r = rig(true, 4);
+        // The leftover: a group leader with a tool beneath it, as a harness is.
+        let leftover = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = leftover.id();
+        // Reaped the moment it dies, as an orphan is by init: until then a
+        // zombie still counts as its group, and the take-down would wait out
+        // its grace for nothing.
+        let (died_tx, died) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut leftover = leftover;
+            let _ = died_tx.send(leftover.wait());
+        });
+        let sid = ObjectId::new();
+        host(&r, sid, |h| {
+            h.harness_pid = Some(pid);
+            h.harness_started = super::super::procs::started(pid);
+        });
+        assert!(hosted_on_disk(&r)[0].harness_started.is_some());
+
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)], "resumed");
+        let status = died
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the leftover was taken down")
+            .unwrap();
+        assert!(!status.success(), "{status:?}");
+        assert!(group_gone(pid).await, "and the tool beneath it");
+        let relaunched = fake_pid(&r).await;
+        assert_ne!(relaunched, pid);
+        assert!(
+            super::super::procs::group_alive(relaunched),
+            "the resume runs"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P1h-1 — a recorded pid is only the harness while its start time still
+    /// matches: whatever holds that pid since is left alone, and a record
+    /// from before P1h (no pid) does nothing.
+    #[tokio::test]
+    async fn a_reused_pid_is_never_taken_down() {
+        use std::os::unix::process::CommandExt;
+        let r = rig(true, 4);
+        let mut bystander = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = bystander.id();
+        let o = order(&r);
+        let mut h = HostedSession {
+            session: ObjectId::new().to_hex(),
+            fence: 1,
+            harness: o.harness,
+            harness_session: o.harness_session,
+            folder: o.folder,
+            account: "dev".into(),
+            starter: r.user.to_hex(),
+            starter_email: o.user_email,
+            turns: 0,
+            running: None,
+            approvals: Vec::new(),
+            resumed_at: None,
+            quick_resumes: 0,
+            harness_pid: Some(pid),
+            harness_started: Some("an earlier process".into()),
+        };
+        reap_leftover(&h).await;
+        h.harness_started = None;
+        reap_leftover(&h).await;
+        h.harness_pid = None;
+        h.harness_started = super::super::procs::started(pid);
+        reap_leftover(&h).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "a pid whose start time is not the recorded one is someone else's"
+        );
+        assert!(super::super::procs::group_alive(pid));
+        super::super::procs::take_down(&[pid], Duration::from_millis(500)).await;
+        bystander.wait().unwrap();
     }
 
     /// A restart in the middle of a turn that waits at an approval: the

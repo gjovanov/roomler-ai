@@ -829,11 +829,11 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 
 /// FR-90 — a Hive session's state lives under its account's home; the home
 /// comes from the same lookup that refuses uid 0. Gated to its one consumer.
-#[cfg(all(target_os = "linux", feature = "hive"))]
+#[cfg(hive_host)]
 pub(crate) use unix_priv::account_home;
 /// The recorder's, and FR-90's toolbelt, whose socket is handed to the
 /// session's account — gated to exactly those two.
-#[cfg(all(target_os = "linux", any(feature = "recording", feature = "hive")))]
+#[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
 pub(crate) use unix_priv::account_ids;
 /// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
@@ -977,7 +977,7 @@ mod unix_priv {
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
     /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
-    #[cfg(all(target_os = "linux", any(feature = "recording", feature = "hive")))]
+    #[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
@@ -987,7 +987,7 @@ mod unix_priv {
 
     /// FR-90 — an account's home directory, resolved as [`resolve`] resolves
     /// it (uid 0 refused, so a session can never be pointed at root's home).
-    #[cfg(all(target_os = "linux", feature = "hive"))]
+    #[cfg(hive_host)]
     pub(crate) fn account_home(account: &str) -> Result<std::path::PathBuf, String> {
         Ok(std::path::PathBuf::from(resolve(account)?.home))
     }

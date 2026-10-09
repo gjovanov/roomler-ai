@@ -223,14 +223,14 @@ const TURN_LOG_EVERY: Duration = Duration::from_secs(60);
 /// The agent sessions mid-turn (ids), as the Hive supervisor sees them; none
 /// in a build without agent sessions.
 fn agent_turns_running() -> Vec<String> {
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     {
         crate::hive::turns_running()
             .into_iter()
             .map(|s| s.to_hex())
             .collect()
     }
-    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    #[cfg(not(hive_host))]
     {
         Vec::new()
     }
@@ -238,11 +238,11 @@ fn agent_turns_running() -> Vec<String> {
 
 /// The device's `hive_update_wait_secs`; zero without agent sessions.
 fn agent_turn_wait() -> Duration {
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     {
         crate::hive::update_wait()
     }
-    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    #[cfg(not(hive_host))]
     {
         Duration::ZERO
     }
@@ -250,7 +250,7 @@ fn agent_turn_wait() -> Duration {
 
 /// Hold (or release) new agent prompts and starts around an install.
 fn hold_agent_prompts(hold: bool) {
-    #[cfg(all(feature = "hive", target_os = "linux"))]
+    #[cfg(hive_host)]
     {
         if hold {
             crate::hive::begin_update();
@@ -258,7 +258,7 @@ fn hold_agent_prompts(hold: bool) {
             crate::hive::end_update();
         }
     }
-    #[cfg(not(all(feature = "hive", target_os = "linux")))]
+    #[cfg(not(hive_host))]
     {
         let _ = hold;
     }
