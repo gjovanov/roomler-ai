@@ -1627,6 +1627,14 @@ fn rpc_caps() -> Vec<String> {
     // own `hive_core_memory`, default off.
     #[cfg(hive_host)]
     caps.push(RpcCap::HiveMemory);
+    // FR-90 P1j — and mirrors terminal sessions its people adopted. NOT a
+    // property of the build alone: advertised only while the device's owner
+    // allows it (`hive_adopt`), and the server honours an offer only from a
+    // connection that advertises it.
+    #[cfg(hive_host)]
+    if crate::hive::adopt_enabled() {
+        caps.push(RpcCap::HiveAdopt);
+    }
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
