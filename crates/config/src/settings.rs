@@ -342,11 +342,13 @@ pub struct StatsSettings {
     /// would turn a provider-asserted address into platform-root.
     /// Env: `ROOMLER__STATS__PLATFORM_ADMINS`.
     pub platform_admins: Option<String>,
-    /// Path to a MaxMind-format country database (GeoLite2 / DB-IP) for
-    /// the platform user analytics. Unset ⇒ every session records
-    /// `unknown` — an honest gap, never a guessed country. Deliberately
-    /// operator-supplied: no licensed dataset is vendored into the repo
-    /// or the image. Env: `ROOMLER__STATS__GEOIP_MMDB`.
+    /// Path to a MaxMind-format country database (DB-IP / GeoLite2) for
+    /// the platform user analytics. Unset or empty ⇒ every session records
+    /// `unknown` — an honest gap, never a guessed country. Nothing is
+    /// vendored into the repo; the server IMAGE sets this to the DB-IP
+    /// "IP to Country Lite" database it carries (CC BY 4.0, #1896,
+    /// `files/geoip/README.md`), and an env value overrides it, or turns it
+    /// off when empty. Env: `ROOMLER__STATS__GEOIP_MMDB`.
     pub geoip_mmdb: Option<String>,
 }
 

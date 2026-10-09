@@ -120,6 +120,15 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --b
 > **6 minutes** on a 2024 laptop (16 cores, Docker Desktop + WSL2); budget
 > 15–20 on a small VPS or 2–4 cores. Subsequent starts are seconds.
 
+> **Countries in the analytics.** The published image carries DB-IP's
+> *IP to Country Lite* database ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/),
+> credited on the dashboard) for the platform analytics' Countries breakdown. A
+> source build carries it only if you run `scripts/fetch-geoip.sh` before
+> building. Without it every country reads `unknown`, which is a supported
+> state, and the boot log warns once. To turn country lookups off in either
+> case, set `ROOMLER__STATS__GEOIP_MMDB` to an empty value. Details:
+> [`files/geoip/README.md`](../files/geoip/README.md).
+
 Watch it come up:
 
 ```bash

@@ -838,6 +838,11 @@ async fn page_view_beacon_normalizes_paths_and_admin_reads_them_back() {
     // No GeoIP database in tests ⇒ the flag says so rather than the
     // payload pretending it resolved countries.
     assert_eq!(body["geoip"], serde_json::json!(false));
+    // ...and names no database, so the dashboard credits no data source
+    // (#1896: the credit follows the database actually loaded). `.get`, not
+    // indexing: `body["…"]` reads `Null` for a MISSING key too, and then
+    // this could not fail.
+    assert_eq!(body.get("geoip_database"), Some(&serde_json::Value::Null));
     let pages = body["pages"].as_array().unwrap();
     assert!(
         pages.iter().any(|p| p["path"] == "/tenant/:id/room/:id"),

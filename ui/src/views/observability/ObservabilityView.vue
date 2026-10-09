@@ -362,6 +362,17 @@
                   </tr>
                 </tbody>
               </v-table>
+              <!-- #1896: the country database's licence asks for this link on
+                   the page that shows its results; geoipCredit() picks it from
+                   the database the server actually loaded. -->
+              <div
+                v-if="b.title === 'Countries' && countryCredit"
+                class="text-caption text-medium-emphasis mt-2"
+              >
+                <a :href="countryCredit.href" target="_blank" rel="noopener noreferrer">{{
+                  countryCredit.text
+                }}</a>
+              </div>
             </v-card-text>
           </v-card>
         </v-col>
@@ -448,6 +459,7 @@ import {
   type UsersPayload,
 } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
+import { geoipCredit } from '@/utils/geoipCredit'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 import UsagePanel from '@/components/stats/UsagePanel.vue'
 import RangePicker, { type StatsRange } from '@/components/stats/RangePicker.vue'
@@ -488,6 +500,9 @@ const breakdowns = computed(() => [
   { title: 'Platforms', rows: users.value?.platforms ?? [] },
   { title: 'Countries', rows: users.value?.countries ?? [] },
 ])
+// #1896: whose country data the Countries card shows, credited as its
+// licence requires (DB-IP's CC BY 4.0 asks for a link back).
+const countryCredit = computed(() => geoipCredit(users.value?.geoip_database))
 
 // Realtime: 15 s poll of the current snapshot (reads the newest persisted
 // buckets — cheap), paused while the tab is hidden.

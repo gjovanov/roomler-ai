@@ -1,33 +1,86 @@
-# GeoIP database (operator-supplied)
+# GeoIP database: DB-IP "IP to Country Lite" (CC BY 4.0)
 
 The platform user analytics resolves a client's country at WebSocket
-connect time and then **drops the address** — no IP is ever stored. That
-lookup needs a MaxMind-format database, which is deliberately NOT in this
-repository: GeoLite2 is licensed data, and vendoring it would put a
-third-party dataset (and its update obligations) into our git history.
+connect time and then **drops the address**, so no IP is ever stored. That
+lookup needs a MaxMind-format country database. The server image carries
+one: DB-IP's **IP to Country Lite**, at
+`/usr/share/roomler/geoip/dbip-country-lite.mmdb`, the path the image's
+`ROOMLER__STATS__GEOIP_MMDB` names (#1896).
 
-Instead the build host drops the `.mmdb` here and the image bakes it in:
+It is never committed. `scripts/fetch-geoip.sh` stages it in this
+directory before `docker build`, and both image workflows run it
+(`hosted-image.yml`, `publish-selfhost-image.yml`):
 
 ```bash
-# once per DB refresh, on the build host
-tar -xzf ~/GeoLite2-Country_YYYYMMDD.tar.gz -C /tmp
-cp /tmp/GeoLite2-Country_*/GeoLite2-Country.mmdb \
-   ~/roomler-build/files/geoip/GeoLite2-Country.mmdb
+scripts/fetch-geoip.sh     # this month's release (or last month's), verified
+docker build .             # COPY files/geoip/ bakes it in
 ```
 
-`scripts/../stats-image-build.sh` on the build host does this automatically
-before `docker build`.
+| | |
+|---|---|
+| Database | IP to Country Lite by DB-IP, MaxMind DB format, released monthly |
+| Download | `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz` |
+| Licence | [Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/) |
+| Credit shown | "IP Geolocation by DB-IP", linking <https://db-ip.com>, under the observability dashboard's Countries table |
+| Checks | gzip integrity, a size between 1 and 128 MiB, MaxMind DB metadata of type `DBIP-Country-Lite`; then the image smoke boots the server and requires `geoip database loaded` |
+| Provenance | `dbip-country-lite.provenance.txt`, written beside the file: release, URL, SHA-256, fetch time, licence |
 
-The image then carries it at `/usr/share/roomler/geoip/`, which
-`ROOMLER__STATS__GEOIP_MMDB` points at.
+## Attribution
 
-**Nothing breaks when it is absent.** A build without the file (CI, a
-fresh clone) produces an image whose analytics report `country: unknown`
-and whose payload carries `geoip: false`, so the dashboard says "no GeoIP
-database" rather than implying every user is in one place. That is the
-designed degradation, not an error.
+This product includes IP geolocation data from **DB-IP**
+(<https://db-ip.com>): "IP to Country Lite", licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and redistributed
+unmodified. DB-IP provides the database as is, without warranties of any
+kind; the licence carries the full disclaimer.
 
-Country granularity is what the analytics uses. The City database also
-exists (much larger); adopting it would only make sense alongside a
-deliberate decision to record finer-grained location, which is a privacy
-choice, not a data-availability one.
+DB-IP's licence terms, quoted from
+<https://db-ip.com/db/download/ip-to-country-lite>:
+
+> The free IP to Country Lite database by DB-IP is licensed under a Creative
+> Commons Attribution 4.0 International License. You are free to use this IP
+> to Country Lite database in your application, provided you give
+> attribution to DB-IP.com for the data. In the case of a web application,
+> you must include a link back to DB-IP.com on pages that display or use
+> results from the database.
+
+The dashboard shows that link only when the server reports a DB-IP
+database loaded (`geoip_database` in `/api/admin/stats/users`,
+`ui/src/utils/geoipCredit.ts`). A deployment that supplies its own
+database is credited by that database's own type, or not at all.
+
+## Why DB-IP, and not GeoLite2
+
+The image is a **public** package, so whatever it carries is redistributed
+to everyone who pulls it. CC BY 4.0 permits that, given the credit above.
+MaxMind's GeoLite End User License Agreement (updated 2026-02-12) does
+not: §6 says you "will not disclose the Services to any third party
+without notifying MaxMind of the anticipated disclosure and obtaining
+MaxMind's prior written consent", and requires old versions to be destroyed
+within 30 days of an update, which old image tags can never honour.
+GeoLite2 therefore stays out of every published image. Before #1896 the
+build host dropped `GeoLite2-Country.mmdb` here by hand; the GitHub lane
+(FR-73) never did, which is why prod read every country as `unknown`.
+
+## Your own database, or none
+
+- **Your own** (a licensed GeoIP2 Country, or a GeoLite2 you are entitled
+  to use): mount it and set `ROOMLER__STATS__GEOIP_MMDB=/path/to/it.mmdb`.
+- **None**: set `ROOMLER__STATS__GEOIP_MMDB=` (empty). Lookups stop, and
+  no warning is logged.
+- ⚠️ An environment variable outranks `config/*.toml`, and the image sets
+  this one. `[stats] geoip_mmdb` in a config file cannot override it; set
+  the variable.
+
+## Nothing breaks when it is absent
+
+A build without the file (DB-IP unreachable during the build, or a source
+build that skipped the script) produces an image whose analytics report
+`country: unknown` and whose payload carries `geoip: false`, so the
+dashboard says "no GeoIP database" rather than implying every user is in
+one place. The fetch warns and the build goes on; the server logs one
+warning at boot. That is the designed degradation, not an error.
+
+Country granularity is what the analytics uses. City databases also exist
+(much larger); adopting one would only make sense alongside a deliberate
+decision to record finer-grained location, which is a privacy choice, not
+a data-availability one.

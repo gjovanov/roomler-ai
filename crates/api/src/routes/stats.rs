@@ -1291,6 +1291,9 @@ pub async fn admin_users(
         "enabled": true,
         "range": q.range.as_deref().unwrap_or("24h"),
         "geoip": state.geoip.enabled(),
+        // #1896 — WHOSE country data this is (the database's own type), so
+        // the dashboard shows the credit its licence asks for, and no other.
+        "geoip_database": state.geoip.database(),
         "series": series,
         "browsers": browsers,
         "platforms": platforms,

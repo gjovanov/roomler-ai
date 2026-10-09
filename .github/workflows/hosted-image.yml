@@ -33,6 +33,7 @@ on:
       - 'config/**'
       - 'scripts/install.sh'
       - 'scripts/install.ps1'
+      - 'scripts/fetch-geoip.sh'
       - 'Dockerfile'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -115,6 +116,20 @@ jobs:
           set -euo pipefail
           cd ui
           bun docs/dates.ts --write
+
+      # #1896: the country database for the user analytics, DB-IP's CC BY 4.0
+      # "IP to Country Lite", which a public image may carry. Staged into the
+      # build context (files/geoip/, which the Dockerfile COPYs), so the layer
+      # is keyed by the file's content. A failed download warns and builds on:
+      # an image without it reports `country: unknown`, the designed state.
+      # The script already exits 0 on every failure and bounds its own waits;
+      # `continue-on-error` + `timeout-minutes` make sure that NOTHING in this
+      # step (a hang, a bug) can fail the build. The smoke then warns.
+      - name: GeoIP database (DB-IP, CC BY 4.0)
+        id: geoip
+        continue-on-error: true
+        timeout-minutes: 8
+        run: bash scripts/fetch-geoip.sh files/geoip
 
       - name: Build clock — start
         id: t0
@@ -200,6 +215,34 @@ jobs:
                 exit 1
               fi
               echo "  device listing: 401 ✓"
+              # #1896: the image carries a country database and the server
+              # LOADS it. A download that failed is a supported state (warn,
+              # build on). A database the fetch step DID stage that the server
+              # then does not load is our bug (the ENV and the file name
+              # drifted, or the reader refused it), and it fails here rather
+              # than as weeks of `unknown` on the dashboard.
+              docker logs roomler > /tmp/roomler.log 2>&1 || true
+              GEO="$(grep -m1 'geoip database' /tmp/roomler.log || true)"
+              echo "  geoip: ${GEO:-no geoip line in the boot log}"
+              if [ '${{ steps.geoip.outputs.present }}' = 'true' ]; then
+                case "$GEO" in
+                  *'geoip database loaded'*'DBIP-Country-Lite'*)
+                    echo "  geoip: DB-IP database loaded ✓" ;;
+                  *)
+                    echo "::error::the fetch step staged a GeoIP database, but the server did not load it"
+                    exit 1 ;;
+                esac
+                # This smoke runs as root, which reads anything; a container
+                # run as any other user must be able to read the file too.
+                GEO_PATH="$(docker exec roomler printenv ROOMLER__STATS__GEOIP_MMDB)"
+                if ! docker exec --user 65534:65534 roomler test -r "$GEO_PATH"; then
+                  echo "::error::$GEO_PATH is not readable by a non-root user: a container not run as root would read every country as 'unknown'"
+                  exit 1
+                fi
+                echo "  geoip: readable by a non-root user ✓"
+              else
+                echo "::warning title=No GeoIP database::this image carries none, so the user analytics will read every country as 'unknown'"
+              fi
               # FR-87 (#1776) — how the public site is SERVED: relative redirects,
               # real 404s (no soft 404s), no-cache HTML, the Atom feed type, and every
               # static page keeping `/`'s security headers (one `add_header` in an
@@ -238,7 +281,16 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          GEO_PRESENT: ${{ steps.geoip.outputs.present }}
+          GEO_RELEASE: ${{ steps.geoip.outputs.release }}
+          GEO_SHA256: ${{ steps.geoip.outputs.sha256 }}
         run: |
+          if [ "$GEO_PRESENT" = true ]; then
+            GEO="DB-IP IP to Country Lite $GEO_RELEASE (sha256 \`$GEO_SHA256\`)"
+          else
+            GEO="none: every country reads \`unknown\`"
+          fi
           {
             echo "## hosted image"
             echo
@@ -247,6 +299,7 @@ jobs:
             echo "| tag | \`${{ steps.tag.outputs.tag }}\` |"
             echo "| commit | \`${{ steps.tag.outputs.sha }}\` (\`${{ steps.tag.outputs.version }}\`) |"
             echo "| build | ${{ steps.t1.outputs.secs }} s (cache: \`buildcache-hosted\`) |"
+            echo "| geoip | $GEO |"
             echo "| pushed | ${{ steps.push.outputs.digest != '' && steps.push.outputs.digest || 'no' }} |"
             echo
             echo "Promote with the \`promote\` workflow (FR-73 P3) — this lane never deploys."
