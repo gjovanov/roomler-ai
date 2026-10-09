@@ -363,6 +363,26 @@ impl Supervisor {
         }
     }
 
+    /// With adopting off: the socket a predecessor left when it was on.
+    /// Nothing listens on it now, and its being there must not say otherwise
+    /// (`roomler hive adopt` read it as "this device adopts", P1j-5's field
+    /// run). A socket only: anything else at that path is left alone.
+    pub(crate) fn adopt_remove_stale_socket(&self) {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = self.runtime.join(proto::SOCKET_NAME);
+        if !std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
+            return;
+        }
+        match std::fs::remove_file(&socket) {
+            Ok(()) => {
+                info!(socket = %socket.display(), "hive: adopting is off — the socket left behind is removed")
+            }
+            Err(e) => {
+                warn!(socket = %socket.display(), %e, "hive: a socket left behind could not be removed")
+            }
+        }
+    }
+
     /// One hook's connection: a `Hello`, then its requests, each answered.
     pub(crate) async fn adopt_conn(self: Arc<Self>, stream: UnixStream) {
         let cred = match stream.peer_cred() {
@@ -1271,6 +1291,23 @@ mod tests {
         }
         assert!(!g.was_adopted(&first), "the oldest fell off");
         assert_eq!(g.ended.len(), MAX_ENDED);
+    }
+
+    /// P1j-5 — with adopting off, the socket a predecessor left is removed;
+    /// a file that is not a socket is left alone.
+    #[tokio::test]
+    async fn a_device_that_does_not_adopt_removes_the_socket_left_behind() {
+        let r = rig_with(true, 4, |c| c.adopt = false, |s| s);
+        let run = r.root.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let socket = run.join(proto::SOCKET_NAME);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        assert!(socket.exists(), "a socket left behind");
+        r.sup.adopt_remove_stale_socket();
+        assert!(!socket.exists(), "removed");
+        std::fs::write(&socket, b"not a socket").unwrap();
+        r.sup.adopt_remove_stale_socket();
+        assert!(socket.exists(), "not the daemon's to remove");
     }
 
     /// P1j-5 — a stopped session whose terminal is gone is forgotten by the

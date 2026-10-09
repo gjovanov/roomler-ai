@@ -403,13 +403,16 @@ pub fn init(cfg: &AgentConfig) {
     );
     let sup = Arc::new(sup);
     let _ = SUPERVISOR.set(Arc::clone(&sup));
-    // P1j — the adopt socket, only while the device's owner allows it.
+    // P1j — the adopt socket, only while the device's owner allows it; with
+    // adopting off, a socket a predecessor left behind is taken away.
     if sup.cfg.adopt {
         tokio::spawn(async move {
             if let Err(e) = sup.adopt_listen().await {
                 warn!(%e, "hive: the adopt socket could not be opened — nothing is adopted");
             }
         });
+    } else {
+        sup.adopt_remove_stale_socket();
     }
 }
 
