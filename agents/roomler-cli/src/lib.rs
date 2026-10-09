@@ -18,6 +18,8 @@
 pub mod cli;
 pub mod config;
 pub mod forward;
+/// FR-90 P1j-3 — `roomler hive adopt | unadopt | hook`.
+pub mod hive_hooks;
 /// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
 pub mod localclient;
 pub mod mesh;

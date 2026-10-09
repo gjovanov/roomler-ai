@@ -8524,6 +8524,7 @@ dependencies = [
  "embed-resource",
  "futures",
  "hex",
+ "indexmap 2.14.0",
  "ipnet",
  "libc",
  "rand 0.9.4",

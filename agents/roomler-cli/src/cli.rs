@@ -329,6 +329,12 @@ enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// FR-90 — Claude Code sessions you run in a terminal, adopted into
+    /// Roomler: mirrored by this device and shown to you alone, read-only.
+    Hive {
+        #[command(subcommand)]
+        action: HiveAction,
+    },
     /// Restart the local daemon through the service manager that runs it —
     /// the companion's "Apply now" (FR-84), for changes `config ls` marks as
     /// needing a restart.
@@ -541,6 +547,32 @@ enum ConfigAction {
 /// `roomler record …` — FR-85 local screen recording. Every verb talks to the
 /// LOCAL daemon; `start`, `stop` and `rm` are refused unless the caller is the
 /// console user (an RDP guest must not record the console user's desktop).
+#[derive(Debug, Subcommand)]
+enum HiveAction {
+    /// Mirror the Claude Code sessions YOU run in a terminal on this machine
+    /// into Roomler, where only you see them (read-only). Adds three hooks to
+    /// your own user-level Claude Code settings and touches nothing else. The
+    /// device's owner must allow it (`hive_adopt`) and map your account in
+    /// `hive_accounts`.
+    Adopt {
+        /// The Claude Code settings file. Default: `/settings.json`,
+        /// else `~/.claude/settings.json`.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+    },
+    /// Take out exactly the hooks `adopt` put in; every other setting and hook
+    /// stays.
+    Unadopt {
+        #[arg(long)]
+        settings: Option<PathBuf>,
+    },
+    /// What Claude Code runs at those hooks: reads the hook's input on stdin
+    /// and hands the session's new transcript lines to this device. Prints
+    /// nothing; always exits 0.
+    #[command(hide = true)]
+    Hook,
+}
+
 #[derive(Debug, Subcommand)]
 enum RecordAction {
     /// Start recording the screen. Answers once the recorder is encoding.
@@ -917,6 +949,16 @@ where
             ConfigAction::Ls { fmt } => localclient::config_ls(fmt.json).await,
             ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
             ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
+        },
+        Command::Hive { action } => match action {
+            HiveAction::Adopt { settings } => {
+                crate::hive_hooks::adopt(settings, origin == Origin::EmbeddedInDaemon)
+            }
+            HiveAction::Unadopt { settings } => crate::hive_hooks::unadopt(settings),
+            HiveAction::Hook => {
+                crate::hive_hooks::hook().await;
+                Ok(())
+            }
         },
         Command::Record { action } => match action {
             RecordAction::Start {
