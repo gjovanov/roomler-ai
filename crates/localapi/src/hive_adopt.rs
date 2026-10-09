@@ -75,7 +75,16 @@ pub enum Request {
     /// The transcript's next whole lines, starting at byte `from`. A `from`
     /// that is not where the daemon's copy ends is answered with where it does
     /// end, and the hook sends from there.
-    Lines { from: u64, data: String },
+    ///
+    /// `skipped`: bytes AFTER `data` the hook did not send: one line longer
+    /// than [`MAX_LINE`] (a huge tool output), whose place the daemon's copy
+    /// moves past and marks. Never part of a line: whole lines only.
+    Lines {
+        from: u64,
+        data: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        skipped: u64,
+    },
     /// The turn the person just finished (the `Stop` hook).
     TurnEnded,
     /// The terminal session ended (`SessionEnd`), with Claude Code's reason.
@@ -84,6 +93,29 @@ pub enum Request {
         reason: Option<String>,
     },
 }
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Where a daemon on this system listens: its Hive runtime directory, which
+/// it owns and clears at boot. `None` where no daemon adopts (Windows, until
+/// its sessions land).
+pub fn socket_path() -> Option<std::path::PathBuf> {
+    let dir = if cfg!(target_os = "linux") {
+        RUNTIME_DIR_LINUX
+    } else if cfg!(target_os = "macos") {
+        RUNTIME_DIR_MACOS
+    } else {
+        return None;
+    };
+    Some(std::path::Path::new(dir).join(SOCKET_NAME))
+}
+
+/// The daemon's Hive runtime directory on Linux (`/run` is cleared at boot).
+pub const RUNTIME_DIR_LINUX: &str = "/run/roomler-hive";
+/// … and on macOS, which clears `/var/run` at boot.
+pub const RUNTIME_DIR_MACOS: &str = "/var/run/roomler-hive";
 
 /// The daemon's answer to one [`Request`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -161,10 +193,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Request::Lines {
                 from: 7,
-                data: "{}\n".into()
+                data: "{}\n".into(),
+                skipped: 0,
             })
             .unwrap(),
             serde_json::json!({"op": "lines", "from": 7, "data": "{}\n"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::Lines {
+                from: 7,
+                data: String::new(),
+                skipped: 9,
+            })
+            .unwrap(),
+            serde_json::json!({"op": "lines", "from": 7, "data": "", "skipped": 9})
         );
         assert_eq!(
             serde_json::to_value(Request::TurnEnded).unwrap(),
