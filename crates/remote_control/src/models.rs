@@ -643,6 +643,16 @@ pub enum RpcCap {
     /// ⚠️ `hive` is its prefix and NOT the same promise: an agent before P1e
     /// drops the frame at `debug!`. Equality-matched, locked by test.
     HiveMemory,
+    /// FR-90 P1j — `rc:hive.adopt`: the agent mirrors terminal sessions its
+    /// accounts adopted (`roomler hive adopt`), and its own `hive_adopt` (default
+    /// off, never pushable) is on. Advertised only then: a device whose owner
+    /// has not allowed adopting offers nothing, and the server honours an
+    /// offer only from a device that advertises it.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise — running sessions
+    /// a person starts from Roomler is not mirroring the ones they started in a
+    /// terminal. Equality-matched, locked by test.
+    HiveAdopt,
 }
 
 impl RpcCap {
@@ -666,11 +676,12 @@ impl RpcCap {
             Self::Hive => "hive",
             Self::HiveView => "hive-view",
             Self::HiveMemory => "hive-memory",
+            Self::HiveAdopt => "hive-adopt",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 12] = [
+    pub const ALL: [RpcCap; 13] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -683,6 +694,7 @@ impl RpcCap {
         Self::Hive,
         Self::HiveView,
         Self::HiveMemory,
+        Self::HiveAdopt,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4427,6 +4439,7 @@ mod tests {
         assert_eq!(RpcCap::Hive.wire(), "hive");
         assert_eq!(RpcCap::HiveView.wire(), "hive-view");
         assert_eq!(RpcCap::HiveMemory.wire(), "hive-memory");
+        assert_eq!(RpcCap::HiveAdopt.wire(), "hive-adopt");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4444,7 +4457,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 5] = [
+        const KNOWN: [(RpcCap, RpcCap); 6] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4457,6 +4470,9 @@ mod tests {
             // FR-90 P1e — nor "understands core memory". Locked by
             // `hive_does_not_imply_hive_memory`.
             (RpcCap::Hive, RpcCap::HiveMemory),
+            // FR-90 P1j — nor "mirrors adopted terminal sessions". Locked by
+            // `hive_does_not_imply_hive_adopt`.
+            (RpcCap::Hive, RpcCap::HiveAdopt),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -4707,6 +4723,25 @@ mod tests {
         assert!(!understands.has_rpc(RpcCap::Hive));
         assert_eq!(RpcCap::from_wire("hive-memory"), Some(RpcCap::HiveMemory));
         assert!(RpcCap::from_wire("hive-memories").is_none());
+    }
+
+    /// FR-90 P1j — running sessions is not mirroring adopted terminal ones:
+    /// a device advertising `hive` has not been allowed to adopt.
+    #[test]
+    fn hive_does_not_imply_hive_adopt() {
+        let runs = AgentCaps {
+            rpc: vec!["hive".into(), "hive-view".into(), "hive-memory".into()],
+            ..Default::default()
+        };
+        assert!(!runs.has_rpc(RpcCap::HiveAdopt));
+        let adopts = AgentCaps {
+            rpc: vec!["hive-adopt".into()],
+            ..Default::default()
+        };
+        assert!(adopts.has_rpc(RpcCap::HiveAdopt));
+        assert!(!adopts.has_rpc(RpcCap::Hive));
+        assert_eq!(RpcCap::from_wire("hive-adopt"), Some(RpcCap::HiveAdopt));
+        assert!(RpcCap::from_wire("hive-adopted").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

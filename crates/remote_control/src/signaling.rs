@@ -785,6 +785,34 @@ pub enum ClientMsg {
         sessions: Vec<crate::hive::HiveManifestEntry>,
     },
 
+    /// FR-90 P1j — a terminal session this device mirrors (`roomler hive
+    /// adopt`), offered for a record. Sent once per Claude Code session, when
+    /// its first hook reaches the device, and answered by
+    /// [`ServerMsg::HiveAdoptAck`]. What follows is the usual `rc:hive.state`
+    /// and `rc:hive.turn`, under the session id the ack names.
+    ///
+    /// ⚠️ METADATA ONLY, and the field set is LOCKED by test: no title, no
+    /// prompt. A terminal's first prompt is content, and the server keeps
+    /// none.
+    /// ⚠️ `keys` are the device's own `hive_accounts` keys that map to the
+    /// account the session runs as, every one of them. The SERVER resolves
+    /// them and adopts only when they name exactly one person, a member of
+    /// this org: the attribution is the device owner's statement, never a
+    /// guess.
+    #[serde(rename = "rc:hive.adopt")]
+    HiveAdopt {
+        /// The device's id for this offer, echoed by the ack.
+        adopt_id: String,
+        /// The harness's own session id (a UUID).
+        harness_session: String,
+        keys: Vec<String>,
+        /// The local account the session runs as, attested by the device's
+        /// kernel (the hook's peer credentials) — a claim by the device.
+        account: String,
+        /// The terminal's working directory.
+        folder: String,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1562,6 +1590,7 @@ impl ClientMsg {
             ClientMsg::HiveTurn { .. } => "rc:hive.turn",
             ClientMsg::HiveApproval { .. } => "rc:hive.approval",
             ClientMsg::HiveManifest { .. } => "rc:hive.manifest",
+            ClientMsg::HiveAdopt { .. } => "rc:hive.adopt",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1658,6 +1687,7 @@ impl ClientMsg {
             | ClientMsg::HiveTurn { .. }
             | ClientMsg::HiveApproval { .. }
             | ClientMsg::HiveManifest { .. }
+            | ClientMsg::HiveAdopt { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1690,6 +1720,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.turn", Owner::Hive),
     ("rc:hive.approval", Owner::Hive),
     ("rc:hive.manifest", Owner::Hive),
+    ("rc:hive.adopt", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -2861,6 +2892,33 @@ pub enum ServerMsg {
         memory_md: Option<String>,
     },
 
+    /// FR-90 P1j — the server's answer to [`ClientMsg::HiveAdopt`]: the
+    /// session's record, or why there is none. The device mirrors the
+    /// terminal only after an answer without `refused`.
+    #[serde(rename = "rc:hive.adopt_ack")]
+    HiveAdoptAck {
+        /// Echo of the offer's `adopt_id`.
+        adopt_id: String,
+        /// The record's id, when adopted.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "option_oid_hex"
+        )]
+        session_id: Option<ObjectId>,
+        /// The fence the device reports it under, when adopted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence: Option<u64>,
+        /// Absent = adopted. Present = refused, decoded leniently — see
+        /// [`crate::hive::HiveAdoptRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::adopt_refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveAdoptRefusal>,
+    },
+
     // ─── Hive viewer peer (rc:hive.view.*) — FR-90 P0d-2 ─────────────────
     /// A view grant: `user_id` may read `session_id` over a data-only WebRTC
     /// peer for `ttl_secs`, and send it prompts if `may_prompt`. The device
@@ -3734,6 +3792,80 @@ mod tests {
             } => assert_eq!((brain_rev, memory_md), (7, None)),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// FR-90 P1j — the adopt offer's field set is locked: whose (the keys and
+    /// the account), which harness session, where. No title and no prompt can
+    /// ride along: a terminal's first prompt is content.
+    #[test]
+    fn hive_adopt_wire_shape_is_locked() {
+        let m = ClientMsg::HiveAdopt {
+            adopt_id: "a1".into(),
+            harness_session: "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f70".into(),
+            keys: vec!["dev@example.com".into()],
+            account: "dev".into(),
+            folder: "/home/dev/work".into(),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account",
+                "adopt_id",
+                "folder",
+                "harness_session",
+                "keys",
+                "t"
+            ]
+        );
+        assert_eq!(v["t"], "rc:hive.adopt");
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(v).unwrap(),
+            ClientMsg::HiveAdopt { ref keys, .. } if keys.len() == 1
+        ));
+        assert_eq!(m.namespace(), Owner::Hive);
+    }
+
+    /// FR-90 P1j — "adopted" is the ABSENCE of `refused`, as for the start
+    /// ack; an unknown refusal is still a refusal and never an adoption.
+    #[test]
+    fn hive_adopt_ack_wire_shape_and_lenient_refusal() {
+        use crate::hive::HiveAdoptRefusal;
+
+        let sid = ObjectId::new();
+        let adopted = ServerMsg::HiveAdoptAck {
+            adopt_id: "a1".into(),
+            session_id: Some(sid),
+            fence: Some(1),
+            refused: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&adopted).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.adopt_ack", "adopt_id": "a1", "session_id": sid.to_hex(), "fence": 1
+            })
+        );
+        let refused = ServerMsg::HiveAdoptAck {
+            adopt_id: "a2".into(),
+            session_id: None,
+            fence: None,
+            refused: Some(HiveAdoptRefusal::AmbiguousAccount),
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::json!({"t": "rc:hive.adopt_ack", "adopt_id": "a2", "refused": "ambiguous_account"})
+        );
+        let unknown = serde_json::json!({"t": "rc:hive.adopt_ack", "adopt_id": "a3", "refused": "solar_flare"});
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(unknown).unwrap(),
+            ServerMsg::HiveAdoptAck {
+                refused: Some(HiveAdoptRefusal::Other),
+                session_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
