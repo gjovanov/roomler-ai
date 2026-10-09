@@ -30,6 +30,6 @@ pub async fn get(State(state): State<AppState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "modules": state.modules.mounted(),
         "compiled": compose::EXTRACTED,
-        "switched_off": state.settings.modules.switched_off(),
+        "switched_off": state.settings.switched_off(),
     }))
 }

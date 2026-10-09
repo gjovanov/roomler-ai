@@ -98,7 +98,7 @@ impl Modules {
     /// always initialised before it. Logs each switch that is off for a
     /// module that is not extracted yet — that switch unmounts nothing.
     pub async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
-        for id in settings.modules.switched_off() {
+        for id in settings.switched_off() {
             // A default-off module (FR-90 `hive`) that this build does not
             // link is the default state, not something an operator did.
             if !EXTRACTED.contains(&id)
@@ -194,7 +194,7 @@ impl Modules {
                     if let Some(m) = &modules.hive {
                         modules.ws.extend(m.ws().handlers);
                     }
-                } else if settings.modules.hive {
+                } else if settings.hive_on() {
                     warn!(
                         "module hive is switched on but chat is off — hive is not mounted \
                          (a session is a chat room)"
