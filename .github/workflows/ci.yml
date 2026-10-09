@@ -1034,7 +1034,10 @@ jobs:
       # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
-        run: cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
+        # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
+        # as a mapping, and then this whole file fails to parse.
+        run: |
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
 
   windows-recorder:
     # FR-85 P1e — the recorder's identity rule is Windows code that no other
