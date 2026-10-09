@@ -285,7 +285,7 @@ pre-P10 behaviour, for the one case where the reason has no path to travel.
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
-| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on the Mac's banner, 2026-10-09** (the field log: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click); the Windows badge owed (a person at that machine) |
+| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on both surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s |
 
 ## Acceptance criteria
 
@@ -386,8 +386,9 @@ Ticked only where a run is recorded in the field log below.
   records it:
   - [x] the companion banner (macOS), from a Playwright field spec on the live
         site — GREEN 2026-10-09 on 0.4.121 + `hosted-20261009-cac4761`
-  - [ ] the Windows badge — only with a person at that machine (it is
-        capture-excluded)
+  - [x] the Windows badge, which is capture-excluded, so the click is aimed by
+        its fixed geometry through the viewer (Claude in Chrome on the live
+        site) — GREEN 2026-10-09 on 0.4.121 + `hosted-20261009-cac4761`
 
 ## Deviations (accepted, recorded up front)
 
@@ -761,6 +762,43 @@ viewer's ladder brings it back.
   recorded here, not taken.
 
 **Not covered:**
-- **The Windows badge.** It is capture-excluded, so it needs a person at that machine.
+- **The Windows badge.** It was capture-excluded in this run; see the next entry.
 - **The Linux companion banner.** It uses the same banner code and the same daemon arm,
   but was not exercised separately.
+
+### 2026-10-09 — P10 GREEN on the Windows badge (0.4.121 + `hosted-20261009-cac4761`)
+
+**What ran.** A corporate Windows laptop with one 1920×1200 display, on agent
+**0.4.121**, checked unlocked before every input. The viewer was the operator's own
+Chrome, driven by Claude in Chrome, on the live site, from a background tab.
+
+**Aiming the click.** The badge is excluded from capture, so the stream cannot show it,
+and `roomler exec` runs in session 0, so it cannot enumerate the user's windows. The
+click was aimed by the badge's fixed geometry instead (`agents/roomlerd/src/indicator/win.rs`):
+- the badge is 300×48, top-centre, at y = 4;
+- its Disconnect is at client (196–292, 9–39);
+- the agent is per-monitor DPI-aware, so that is physical (1006–1102, 13–43), centre
+  (1054, 28), and the same point still lands inside the button if the badge were drawn
+  DPI-unaware at 125 % or 150 %.
+
+The input went through the viewer's own input path: pointer events dispatched on the
+stage, which maps them to normalised coordinates and sends them over the input
+channel. The stage's `setPointerCapture` was shimmed for the synthetic pointer id,
+because the handler calls it before it sends the button-down. On the device it is
+ordinary injected input, so the badge got a real `WM_LBUTTONUP`. The sequence was a
+move to the top edge (the badge reveals after 1.2 s there), a move onto the button,
+and **one** click.
+
+| check | evidence |
+|---|---|
+| one click → the device's word, first | the agent: `viewee requested disconnect via overlay badge` 09:38:04.639Z, then `host disconnect: told the server … reason="host_disconnect" grace_ms=1000` **+1.0 ms**, then the hub's echo `reason=HostDisconnect` +30 ms, then `PC state change … Closed` **+1.031 s** (the grace) |
+| the viewer is told | `rc:terminate reason=host_disconnect`; the notice "The person at the device ended the session."; the phase chip `closed`; **nothing** sent by the viewer after the click |
+| stays disconnected ≥ 60 s | **67 s**: 0 `rc:session.request`, 0 outgoing frames of any kind, the notice still shown. The agent's last peer state change in the window is that session's `Closed` |
+| the audit | `session_requested → consent_prompted → consent_granted → session_started → session_ended: host_disconnect` |
+| Reconnect is an explicit act | one click: `rc:session.request` +39 ms, a **new** session, connected in **1.37 s**, the notice gone |
+| an ordinary drop, after all of the above | the app's own signalling socket was killed mid-session (`forceRedial()` on its ws store, which closes the live socket and dials a new one). The viewer re-created the session by itself: `rc:terminate controller_hangup` for the dead one, a new request, connected **0.95 s** after the cut, no click, no notice |
+
+The run ended with the viewer's own Disconnect (`controller_hangup` both ways), and the
+tab was closed. The badge's Disconnect, the companion banner's and the ordinary-drop
+ladder now all have field evidence. Only the Linux companion banner has not been
+exercised separately.
