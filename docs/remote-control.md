@@ -851,7 +851,11 @@ Ordinary drops are untouched: `agent_disconnect` and `error` still
 re-create the session, as do a failed peer and a control channel that closes
 mid-session (the S3 ladder in `useRemoteControl.ts`, `scheduleReconnect`).
 Reconnecting after a host Disconnect is an explicit click and a **new**
-request, through consent like any other.
+request, through consent like any other. It is the notice's **only** action.
+Break-glass ("Force control") is not offered there: the person's Disconnect is an
+explicit stop, and an override as the suggested next step would undercut it
+(operator decision, 2026-10-10). Break-glass itself is unchanged. It is still on a
+fresh page, still needs a reason, and is still audited and notified to the owner.
 
 **Measured** on the macOS banner, 2026-10-09, agent 0.4.121 with the P10 image
 (the FR-27 field log):
