@@ -135,6 +135,13 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .get("may_record")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // #1882 — the device's `AccessPolicy.rc_overlay`, resolved by
+                // the same ORIGIN-pod gate. Absent (an older pod) reads OFF,
+                // the policy's own default.
+                let rc_overlay = body
+                    .get("rc_overlay")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -192,6 +199,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     input_mode,
                     tenant_name,
                     may_record,
+                    rc_overlay,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -329,6 +337,8 @@ pub async fn relay_rc_frame(
     // FR-85 P3 — the origin pod ran the authz gate; the owner pod's hub
     // strips RECORD without it.
     may_record: bool,
+    // #1882 — resolved by the same gate; the owner pod reads absent as off.
+    rc_overlay: bool,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -347,6 +357,7 @@ pub async fn relay_rc_frame(
         "input_mode": input_mode,
         "tenant_name": tenant_name,
         "may_record": may_record,
+        "rc_overlay": rc_overlay,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {

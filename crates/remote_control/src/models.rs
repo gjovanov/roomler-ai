@@ -851,9 +851,29 @@ pub struct AccessPolicy {
     /// deserialize to `None` via the default.
     #[serde(default)]
     pub input_mode: Option<InputMode>,
+    /// #1882 — may a remote-desktop session ride the WireGuard overlay?
+    ///
+    /// `None`/`false` (the default, and every row older than the field): no.
+    /// The agent keeps every overlay address out of the session's ICE — its
+    /// own overlay interface, a browser candidate on a mesh address, and the
+    /// loopback-TURN relay the Hub would otherwise hand it — so the media
+    /// takes a LAN, srflx or TURN pair. `true` restores the behaviour from
+    /// before the field: whichever pair ICE finds best, overlay included.
+    ///
+    /// Off by default because a session on the overlay inherits the
+    /// overlay's failure modes (#1856: a 3 ms route hole on macOS killed
+    /// sessions) and hides its carrier from rate control: a pair the mesh
+    /// carries over DERP/TCP reads as a direct host pair.
+    #[serde(default)]
+    pub rc_overlay: Option<bool>,
 }
 
 impl AccessPolicy {
+    /// #1882 — [`Self::rc_overlay`] resolved: off unless explicitly on.
+    pub fn rc_overlay_allowed(&self) -> bool {
+        self.rc_overlay.unwrap_or(false)
+    }
+
     /// Effective consent mode for a NON-owner controller: the per-device mode,
     /// or the system default (`Prompt` = attended) when unset.
     pub fn effective_consent_mode(&self) -> ConsentMode {
@@ -4292,6 +4312,37 @@ impl BlockList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1882 — every policy row written before `rc_overlay` existed must read
+    /// OFF: the default is the whole point, and it has to hold for the rows
+    /// already in Mongo, not just for `AccessPolicy::default()`.
+    #[test]
+    fn rc_overlay_is_off_unless_a_row_says_on() {
+        let old: AccessPolicy = bson::from_document(bson::doc! {
+            "consent_mode": "auto",
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "auto_terminate_idle_minutes": null,
+        })
+        .expect("a pre-#1882 row deserialises");
+        assert_eq!(old.rc_overlay, None);
+        assert!(!old.rc_overlay_allowed());
+        assert!(!AccessPolicy::default().rc_overlay_allowed());
+
+        let on = AccessPolicy {
+            rc_overlay: Some(true),
+            ..Default::default()
+        };
+        let back: AccessPolicy =
+            bson::from_document(bson::to_document(&on).expect("serialises")).expect("round-trips");
+        assert!(back.rc_overlay_allowed());
+
+        let off = AccessPolicy {
+            rc_overlay: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.rc_overlay_allowed());
+    }
 
     /// FR-51 — a device row written before the ephemeral fields existed must
     /// deserialise PERMANENT. This is the property that makes enabling the
