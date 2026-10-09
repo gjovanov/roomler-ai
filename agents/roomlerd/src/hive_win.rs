@@ -1574,6 +1574,36 @@ mod tests {
         s
     }
 
+    /// How the system writes `sid` back in SDDL: by its alias where it has one.
+    /// CI's runner signs in as the built-in Administrator, which comes back as
+    /// `LA`, never as its `S-1-5-21-…-500`. Asked of the system, so no rule
+    /// for which accounts have an alias is guessed here.
+    fn as_written(sid: &str) -> String {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let sd = Sddl::new(&format!("O:{sid}")).unwrap();
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a descriptor `sd` owns; `text` is LocalAlloc'd, freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd.psd,
+                1,
+                OWNER_SECURITY_INFORMATION,
+                &mut text,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok, 0,
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW"
+        );
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        // SAFETY: `len` units were just read from `text`.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: the one allocation above, freed once.
+        unsafe { LocalFree(text as _) };
+        s.trim_start_matches("O:").to_string()
+    }
+
     /// P1i-2 — a session's directory is made with exactly its DACL, protected
     /// from what its parent would hand down, and given it again when it is
     /// there already; and a junction where it goes is refused, not followed.
@@ -1581,6 +1611,7 @@ mod tests {
     fn a_session_directory_carries_its_dacl_and_a_junction_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let me = own_sid().unwrap();
+        let shown = as_written(&me);
         let dir = root.path().join("s1");
         dir_with_dacl(&dir, &session_dir_sddl(&me)).unwrap();
         let sddl = dacl_of(&dir);
@@ -1589,7 +1620,7 @@ mod tests {
             "owned by Administrators, protected: {sddl}"
         );
         assert!(
-            sddl.contains(&format!(";;;{me})")),
+            sddl.contains(&format!(";;;{shown})")),
             "the session's account: {sddl}"
         );
         assert!(sddl.contains(";;;SY)") && sddl.contains(";;;BA)"), "{sddl}");
@@ -1600,14 +1631,17 @@ mod tests {
 
         // Again over the one already there, with another DACL.
         dir_with_dacl(&dir, PRIVATE_DIR_SDDL).unwrap();
-        assert!(!dacl_of(&dir).contains(&me), "the account's grant is gone");
+        assert!(
+            !dacl_of(&dir).contains(&format!(";;;{shown})")),
+            "the account's grant is gone"
+        );
 
         // A folder someone else made first, and owns: taken over, owner and
         // all, since an owner keeps WRITE_DAC whatever the DACL says.
         let squatted = root.path().join("s0");
         dir_with_dacl(&squatted, &format!("O:{me}D:P(A;OICI;FA;;;{me})")).unwrap();
         assert!(
-            dacl_of(&squatted).starts_with(&format!("O:{me}")),
+            dacl_of(&squatted).starts_with(&format!("O:{shown}D:")),
             "the squatter owns it"
         );
         dir_with_dacl(&squatted, PRIVATE_DIR_SDDL).unwrap();
@@ -1617,7 +1651,7 @@ mod tests {
             "Administrators own it now: {taken}"
         );
         assert!(
-            !taken.contains(&me),
+            !taken.contains(&format!(";;;{shown})")),
             "and the squatter has nothing: {taken}"
         );
 
