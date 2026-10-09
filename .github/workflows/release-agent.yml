@@ -1281,9 +1281,12 @@ jobs:
         # (config `overlay_enabled`).
         # `full-hw` includes `audio` (via `full`) → cpal WASAPI loopback (no
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
+        # `hive` (FR-90 P1i-3): agent sessions, run as the user signed in at
+        # the console, at Medium. Inert until a device's owner sets
+        # `hive_enabled`; a device that never does keeps nothing for them.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full-hw,hive,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
