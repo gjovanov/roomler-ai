@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) in review · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) merged; P1i-0 (Windows sessions' design) in review · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -393,6 +393,40 @@ every process.
 ⚠️ CI gains a macOS step (`cargo check` and `cargo test -- hive::` with `--features hive`).
 Before it, the supervisor had never compiled for a Mac. The run on a real Mac is P1h-3.
 
+**P1i, sessions on Windows, as designed.** Design §0.1 (D2) and §4.2: a Windows device runs a
+session as the user signed in at the console, never as SYSTEM and never as anyone else. With
+nobody signed in it refuses `no_console_user` (already on the wire since P0b). The supervisor P0–P1h
+built is Unix-shaped at the points below. Each gets a Windows counterpart built from code the
+daemon already ships. `cfg(hive_host)` grows to Windows only once all of them are in, and the
+Windows release build gains `hive` last (P1i-3), so a half-built launcher never answers a start.
+
+```mermaid
+flowchart TD
+    S["rc:hive.start: the gates as on Linux"] --> C{"someone signed in<br/>at the console?"}
+    C -- no --> N["refused no_console_user"]
+    C -- yes --> M{"hive_accounts maps the starter<br/>to THAT user?"}
+    M -- no --> A["refused no_account,<br/>naming who is at the console"]
+    M -- yes --> P["roomlerd hive-prep, as the user:<br/>the config dir, core memory copied in"]
+    P --> L["CreateProcessAsUserW, suspended:<br/>three pipes, the user's environment<br/>plus the session's variables"]
+    L --> J["into the session's Job Object<br/>(KILL_ON_JOB_CLOSE), then resumed"]
+    J --> R["Claude Code: stream-json over the pipes,<br/>its toolbelt over a named pipe"]
+```
+
+| Unix (P0–P1h) | Windows (P1i) | Built from |
+|---|---|---|
+| `apply_run_as` (setuid) and the `/bin/sh` wrapper | the console session's token: `WTSGetActiveConsoleSessionId` → `WTSQueryUserToken` (the daemon must be SYSTEM) → `CreateProcessAsUserW` with stdin, stdout and stderr piped, and the user's environment block plus the session's variables (`CLAUDE_CONFIG_DIR`, the sidecar's URL and token) | `win_service/supervisor.rs` `spawn_in_session_captured` (FR-89's exec streams), which gains extra variables and a suspended start |
+| the account `hive_accounts` maps the starter to | the map must name the console user (`user` or `DOMAIN\user`, case-insensitive). A starter mapped to anyone else is refused `no_account`, and the refusal says who is at the console | `hive/gates.rs` `account_for` |
+| the wrapper, run as the account: the config dir, the core-memory copy into an empty place | `roomlerd hive-prep`, a hidden subcommand the daemon runs as the console user and waits for, doing exactly that | new, small |
+| the harness: `hive_harness`, else `~/.local/bin/claude` and the system paths | `hive_harness`, else the native installer's `%USERPROFILE%\.local\bin\claude.exe`, else npm's `%APPDATA%\npm\claude.cmd` (run through `cmd /c`, inside the same job) | `hive/supervisor.rs` `resolve_harness` |
+| the harness's process group (`process_group(0)`, `kill(-pgid)`) | a Job Object per harness with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The harness is created suspended and assigned before it runs, so none of its tools escapes. `wind_down` and a stop end the job; a crash's leftover is found by pid and creation time | `pty/windows.rs` (the PTY's job) |
+| the toolbelt's Unix socket, the account's, the peer's uid checked | a named pipe `\\.\pipe\roomler-hive-<session>-<nonce>`, created with `FILE_FLAG_FIRST_PIPE_INSTANCE` and a DACL of SYSTEM plus the console user's SID. The client's token is checked on connect | the LocalAPI pipe (`crates/localapi`), `recording/launch.rs` |
+| `procs::started`: the boot id and `/proc` start time | `GetProcessTimes`'s creation time | new |
+| `/run/roomler-hive/<session>` (settings, MCP config) | `%ProgramData%\Roomler\hive\run\<session>`, SYSTEM's, with read for the console user | new |
+| the update wait (P1d-1) | the same `wait_for_agent_turns` in the in-process MSI updater, once `hive_host` covers Windows | `updater.rs` |
+
+Not in P1i: `adopt` on Windows (the hooks CLI refuses there), and a session for anyone but the
+console user. There is no S4U and no `LogonUser`: the daemon "will not ask for" credentials.
+
 ### 3e. Toolbelt, vault, knowhow
 
 The `roomler` MCP server per session (over a per-session socket or pipe, not the main LocalAPI):
@@ -650,9 +684,13 @@ What each rule is, and where it lives:
 | P1g | the org gate (§3g "P1g … as built"): `hive.tenants`, the organizations agent sessions serve; every route, the viewer and a connecting device answer an unserved one as if the module were not there for it; `GET …/hive` for the SPA | `hive.tenants` empty (every org), and the module switch itself | **merged** #1879 `f3fcfd956` |
 | P1g-2 | the list is the switch (§3g): a non-empty `hive.tenants` mounts the module with no `[modules] hive`, and `/api/capabilities` reports it — so an older image leaves the pillar off instead of open to every organization | clearing `hive.tenants` | **merged** #1887 `6c9be55c5`; on prod since 2026-10-09 (`hosted-20261009-6c9be55`), serving the test org only (§8) |
 | P1h-1 | sessions on macOS, the build (§3d "P1h-1 … as built"): the supervisor, toolbelt, sidecar and viewer compile for macOS (`cfg(hive_host)`); the harness's macOS paths; the daemon takes its harnesses down when it leaves, which launchd does not; a harness a crash left running is reaped before the resume; a macOS CI step | device `hive_enabled = false`, the default | **merged** #1888 `16d98a451` |
-| P1h-2 | the macOS update helper waits for running turns (AC7 there), and `hive` in the release builds for Linux and macOS: every gate stays the device's, default-deny | the feature itself; device `hive_enabled = false` | in review |
+| P1h-2 | the macOS update helper waits for running turns (AC7 there), and `hive` in the release builds for Linux and macOS: every gate stays the device's, default-deny | the feature itself; device `hive_enabled = false` | **merged** #1900 `f9d5db0b3` |
 | P1h-3 | the field run on a Mac in the test org on prod (decision 10): AC3, AC7 and AC20 on macOS | device `hive_enabled = false`, the default | — |
-| P1i | sessions on Windows, as the console user only (design §0.1): the user's token from the active console session, the toolbelt over a named pipe, the account's copy of core memory done as the user; refused `no_console_user` with nobody signed in (AC13) | device `hive_enabled = false`, the default | — |
+| P1i-0 | Windows sessions' design (§3d "P1i … as designed"): the console user only; each Unix-shaped point and its Windows counterpart | docs only | in review |
+| P1i-1 | the launcher and its refusals (`no_console_user`, the console-user mapping), `roomlerd hive-prep`, the suspended start into a Job Object, `resolve_harness` on Windows; compiled and unit-tested on Windows CI | `hive` not in the Windows release build; device `hive_enabled = false` | — |
+| P1i-2 | the toolbelt over a named pipe; take-down and a crash's leftover by Job Object and creation time; the resume (`hosted.json`) on Windows | the same | — |
+| P1i-3 | `hive` in the Windows release build | device `hive_enabled = false`, the default | — |
+| P1i-4 | the field run on a Windows VM in the test org: AC3, AC7 and AC20 on Windows | — | — |
 | P1j-1 | `adopt`, the server (§3h): `rc:hive.adopt` → `rc:hive.adopt_ack`, `RpcCap::HiveAdopt` (`hive-adopt`, equality-matched), the record with `origin: adopted` and no title, the keys resolved to exactly one member, the same record for a repeated offer, no drivers (a 409), the audit (`action: adopt`) | a device's `hive_adopt` (P1j-2), and the org gate | **merged** #1890 `27628762d` |
 | P1j-2 | `adopt`, the device (§3h): `hive_adopt` (never pushable), the adopt socket and its protocol (`localapi::hive_adopt`), the peer's account from the kernel, the account's keys, the transcript JSONL into the store, turn stubs, the liveness sweep, the manifest, the stop, the viewer on `hive_adopt` alone | device `hive_adopt = false`, the default | **merged** #1891 `d4274ee92` |
 | P1j-3 | `roomler hive adopt` · `unadopt` · `hook` (§3h): the person's own user-level hooks, merged and removed exactly; the hook streams what it reads, whole lines only; the hook client and the daemon tested together | the person's own settings | **merged** #1892 `c0b8f68ad`, with finding (1) of P1j-5's field run |
