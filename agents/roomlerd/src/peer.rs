@@ -1403,7 +1403,18 @@ impl AgentPeer {
             .context("add_ice_candidate")
     }
 
-    pub async fn close(&self) {
+    /// Stop SERVING this session without closing its transport: the channel
+    /// handlers let go (clipboard, files, the cursor), the media pumps stop,
+    /// and the input arbiter forgets the session, so its next event is denied
+    /// and any key or button it holds is released. No channel closes, so the
+    /// browser sees nothing yet.
+    ///
+    /// FR-27 P10 — the host's Disconnect calls this at the click, then keeps
+    /// the bare connection for a grace so the server's word reaches the
+    /// viewer before the peer dies. Without it the grace was a window in
+    /// which the controller still drove the machine its owner had just taken
+    /// back. Idempotent: [`Self::close`] and the drop repeat every step.
+    pub fn stop_serving(&self) {
         // First: the channel handlers let go whatever the channels do next.
         self.session_end.cancel();
         if let Some(pump) = &self.media_pump {
@@ -1416,6 +1427,11 @@ impl AgentPeer {
         if let Some(reader) = &self.rtcp_reader {
             reader.abort();
         }
+        crate::input::arbiter::global().session_closed(self.session_id);
+    }
+
+    pub async fn close(&self) {
+        self.stop_serving();
         if let Err(e) = self.pc.close().await {
             warn!(session = %self.session_id, %e, "PC close failed");
         }
