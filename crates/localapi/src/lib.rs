@@ -3126,15 +3126,17 @@ pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
 /// as them (#1911). This socket gives them exactly that and nothing more:
 /// - it lives in THEIR runtime dir, which logind created and they own — this
 ///   function never creates it, and refuses a dir owned by anyone else;
-/// - it is theirs, 0600: chmod first while root still owns it, then chown,
-///   so there is no moment another account could open it;
+/// - it is made AS THEM ([`bind_as_person`]), so it is theirs and 0600 from
+///   the start, and no path operation runs with root's rights in their dir;
 /// - every connection's `SO_PEERCRED` uid must be theirs or root
-///   ([`person_peer_ok`]);
+///   ([`person_peer_ok`]) — that check, not the file's mode, is what keeps
+///   every other account out;
 /// - every request goes through [`Scope::Person`] ([`person_may`]).
 ///
 /// ⚠️ It never replaces a LIVE socket at that path (a per-user daemon of the
 /// same person would own it), removes a stale file only if it IS a socket,
-/// and on the way out removes only the inode it bound.
+/// and on the way out unlinks only the entry it bound (`lstat`, never
+/// following a link).
 #[cfg(target_os = "linux")]
 pub async fn serve_person_socket(
     path: std::path::PathBuf,
@@ -3143,7 +3145,7 @@ pub async fn serve_person_socket(
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     use tokio::net::UnixListener;
 
     if *stop.borrow() {
@@ -3162,25 +3164,14 @@ pub async fn serve_person_socket(
             ),
         ));
     }
-    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-        return Err(Error::new(
-            ErrorKind::AddrInUse,
-            format!("{} is already served by another process", path.display()),
-        ));
-    }
-    if let Ok(m) = std::fs::symlink_metadata(&path) {
-        if !m.file_type().is_socket() {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                format!("{} exists and is not a socket", path.display()),
-            ));
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    std::os::unix::fs::chown(&path, Some(owner_uid), None)?;
-    let bound_ino = std::fs::metadata(&path)?.ino();
+    let owner_gid = dir_meta.gid();
+    let bind_path = path.clone();
+    let (std_listener, bound_ino) =
+        tokio::task::spawn_blocking(move || bind_as_person(&bind_path, owner_uid, owner_gid))
+            .await
+            .map_err(|e| Error::other(format!("person socket: the bind task failed: {e}")))??;
+    std_listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(std_listener)?;
     tracing::info!(
         path = %path.display(), uid = owner_uid,
         "localapi: person-at-the-device socket up (FR-27 P11)"
@@ -3220,11 +3211,92 @@ pub async fn serve_person_socket(
             }
         }
     };
-    if matches!(std::fs::metadata(&path), Ok(m) if m.ino() == bound_ino) {
+    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
         let _ = std::fs::remove_file(&path);
     }
     tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
     served
+}
+
+/// FR-27 P11 — make the person socket AS the person: check the path, clear a
+/// stale socket, bind, and chmod 0600, all with THIS thread's filesystem ids
+/// switched to theirs. Returns the listener and the inode it bound.
+///
+/// ⚠️ Load-bearing, not tidiness. The socket's directory belongs to the
+/// person, so they can swap its entry between any two calls the daemon makes
+/// on the PATH, and `chmod` and `chown` follow symlinks. A root daemon that
+/// bound the socket and then chown'ed the path could be raced into handing
+/// them `/etc/shadow`. With `setfsuid`/`setfsgid` (per-thread on Linux; glibc
+/// broadcasts only the POSIX set*id calls to every thread) the socket is born
+/// theirs, so there is no chown at all, and whatever a swapped entry
+/// redirects to is reached with THEIR rights, i.e. only what they already
+/// own. The previous ids are restored on every way out, error and panic
+/// included, before this blocking-pool thread serves anything else.
+#[cfg(target_os = "linux")]
+fn bind_as_person(
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    struct Restore {
+        uid: u32,
+        gid: u32,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: setfsuid/setfsgid change only this thread's filesystem
+            // ids. The uid first, which brings back the filesystem
+            // capabilities a non-zero fsuid drops.
+            unsafe {
+                libc::setfsuid(self.uid);
+                libc::setfsgid(self.gid);
+            }
+        }
+    }
+    // SAFETY: as above. The group first, while the fsuid is still ours.
+    let prev_gid = unsafe { libc::setfsgid(gid) } as u32;
+    let prev_uid = unsafe { libc::setfsuid(uid) } as u32;
+    let _restore = Restore {
+        uid: prev_uid,
+        gid: prev_gid,
+    };
+    // Both calls report the PREVIOUS id and fail silently; an invalid id
+    // changes nothing and reports the current one, which proves the switch.
+    // SAFETY: as above.
+    let (now_uid, now_gid) = unsafe {
+        (
+            libc::setfsuid(u32::MAX) as u32,
+            libc::setfsgid(u32::MAX) as u32,
+        )
+    };
+    if now_uid != uid || now_gid != gid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("could not act as uid {uid} to make its person socket"),
+        ));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!("{} is already served by another process", path.display()),
+        ));
+    }
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        std::fs::remove_file(path)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let ino = std::fs::symlink_metadata(path)?.ino();
+    Ok((listener, ino))
 }
 
 // ---------------------------------------------------------------------------
