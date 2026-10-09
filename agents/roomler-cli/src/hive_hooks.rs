@@ -24,7 +24,9 @@ use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Value, json};
-use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent, Reply, Request};
+use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent};
+#[cfg(unix)]
+use tunnel_core::localapi::hive_adopt::{Reply, Request};
 
 /// An object whose values are kept exactly as written.
 type Obj = IndexMap<String, Box<RawValue>>;
