@@ -108,7 +108,7 @@
       <!-- FR-90 — an agent session's room: its transcript, streamed from the
            device over a viewer peer (the server holds only the stubs above). -->
       <div v-if="hiveSessionId && showTranscript" class="chat-side-panel hive-panel border-s d-flex flex-column">
-        <hive-transcript :tenant-id="tenantId" :session-id="hiveSessionId" />
+        <hive-transcript :tenant-id="tenantId" :session-id="hiveSessionId" :adopted="hiveAdopted" />
       </div>
 
       <!-- Thread panel -->
@@ -196,6 +196,7 @@ import type { MentionData } from '@/components/chat/MessageEditor.vue'
 import type { MentionItem } from '@/components/chat/MentionList.vue'
 import MemberPanel from '@/components/chat/MemberPanel.vue'
 import HiveTranscript from '@/components/hive/HiveTranscript.vue'
+import { isAdopted, useHiveStore } from '@/stores/hive'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
@@ -228,6 +229,18 @@ const hiveSessionId = computed(() => {
   return b?.module === 'hive' ? b.ref : null
 })
 const showTranscript = ref(true)
+// FR-90 P1j — an adopted session (a terminal's) is read-only: the panel says
+// so, and its People dialog takes readers only. Read from the record; a
+// failed read leaves it a started session, which the server enforces anyway.
+const hive = useHiveStore()
+const hiveAdopted = computed(() => isAdopted(hive.sessions.find((s) => s.id === hiveSessionId.value)))
+watch(
+  hiveSessionId,
+  (sid) => {
+    if (sid && tenantId.value) hive.fetchSession(tenantId.value, sid).catch(() => {})
+  },
+  { immediate: true },
+)
 const showEmojiPicker = ref(false)
 const showGiphyPicker = ref(false)
 const emojiTarget = ref<'editor' | 'thread'>('editor')
