@@ -49,7 +49,9 @@
       </div>
       <div v-for="e in visible" :key="e.seq" class="hive-event mb-2" :data-kind="e.event.kind">
         <template v-if="e.event.kind === 'user_message'">
-          <div class="text-caption text-medium-emphasis">{{ asText(e.event.author) || $t('hive.viewer.someone') }}</div>
+          <div class="text-caption text-medium-emphasis">
+            {{ asText(e.event.author) || (adopted ? $t('hive.viewer.inTerminal') : $t('hive.viewer.someone')) }}
+          </div>
           <div class="hive-prompt pa-2 rounded">{{ asText(e.event.text) }}</div>
         </template>
         <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown is the sanitising boundary -->

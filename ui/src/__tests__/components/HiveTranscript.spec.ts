@@ -242,6 +242,16 @@ describe('HiveTranscript — who drives (FR-90 P1c)', () => {
     )
   })
 
+  it('names the terminal as who typed an adopted session’s prompt; elsewhere an unknown author is someone', async () => {
+    const prompt = { kind: 'user_message', text: 'tidy the build' }
+    hoisted.viewer = makeViewer([prompt], [], false)
+    const adopted = await render({ adopted: true })
+    expect(adopted.find('.hive-event[data-kind="user_message"] .text-caption').text()).toBe('In the terminal')
+    hoisted.viewer = makeViewer([prompt], [], false)
+    const started = await render()
+    expect(started.find('.hive-event[data-kind="user_message"] .text-caption').text()).toBe('Someone')
+  })
+
   it("says in the device's words why a driver the server named cannot act there", async () => {
     hoisted.viewer = makeViewer([], [], false)
     hoisted.viewer.drivingRefused.value = "this device's hive_accounts maps you to no account"
