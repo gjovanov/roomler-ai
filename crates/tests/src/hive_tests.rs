@@ -3264,3 +3264,223 @@ async fn a_re_sent_start_carries_the_same_snapshot_first() {
             .contains("ORG-FACT-TWO")
     );
 }
+
+// ─── P1j — terminal sessions a person adopted (`rc:hive.adopt`) ─────────────
+
+/// The device offers a terminal session; the server's answer.
+async fn adopt(ws: &mut AgentWs, adopt_id: &str, harness_session: &str, keys: &[&str]) -> Value {
+    send(
+        ws,
+        json!({
+            "t": "rc:hive.adopt",
+            "adopt_id": adopt_id,
+            "harness_session": harness_session,
+            "keys": keys,
+            "account": "alice",
+            "folder": "/home/alice/client-x",
+        }),
+    )
+    .await;
+    let ack = read_until(ws, "rc:hive.adopt_ack")
+        .await
+        .expect("an answer to the offer");
+    assert_eq!(ack["adopt_id"], adopt_id, "{ack}");
+    ack
+}
+
+/// Decision 11 on the server: an adopted terminal session is attributed
+/// through the device's keys, never by guess; it is its owner's alone, the
+/// org's admin included; it is read-only, with readers by name and no
+/// drivers; and one terminal session is one record, however often offered.
+#[tokio::test]
+async fn an_adopted_terminal_session_is_its_owners_alone() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hiveadopt").await;
+    let (owner, admin) = (&seeded.member, &seeded.admin);
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(
+        &app,
+        &seeded,
+        "adopter",
+        &["hive", "hive-view", "hive-adopt"],
+    )
+    .await;
+
+    let uuid = "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f70";
+    let ack = adopt(&mut dev.ws, "a1", uuid, &[&owner.email]).await;
+    assert!(ack.get("refused").is_none(), "{ack}");
+    assert_eq!(ack["fence"], 1);
+    let sid = ack["session_id"].as_str().unwrap().to_string();
+
+    // Its owner's: read-only, named after its folder (no title is offered).
+    let (code, s) = get_session(&app, &tid, &owner.access_token, &sid).await;
+    assert_eq!(code, 200, "{s}");
+    assert_eq!(
+        (
+            s["origin"].clone(),
+            s["status"].clone(),
+            s["title"].clone(),
+            s["account"].clone()
+        ),
+        (
+            json!("adopted"),
+            json!("idle"),
+            json!("client-x"),
+            json!("alice")
+        ),
+        "{s}"
+    );
+    let row = stored(&app, &sid).await;
+    assert_eq!(row.get_str("origin").unwrap(), "adopted");
+    // Nobody else's — the org's admin included.
+    let (code, _) = get_session(&app, &tid, &admin.access_token, &sid).await;
+    assert_eq!(code, 404, "an admin does not read someone's terminal");
+
+    // No drivers, even ones the org trusts; readers by name.
+    let (code, body) = set_part(&app, &tid, &owner.access_token, &sid, &admin.id, "driver").await;
+    assert_eq!(code, 409, "{body}");
+    let (code, body) = set_part(&app, &tid, &owner.access_token, &sid, &admin.id, "reader").await;
+    assert_eq!(code, 200, "{body}");
+    let (code, _) = get_session(&app, &tid, &admin.access_token, &sid).await;
+    assert_eq!(code, 200, "a reader the owner named reads it");
+
+    // The same terminal offered again — a restart, a lost ack: the same record.
+    let again = adopt(&mut dev.ws, "a2", uuid, &[&owner.email]).await;
+    assert_eq!(again["session_id"], sid.as_str(), "{again}");
+
+    // Attributed by the keys, never by guess.
+    let two = adopt(
+        &mut dev.ws,
+        "a3",
+        "11111111-2222-3333-4444-555555555555",
+        &[&owner.email, &admin.email],
+    )
+    .await;
+    assert_eq!(
+        two["refused"], "ambiguous_account",
+        "two people behind one account: {two}"
+    );
+    let nobody = adopt(
+        &mut dev.ws,
+        "a4",
+        "22222222-2222-3333-4444-555555555555",
+        &["nobody@example.com"],
+    )
+    .await;
+    assert_eq!(nobody["refused"], "no_account", "{nobody}");
+    let placeholder = format!("{}.invalid", owner.email);
+    let unproven = adopt(
+        &mut dev.ws,
+        "a5",
+        "33333333-2222-3333-4444-555555555555",
+        &[&placeholder],
+    )
+    .await;
+    assert_eq!(
+        unproven["refused"], "no_account",
+        "a placeholder names nobody: {unproven}"
+    );
+    let elsewhere = app.seed_tenant("hiveadopt2").await;
+    let foreign = adopt(
+        &mut dev.ws,
+        "a6",
+        "44444444-2222-3333-4444-555555555555",
+        &[&elsewhere.member.email],
+    )
+    .await;
+    assert_eq!(foreign["refused"], "not_a_member", "{foreign}");
+    // By user id, and an address in another case, both name the owner.
+    let by_id = adopt(
+        &mut dev.ws,
+        "a7",
+        "55555555-2222-3333-4444-555555555555",
+        &[&owner.id],
+    )
+    .await;
+    assert!(by_id.get("refused").is_none(), "{by_id}");
+    let upper = owner.email.to_ascii_uppercase();
+    let by_case = adopt(
+        &mut dev.ws,
+        "a8",
+        "66666666-2222-3333-4444-555555555555",
+        &[&upper],
+    )
+    .await;
+    assert!(by_case.get("refused").is_none(), "{by_case}");
+
+    // The device's owner remapped the account: the same terminal session now
+    // names someone else. Its record ends; nothing more is mirrored into it.
+    let remapped_sid = by_id["session_id"].as_str().unwrap().to_string();
+    let moved = adopt(
+        &mut dev.ws,
+        "a9",
+        "55555555-2222-3333-4444-555555555555",
+        &[&admin.email],
+    )
+    .await;
+    assert_eq!(moved["refused"], "ambiguous_account", "{moved}");
+    let row = stored(&app, &remapped_sid).await;
+    assert_eq!(
+        (
+            row.get_str("status").unwrap(),
+            row.get_str("end_reason").unwrap()
+        ),
+        ("ended", "attribution_changed"),
+        "the record held for the old owner ends"
+    );
+
+    // The device's reports move it like any session's.
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "ended", "detail": "the terminal closed"}),
+    )
+    .await;
+    let s = wait_status(&app, &tid, &owner.access_token, &sid, "ended").await;
+    assert_eq!(s["origin"], "adopted", "{s}");
+}
+
+/// The gates before attribution: a device that did not say it adopts is not
+/// answered at all, and an org agent sessions do not serve is refused in
+/// those words.
+#[tokio::test]
+async fn an_adopt_offer_passes_the_device_and_org_gates_first() {
+    let first = hive_app().await;
+    let a = first.seed_tenant("hiveadoptgate").await;
+    let b = first.seed_tenant("hiveadoptother").await;
+    // Hive serves B only.
+    let app = serving_only(&first, &b.tenant_id).await;
+
+    let mut quiet = device(&app, &a, "noadopt", &["hive", "hive-view"]).await;
+    send(
+        &mut quiet.ws,
+        json!({
+            "t": "rc:hive.adopt", "adopt_id": "q1",
+            "harness_session": "77777777-2222-3333-4444-555555555555",
+            "keys": [a.member.email.clone()], "account": "alice", "folder": "/home/alice/x",
+        }),
+    )
+    .await;
+    assert!(
+        read_until(&mut quiet.ws, "rc:hive.adopt_ack")
+            .await
+            .is_none(),
+        "a device that did not advertise hive-adopt is not answered"
+    );
+
+    let mut unserved = device(&app, &a, "adopter2", &["hive", "hive-view", "hive-adopt"]).await;
+    let ack = adopt(
+        &mut unserved.ws,
+        "u1",
+        "88888888-2222-3333-4444-555555555555",
+        &[&a.member.email],
+    )
+    .await;
+    assert_eq!(ack["refused"], "hive_not_enabled", "{ack}");
+    let none = app
+        .db
+        .collection::<Document>("agent_sessions")
+        .count_documents(doc! { "origin": "adopted" })
+        .await
+        .unwrap();
+    assert_eq!(none, 0, "no record for a refused or unanswered offer");
+}

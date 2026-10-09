@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) in review · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) in review · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -540,6 +540,61 @@ flowchart LR
 | a malformed entry | logged, and it matches nothing: a typo shuts the org it meant rather than opening any other | `scope.rs` `TenantScope::parse` |
 | the module switch | a list mounts the module by itself (`*` included); an image that predates P1g-2 leaves it unmounted | `settings.rs` `Settings::hive_on`, `Settings::switched_off` |
 
+### 3h. Adopting terminal sessions (P1j)
+
+People already run Claude Code in a terminal. `adopt` mirrors those sessions into the device's
+store and lists them for their owner as read-only sessions (decision 11, design §10.8). A
+terminal session passed none of Hive's start gates (`HIVE_RUN`, `hive_enabled`, `hive_roots`):
+it is the person's own work, in their own account. So the gates are different ones, each
+default-deny, and each owned by a different party.
+
+```mermaid
+sequenceDiagram
+    participant T as Claude Code<br/>(a terminal, as the account)
+    participant H as roomler hive hook<br/>(as the account)
+    participant D as roomlerd<br/>(root / SYSTEM)
+    participant S as server (hive)
+    T->>H: SessionStart {session_id, transcript_path, cwd}
+    H->>D: the adopt socket: start {harness session, cwd}
+    Note over D: hive_adopt on?<br/>the peer's uid → its account → the hive_accounts keys for it
+    D->>S: rc:hive.adopt {adopt_id, harness_session, keys, account, folder}
+    S-->>D: rc:hive.adopt_ack {session_id, fence} or {refused}
+    loop every turn
+        T->>H: Stop
+        H->>D: the transcript's new lines, read AS the account
+        D->>D: the session's chain in the store
+        D->>S: rc:hive.turn (metadata only)
+    end
+    T->>H: SessionEnd
+    H->>D: the rest, and the end
+    D->>S: rc:hive.state ended
+```
+
+| Gate | Owner | Default | A refusal |
+|---|---|---|---|
+| the hooks are installed | the person, in their own user-level Claude Code settings (`roomler hive adopt`) | not installed | nothing is mirrored |
+| `hive_adopt` | the device's owner: a device key, never pushable, advertised as `hive-adopt` | off | nothing reaches the server; an offer from a connection without `hive-adopt` is dropped unanswered |
+| the org is served | the server (`hive.tenants`, P1g) | — | `hive_not_enabled` |
+| the account names ONE person, a member | the device's `hive_accounts`, resolved by the server | — | `no_account` (no key names anyone) · `ambiguous_account` (two people) · `not_a_member` |
+| capacity, rate | the server: 16 live adopted sessions a device, 20 offers a minute | — | `at_capacity` · `rate_limited` |
+
+What each rule is, and where it lives:
+
+| Rule | Why | Where |
+|---|---|---|
+| The device sends EVERY `hive_accounts` key that maps to the account; the server resolves each (a user id, or an address some account proved) and adopts only for exactly one person | the attribution is the device owner's statement, never a guess. An account shared with a second person (decision 8's `"alice.com" = "bob"`) is `ambiguous_account`, not "the one of them who is a member", which would show one person's terminal to another | `crates/modules/hive/src/adopt.rs` `people` |
+| Every offer is attributed afresh. One for a terminal session already held is answered with the same record, for the same person only; held for someone else, that record ends `attribution_changed` | the device offers again after a restart or a lost ack, and a second record would split one terminal in two. A remap must never pour a new person's terminal into the old person's record | `adopt.rs` `decide` |
+| No drivers, the owner included: `drives_now` is false, and naming a driver is a 409; readers by name, as for any session | the terminal holds the harness, so nothing typed here could reach it | `access.rs` `drives_now`, `participants.rs` `set` |
+| The record holds no title, only the folder's name; `origin: adopted` | a terminal's first prompt is content | `model.rs` `SessionOrigin` |
+| The hook reads the transcript, never the daemon | a root daemon opening a path a hook names would read any file the requester could point it at | P1j-2 |
+| Who it is comes from the kernel (the adopt socket's peer credentials), not from the hook; root's own sessions are refused | the hook runs as whoever ran Claude Code, and says nothing that is not checked | P1j-2 |
+| Mirroring happens at every `Stop`; `SessionEnd` only flushes | Claude Code gives `SessionEnd` hooks a shared 1.5 s budget | P1j-3 |
+| `unadopt` takes out exactly what `adopt` put in; every other key and hook in the file stays, and a file that is not valid JSON is refused, never rewritten | the person's own settings, and other tools' hooks in them (this repo's own dev box carries FR-8's), are theirs | P1j-3 |
+| A terminal killed outright never says `SessionEnd`: the daemon records Claude Code's process (pid + start time) and ends a session whose process is gone (`terminal_gone`) | otherwise a crashed terminal stays "live" forever | P1j-2 |
+| The device serves an adopted session's viewer on `hive_adopt` alone, and holds no input channel for it | a device may allow adopting with `hive_enabled` off, and the viewer refused every grant on `hive_enabled` before P1j (`hive/view.rs`); `may_prompt` is false from the server, and the device refuses a prompt anyway | P1j-2 |
+
+⚠️ Its "an adopted session becomes a managed one when promoted" half needs P2's replicaset.
+
 ## 4. Phases
 
 | P | What | Kill switch | Status |
@@ -575,11 +630,15 @@ flowchart LR
 | P1f-2 | the long list (§3c "P1f-2, the long list"): following the newest, the transcript keeps at most 1,000 events, the oldest a "load earlier" away, never while someone reads further up (`content-visibility` was tried and dropped: the first scroll to the bottom landed short) | none: the device keeps every event; the window is the browser's | **merged** #1877 `48cc6d17a` (field-verified 2026-10-08, §8) |
 | P1g | the org gate (§3g "P1g … as built"): `hive.tenants`, the organizations agent sessions serve; every route, the viewer and a connecting device answer an unserved one as if the module were not there for it; `GET …/hive` for the SPA | `hive.tenants` empty (every org), and the module switch itself | **merged** #1879 `f3fcfd956` |
 | P1g-2 | the list is the switch (§3g): a non-empty `hive.tenants` mounts the module with no `[modules] hive`, and `/api/capabilities` reports it — so an older image leaves the pillar off instead of open to every organization | clearing `hive.tenants` | **merged** #1887 `6c9be55c5`; on prod since 2026-10-09 (`hosted-20261009-6c9be55`), serving the test org only (§8) |
-| P1h-1 | sessions on macOS, the build (§3d "P1h-1 … as built"): the supervisor, toolbelt, sidecar and viewer compile for macOS (`cfg(hive_host)`); the harness's macOS paths; the daemon takes its harnesses down when it leaves, which launchd does not; a harness a crash left running is reaped before the resume; a macOS CI step | device `hive_enabled = false`, the default | in review |
+| P1h-1 | sessions on macOS, the build (§3d "P1h-1 … as built"): the supervisor, toolbelt, sidecar and viewer compile for macOS (`cfg(hive_host)`); the harness's macOS paths; the daemon takes its harnesses down when it leaves, which launchd does not; a harness a crash left running is reaped before the resume; a macOS CI step | device `hive_enabled = false`, the default | **merged** #1888 `16d98a451` |
 | P1h-2 | the macOS update helper waits for running turns (AC7 there), and `hive` in the release builds for Linux and macOS: every gate stays the device's, default-deny | the feature itself; device `hive_enabled = false` | — |
 | P1h-3 | the field run on a Mac in the test org on prod (decision 10): AC3, AC7 and AC20 on macOS | device `hive_enabled = false`, the default | — |
 | P1i | sessions on Windows, as the console user only (design §0.1): the user's token from the active console session, the toolbelt over a named pipe, the account's copy of core memory done as the user; refused `no_console_user` with nobody signed in (AC13) | device `hive_enabled = false`, the default | — |
-| P1j | `adopt` (design §10.8, decision 11): a person mirrors their own terminal sessions as read-only sessions only they see, on a device whose owner allows it | device `hive_adopt = false`, the default | — |
+| P1j-1 | `adopt`, the server (§3h): `rc:hive.adopt` → `rc:hive.adopt_ack`, `RpcCap::HiveAdopt` (`hive-adopt`, equality-matched), the record with `origin: adopted` and no title, the keys resolved to exactly one member, the same record for a repeated offer, no drivers (a 409), the audit (`action: adopt`) | a device's `hive_adopt` (P1j-2), and the org gate | in review |
+| P1j-2 | `adopt`, the device: `hive_adopt` (never pushable), the adopt socket and its peer credentials, the account's keys, the transcript JSONL into the store, turn stubs, the liveness sweep, the manifest | device `hive_adopt = false`, the default | — |
+| P1j-3 | `roomler hive adopt` · `unadopt` · `hook`: the person's own user-level hooks, merged and removed exactly; the hook streams what it reads | the person's own settings | — |
+| P1j-4 | `adopt`, the UI: an adopted session is marked, has no composer, and "Stop" stops the mirroring | the server's `origin` | — |
+| P1j-5 | the field run, and AC21 | — | — |
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset: replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` | — |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
@@ -734,6 +793,10 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   - *Open: an update's restart takes the same two paths, the internal shutdown and then
     systemd's restart, but is not field-run here, because the dry run installs nothing. macOS and
     Windows are also open.*
+- [ ] **AC21:** a terminal session adopted on a device whose owner allows it (`hive_adopt`)
+  appears to its owner alone — another member, an org admin and a device manager each get a
+  404 — renders through the viewer, takes no prompt from anywhere, and an account two people
+  share is refused, never attributed by guess. *Added with P1j (decision 11, 2026-10-09).*
 
 ## 6. Open decisions
 
