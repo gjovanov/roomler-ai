@@ -72,8 +72,12 @@ ui/e2e/video/output/
 # through refs/pull/* forever. Those skills belong sanitised, or in the private
 # roomler-ai-docs repo. Do not "finish the job" by deleting this rule.
 dist/
-# Operator-supplied GeoLite2 databases — licensed data, never committed.
-files/geoip/*.mmdb
+# The image's GeoIP country database and its provenance note, staged by
+# scripts/fetch-geoip.sh before `docker build` (#1896): fetched, never
+# committed. Everything but the README, so a GeoLite2 file someone drops in
+# stays out of git too.
+files/geoip/*
+!files/geoip/README.md
 
 # Code-signing operator state + local key material (scripts/signing/).
 # The state file holds only public identifiers, but dev-cert/ holds a real

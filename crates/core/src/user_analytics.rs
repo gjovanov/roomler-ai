@@ -11,10 +11,12 @@
 //! browser family, platform, country, page.
 //!
 //! Country resolution is OPTIONAL and pluggable — point
-//! `ROOMLER__STATS__GEOIP_MMDB` at a GeoLite2/DB-IP country database and
-//! it resolves; leave it unset and every session records `unknown`. No
-//! licensed dataset is vendored into the repo, and an absent database
-//! yields an honest "we don't know" rather than a guess.
+//! `ROOMLER__STATS__GEOIP_MMDB` at a MaxMind-format country database
+//! (DB-IP, GeoLite2) and it resolves; leave it unset, or set it empty, and
+//! every session records `unknown`. The server image names DB-IP's
+//! CC BY 4.0 "IP to Country Lite" by default (#1896, `files/geoip/README.md`);
+//! no dataset is vendored into the repo, and an absent database yields an
+//! honest "we don't know" rather than a guess.
 
 use std::net::IpAddr;
 
@@ -90,10 +92,24 @@ impl GeoIp {
     /// Open the database named by `stats.geoip_mmdb`. A missing or
     /// unreadable file is logged and degrades to "no geo", because
     /// analytics must never keep the server from starting.
+    ///
+    /// An EMPTY value is an explicit "off", not a broken path. The image
+    /// names a database by default (#1896), so an operator who wants no
+    /// country lookup at all sets the variable to `""`. That must not log a
+    /// warning on every boot.
     pub fn open(path: Option<&str>) -> Self {
+        let path = path.map(str::trim).filter(|p| !p.is_empty());
         let reader = path.and_then(|p| match maxminddb::Reader::open_readfile(p) {
             Ok(r) => {
-                tracing::info!(path = %p, "geoip database loaded");
+                // WHICH database and HOW OLD: a country database goes stale
+                // month by month, and the dashboard's credit depends on whose
+                // data it is. The image's CI smoke greps this line.
+                tracing::info!(
+                    path = %p,
+                    database = %r.metadata.database_type,
+                    built = %built_on(r.metadata.build_epoch),
+                    "geoip database loaded"
+                );
                 Some(r)
             }
             Err(e) => {
@@ -108,6 +124,16 @@ impl GeoIp {
         self.reader.is_some()
     }
 
+    /// The loaded database's own `database_type` (`DBIP-Country-Lite`,
+    /// `GeoLite2-Country`, …), or `None` with no database. The dashboard
+    /// keys its attribution on this, so a deployment that supplies its own
+    /// database is never credited to someone else's.
+    pub fn database(&self) -> Option<&str> {
+        self.reader
+            .as_ref()
+            .map(|r| r.metadata.database_type.as_str())
+    }
+
     /// ISO country code for an address, or `None` when unresolvable —
     /// an address the database doesn't cover is a normal outcome, not an
     /// error worth logging on every connection.
@@ -115,6 +141,18 @@ impl GeoIp {
         let r = self.reader.as_ref()?;
         let looked: maxminddb::geoip2::Country = r.lookup(ip).ok()?;
         looked.country?.iso_code.map(str::to_string)
+    }
+}
+
+/// The database's `build_epoch` as a calendar date, for the load log.
+fn built_on(epoch: u64) -> String {
+    let date = i64::try_from(epoch)
+        .ok()
+        .and_then(|s| s.checked_mul(1000))
+        .and_then(|ms| DateTime::from_millis(ms).try_to_rfc3339_string().ok());
+    match date {
+        Some(d) => d.get(..10).unwrap_or(&d).to_string(),
+        None => format!("epoch {epoch}"),
     }
 }
 
@@ -289,8 +327,121 @@ mod tests {
         let g = GeoIp::open(None);
         assert!(!g.enabled());
         assert_eq!(g.country("8.8.8.8".parse().unwrap()), None);
+        // No database ⇒ nobody to credit on the dashboard.
+        assert_eq!(g.database(), None);
         // A configured-but-missing file degrades the same way.
         let g = GeoIp::open(Some("/nonexistent/GeoLite2-Country.mmdb"));
         assert!(!g.enabled());
+        // An empty value is how an operator turns off the image's default
+        // database (#1896): off, not a path to try.
+        for off in ["", "   "] {
+            let g = GeoIp::open(Some(off));
+            assert!(!g.enabled());
+            assert_eq!(g.database(), None);
+        }
+    }
+
+    /// A two-record MaxMind DB (format 2.0), built byte by byte: one IPv4
+    /// search-tree node sends 0.0.0.0/1 to `{country: {iso_code: "US"}}` and
+    /// 128.0.0.0/1 to `{country: {iso_code: "DE"}}`. Small enough to read in
+    /// full, and real enough that the reader the server uses opens it and
+    /// decodes the same record shape DB-IP and GeoLite2 ship.
+    fn tiny_country_mmdb(database_type: &str) -> Vec<u8> {
+        // Data-section encodings (sizes stay < 29, so one control byte).
+        fn text(out: &mut Vec<u8>, v: &str) {
+            out.push(0x40 | v.len() as u8); // utf8_string
+            out.extend_from_slice(v.as_bytes());
+        }
+        fn map(out: &mut Vec<u8>, entries: u8) {
+            out.push(0xE0 | entries);
+        }
+        fn uint16(out: &mut Vec<u8>, v: u16) {
+            out.push(0xA2);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn uint32(out: &mut Vec<u8>, v: u32) {
+            out.push(0xC4);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn uint64(out: &mut Vec<u8>, v: u64) {
+            out.extend_from_slice(&[0x08, 9 - 7]); // extended type 9, 8 bytes
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn country(code: &str) -> Vec<u8> {
+            let mut d = Vec::new();
+            map(&mut d, 1);
+            text(&mut d, "country");
+            map(&mut d, 1);
+            text(&mut d, "iso_code");
+            text(&mut d, code);
+            d
+        }
+
+        let (us, de) = (country("US"), country("DE"));
+        let node_count: u32 = 1;
+        // A record above `node_count` points into the data section, at
+        // `record - node_count - 16` (the 16 is the zeroed separator).
+        let to_us = node_count + 16;
+        let to_de = to_us + us.len() as u32;
+        let mut db = Vec::new();
+        db.extend_from_slice(&to_us.to_be_bytes()[1..]); // 24-bit records
+        db.extend_from_slice(&to_de.to_be_bytes()[1..]);
+        db.extend_from_slice(&[0; 16]);
+        db.extend_from_slice(&us);
+        db.extend_from_slice(&de);
+        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+        map(&mut db, 9);
+        text(&mut db, "binary_format_major_version");
+        uint16(&mut db, 2);
+        text(&mut db, "binary_format_minor_version");
+        uint16(&mut db, 0);
+        text(&mut db, "build_epoch");
+        uint64(&mut db, 1_790_812_800); // 2026-10-01T00:00:00Z
+        text(&mut db, "database_type");
+        text(&mut db, database_type);
+        text(&mut db, "description");
+        map(&mut db, 1);
+        text(&mut db, "en");
+        text(&mut db, "test fixture");
+        text(&mut db, "ip_version");
+        uint16(&mut db, 4);
+        text(&mut db, "languages");
+        db.extend_from_slice(&[0x01, 11 - 7]); // extended type 11 (array), 1 entry
+        text(&mut db, "en");
+        text(&mut db, "node_count");
+        uint32(&mut db, node_count);
+        text(&mut db, "record_size");
+        uint16(&mut db, 24);
+        db
+    }
+
+    #[test]
+    fn geoip_resolves_countries_and_names_its_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbip-country-lite.mmdb");
+        std::fs::write(&path, tiny_country_mmdb("DBIP-Country-Lite")).unwrap();
+
+        let g = GeoIp::open(path.to_str());
+        assert!(g.enabled(), "a valid database must load");
+        // What the dashboard credits: the database's own type, not a guess
+        // from the file name.
+        assert_eq!(g.database(), Some("DBIP-Country-Lite"));
+        // `country.iso_code` is the field the analytics stores. A reader that
+        // looked anywhere else (`registered_country`, which DB-IP's Lite
+        // database does not carry) would answer `None` for every address,
+        // with `geoip: true` on the dashboard.
+        assert_eq!(g.country("8.8.8.8".parse().unwrap()).as_deref(), Some("US"));
+        assert_eq!(
+            g.country("193.0.6.139".parse().unwrap()).as_deref(),
+            Some("DE")
+        );
+    }
+
+    #[test]
+    fn geoip_build_date_reads_as_a_date() {
+        assert_eq!(built_on(1_790_812_800), "2026-10-01");
+        assert_eq!(built_on(0), "1970-01-01");
+        // Out of `DateTime`'s range: still logged, never a panic.
+        assert_eq!(built_on(u64::MAX), format!("epoch {}", u64::MAX));
     }
 }
