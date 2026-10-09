@@ -854,6 +854,14 @@ request, through consent like any other.
 - an explicit Reconnect connected in **2.4–3.5 s**;
 - a later cut of the viewer's signalling socket was back in **6.3 s** with no click.
 
+The same day on the **Windows badge** (capture-excluded, so the click was aimed by its
+fixed geometry):
+- the agent told the server **1 ms** after the click;
+- the transport closed **1.03 s** after it;
+- the viewer held **67 s** with no frame sent;
+- an explicit Reconnect connected in **1.4 s**;
+- a killed signalling socket was back in **0.95 s** with no click.
+
 ⚠️ Playwright's `context.setOffline` is not a drop: 10 s of it closed neither the
 open `/ws` nor the WebRTC path, and the session streamed on. To test the ladder,
 cut the socket.
