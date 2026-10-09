@@ -157,7 +157,9 @@ exactly those three. Each session you then run in a terminal is mirrored by
 this machine and listed for you alone in Roomler, read-only: nobody prompts it
 from there, and you may name readers. Nothing happens until this machine's
 owner turns on `hive_adopt` and maps your account in `hive_accounts`
-([configuration](/docs/reference/configuration/)).
+([configuration](/docs/reference/configuration/)). **Stop mirroring** in
+Roomler stops watching that terminal run; the terminal goes on. A
+`claude --resume` of it later is mirrored afresh, as a new session.
 
 :::tip What leaves the machine
 The server keeps that a session exists, its folder and its turns' sizes —
