@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+// FR-90 P1j — the adopt socket's protocol: a separate socket, open to every
+// account, whose peer the daemon identifies by the kernel's word alone.
+pub mod hive_adopt;
+
 // FR-84 D5b — the device's own view of its org (the Devices page's grid and
 // mesh), in its own file so the verbs' types don't sprawl through this one.
 mod devices;
