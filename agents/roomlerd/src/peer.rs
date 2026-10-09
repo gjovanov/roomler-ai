@@ -253,6 +253,10 @@ pub struct AgentPeer {
     /// ever told. The same shape as the arbiter entries the `Drop` below
     /// releases.
     session_end: tokio_util::sync::CancellationToken,
+    /// #1882 — may this session use the overlay? Read by
+    /// [`Self::add_remote_candidate`] and [`Self::handle_offer`]; the local
+    /// half is already in the `SettingEngine`.
+    rc_overlay: crate::rc_overlay::RcOverlay,
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
@@ -315,6 +319,10 @@ impl AgentPeer {
         // ("free"/"exclusive"; None = agent default, which is free). Only
         // the FIRST session's hint seeds the mode — see input::arbiter.
         input_mode: Option<String>,
+        // #1882 — the device's `rc_overlay` decision for this session (see
+        // `crate::rc_overlay`). Off, the default, keeps every overlay address
+        // out of this session's ICE.
+        rc_overlay: crate::rc_overlay::RcOverlay,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -331,12 +339,18 @@ impl AgentPeer {
             webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut engine)
                 .context("register default interceptors")?;
 
-        // Keep the OVERLAY interface out of ICE. The controller is a
-        // BROWSER, which is never a node on the overlay mesh, so a candidate
-        // bound to the `roomler` TUN can never pair — but it is not merely
-        // dead weight: the STUN query that rides that interface comes back
-        // reflected as the node's own overlay address, and webrtc-rs offers
-        // it as a perfectly ordinary `typ=srflx` candidate.
+        // Keep the OVERLAY interface out of ICE. The STUN query that rides
+        // that interface comes back reflected as the node's own overlay
+        // address, and webrtc-rs offers it as a perfectly ordinary
+        // `typ=srflx` candidate.
+        //
+        // (This used to say the controller's browser is never on the mesh,
+        // so an overlay candidate could never pair. #1882 measured the
+        // opposite: an operator's browser runs on an overlay node, its
+        // wintun address is a host candidate, and a Mac — whose `utunN` this
+        // name rule cannot see — paired host↔host over the overlay. Whether
+        // a session may do that is now the device's call; see the IP filter
+        // below and `crate::rc_overlay`.)
         //
         // Field 2026-08-07 (winhost-a, Check Point profile blocking STUN on the
         // physical NIC): the ONLY srflx it gathered was
@@ -354,6 +368,22 @@ impl AgentPeer {
         // candidate from anyone behind carrier-grade NAT.
         let mut setting = webrtc::api::setting_engine::SettingEngine::default();
         setting.set_interface_filter(Box::new(|name: &str| !is_overlay_iface(name)));
+        // #1882 — unless the device lets remote desktop use the overlay, keep
+        // its ADDRESSES out of the host candidates too, whatever the interface
+        // is called: the overlay's own blocks and the derived-v6 ULA, never the
+        // whole CGNAT `/10` (the CGNAT caveat above still holds). Remote
+        // candidates and ICE servers get the same rule below and in
+        // `add_remote_candidate`.
+        if !rc_overlay.allow {
+            let keep = rc_overlay.clone();
+            setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
+        }
+        info!(
+            session = %session_id,
+            overlay_blocks = rc_overlay.v4_nets.len(),
+            "rc ICE: overlay {}",
+            rc_overlay.describe()
+        );
         let api = APIBuilder::new()
             .with_media_engine(engine)
             .with_interceptor_registry(registry)
@@ -370,6 +400,10 @@ impl AgentPeer {
         let relay_tcp = node_env("ICE_RELAY_TCP")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // #1882 — an ICE server on an overlay address (the loopback-TURN
+        // relay) is an overlay path. Gone unless the device allows it; the
+        // Hub withholds it too, but an older server does not.
+        let ice_servers = &rc_overlay.ice_servers(ice_servers);
         let mut config = RTCConfiguration {
             ice_servers: if relay_tcp {
                 map_ice_servers_relay_tcp(ice_servers)
@@ -1267,6 +1301,7 @@ impl AgentPeer {
                 construction_guard.disarm();
                 session_end
             },
+            rc_overlay,
         })
     }
 
@@ -1337,6 +1372,10 @@ impl AgentPeer {
         // field of the rtpmap line; everything else (PT, clock rate, fmtp)
         // is untouched.
         let munged_offer = offer_sdp.replace("H265/90000", "HEVC/90000");
+        // #1882 — an offer that carries its candidates (a browser that
+        // gathered before offering) loses the overlay-addressed ones here,
+        // where no trickle filter would see them.
+        let munged_offer = self.rc_overlay.strip_sdp(&munged_offer);
         let offer = RTCSessionDescription::offer(munged_offer).context("parse offer")?;
         self.pc
             .set_remote_description(offer)
@@ -1364,6 +1403,18 @@ impl AgentPeer {
             other => serde_json::from_value(other)
                 .map_err(|e| anyhow!("bad ICE candidate shape: {e}"))?,
         };
+        // #1882 — a candidate on a mesh address is an overlay pair waiting to
+        // happen even though this side offered no overlay candidate: the
+        // srflx and relay sockets are bound to `0.0.0.0`, so a check to it
+        // routes into the TUN. Dropped, unless the device allows the overlay.
+        if !self.rc_overlay.keeps_remote_candidate(&init.candidate) {
+            debug!(
+                session = %self.session_id,
+                candidate = %init.candidate,
+                "rc ICE: remote candidate on the overlay dropped (rc_overlay off)"
+            );
+            return Ok(());
+        }
         // Relay-escape — Chrome hides its LAN host candidates behind mDNS
         // `.local` names (the controller page holds no cam/mic permission),
         // and webrtc-ice's in-process QueryOnly resolution is unreliable on
@@ -1380,6 +1431,7 @@ impl AgentPeer {
         if crate::mdns_resolve::candidate_mdns_name(&init.candidate).is_some() {
             let pc = self.pc.clone();
             let session_id = self.session_id;
+            let rc_overlay = self.rc_overlay.clone();
             let mut init = init;
             tokio::spawn(async move {
                 match crate::mdns_resolve::resolve_mdns_candidate(&init.candidate).await {
@@ -1390,6 +1442,16 @@ impl AgentPeer {
                             "mDNS candidate resolution failed — adding unmodified (prflx fallback)"
                         );
                     }
+                }
+                // #1882 — the name hid the address; the OS resolver returns the
+                // candidate's own record, which for the browser's wintun
+                // candidate IS its overlay address.
+                if !rc_overlay.keeps_remote_candidate(&init.candidate) {
+                    debug!(
+                        session = %session_id,
+                        "rc ICE: mDNS candidate resolved onto the overlay — dropped (rc_overlay off)"
+                    );
+                    return;
                 }
                 if let Err(e) = pc.add_ice_candidate(init).await {
                     debug!(session = %session_id, %e, "add_ice_candidate (mDNS path) failed");
@@ -10773,10 +10835,12 @@ async fn or_stopped<T>(
 ///
 /// The names come from `tunnel_core::overlay::tun`: `roomler` on Windows,
 /// `roomler0` on Linux, and a kernel-assigned `utunN` on macOS — which we
-/// cannot match by name, so macOS keeps offering the overlay candidate. That
-/// is acceptable: the candidate is inert (no browser is on the mesh) and the
-/// masking-srflx failure this guards against needs a host whose STUN is
-/// blocked on the physical NIC, which is the corp-Windows case.
+/// cannot match by name. The masking-srflx failure this guards against
+/// needs a host whose STUN is blocked on the physical NIC, which is the
+/// corp-Windows case. The macOS candidate is NOT inert, though (#1882: a
+/// browser on an overlay node paired with it); keeping it out is the job of
+/// the address filter in `crate::rc_overlay`, which the device's
+/// `rc_overlay` policy arms by default.
 ///
 /// Prefix-matched rather than compared exactly so a suffixed variant (a
 /// second adapter, a `:N` alias) is caught too. Anything else — including a
