@@ -4,11 +4,18 @@
 //! it runs, and the session's preparation.
 //!
 //! A Windows device runs a session as the user signed in at the console, and as
-//! nobody else (design §0.1, D2). Never as SYSTEM, which the daemon is. Never as
+//! nobody else (design §0.1, D2). Never as SYSTEM, and never elevated. Never as
 //! another account either, which would take that account's password: there is
 //! no S4U and no `LogonUser` here, and the daemon asks for no credential. So
 //! `hive_accounts` must map the starter to the console user, and with nobody
 //! signed in a start is refused `no_console_user`.
+//!
+//! The daemon that hosts sessions is the service's WORKER. It runs as SYSTEM
+//! (the SystemContext worker, while a controller is connected or before
+//! anyone signs in) or, most of the time, as the console user, elevated
+//! (`ROOMLERD_ELEVATE_WORKER`). [`console_user`] reaches the same person from
+//! either, at Medium integrity: FR-85's recorder rule, whose token code
+//! [`crate::win_token`] now holds for both.
 //!
 //! These are the Windows counterparts of what the Unix launcher does with
 //! `setuid` and a `/bin/sh` wrapper (`hive/supervisor.rs`):
@@ -20,8 +27,9 @@
 //! | the wrapper, run as the account | `roomlerd hive-prep` ([`prep`]), which [`run_prep`] runs as the console user |
 //! | the harness's process group | its Job Object ([`JobObject`], [`spawn_into_job`]) |
 //!
-//! P1i-2 wires them into the supervisor. Until then nothing calls them, and the
-//! Windows build does not advertise `hive`.
+//! The supervisor launches through them from P1i-2, which also brings the
+//! toolbelt's named pipe and the directories' DACLs here. The Windows release
+//! build carries `hive` from P1i-3; until then only a build made with it does.
 //!
 //! [`JobObject`]: crate::win_service::supervisor::JobObject
 //! [`spawn_into_job`]: crate::win_service::supervisor::spawn_into_job
@@ -29,20 +37,38 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use roomler_ai_remote_control::hive::HiveRefusal;
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, LookupAccountSidW, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SID_NAME_USE,
+    SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+};
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::win_service::supervisor::{
-    self, CapturedChild, EnvBlock, JobObject, OwnedHandle, SpawnAs,
+    self, CapturedChild, EnvBlock, JobObject, OwnedHandle, OwnedProcess, SpawnAs,
 };
 
 /// The hidden subcommand the daemon runs as the console user before a harness
@@ -64,19 +90,33 @@ pub struct ConsoleUser {
     /// `AzureAD` for an Entra ID one, the NetBIOS domain for a domain one.
     pub domain: String,
     pub name: String,
+    /// The account's SID (`S-1-5-21-…`): what the session's toolbelt pipe and
+    /// runtime directory grant access to (P1i-2).
+    pub sid: String,
     /// The profile Windows records for the user, from the token. Never built
     /// from the name: `C:\Users\alice` and `C:\Users\alice.CORP` are two people.
     pub profile: PathBuf,
     /// `%APPDATA%` in the user's own environment, where npm puts `claude.cmd`.
     pub appdata: Option<PathBuf>,
-    token: OwnedHandle,
+    token: UserToken,
+}
+
+/// The token a session's processes start with.
+enum UserToken {
+    /// The console session's, as Windows hands it out (`WTSQueryUserToken`).
+    Session(OwnedHandle),
+    /// A restricted, Medium copy of this daemon's own.
+    Restricted(crate::win_token::Owned),
 }
 
 impl ConsoleUser {
     /// What a session's processes are started as. The token lives as long as
     /// `self`, so `self` must outlive the spawn.
     pub fn spawn_as(&self) -> SpawnAs {
-        SpawnAs::User(self.token.raw())
+        SpawnAs::User(match &self.token {
+            UserToken::Session(t) => t.raw(),
+            UserToken::Restricted(t) => t.raw(),
+        })
     }
 
     /// `DOMAIN\name`.
@@ -85,12 +125,38 @@ impl ConsoleUser {
     }
 }
 
-/// Who is signed in at the console, or why no session can run as them.
+/// Who a session here runs as, or why none can: the same person, at Medium
+/// integrity, whichever worker hosts it.
 ///
-/// `no_console_user` when nobody is: no console session, or one showing the
-/// sign-in screen. A daemon that may not ask (it is not SYSTEM, so
-/// `WTSQueryUserToken` is refused) gets `launch_failed`, saying so.
+/// | this daemon is | a session runs as |
+/// |---|---|
+/// | SYSTEM | the user signed in at the console, by the token Windows hands out for that session (`WTSQueryUserToken`), which for a UAC administrator is the filtered one; `no_console_user` with nobody signed in |
+/// | a person (the worker, often elevated) | that person, by a restricted, Medium copy of this daemon's own token ([`crate::win_token::restricted_medium_copy`]): every administrator group deny-only, no privilege but traverse |
 pub fn console_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
+    if crate::win_identity::process_is_local_system() {
+        signed_in_user()
+    } else {
+        this_user()
+    }
+}
+
+/// This daemon's own person, never elevated.
+fn this_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
+    let token = crate::win_token::restricted_medium_copy().map_err(|e| {
+        (
+            HiveRefusal::LaunchFailed,
+            format!("a restricted copy of this daemon's token: {e}"),
+        )
+    })?;
+    let mut session = 0u32;
+    // SAFETY: GetCurrentProcessId has no preconditions; `session` is a valid
+    // out-param.
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    user_of(session, UserToken::Restricted(token))
+}
+
+/// The user signed in at the console, for a daemon that is SYSTEM.
+fn signed_in_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
     let Some(session) = supervisor::active_console_session_id() else {
         return Err((
             HiveRefusal::NoConsoleUser,
@@ -113,20 +179,32 @@ pub fn console_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
         Err(e) => {
             return Err((
                 HiveRefusal::LaunchFailed,
-                format!(
-                    "cannot obtain the console user's token ({e}); this needs the daemon to run \
-                     as SYSTEM, a perMachine service install"
-                ),
+                format!("cannot obtain the console user's token ({e})"),
             ));
         }
     };
-    let (domain, name) = account_of_token(token.raw()).map_err(|e| {
+    user_of(session, UserToken::Session(token))
+}
+
+/// The person `token` is for: their account, SID, profile and `%APPDATA%`.
+fn user_of(session: u32, token: UserToken) -> Result<ConsoleUser, (HiveRefusal, String)> {
+    let raw = match &token {
+        UserToken::Session(t) => t.raw(),
+        UserToken::Restricted(t) => t.raw(),
+    };
+    let (domain, name) = account_of_token(raw).map_err(|e| {
         (
             HiveRefusal::LaunchFailed,
             format!("reading the console user's account: {e}"),
         )
     })?;
-    let profile = crate::win_identity::profile_dir_of_token(token.raw())
+    let sid = sid_of_token(raw).map_err(|e| {
+        (
+            HiveRefusal::LaunchFailed,
+            format!("reading the console user's SID: {e}"),
+        )
+    })?;
+    let profile = crate::win_identity::profile_dir_of_token(raw)
         .map(PathBuf::from)
         .ok_or_else(|| {
             (
@@ -134,7 +212,7 @@ pub fn console_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
                 format!("{domain}\\{name} has no profile directory"),
             )
         })?;
-    let appdata = EnvBlock::for_token(token.raw())
+    let appdata = EnvBlock::for_token(raw)
         .ok()
         .and_then(|block| env_value(&block.entries(), "APPDATA"))
         .map(PathBuf::from);
@@ -142,15 +220,17 @@ pub fn console_user() -> Result<ConsoleUser, (HiveRefusal, String)> {
         session,
         domain,
         name,
+        sid,
         profile,
         appdata,
         token,
     })
 }
 
-/// The account a token is for, as `(domain, name)`. `token` must be live,
-/// with `TOKEN_QUERY`.
-fn account_of_token(token: HANDLE) -> Result<(String, String), String> {
+/// A token's `TOKEN_USER`, in `u64`s so the structure, which holds a pointer,
+/// is aligned; the SID it points at lives in the same buffer. `token` must be
+/// live, with `TOKEN_QUERY`.
+fn token_user(token: HANDLE) -> Result<Vec<u64>, String> {
     let mut len: u32 = 0;
     // SAFETY: the documented size query: no buffer, the size written to `len`.
     unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
@@ -160,7 +240,6 @@ fn account_of_token(token: HANDLE) -> Result<(String, String), String> {
             std::io::Error::last_os_error()
         ));
     }
-    // `u64`s, so the TOKEN_USER, which holds a pointer, is aligned.
     let mut buf = vec![0u64; (len as usize).div_ceil(8)];
     // SAFETY: `buf` holds at least `len` bytes and outlives the call.
     if unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) } == 0
@@ -170,6 +249,94 @@ fn account_of_token(token: HANDLE) -> Result<(String, String), String> {
             std::io::Error::last_os_error()
         ));
     }
+    Ok(buf)
+}
+
+/// The SID string (`S-1-5-21-…`) of the account `token` is for. `token` must
+/// be live, with `TOKEN_QUERY`.
+fn sid_of_token(token: HANDLE) -> Result<String, String> {
+    let buf = token_user(token)?;
+    // SAFETY: a TOKEN_USER, whose SID points into `buf`, alive below.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a valid SID; `text` receives a LocalAlloc'd string, freed below.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(format!(
+            "ConvertSidToStringSidW: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a NUL-terminated wide string the call allocated.
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    // SAFETY: `len` units were just read from `text`.
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: the one allocation ConvertSidToStringSidW made, freed once.
+    unsafe { LocalFree(text as _) };
+    Ok(s)
+}
+
+/// This process's own account's SID string.
+pub fn own_sid() -> Result<String, String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: our own process's token, closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(format!(
+            "OpenProcessToken: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let sid = sid_of_token(token);
+    // SAFETY: the handle OpenProcessToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    sid
+}
+
+/// The SID string of the account at the far end of a server pipe instance:
+/// the process that connected, by its pid, and its token. `pipe` must be a
+/// live, connected server end.
+///
+/// A pid can name another process by the time it is read, if the client
+/// exited at once. Then this reads that other process's account: one the pipe
+/// refuses unless it is the same account, whose dead connection carries
+/// nothing. The pipe's DACL decides who may connect at all.
+pub(crate) fn pipe_client_sid(pipe: HANDLE) -> Result<String, String> {
+    let mut pid = 0u32;
+    // SAFETY: a live server pipe handle; `pid` is a valid out-param.
+    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+        return Err(format!(
+            "GetNamedPipeClientProcessId: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a plain open; closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(format!(
+            "OpenProcess({pid}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: a live process handle; `token` is closed below.
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0;
+    // SAFETY: the handle OpenProcess gave us, closed once.
+    unsafe { CloseHandle(process) };
+    if !opened {
+        return Err(format!(
+            "OpenProcessToken({pid}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let sid = sid_of_token(token);
+    // SAFETY: the handle OpenProcessToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    sid
+}
+
+/// The account a token is for, as `(domain, name)`. `token` must be live,
+/// with `TOKEN_QUERY`.
+fn account_of_token(token: HANDLE) -> Result<(String, String), String> {
+    let buf = token_user(token)?;
     // SAFETY: a TOKEN_USER, whose SID points into `buf`, alive below.
     let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
     let (mut name_len, mut domain_len) = (0u32, 0u32);
@@ -410,7 +577,7 @@ pub fn harness_command_line(harness: &Path, args: &[OsString]) -> Result<String,
 
 /// `%SystemRoot%\System32\cmd.exe`, by its full path: a bare `cmd.exe` is
 /// looked for in the daemon's own directory first.
-fn system_cmd() -> PathBuf {
+pub(crate) fn system_cmd() -> PathBuf {
     std::env::var_os("SystemRoot")
         .filter(|r| !r.is_empty())
         .map(PathBuf::from)
@@ -604,13 +771,261 @@ pub unsafe fn run_prep(who: SpawnAs, cmdline: &str, timeout: Duration) -> Result
     }
 }
 
+// ─── P1i-2: where a session's files live, and who may touch them ────────────
+//
+// On Windows the daemon that hosts sessions is the WORKER, which the service
+// runs as SYSTEM, or (most of the time) as the console user, elevated
+// (`ROOMLERD_ELEVATE_WORKER`). A controller connecting swaps one for the
+// other. Both reach the service's machine-wide directory, so the store, what
+// the device hosts and each session's runtime files live there, and the worker
+// after a swap finds what the last one hosted. Every directory is owned by
+// Administrators with a protected DACL, so a folder someone else made there
+// first is taken over, never trusted: as its owner its maker would keep
+// WRITE_DAC whatever the DACL said.
+
+/// The replica store's directory and the runtime root: SYSTEM's and
+/// Administrators', owned by Administrators, inheritance off. Unix's `0700` for
+/// a daemon that runs as SYSTEM or as an elevated administrator. A session's
+/// restricted Medium token, whose Administrators group is deny-only, reads none
+/// of it.
+pub const PRIVATE_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+/// A session's own runtime directory: its account (`peer`) may also list,
+/// traverse and read it (`0x1200a9`) for its settings, its MCP config and its
+/// core memory, and write nothing.
+pub fn session_dir_sddl(peer: &str) -> String {
+    format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;{peer})")
+}
+
+/// A session's toolbelt pipe: SYSTEM's and Administrators' (the daemon is one
+/// or the other, and makes an instance for each client), and the session's
+/// account's (`peer`) to read and write (`0x12008b`). Not `GENERIC_WRITE`,
+/// which carries `FILE_CREATE_PIPE_INSTANCE`: with it a process of that account
+/// could add an instance of its own under the name and take the next
+/// connection, so the relay opens the pipe with exactly this mask
+/// ([`open_toolbelt_pipe`]). A session's token is a restricted copy whose
+/// Administrators group is deny-only, so the last grant is all it has, even
+/// when the daemon is the same person, elevated. The Medium no-write-up label
+/// keeps anything below Medium integrity from writing to it.
+pub fn toolbelt_pipe_sddl(peer: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;{peer})S:(ML;;NW;;;ME)")
+}
+
+/// The replica store's directory, `%ProgramData%\roomler\roomler\hive`, also
+/// holding what the device hosts.
+pub fn store_dir() -> PathBuf {
+    roomler_node_core::appdirs::machine_global_dir().join("hive")
+}
+
+/// Where each session's runtime directory is made: `…\hive\run`.
+pub fn runtime_root() -> PathBuf {
+    store_dir().join("run")
+}
+
+/// A security descriptor built from SDDL, and the `SECURITY_ATTRIBUTES` that
+/// hand it to `CreateDirectoryW` or a pipe instance. Frees it on drop.
+pub struct Sddl {
+    sa: SECURITY_ATTRIBUTES,
+    psd: PSECURITY_DESCRIPTOR,
+}
+
+// SAFETY: the descriptor is a LocalAlloc'd buffer with no thread affinity;
+// freeing it on another thread is sound. A pipe's accept loop holds one across
+// `.await`.
+unsafe impl Send for Sddl {}
+
+impl Sddl {
+    pub fn new(sddl: &str) -> std::io::Result<Self> {
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated string; `psd` receives a LocalAlloc'd
+        // descriptor, freed in Drop; the size out-param is optional.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &mut psd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            sa: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            },
+            psd,
+        })
+    }
+
+    /// Valid while `self` lives; the system copies the descriptor into each
+    /// object made with it.
+    pub fn attributes(&mut self) -> *mut SECURITY_ATTRIBUTES {
+        &raw mut self.sa
+    }
+}
+
+impl Drop for Sddl {
+    fn drop(&mut self) {
+        // SAFETY: the one descriptor ConvertStringSecurityDescriptor… made.
+        unsafe { LocalFree(self.psd as _) };
+    }
+}
+
+/// Make the directory `dir` with `sddl`'s owner and DACL, or give the plain
+/// directory already there that owner and DACL, protected from inheritance. Its
+/// parent must exist. The owner is set as well because an owner keeps
+/// WRITE_DAC whatever the DACL says: a folder someone else made there first
+/// would otherwise stay theirs to reopen. A link or junction on the way, or
+/// anything but a directory in its place, is refused, never followed.
+pub fn dir_with_dacl(dir: &Path, sddl: &str) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+        return Err(format!("{} is a link", link.display()));
+    }
+    let failed = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let mut sd = Sddl::new(sddl).map_err(failed)?;
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) => {
+            if !m.is_dir() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!("{} is not a plain directory", dir.display()));
+            }
+            // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
+            let ok = unsafe {
+                SetFileSecurityW(
+                    wide.as_ptr(),
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    sd.psd,
+                )
+            };
+            if ok == 0 {
+                return Err(failed(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: a NUL-terminated path; the attributes live in `sd`.
+            if unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) } == 0 {
+                return Err(failed(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+        Err(e) => Err(failed(e)),
+    }
+}
+
+/// The client end of a session's toolbelt pipe, opened for reading and for
+/// writing data only: the access its DACL grants ([`toolbelt_pipe_sddl`]).
+/// Overlapped, as tokio needs, and at the identification level, so the daemon
+/// can name the relay's account and never act as it.
+pub fn open_toolbelt_pipe(
+    name: &Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let wide: Vec<u16> = name
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: a NUL-terminated name; the handle is handed to tokio below, or
+    // closed.
+    let h = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | FILE_WRITE_DATA,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a pipe handle opened overlapped, owned from here by tokio.
+    match unsafe { tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(h as _) } {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            // SAFETY: tokio did not take it; closed once.
+            unsafe { CloseHandle(h) };
+            Err(e)
+        }
+    }
+}
+
+/// A harness started into its Job Object, with the surface of tokio's
+/// `Child` the session task uses: its three pipes as async files, and `id`,
+/// `wait` and `start_kill`. Dropping it closes the job, which ends the harness
+/// and everything it started, as `kill_on_drop` does on Unix.
+pub struct HarnessChild {
+    pub stdin: Option<tokio::fs::File>,
+    pub stdout: Option<tokio::fs::File>,
+    pub stderr: Option<tokio::fs::File>,
+    process: OwnedProcess,
+    job: JobObject,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl HarnessChild {
+    pub fn new(child: CapturedChild, job: JobObject) -> Self {
+        let file = |h: OwnedHandle| {
+            // SAFETY: a pipe handle this value owned; the file owns it now.
+            tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_handle(h.into_raw() as _) })
+        };
+        Self {
+            stdin: child.stdin.map(file),
+            stdout: Some(file(child.stdout)),
+            stderr: Some(file(child.stderr)),
+            process: child.process,
+            job,
+            status: None,
+        }
+    }
+
+    /// The process id, until the process has been waited for.
+    pub fn id(&self) -> Option<u32> {
+        self.status.is_none().then_some(self.process.pid)
+    }
+
+    /// Wait for the process to exit, polling: cancel-safe, as a `select!` and
+    /// a timeout need it to be, and holding no thread while it waits.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        use std::os::windows::process::ExitStatusExt;
+        loop {
+            if let Some(s) = self.status {
+                return Ok(s);
+            }
+            match self.process.try_wait() {
+                Ok(Some(code)) => self.status = Some(std::process::ExitStatus::from_raw(code)),
+                Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(e) => return Err(std::io::Error::other(format!("{e:#}"))),
+            }
+        }
+    }
+
+    /// End the harness and everything in its job. Asynchronous: [`Self::wait`]
+    /// sees it gone.
+    pub fn start_kill(&mut self) -> std::io::Result<()> {
+        self.job
+            .terminate(1)
+            .map_err(|e| std::io::Error::other(format!("{e:#}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
-    use windows_sys::Win32::Security::TOKEN_QUERY;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
     /// What a command line reads back as, by the rules a C-runtime program
@@ -984,21 +1399,35 @@ mod tests {
         }
     }
 
-    /// A test process is not SYSTEM, so it cannot obtain the console user's
-    /// token. It must refuse, naming why, and never come back as someone.
+    /// P1i-2 — a daemon that is not SYSTEM (this test process, elevated on CI's
+    /// runner) runs a session as itself, never elevated: what it starts with
+    /// the session's token carries the Medium label and not the High one. The
+    /// labels are read by SID, which no display language changes.
     #[test]
-    fn without_system_there_is_no_console_user_to_run_as() {
+    fn a_daemon_that_is_not_system_runs_a_session_as_itself_at_medium() {
         if crate::win_identity::process_is_local_system() {
             return;
         }
-        match console_user() {
-            Ok(u) => panic!("a non-SYSTEM process obtained {}", u.qualified()),
-            Err((HiveRefusal::NoConsoleUser, _)) => {}
-            Err((HiveRefusal::LaunchFailed, detail)) => {
-                assert!(detail.contains("SYSTEM"), "{detail}")
-            }
-            Err((other, detail)) => panic!("unexpected refusal {other:?}: {detail}"),
+        let u = console_user().unwrap();
+        assert_eq!(u.sid, own_sid().unwrap(), "this process's own person");
+        if let Ok(user) = std::env::var("USERNAME") {
+            assert!(u.name.eq_ignore_ascii_case(&user), "{} vs {user}", u.name);
         }
+        let job = JobObject::kill_on_close().unwrap();
+        let whoami = format!(
+            "{} /groups /fo csv /nh",
+            program(&system_cmd().with_file_name("whoami.exe")).unwrap()
+        );
+        // SAFETY: `u` holds the token across the call.
+        let child =
+            unsafe { supervisor::spawn_into_job(u.spawn_as(), &whoami, None, &[], false, &job) }
+                .unwrap();
+        let budget = std::sync::atomic::AtomicU64::new(256 * 1024);
+        let (out, _) = supervisor::read_pipe_to_end(&child.stdout, &budget);
+        assert!(child.process.wait_for_exit(Duration::from_secs(10)));
+        let groups = String::from_utf8_lossy(&out);
+        assert!(groups.contains("S-1-16-8192"), "the Medium label: {groups}");
+        assert!(!groups.contains("S-1-16-12288"), "never High: {groups}");
     }
 
     #[test]
@@ -1016,5 +1445,265 @@ mod tests {
             Some(OsString::from(r"C:\Users\dev\AppData\Roaming"))
         );
         assert_eq!(env_value(&entries, "TEMP"), None);
+    }
+
+    /// `cmd.exe` with delayed expansion, so `!L!` reads what `set /p` read.
+    fn cmd_v(script: &str) -> String {
+        format!(
+            "{} /d /v:on /c \"{script}\"",
+            program(&system_cmd()).unwrap()
+        )
+    }
+
+    /// P1i-2 — what the session task does with a harness: a line to its stdin,
+    /// a line back from its stdout, and its end, all through tokio's files
+    /// over the anonymous pipes.
+    #[tokio::test]
+    async fn a_harness_child_speaks_over_its_pipes_and_is_waited_for() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            supervisor::spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd_v("set /p L=& echo got !L!& exit 7"),
+                None,
+                &[],
+                true,
+                &job,
+            )
+        }
+        .unwrap();
+        let mut h = HarnessChild::new(child, job);
+        assert!(h.id().is_some(), "running");
+        let mut stdin = h.stdin.take().unwrap();
+        stdin.write_all(b"hello\r\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        let mut lines = BufReader::new(h.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.trim(), "got hello");
+        let status = tokio::time::timeout(Duration::from_secs(10), h.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(h.id(), None, "no id once it has been waited for");
+    }
+
+    /// P1i-2 — a stop that the harness does not heed ends its job, and the
+    /// wait sees it.
+    #[tokio::test]
+    async fn killing_a_harness_child_ends_it_and_its_wait_returns() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            supervisor::spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                true,
+                &job,
+            )
+        }
+        .unwrap();
+        let mut h = HarnessChild::new(child, job);
+        h.start_kill().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), h.wait())
+            .await
+            .expect("ended, not waited out")
+            .unwrap();
+        assert_eq!(status.code(), Some(1), "the job's exit code");
+    }
+
+    /// The DACL a directory carries, as SDDL.
+    fn dacl_of(dir: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SE_FILE_OBJECT,
+        };
+        let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path; `sd` receives a LocalAlloc'd
+        // descriptor, freed below; the other out-params are optional.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                what,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(rc, 0, "GetNamedSecurityInfoW");
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: the descriptor read above; `text` is LocalAlloc'd, freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                1,
+                what,
+                &mut text,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok, 0,
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW"
+        );
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        // SAFETY: `len` units were just read from `text`.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: the two allocations above, each freed once.
+        unsafe {
+            LocalFree(text as _);
+            LocalFree(sd as _);
+        }
+        s
+    }
+
+    /// How the system writes `sid` back in SDDL: by its alias where it has one.
+    /// CI's runner signs in as the built-in Administrator, which comes back as
+    /// `LA`, never as its `S-1-5-21-…-500`. Asked of the system, so no rule
+    /// for which accounts have an alias is guessed here.
+    fn as_written(sid: &str) -> String {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let sd = Sddl::new(&format!("O:{sid}")).unwrap();
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a descriptor `sd` owns; `text` is LocalAlloc'd, freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd.psd,
+                1,
+                OWNER_SECURITY_INFORMATION,
+                &mut text,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok, 0,
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW"
+        );
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        // SAFETY: `len` units were just read from `text`.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: the one allocation above, freed once.
+        unsafe { LocalFree(text as _) };
+        s.trim_start_matches("O:").to_string()
+    }
+
+    /// P1i-2 — a session's directory is made with exactly its DACL, protected
+    /// from what its parent would hand down, and given it again when it is
+    /// there already; and a junction where it goes is refused, not followed.
+    #[test]
+    fn a_session_directory_carries_its_dacl_and_a_junction_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let me = own_sid().unwrap();
+        let shown = as_written(&me);
+        let dir = root.path().join("s1");
+        dir_with_dacl(&dir, &session_dir_sddl(&me)).unwrap();
+        let sddl = dacl_of(&dir);
+        assert!(
+            sddl.starts_with("O:BAD:P"),
+            "owned by Administrators, protected: {sddl}"
+        );
+        assert!(
+            sddl.contains(&format!(";;;{shown})")),
+            "the session's account: {sddl}"
+        );
+        assert!(sddl.contains(";;;SY)") && sddl.contains(";;;BA)"), "{sddl}");
+        assert!(
+            !sddl.contains(";;;BU)") && !sddl.contains(";;;AU)"),
+            "no Users: {sddl}"
+        );
+
+        // Again over the one already there, with another DACL.
+        dir_with_dacl(&dir, PRIVATE_DIR_SDDL).unwrap();
+        assert!(
+            !dacl_of(&dir).contains(&format!(";;;{shown})")),
+            "the account's grant is gone"
+        );
+
+        // A folder someone else made first, and owns: taken over, owner and
+        // all, since an owner keeps WRITE_DAC whatever the DACL says.
+        let squatted = root.path().join("s0");
+        dir_with_dacl(&squatted, &format!("O:{me}D:P(A;OICI;FA;;;{me})")).unwrap();
+        assert!(
+            dacl_of(&squatted).starts_with(&format!("O:{shown}D:")),
+            "the squatter owns it"
+        );
+        dir_with_dacl(&squatted, PRIVATE_DIR_SDDL).unwrap();
+        let taken = dacl_of(&squatted);
+        assert!(
+            taken.starts_with("O:BAD:P"),
+            "Administrators own it now: {taken}"
+        );
+        assert!(
+            !taken.contains(&format!(";;;{shown})")),
+            "and the squatter has nothing: {taken}"
+        );
+
+        let target = root.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.path().join("s2");
+        let made = std::process::Command::new(system_cmd())
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        assert!(
+            dir_with_dacl(&link, PRIVATE_DIR_SDDL).is_err(),
+            "a junction is refused"
+        );
+        assert!(
+            !dacl_of(&target).contains("D:P"),
+            "and what it points at is untouched"
+        );
+    }
+
+    /// P1i-2 — the SID read from a token is this process's account's, and a
+    /// toolbelt's pipe grants the session's account no right to make an
+    /// instance, and nobody but SYSTEM and Administrators anything more.
+    #[test]
+    fn the_sid_is_ours_and_the_pipe_grants_no_instance_creation() {
+        let me = own_sid().unwrap();
+        assert!(me.starts_with("S-1-5-"), "{me}");
+        let sddl = toolbelt_pipe_sddl(&me);
+        let aces: Vec<&str> = sddl
+            .trim_start_matches("D:P(")
+            .split(")S:")
+            .next()
+            .unwrap()
+            .split(")(")
+            .collect();
+        let grant = aces
+            .iter()
+            .find(|ace| ace.ends_with(&format!(";;;{me}")))
+            .unwrap();
+        let mask = grant.split(';').nth(2).unwrap();
+        let mask = u32::from_str_radix(mask.trim_start_matches("0x"), 16).unwrap();
+        // FILE_CREATE_PIPE_INSTANCE (= FILE_APPEND_DATA) is 0x4.
+        assert_eq!(mask & 0x4, 0, "{sddl}");
+        for ace in &aces {
+            assert!(
+                ace.ends_with(";;;SY") || ace.ends_with(";;;BA") || *ace == *grant,
+                "only SYSTEM, Administrators and the session's account: {ace}"
+            );
+        }
+        assert!(Sddl::new(&sddl).is_ok(), "the SDDL parses");
     }
 }
