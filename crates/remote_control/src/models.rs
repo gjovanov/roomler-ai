@@ -3374,6 +3374,14 @@ pub enum EndReason {
     AdminTerminated,
     IdleTimeout,
     Error,
+    /// FR-27 P10 — the person AT THE DEVICE ended the session: the banner's
+    /// or the badge's Disconnect. Distinct from [`Self::AgentHangup`] (the
+    /// agent process gave the session up) and from
+    /// [`Self::ControllerHangup`] (the viewer left) because the viewer
+    /// treats this one differently: it is told who ended it and does NOT
+    /// auto-reconnect. Only the device may claim it — the hub records a
+    /// controller's claim as `ControllerHangup`.
+    HostDisconnect,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
