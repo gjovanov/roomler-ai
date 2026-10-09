@@ -170,6 +170,12 @@ pub struct SessionParams {
     /// `unavailable`, exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<DelegatedRecord>,
+    /// #1882 — whether the session may use the overlay, and the overlay
+    /// blocks the daemon resolved it against: the worker runs no overlay, so
+    /// it cannot read them itself. `None` (a daemon older than the field)
+    /// reads as the default — off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rc_overlay: Option<crate::rc_overlay::RcOverlay>,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -1292,6 +1298,7 @@ mod params_tests {
             input_mode: None,
             asking_org: None,
             record: None,
+            rc_overlay: None,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -1330,6 +1337,7 @@ mod params_tests {
             input_mode: None,
             asking_org: None,
             record: None,
+            rc_overlay: None,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -1353,7 +1361,36 @@ mod params_tests {
             input_mode: None,
             asking_org: None,
             record: None,
+            rc_overlay: None,
         }
+    }
+
+    /// #1882 — the worker runs no overlay, so the daemon's overlay blocks must
+    /// cross WITH the decision: without them a supervised Mac's worker would
+    /// read its own `utunN` address as foreign and offer it again. A frame
+    /// from an older daemon carries neither and reads as off.
+    #[test]
+    fn the_overlay_decision_and_its_blocks_cross_and_absent_reads_off() {
+        let mut p = params(
+            &bson::oid::ObjectId::new().to_hex(),
+            roomler_ai_remote_control::permissions::Permissions::all(),
+        );
+        p.rc_overlay = Some(crate::rc_overlay::RcOverlay {
+            allow: false,
+            v4_nets: vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+        });
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
+            .expect("serialises");
+        match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
+            DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
+            other => panic!("expected SessionParams, got {other:?}"),
+        }
+
+        p.rc_overlay = None;
+        let older = serde_json::to_string(&p).unwrap();
+        assert!(!older.contains("rc_overlay"), "{older}");
+        let back: SessionParams = serde_json::from_str(&older).unwrap();
+        assert!(!back.rc_overlay.unwrap_or_default().allow);
     }
 
     /// FR-85 P1e-mac — the record context crosses intact, and a frame from a

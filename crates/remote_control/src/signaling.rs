@@ -2015,6 +2015,15 @@ pub enum ServerMsg {
         /// (the pre-multi-org behaviour).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant_name: Option<String>,
+        /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved: may this
+        /// session's ICE use the WireGuard overlay? `false` — absent from an
+        /// older server, and the policy default — makes the agent keep every
+        /// overlay address out of the session (its own overlay interface, an
+        /// overlay-addressed remote candidate, an overlay TURN server).
+        /// `true` is the behaviour from before the field. Skipped when false,
+        /// so the default costs nothing on the wire.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rc_overlay: bool,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -4598,6 +4607,47 @@ mod tests {
                 assert_eq!(d.overlay_ip, "100.64.0.7");
             }
             _ => panic!("expected SessionRequest"),
+        }
+    }
+
+    /// #1882 — `rc_overlay` is OFF unless the server says otherwise. An older
+    /// server never sends it, so absent has to read `false`; `false` is
+    /// skipped so the default costs nothing on the wire; `true` round-trips.
+    #[test]
+    fn request_rc_overlay_is_off_when_absent_and_round_trips_when_on() {
+        let req = |rc_overlay| ServerMsg::Request {
+            session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            controller_name: "Alice".into(),
+            permissions: Permissions::VIEW,
+            consent_timeout_secs: 30,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            consent_mode: None,
+            host_prompt_timeout_secs: None,
+            input_mode: None,
+            tenant_name: None,
+            rc_overlay,
+        };
+        let off = serde_json::to_string(&req(false)).unwrap();
+        assert!(
+            !off.contains("rc_overlay"),
+            "false is the default and must not reach the wire: {off}"
+        );
+        match serde_json::from_str::<ServerMsg>(&off).unwrap() {
+            ServerMsg::Request { rc_overlay, .. } => {
+                assert!(!rc_overlay, "absent (an older server) must read OFF")
+            }
+            _ => panic!("expected Request"),
+        }
+        let on = serde_json::to_string(&req(true)).unwrap();
+        assert!(on.contains("\"rc_overlay\":true"), "{on}");
+        match serde_json::from_str::<ServerMsg>(&on).unwrap() {
+            ServerMsg::Request { rc_overlay, .. } => assert!(rc_overlay),
+            _ => panic!("expected Request"),
         }
     }
 

@@ -199,6 +199,57 @@ N controllers : 1 agent          → agent → mediasoup → N consumers (view-o
 
 This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler — we just add a transport kind for "remote screen capture" and a one-producer router shape.
 
+### 4.4 Whether a session may ride the overlay (#1882)
+
+A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device in **Admin → Agents** ("Remote desktop over the mesh"), **off by default**.
+
+**Why off.** A session on the overlay inherits the overlay's failure modes, and its carrier is invisible to rate control:
+
+- **#1856:** a 3 ms route hole on a Mac killed RC sessions.
+- **Hidden carrier:** a pair the mesh carries over DERP/TCP reads as `local_typ=Host, relay=false`, so ABR budgets for a direct path while the video crosses a TCP relay.
+
+On the hotspot topology in #1882, the overlay was the *only* working pair. Off means that topology falls to TURN instead, as every Windows and Linux target already did for host candidates.
+
+```mermaid
+flowchart LR
+    P["AccessPolicy.rc_overlay<br/>(device row, default off)"] --> G["authz gate<br/>controller.rs"]
+    G --> H["Hub: ServerMsg::Request { rc_overlay }"]
+    G --> W["Hub forward_offer:<br/>withhold the loopback-TURN<br/>relay when off"]
+    H --> D["daemon: RcOverlay::resolve<br/>+ the overlay's v4 blocks"]
+    D -->|"delegated (macOS GUI worker)"| S["SessionParams.rc_overlay"]
+    D --> A["AgentPeer::new"]
+    S --> A
+    A --> F1["host candidates:<br/>SettingEngine IP filter"]
+    A --> F2["ICE servers:<br/>drop overlay-addressed URLs"]
+    A --> F3["remote candidates + offer SDP:<br/>drop overlay addresses"]
+```
+
+The overlay reaches a session's ICE three ways. The interface-name rule RC always had (`is_overlay_iface`: `roomler`, `roomler-*`, `roomler0`) covers only part of the first, so "off" needs one filter per way:
+
+| How the overlay gets in | Filter (off) | Where |
+|---|---|---|
+| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:379` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:406`, `crates/modules/fleet/src/hub.rs:1365` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1410`, `peer.rs:1449`, `peer.rs:1378` |
+
+"Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2107`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
+
+> ⚠️ **Never the whole `100.64.0.0/10`.** That is real CGNAT space: an LTE modem, a cloud VPC's secondary range and Tailscale all hand out addresses in it, and a CIDR rule would silently strip their candidates. The footprint registry only ever grows, so a WS reconnect or runtime restart never opens a window in which an overlay address reads as foreign.
+
+> ⚠️ **A delegated session's worker runs no overlay.** On a supervised Mac (FR-43), the GUI worker builds the peer, but it has no overlay to read blocks from. The daemon resolves the decision *with* its blocks (`signaling.rs:2615`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:178`). A frame from an older daemon carries none and reads **off**.
+
+**Compatibility.** Each half defaults to off on its own, so mixed versions never turn the overlay on by accident:
+
+| Server | Agent | Result |
+|---|---|---|
+| Older (no field) | New | Absent reads **off** (`signaling.rs:2026`, `serde(default)`) |
+| New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
+| Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
+
+**What "off" does not cover.** It keeps overlay addresses out of the session; it does not override the host's own routing. A controller host using an **exit node**, or a route the mesh advertises for the browser's LAN (a **subnet router**), still sends ordinary internet or LAN traffic through the mesh. That traffic is the host's routing choice, not an overlay candidate.
+
+**Verify on a device.** Each session logs one line, `rc ICE: overlay excluded (device policy rc_overlay=off, the default)` (or `allowed …`), with `overlay_blocks=N`. A dropped remote candidate logs at DEBUG. With `rc_overlay` on, nothing is filtered beyond the name rule, which is the behaviour from before the switch existed.
+
 ## 5. Capture & encode pipeline
 
 ### 5.1 Capture targets per OS

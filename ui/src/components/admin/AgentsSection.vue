@@ -500,6 +500,19 @@
                 :aria-label="`Input mode for ${item.name}`"
                 @update:model-value="(m) => onInputModeChange(agentFor(item)!, m as 'free' | 'exclusive')"
               />
+              <!-- #1882 — may a session to this device ride the mesh? Off by
+                   default: the agent keeps overlay addresses out of its ICE. -->
+              <v-checkbox
+                :model-value="agentFor(item)!.access_policy.rc_overlay ?? false"
+                density="compact"
+                hide-details
+                :disabled="consentBusy === item.id"
+                label="Remote desktop over the mesh"
+                :title="RC_OVERLAY_HINT"
+                :aria-label="`Let remote desktop to ${item.name} use the mesh (overlay)`"
+                class="consent-owner-toggle"
+                @update:model-value="(v) => onRcOverlayChange(agentFor(item)!, v === true)"
+              />
             </template>
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
@@ -755,6 +768,18 @@
               class="mb-2"
               :aria-label="`Input mode for ${a.name}`"
               @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
+            />
+            <!-- #1882 — see the desktop table: off by default. -->
+            <v-checkbox
+              :model-value="a.access_policy.rc_overlay ?? false"
+              density="compact"
+              hide-details
+              :disabled="consentBusy === a.id"
+              label="Remote desktop over the mesh"
+              :title="RC_OVERLAY_HINT"
+              :aria-label="`Let remote desktop to ${a.name} use the mesh (overlay)`"
+              class="mb-2"
+              @update:model-value="(v) => onRcOverlayChange(a, v === true)"
             />
             <div class="d-flex gap-2">
               <v-btn
@@ -1894,6 +1919,29 @@ async function onInputModeChange(a: Agent, mode: 'free' | 'exclusive') {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
       input_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
+
+/** #1882 — what the "Remote desktop over the mesh" switch does, for its
+ *  tooltip. */
+const RC_OVERLAY_HINT =
+  'Off (default): remote desktop never rides the WireGuard mesh; it connects ' +
+  'over the LAN, a direct path or a TURN relay. On: it may take the mesh when ' +
+  'that is the best path, and inherits the mesh’s outages. Applies to the ' +
+  'next session.'
+
+async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
+  if ((a.access_policy.rc_overlay ?? false) === rc_overlay) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      rc_overlay,
     })
   } catch (e) {
     agentStore.error = (e as Error).message

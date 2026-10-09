@@ -62,6 +62,13 @@ export interface AccessPolicy {
    *  INPUT injects, agent-fenced) | `exclusive` (one floor holder,
    *  request/grant). `null`/absent = free. */
   input_mode?: 'free' | 'exclusive' | null
+  /** #1882 — may a remote-desktop session to this device ride the WireGuard
+   *  mesh (overlay)? `null`/absent/`false` = no, the default: the agent keeps
+   *  every overlay address out of the session's ICE, so it takes a LAN,
+   *  direct or TURN path. `true` lets ICE pick the overlay pair when it is
+   *  the best one (it can be the only working path between two hostile NATs,
+   *  but it inherits the mesh's failure modes). */
+  rc_overlay?: boolean | null
 }
 
 /** Codec + HW backend availability advertised by the agent in its

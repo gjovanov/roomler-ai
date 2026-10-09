@@ -179,12 +179,14 @@ pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
 /// P6's controller display name and the device policy's input mode, FR-27's
 /// asking org (the "Being viewed by" banner is raised at peer-build time, not
-/// request time), and FR-85 P3b's record-channel context.
+/// request time), FR-85 P3b's record-channel context, and #1882's overlay
+/// decision.
 type SessionMeta = (
     String,
     Option<roomler_ai_remote_control::models::InputMode>,
     Option<String>,
     Option<RecordMeta>,
+    crate::rc_overlay::RcOverlay,
 );
 
 /// FR-85 P3b — what a session's `record` channel needs, resolved when the
@@ -2106,9 +2108,19 @@ async fn connect_once(
                                         prompt_window: r.prompt_window_ms.map(Duration::from_millis),
                                     })
                                 });
+                                // #1882 — the daemon's overlay decision, with its
+                                // overlay blocks: this worker runs no overlay to
+                                // read them from. An older daemon sends none,
+                                // which is the default — off.
                                 pending_session_meta.insert(
                                     sid,
-                                    (p.controller_name, p.input_mode, p.asking_org, record),
+                                    (
+                                        p.controller_name,
+                                        p.input_mode,
+                                        p.asking_org,
+                                        record,
+                                        p.rc_overlay.unwrap_or_default(),
+                                    ),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
                             }
@@ -2595,7 +2607,12 @@ async fn handle_server_msg(
             host_prompt_timeout_secs,
             input_mode,
             tenant_name,
+            rc_overlay,
         } => {
+            // #1882 — the device's overlay decision, resolved HERE, by the
+            // daemon: it is the process whose overlay knows the blocks, and a
+            // delegated session's worker gets this same value.
+            let rc_overlay = crate::rc_overlay::RcOverlay::resolve(rc_overlay);
             // Multi-org — WHICH organization is asking. The server's display
             // name when it sent one; otherwise this loop's own org label,
             // which at least distinguishes secondaries.
@@ -2674,6 +2691,7 @@ async fn handle_server_msg(
                     input_mode,
                     asking_org.clone(),
                     None,
+                    rc_overlay.clone(),
                 ),
             );
             info!(
@@ -2688,6 +2706,7 @@ async fn handle_server_msg(
                 audio_negotiated,
                 consent_mode = ?consent_broker.mode(),
                 org = ?asking_org,
+                rc_overlay = rc_overlay.allow,
                 "incoming session request — running consent broker"
             );
             // FR-27 follow-up (field, 2026-08-30) — the "Being viewed by …"
@@ -2790,6 +2809,7 @@ async fn handle_server_msg(
                             prompt_window_ms: record_prompt_window
                                 .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
                         }),
+                        rc_overlay: Some(rc_overlay.clone()),
                     }),
                 ));
                 if !sent {
@@ -3047,10 +3067,19 @@ async fn handle_server_msg(
             // P6 — controller name + policy input mode for the arbiter
             // registration. Missing (harness skipped rc:request) → an
             // anonymous label + the agent-default (free) mode.
+            // #1882 — and the overlay decision; missing means off, with this
+            // process's own overlay blocks.
             #[cfg_attr(not(feature = "recording"), allow(unused_variables))]
-            let (controller_name, input_mode, asking_org, record_meta) = pending_session_meta
-                .remove(&session_id)
-                .unwrap_or_else(|| ("Controller".to_string(), None, None, None));
+            let (controller_name, input_mode, asking_org, record_meta, rc_overlay) =
+                pending_session_meta.remove(&session_id).unwrap_or_else(|| {
+                    (
+                        "Controller".to_string(),
+                        None,
+                        None,
+                        None,
+                        crate::rc_overlay::RcOverlay::resolve(false),
+                    )
+                });
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
@@ -3082,6 +3111,7 @@ async fn handle_server_msg(
                     }
                     .to_string()
                 }),
+                rc_overlay,
             )
             .await
             {
