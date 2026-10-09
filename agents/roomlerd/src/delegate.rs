@@ -364,6 +364,10 @@ pub fn delegable_outbound(msg: &ClientMsg) -> bool {
     )
 }
 
+/// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
+/// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
+pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
+
 /// The daemon's end of the delegation channel.
 #[derive(Clone, Default)]
 pub struct DelegateHost {
@@ -406,7 +410,7 @@ struct Inner {
     /// an attached worker ([`DelegateFrame::OverlayFootprint`]). Set by the
     /// daemon to `tunnel_core::overlay_footprint::v4_nets`; unset (every test
     /// host) pushes nothing, so the frame-by-frame tests never meet the frame.
-    footprint: Mutex<Option<fn() -> Vec<(std::net::Ipv4Addr, u8)>>>,
+    footprint: Mutex<Option<FootprintSource>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -435,7 +439,7 @@ impl DelegateHost {
     /// #1882 — read the overlay footprint pushed to an attached worker from
     /// `source`. The daemon passes `tunnel_core::overlay_footprint::v4_nets`;
     /// without a source nothing is pushed.
-    pub fn set_overlay_footprint(&self, source: fn() -> Vec<(std::net::Ipv4Addr, u8)>) {
+    pub fn set_overlay_footprint(&self, source: FootprintSource) {
         *self.inner.footprint.lock().expect("footprint mutex") = Some(source);
     }
 
