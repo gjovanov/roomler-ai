@@ -476,6 +476,14 @@ server, so it has a second dial: `hive.tenants` (`ROOMLER__HIVE__TENANTS`), the 
 agent sessions serve, as comma-separated ids. Empty or `*` is every one, which is what a
 self-hosted server wants. A hosted server lists one test organization first (decision 10).
 
+**The list is the switch** (P1g-2). A non-empty `hive.tenants` mounts the module by itself, with
+no `[modules] hive`, and `/api/capabilities` says so (`Settings::hive_on`,
+`crates/config/src/settings.rs`). A hosted server sets only the list, because that form fails
+safe: an image from before P1g never reads the list, so with `ROOMLER__MODULES__HIVE=true` beside
+it, promoting such an image — a rollback, or another session's older tag — would open the pillar
+to every organization on the hosted server. With the list alone, every older image leaves it off.
+Clearing the list is the kill switch.
+
 ```mermaid
 flowchart LR
     R["a request for org X"] --> M{"a member of X?"}
@@ -495,6 +503,7 @@ flowchart LR
 | the viewer | `hive:view.open` answers `not_found`, as for a session the caller may not read | `view.rs` `open` |
 | a device connecting | nothing is re-sent; what it still runs for the org ends (`hive_not_enabled`) and is told to stop | `agent_socket.rs` `end_unserved` |
 | a malformed entry | logged, and it matches nothing: a typo shuts the org it meant rather than opening any other | `scope.rs` `TenantScope::parse` |
+| the module switch | a list mounts the module by itself (`*` included); an image that predates P1g-2 leaves it unmounted | `settings.rs` `Settings::hive_on`, `Settings::switched_off` |
 
 ## 4. Phases
 
@@ -529,7 +538,8 @@ flowchart LR
 | P1e-4 | AC8 end to end in CI (`hive_memory.rs`, the gate on; `hive_memory_off.rs`, the gate off; see the AC8 test above), and the field run | a test | **merged** #1875 `bc717a495` (field-verified 2026-10-08, §8) |
 | P1f-1 | the transcript's renderers (§3c "P1f-1 … as built"): a tool call drawn by its tool — a command line, an edit as a diff, a new file's first lines, a file range, a search, a to-do list — its result folded under it by `tool_use_id`; output coloured from SGR, every other escape dropped; an approval shows its input the same way | none: the old JSON view is the fallback for anything off-shape | **merged** #1876 `5c770db51` (field-verified 2026-10-08, §8) |
 | P1f-2 | the long list (§3c "P1f-2, the long list"): following the newest, the transcript keeps at most 1,000 events, the oldest a "load earlier" away, never while someone reads further up (`content-visibility` was tried and dropped: the first scroll to the bottom landed short) | none: the device keeps every event; the window is the browser's | **merged** #1877 `48cc6d17a` (field-verified 2026-10-08, §8) |
-| P1g | the org gate (§3g "P1g … as built"): `hive.tenants`, the organizations agent sessions serve; every route, the viewer and a connecting device answer an unserved one as if the module were not there for it; `GET …/hive` for the SPA | `hive.tenants` empty (every org), and the module switch itself | in review |
+| P1g | the org gate (§3g "P1g … as built"): `hive.tenants`, the organizations agent sessions serve; every route, the viewer and a connecting device answer an unserved one as if the module were not there for it; `GET …/hive` for the SPA | `hive.tenants` empty (every org), and the module switch itself | **merged** #1879 `f3fcfd956` |
+| P1g-2 | the list is the switch (§3g): a non-empty `hive.tenants` mounts the module with no `[modules] hive`, and `/api/capabilities` reports it — so an older image leaves the pillar off instead of open to every organization | clearing `hive.tenants` | in review |
 | P1h | sessions on macOS: the launcher for a mapped account (`setuid`/`setgid` like Linux; the harness's macOS paths), field-verified on prod in the test org (decision 10) | device `hive_enabled = false`, the default | — |
 | P1i | sessions on Windows, as the console user only (design §0.1): the user's token from the active console session, the toolbelt over a named pipe, the account's copy of core memory done as the user; refused `no_console_user` with nobody signed in (AC13) | device `hive_enabled = false`, the default | — |
 | P1j | `adopt` (design §10.8, decision 11): a person mirrors their own terminal sessions as read-only sessions only they see, on a device whose owner allows it | device `hive_adopt = false`, the default | — |
