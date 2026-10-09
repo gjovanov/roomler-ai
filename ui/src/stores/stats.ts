@@ -195,6 +195,9 @@ export interface UsersPayload {
   range?: string
   /** false = no GeoIP database configured ⇒ countries read "unknown" */
   geoip?: boolean
+  /** The loaded database's own type (`DBIP-Country-Lite`, …), null with none.
+   *  Picks the credit its licence asks for (`utils/geoipCredit.ts`, #1896). */
+  geoip_database?: string | null
   series?: SeriesPoint[]
   browsers?: Array<{ key: string; sessions: number }>
   platforms?: Array<{ key: string; sessions: number }>

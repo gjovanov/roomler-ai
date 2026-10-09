@@ -142,6 +142,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # #1896: the same country database the hosted image carries (DB-IP's
+      # CC BY 4.0 "IP to Country Lite"), staged into the build context before
+      # the build. A failed download warns and builds on: the image then
+      # reports `country: unknown`, the designed state.
+      - name: GeoIP database (DB-IP, CC BY 4.0)
+        id: geoip
+        if: steps.gate.outputs.skip != 'true'
+        run: bash scripts/fetch-geoip.sh files/geoip
+
       - name: Build
         if: steps.gate.outputs.skip != 'true'
         uses: docker/build-push-action@v6
@@ -235,6 +244,31 @@ jobs:
                 exit 1
               fi
               echo "  device listing: $DEV ✓"
+              # #1896: a staged country database must be one the server LOADS
+              # (the same rule as the hosted lane). No database is a warning,
+              # never a failure: a download outage must not block a release.
+              docker logs roomler > /tmp/roomler.log 2>&1 || true
+              GEO="$(grep -m1 'geoip database' /tmp/roomler.log || true)"
+              echo "  geoip: ${GEO:-no geoip line in the boot log}"
+              if [ '${{ steps.geoip.outputs.present }}' = 'true' ]; then
+                case "$GEO" in
+                  *'geoip database loaded'*'DBIP-Country-Lite'*)
+                    echo "  geoip: DB-IP database loaded on ${{ matrix.arch }} ✓" ;;
+                  *)
+                    echo "::error::the fetch step staged a GeoIP database, but the ${{ matrix.arch }} server did not load it"
+                    exit 1 ;;
+                esac
+                # This smoke runs as root; a self-hoster may not (`user:` in
+                # compose, runAsNonRoot), so the file must be world-readable.
+                GEO_PATH="$(docker exec roomler printenv ROOMLER__STATS__GEOIP_MMDB)"
+                if ! docker exec --user 65534:65534 roomler test -r "$GEO_PATH"; then
+                  echo "::error::$GEO_PATH is not readable by a non-root user: a container not run as root would read every country as 'unknown'"
+                  exit 1
+                fi
+                echo "  geoip: readable by a non-root user ✓"
+              else
+                echo "::warning title=No GeoIP database::this image carries none, so the user analytics will read every country as 'unknown'"
+              fi
               exit 0
             fi
             sleep 10
