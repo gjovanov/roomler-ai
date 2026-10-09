@@ -49,7 +49,7 @@
                   <v-btn value="reader" size="small" data-testid="hive-person-reader">
                     {{ $t('hive.people.role.reader') }}
                   </v-btn>
-                  <v-btn value="driver" size="small" data-testid="hive-person-driver">
+                  <v-btn v-if="!adopted" value="driver" size="small" data-testid="hive-person-driver">
                     {{ $t('hive.people.role.driver') }}
                   </v-btn>
                 </v-btn-toggle>
@@ -96,6 +96,7 @@
               {{ $t('hive.people.addReader') }}
             </v-btn>
             <v-btn
+              v-if="!adopted"
               size="small"
               color="primary"
               variant="flat"
@@ -105,6 +106,9 @@
             >
               {{ $t('hive.people.addDriver') }}
             </v-btn>
+          </div>
+          <div v-if="adopted" class="text-caption text-medium-emphasis mt-1" data-testid="hive-people-readers-only">
+            {{ $t('hive.people.adoptedReadersOnly') }}
           </div>
         </div>
         <div v-if="error" class="text-caption text-error mt-2" data-testid="hive-people-error">{{ error }}</div>
@@ -122,7 +126,15 @@ import { computed, ref, watch } from 'vue'
 import { api } from '@/api/client'
 import { useHiveStore, type HiveParticipant, type HiveParticipants } from '@/stores/hive'
 
-const props = defineProps<{ tenantId: string; sessionId: string }>()
+const props = withDefaults(
+  defineProps<{
+    tenantId: string
+    sessionId: string
+    /** P1j — an adopted session (a terminal's) takes readers only. */
+    adopted?: boolean
+  }>(),
+  { adopted: false },
+)
 const hive = useHiveStore()
 
 const shown = ref(false)

@@ -57,10 +57,10 @@ const asked = (id: string, input: unknown = { command: 'whoami' }) => ({
   input,
 })
 
-async function render() {
+async function render(extra: Record<string, unknown> = {}) {
   const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
   const w = mount(HiveTranscript, {
-    props: { sessionId: 's1' },
+    props: { sessionId: 's1', ...extra },
     global: { plugins: [vuetify, i18n] },
   })
   await flushPromises()
@@ -231,6 +231,15 @@ describe('HiveTranscript — who drives (FR-90 P1c)', () => {
     const w = await render()
     expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
     expect(w.find('[data-testid="hive-read-only"]').text()).toContain('Only its drivers can prompt the agent.')
+  })
+
+  it('says an adopted session (P1j) runs in a terminal and is read-only, with no composer', async () => {
+    hoisted.viewer = makeViewer([], [], false)
+    const w = await render({ adopted: true })
+    expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
+    expect(w.find('[data-testid="hive-read-only"]').text()).toBe(
+      'This session runs in a terminal on its device, so it is read-only here: nobody prompts it from Roomler.',
+    )
   })
 
   it("says in the device's words why a driver the server named cannot act there", async () => {
