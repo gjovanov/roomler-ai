@@ -444,6 +444,15 @@ pub struct AgentConfig {
     /// owner's call alone.
     #[serde(default)]
     pub hive_core_memory: bool,
+    /// FR-90 P1j — let the people who use this device adopt the Claude Code
+    /// sessions they run in a terminal (`roomler hive adopt`): mirrored into
+    /// this device's store and listed for their owner alone, read-only.
+    /// Default OFF, and never pushable: a terminal session passed none of
+    /// Hive's start gates, so whether this machine reports on its terminals
+    /// at all is the device owner's call alone. Each person still opts in
+    /// themselves, and their account must map in `hive_accounts`.
+    #[serde(default)]
+    pub hive_adopt: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2219,6 +2228,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_api_workspace_id: None,
         hive_update_wait_secs: None,
         hive_core_memory: false,
+        hive_adopt: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

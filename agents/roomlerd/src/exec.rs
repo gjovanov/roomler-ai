@@ -837,8 +837,8 @@ pub(crate) use unix_priv::account_home;
 pub(crate) use unix_priv::account_ids;
 /// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
-/// Gated to its one consumer, like the drop above.
-#[cfg(all(target_os = "linux", feature = "recording"))]
+/// FR-90 P1j: and the adopt socket, which names the account its peer runs as.
+#[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
 pub(crate) use unix_priv::account_name;
 /// Unix privilege drop.
 ///
@@ -994,7 +994,7 @@ mod unix_priv {
 
     /// FR-85 P1e-unix — the name of the account with `uid` (`getpwuid_r`,
     /// the buffer grown as [`resolve`] grows its own).
-    #[cfg(all(target_os = "linux", feature = "recording"))]
+    #[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
     pub(crate) fn account_name(uid: libc::uid_t) -> Result<String, String> {
         let mut buf = vec![0 as libc::c_char; 1024];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };

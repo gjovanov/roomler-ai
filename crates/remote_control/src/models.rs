@@ -5363,6 +5363,9 @@ mod tests {
             // session's model; a server that could set it would vouch for
             // itself.
             "hive_core_memory",
+            // FR-90 P1j — whether this machine reports on its terminals at
+            // all (decision 11): the device owner's alone.
+            "hive_adopt",
         ] {
             assert!(
                 !keys.contains(&forbidden),
