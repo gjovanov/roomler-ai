@@ -731,6 +731,12 @@ pub struct AgentConfig {
     /// restores the pre-rc.409 blind per-wave eviction.
     #[serde(default)]
     pub overlay_route_reclaim: Option<bool>,
+    /// #1405 — evict a competing VPN route only when it WINS the FIB
+    /// decision, Windows only (`ROOMLERD_OVERLAY_ROUTE_EVICT_WINNERS_ONLY`).
+    /// Built-in default: on; off restores evicting every competing row on
+    /// every wave.
+    #[serde(default)]
+    pub overlay_route_evict_winners_only: Option<bool>,
     /// Keep the overlay TUN device alive across signaling reconnects
     /// (process-lifetime cache in the agent's TUN factory)
     /// (`ROOMLERD_OVERLAY_TUN_PERSIST`). Built-in default: on.
@@ -2269,6 +2275,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
         overlay_route_reclaim: None,
+        overlay_route_evict_winners_only: None,
         overlay_tun_persist: None,
         overlay_route_metric0: None,
         overlay_route_win: None,
@@ -2461,7 +2468,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2540,6 +2547,10 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82]
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_ROUTE_RECLAIM", cfg.overlay_route_reclaim),
+        (
+            "OVERLAY_ROUTE_EVICT_WINNERS_ONLY",
+            cfg.overlay_route_evict_winners_only,
+        ),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
         ("OVERLAY_ROUTE_METRIC0", cfg.overlay_route_metric0),
         ("OVERLAY_ROUTE_WIN", cfg.overlay_route_win),

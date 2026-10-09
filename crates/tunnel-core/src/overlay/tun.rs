@@ -1062,10 +1062,74 @@ mod system {
             }
         }
 
+        /// #1405 — per-prefix eviction futility. Its own table, not
+        /// `WRITE_STRIKES`: `note_present` clears that entry whenever OUR route
+        /// is present, which in this war it always is, so a pause kept there
+        /// would be lifted on the very next wave.
+        static EVICT_STREAKS: std::sync::Mutex<
+            Option<std::collections::HashMap<(IpAddr, u8), super::EvictStreak>>,
+        > = std::sync::Mutex::new(None);
+
+        fn eviction_paused(key: (IpAddr, u8)) -> bool {
+            if !super::route_yield_enabled() {
+                return false;
+            }
+            EVICT_STREAKS
+                .lock()
+                .ok()
+                .and_then(|g| {
+                    g.as_ref()?
+                        .get(&key)
+                        .map(|s| s.paused(std::time::Instant::now()))
+                })
+                .unwrap_or(false)
+        }
+
+        fn note_eviction(key: (IpAddr, u8)) {
+            if !super::route_yield_enabled() {
+                return;
+            }
+            let Ok(mut g) = EVICT_STREAKS.lock() else {
+                return;
+            };
+            let s = g
+                .get_or_insert_with(std::collections::HashMap::new)
+                .entry(key)
+                .or_default();
+            if let Some(back) = s.evicted(std::time::Instant::now()) {
+                crate::evidence::ROUTE_YIELDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    dest = %key.0,
+                    plen = key.1,
+                    backoff_s = back.as_secs(),
+                    "overlay: STANDING DOWN from evicting a competing route — it is back on \
+                     every wave and wins every lookup between deletions, so deleting it only \
+                     churns the FIB (and each deletion re-arms the route guard). Leaving it \
+                     for the backoff, then probing once (#1405)"
+                );
+            }
+        }
+
+        /// #1405 — does a competitor actually win the FIB decision for
+        /// `dest/plen`? A foreign row that loses every lookup carries no
+        /// traffic, and deleting it is a route-change event that re-arms the
+        /// guard; AnyConnect then re-adds it within milliseconds. A failed
+        /// lookup fails toward the old behaviour (evict).
+        fn competitor_wins(ours: u64, dest: IpAddr, plen: u8) -> bool {
+            if !super::route_evict_winners_only_enabled() {
+                return true;
+            }
+            best_route_luid(super::eviction_probe(dest, plen))
+                .is_none_or(|luid| !super::adapter_is_ours(luid, ours))
+        }
+
         /// Evict any `dest/plen` route on an interface OTHER than `ours` — the
         /// full-tunnel-VPN route war (Check Point installs a competing `/32` per
         /// overlay peer). Snapshots the v4 FIB (in-memory, ~µs) and deletes the
         /// competing entries so our wintun route wins.
+        ///
+        /// #1405 — only when the competitor actually wins the lookup, and not
+        /// while a futility pause holds for this prefix.
         pub fn evict_competing_v4(ours: u64, dest: Ipv4Addr, plen: u8) {
             // rc.279 kill-switch — deleting ANOTHER product's routes is the
             // right default (the overlay is unusable under a hostile
@@ -1079,6 +1143,11 @@ mod system {
             if yielded((IpAddr::V4(dest), plen)) {
                 return;
             }
+            let key = (IpAddr::V4(dest), plen);
+            if eviction_paused(key) || !competitor_wins(ours, key.0, plen) {
+                return;
+            }
+            let mut evicted_any = false;
             let want = u32::from_ne_bytes(dest.octets());
             // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
             // free; every union read is guarded by the `si_family` check.
@@ -1104,6 +1173,7 @@ mod system {
                         // rc.287 throttles the emit to 1 WARN/min/prefix
                         // because AnyConnect re-adds within milliseconds.
                         if DeleteIpForwardEntry2(r) == NO_ERROR {
+                            evicted_any = true;
                             evict_warn(
                                 IpAddr::V4(dest),
                                 plen,
@@ -1114,6 +1184,9 @@ mod system {
                     }
                 }
                 FreeMibTable(table as *const core::ffi::c_void);
+            }
+            if evicted_any {
+                note_eviction(key);
             }
         }
 
@@ -1283,6 +1356,15 @@ mod system {
             if yielded((IpAddr::V6(dest), plen)) {
                 return;
             }
+            // #1405 — only a winner, and not while this prefix is paused. The
+            // ULA `/96` behind AnyConnect is the case this was found on: their
+            // mirror wins (26 vs our 261), comes back within milliseconds, and
+            // deleting it ~20×/min held nothing (v6 stayed 100% lost).
+            let key = (IpAddr::V6(dest), plen);
+            if eviction_paused(key) || !competitor_wins(ours, key.0, plen) {
+                return;
+            }
+            let mut evicted_any = false;
             let want = dest.octets();
             // SAFETY: same snapshot-iterate-free shape as the v4 walk; every
             // union read is guarded by the `si_family` check.
@@ -1300,6 +1382,7 @@ mod system {
                         && !super::route_belongs_to_us(r.InterfaceLuid.Value, ours)
                         && DeleteIpForwardEntry2(r) == NO_ERROR
                     {
+                        evicted_any = true;
                         evict_warn(
                             IpAddr::V6(dest),
                             plen,
@@ -1309,6 +1392,9 @@ mod system {
                     }
                 }
                 FreeMibTable(table as *const core::ffi::c_void);
+            }
+            if evicted_any {
+                note_eviction(key);
             }
         }
 
@@ -2125,6 +2211,17 @@ mod system {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
     }
 
+    /// #1405 — evict a competing route only when it WINS the FIB decision
+    /// (`ROOMLERD_OVERLAY_ROUTE_EVICT_WINNERS_ONLY`, config
+    /// `overlay_route_evict_winners_only`). Default **ON**. A competitor row
+    /// that loses every lookup carries no traffic, while deleting it is a
+    /// route-change event that re-arms the guard. `0` restores evicting every
+    /// competing row on every wave.
+    #[cfg(windows)]
+    fn route_evict_winners_only_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_EVICT_WINNERS_ONLY", true)
+    }
+
     /// #1328 — how long to stand down from a prefix after `yields` consecutive
     /// futile defend-cycles: 30 s, doubling, capped at 15 min.
     ///
@@ -2155,6 +2252,166 @@ mod system {
         // saturating counter.
         let step = 30u64.saturating_mul(1u64 << yields.min(5));
         std::time::Duration::from_secs(step.clamp(30, 900))
+    }
+
+    /// #1405 — the address a competing-route eviction asks the FIB about: the
+    /// destination itself for a host route, else the first address inside the
+    /// prefix. Pure and outside `cfg(windows)` for the same reason as
+    /// [`yield_backoff`]: CI's Rust lane is Linux.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn eviction_probe(dest: std::net::IpAddr, plen: u8) -> std::net::IpAddr {
+        match dest {
+            std::net::IpAddr::V4(a) if plen < 32 => {
+                std::net::IpAddr::V4(Ipv4Addr::from(u32::from(a) | 1))
+            }
+            std::net::IpAddr::V6(a) if plen < 128 => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(a) | 1))
+            }
+            other => other,
+        }
+    }
+
+    /// #1405 — consecutive waves on which this prefix had to be evicted
+    /// AGAIN: the competitor put its row straight back after the last delete.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const EVICTIONS_TO_STAND_DOWN: u32 = 4;
+    /// #1405 — an eviction this soon after the previous one continues the
+    /// streak: 3 heartbeats, so a war at the 30 s heartbeat counts as
+    /// consecutive while a competitor that returns an hour later does not.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const EVICT_STREAK_GAP: std::time::Duration = std::time::Duration::from_secs(90);
+    /// #1405 — this long without a single eviction resets the backoff ladder:
+    /// the competitor left, and the next one gets a fresh hearing.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const EVICT_LADDER_RESET: std::time::Duration = std::time::Duration::from_secs(1800);
+
+    /// #1405 — eviction futility for one prefix.
+    ///
+    /// AnyConnect mirrors our prefixes onto its miniport and re-adds a deleted
+    /// mirror within milliseconds. A competitor row that WINS every lookup and
+    /// comes straight back is therefore never actually beaten by deleting it.
+    /// The deletion only churns the FIB, and every deletion is a route-change
+    /// event that re-arms the route guard 3 s later. Field, CORPLAP-3 on
+    /// 0.4.121: ~200 evictions/min, `pulled == tick`. After
+    /// [`EVICTIONS_TO_STAND_DOWN`] consecutive evictions the prefix pauses for
+    /// [`yield_backoff`] (1 min, doubling, capped at 15 min). The pause costs
+    /// nothing, because between evictions the competitor was winning anyway.
+    #[derive(Debug, Default, Clone, Copy)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    struct EvictStreak {
+        n: u32,
+        yields: u32,
+        last: Option<std::time::Instant>,
+        paused_until: Option<std::time::Instant>,
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    impl EvictStreak {
+        fn paused(&self, now: std::time::Instant) -> bool {
+            self.paused_until.is_some_and(|t| now < t)
+        }
+
+        /// Record one eviction at `now`. `Some(backoff)` when this one makes
+        /// the streak futile and evicting this prefix should pause.
+        fn evicted(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+            let gap = self.last.map(|t| now.saturating_duration_since(t));
+            if gap.is_none_or(|g| g > EVICT_LADDER_RESET) {
+                self.yields = 0;
+            }
+            self.n = if gap.is_some_and(|g| g <= EVICT_STREAK_GAP) {
+                self.n + 1
+            } else {
+                1
+            };
+            self.last = Some(now);
+            if self.n < EVICTIONS_TO_STAND_DOWN {
+                return None;
+            }
+            self.yields = self.yields.saturating_add(1);
+            let back = yield_backoff(self.yields);
+            self.paused_until = Some(now + back);
+            self.n = 0;
+            Some(back)
+        }
+    }
+
+    #[cfg(test)]
+    mod evict_futility_tests {
+        use super::{EvictStreak, eviction_probe};
+        use std::net::IpAddr;
+        use std::time::{Duration, Instant};
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        /// A host route is probed as itself; a prefix by its first address, so
+        /// the lookup lands INSIDE the contested prefix (the ULA `/96`, a
+        /// narrowed org prefix, a floor) and not on its network address.
+        #[test]
+        fn probe_is_the_host_or_the_first_address_inside_the_prefix() {
+            assert_eq!(eviction_probe(ip("100.65.4.14"), 32), ip("100.65.4.14"));
+            assert_eq!(eviction_probe(ip("100.65.7.0"), 24), ip("100.65.7.1"));
+            assert_eq!(
+                eviction_probe(ip("fd72:6f6f:6d6c::"), 96),
+                ip("fd72:6f6f:6d6c::1")
+            );
+            assert_eq!(
+                eviction_probe(ip("fd72:6f6f:6d6c::6441:400"), 118),
+                ip("fd72:6f6f:6d6c::6441:401")
+            );
+            assert_eq!(
+                eviction_probe(ip("fd72:6f6f:6d6c::6441:41e"), 128),
+                ip("fd72:6f6f:6d6c::6441:41e")
+            );
+        }
+
+        /// The CORPLAP-3 shape: an eviction every 3 s wave stands down on the
+        /// 4th, pauses for the ladder's rung, then probes once and climbs.
+        #[test]
+        fn evictions_that_keep_coming_back_stand_down_and_climb_the_ladder() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let mut s = EvictStreak::default();
+            assert_eq!(s.evicted(at(0)), None);
+            assert_eq!(s.evicted(at(3)), None);
+            assert_eq!(s.evicted(at(6)), None);
+            assert_eq!(s.evicted(at(9)), Some(Duration::from_secs(60)));
+            assert!(s.paused(at(10)) && s.paused(at(68)) && !s.paused(at(69)));
+            // After the pause the competitor is still there: the next streak
+            // stands down again, one rung higher.
+            for t in [70, 73, 76] {
+                assert_eq!(s.evicted(at(t)), None);
+            }
+            assert_eq!(s.evicted(at(79)), Some(Duration::from_secs(120)));
+        }
+
+        /// An eviction that sticks (the competitor does not come back) never
+        /// pauses anything, and a long quiet spell resets the ladder.
+        #[test]
+        fn evictions_spread_out_never_pause_and_quiet_resets_the_ladder() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let mut s = EvictStreak::default();
+            for k in 0..10 {
+                assert_eq!(
+                    s.evicted(at(k * 120)),
+                    None,
+                    "2-minute gaps are not a streak"
+                );
+            }
+            let mut w = EvictStreak::default();
+            for t in [0, 3, 6] {
+                w.evicted(at(t));
+            }
+            assert_eq!(w.evicted(at(9)), Some(Duration::from_secs(60)));
+            // 2 h later a new competitor: a fresh hearing, rung 1 again.
+            let later = 9 + 7200;
+            for t in [later, later + 3, later + 6] {
+                assert_eq!(w.evicted(at(t)), None);
+            }
+            assert_eq!(w.evicted(at(later + 9)), Some(Duration::from_secs(60)));
+        }
     }
 
     #[cfg(test)]
