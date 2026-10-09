@@ -680,6 +680,32 @@ server. Detail and the negative-control test:
   with a capped backoff (250 ms → 30 s), and each respawn sends one synthetic
   wake-up, so whatever changed while nothing was watching is re-sampled and
   re-asserted.
+* **Evict a competing route only when it wins, and stop when it is futile**
+  (#1405, Windows). AnyConnect mirrors our prefixes onto its miniport: every
+  peer `/32`, the floor `/24`s, and the derived ULA `/96`. It re-adds a
+  deleted mirror within milliseconds. Two rules stop the guard fighting a war
+  it either already won or cannot win:
+  1. **Only a winner is evicted.** Before deleting anything, the guard asks
+     the FIB which interface it would use (`GetBestRoute2` on the host, or on
+     the first address inside a prefix). If that is ours (a sibling roomler
+     adapter counts as ours), the competitor's row loses every lookup and
+     carries no traffic, so it is left alone. On CORPLAP-3 our v4 rows win
+     (effective 1 vs Cisco's 26), so the per-wave v4 evictions stop entirely.
+     Kill switch: `overlay_route_evict_winners_only` (default on).
+  2. **A winner that comes straight back is a futile fight.** If the same
+     prefix needs evicting on 4 consecutive waves, eviction of it pauses for
+     the #1328 ladder (1 min, doubling, capped at 15 min) and the pause is
+     counted in `yielded`. That is the ULA `/96` behind AnyConnect: their
+     mirror wins 26 vs 261 and returns within milliseconds, so deleting it
+     ~20×/min never held the prefix (v6 overlay stayed 100% lost). Each
+     deletion only re-armed the guard: 0.4.121 measured ~200 evictions/min
+     with `pulled == tick`. Shares the `overlay_route_yield` switch.
+
+  ⚠️ IPv6 overlay behind AnyConnect stays unroutable either way. Winning the
+  `/96` by metric gets our connected row deleted (rc.289, re-confirmed in
+  #1405). The remaining lever is routes we ADD, more specific than `/96`,
+  which AnyConnect tolerates for v4. Nothing opens overlay-v6 sockets today
+  (#1405), so that stays unbuilt until something does.
 
 ---
 
@@ -702,6 +728,7 @@ prefix is still honoured.
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
 | `…_ROUTE_TICK_SECS` | 30 | route-guard heartbeat seconds while the subscription is live (2–300; `2` = pre-demotion cadence). Ignored — always 2 s — without a live subscription |
+| `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
