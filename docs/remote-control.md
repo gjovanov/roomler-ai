@@ -795,6 +795,18 @@ mid-session (the S3 ladder in `useRemoteControl.ts`, `scheduleReconnect`).
 Reconnecting after a host Disconnect is an explicit click and a **new**
 request, through consent like any other.
 
+**Measured** on the macOS banner, 2026-10-09, agent 0.4.121 with the P10 image
+(the FR-27 field log):
+- the reason reached the viewer **72–86 ms** after the click;
+- the transport closed **1.0 s** after it, exactly the grace;
+- the viewer held **65 s** with no request;
+- an explicit Reconnect connected in **2.4–3.5 s**;
+- a later cut of the viewer's signalling socket was back in **6.3 s** with no click.
+
+⚠️ Playwright's `context.setOffline` is not a drop: 10 s of it closed neither the
+open `/ws` nor the WebRTC path, and the session streamed on. To test the ladder,
+cut the socket.
+
 ⚠️ The wire is `rc:terminate`, unchanged; `host_disconnect` is a new
 `EndReason` value. A pre-P10 **server** cannot decode the frame and drops it
 (debug log, socket up): the session then ends when the peer closes and the
