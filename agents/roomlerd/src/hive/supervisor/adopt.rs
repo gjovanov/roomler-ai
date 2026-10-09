@@ -19,6 +19,7 @@
 //! | a terminal session belongs to the account that first offered it; another account's lines are refused | [`Supervisor::adopt_lines`] |
 //! | nothing is taken for a session stopped from Roomler, or ended | [`Supervisor::adopt_stop`] |
 //! | a terminal killed outright is found by its process (pid + start time) and ended | [`Supervisor::adopt_sweep`] |
+//! | an ended session is forgotten as a live one (a resume is offered afresh), and stays its owner's to read | [`AdoptedFile::retire`] |
 //!
 //! ⚠️ An adopted session takes no prompt: it has no input channel here at
 //! all. The terminal holds the harness; the server's grant says
@@ -59,6 +60,9 @@ const MAX_REQUEST: usize = 8 * proto::MAX_LINE;
 /// Adopted sessions one device mirrors at once; the server holds the same
 /// bound (`hive_limits::MAX_ADOPTED_PER_DEVICE`).
 const MAX_ADOPTED: usize = 16;
+/// Ended adopted sessions the device still serves to their owner's viewer
+/// with agent sessions off (`hive_enabled`); the oldest falls off.
+const MAX_ENDED: usize = 1000;
 
 /// One adopted terminal session, as this device keeps it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -105,6 +109,9 @@ struct Doc {
     v: u32,
     agent: String,
     sessions: Vec<Adopted>,
+    /// The records of adopted sessions that ended here, oldest first.
+    #[serde(default)]
+    ended: Vec<String>,
 }
 
 /// The adopted sessions and the file that keeps them, `0600`, written whole.
@@ -113,6 +120,7 @@ pub(crate) struct AdoptedFile {
     path: Option<PathBuf>,
     agent: String,
     sessions: Vec<Adopted>,
+    ended: Vec<String>,
 }
 
 impl AdoptedFile {
@@ -120,21 +128,22 @@ impl AdoptedFile {
     /// cannot be read, belongs to another enrollment or is from a newer
     /// daemon mirrors nothing, and the next write replaces it.
     pub(crate) fn load(path: Option<PathBuf>, agent: &str) -> Self {
-        let sessions = match path.as_ref().map(std::fs::read) {
+        let (sessions, ended) = match path.as_ref().map(std::fs::read) {
             Some(Ok(bytes)) => match serde_json::from_slice::<Doc>(&bytes) {
-                Ok(doc) if doc.v <= VERSION && doc.agent == agent => doc.sessions,
-                Ok(_) => Vec::new(),
+                Ok(doc) if doc.v <= VERSION && doc.agent == agent => (doc.sessions, doc.ended),
+                Ok(_) => Default::default(),
                 Err(e) => {
                     warn!(%e, "hive: the adopted sessions could not be read — none is kept");
-                    Vec::new()
+                    Default::default()
                 }
             },
-            _ => Vec::new(),
+            _ => Default::default(),
         };
         Self {
             path,
             agent: agent.to_string(),
             sessions,
+            ended,
         }
     }
 
@@ -150,6 +159,11 @@ impl AdoptedFile {
 
     fn live(&self) -> impl Iterator<Item = &Adopted> {
         self.sessions.iter().filter(|a| !a.stopped)
+    }
+
+    /// Whether `session` is, or was, an adopted session of this device.
+    fn was_adopted(&self, session: &str) -> bool {
+        self.by_session(session).is_some() || self.ended.iter().any(|s| s == session)
     }
 
     fn put(&mut self, a: Adopted) {
@@ -175,13 +189,27 @@ impl AdoptedFile {
         Some(out)
     }
 
-    fn remove(&mut self, harness_session: &str) {
-        let before = self.sessions.len();
-        self.sessions
-            .retain(|e| e.harness_session != harness_session);
-        if self.sessions.len() != before {
-            self.save();
+    /// A terminal session that ended: forgotten as a live one, so a `claude
+    /// --resume` later is offered afresh, and its record kept among the ended
+    /// ones, whose transcripts stay their owner's to read. A stopped session
+    /// is held until its terminal ends, or every later hook would offer it
+    /// again.
+    fn retire(&mut self, harness_session: &str) {
+        let Some(i) = self
+            .sessions
+            .iter()
+            .position(|e| e.harness_session == harness_session)
+        else {
+            return;
+        };
+        let a = self.sessions.remove(i);
+        self.ended.retain(|s| *s != a.session);
+        self.ended.push(a.session);
+        if self.ended.len() > MAX_ENDED {
+            let over = self.ended.len() - MAX_ENDED;
+            self.ended.drain(..over);
         }
+        self.save();
     }
 
     fn save(&self) {
@@ -190,6 +218,7 @@ impl AdoptedFile {
             v: VERSION,
             agent: self.agent.clone(),
             sessions: self.sessions.clone(),
+            ended: self.ended.clone(),
         };
         if let Err(e) = super::super::hosted::write_private_json(path, &doc) {
             warn!(file = %path.display(), %e, "hive: the adopted sessions were not saved");
@@ -426,6 +455,12 @@ impl Supervisor {
                 return (Reply::refused(refusal::NOT_YOURS, None), None);
             }
             if a.stopped {
+                // Refused for good while its terminal runs. At its end it is
+                // forgotten, as every ended session is: its `End` would never
+                // come past this refusal.
+                if matches!(event, HookEvent::SessionEnd) {
+                    self.adopted_lock().retire(&hs);
+                }
                 return (Reply::refused(refusal::STOPPED, Some(a.offset)), None);
             }
             return (Reply::ok(Some(a.offset)), Some(hs));
@@ -711,9 +746,9 @@ impl Supervisor {
     }
 
     /// End an adopted session for good: its turn interrupted if one ran, the
-    /// state `ended`, and this device forgets it.
+    /// state `ended`, and this device forgets it as a live one.
     fn adopt_finish(&self, a: &Adopted, detail: String) {
-        self.adopted_lock().remove(&a.harness_session);
+        self.adopted_lock().retire(&a.harness_session);
         let Ok(session) = ObjectId::parse_str(&a.session) else {
             return;
         };
@@ -767,10 +802,12 @@ impl Supervisor {
 
     /// The terminals that closed without a word (killed, a reboot of their
     /// machine's session): their process is gone, or another holds its pid.
+    /// A stopped session's terminal too: held until it ends, then forgotten.
     pub(crate) fn adopt_sweep(&self) {
         let gone: Vec<Adopted> = self
             .adopted_lock()
-            .live()
+            .sessions
+            .iter()
             .filter(|a| match (a.terminal_pid, a.terminal_started.as_deref()) {
                 (Some(pid), Some(was)) => procs::started(pid).as_deref() != Some(was),
                 _ => false,
@@ -778,7 +815,9 @@ impl Supervisor {
             .cloned()
             .collect();
         for a in gone {
-            info!(session = %a.session, "hive: an adopted session's terminal closed");
+            if !a.stopped {
+                info!(session = %a.session, "hive: an adopted session's terminal closed");
+            }
             self.adopt_finish(&a, "the terminal closed".into());
         }
     }
@@ -796,9 +835,12 @@ impl Supervisor {
         self.cfg.adopt
     }
 
-    /// Whether `session` is an adopted one this device mirrors.
+    /// Whether `session` is an adopted one this device mirrors or mirrored:
+    /// an ended one's transcript is still its owner's to read, with agent
+    /// sessions off here too (P1j-5's field run: before, it was refused
+    /// `hive_disabled` the moment its terminal ended).
     pub(crate) fn adopt_holds(&self, session: ObjectId) -> bool {
-        self.adopted_lock().by_session(&session.to_hex()).is_some()
+        self.adopted_lock().was_adopted(&session.to_hex())
     }
 
     fn adopted_lock(&self) -> std::sync::MutexGuard<'_, AdoptedFile> {
@@ -1166,6 +1208,107 @@ mod tests {
             !r.sup.manifest().iter().any(|e| e.session_id == sid),
             "a stopped session is not mirrored any more"
         );
+
+        // Its terminal ends: refused still, and forgotten as a live session
+        // (P1j-5's field run: it was held forever), its transcript still its
+        // owner's to read. A `claude --resume` later is offered afresh.
+        let mut last = Hook::connect(&socket).await;
+        last.ask(hello(HookEvent::SessionEnd)).await;
+        assert_eq!(
+            last.reply().await.refused.as_deref(),
+            Some(refusal::STOPPED)
+        );
+        assert!(r.sup.adopted_lock().get(UUID).is_none(), "forgotten");
+        assert!(r.sup.adopt_holds(sid), "still readable");
+        let mut resumed = Hook::connect(&socket).await;
+        resumed.ask(hello(HookEvent::SessionStart)).await;
+        next_report(&mut r, |m| match m {
+            ClientMsg::HiveAdopt {
+                harness_session, ..
+            } if harness_session == UUID => Some(()),
+            _ => None,
+        })
+        .await;
+    }
+
+    /// P1j-5 — an ended session is kept among the ended ones, across a
+    /// restart, and the oldest falls off past the bound.
+    #[test]
+    fn an_ended_session_stays_readable_and_the_oldest_falls_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ADOPTED_FILE);
+        let mut f = AdoptedFile::load(Some(path.clone()), "agent-a");
+        let adopted = |hs: &str, session: &str| Adopted {
+            harness_session: hs.into(),
+            session: session.into(),
+            fence: 1,
+            account: "alice".into(),
+            uid: 1000,
+            offset: 0,
+            turns: 0,
+            running: None,
+            terminal_pid: None,
+            terminal_started: None,
+            stopped: false,
+        };
+        let first = ObjectId::new().to_hex();
+        f.put(adopted("u0", &first));
+        f.retire("u0");
+        assert!(f.get("u0").is_none(), "forgotten as a live session");
+        assert!(f.was_adopted(&first));
+        assert!(
+            AdoptedFile::load(Some(path.clone()), "agent-a").was_adopted(&first),
+            "kept across a restart"
+        );
+        // The bound, in memory (a file written a thousand times proves
+        // nothing more).
+        let mut g = AdoptedFile::load(None, "agent-a");
+        g.put(adopted("u0", &first));
+        g.retire("u0");
+        for i in 1..=MAX_ENDED {
+            g.put(adopted(&format!("u{i}"), &ObjectId::new().to_hex()));
+            g.retire(&format!("u{i}"));
+        }
+        assert!(!g.was_adopted(&first), "the oldest fell off");
+        assert_eq!(g.ended.len(), MAX_ENDED);
+    }
+
+    /// P1j-5 — a stopped session whose terminal is gone is forgotten by the
+    /// sweep, without a word: it ended when it was stopped.
+    #[tokio::test]
+    async fn the_sweep_forgets_a_stopped_session_whose_terminal_is_gone() {
+        if me().is_none() {
+            return;
+        }
+        let (mut r, _socket) = adopting(true).await;
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        let sid = ObjectId::new();
+        r.sup.adopted_lock().put(Adopted {
+            harness_session: UUID.into(),
+            session: sid.to_hex(),
+            fence: 1,
+            account: me().unwrap(),
+            uid: 1000,
+            offset: 7,
+            turns: 1,
+            running: None,
+            terminal_pid: Some(pid),
+            terminal_started: Some("a process that ended".into()),
+            stopped: true,
+        });
+        r.sup.adopt_sweep();
+        assert!(r.sup.adopted_lock().get(UUID).is_none(), "forgotten");
+        assert!(r.sup.adopt_holds(sid), "still readable");
+        while let Ok(Some(m)) =
+            tokio::time::timeout(Duration::from_millis(300), r.reports.recv()).await
+        {
+            assert!(
+                !matches!(&m, ClientMsg::HiveState { session_id, .. } if *session_id == sid),
+                "nothing reported: {m:?}"
+            );
+        }
     }
 
     /// An account the device's owner did not map is refused at the socket,
@@ -1277,7 +1420,8 @@ mod tests {
         })
         .await;
 
-        // SessionEnd: ended, and forgotten.
+        // SessionEnd: ended, and forgotten as a live session; its transcript
+        // is still its owner's to read.
         roomler_cli::hive_hooks::mirror_at(&socket, &input(HookEvent::SessionEnd))
             .await
             .expect("the last run");
@@ -1290,6 +1434,7 @@ mod tests {
             _ => None,
         })
         .await;
-        assert!(!r.sup.adopt_holds(sid));
+        assert!(r.sup.adopted_lock().get(UUID).is_none());
+        assert!(r.sup.adopt_holds(sid));
     }
 }
