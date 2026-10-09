@@ -333,6 +333,18 @@ async fn attach_once(
                                 tracing::debug!(kind, "delegation: serving an rc message");
                             }
                         }
+                        // #1882 — the overlay's blocks, from the daemon that
+                        // runs it. This process runs none, and its OWN
+                        // sessions resolve the device's `rc_overlay` against
+                        // this registry: empty, the `utunN` address read as
+                        // foreign and stayed a host candidate.
+                        Ok(DelegateFrame::OverlayFootprint { v4_nets }) => {
+                            tunnel_core::overlay_footprint::note_v4_blocks(&v4_nets);
+                            tracing::info!(
+                                blocks = v4_nets.len(),
+                                "delegation: the daemon's overlay footprint received"
+                            );
+                        }
                         Ok(DelegateFrame::FromWorker { .. } | DelegateFrame::WorkerCaps { .. }) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
