@@ -45,10 +45,15 @@ pub mod files;
 pub mod fp16;
 pub mod gpu_clock;
 /// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
-/// Linux only in P0: elsewhere the feature compiles nothing and the build
-/// does not advertise `hive`, so no server sends it a session.
+/// Linux and macOS (`cfg(hive_host)`, set by `build.rs`): elsewhere the
+/// feature compiles nothing here and the build does not advertise `hive`, so
+/// no server sends it a session.
 #[cfg(hive_host)]
 pub mod hive;
+/// FR-90 P1i — agent sessions on Windows: the console user, the harness, the
+/// session's preparation. The supervisor is wired to them in P1i-2.
+#[cfg(all(windows, feature = "hive"))]
+pub mod hive_win;
 /// #1740 — a closed ICE agent (the vendored `webrtc-ice`) leaves nothing
 /// running behind it; black-box over the agent this daemon's sessions use.
 #[cfg(test)]
