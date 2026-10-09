@@ -94,6 +94,52 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// FR-27 P10 — how long the host's Disconnect keeps the peer up AFTER the
+/// server has been told, so the viewer hears the reason over signalling
+/// before it sees the peer die.
+///
+/// The order is the whole fix. Before P10 the peer was closed first (up to
+/// [`PEER_CLOSE_BUDGET`]) and the server told after, and the browser's
+/// control data-channel `onclose` won every time: it read the drop as an
+/// ordinary one, scheduled a reconnect, and hung the old session up itself
+/// — so the audit said `controller_hangup` and the viewer was back within
+/// 3 s of the person at the device sending it away. Now the Terminate goes
+/// out first; the hub forwards it to the controller BEFORE it echoes it to
+/// us; the viewer closes as "ended by the person at the device" and tears
+/// its own peer down. The grace only covers a slow signalling path. On a
+/// dead control WS there is nothing to wait for and the close is immediate.
+///
+/// `ROOMLERD_HOST_DISCONNECT_GRACE_MS` overrides it, `0` restoring the
+/// pre-P10 timing (the kill switch), capped at [`PEER_CLOSE_BUDGET`].
+const HOST_DISCONNECT_GRACE_DEFAULT: Duration = Duration::from_millis(1000);
+
+/// The grace from the environment, or the default. Read per Disconnect: it
+/// is a field knob, and a daemon that has to restart to honour it is one
+/// nobody will set.
+fn host_disconnect_grace() -> Duration {
+    host_disconnect_grace_from(
+        std::env::var("ROOMLERD_HOST_DISCONNECT_GRACE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn host_disconnect_grace_from(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms).min(PEER_CLOSE_BUDGET),
+        None => HOST_DISCONNECT_GRACE_DEFAULT,
+    }
+}
+
+/// The one message the host's Disconnect puts on the wire. A function so a
+/// test can hold the daemon to the spelling the viewer and the audit key on.
+fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
+    ClientMsg::Terminate {
+        session_id,
+        reason: EndReason::HostDisconnect,
+    }
+}
+
 /// Run a session's peer close (a remote-control or a tunnel peer) within
 /// [`PEER_CLOSE_BUDGET`], and SAY so when the budget runs out (#1738). The
 /// session-scoped teardown still runs in Drop, but a close dropped at its
@@ -1861,32 +1907,68 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some(sid) = kill_rx.recv() => {
-                // Viewee clicked "Disconnect" in the on-screen overlay.
-                // Close the local peer and tell the server, which notifies
-                // the browser and echoes ServerMsg::Terminate back; that
-                // handler is idempotent, so the echo re-running is safe.
+                // Viewee clicked "Disconnect" in the on-screen overlay: the
+                // Windows badge, or the companion banner over LocalAPI.
+                //
+                // FR-27 P10 — SAY it first, then close. The hub forwards the
+                // Terminate to the controller before it echoes it back here
+                // (the echo handler is idempotent), so the viewer learns that
+                // the person at the device ended the session BEFORE its peer
+                // dies, closes as such, and does not reconnect on its own.
+                // Closing first made the browser read a plain drop and come
+                // back within 3 s, hanging the old session up itself — which
+                // is why the audit used to say `controller_hangup` (the P10
+                // field log). The peer closes after a short grace, in a task
+                // of its own, so this loop is never held.
                 info!(session_id = %sid, "viewee requested disconnect via overlay badge");
                 // FR-85 P3b-3 — the person at the device sent the controller
                 // away: a recording of this session STOPS now, rather than
                 // wait for the controller to come back (a drop does wait).
                 #[cfg(feature = "recording")]
                 crate::recording::remote::host_ended(sid);
-                if let Some(peer) = peers.remove(&sid) {
-                    close_within_budget(peer.close(), sid, "host_disconnect").await;
+                // Control ends at the click, not after the grace: no input,
+                // clipboard, files or frames from here on, while the bare
+                // connection waits for the viewer to hear why.
+                let peer = peers.remove(&sid);
+                if let Some(peer) = &peer {
+                    peer.stop_serving();
                 }
+                // A delegated session (a supervised Mac) speaks through the
+                // daemon's WS, the way its answer and its ICE did.
+                let grace = match reply_for_session(
+                    &mut ws,
+                    delegated_out.as_ref(),
+                    &host_disconnect_terminate(sid),
+                )
+                .await
+                {
+                    Ok(()) => host_disconnect_grace(),
+                    Err(e) => {
+                        warn!(
+                            session_id = %sid, %e,
+                            "host disconnect: could not tell the server — closing the peer now"
+                        );
+                        Duration::ZERO
+                    }
+                };
+                info!(
+                    session_id = %sid,
+                    reason = "host_disconnect",
+                    grace_ms = grace.as_millis() as u64,
+                    "host disconnect: told the server; the peer closes after the grace"
+                );
+                if let Some(peer) = peer {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(grace).await;
+                        close_within_budget(peer.close(), sid, "host_disconnect").await;
+                    });
+                }
+                crate::gpu_clock::on_sessions_changed(peers.len());
                 pending_codecs.remove(&sid);
                 pending_transports.remove(&sid);
                 pending_audio.remove(&sid);
                 pending_permissions.remove(&sid);
                 pending_session_meta.remove(&sid);
-                let _ = send_msg(
-                    &mut ws,
-                    &ClientMsg::Terminate {
-                        session_id: sid,
-                        reason: EndReason::AgentHangup,
-                    },
-                )
-                .await;
                 indicator.hide_session(sid.to_hex());
                 watchdog::tick(ctx.pump);
             }
@@ -4917,6 +4999,52 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-27 P10 — the host's Disconnect names itself on the wire. The
+    /// viewer's "the person at the device ended the session" notice and the
+    /// audit both key on this spelling; `agent_hangup` would read as the
+    /// daemon giving the session up, which is a different story.
+    #[test]
+    fn a_host_disconnect_terminates_as_host_disconnect() {
+        let sid = bson::oid::ObjectId::new();
+        let msg = host_disconnect_terminate(sid);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""t":"rc:terminate""#), "{json}");
+        assert!(json.contains(r#""reason":"host_disconnect""#), "{json}");
+        match msg {
+            ClientMsg::Terminate { session_id, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(reason, EndReason::HostDisconnect);
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    /// The grace is a field knob with a kill switch (`0`), never longer than
+    /// the close budget, and anything unparseable falls back to the default.
+    /// Tested on the parser, not the environment: a test that sets a process
+    /// variable races every other test in this binary (#1787).
+    #[test]
+    fn host_disconnect_grace_is_bounded_and_switchable() {
+        assert_eq!(
+            host_disconnect_grace_from(None),
+            HOST_DISCONNECT_GRACE_DEFAULT
+        );
+        assert_eq!(host_disconnect_grace_from(Some("0")), Duration::ZERO);
+        assert_eq!(
+            host_disconnect_grace_from(Some(" 250 ")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(host_disconnect_grace_from(Some("99999")), PEER_CLOSE_BUDGET);
+        assert_eq!(
+            host_disconnect_grace_from(Some("soon")),
+            HOST_DISCONNECT_GRACE_DEFAULT
+        );
+        assert_eq!(
+            host_disconnect_grace_from(Some("")),
+            HOST_DISCONNECT_GRACE_DEFAULT
+        );
+    }
 
     fn gone(label: &str, reason: AgentCloseReason) -> SecondaryGoodbye {
         SecondaryGoodbye {

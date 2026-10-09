@@ -500,3 +500,21 @@ frame round a Mac's screen during a session; that was the operator's call (2026-
 
 Kill switches, each on its own: `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (the banner stays, as
 before P9) and `ROOMLER_DESKTOP_FRAME=0` (no frame).
+
+### 12.1 The banner's Disconnect (FR-27 P10)
+
+The banner's **Disconnect** ends every live session (`panel-viewing.js` sends one
+LocalAPI `RcDisconnect` per session, `cmd_rc_disconnect`) — and since P10 it ends them
+**for good**: control ends at the click (no more input, clipboard, files or frames),
+the daemon tells the server `host_disconnect` before it closes the peer,
+the viewer is told "The person at the device ended the session." and stays
+disconnected, and coming back is an explicit Reconnect on the viewer's side, through
+consent like any new session. Before P10 the viewer read the closed peer as an ordinary
+drop and was back within ~3 s of being sent away (measured on this banner, 0.4.119,
+2026-10-08). The mechanism, the ordering it relies on and the version matrix are in
+`docs/remote-control.md` §11.5; the companion itself did not change — the fix is in the
+daemon's arm that every Disconnect surface reaches, so the Windows badge gets it too.
+
+On a supervised Mac the session lives in the GUI worker (FR-43), and so does the
+Disconnect: the worker's `host_disconnect` rides the delegation link to the daemon's
+WS, the way the session's answer did.

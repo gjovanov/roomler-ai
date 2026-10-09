@@ -1154,9 +1154,11 @@ mod routing_tests {
             session_id: oid(),
             candidate: serde_json::Value::Null,
         }));
+        // FR-27 P10 — the banner's Disconnect on a supervised Mac is answered
+        // by the WORKER (the session lives there), as `host_disconnect`.
         assert!(delegable_outbound(&ClientMsg::Terminate {
             session_id: oid(),
-            reason: EndReason::AgentHangup,
+            reason: EndReason::HostDisconnect,
         }));
 
         // Consent is the interesting refusal: FR-27 put the decision in the

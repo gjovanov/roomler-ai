@@ -741,6 +741,68 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **Tray icon cannot be hidden** by config; if you want covert monitoring, this is the wrong product.
 - **Break-glass never records** (FR-85). An `ADMINISTRATOR` who skips consent with an `override_reason` is never granted `RECORD`, whatever their mask says: nobody at the machine agreed to the session, so a recording of it would be covert.
 
+### 11.5 The host's Disconnect (FR-27 P10)
+
+The person at the device can end a session from their own screen — the
+Windows badge's **Disconnect** (§18.3) or the companion banner's
+(`docs/desktop-companion.md` §12). Every one of those surfaces reaches the
+same arm of the agent's signalling loop (`kill_rx`, `agents/roomlerd/src/signaling.rs`),
+and that arm's job is to make the ending **final and attributed**: the viewer
+is told who ended it and does not come back on its own.
+
+```mermaid
+sequenceDiagram
+    participant H as person at the device
+    participant A as roomlerd
+    participant S as hub (server)
+    participant V as viewer (browser)
+    H->>A: Disconnect (badge / banner over LocalAPI)
+    A->>A: peer.stop_serving() — no input, clipboard, files or frames
+    A->>S: rc:terminate reason=host_disconnect
+    S->>V: rc:terminate reason=host_disconnect
+    S->>A: rc:terminate (echo, idempotent)
+    Note over S: audit: session_ended host_disconnect
+    V->>V: phase=closed, endedBy=host, ladder cancelled
+    Note over V: "The person at the device ended the session." + Reconnect
+    Note over A: grace (1 s default)
+    A->>A: peer.close()
+```
+
+The order is the whole mechanism. Before P10 the agent closed the peer first
+and told the server afterwards, and the browser's control data-channel
+`onclose` won every time: it read the drop as an ordinary one, hung the old
+session up itself and scheduled the reconnect ladder — so the audit said
+`controller_hangup` and the viewer was back within ~3 s of being sent away
+(measured on 0.4.119, 2026-10-08). Now:
+
+| step | where | what holds it |
+|---|---|---|
+| control ends **at the click**: the channel handlers let go, the media pumps stop, and the input arbiter forgets the session (its next event is denied, anything it holds is released); no channel closes, so the browser sees nothing yet | `AgentPeer::stop_serving`, called by the `kill_rx` arm before it speaks; `close` repeats it | — |
+| the agent says it **first** | the `kill_rx` arm; on a supervised Mac through the delegation link, like the session's answer | `a_host_disconnect_terminates_as_host_disconnect` |
+| the hub forwards it to the controller **before** echoing it to the agent, and audits `SessionEnded { HostDisconnect }` | `Hub::terminate` | — |
+| only the **device** may claim it: a controller's `host_disconnect` is recorded as `controller_hangup` | the hub's `rc:terminate` arm | `host_disconnect_is_the_devices_claim_only` |
+| the viewer closes as "ended by the host", cancels the ladder, drops its replay args, then tears the peer down with the phase already `closed`, so the control DC's `onclose` stays quiet | `useRemoteControl.ts`, the `rc:terminate` handler | `FR-27 P10` in `useRemoteControl.spec.ts` |
+| the bare connection closes after a grace, off the loop | `ROOMLERD_HOST_DISCONNECT_GRACE_MS`, default 1000, `0` = the pre-P10 timing, capped at the 5 s close budget | `host_disconnect_grace_is_bounded_and_switchable` |
+
+⚠️ The grace holds the **transport**, never the session's powers. A grace
+that kept the peer serving would hand the controller up to a second more of
+the machine its owner had just taken back, so the arm stops serving first and
+only the connection waits for the viewer to hear why.
+
+Ordinary drops are untouched: `agent_disconnect` and `error` still
+re-create the session, as do a failed peer and a control channel that closes
+mid-session (the S3 ladder in `useRemoteControl.ts`, `scheduleReconnect`).
+Reconnecting after a host Disconnect is an explicit click and a **new**
+request, through consent like any other.
+
+⚠️ The wire is `rc:terminate`, unchanged; `host_disconnect` is a new
+`EndReason` value. A pre-P10 **server** cannot decode the frame and drops it
+(debug log, socket up): the session then ends when the peer closes and the
+viewer reconnects as before — degraded, never broken, and locked by
+`pre_p10_end_reason_rejects_host_disconnect_so_old_servers_drop_the_frame`.
+A pre-P10 **viewer** treats the unknown reason as terminal (the retry list is
+an allowlist) and simply shows no notice. The full matrix is in the FR-27 spec.
+
 ## 12. Performance targets & budget
 
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |
@@ -1487,8 +1549,11 @@ to-activate, so the browser never sees a bait-and-switch.
   auto-hiding ~2.5 s after the pointer leaves — shows the controller's
   **initials avatar + display name** and a **Disconnect** button.
   Clicking Disconnect sends the session's `ObjectId` through an
-  in-process channel to the signaling `select!`, which closes the peer
-  and emits `ClientMsg::Terminate {reason: AgentHangup}`; the server
+  in-process channel to the signaling `select!`, which stops serving the
+  session at once (`AgentPeer::stop_serving`: no more input, clipboard,
+  files or frames), emits `ClientMsg::Terminate {reason: HostDisconnect}`
+  and closes the bare peer after a grace (FR-27 P10, §11.5 — before P10 it closed first and
+  said `AgentHangup` after, and the viewer reconnected); the server
   tears the session down, notifies the browser, and echoes `Terminate`
   back (the agent handler is idempotent). The overlay label is the
   controller's real `display_name`, resolved server-side at WS connect
