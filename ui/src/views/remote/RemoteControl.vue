@@ -4243,6 +4243,14 @@ onBeforeUnmount(() => {
   padding: 32px;
   color: rgba(255, 255, 255, 0.7);
 }
+/* The stage is dark in every theme, but Vuetify's `text-medium-emphasis` is
+   theme-relative (on-background at medium opacity, `!important`): in the light
+   theme it painted the stage's secondary lines dark grey on #0b0b0b, unreadable
+   (FR-27 P10's notice, measured 2026-10-09; the offline, reconnecting and
+   no-media lines too). Inside the stage they stay light, like the rest. */
+.remote-stage .text-medium-emphasis {
+  color: rgba(255, 255, 255, 0.6) !important;
+}
 .video-frame {
   position: relative;
   width: 100%;
