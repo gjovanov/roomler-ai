@@ -183,6 +183,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_evict: None,
         overlay_iface_metric: None,
         overlay_route_reclaim: None,
+        overlay_route_evict_winners_only: None,
         overlay_tun_persist: None,
         overlay_route_metric0: None,
         overlay_route_win: None,
