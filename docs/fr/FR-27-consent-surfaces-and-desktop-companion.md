@@ -763,8 +763,10 @@ viewer's ladder brings it back.
   records this run (`.remote-stage .text-medium-emphasis` stays light).
 - An admin sees **Force control (admin break-glass)** next to "The person at the device
   ended the session." Break-glass predates P10 and is audited with a reason. Whether to
-  offer it right after the person's own Disconnect is an operator decision. It is
-  recorded here, not taken.
+  offer it right after the person's own Disconnect was an operator decision.
+  **Decided 2026-10-10: not offered.** The notice keeps Reconnect alone, which asks the
+  person again; break-glass stays reachable from a fresh page. See
+  `docs/remote-control.md` §11.5.
 
 **Not covered:**
 - **The Windows badge.** It was capture-excluded in this run; see the next entry.
