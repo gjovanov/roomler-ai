@@ -115,9 +115,10 @@ reads that path anyway.
 The platform user analytics records the **country** a browser session came from: the server
 resolves the client's address once, at the `/ws` upgrade, and then drops it, so no IP is ever
 stored (`crates/core/src/user_analytics.rs:189`). That lookup needs a MaxMind-format database.
-Until 2026-10 the build host dropped MaxMind's GeoLite2 into `files/geoip/` by hand before each
-`docker build`; the GitHub lane (FR-73) never did, so every image it built read every country
-as `unknown` (`geoip: false`), which nobody noticed until 2026-10-09.
+While the build host built the image, it dropped MaxMind's GeoLite2 into `files/geoip/` by hand
+before each `docker build`. The GitHub lane that replaced it on 2026-09-05 (FR-73) never did, so
+every image it built read every country as `unknown` (`geoip: false`), which nobody noticed until
+2026-10-09.
 
 The image now carries **DB-IP's "IP to Country Lite"**, which a public image may lawfully
 carry, and names it itself, so a deployment needs no setting at all.
@@ -141,7 +142,7 @@ flowchart LR
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| Fetch + verify | `scripts/fetch-geoip.sh:109` (`fetch`), `:150` (`stage`) | TLS from DB-IP's host; gzip CRC, 1–128 MiB, MaxMind metadata naming `DBIP-Country-Lite`. Writes the file 0644 and a provenance note with its SHA-256. **Every failure exits 0 with a warning** |
+| Fetch + verify | `scripts/fetch-geoip.sh:109` (`fetch`), `:151` (`stage`) | TLS from DB-IP's host; gzip CRC, 1–128 MiB, MaxMind metadata naming `DBIP-Country-Lite`. Writes the file 0644 and a provenance note with its SHA-256. **Every failure exits 0 with a warning** |
 | Both image lanes | `hosted-image.yml:125`, `publish-selfhost-image.yml:149` | Run the fetch before `docker build`, into the build context. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
 | Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
@@ -172,9 +173,10 @@ public image tag can never honour. Full text and the operator recipes:
 > variable.
 
 > ⚠️ **The root-run smoke cannot see a root-only file.** `mktemp` creates files 0600 and
-> Docker's `COPY` keeps the bits, so the first version of the fetch baked a database only root
-> could read: invisible to a smoke that runs as root, fatal to any container run as another
-> user. The fetch now `chmod`s it, and the smoke reads it as uid 65534.
+> Docker's `COPY` keeps the bits, so the first draft of the fetch staged a database only root
+> could read (caught on its first local run, before any image). Baked in, that is invisible to a
+> smoke that runs as root and fatal to any container run as another user. The fetch now
+> `chmod`s it, and the smoke reads it as uid 65534.
 
 An image's database is at most about a month old when it is built (DB-IP publishes on the 1st,
 and each build takes the newest release), and it refreshes with every rebuild, which every merge
