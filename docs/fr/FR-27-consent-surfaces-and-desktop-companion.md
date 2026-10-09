@@ -285,7 +285,7 @@ pre-P10 behaviour, for the one case where the reason has no path to travel.
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
-| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **implemented** — RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z (the #1852 log; the deploy tag re-checked unchanged on 2026-10-09); GREEN owed after the next agent release AND a hosted promote (the viewer ships in the image) |
+| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on the Mac's banner, 2026-10-09** (the field log: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click); the Windows badge owed (a person at that machine) |
 
 ## Acceptance criteria
 
@@ -375,16 +375,19 @@ Ticked only where a run is recorded in the field log below.
       diagram of how one session's consent is resolved, and is linked from
       `docs/README.md` (the docs-before-close rule). The field-result half of
       phase 6 lives in this spec's log.
-- [ ] **P10** — one click on the host's Disconnect (the companion banner on
-      macOS/Linux, the Windows badge) ends the session for good: the viewer
-      shows that the person at the device ended it and stays disconnected for
-      ≥ 60 s with no new session in the agent log; Reconnect is an explicit
-      click that goes through consent; an ordinary drop (the viewer offline
-      ~10 s) still auto-reconnects; the agent log and the session audit record
-      `host_disconnect`, not `controller_hangup`. Ticked per surface as the
-      log records it — the Mac's banner from the demo harness, the Windows
-      badge only with a person at that machine (it is capture-excluded).
-      Docs: `docs/remote-control.md` §11.5 and `docs/desktop-companion.md` §12.
+- **P10** — one click on the host's Disconnect ends the session for good: the
+  viewer shows that the person at the device ended it and stays disconnected for
+  ≥ 60 s with no new session in the agent log; Reconnect is an explicit click
+  that goes through consent; an ordinary drop (the viewer's signalling socket
+  cut mid-session, even after a host Disconnect and a Reconnect) still
+  auto-reconnects; the agent log and the session audit record `host_disconnect`,
+  not `controller_hangup`. Docs: `docs/remote-control.md` §11.5 and
+  `docs/desktop-companion.md` §12. One box per surface, ticked as the log
+  records it:
+  - [x] the companion banner (macOS), from a Playwright field spec on the live
+        site — GREEN 2026-10-09 on 0.4.121 + `hosted-20261009-cac4761`
+  - [ ] the Windows badge — only with a person at that machine (it is
+        capture-excluded)
 
 ## Deviations (accepted, recorded up front)
 
@@ -697,7 +700,7 @@ attempts were lost, the first to the pre-#1858 every-few-seconds RC drop while
 the Mac was mid-update, the second to the device owner's own live session on the
 Mac. **#1852 stays open** for that one direct demonstration.
 
-### 2026-10-09 — P10: the host's Disconnect must end the session for good (RED on record)
+### 2026-10-09 — P10: the host's Disconnect must end the session for good (RED)
 
 **The requirement** came from the operator on 2026-10-09: a Disconnect clicked on the
 viewed desktop has to stop the reconnect mechanism and tell the viewer they were
@@ -715,15 +718,49 @@ P10. The audit's `ControllerHangup` is the viewer's own hangup from its reconnec
 ladder, sent when the control data-channel closed under it — the ordering explained
 in the P10 design above.
 
-**GREEN — owed.** Needs BOTH halves deployed: the agent (the reason, said first) and the
-hosted image (the hub's guard, the viewer's notice). The checks, on the Mac from the
-demo harness (`ROOMLER_DEMO_STEPS`: fullscreen → a top-edge `move` to reveal the banner
-→ `move` onto Disconnect → `click` → a long `wait`), and on a Windows laptop only with a
-person at it (the badge is capture-excluded):
+### 2026-10-09 — P10 GREEN on the Mac's banner (0.4.121 + `hosted-20261009-cac4761`)
 
-| check | evidence to record |
+**What ran.** Agent **0.4.121** on the Mac, which its update helper installed at
+02:36:17Z. The server and the viewer were on `hosted-20261009-cac4761`, promoted at
+07:42Z, with both pods on it and 0 restarts. A Playwright field spec drove the live site
+from the demo harness's saved session:
+1. connect, full screen, and a top-edge move to reveal the banner;
+2. **one** click on the banner's Disconnect, then a 65 s hold;
+3. read the session audit, then press Reconnect;
+4. cut the viewer's signalling socket and keep hands off.
+
+The screen was lock-checked before every input. It ran twice. The browser host's clock
+runs about 10 s behind the Mac's, so each side's times below are its own clock.
+
+| check | run 2, 07:58Z (run 1, 07:52Z, agreed on every row it reached) |
 |---|---|
-| one click on Disconnect → the viewer shows the notice and stays disconnected ≥ 60 s | the take's frames after `click1`; the agent log: no new `session` after the `host_disconnect` line |
-| Reconnect works when chosen | a session after an explicit click on the viewer's Reconnect |
-| an ordinary drop still auto-reconnects | Playwright `context.setOffline(true)` ~10 s, back online → `reconnecting` → `connected` |
-| the reason is recorded truthfully | agent log `reason=HostDisconnect`; the session row's `end_reason: host_disconnect` |
+| one click → the viewer is told | `rc:terminate reason=host_disconnect` reached the viewer **72 ms** after the click (run 1: 86 ms). The viewer logged `session ended by the person at the device - not reconnecting`. It left full screen by itself, because the full-screen target exists only while connected, and showed "The person at the device ended the session." with Reconnect |
+| stays disconnected ≥ 60 s | 65.0 s after the click: **0** `rc:session.request` sent, the notice still shown, not connected. The agent log created no session in that window |
+| the device's side | `viewee requested disconnect via overlay badge`, then 0.2 ms later `host disconnect: told the server; the peer closes after the grace reason="host_disconnect" grace_ms=1000`, then `session terminated by server … reason=HostDisconnect` (the hub's echo, +43 ms), then `PC state change … Closed` **1.003 s** after the click. The grace held the transport for exactly its length |
+| the audit | the session's audit (`GET …/session/{id}/audit`) ends with `host_disconnect` |
+| Reconnect is an explicit act | one click on the notice's Reconnect sent a new `rc:session.request` and connected in **2.4 s** (run 1: 3.5 s; consent is auto-granted to the owner by the device's policy). The notice was gone |
+| an ordinary drop, after all of the above, still auto-reconnects | the viewer's `/ws` was closed from the page. The viewer logged `control channel closed mid-session — re-creating session`; the socket came back in 3.1 s (`signalling restored — retrying immediately`); a new session was up **6.3 s** after the cut, with **0 clicks** and no notice |
+
+**Wrong turn, recorded.** Run 1's ordinary drop was the `context.setOffline(true)` for
+10 s planned here, and it dropped **nothing**. The open `/ws` stayed open with no close
+event, the WebRTC path is outside DevTools network emulation, and the session kept
+streaming through the whole window. The check timed out on a session that had never
+ended. A viewer whose network blips for 10 s keeping its session is correct, but it is
+not the check. Run 2 cut the signalling socket itself, the chain a real blip triggers
+when it kills TCP: the hub ends the session, the device closes the peer, and the
+viewer's ladder brings it back.
+
+**Side findings** (neither blocks the box):
+- The notice's second line was dark grey on the black stage in the light theme, because
+  Vuetify's `text-medium-emphasis` is theme-relative and `!important`. The stage's
+  offline, reconnecting and no-media lines had the same problem. Fixed in the PR that
+  records this run (`.remote-stage .text-medium-emphasis` stays light).
+- An admin sees **Force control (admin break-glass)** next to "The person at the device
+  ended the session." Break-glass predates P10 and is audited with a reason. Whether to
+  offer it right after the person's own Disconnect is an operator decision. It is
+  recorded here, not taken.
+
+**Not covered:**
+- **The Windows badge.** It is capture-excluded, so it needs a person at that machine.
+- **The Linux companion banner.** It uses the same banner code and the same daemon arm,
+  but was not exercised separately.
