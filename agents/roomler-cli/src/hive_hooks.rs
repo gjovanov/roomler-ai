@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent};
 #[cfg(unix)]
@@ -150,45 +150,82 @@ fn object(text: &str, what: &str) -> Result<Obj> {
         .with_context(|| format!("{what} is not a JSON object — the file was not touched"))
 }
 
-fn pretty(doc: &Obj) -> Result<String> {
-    let mut s = serde_json::to_string_pretty(doc)?;
-    s.push('\n');
+/// A value as the settings are written back. What `adopt` does not own stays
+/// raw, exactly as written; the containers it rewrites (`hooks`, and the
+/// lists of the events it touches) are laid out as Claude Code writes its
+/// settings, two spaces a level, so a file Claude Code wrote comes back from
+/// `adopt` then `unadopt` byte for byte (P1j-5's field run: they came back
+/// on one line).
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Out {
+    Raw(Box<RawValue>),
+    Map(IndexMap<String, Out>),
+    List(Vec<Out>),
+    New(Value),
+}
+
+/// The settings written back: `doc`'s members as they were, `hooks` laid out
+/// anew in its place (or gone), and a final newline when the file had one.
+fn render(
+    doc: Obj,
+    hooks: Option<IndexMap<String, Out>>,
+    original: Option<&str>,
+) -> Result<String> {
+    let mut hooks = hooks;
+    let mut top: IndexMap<String, Out> = IndexMap::new();
+    for (key, value) in doc {
+        if key == "hooks" {
+            if let Some(h) = hooks.take() {
+                top.insert(key, Out::Map(h));
+            }
+        } else {
+            top.insert(key, Out::Raw(value));
+        }
+    }
+    if let Some(h) = hooks {
+        top.insert("hooks".to_string(), Out::Map(h));
+    }
+    let mut s = serde_json::to_string_pretty(&top)?;
+    if original.is_none_or(|t| t.trim().is_empty() || t.ends_with('\n')) {
+        s.push('\n');
+    }
     Ok(s)
 }
 
 /// The settings with `adopt`'s three hooks in, and whether anything changed.
 /// `None`: there is no settings file yet.
 pub fn adopt_doc(text: Option<&str>, hook: &HookCommand) -> Result<(String, bool)> {
-    let mut doc = match text.map(str::trim) {
+    let doc = match text.map(str::trim) {
         None | Some("") => Obj::new(),
         Some(t) => object(t, "the settings file")?,
     };
-    let mut hooks = match doc.get("hooks") {
+    let hooks = match doc.get("hooks") {
         None => Obj::new(),
         Some(raw) => object(raw.get(), "its `hooks`")?,
     };
-    let mut changed = false;
+    let mut adding = Vec::new();
     for (event, background) in EVENTS {
-        let mut groups: Vec<Box<RawValue>> = match hooks.get(event) {
+        let groups: Vec<Box<RawValue>> = match hooks.get(event) {
             None => Vec::new(),
             Some(raw) => serde_json::from_str(raw.get()).with_context(|| {
                 format!("`hooks.{event}` is not a list — the file was not touched")
             })?,
         };
-        if groups.iter().any(|g| group_has_ours(g)) {
-            continue;
+        if !groups.iter().any(|g| group_has_ours(g)) {
+            adding.push((event, groups, background));
         }
-        groups.push(to_raw_value(
-            &json!({ "hooks": [hook.handler(background)] }),
-        )?);
-        hooks.insert(event.to_string(), to_raw_value(&groups)?);
-        changed = true;
     }
-    if !changed {
+    if adding.is_empty() {
         return Ok((text.unwrap_or_default().to_string(), false));
     }
-    doc.insert("hooks".to_string(), to_raw_value(&hooks)?);
-    Ok((pretty(&doc)?, true))
+    let mut out: IndexMap<String, Out> = hooks.into_iter().map(|(k, v)| (k, Out::Raw(v))).collect();
+    for (event, groups, background) in adding {
+        let mut list: Vec<Out> = groups.into_iter().map(Out::Raw).collect();
+        list.push(Out::New(json!({ "hooks": [hook.handler(background)] })));
+        out.insert(event.to_string(), Out::List(list));
+    }
+    Ok((render(doc, Some(out), text)?, true))
 }
 
 /// The settings with `adopt`'s hooks taken out, every other key and hook
@@ -198,19 +235,21 @@ pub fn unadopt_doc(text: &str) -> Result<(String, bool)> {
     if text.trim().is_empty() {
         return Ok((text.to_string(), false));
     }
-    let mut doc = object(text, "the settings file")?;
+    let doc = object(text, "the settings file")?;
     let Some(raw_hooks) = doc.get("hooks") else {
         return Ok((text.to_string(), false));
     };
-    let mut hooks = object(raw_hooks.get(), "its `hooks`")?;
+    let hooks = object(raw_hooks.get(), "its `hooks`")?;
+    let mut out: IndexMap<String, Out> = IndexMap::new();
     let mut changed = false;
-    for (event, _) in EVENTS {
-        let Some(raw) = hooks.get(event) else {
+    for (event, raw) in hooks {
+        if !EVENTS.iter().any(|(e, _)| *e == event) {
+            out.insert(event, Out::Raw(raw));
             continue;
-        };
+        }
         let groups: Vec<Box<RawValue>> = serde_json::from_str(raw.get())
             .with_context(|| format!("`hooks.{event}` is not a list — the file was not touched"))?;
-        let mut kept: Vec<Box<RawValue>> = Vec::new();
+        let mut kept: Vec<Out> = Vec::new();
         let mut touched = false;
         for g in groups {
             let mut v: Value = serde_json::from_str(g.get())?;
@@ -224,34 +263,30 @@ pub fn unadopt_doc(text: &str) -> Result<(String, bool)> {
             };
             match removed {
                 // Untouched: kept exactly as written.
-                None => kept.push(g),
+                None => kept.push(Out::Raw(g)),
                 // Ours alone: the group goes.
                 Some(true) => touched = true,
                 // Ours among others: the others stay.
                 Some(false) => {
                     touched = true;
-                    kept.push(to_raw_value(&v)?);
+                    kept.push(Out::New(v));
                 }
             }
         }
-        if touched {
+        if !touched {
+            out.insert(event, Out::Raw(raw));
+        } else {
             changed = true;
-            if kept.is_empty() {
-                hooks.shift_remove(event);
-            } else {
-                hooks.insert(event.to_string(), to_raw_value(&kept)?);
+            if !kept.is_empty() {
+                out.insert(event, Out::List(kept));
             }
         }
     }
     if !changed {
         return Ok((text.to_string(), false));
     }
-    if hooks.is_empty() {
-        doc.shift_remove("hooks");
-    } else {
-        doc.insert("hooks".to_string(), to_raw_value(&hooks)?);
-    }
-    Ok((pretty(&doc)?, true))
+    let hooks = (!out.is_empty()).then_some(out);
+    Ok((render(doc, hooks, Some(text))?, true))
 }
 
 /// The person's user-level Claude Code settings: `--settings`, else
@@ -304,6 +339,21 @@ fn write_settings(path: &Path, previous: Option<&[u8]>, text: &str) -> Result<Pa
     Ok(target)
 }
 
+/// Whether this device adopts: something listens on its adopt socket. The
+/// socket's file alone says nothing — a daemon stopped while adopting leaves
+/// one behind (P1j-5's field run).
+fn device_adopts(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
 /// `roomler hive adopt`.
 pub fn adopt(explicit: Option<PathBuf>, embedded: bool) -> Result<()> {
     if cfg!(windows) {
@@ -332,7 +382,7 @@ pub fn adopt(explicit: Option<PathBuf>, embedded: bool) -> Result<()> {
         println!("Already adopted ({}).", path.display());
     }
     match proto::socket_path() {
-        Some(s) if s.exists() => println!("  this device adopts terminal sessions"),
+        Some(s) if device_adopts(&s) => println!("  this device adopts terminal sessions"),
         _ => println!(
             "  this device does not adopt yet: its owner turns on `hive_adopt` and maps your \
              account in `hive_accounts`; until then the hooks do nothing"
@@ -663,6 +713,46 @@ mod tests {
         let (again, changed) = unadopt_doc(&out).unwrap();
         assert!(!changed);
         assert_eq!(again, out);
+    }
+
+    /// P1j-5 — a file laid out as Claude Code writes its settings comes back
+    /// from `adopt` then `unadopt` byte for byte, with a final newline or
+    /// without; so does one with its leaves written inline (`THEIRS`).
+    #[test]
+    fn adopt_then_unadopt_gives_back_the_same_bytes() {
+        let written = serde_json::to_string_pretty(&json!({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "audit" }] }
+                ],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "notify" }] }]
+            },
+            "permissions": { "deny": ["Read(//proc/**)"] }
+        }))
+        .unwrap();
+        for original in [written.clone(), format!("{written}\n"), THEIRS.to_string()] {
+            let (adopted, changed) = adopt_doc(Some(&original), &hook()).unwrap();
+            assert!(changed);
+            let (back, changed) = unadopt_doc(&adopted).unwrap();
+            assert!(changed);
+            assert_eq!(back, original);
+        }
+    }
+
+    /// P1j-5 — the socket's file alone does not say the device adopts: a
+    /// daemon stopped while adopting leaves one behind.
+    #[cfg(unix)]
+    #[test]
+    fn the_device_adopts_only_while_something_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("adopt.sock");
+        assert!(!device_adopts(&socket), "no socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(device_adopts(&socket), "a daemon listening");
+        drop(listener);
+        assert!(socket.exists(), "the file it leaves behind");
+        assert!(!device_adopts(&socket), "says nothing by itself");
     }
 
     #[test]
