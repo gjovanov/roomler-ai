@@ -383,16 +383,28 @@ pub fn end_update() {
 /// is answered with the device's actual refusal rather than silence.
 pub fn init(cfg: &AgentConfig) {
     let hive = HiveConfig::from_agent(cfg);
-    let path = store_path();
-    let store = path.clone().and_then(|p| StoreHandle::spawn(Some(&p)));
-    if let Err(e) = &store {
-        warn!(%e, "hive: the replica store is unavailable — every start will be refused");
+    // P1h-2 — `hive` is in the release builds, so every device runs this. One
+    // whose owner never turned agent sessions on keeps no store: nothing is
+    // created for it, and a start is refused `hive_disabled` before a store
+    // is needed. One that did keeps serving the transcripts its store holds.
+    let path = store_path(|file| store_wanted(&hive, file.exists()));
+    let store = match &path {
+        Ok(Some(p)) => StoreHandle::spawn(Some(p)),
+        Ok(None) => Err("agent sessions are off on this device".to_string()),
+        Err(e) => Err(e.clone()),
+    };
+    match (&path, &store) {
+        (Ok(None), _) => debug!("hive: agent sessions are off here — no replica store is kept"),
+        (_, Err(e)) => {
+            warn!(%e, "hive: the replica store is unavailable — every start will be refused")
+        }
+        _ => {}
     }
     // P1d-2 — what the previous daemon hosted, resumed at the first
     // connection. Without a data directory nothing can be.
-    let hosted = match path {
-        Ok(p) => Hosted::load(p.with_file_name(HOSTED_FILE), &cfg.agent_id),
-        Err(_) => Hosted::in_memory(),
+    let hosted = match &path {
+        Ok(Some(p)) => Hosted::load(p.with_file_name(HOSTED_FILE), &cfg.agent_id),
+        _ => Hosted::in_memory(),
     };
     let sup = Supervisor::new(
         hive,
@@ -488,12 +500,26 @@ pub fn global() -> Option<Arc<Supervisor>> {
 
 /// `<data dir>/hive/hive.db`, in a directory locked to the daemon (0700, no
 /// link on the way): other local users must not read anyone's transcript.
-fn store_path() -> Result<PathBuf, String> {
+/// `Ok(None)` when `wanted` says this daemon keeps no store, and then
+/// nothing is created (P1h-2).
+fn store_path(wanted: impl FnOnce(&Path) -> bool) -> Result<Option<PathBuf>, String> {
     let dir = roomler_node_core::appdirs::project_dirs()
         .map(|p| p.data_local_dir().join("hive"))
         .ok_or("no data directory for the replica store")?;
+    let file = dir.join("hive.db");
+    if !wanted(&file) {
+        return Ok(None);
+    }
     private_dir(&dir)?;
-    Ok(dir.join("hive.db"))
+    Ok(Some(file))
+}
+
+/// FR-90 P1h-2 — whether this daemon keeps a replica store: while its owner
+/// runs or adopts agent sessions, or once it holds one (whose transcripts
+/// are still served after `hive_enabled` goes off). A device that never
+/// turned agent sessions on keeps none.
+fn store_wanted(hive: &HiveConfig, store_exists: bool) -> bool {
+    hive.enabled || hive.adopt || store_exists
 }
 
 /// Create `dir` if missing and lock it to the daemon's account. A link
@@ -2714,6 +2740,27 @@ fn describe_end(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// P1h-2 — `hive` is in the release builds, so every device starts a
+    /// supervisor: one whose owner never turned agent sessions on keeps no
+    /// store, while one that runs or adopts them does, and so does one that
+    /// holds a store already (its transcripts are still served).
+    #[test]
+    fn a_device_that_never_turned_agent_sessions_on_keeps_no_store() {
+        let closed = HiveConfig::closed();
+        assert!(!store_wanted(&closed, false), "nothing to keep");
+        assert!(store_wanted(&closed, true), "a store kept from before");
+        let enabled = HiveConfig {
+            enabled: true,
+            ..HiveConfig::closed()
+        };
+        assert!(store_wanted(&enabled, false));
+        let adopting = HiveConfig {
+            adopt: true,
+            ..HiveConfig::closed()
+        };
+        assert!(store_wanted(&adopting, false));
+    }
 
     /// A stand-in for Claude Code that speaks just enough stream-json. Like
     /// the headless harness reading stream-json input, it says `init` once

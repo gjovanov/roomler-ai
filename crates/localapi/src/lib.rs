@@ -1316,6 +1316,17 @@ pub enum Request {
     /// answer is `not_probed`; a build without encoders answers
     /// `unsupported`. Returns [`Response::EncoderCaps`].
     EncoderCaps,
+    /// FR-90 P1h-2 (AC7 on macOS) — the root update helper asks this daemon
+    /// to hold for its running agent turns before `installer(8)` restarts it
+    /// and, with it, every session's harness: what the in-process updater
+    /// does on Linux (P1d-1). Answered [`Response::HiveUpdateHeld`] once no
+    /// turn runs, or once the device's `hive_update_wait_secs` is spent; from
+    /// then on new prompts and starts are refused until THIS CONNECTION
+    /// closes. A successful install has restarted the daemon by then; a
+    /// failed one takes prompts and starts again. Root only. A daemon older
+    /// than the verb answers `Error("bad request: …")`, and the helper
+    /// installs without a hold, as before.
+    HiveUpdateHold,
 }
 
 /// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
@@ -1612,6 +1623,15 @@ pub enum Response {
     Devices(Box<DevicesPage>),
     /// FR-84 D5b — the mesh graph ([`Request::Mesh`]).
     Mesh(Box<MeshView>),
+    /// FR-90 P1h-2 — the daemon holds for the update ([`Request::HiveUpdateHold`]):
+    /// install now. It waited `waited_secs` for agent turns; `cut` turns were
+    /// still running when the device's `hive_update_wait_secs` ran out, and the
+    /// install cuts them. New prompts and starts are refused until the
+    /// connection that asked closes.
+    HiveUpdateHeld {
+        waited_secs: u64,
+        cut: u32,
+    },
     /// FR-84 D5b — the daemon answered FOR THE SERVER and the server did not
     /// give it the list. `code` names the cause so a client can choose what
     /// to show without reading prose: `server_unreachable` (connect / TLS /
@@ -1807,6 +1827,13 @@ impl ClientPeer {
     /// daemon, whose socket is 0600 anyway), or root.
     pub fn is_console_user(&self) -> bool {
         peer_is_console_user(self, console_session_id(), own_uid())
+    }
+
+    /// FR-90 P1h-2 — is this peer root (Unix)? What may hold the daemon for
+    /// an update: a hold refuses every new agent prompt and start until it
+    /// ends, so no other local account may place one. Unknown is not root.
+    pub fn is_root(&self) -> bool {
+        self.uid == Some(0)
     }
 }
 
@@ -2151,6 +2178,21 @@ pub trait LocalApiState: Send + Sync {
     /// connection die before it learns the restart was accepted. Default:
     /// no-op.
     fn restart_commit(&self) {}
+    /// FR-90 P1h-2 — hold this daemon for an update the root helper is about
+    /// to install: wait for running agent turns (at most the device's
+    /// `hive_update_wait_secs`), refuse new prompts and starts, and answer
+    /// [`Response::HiveUpdateHeld`]. The hold lasts until the asking
+    /// connection closes ([`Self::hive_update_release`]). Default: this node
+    /// runs no agent sessions, so there is nothing to hold for.
+    async fn hive_update_hold(&self) -> Response {
+        Response::Error {
+            message: "this node runs no agent sessions".into(),
+        }
+    }
+    /// FR-90 P1h-2 — the connection that held the daemon closed. An install
+    /// that worked restarted the daemon long before, so this is one that did
+    /// not: take prompts and starts again. Default: no-op.
+    fn hive_update_release(&self) {}
     /// FR-84 D4 — what this device can encode, from the probe's CACHED
     /// result only (never a probe). `None` = this node does not report
     /// encoder capabilities at all (mocks, non-daemon impls); the daemon
@@ -2220,7 +2262,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
         | Request::Mesh { .. }
-        | Request::RestartDaemon { .. } => Response::Error {
+        | Request::RestartDaemon { .. }
+        | Request::HiveUpdateHold => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -2255,134 +2298,159 @@ where
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let resp = match serde_json::from_str::<Request>(&line) {
-            // The async verbs — await them here; everything else is a pure sync
-            // dispatch through `handle`.
-            Ok(Request::Ping {
-                target,
-                timeout_ms,
-                prefer_v6,
-            }) => state.ping(&target, timeout_ms, prefer_v6).await,
-            Ok(Request::CreateForward {
-                node,
-                local,
-                remote,
-                transport,
-                start_transport,
-            }) => {
-                state
-                    .create_forward(&node, local, &remote, &transport, &start_transport)
-                    .await
+    // FR-90 P1h-2 — a hold this connection placed ends with it, however it
+    // ends: EOF, a read error, a write error.
+    let mut held = false;
+    let served: std::io::Result<()> = async {
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
             }
-            Ok(Request::CreateSocks5 {
-                node,
-                local,
-                transport,
-            }) => state.create_socks5(&node, local, &transport).await,
-            Ok(Request::RouteAdd { route }) => state.route_add(route).await,
-            Ok(Request::RouteRemove { id }) => state.route_remove(&id).await,
-            Ok(Request::RouteSetEnabled { id, enabled }) => {
-                state.route_set_enabled(&id, enabled).await
-            }
-            Ok(Request::RouteUpdate { route }) => state.route_update(route).await,
-            Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
-            Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
-            Ok(Request::ConfigGet) => state.config_entries().await,
-            // FR-85 — where recordings are written is the console user's call.
-            Ok(Request::ConfigSet { key, .. })
-                if key.starts_with("record_") && !peer.is_console_user() =>
-            {
-                not_the_console_user()
-            }
-            // FR-84 D4 — and so is where files dropped into the console
-            // user's session land: the pipe admits RDP guests too, and one
-            // must not steer another person's incoming files (say, into
-            // their Startup folder). Equality, not a prefix match.
-            Ok(Request::ConfigSet { key, .. }) if key == "files_dir" && !peer.is_console_user() => {
-                Response::Error {
-                    message: "only the person at this device's console can change where \
-                              incoming files land"
-                        .into(),
+            let resp = match serde_json::from_str::<Request>(&line) {
+                // The async verbs — await them here; everything else is a pure sync
+                // dispatch through `handle`.
+                Ok(Request::Ping {
+                    target,
+                    timeout_ms,
+                    prefer_v6,
+                }) => state.ping(&target, timeout_ms, prefer_v6).await,
+                Ok(Request::CreateForward {
+                    node,
+                    local,
+                    remote,
+                    transport,
+                    start_transport,
+                }) => {
+                    state
+                        .create_forward(&node, local, &remote, &transport, &start_transport)
+                        .await
                 }
-            }
-            Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
-            Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
-            Ok(Request::ExecRemote {
-                node,
-                shell,
-                command,
-                timeout_ms,
-            }) => state.exec_remote(&node, &shell, &command, timeout_ms).await,
-            Ok(Request::SshSession {
-                node,
-                public_key,
-                session_secs,
-            }) => state.ssh_session(&node, &public_key, session_secs).await,
-            // FR-85 — recording. Reading state is open to every local client;
-            // starting, stopping and deleting are the console user's alone.
-            Ok(Request::RecordStatus) => state.record_status().await,
-            Ok(Request::RecordingsList) => state.recordings_list().await,
-            Ok(
-                Request::RecordStart { .. } | Request::RecordStop | Request::RecordingDelete { .. },
-            ) if !peer.is_console_user() => not_the_console_user(),
-            Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
-            Ok(Request::RecordStop) => state.record_stop().await,
-            Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
-            // FR-84 D5b — read-only, open to every local client like `Peers`.
-            Ok(Request::Devices {
-                org,
-                page,
-                per_page,
-                q,
-                sort,
-                dir,
-            }) => {
-                let query = DevicesQuery {
+                Ok(Request::CreateSocks5 {
+                    node,
+                    local,
+                    transport,
+                }) => state.create_socks5(&node, local, &transport).await,
+                Ok(Request::RouteAdd { route }) => state.route_add(route).await,
+                Ok(Request::RouteRemove { id }) => state.route_remove(&id).await,
+                Ok(Request::RouteSetEnabled { id, enabled }) => {
+                    state.route_set_enabled(&id, enabled).await
+                }
+                Ok(Request::RouteUpdate { route }) => state.route_update(route).await,
+                Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
+                Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
+                Ok(Request::ConfigGet) => state.config_entries().await,
+                // FR-85 — where recordings are written is the console user's call.
+                Ok(Request::ConfigSet { key, .. })
+                    if key.starts_with("record_") && !peer.is_console_user() =>
+                {
+                    not_the_console_user()
+                }
+                // FR-84 D4 — and so is where files dropped into the console
+                // user's session land: the pipe admits RDP guests too, and one
+                // must not steer another person's incoming files (say, into
+                // their Startup folder). Equality, not a prefix match.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "files_dir" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change where \
+                              incoming files land"
+                            .into(),
+                    }
+                }
+                Ok(Request::ConfigSet { key, value }) => {
+                    state.config_set(&key, value.as_deref()).await
+                }
+                Ok(Request::TailLog { source, max_bytes }) => {
+                    state.tail_log(&source, max_bytes).await
+                }
+                Ok(Request::ExecRemote {
+                    node,
+                    shell,
+                    command,
+                    timeout_ms,
+                }) => state.exec_remote(&node, &shell, &command, timeout_ms).await,
+                Ok(Request::SshSession {
+                    node,
+                    public_key,
+                    session_secs,
+                }) => state.ssh_session(&node, &public_key, session_secs).await,
+                // FR-85 — recording. Reading state is open to every local client;
+                // starting, stopping and deleting are the console user's alone.
+                Ok(Request::RecordStatus) => state.record_status().await,
+                Ok(Request::RecordingsList) => state.recordings_list().await,
+                Ok(
+                    Request::RecordStart { .. }
+                    | Request::RecordStop
+                    | Request::RecordingDelete { .. },
+                ) if !peer.is_console_user() => not_the_console_user(),
+                Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
+                Ok(Request::RecordStop) => state.record_stop().await,
+                Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
+                // FR-84 D5b — read-only, open to every local client like `Peers`.
+                Ok(Request::Devices {
+                    org,
                     page,
                     per_page,
                     q,
                     sort,
                     dir,
-                };
-                state.devices(&org, &query).await
+                }) => {
+                    let query = DevicesQuery {
+                        page,
+                        per_page,
+                        q,
+                        sort,
+                        dir,
+                    };
+                    state.devices(&org, &query).await
+                }
+                Ok(Request::Mesh { org }) => state.mesh(&org).await,
+                // FR-84 D3 — the daemon decides (and records) here; it leaves only
+                // after the answer below is on the wire.
+                Ok(Request::RestartDaemon { reason }) => state.restart_daemon(&reason).await,
+                // FR-90 P1h-2 — root alone holds the daemon for an update: the
+                // hold refuses every new agent prompt and start until it ends.
+                Ok(Request::HiveUpdateHold) if !peer.is_root() => Response::Error {
+                    message: "only root may hold this daemon for an update".into(),
+                },
+                Ok(Request::HiveUpdateHold) => state.hive_update_hold().await,
+                Ok(req) => handle(&req, state),
+                Err(e) => Response::Error {
+                    message: format!("bad request: {e}"),
+                },
+            };
+            let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
+            held |= matches!(resp, Response::HiveUpdateHeld { .. });
+            // A Response always serialises; fall back to an Error line if a
+            // custom serializer ever failed, so we never break the frame.
+            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
+                serde_json::to_vec(&Response::Error {
+                    message: format!("encode error: {e}"),
+                })
+                .expect("Error response always serialises")
+            });
+            out.push(b'\n');
+            let written = async {
+                wr.write_all(&out).await?;
+                wr.flush().await
             }
-            Ok(Request::Mesh { org }) => state.mesh(&org).await,
-            // FR-84 D3 — the daemon decides (and records) here; it leaves only
-            // after the answer below is on the wire.
-            Ok(Request::RestartDaemon { reason }) => state.restart_daemon(&reason).await,
-            Ok(req) => handle(&req, state),
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
-        };
-        let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
-        // A Response always serialises; fall back to an Error line if a
-        // custom serializer ever failed, so we never break the frame.
-        let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
-            serde_json::to_vec(&Response::Error {
-                message: format!("encode error: {e}"),
-            })
-            .expect("Error response always serialises")
-        });
-        out.push(b'\n');
-        let written = async {
-            wr.write_all(&out).await?;
-            wr.flush().await
+            .await;
+            if restart_accepted {
+                // FR-84 D3 — the answer is out (or the caller is gone; the
+                // restart was accepted and recorded either way): only NOW may the
+                // shutdown begin.
+                state.restart_commit();
+            }
+            written?;
         }
-        .await;
-        if restart_accepted {
-            // FR-84 D3 — the answer is out (or the caller is gone; the
-            // restart was accepted and recorded either way): only NOW may the
-            // shutdown begin.
-            state.restart_commit();
-        }
-        written?;
+        Ok(())
     }
-    Ok(())
+    .await;
+    if held {
+        state.hive_update_release();
+    }
+    served
 }
 
 // ---------------------------------------------------------------------------
@@ -2800,9 +2868,10 @@ pub(crate) fn user_socket_path() -> std::path::PathBuf {
         .join(LOCALAPI_SOCKET_NAME)
 }
 
-/// The SYSTEM socket path, used by a daemon privileged enough to bind it.
+/// The SYSTEM socket path, used by a daemon privileged enough to bind it,
+/// and by the root update helper (FR-90 P1h-2), which holds THAT daemon.
 #[cfg(unix)]
-pub(crate) fn system_socket_path() -> std::path::PathBuf {
+pub fn system_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(LOCALAPI_SYSTEM_DIR).join(LOCALAPI_SOCKET_NAME)
 }
 
@@ -3064,9 +3133,9 @@ pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Clien
 }
 
 /// Unix-socket connect, parameterised on the path so tests can target a private
-/// one.
+/// one, and the root update helper the system daemon (FR-90 P1h-2).
 #[cfg(unix)]
-pub(crate) async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
+pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
     let stream = tokio::net::UnixStream::connect(path).await?;
     Ok(Client::new(Box::new(stream)))
 }
@@ -5414,6 +5483,93 @@ mod tests {
 
     fn is_console_refusal(r: &Response) -> bool {
         matches!(r, Response::Error { message } if message.contains("console"))
+    }
+
+    /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
+    #[derive(Default)]
+    struct HoldMock {
+        holds: std::sync::atomic::AtomicUsize,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl LocalApiState for HoldMock {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Mock.peers()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Mock.flows()
+        }
+        async fn hive_update_hold(&self) -> Response {
+            self.holds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Response::HiveUpdateHeld {
+                waited_secs: 7,
+                cut: 0,
+            }
+        }
+        fn hive_update_release(&self) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// FR-90 P1h-2 — root alone holds the daemon for an update (a hold
+    /// refuses every new agent prompt and start), and the hold ends with the
+    /// connection that placed it; a refusal places none. The wire is pinned:
+    /// the helper and the daemon are different processes, often of different
+    /// builds.
+    #[tokio::test]
+    async fn only_root_holds_the_daemon_and_the_hold_ends_with_its_connection() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = ClientPeer {
+            session_id: None,
+            uid: Some(0),
+        };
+        let someone = ClientPeer {
+            session_id: None,
+            uid: Some(1000),
+        };
+        for (peer, holds) in [(root, true), (someone, false), (ClientPeer::UNKNOWN, false)] {
+            let state = std::sync::Arc::new(HoldMock::default());
+            let (client, server) = tokio::io::duplex(4096);
+            let st = std::sync::Arc::clone(&state);
+            let srv = tokio::spawn(async move { serve_connection_as(server, &*st, peer).await });
+            let (crd, mut cwr) = tokio::io::split(client);
+            let mut clines = tokio::io::BufReader::new(crd).lines();
+            cwr.write_all(b"{\"t\":\"hive_update_hold\"}\n")
+                .await
+                .unwrap();
+            let line = clines.next_line().await.unwrap().unwrap();
+            if holds {
+                assert_eq!(
+                    line,
+                    r#"{"t":"hive_update_held","d":{"waited_secs":7,"cut":0}}"#
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert_eq!(
+                    state.releases.load(SeqCst),
+                    0,
+                    "held while the helper installs"
+                );
+            } else {
+                let r: Response = serde_json::from_str(&line).unwrap();
+                assert!(
+                    matches!(&r, Response::Error { message } if message.contains("only root")),
+                    "{peer:?} → {r:?}"
+                );
+            }
+            drop(cwr);
+            drop(clines);
+            srv.await.unwrap().unwrap();
+            assert_eq!(state.holds.load(SeqCst), usize::from(holds), "{peer:?}");
+            assert_eq!(
+                state.releases.load(SeqCst),
+                usize::from(holds),
+                "released once its connection closed: {peer:?}"
+            );
+        }
     }
 
     #[tokio::test]
