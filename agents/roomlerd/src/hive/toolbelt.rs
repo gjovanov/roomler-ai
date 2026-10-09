@@ -18,7 +18,8 @@
 //! root-only, and most of its verbs trust the socket alone.
 //!
 //! On Windows (P1i-2) it is a named pipe, `\\.\pipe\roomler-hive-<session>-<nonce>`,
-//! whose DACL admits SYSTEM and the session's account by SID, and whose
+//! whose DACL admits SYSTEM and Administrators (the daemon is one or the
+//! other) and the session's account by SID, to read and write only, and whose
 //! clients' accounts are checked again by SID.
 //!
 //! # An approval
