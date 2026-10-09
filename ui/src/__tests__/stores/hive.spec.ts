@@ -19,7 +19,7 @@ const hoisted = vi.hoisted(() => {
 })
 vi.mock('@/api/client', () => ({ api: { get: hoisted.get }, ApiError: hoisted.ApiError }))
 
-import { useHiveStore } from '@/stores/hive'
+import { isAdopted, useHiveStore } from '@/stores/hive'
 
 beforeEach(() => {
   setActivePinia(createPinia())
@@ -59,5 +59,12 @@ describe('hive store — the organizations agent sessions serve (FR-90 P1g)', ()
     expect(hive.served).toEqual({})
     expect(await hive.checkServed('t3')).toBe(true)
     expect(hoisted.get).toHaveBeenCalledTimes(2)
+  })
+
+  it('tells an adopted session (P1j) from a started one, an older server included', () => {
+    expect(isAdopted({ origin: 'adopted' })).toBe(true)
+    expect(isAdopted({ origin: 'started' })).toBe(false)
+    expect(isAdopted({})).toBe(false)
+    expect(isAdopted(undefined)).toBe(false)
   })
 })
