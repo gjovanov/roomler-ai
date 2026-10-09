@@ -47,20 +47,11 @@ fn parse_v4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
     if plen > 32 {
         return None;
     }
-    let mask = if plen == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(plen))
-    };
-    Some((Ipv4Addr::from(u32::from(addr) & mask), plen))
+    Some((Ipv4Addr::from(u32::from(addr) & prefix_mask(plen)), plen))
 }
 
 fn v4_in(net: (Ipv4Addr, u8), ip: Ipv4Addr) -> bool {
-    let mask = if net.1 == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(net.1.min(32)))
-    };
+    let mask = prefix_mask(net.1);
     u32::from(ip) & mask == u32::from(net.0) & mask
 }
 
@@ -69,15 +60,37 @@ fn v4_in(net: (Ipv4Addr, u8), ip: Ipv4Addr) -> bool {
 /// skipped.
 pub fn note_v4_nets(cidrs: &[String]) {
     let parsed: Vec<_> = cidrs.iter().filter_map(|c| parse_v4_cidr(c)).collect();
-    if parsed.is_empty() {
+    note_v4_blocks(&parsed);
+}
+
+/// [`note_v4_nets`] for blocks that are already parsed: what a process that
+/// runs NO overlay is handed by one that does. A supervised macOS worker
+/// serves its own enrollment's sessions from the user's GUI session, while
+/// the overlay lives in the root daemon; without this its footprint is empty
+/// and its own sessions would read the mesh as foreign (#1882). Each block is
+/// masked to its network address; a prefix over 32 is dropped.
+pub fn note_v4_blocks(blocks: &[(Ipv4Addr, u8)]) {
+    if blocks.is_empty() {
         return;
     }
     if let Ok(mut g) = V4_NETS.lock() {
-        for n in parsed {
+        for &(addr, plen) in blocks {
+            if plen > 32 {
+                continue;
+            }
+            let n = (Ipv4Addr::from(u32::from(addr) & prefix_mask(plen)), plen);
             if !g.contains(&n) {
                 g.push(n);
             }
         }
+    }
+}
+
+fn prefix_mask(plen: u8) -> u32 {
+    if plen == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(plen.min(32)))
     }
 }
 
@@ -178,5 +191,25 @@ mod tests {
         let ours = |n: &(Ipv4Addr, u8)| n.0.octets()[..2] == [100, 66];
         assert_eq!(nets.iter().filter(|n| ours(n)).count(), 2);
         assert!(is_overlay_addr(&nets, ip("100.66.5.1")));
+    }
+
+    /// What a worker is handed: already parsed, but not necessarily masked.
+    /// A host address with its prefix is stored as the block, a repeat is not
+    /// stored twice, and an impossible prefix is dropped.
+    #[test]
+    fn handed_blocks_are_masked_deduplicated_and_sane() {
+        // Process-global: assert only on blocks this test owns.
+        note_v4_blocks(&[
+            (Ipv4Addr::new(100, 67, 4, 34), 22),
+            (Ipv4Addr::new(100, 67, 4, 0), 22),
+            (Ipv4Addr::new(100, 67, 9, 9), 40),
+        ]);
+        let nets = v4_nets();
+        let ours: Vec<_> = nets
+            .iter()
+            .filter(|n| n.0.octets()[..2] == [100, 67])
+            .collect();
+        assert_eq!(ours, [&(Ipv4Addr::new(100, 67, 4, 0), 22)]);
+        assert!(is_overlay_addr(&nets, ip("100.67.7.255")));
     }
 }
