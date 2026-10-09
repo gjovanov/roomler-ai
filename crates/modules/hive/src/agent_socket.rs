@@ -95,6 +95,9 @@ enum Report {
     },
     /// P1b — the sessions the device runs now (`rc:hive.manifest`).
     Manifest(Vec<HiveManifestEntry>),
+    /// P1j — a terminal session the device offers for a record
+    /// (`rc:hive.adopt`).
+    Adopt(crate::adopt::Offer),
     /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
     /// the device's answer must reach the browser before its candidates.
     View(ClientMsg),
@@ -194,6 +197,19 @@ impl AgentMsgHandler for HiveAgentSocket {
                 },
             },
             ClientMsg::HiveManifest { sessions } => Report::Manifest(sessions),
+            ClientMsg::HiveAdopt {
+                adopt_id,
+                harness_session,
+                keys,
+                account,
+                folder,
+            } => Report::Adopt(crate::adopt::Offer {
+                adopt_id,
+                harness_session,
+                keys,
+                account,
+                folder,
+            }),
             view @ (ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -424,6 +440,7 @@ async fn apply_reports(
             Report::Manifest(sessions) => {
                 end_what_the_device_does_not_run(state, tenant_id, device_id, &sessions).await;
             }
+            Report::Adopt(offer) => crate::adopt::offer(state, tenant_id, device_id, offer).await,
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
         }
     }

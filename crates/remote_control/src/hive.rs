@@ -61,6 +61,21 @@ pub mod hive_limits {
     /// fit with room for headings even at four bytes a character; a larger
     /// one is no snapshot this server rendered, and the device drops it.
     pub const MAX_CORE_MEMORY_BYTES: usize = 32 * 1024;
+    /// FR-90 P1j — keys one `rc:hive.adopt` may carry: the `hive_accounts`
+    /// keys that map to one account. A handful; a longer list is no
+    /// device's.
+    pub const MAX_ADOPT_KEYS: usize = 8;
+    /// A key as the device holds it: a user id, or an address.
+    pub const MAX_ADOPT_KEY_LEN: usize = 320;
+    /// The device's id for one offer, echoed by the ack.
+    pub const MAX_ADOPT_ID_LEN: usize = 64;
+    /// The local account name, as the device reports it.
+    pub const MAX_ACCOUNT_LEN: usize = 64;
+    /// Live adopted sessions one device may hold.
+    pub const MAX_ADOPTED_PER_DEVICE: usize = 16;
+    /// Adopt offers per device per minute — a terminal session is offered
+    /// once, so more is a device in a loop or one that lies.
+    pub const ADOPT_RATE_PER_MINUTE: u32 = 20;
 }
 
 /// FR-90 P1b — one session a device runs, in `rc:hive.manifest`: its id and
@@ -192,6 +207,80 @@ impl HiveRefusal {
         Self::AtCapacity,
         Self::Other,
     ];
+}
+
+/// FR-90 P1j — why the server did not adopt a terminal session, carried in
+/// `rc:hive.adopt_ack`. Absent = adopted: the record exists and the device
+/// mirrors the session.
+///
+/// ⚠️ Decoded LENIENTLY ([`adopt_refusal_lenient`]): an unknown word is
+/// [`Self::Other`], still a refusal — never "adopted", which would have the
+/// device mirror a terminal into a session nobody has a record of.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveAdoptRefusal {
+    /// The device's organization is not one agent sessions serve
+    /// (`hive.tenants`, P1g).
+    HiveNotEnabled,
+    /// No key the device sent names an account that exists here.
+    NoAccount,
+    /// The keys name two or more people: the account is shared, so whose
+    /// terminal this is cannot be known, and it is never guessed.
+    AmbiguousAccount,
+    /// The one person the keys name is not a member of the device's org.
+    NotAMember,
+    /// The device already holds [`hive_limits::MAX_ADOPTED_PER_DEVICE`].
+    AtCapacity,
+    /// More than [`hive_limits::ADOPT_RATE_PER_MINUTE`] offers.
+    RateLimited,
+    /// A word this build does not know.
+    Other,
+}
+
+impl HiveAdoptRefusal {
+    /// The spelling on the wire and in `hive_audit`. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HiveNotEnabled => "hive_not_enabled",
+            Self::NoAccount => "no_account",
+            Self::AmbiguousAccount => "ambiguous_account",
+            Self::NotAMember => "not_a_member",
+            Self::AtCapacity => "at_capacity",
+            Self::RateLimited => "rate_limited",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveAdoptRefusal; 7] = [
+        Self::HiveNotEnabled,
+        Self::NoAccount,
+        Self::AmbiguousAccount,
+        Self::NotAMember,
+        Self::AtCapacity,
+        Self::RateLimited,
+        Self::Other,
+    ];
+}
+
+/// Lenient decoder for `rc:hive.adopt_ack`'s `refused`, as
+/// [`refusal_lenient`]: only absent or `null` means adopted.
+pub(crate) fn adopt_refusal_lenient<'de, D>(de: D) -> Result<Option<HiveAdoptRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveAdoptRefusal::Other));
+    };
+    Ok(Some(
+        HiveAdoptRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveAdoptRefusal::Other),
+    ))
 }
 
 /// Where a running session is, as its device reports it in `rc:hive.state`.
@@ -543,6 +632,49 @@ mod tests {
             Some(HiveViewRefusal::Other)
         );
         assert_eq!(v(r#"{"refused":false}"#), Some(HiveViewRefusal::Other));
+    }
+
+    /// FR-90 P1j — WIRE LOCK for the adopt refusals, and the fallback's
+    /// direction: an unknown word still refuses, so a device never mirrors a
+    /// terminal into a session the server did not record.
+    #[test]
+    fn adopt_refusals_are_locked_and_an_unknown_one_still_refuses() {
+        let words: Vec<&str> = HiveAdoptRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "hive_not_enabled",
+                "no_account",
+                "ambiguous_account",
+                "not_a_member",
+                "at_capacity",
+                "rate_limited",
+                "other"
+            ]
+        );
+        for r in HiveAdoptRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct A {
+            #[serde(default, deserialize_with = "adopt_refusal_lenient")]
+            refused: Option<HiveAdoptRefusal>,
+        }
+        let a = |j: &str| serde_json::from_str::<A>(j).unwrap().refused;
+        assert_eq!(a("{}"), None);
+        assert_eq!(a(r#"{"refused":null}"#), None);
+        assert_eq!(
+            a(r#"{"refused":"ambiguous_account"}"#),
+            Some(HiveAdoptRefusal::AmbiguousAccount)
+        );
+        assert_eq!(
+            a(r#"{"refused":"terminal_banned"}"#),
+            Some(HiveAdoptRefusal::Other)
+        );
+        assert_eq!(a(r#"{"refused":0}"#), Some(HiveAdoptRefusal::Other));
     }
 
     #[derive(Deserialize)]

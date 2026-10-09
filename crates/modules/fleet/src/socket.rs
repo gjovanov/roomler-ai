@@ -148,6 +148,9 @@ pub async fn handle_agent_socket(
     let serves_hive_views = caps.has_rpc(RpcCap::HiveView);
     // FR-90 P1e — and understands core memory; `hive` is its prefix too.
     let takes_hive_memory = caps.has_rpc(RpcCap::HiveMemory);
+    // FR-90 P1j — and mirrors adopted terminal sessions; `hive` is its
+    // prefix too.
+    let adopts_hive = caps.has_rpc(RpcCap::HiveAdopt);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -169,6 +172,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_memory_support(agent_id, takes_hive_memory);
+    state
+        .rc_hub
+        .set_agent_hive_adopt_support(agent_id, adopts_hive);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

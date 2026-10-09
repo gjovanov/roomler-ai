@@ -142,6 +142,11 @@ pub struct ConnectedAgent {
     /// session's core-memory snapshot (`rc:hive.memory`). Per connection, for
     /// the same reason; `hive` does NOT imply it.
     pub supports_hive_memory: bool,
+    /// FR-90 P1j — the agent advertises `hive-adopt`: it mirrors terminal
+    /// sessions its accounts adopted, and its owner allowed it (`hive_adopt`).
+    /// An `rc:hive.adopt` from a connection without it is refused unread. Per
+    /// connection, for the same reason; `hive` does NOT imply it.
+    pub supports_hive_adopt: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -423,6 +428,9 @@ impl Hub {
             // FR-90 P1e — set by `set_agent_hive_memory_support`; `false` = no
             // core memory is ever pushed to this connection.
             supports_hive_memory: false,
+            // FR-90 P1j — set by `set_agent_hive_adopt_support`; `false` = an
+            // adopt offer from this connection is never honoured.
+            supports_hive_adopt: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1665,6 +1673,49 @@ impl Hub {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.supports_hive_memory = supports;
         }
+    }
+
+    /// FR-90 P1j — record whether this connection mirrors adopted terminal
+    /// sessions (`hive-adopt`), right after registration.
+    pub fn set_agent_hive_adopt_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_adopt = supports;
+        }
+    }
+
+    /// FR-90 P1j — whether a connected agent advertises `hive-adopt`.
+    /// `None` = not online on this pod.
+    pub fn agent_supports_hive_adopt(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.supports_hive_adopt)
+    }
+
+    /// FR-90 P1j — answer an adopt offer (`rc:hive.adopt_ack`), checked in the
+    /// lookup that sends it, as [`Self::push_hive`]: offline or another
+    /// tenant's is [`Error::AgentOffline`]; a connection without `hive-adopt`
+    /// is [`Error::ExecUnsupported`] and receives nothing.
+    pub fn push_hive_adopt(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive_adopt {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
     }
 
     /// FR-90 P1e — whether a connected agent advertises `hive-memory`.
