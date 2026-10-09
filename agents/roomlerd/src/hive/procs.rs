@@ -14,13 +14,19 @@
 //! A pid alone does not name a process across time: the pid of a harness that
 //! ended may belong to anything by now. [`started`] adds the process's start
 //! time, and a group is signalled only when both still match.
+//!
+//! P1i-2 — on Windows a harness's group is its Job Object, which the session
+//! task holds and which ends with the daemon that holds it
+//! (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), so a crash leaves no harness
+//! running there. [`take_down`] still ends what it is given, by pid.
 
 use std::time::{Duration, Instant};
 
 /// When `pid` started, as a token that differs for every process ever given
 /// that pid: on Linux the boot id and the start time in clock ticks since
-/// boot, on macOS the start time in microseconds since the epoch. `None`: no
-/// such process (or none this daemon may read).
+/// boot, on macOS the start time in microseconds since the epoch, on Windows
+/// the creation time in 100 ns units since 1601. `None`: no such process (or
+/// none this daemon may read).
 pub(crate) fn started(pid: u32) -> Option<String> {
     imp::started(pid)
 }
@@ -34,6 +40,7 @@ pub(crate) fn started(pid: u32) -> Option<String> {
 /// and the next turn's hook offered the session again as a new record.
 /// Claude Code is never a shell, and a shell that exec'd the hook is not
 /// there at all. `None`: no such process, or more shells than any wrapper.
+#[cfg(unix)]
 pub(crate) fn hook_terminal(pid: u32) -> Option<u32> {
     let mut p = imp::parent(pid)?;
     for _ in 0..MAX_WRAPPING_SHELLS {
@@ -46,12 +53,15 @@ pub(crate) fn hook_terminal(pid: u32) -> Option<u32> {
 }
 
 /// What a hook's command line may run under, by process name.
+#[cfg(unix)]
 const SHELLS: [&str; 8] = ["sh", "dash", "bash", "zsh", "ksh", "mksh", "ash", "fish"];
 
 /// The most shells between a hook and the Claude Code that ran it.
+#[cfg(unix)]
 const MAX_WRAPPING_SHELLS: usize = 3;
 
 /// Signal `pid`'s process group (the group a harness leads).
+#[cfg(unix)]
 pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
@@ -66,6 +76,7 @@ pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
 }
 
 /// Whether anything is left in `pid`'s process group.
+#[cfg(unix)]
 pub(crate) fn group_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -82,6 +93,7 @@ pub(crate) fn group_alive(pid: u32) -> bool {
 /// SIGTERM to each group — a harness exits cleanly on it and Claude Code
 /// records its running cost — then SIGKILL, after `grace`, to any group still
 /// there. Returns once every group is gone, or after the SIGKILL.
+#[cfg(unix)]
 pub(crate) async fn take_down(pids: &[u32], grace: Duration) {
     if pids.is_empty() {
         return;
@@ -97,6 +109,24 @@ pub(crate) async fn take_down(pids: &[u32], grace: Duration) {
         if group_alive(pid) {
             signal_group(pid, libc::SIGKILL);
         }
+    }
+}
+
+/// P1i-2 — Windows has no signal a console-less harness could catch, so each
+/// process is ended outright (`TerminateProcess`), then this waits up to
+/// `grace` for every one to be gone. Its tools are its Job Object's, which ends
+/// them when its last handle closes: with the session task, or with the daemon.
+#[cfg(windows)]
+pub(crate) async fn take_down(pids: &[u32], grace: Duration) {
+    if pids.is_empty() {
+        return;
+    }
+    for &pid in pids {
+        imp::terminate(pid);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && pids.iter().any(|&p| imp::alive(p)) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -185,7 +215,131 @@ mod imp {
     }
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+mod imp {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    /// `pid` opened with `access`, if it is still running: a process that
+    /// ended stays openable while anything holds a handle to it, and its
+    /// creation time with it, so a dead one must not read as the live one.
+    fn open_running(pid: u32, access: u32) -> Option<HANDLE> {
+        // 0 is the idle process and 4 the kernel's; neither is a harness.
+        if pid <= 4 {
+            return None;
+        }
+        // SAFETY: a plain open; every caller closes the handle.
+        let h = unsafe { OpenProcess(access | PROCESS_SYNCHRONIZE, 0, pid) };
+        if h.is_null() {
+            return None;
+        }
+        // SAFETY: a live handle opened with SYNCHRONIZE; a 0 ms wait only asks.
+        if unsafe { WaitForSingleObject(h, 0) } != WAIT_TIMEOUT {
+            // SAFETY: the handle opened above, closed once.
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+        Some(h)
+    }
+
+    pub(super) fn started(pid: u32) -> Option<String> {
+        let h = open_running(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: a live handle with QUERY_LIMITED_INFORMATION; four valid
+        // out-params.
+        let ok =
+            unsafe { GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+        // SAFETY: the handle `open_running` gave us, closed once.
+        unsafe { CloseHandle(h) };
+        ok.then(|| {
+            let t = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            t.to_string()
+        })
+    }
+
+    pub(super) fn alive(pid: u32) -> bool {
+        match open_running(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Some(h) => {
+                // SAFETY: the handle `open_running` gave us, closed once.
+                unsafe { CloseHandle(h) };
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn terminate(pid: u32) {
+        // SAFETY: GetCurrentProcessId has no preconditions.
+        if pid == unsafe { GetCurrentProcessId() } {
+            return;
+        }
+        if let Some(h) = open_running(pid, PROCESS_TERMINATE) {
+            // SAFETY: a live handle opened with PROCESS_TERMINATE; closed once.
+            unsafe {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+
+    fn ping() -> std::process::Child {
+        std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_live_process_has_a_start_time_that_holds_and_a_dead_one_has_none() {
+        let me = std::process::id();
+        let a = started(me).expect("this process's own start time");
+        assert_eq!(started(me), Some(a), "the same process, the same token");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/d", "/c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // `child` still holds its handle, so the ended process stays openable:
+        // the token must say it ended all the same.
+        child.wait().unwrap();
+        assert_eq!(started(pid), None, "an ended process has no start time");
+        assert_eq!(started(0), None);
+        assert_eq!(started(4), None);
+    }
+
+    #[tokio::test]
+    async fn take_down_ends_each_process_it_is_given() {
+        let mut child = ping();
+        let pid = child.id();
+        assert!(imp::alive(pid));
+        take_down(&[pid], Duration::from_secs(5)).await;
+        assert!(!imp::alive(pid), "gone once take_down returns");
+        assert!(child.wait().is_ok());
+    }
+
+    #[test]
+    fn the_daemon_and_the_kernel_are_never_ended() {
+        imp::terminate(std::process::id());
+        imp::terminate(0);
+        imp::terminate(4);
+        assert!(imp::alive(std::process::id()), "still here");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;

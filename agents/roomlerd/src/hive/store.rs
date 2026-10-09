@@ -43,7 +43,7 @@ enum Cmd {
         session: String,
         reply: oneshot::Sender<Option<u64>>,
     },
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Events {
         session: String,
         reply: mpsc::Sender<Vec<TranscriptEvent>>,
@@ -126,7 +126,7 @@ impl StoreHandle {
     }
 
     /// Everything recorded for `session`, in order — tests only.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn events(&self, session: &str) -> Vec<TranscriptEvent> {
         let (reply, rx) = mpsc::channel();
         let _ = self.tx.send(Cmd::Events {
@@ -186,7 +186,7 @@ fn writer(
             Cmd::Tip { session, reply } => {
                 let _ = reply.send(store.tip(&session).ok().flatten().map(|t| t.seq));
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Cmd::Events { session, reply } => {
                 let events = store
                     .page(&session, 0, 100_000)
