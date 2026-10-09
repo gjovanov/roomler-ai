@@ -50,6 +50,17 @@
           <v-chip size="small" variant="tonal" :color="statusColor(s.status)" class="mr-2">
             {{ $t(`hive.state.${s.status}`, s.status) }}
           </v-chip>
+          <v-chip
+            v-if="isAdopted(s)"
+            size="small"
+            variant="outlined"
+            prepend-icon="mdi-console"
+            class="mr-2"
+            :title="$t('hive.adoptedExplain')"
+            data-testid="hive-adopted"
+          >
+            {{ $t('hive.adopted') }}
+          </v-chip>
           <v-btn
             v-if="isLive(s) && s.status !== 'stopping'"
             size="small"
@@ -58,7 +69,7 @@
             :loading="stopping === s.id"
             @click.prevent.stop="stopSession(s.id)"
           >
-            {{ $t('hive.stop') }}
+            {{ isAdopted(s) ? $t('hive.stopMirroring') : $t('hive.stop') }}
           </v-btn>
         </template>
       </v-list-item>
@@ -112,7 +123,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { isLive, useHiveStore, type HiveSessionStatus } from '@/stores/hive'
+import { isAdopted, isLive, useHiveStore, type HiveSessionStatus } from '@/stores/hive'
 import { useDeviceStore } from '@/stores/devices'
 
 const route = useRoute()

@@ -190,6 +190,9 @@
   "hive": {
     "title": "Agent sessions",
     "stop": "Stop",
+    "stopMirroring": "Stop mirroring",
+    "adopted": "Adopted",
+    "adoptedExplain": "A session you run in a terminal, mirrored here for you alone. It is read-only: nobody prompts it from Roomler.",
     "empty": {
       "title": "No agent sessions yet",
       "body": "Start one on a device whose owner has turned agent sessions on (hive_enabled). It runs there, as the account the device maps you to, and its transcript stays on the device."
@@ -229,6 +232,7 @@
       "loadEarlier": "Load earlier",
       "empty": "Nothing in this session yet.",
       "someone": "Someone",
+      "inTerminal": "In the terminal",
       "thinking": "Thinking",
       "truncated": "The output was cut to the device's limit; its start and end are kept.",
       "turnDone": "Turn done",
@@ -259,6 +263,7 @@
       "askPlaceholder": "Ask the agent…",
       "askFailed": "The prompt did not reach the agent.",
       "readOnly": "You can read this session and talk in its room. Only its drivers can prompt the agent.",
+      "adoptedReadOnly": "This session runs in a terminal on its device, so it is read-only here: nobody prompts it from Roomler.",
       "drivingRefused": "You drive this session, but its device does not let you act there: {why}",
       "approval": {
         "asks": "{tool} needs approval to run",
@@ -289,7 +294,8 @@
       "noMatch": "No one else matches",
       "addReader": "Add as reader",
       "addDriver": "Add as driver",
-      "remove": "Take them out of the session"
+      "remove": "Take them out of the session",
+      "adoptedReadersOnly": "It runs in a terminal, so it takes readers only."
     },
     "memory": {
       "title": "Agent memory",
