@@ -267,7 +267,10 @@ impl Supervisor {
                 "agent sessions are served only to this device's primary organization".into(),
             ));
         }
-        if !self.enabled() {
+        // P1j — an adopted session is served on `hive_adopt` alone: a device
+        // may allow adopting with agent sessions themselves off.
+        let adopted = self.adopt_allowed() && self.adopt_holds(grant.session_id);
+        if !self.enabled() && !adopted {
             return Err((
                 HiveViewRefusal::HiveDisabled,
                 "agent sessions are off on this device (hive_enabled)".into(),

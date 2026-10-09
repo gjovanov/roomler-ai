@@ -36,6 +36,9 @@ pub struct HiveConfig {
     pub update_wait: std::time::Duration,
     /// P1e — whether a session here is shown the org's core memory.
     pub core_memory: bool,
+    /// P1j — whether this device's people may adopt their terminal
+    /// sessions (`hive_adopt`).
+    pub adopt: bool,
 }
 
 impl HiveConfig {
@@ -56,6 +59,7 @@ impl HiveConfig {
                 .map(|s| std::time::Duration::from_secs(u64::from(s)))
                 .unwrap_or(DEFAULT_UPDATE_WAIT),
             core_memory: cfg.hive_core_memory,
+            adopt: cfg.hive_adopt,
         }
     }
 
@@ -71,6 +75,7 @@ impl HiveConfig {
             api_workspace_id: None,
             update_wait: DEFAULT_UPDATE_WAIT,
             core_memory: false,
+            adopt: false,
         }
     }
 }
