@@ -53,6 +53,11 @@ pub mod mux;
 /// Overlay L3 data plane (userspace WireGuard mesh) — feature `overlay`.
 #[cfg(feature = "overlay")]
 pub mod overlay;
+/// #1882 — the address space the overlay runs on (every org's v4 blocks + the
+/// derived-v6 ULA), for code outside the overlay that must tell whether an
+/// address is reached through the mesh (remote desktop's ICE). Ungated: the
+/// overlay WRITES it, but a build without one still asks.
+pub mod overlay_footprint;
 pub mod policy;
 pub mod signaling;
 /// The tunnel-session driver's signaling seam — the cloneable sink + single-

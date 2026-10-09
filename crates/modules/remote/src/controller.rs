@@ -72,6 +72,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.input_mode,
         authz.tenant_name,
         authz.may_record,
+        authz.rc_overlay,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -98,6 +99,9 @@ pub async fn dispatch_controller_rc(
     tenant_name: Option<String>,
     // FR-85 P3 — may this controller record (resolved by the same gate)?
     may_record: bool,
+    // #1882 — may the session use the overlay (the device's policy, resolved
+    // by the same gate)?
+    rc_overlay: bool,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -123,6 +127,7 @@ pub async fn dispatch_controller_rc(
         input_mode,
         tenant_name: tenant_name.clone(),
         may_record,
+        rc_overlay,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -170,6 +175,7 @@ pub async fn dispatch_controller_rc(
                     input_mode,
                     &relay_tenant_name,
                     may_record,
+                    rc_overlay,
                     &frame_val,
                 )
                 .await
@@ -287,6 +293,7 @@ pub async fn dispatch_controller_rc(
                         input_mode,
                         &relay_tenant_name,
                         may_record,
+                        rc_overlay,
                         &frame_val,
                     )
                     .await
@@ -347,6 +354,11 @@ pub struct SessionAuthz {
     /// could also record would be covert monitoring (docs §11.4). The hub
     /// strips `Permissions::RECORD` from the grant when this is false.
     pub may_record: bool,
+    /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved: may the
+    /// session's ICE use the WireGuard overlay? Like `input_mode` it is the
+    /// DEVICE's setting and rides every allowed outcome; `false` on the
+    /// early-out paths, which never build a session.
+    pub rc_overlay: bool,
 }
 
 impl SessionAuthz {
@@ -357,12 +369,14 @@ impl SessionAuthz {
             input_mode: None,
             tenant_name: None,
             may_record: false,
+            rc_overlay: false,
         }
     }
     fn allow_with_input(
         mode: ConsentMode,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         tenant_name: Option<String>,
+        rc_overlay: bool,
     ) -> Self {
         Self {
             mode,
@@ -370,6 +384,7 @@ impl SessionAuthz {
             input_mode,
             tenant_name,
             may_record: false,
+            rc_overlay,
         }
     }
     /// FR-85 P3 — set whether this allowed controller may record.
@@ -424,6 +439,8 @@ pub async fn resolve_session_authz(
 
     // P6 — the device's input arbitration mode rides every allowed outcome.
     let input_mode = agent.access_policy.input_mode;
+    // #1882 — and so does whether its sessions may use the overlay.
+    let rc_overlay = agent.access_policy.rc_overlay_allowed();
 
     // Multi-org — the organization name the host's consent prompt will show.
     // One extra read, and only on a real session request (the early-outs above
@@ -459,6 +476,7 @@ pub async fn resolve_session_authz(
             agent.access_policy.owner_consent_mode(),
             input_mode,
             tenant_name,
+            rc_overlay,
         )
         .recording(true));
     }
@@ -484,11 +502,16 @@ pub async fn resolve_session_authz(
                 // ⚠️ FR-85 P3 — never record under break-glass (§11.4): the
                 // consent was skipped, so recording would be covert.
                 may_record: false,
+                rc_overlay,
             });
         }
-        return Ok(
-            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone()).recording(true),
-        );
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+            rc_overlay,
+        )
+        .recording(true));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -500,16 +523,22 @@ pub async fn resolve_session_authz(
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return Ok(
-            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
-                .recording(may_record),
-        );
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+            rc_overlay,
+        )
+        .recording(may_record));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return Ok(
-            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
-                .recording(may_record),
-        );
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+            rc_overlay,
+        )
+        .recording(may_record));
     }
     let role_ids = state
         .tenants
@@ -517,10 +546,13 @@ pub async fn resolve_session_authz(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return Ok(
-            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
-                .recording(may_record),
-        );
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+            rc_overlay,
+        )
+        .recording(may_record));
     }
     Err("you're not on this device's control allowlist".to_string())
 }

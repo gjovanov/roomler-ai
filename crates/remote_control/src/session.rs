@@ -57,6 +57,12 @@ pub struct LiveSession {
     /// forward one (the default). See [`LocalRelayDescriptor`].
     pub local_relay: Option<LocalRelayDescriptor>,
 
+    /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved at session
+    /// create. `forward_offer` hands the agent the overlay `local_relay` TURN
+    /// only when this is `true`: with the overlay off, an overlay relay is a
+    /// candidate the agent would only discard.
+    pub rc_overlay: bool,
+
     /// Multi-region relay: the region FROZEN at session create (load-aware
     /// pick over the agent's home + RTT-ordered prefs). Frozen so all three
     /// per-session issuance pushes (Ready / SdpOffer / SdpAnswer) carry the
@@ -116,6 +122,7 @@ impl LiveSession {
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
             local_relay: None,
+            rc_overlay: false,
             relay_region: None,
             offer_seen: false,
             pending_request: None,

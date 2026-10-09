@@ -2101,6 +2101,10 @@ impl OverlayRuntime {
         } else {
             network.cidrs.clone()
         };
+        // #1882 — the same blocks are what reaches this process THROUGH the
+        // mesh; remote desktop's ICE reads them to keep a session off the
+        // overlay when the device asks it to.
+        crate::overlay_footprint::note_v4_nets(&nat_cidrs);
         let _subnet_router = super::nat::enable(
             nat_if.as_deref().unwrap_or(super::tun::IF_NAME),
             &nat_cidrs,

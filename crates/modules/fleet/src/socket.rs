@@ -351,6 +351,7 @@ pub async fn handle_agent_socket(
         input_mode: None,
         tenant_name: None,
         may_record: false,
+        rc_overlay: false,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's

@@ -93,6 +93,9 @@ pub mod preflight;
 /// the module gates itself, so the `cfg` here would be redundant).
 pub mod pty;
 pub mod rc_local_turn;
+/// #1882 — may a remote-desktop session use the overlay (the device's policy,
+/// default off), and the ICE filters that keep it off.
+pub mod rc_overlay;
 pub mod rc_sessions;
 #[cfg(feature = "recording")]
 pub mod recording;
