@@ -1,25 +1,30 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! The toolbelt over a real socket, with the test playing Claude Code: the
-//! messages it sends are the ones FR-90 P1a's contract probe recorded from
-//! Claude Code 2.1.293 (spec §8).
+//! The toolbelt over a real socket (on Windows a named pipe, P1i-2), with the
+//! test playing Claude Code: the messages it sends are the ones FR-90 P1a's
+//! contract probe recorded from Claude Code 2.1.293 (spec §8).
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use super::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-fn me() -> u32 {
+#[cfg(unix)]
+fn me() -> PeerId {
     // SAFETY: getuid reads our own credentials.
     unsafe { libc::getuid() }
+}
+
+#[cfg(windows)]
+fn me() -> PeerId {
+    crate::hive_win::own_sid().unwrap()
 }
 
 struct Belt {
@@ -32,10 +37,13 @@ fn belt(timing: Timing) -> Belt {
     belt_for(me(), timing)
 }
 
-fn belt_for(uid: u32, timing: Timing) -> Belt {
+fn belt_for(peer: PeerId, timing: Timing) -> Belt {
     let dir = tempfile::tempdir().unwrap();
     let (tx, events) = mpsc::channel(64);
-    let toolbelt = open(dir.path(), None, uid, ObjectId::new(), tx, timing).unwrap();
+    #[cfg(unix)]
+    let toolbelt = open(dir.path(), None, peer, ObjectId::new(), tx, timing).unwrap();
+    #[cfg(windows)]
+    let toolbelt = open(peer, ObjectId::new(), tx, timing).unwrap();
     Belt {
         _dir: dir,
         toolbelt,
@@ -52,8 +60,8 @@ fn quick() -> Timing {
 
 /// Claude Code's side of one connection — the harness, through its relay.
 pub(crate) struct Client {
-    rd: tokio::io::Lines<BufReader<OwnedReadHalf>>,
-    wr: OwnedWriteHalf,
+    rd: tokio::io::Lines<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
+    wr: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
 impl Client {
@@ -61,13 +69,14 @@ impl Client {
         Self::at(b.toolbelt.socket()).await
     }
 
-    /// Connect to the toolbelt socket at `path`.
+    /// Connect to the toolbelt at `path` (a socket; on Windows a pipe name),
+    /// as the relay does.
     pub(crate) async fn at(path: &Path) -> Self {
-        let s = UnixStream::connect(path).await.unwrap();
-        let (rd, wr) = s.into_split();
+        let (rd, wr) = connect(path).await.unwrap();
+        let rd: Box<dyn AsyncRead + Unpin + Send> = Box::new(rd);
         Self {
             rd: BufReader::new(rd).lines(),
-            wr,
+            wr: Box::new(wr),
         }
     }
 
@@ -334,12 +343,62 @@ async fn the_toolbelt_ends_with_its_session() {
             ..
         })
     ));
+    #[cfg(unix)]
     assert!(!socket.exists(), "the socket went with the session");
+    // A pipe is gone once its last instance is: the listening one, and the
+    // connected one whose task the stop ended.
+    #[cfg(windows)]
+    {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            match connect(&socket).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                other => {
+                    drop(other);
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the pipe went with the session"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+}
+
+/// P1i-2 — a toolbelt is its session account's alone on Windows too. One made
+/// for another account (SYSTEM's, here) drops this one's connection unanswered:
+/// its DACL admits this test process as an administrator (CI's runner is
+/// elevated), and the daemon checks every client's account again. And its name
+/// cannot be taken twice.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_pipe_is_the_sessions_alone() {
+    let other = belt_for("S-1-5-18".into(), quick());
+    let mut c = Client::connect(&other).await;
+    // A write may already find the pipe closing: that is the refusal too.
+    let _ =
+        c.wr.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await;
+    let got = tokio::time::timeout(WAIT, c.rd.next_line()).await.unwrap();
+    assert!(
+        matches!(got, Ok(None) | Err(_)),
+        "another account's connection is dropped: {got:?}"
+    );
+
+    let b = belt(quick());
+    let name = b.toolbelt.socket().to_string_lossy().into_owned();
+    let sddl = crate::hive_win::toolbelt_pipe_sddl(&me());
+    assert!(
+        pipe_instance(&name, &sddl, true).is_err(),
+        "a name in use is never joined as the first"
+    );
 }
 
 /// The socket is the session account's alone: `0600`; a connection from any
 /// other uid is dropped unanswered; and what sits where the socket goes is
 /// removed only if it is a socket.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_socket_is_the_sessions_alone() {
     let b = belt(quick());
@@ -428,11 +487,10 @@ async fn the_relay_pipes_both_ways_and_ends_with_the_harness() {
         .unwrap();
 
     // Nothing to relay to is an error the harness sees, never a silent pipe.
-    let gone = relay_io(
-        Path::new("/nonexistent/toolbelt.sock"),
-        tokio::io::empty(),
-        tokio::io::sink(),
-    )
-    .await;
+    #[cfg(unix)]
+    let nowhere = Path::new("/nonexistent/toolbelt.sock");
+    #[cfg(windows)]
+    let nowhere = Path::new(r"\\.\pipe\roomler-hive-nowhere");
+    let gone = relay_io(nowhere, tokio::io::empty(), tokio::io::sink()).await;
     assert!(gone.is_err());
 }

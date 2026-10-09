@@ -1028,10 +1028,13 @@ jobs:
       # environment; ending or closing the job ending what it started; the
       # console-user mapping, the harness and its command line, and
       # `roomlerd hive-prep`. The whole `win_service::supervisor` suite runs
-      # here too: it ran in no lane before.
+      # here too: it ran in no lane before. P1i-2: `hive::` as Windows compiles
+      # it: the toolbelt over its named pipe, processes by creation time, the
+      # store's file in a DACL'd directory. (The supervisor's own tests drive a
+      # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
-        run: cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive_win win_service::supervisor
+        run: cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
 
   windows-recorder:
     # FR-85 P1e — the recorder's identity rule is Windows code that no other

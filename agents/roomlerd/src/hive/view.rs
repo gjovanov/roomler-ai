@@ -157,7 +157,7 @@ impl Viewers {
 
     /// Grants held now. Tests only: dead code in this module once ICEd
     /// rustc 1.95's deathness pass (see `crate::key_rotation`).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn count(&self) -> usize {
         self.lock().len()
     }
@@ -956,5 +956,5 @@ async fn on_feed(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

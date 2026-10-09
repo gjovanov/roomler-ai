@@ -117,6 +117,14 @@ impl OwnedHandle {
     pub fn raw(&self) -> HANDLE {
         self.0
     }
+
+    /// Give the handle up: whoever takes it closes it, and dropping this no
+    /// longer does (FR-90 P1i-2: a harness's pipes, handed to tokio).
+    pub fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
 }
 
 // SAFETY: a Win32 `HANDLE` is a process-wide reference to a kernel object, not

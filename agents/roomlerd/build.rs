@@ -44,7 +44,8 @@ fn main() {
 
 /// FR-90 P1h — `cfg(hive_host)`: this build hosts agent sessions. That is the
 /// `hive` feature, on an operating system whose session launcher exists:
-/// Linux, and macOS from P1h. One name at the forty-odd sites that would each
+/// Linux, macOS from P1h, and Windows from P1i-2, as the console user only.
+/// One name at the forty-odd sites that would each
 /// spell `all(feature = "hive", any(target_os = …))`, so the next system is
 /// one line here. Read from Cargo's environment, not `cfg!`: a build script
 /// runs on the HOST, and these describe the TARGET.
@@ -52,7 +53,7 @@ fn hive_host() {
     println!("cargo::rustc-check-cfg=cfg(hive_host)");
     let hive = std::env::var_os("CARGO_FEATURE_HIVE").is_some();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if hive && matches!(os.as_str(), "linux" | "macos") {
+    if hive && matches!(os.as_str(), "linux" | "macos" | "windows") {
         println!("cargo::rustc-cfg=hive_host");
     }
 }

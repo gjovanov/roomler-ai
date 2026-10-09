@@ -216,10 +216,11 @@ impl Hosted {
 }
 
 /// `path`, written whole and `0600` from its first byte: a temporary in the
-/// same directory, then a rename over the old file.
+/// same directory, then a rename over the old file. On Windows the file takes
+/// the store directory's protected DACL, SYSTEM's and Administrators', which is
+/// what `0600` is for a daemon that runs as SYSTEM (P1i-2).
 pub(crate) fn write_private_json<T: Serialize>(path: &Path, doc: &T) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     match std::fs::remove_file(&tmp) {
@@ -227,10 +228,14 @@ pub(crate) fn write_private_json<T: Serialize>(path: &Path, doc: &T) -> Result<(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", tmp.display())),
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&tmp)
         .map_err(|e| format!("{}: {e}", tmp.display()))?;
     f.write_all(&bytes)
@@ -242,6 +247,7 @@ pub(crate) fn write_private_json<T: Serialize>(path: &Path, doc: &T) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn entry(session: &str) -> HostedSession {
@@ -281,8 +287,11 @@ mod tests {
             e.approvals.push("ap-1".into());
         });
         h.remove("s2");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "root's alone");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "root's alone");
+        }
 
         let again = Hosted::load(path, "agent-a");
         assert_eq!(again.sessions().len(), 1);

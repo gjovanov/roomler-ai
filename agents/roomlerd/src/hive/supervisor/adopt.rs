@@ -25,6 +25,12 @@
 //! all. The terminal holds the harness; the server's grant says
 //! `may_prompt: false`, and [`Supervisor::prompt`] refuses a session it does
 //! not run anyway.
+//!
+//! P1i-2 — nothing is adopted on Windows (the hooks CLI refuses there, and
+//! `hive_adopt` reads off): the socket and the connections it takes are
+//! compiled out, and what only they reach is unused there.
+
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,13 +43,18 @@ use roomler_hive_node::TranscriptEvent;
 use roomler_hive_node::stream_json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
 use tokio::io::{AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
-use tunnel_core::localapi::hive_adopt::{self as proto, HookEvent, Reply, Request, refusal};
+use tunnel_core::localapi::hive_adopt::{self as proto, Reply, refusal};
+#[cfg(unix)]
+use tunnel_core::localapi::hive_adopt::{HookEvent, Request};
 
 use super::Supervisor;
+#[cfg(unix)]
 use crate::hive::lines::LineReader;
 use crate::hive::procs;
 
@@ -315,6 +326,7 @@ impl Supervisor {
     /// adopting. The runtime directory is the daemon's (`0755`, no link on
     /// the way); the socket is `0666`, because every local account may adopt
     /// its own sessions and the kernel names each peer.
+    #[cfg(unix)]
     pub(crate) async fn adopt_listen(self: Arc<Self>) -> Result<(), String> {
         if !self.cfg.adopt {
             return Ok(());
@@ -367,6 +379,7 @@ impl Supervisor {
     /// Nothing listens on it now, and its being there must not say otherwise
     /// (`roomler hive adopt` read it as "this device adopts", P1j-5's field
     /// run). A socket only: anything else at that path is left alone.
+    #[cfg(unix)]
     pub(crate) fn adopt_remove_stale_socket(&self) {
         use std::os::unix::fs::FileTypeExt;
         let socket = self.runtime.join(proto::SOCKET_NAME);
@@ -383,7 +396,20 @@ impl Supervisor {
         }
     }
 
+    /// P1i-2 — nothing is adopted on Windows, so there is no socket to listen
+    /// on. `hive_adopt` reads off there ([`super::gates::HiveConfig`]), so this
+    /// is never reached; it refuses anyway rather than pretend to listen.
+    #[cfg(windows)]
+    pub(crate) async fn adopt_listen(self: Arc<Self>) -> Result<(), String> {
+        Err("adopting terminal sessions is not available on Windows".into())
+    }
+
+    /// P1i-2 — and no socket to leave behind.
+    #[cfg(windows)]
+    pub(crate) fn adopt_remove_stale_socket(&self) {}
+
     /// One hook's connection: a `Hello`, then its requests, each answered.
+    #[cfg(unix)]
     pub(crate) async fn adopt_conn(self: Arc<Self>, stream: UnixStream) {
         let cred = match stream.peer_cred() {
             Ok(c) => c,
@@ -452,6 +478,7 @@ impl Supervisor {
 
     /// `Hello`: the session is held, or offered to the server now. Returns the
     /// answer and, when the connection may go on, the session it speaks for.
+    #[cfg(unix)]
     async fn adopt_hello(
         &self,
         uid: u32,
@@ -894,7 +921,7 @@ pub(super) fn adopted_path(hosted: Option<&Path>) -> Option<PathBuf> {
     hosted.map(|p| p.with_file_name(ADOPTED_FILE))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
