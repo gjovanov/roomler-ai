@@ -4846,6 +4846,11 @@ mod tests {
     /// changed shape and the matrix in the FR-27 spec would be stale.
     #[test]
     fn pre_p10_end_reason_rejects_host_disconnect_so_old_servers_drop_the_frame() {
+        // A pre-P10 server's `EndReason`, re-declared on its own. A mock
+        // `ClientMsg` would need the `rc:terminate` tag spelled as a serde
+        // rename, and `composition::wire_names` reads every such literal in
+        // this file as a wire name (the FR-69 composition gate). Serde fails
+        // the whole frame when one field fails, so the reason is the cell.
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "snake_case")]
         #[allow(dead_code)]
@@ -4860,33 +4865,25 @@ mod tests {
             IdleTimeout,
             Error,
         }
-        #[derive(Deserialize, Debug)]
-        #[serde(tag = "t")]
-        #[allow(dead_code)]
-        enum PreP10ClientMsg {
-            #[serde(rename = "rc:terminate")]
-            Terminate {
-                session_id: String,
-                reason: PreP10EndReason,
-            },
-        }
-        let frame = serde_json::to_string(&ClientMsg::Terminate {
-            session_id: ObjectId::new(),
-            reason: EndReason::HostDisconnect,
-        })
-        .unwrap();
+        let reason_of = |reason: EndReason| -> serde_json::Value {
+            serde_json::to_value(ClientMsg::Terminate {
+                session_id: ObjectId::new(),
+                reason,
+            })
+            .unwrap()["reason"]
+                .clone()
+        };
+        let new = reason_of(EndReason::HostDisconnect);
+        assert_eq!(new, serde_json::json!("host_disconnect"));
         assert!(
-            serde_json::from_str::<PreP10ClientMsg>(&frame).is_err(),
-            "a pre-P10 decoder must reject the frame whole: {frame}"
+            serde_json::from_value::<PreP10EndReason>(new).is_err(),
+            "a pre-P10 decoder must reject host_disconnect"
         );
         // And the same decoder still takes what a pre-P10 agent sends, so the
         // test proves the VARIANT is the difference, not the shape.
-        let old = serde_json::to_string(&ClientMsg::Terminate {
-            session_id: ObjectId::new(),
-            reason: EndReason::AgentHangup,
-        })
-        .unwrap();
-        assert!(serde_json::from_str::<PreP10ClientMsg>(&old).is_ok());
+        assert!(
+            serde_json::from_value::<PreP10EndReason>(reason_of(EndReason::AgentHangup)).is_ok()
+        );
     }
 
     // ─── rc:tunnel.* wire-format locks (T2.1) ─────────────────────────
