@@ -273,7 +273,11 @@ socket. That left the person at the screen with no "being viewed" banner, no
 Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the user of the **active** graphical session only;
-- it is 0600 and theirs, made so by `chmod` before `chown`;
+- it is 0600 and theirs because it is **made as them**: the bind and the `chmod` run on a
+  thread switched to their filesystem ids (`setfsuid`/`setfsgid`). Their own directory
+  lets them swap the path between any two root calls, and `chmod`/`chown` follow
+  symlinks, so a root `chown` of that path could be raced into handing them
+  `/etc/shadow`. The daemon therefore never runs a root path operation there;
 - `SO_PEERCRED` is checked against that user or root on every connection;
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`.
