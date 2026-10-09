@@ -469,10 +469,11 @@ impl Supervisor {
             }
             Some(Ok(ok)) => ok,
         };
-        // The terminal is the hook's parent: Claude Code runs its hooks itself.
+        // The terminal is the Claude Code that ran the hook — past the shell
+        // it ran the hook's command line through (`procs::hook_terminal`).
         let terminal_pid = peer_pid
             .and_then(|p| u32::try_from(p).ok())
-            .and_then(procs::parent);
+            .and_then(procs::hook_terminal);
         let terminal_started = terminal_pid.and_then(procs::started);
         let a = Adopted {
             harness_session: hs.clone(),
