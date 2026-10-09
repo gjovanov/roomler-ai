@@ -285,7 +285,7 @@ pre-P10 behaviour, for the one case where the reason has no path to travel.
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
-| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on both surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s |
+| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on all three surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s. The Linux banner, where the companion reaches its daemon: 33 ms, 65.8 s held, 0.54 s Reconnect, 4.0 s drop. ⚠️ A Linux SYSTEM install's companion cannot reach its root daemon at all, so it has no banner and no Disconnect: #1911 |
 
 ## Acceptance criteria
 
@@ -389,6 +389,11 @@ Ticked only where a run is recorded in the field log below.
   - [x] the Windows badge, which is capture-excluded, so the click is aimed by
         its fixed geometry through the viewer (Claude in Chrome on the live
         site) — GREEN 2026-10-09 on 0.4.121 + `hosted-20261009-cac4761`
+  - [x] the companion banner (Linux), on a vmtest Ubuntu 24.04 GNOME Wayland
+        guest — GREEN 2026-10-09 on 0.4.122. It ran wherever the companion
+        reaches its daemon, which a per-user install provides. On a SYSTEM
+        install it cannot (a root-only socket, #1911); the run opened the socket
+        on the throwaway guest to exercise the banner itself
 
 ## Deviations (accepted, recorded up front)
 
@@ -801,4 +806,43 @@ and **one** click.
 The run ended with the viewer's own Disconnect (`controller_hangup` both ways), and the
 tab was closed. The badge's Disconnect, the companion banner's and the ordinary-drop
 ladder now all have field evidence. Only the Linux companion banner has not been
-exercised separately.
+exercised separately (see the next entry).
+
+### 2026-10-09 — P10 GREEN on the Linux companion banner, and a gap it found (#1911)
+
+**What ran.** One vmtest cell, `ubuntu/installer/system@zeus --keep`: Ubuntu 24.04 with
+a GNOME **Wayland** session, the release `.deb`s, a root daemon, agent **0.4.122**. Every
+check passed: install, enroll, overlay, wayland, rd, the companion autostart and the
+desktop views. Issue filing was off and the harness's `LATEST` verdict was restored after.
+The viewer was a Playwright spec in the harness's own container on mars, signed in the way
+`vmtest-remote.spec.ts` is. The guest was destroyed after the run.
+
+**The gap, measured first.** The companion read *"Service offline"*. A root daemon's
+LocalAPI is `/var/run/roomler/roomler.sock`, with the directory at 0700 and the socket at
+0600, both root-owned. As the desktop user, `roomler status` fails with *"Permission
+denied (os error 13)"*. So on a Linux **system** install the companion cannot see sessions,
+and the person at the device gets no banner and no Disconnect. On Wayland, with no native
+overlay, there is no companion consent prompt either. This predates P10 and is filed as
+**#1911** (bug), with the options left to the operator. The root-only ACL is the trust
+boundary, so widening it is not the fix.
+
+**The banner, with the companion able to reach its daemon.** That is what a per-user
+install has. On the throwaway guest only, the socket was opened (directory 0711, socket
+0666), and the companion read **"Connected"** at once. The banner appeared at session
+start: *"Being viewed by vmtest admin · keyboard + mouse"* with Disconnect, centred by
+mutter. On Wayland it stays up, because the pointer cannot be read
+(`panels.rs` `Sample::read`). It is in the stream, since Linux has no capture exclusion.
+The click went to where the page showed the button.
+
+| check | evidence |
+|---|---|
+| one click → the device's word, first | the daemon: `viewee requested disconnect via overlay badge` 21:43:23.0792Z, then `host disconnect: told the server … reason="host_disconnect" grace_ms=1000` **+0.06 ms**, then the hub's echo `reason=HostDisconnect` +1.6 ms, then `PC state change … Closed` **+1.002 s** |
+| the viewer is told | `rc:terminate reason=host_disconnect` **33 ms** after the click; the viewer logged `session ended by the person at the device - not reconnecting`; the notice shown, its second line readable on the stage (#1899) |
+| stays disconnected ≥ 60 s | **65.8 s**: 0 `rc:session.request`, not connected; no session on the daemon in the window |
+| the audit | ends with `host_disconnect` |
+| Reconnect is an explicit act | a new session in **544 ms**, the notice gone |
+| an ordinary drop, after all of the above | the viewer's `/ws` was cut, and the viewer logged `control channel closed mid-session — re-creating session`. A new session came up **4.0 s** later, with no click and no notice |
+
+All three P10 surfaces now have field evidence: the macOS banner, the Windows badge, and
+the Linux banner where it can reach its daemon. On a Linux system install it cannot, and
+that is #1911.
