@@ -155,6 +155,16 @@ impl Hosted {
         }
     }
 
+    /// The file, when there is one: what P1j's `adopted.json` sits beside.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The enrollment the file belongs to.
+    pub(crate) fn agent(&self) -> &str {
+        &self.agent
+    }
+
     pub(crate) fn sessions(&self) -> &[HostedSession] {
         &self.sessions
     }
@@ -198,7 +208,7 @@ impl Hosted {
             agent: self.agent.clone(),
             sessions: self.sessions.clone(),
         };
-        if let Err(e) = write_private(path, &doc) {
+        if let Err(e) = write_private_json(path, &doc) {
             warn!(file = %path.display(), %e,
                 "hive: the hosted sessions were not saved — a restart will not resume them");
         }
@@ -207,7 +217,7 @@ impl Hosted {
 
 /// `path`, written whole and `0600` from its first byte: a temporary in the
 /// same directory, then a rename over the old file.
-fn write_private(path: &Path, doc: &Doc) -> Result<(), String> {
+pub(crate) fn write_private_json<T: Serialize>(path: &Path, doc: &T) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;

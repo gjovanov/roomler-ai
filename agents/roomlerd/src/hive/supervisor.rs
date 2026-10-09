@@ -253,6 +253,9 @@ enum Launcher {
     },
 }
 
+/// P1j — terminal sessions adopted on this device.
+mod adopt;
+
 pub struct Supervisor {
     cfg: HiveConfig,
     /// Per-session settings files (`<runtime>/<sid>/settings.json`): written
@@ -305,6 +308,10 @@ pub struct Supervisor {
     going_down: AtomicBool,
     /// P1e — core memory waiting for its start's launch, by (session, fence).
     memory: Mutex<HashMap<(ObjectId, u64), (CoreMemory, Instant)>>,
+    /// P1j — the terminal sessions this device mirrors ([`adopt`]), on disk.
+    adopted: Mutex<adopt::AdoptedFile>,
+    /// P1j — adopt offers waiting for the server's word, by offer id.
+    adopt_offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<adopt::OfferAnswer>>>,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
@@ -394,7 +401,48 @@ pub fn init(cfg: &AgentConfig) {
         store,
         hosted,
     );
-    let _ = SUPERVISOR.set(Arc::new(sup));
+    let sup = Arc::new(sup);
+    let _ = SUPERVISOR.set(Arc::clone(&sup));
+    // P1j — the adopt socket, only while the device's owner allows it.
+    if sup.cfg.adopt {
+        tokio::spawn(async move {
+            if let Err(e) = sup.adopt_listen().await {
+                warn!(%e, "hive: the adopt socket could not be opened — nothing is adopted");
+            }
+        });
+    }
+}
+
+/// FR-90 P1j — `rc:hive.adopt_ack`: the server's word on an offer. The
+/// primary enrollment's only, like every Hive frame.
+pub fn handle_adopt_ack(
+    adopt_id: &str,
+    session_id: Option<ObjectId>,
+    fence: Option<u64>,
+    refused: Option<roomler_ai_remote_control::hive::HiveAdoptRefusal>,
+    is_primary: bool,
+) {
+    if !is_primary {
+        warn!(
+            adopt_id,
+            "hive: rc:hive.adopt_ack ignored — not the primary enrollment"
+        );
+        return;
+    }
+    let answer = match (refused, session_id) {
+        (None, Some(sid)) => Ok((sid, fence.unwrap_or(1))),
+        (Some(word), _) => Err(word),
+        (None, None) => Err(roomler_ai_remote_control::hive::HiveAdoptRefusal::Other),
+    };
+    if let Some(sup) = global() {
+        sup.adopt_answered(adopt_id, answer);
+    }
+}
+
+/// FR-90 P1j — whether this device's owner allows adopting terminal
+/// sessions: what decides whether it advertises `hive-adopt`.
+pub fn adopt_enabled() -> bool {
+    global().is_some_and(|s| s.cfg.adopt)
 }
 
 /// FR-90 P0f — an integration test's supervisor: sessions launch as the
@@ -511,6 +559,7 @@ impl Supervisor {
         hosted: Hosted,
     ) -> Self {
         let to_resume = hosted.sessions().to_vec();
+        let adopted = adopt::AdoptedFile::load(adopt::adopted_path(hosted.path()), hosted.agent());
         Self {
             cfg,
             runtime,
@@ -538,6 +587,8 @@ impl Supervisor {
             resumed: tokio::sync::OnceCell::new(),
             going_down: AtomicBool::new(false),
             memory: Mutex::new(HashMap::new()),
+            adopted: Mutex::new(adopted),
+            adopt_offers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -845,6 +896,10 @@ impl Supervisor {
     }
 
     pub(crate) fn stop(&self, session: ObjectId, fence: u64, reason: String) {
+        // P1j — an adopted session is stopped by no longer mirroring it.
+        if self.adopt_stop(session, fence) {
+            return;
+        }
         let input = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             match live.get(&session) {
@@ -972,7 +1027,8 @@ impl Supervisor {
 
     /// The sessions this device runs now, as the manifest names them.
     fn manifest(&self) -> Vec<HiveManifestEntry> {
-        self.live
+        let mut m: Vec<HiveManifestEntry> = self
+            .live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -980,7 +1036,15 @@ impl Supervisor {
                 session_id: *session_id,
                 fence: l.fence,
             })
-            .collect()
+            .collect();
+        // P1j — and the terminal sessions it mirrors: the server ends what
+        // the list leaves out.
+        m.extend(
+            self.adopt_manifest()
+                .into_iter()
+                .map(|(session_id, fence)| HiveManifestEntry { session_id, fence }),
+        );
+        m
     }
 
     /// P1d-2 — resume what the previous daemon hosted: once, at the first
@@ -2769,6 +2833,7 @@ done
             api_workspace_id: None,
             update_wait: super::gates::DEFAULT_UPDATE_WAIT,
             core_memory: false,
+            adopt: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
