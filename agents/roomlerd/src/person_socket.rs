@@ -32,9 +32,25 @@ use tokio::sync::watch;
 use tunnel_core::localapi::{self, LocalApiState};
 
 /// How often the seat is looked at. A consent prompt stays up for 30 s or
-/// more, so following a user switch within a few seconds is plenty, and each
-/// look is a couple of `loginctl` calls.
-const POLL: Duration = Duration::from_secs(4);
+/// more, so following a user switch within a few seconds is plenty. A look is
+/// a couple of `loginctl` calls, and none at all where nobody but root is
+/// logged in ([`any_user_runtime_dir`]).
+const POLL: Duration = Duration::from_secs(5);
+
+/// Is any NON-root user logged in? logind gives every logged-in user a
+/// `/run/user/<uid>`, so its absence is a free answer of "nobody to serve".
+pub fn any_user_runtime_dir(root: &std::path::Path) -> bool {
+    std::fs::read_dir(root)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|uid| uid != 0)
+            })
+        })
+        .unwrap_or(false)
+}
 
 /// After a listener could not be served (no runtime dir yet, or a per-user
 /// daemon owns the path), the same person is retried this long after, rather
@@ -117,6 +133,12 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
             failed = Some((l.uid, Instant::now()));
         }
         let at_seat = tokio::task::spawn_blocking(|| {
+            // This runs on EVERY Linux root daemon, servers and cluster nodes
+            // included. Where no non-root user is logged in at all there is
+            // nobody to serve, and no `loginctl` to spawn.
+            if !any_user_runtime_dir(std::path::Path::new("/run/user")) {
+                return None;
+            }
             crate::companion::graphical_session_matching(None, true)
                 .ok()
                 .map(|s| s.uid)
@@ -136,16 +158,19 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
                 }
             }
             Step::Start(uid) | Step::Move(uid) => {
+                // The previous person's socket goes at once, whatever happens
+                // to the new one: a person switched away must not keep it
+                // while the new one waits out a retry.
+                if let Some(l) = current.take() {
+                    tracing::info!(
+                        from = l.uid,
+                        to = uid,
+                        "person socket: the person at the seat changed"
+                    );
+                    l.stop().await;
+                }
                 let too_soon = failed.is_some_and(|(u, at)| u == uid && at.elapsed() < RETRY_AFTER);
                 if !too_soon {
-                    if let Some(l) = current.take() {
-                        tracing::info!(
-                            from = l.uid,
-                            to = uid,
-                            "person socket: the person at the seat changed"
-                        );
-                        l.stop().await;
-                    }
                     current = Some(Listener::start(uid, state.clone()));
                     failed = None;
                 }
@@ -177,6 +202,24 @@ mod tests {
         for off in ["0", "false", "OFF", " no "] {
             assert!(!enabled_by_env(Some(off)), "{off:?} turns it off");
         }
+    }
+
+    /// Only a NON-root uid's runtime dir means someone could be at the seat;
+    /// an unreadable root means nobody (and no `loginctl`).
+    #[test]
+    fn only_a_non_root_runtime_dir_counts_as_someone_logged_in() {
+        let base = std::env::temp_dir().join(format!("roomler-p11-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("0")).unwrap();
+        std::fs::create_dir_all(base.join("not-a-uid")).unwrap();
+        assert!(
+            !any_user_runtime_dir(&base),
+            "root alone is nobody to serve"
+        );
+        std::fs::create_dir_all(base.join("1000")).unwrap();
+        assert!(any_user_runtime_dir(&base));
+        assert!(!any_user_runtime_dir(&base.join("missing")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The listener follows the person at the seat; root and nobody get none.
