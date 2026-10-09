@@ -1198,4 +1198,97 @@ mod tests {
             Some(refusal::BAD_REQUEST)
         );
     }
+
+    /// P1j-3 — the hook client (`roomler hive hook`) and the daemon speak the
+    /// same protocol: the real client mirrors a real transcript file through
+    /// the real socket, a `Stop` ends the turn, and the next run sends only
+    /// what is new.
+    #[tokio::test]
+    async fn the_hook_client_and_the_daemon_speak_the_same_protocol() {
+        use std::io::Write as _;
+        if me().is_none() {
+            return;
+        }
+        let (mut r, socket) = adopting(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{USER_PROMPT}\n{ASSISTANT_TOOL}\n{TOOL_RESULT}\n{ASSISTANT_TEXT}\n"),
+        )
+        .unwrap();
+        let input = |event| roomler_cli::hive_hooks::HookInput {
+            session_id: UUID.into(),
+            transcript_path: transcript.to_string_lossy().into_owned(),
+            cwd: "/home/me/work".into(),
+            event,
+            reason: None,
+        };
+
+        let (sock, first) = (socket.clone(), input(HookEvent::Stop));
+        let run =
+            tokio::spawn(async move { roomler_cli::hive_hooks::mirror_at(&sock, &first).await });
+        let adopt_id = next_report(&mut r, |m| match m {
+            ClientMsg::HiveAdopt { adopt_id, .. } => Some(adopt_id.clone()),
+            _ => None,
+        })
+        .await;
+        let sid = ObjectId::new();
+        r.sup.adopt_answered(&adopt_id, Ok((sid, 1)));
+        run.await.unwrap().expect("the hook ran clean");
+        assert_eq!(r.store.events(&sid.to_hex()).len(), 4);
+        let steps = next_report(&mut r, |m| match m {
+            ClientMsg::HiveTurn {
+                session_id,
+                turn: 1,
+                status: Some(HiveTurnStatus::Ok),
+                steps,
+                ..
+            } if *session_id == sid => Some(*steps),
+            _ => None,
+        })
+        .await;
+        assert_eq!(steps, 1);
+
+        // The next turn's hook sends only the new lines.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(format!("{USER_PROMPT}\n{ASSISTANT_TEXT}\n").as_bytes())
+            .unwrap();
+        roomler_cli::hive_hooks::mirror_at(&socket, &input(HookEvent::Stop))
+            .await
+            .expect("the second run");
+        assert_eq!(
+            r.store.events(&sid.to_hex()).len(),
+            6,
+            "two new events, none twice"
+        );
+        next_report(&mut r, |m| match m {
+            ClientMsg::HiveTurn {
+                session_id,
+                turn: 2,
+                status: Some(HiveTurnStatus::Ok),
+                ..
+            } if *session_id == sid => Some(()),
+            _ => None,
+        })
+        .await;
+
+        // SessionEnd: ended, and forgotten.
+        roomler_cli::hive_hooks::mirror_at(&socket, &input(HookEvent::SessionEnd))
+            .await
+            .expect("the last run");
+        next_report(&mut r, |m| match m {
+            ClientMsg::HiveState {
+                session_id,
+                state: Some(HiveRunState::Ended),
+                ..
+            } if *session_id == sid => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(!r.sup.adopt_holds(sid));
+    }
 }
