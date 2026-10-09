@@ -462,10 +462,22 @@ On macOS and Linux the companion IS the "Being viewed by …" indicator (Windows
 in the daemon, `indicator/win.rs`). P9 gives it the Windows badge's manners:
 
 ⚠️ **Only where the companion can reach its daemon.** On a Linux **system** install the
-daemon's LocalAPI is root-only (`/var/run/roomler`, 0700, and the socket 0600). The companion
-runs as the desktop user and reads "Service offline". There is then no banner and no
-Disconnect, and on Wayland no companion consent prompt either (measured 2026-10-09; #1911).
-A per-user install, and a supervised Mac through its worker (FR-43), do not have this problem.
+daemon's own LocalAPI is root-only (`/var/run/roomler`, 0700, and the socket 0600), and the
+companion runs as the desktop user. Until FR-27 P11 it read "Service offline". There was no
+banner, no Disconnect, and on Wayland no companion consent prompt (measured 2026-10-09;
+#1911).
+
+**P11 fixes it** without widening that ACL. The root daemon also serves a **person socket**
+at the person's own `/run/user/<uid>/roomler.sock`, which is the path the companion already
+tries first:
+- it is theirs, mode 0600, and only they or root may connect (`SO_PEERCRED`);
+- it follows the active graphical session's user;
+- it serves only the safety surface: status, the sessions viewing the screen, their
+  Disconnect, consent, and the recording state.
+
+Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
+views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
+A per-user install, and a supervised Mac through its worker (FR-43), never had this problem.
 
 | | Behaviour | Where |
 |---|---|---|
