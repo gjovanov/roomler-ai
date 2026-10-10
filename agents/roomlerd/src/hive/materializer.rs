@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P2b-4a — `roomlerd hive-materialize`: a checkpoint put back into a
-//! session's config directory AS THE TARGET'S ACCOUNT, from what the daemon
-//! streams to its stdin.
+//! FR-90 P2b-4 — `roomlerd hive-materialize`: a checkpoint put back into a
+//! session's config directory (P2b-4a) and its folder (P2b-4b) AS THE TARGET'S
+//! ACCOUNT, from what the daemon streams to its stdin.
 //!
 //! The reverse of `hive-checkpoint` (P2b-3a), for the same reason: the daemon
 //! never writes a path in an account's tree (spec §3b). It starts `roomlerd
-//! hive-materialize` as the account and streams it the files of the
-//! checkpoint it materializes:
+//! hive-materialize` as the account and streams it the checkpoint it
+//! materializes:
 //!
 //! ```text
 //! "HIVEMZ1\n"                        the magic
-//! u32 le · JSON {"target": …}        where to, and every file's entry
+//! u32 le · JSON {"target": …}        where to, every file's entry, the workspace's
 //! ( u64 le · bytes ) × files         each file whole, in the entries' order
+//! ( u64 le · bytes ) × packs         the workspace's packs, oldest first
 //! ```
 //!
-//! The daemon reads each file out of the chain chunk by chunk ([`plan`],
-//! `checkpoint::chunks_of`), never holding a history whole, and the child
-//! answers with one line on stdout, `{"files":N,"removed":M}`.
+//! The daemon reads each file and pack out of the chain chunk by chunk
+//! ([`plan`], `checkpoint::chunks_of`), never holding a history whole, and the
+//! child answers with one line on stdout, `{"files":N,"removed":M,…}`. The
+//! folder goes through the account's own git ([`workspace`]): its packs into
+//! the folder's repository, then git's own two-tree switch.
 //!
 //! ⚠️ **What comes in is another device's word.** A checkpoint was taken by
 //! whichever member was primary, and this daemon only relays it. So the child
@@ -39,10 +42,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use roomler_hive_node::checkpoint::{self, Checkpoint, Chunk, Digest, MAX_DEPTH, MAX_FILES};
+use roomler_hive_node::checkpoint::{
+    self, Checkpoint, Chunk, Digest, MAX_DEPTH, MAX_FILES, RepoKind, WorkspaceSnap,
+};
 use serde::{Deserialize, Serialize};
 
 use super::checkpointer::{Runner, allowed};
+use super::workspace::{self, Git};
 
 /// The hidden subcommand: `roomlerd hive-materialize`, fed on its stdin.
 pub const MATERIALIZE_SUBCOMMAND: &str = "hive-materialize";
@@ -78,6 +84,29 @@ pub(crate) struct Target {
     /// Every file of the checkpoint, in path order; each arrives whole, in
     /// this order.
     pub files: Vec<Entry>,
+    /// P2b-4b — the session's folder, when the last checkpoint took one: its
+    /// packs arrive after the files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Workspace>,
+}
+
+/// Where the session's folder is materialized, and what goes in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Workspace {
+    /// The Hive session id (24 hex): the temporary index's and the ref's
+    /// names.
+    pub sid: String,
+    /// The session's folder on this device.
+    pub folder: PathBuf,
+    /// The session's state directory on this device: a shadow repository's
+    /// home.
+    pub state_dir: PathBuf,
+    /// The last checkpoint's tree and commit.
+    pub tree: String,
+    pub commit: String,
+    /// Each pack's length, in the order they arrive: from the last whole pack
+    /// on, each thin against the one before.
+    pub packs: Vec<u64>,
 }
 
 /// One file as the checkpoint has it.
@@ -89,12 +118,33 @@ pub(crate) struct Entry {
     pub hash: Digest,
 }
 
-/// What a materialize did: the files it put in place, and the ones the
-/// checkpoint no longer lists that it removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a materialize did: the files it put in place, the ones the
+/// checkpoint no longer lists that it removed, and the folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Done {
     pub files: usize,
     pub removed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Placed>,
+}
+
+/// The folder a materialize moved (P2b-4b): its repository's kind, and the
+/// tree it was held to afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Placed {
+    pub repo: RepoKind,
+    pub tree: String,
+}
+
+/// Where on this device a session's checkpoint goes.
+pub(crate) struct Dest {
+    /// The Hive session id.
+    pub sid: String,
+    /// The harness's session id (a UUID).
+    pub harness_session: String,
+    pub config_dir: PathBuf,
+    pub folder: PathBuf,
+    pub state_dir: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,20 +178,23 @@ impl Os {
 
 // ─── the daemon's side ──────────────────────────────────────────────────────
 
-/// The target for materializing the last of `chain` (oldest first) into
-/// `config_dir`, and the chunks that make each of its files.
-pub(crate) fn plan(
-    chain: &[Checkpoint],
-    harness_session: &str,
-    config_dir: &Path,
-) -> Result<(Target, Vec<Vec<Chunk>>), String> {
+/// What is streamed after the header: each file's chunks, then each pack's,
+/// in the order the header names them.
+pub(crate) struct Planned {
+    pub files: Vec<Vec<Chunk>>,
+    pub packs: Vec<Vec<Chunk>>,
+}
+
+/// The target for materializing the last of `chain` (oldest first) at
+/// `dest`, and the chunks that make each of its files and packs.
+pub(crate) fn plan(chain: &[Checkpoint], dest: &Dest) -> Result<(Target, Planned), String> {
     let last = chain.last().ok_or("no checkpoint to materialize")?;
     if last.files.len() > MAX_FILES {
         return Err(format!("{} files", last.files.len()));
     }
-    let allow = checkpoint::allowlist(harness_session).map_err(|e| e.to_string())?;
+    let allow = checkpoint::allowlist(&dest.harness_session).map_err(|e| e.to_string())?;
     let mut files = Vec::with_capacity(last.files.len());
-    let mut chunks = Vec::with_capacity(last.files.len());
+    let mut file_chunks = Vec::with_capacity(last.files.len());
     for f in &last.files {
         if !allowed(&f.path, &allow) {
             return Err(format!("{} is not in the allowlist", f.path));
@@ -152,17 +205,82 @@ pub(crate) fn plan(
             len: entry.len,
             hash: entry.hash,
         });
-        chunks.push(cs);
+        file_chunks.push(cs);
     }
+    let (workspace, packs) = match &last.workspace {
+        None => (None, Vec::new()),
+        Some(ws) => {
+            let packs = packs_of(chain, ws)?;
+            let lens = packs
+                .iter()
+                .map(|p| p.iter().map(|c| c.len).sum())
+                .collect();
+            let target = Workspace {
+                sid: dest.sid.clone(),
+                folder: dest.folder.clone(),
+                state_dir: dest.state_dir.clone(),
+                tree: ws.tree.clone(),
+                commit: ws.commit.clone(),
+                packs: lens,
+            };
+            (Some(target), packs)
+        }
+    };
     Ok((
         Target {
             v: TARGET_V,
-            harness_session: harness_session.to_string(),
-            config_dir: config_dir.to_path_buf(),
+            harness_session: dest.harness_session.clone(),
+            config_dir: dest.config_dir.clone(),
             files,
+            workspace,
         },
-        chunks,
+        Planned {
+            files: file_chunks,
+            packs,
+        },
     ))
+}
+
+/// The packs that bring `last`'s commit, oldest first: back from it along
+/// each `base` to a whole pack (one with no base), past the turns that
+/// changed nothing (an empty pack, the same commit). Each pack's chunks must
+/// follow one another from offset 0.
+fn packs_of(chain: &[Checkpoint], last: &WorkspaceSnap) -> Result<Vec<Vec<Chunk>>, String> {
+    let mut need = last.commit.as_str();
+    let mut packs = Vec::new();
+    for cp in chain.iter().rev() {
+        let Some(ws) = cp.workspace.as_ref() else {
+            break;
+        };
+        if ws.commit != need {
+            return Err(format!(
+                "checkpoint {}'s workspace is {}, where {need} was to come before",
+                cp.n, ws.commit
+            ));
+        }
+        if ws.pack.is_empty() {
+            continue;
+        }
+        let mut offset = 0u64;
+        for chunk in &ws.pack {
+            if chunk.offset != offset {
+                return Err(format!("checkpoint {}'s pack has a gap", cp.n));
+            }
+            offset += chunk.len;
+        }
+        if offset > workspace::MAX_PACK as u64 {
+            return Err(format!("checkpoint {}'s pack is over its limit", cp.n));
+        }
+        packs.push(ws.pack.clone());
+        match ws.base.as_deref() {
+            Some(base) => need = base,
+            None => {
+                packs.reverse();
+                return Ok(packs);
+            }
+        }
+    }
+    Err("the chain does not reach a whole pack of the workspace".into())
 }
 
 /// Where the daemon reads the blobs: the session's store; a map in tests.
@@ -232,7 +350,7 @@ pub(crate) enum Stop {
 pub(crate) async fn write_frames(
     out: &mut impl Sink,
     target: &Target,
-    chunks: &[Vec<Chunk>],
+    planned: &Planned,
     blobs: &Blobs<'_>,
 ) -> Result<(), Stop> {
     let header = serde_json::to_vec(&Header {
@@ -245,24 +363,36 @@ pub(crate) async fn write_frames(
     out.put(MAGIC).await.map_err(pipe)?;
     out.put(&header_len.to_le_bytes()).await.map_err(pipe)?;
     out.put(&header).await.map_err(pipe)?;
-    for (entry, chunks) in target.files.iter().zip(chunks) {
+    for (entry, chunks) in target.files.iter().zip(&planned.files) {
         out.put(&entry.len.to_le_bytes()).await.map_err(pipe)?;
-        for chunk in chunks {
-            let data = blobs.get(&chunk.hash).await.map_err(Stop::Source)?;
-            let data = data.ok_or_else(|| {
-                Stop::Source(format!(
-                    "{}: the blob {} is missing",
-                    entry.path, chunk.hash
-                ))
-            })?;
-            if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
-                return Err(Stop::Source(format!(
-                    "{}: the blob {} is not what was named",
-                    entry.path, chunk.hash
-                )));
-            }
-            out.put(&data).await.map_err(pipe)?;
+        put_chunks(out, &entry.path, chunks, blobs).await?;
+    }
+    let lens = target.workspace.as_ref().map_or(&[][..], |w| &w.packs[..]);
+    for (i, (len, chunks)) in lens.iter().zip(&planned.packs).enumerate() {
+        out.put(&len.to_le_bytes()).await.map_err(pipe)?;
+        put_chunks(out, &format!("the workspace's pack {i}"), chunks, blobs).await?;
+    }
+    Ok(())
+}
+
+/// The bytes `chunks` name, blob by blob, each held to its chunk.
+async fn put_chunks(
+    out: &mut impl Sink,
+    what: &str,
+    chunks: &[Chunk],
+    blobs: &Blobs<'_>,
+) -> Result<(), Stop> {
+    for chunk in chunks {
+        let data = blobs.get(&chunk.hash).await.map_err(Stop::Source)?;
+        let data = data
+            .ok_or_else(|| Stop::Source(format!("{what}: the blob {} is missing", chunk.hash)))?;
+        if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
+            return Err(Stop::Source(format!(
+                "{what}: the blob {} is not what was named",
+                chunk.hash
+            )));
         }
+        out.put(&data).await.map_err(|_| Stop::Pipe)?;
     }
     Ok(())
 }
@@ -276,18 +406,17 @@ pub(crate) struct Who {
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
-/// Materialize the last of `chain` (oldest first) into `config_dir`, the
-/// session's config directory on this device, as `who`: the target's half of
-/// a promotion (P2e) and of a teleport (P2f).
+/// Materialize the last of `chain` (oldest first) at `dest`, the session's
+/// place on this device, as `who`: the target's half of a promotion (P2e) and
+/// of a teleport (P2f).
 pub(crate) async fn materialize(
     run: &Runner,
     who: &Who,
     chain: &[Checkpoint],
-    harness_session: &str,
-    config_dir: &Path,
+    dest: &Dest,
     blobs: &Blobs<'_>,
 ) -> Result<Done, String> {
-    let (target, chunks) = plan(chain, harness_session, config_dir)?;
+    let (target, planned) = plan(chain, dest)?;
     match run {
         Runner::Subprocess => {
             let exe = PathBuf::from(super::supervisor::own_exe()?);
@@ -298,7 +427,7 @@ pub(crate) async fn materialize(
                     who.account.as_deref(),
                     who.env.clone(),
                     &target,
-                    &chunks,
+                    &planned,
                     blobs,
                     MATERIALIZE_TIMEOUT,
                 )
@@ -307,20 +436,20 @@ pub(crate) async fn materialize(
             #[cfg(windows)]
             {
                 let account = who.account.clone().ok_or("no account to run as")?;
-                run_as_console_user(&exe, account, &target, &chunks, blobs, MATERIALIZE_TIMEOUT)
+                run_as_console_user(&exe, account, &target, &planned, blobs, MATERIALIZE_TIMEOUT)
                     .await
             }
         }
         #[cfg(all(test, unix))]
-        Runner::InProcess { .. } => {
+        Runner::InProcess { ceiling } => {
             let mut bytes = Vec::new();
-            write_frames(&mut bytes, &target, &chunks, blobs)
+            write_frames(&mut bytes, &target, &planned, blobs)
                 .await
                 .map_err(|s| match s {
                     Stop::Source(e) => e,
                     Stop::Pipe => "the frames could not be written".into(),
                 })?;
-            materialize_from(&mut bytes.as_slice(), Os::this())
+            materialize_from(&mut bytes.as_slice(), Os::this(), &Git::under(ceiling))
         }
         #[cfg(all(test, unix))]
         Runner::Failing(why) => Err((*why).to_string()),
@@ -344,7 +473,7 @@ pub(crate) async fn run_as(
     account: Option<&str>,
     env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     target: &Target,
-    chunks: &[Vec<Chunk>],
+    planned: &Planned,
     blobs: &Blobs<'_>,
     timeout: Duration,
 ) -> Result<Done, String> {
@@ -366,7 +495,7 @@ pub(crate) async fn run_as(
     }
     let feed = |mut stdin: tokio::process::ChildStdin| async move {
         // `stdin` is dropped at the end: the child's end of input.
-        match write_frames(&mut stdin, target, chunks, blobs).await {
+        match write_frames(&mut stdin, target, planned, blobs).await {
             Ok(()) => Fed::Done,
             Err(Stop::Pipe) => Fed::Closed,
             Err(Stop::Source(e)) => Fed::Failed(e),
@@ -384,7 +513,7 @@ pub(crate) async fn run_as_console_user(
     exe: &Path,
     account: String,
     target: &Target,
-    chunks: &[Vec<Chunk>],
+    planned: &Planned,
     blobs: &Blobs<'_>,
     timeout: Duration,
 ) -> Result<Done, String> {
@@ -409,7 +538,7 @@ pub(crate) async fn run_as_console_user(
         drop(console);
         out
     });
-    let fed = write_frames(&mut tx, target, chunks, blobs).await;
+    let fed = write_frames(&mut tx, target, planned, blobs).await;
     // The child's end of input.
     drop(tx);
     let out = child
@@ -439,7 +568,7 @@ pub fn materialize_args() -> bool {
 pub fn materialize_main() -> i32 {
     let stdin = std::io::stdin();
     let mut input = std::io::BufReader::new(stdin.lock());
-    let answer = materialize_from(&mut input, Os::this())
+    let answer = materialize_from(&mut input, Os::this(), &Git::on_path())
         .and_then(|done| serde_json::to_string(&done).map_err(|e| e.to_string()));
     match answer {
         Ok(line) => {
@@ -456,9 +585,13 @@ pub fn materialize_main() -> i32 {
 /// The child's work, as the account: read the frames from `r`; hold every
 /// name to the allowlist and to what `os` can hold, and every place to being
 /// a directory of its own, before writing anything; stage each file beside
-/// where it goes and hold it to its entry; and only then put them all in
-/// place and remove what the checkpoint no longer lists.
-pub(crate) fn materialize_from(r: &mut impl Read, os: Os) -> Result<Done, String> {
+/// where it goes and hold it to its entry. Then the workspace, through `git`:
+/// its packs into the folder's repository, the commit's tree held to the
+/// checkpoint's, the tree's names to what `os` can hold, and the folder to
+/// being one it is safe to replace. Only when every check is passed is the
+/// folder switched, the files put in place, and what the checkpoint no longer
+/// lists removed.
+pub(crate) fn materialize_from(r: &mut impl Read, os: Os, git: &Git) -> Result<Done, String> {
     let mut magic = [0u8; 8];
     if r.read_exact(&mut magic).is_err() || &magic != MAGIC {
         return Err("not a materialize stream (no magic)".into());
@@ -502,18 +635,70 @@ pub(crate) fn materialize_from(r: &mut impl Read, os: Os) -> Result<Done, String
             return Err(format!("{} is not the file its entry names", e.path));
         }
     }
+    let prepared = match &target.workspace {
+        None => None,
+        Some(ws) => Some(prepare(r, os, git, ws)?),
+    };
     let mut more = [0u8; 1];
     match r.read(&mut more) {
         Ok(0) => {}
-        Ok(_) => return Err("bytes after the last file".into()),
+        Ok(_) => return Err("bytes after the last frame".into()),
         Err(e) => return Err(format!("reading: {e}")),
     }
+    let placed = match (&target.workspace, &prepared) {
+        (Some(ws), Some((place, current))) => {
+            workspace::switch(git, place, &ws.sid, current, &ws.tree, &ws.commit)
+                .map_err(|e| format!("the workspace: {e}"))?;
+            Some(Placed {
+                repo: place.kind(),
+                tree: ws.tree.clone(),
+            })
+        }
+        _ => None,
+    };
     staged.place()?;
     let removed = remove_unlisted(&target)?;
     Ok(Done {
         files: target.files.len(),
         removed,
+        workspace: placed,
     })
+}
+
+/// The workspace, up to the switch: its packs into the folder's repository
+/// (git checks each object as it lands), the commit's tree held to the
+/// checkpoint's, every name in it to what `os` can hold, and the folder to
+/// being one it is safe to replace. The folder itself is not touched.
+fn prepare(
+    r: &mut impl Read,
+    os: Os,
+    git: &Git,
+    ws: &Workspace,
+) -> Result<(workspace::Place, workspace::Current), String> {
+    let at = |e: String| format!("the workspace: {e}");
+    let place = workspace::place_for(git, &ws.folder, &ws.state_dir).map_err(at)?;
+    for (i, &len) in ws.packs.iter().enumerate() {
+        let got = u64::from_le_bytes(read_array(r, "a pack's length")?);
+        if got != len {
+            return Err(format!(
+                "the workspace's pack {i} arrives as {got} bytes; the header says {len}"
+            ));
+        }
+        workspace::index_pack(git, &place, r, len).map_err(at)?;
+    }
+    let tree = workspace::tree_of(git, &place, &ws.commit).map_err(at)?;
+    if tree != ws.tree {
+        return Err(format!(
+            "the workspace: commit {} holds the tree {tree}, not the checkpoint's {}",
+            ws.commit, ws.tree
+        ));
+    }
+    let paths = workspace::tree_paths(git, &place, &ws.tree).map_err(at)?;
+    if let Some(why) = names_refusal(&ws.folder, paths.iter().map(String::as_str), os) {
+        return Err(at(why));
+    }
+    let current = workspace::judge(git, &place, &ws.sid, &ws.tree).map_err(at)?;
+    Ok((place, current))
 }
 
 fn read_array<const N: usize>(r: &mut impl Read, what: &str) -> Result<[u8; N], String> {
@@ -524,8 +709,8 @@ fn read_array<const N: usize>(r: &mut impl Read, what: &str) -> Result<[u8; N], 
 }
 
 /// Why `target` cannot be written on `os`, if it cannot: too many files, a
-/// name out of order or outside the allowlist, one Windows cannot hold, or
-/// (case-insensitive systems) two names that are one file there.
+/// name out of order or outside the allowlist, one this OS cannot hold
+/// ([`names_refusal`]), or a workspace that names something that is not git's.
 pub(crate) fn refusal(target: &Target, os: Os) -> Option<String> {
     let allow = match checkpoint::allowlist(&target.harness_session) {
         Ok(a) => a,
@@ -535,7 +720,6 @@ pub(crate) fn refusal(target: &Target, os: Os) -> Option<String> {
         return Some(format!("{} files", target.files.len()));
     }
     let mut last: Option<&str> = None;
-    let mut folded = HashSet::new();
     for e in &target.files {
         if last.is_some_and(|p| p >= e.path.as_str()) {
             return Some(format!("{} is out of order", e.path));
@@ -544,26 +728,75 @@ pub(crate) fn refusal(target: &Target, os: Os) -> Option<String> {
         if !allowed(&e.path, &allow) {
             return Some(format!("{} is not in the allowlist", e.path));
         }
+    }
+    if let Some(why) = names_refusal(
+        &target.config_dir,
+        target.files.iter().map(|e| e.path.as_str()),
+        os,
+    ) {
+        return Some(why);
+    }
+    if let Some(ws) = &target.workspace {
+        let sid_ok = ws.sid.len() == 24
+            && ws
+                .sid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let is_id = |s: &str| {
+            (s.len() == 40 || s.len() == 64)
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !sid_ok || !is_id(&ws.tree) || !is_id(&ws.commit) {
+            return Some("the workspace names something that is not git's".into());
+        }
+        if ws.packs.iter().any(|&l| l > workspace::MAX_PACK as u64) {
+            return Some("a workspace pack is over its limit".into());
+        }
+    }
+    None
+}
+
+/// Why `paths` (`/`-separated, under `base`) cannot all be held on `os`, if
+/// they cannot. On Windows: a name it refuses ([`windows_name`]), or a path
+/// past its length where it goes. On Windows and macOS: two names that are
+/// one there, files or the directories on their way (`Dir/a` beside `dir/b`
+/// is one directory).
+fn names_refusal<'a>(
+    base: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+    os: Os,
+) -> Option<String> {
+    let mut folded: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for p in paths {
         if os == Os::Windows {
-            if let Some(why) = e.path.split('/').find_map(windows_name) {
-                return Some(format!("{}: {why}", e.path));
+            if let Some(why) = p.split('/').find_map(windows_name) {
+                return Some(format!("{p}: {why}"));
             }
-            let n = place_of(&target.config_dir, &e.path)
-                .to_string_lossy()
-                .encode_utf16()
-                .count();
+            let n = place_of(base, p).to_string_lossy().encode_utf16().count();
             if n > WINDOWS_MAX_PATH {
                 return Some(format!(
-                    "{}: {n} characters where it goes, past Windows' {WINDOWS_MAX_PATH}",
-                    e.path
+                    "{p}: {n} characters where it goes, past Windows' {WINDOWS_MAX_PATH}"
                 ));
             }
         }
-        if os != Os::Linux && !folded.insert(e.path.to_lowercase()) {
-            return Some(format!(
-                "{}: another file's name differs from it only in case",
-                e.path
-            ));
+        if os != Os::Linux {
+            // Every prefix of the path, each directory on its way and itself.
+            let ends = p.match_indices('/').map(|(i, _)| i).chain([p.len()]);
+            for end in ends {
+                let prefix = &p[..end];
+                match folded.get(&prefix.to_lowercase()) {
+                    Some(seen) if *seen != prefix => {
+                        return Some(format!(
+                            "{p}: {prefix} and {seen} differ only in case, and are one here"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        folded.insert(prefix.to_lowercase(), prefix);
+                    }
+                }
+            }
         }
     }
     None
@@ -808,6 +1041,19 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     const HID: &str = "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9";
+    const SID: &str = "6aca8ef5dac84dd57e492eb7";
+
+    /// The session's place beside `config`: its config directory, its folder
+    /// (`work`) and its state directory (`state`).
+    fn dest(config: &Path) -> Dest {
+        Dest {
+            sid: SID.into(),
+            harness_session: HID.into(),
+            config_dir: config.to_path_buf(),
+            folder: config.with_file_name("work"),
+            state_dir: config.with_file_name("state"),
+        }
+    }
 
     fn write(dir: &Path, rel: &str, bytes: &[u8]) {
         let p = place_of(dir, rel);
@@ -883,10 +1129,10 @@ mod tests {
         dir: &Path,
         blobs: &HashMap<Digest, Vec<u8>>,
     ) -> Vec<u8> {
-        let (target, chunks) = plan(chain, HID, dir).unwrap();
+        let (target, planned) = plan(chain, &dest(dir)).unwrap();
         let mut bytes = Vec::new();
         assert!(
-            write_frames(&mut bytes, &target, &chunks, &Blobs::Map(blobs))
+            write_frames(&mut bytes, &target, &planned, &Blobs::Map(blobs))
                 .await
                 .is_ok()
         );
@@ -902,12 +1148,13 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let config = dst.path().join("claude");
         let bytes = frames_of(&chain, &config, &blobs).await;
-        let done = materialize_from(&mut bytes.as_slice(), Os::this()).unwrap();
+        let done = materialize_from(&mut bytes.as_slice(), Os::this(), &Git::on_path()).unwrap();
         assert_eq!(
             done,
             Done {
                 files: 3,
-                removed: 0
+                removed: 0,
+                workspace: None
             }
         );
         assert_eq!(files_under(&config), files_under(src.path()));
@@ -949,12 +1196,13 @@ mod tests {
             write(&config, k, b"not the checkpoint's\n");
         }
         let bytes = frames_of(&chain, &config, &blobs).await;
-        let done = materialize_from(&mut bytes.as_slice(), Os::this()).unwrap();
+        let done = materialize_from(&mut bytes.as_slice(), Os::this(), &Git::on_path()).unwrap();
         assert_eq!(
             done,
             Done {
                 files: 3,
-                removed: 3
+                removed: 3,
+                workspace: None
             }
         );
         let now = files_under(&config);
@@ -981,7 +1229,7 @@ mod tests {
         let header_end = 12 + u32::from_le_bytes(good[8..12].try_into().unwrap()) as usize;
 
         let refused = |bytes: &[u8], needle: &str| {
-            let e = materialize_from(&mut &bytes[..], Os::this()).unwrap_err();
+            let e = materialize_from(&mut &bytes[..], Os::this(), &Git::on_path()).unwrap_err();
             assert!(e.contains(needle), "{needle:?} in {e:?}");
             assert_eq!(files_under(&config), BTreeMap::new(), "nothing written");
         };
@@ -992,11 +1240,11 @@ mod tests {
         refused(&good[..good.len() - 1], "ends inside it");
         let mut padded = good.clone();
         padded.push(0);
-        refused(&padded, "bytes after the last file");
+        refused(&padded, "bytes after the last frame");
         refused(b"HIVEMZ2\n", "no magic");
         refused(&good[..header_end - 1], "inside the header");
 
-        let (mut target, _) = plan(&chain, HID, &config).unwrap();
+        let (mut target, _) = plan(&chain, &dest(&config)).unwrap();
         let reheader = |t: &Target| {
             let h = serde_json::to_vec(&Header { target: t.clone() }).unwrap();
             let mut b = MAGIC.to_vec();
@@ -1062,6 +1310,7 @@ mod tests {
                     hash: Digest::of(b""),
                 })
                 .collect(),
+            workspace: None,
         };
         let device = target(&[memory("aux.md")]);
         assert!(refusal(&device, Os::Linux).is_none());
@@ -1084,6 +1333,147 @@ mod tests {
         }
     }
 
+    /// A session whose checkpoints took its folder too (a shadow): two turns of
+    /// the config directory and the folder, by `hive-checkpoint`'s own
+    /// `produce`. Their blobs, by hash.
+    fn two_turns_with_a_folder(root: &Path) -> (Vec<Checkpoint>, HashMap<Digest, Vec<u8>>) {
+        use super::super::checkpointer::{REQUEST_V, Request, produce};
+        let git = Git::under(root);
+        let req = |n: u64, previous: Option<Checkpoint>| Request {
+            v: REQUEST_V,
+            sid: SID.into(),
+            harness_session: HID.into(),
+            config_dir: root.join("claude"),
+            folder: root.join("work"),
+            state_dir: root.join("state"),
+            n,
+            turn: n as u32,
+            previous,
+        };
+        write(&root.join("claude"), &history(), b"{\"t\":1}\n");
+        write(&root.join("work"), "main.rs", b"fn main() {}\n");
+        let (one, b1) = produce(&req(1, None), &git).unwrap();
+        write(&root.join("claude"), &history(), b"{\"t\":1}\n{\"t\":2}\n");
+        write(&root.join("work"), "src/lib.rs", b"pub fn f() {}\n");
+        let (two, b2) = produce(&req(2, Some(one.clone())), &git).unwrap();
+        let blobs = b1
+            .into_iter()
+            .chain(b2)
+            .map(|b| (Digest::of(&b), b))
+            .collect();
+        (vec![one, two], blobs)
+    }
+
+    /// [`files_under`], lines compared as LF on Windows: a move keeps git's
+    /// tree, not the bytes, and a Windows checkout ends its lines as its git
+    /// is configured to (design §6.3).
+    fn lines_under(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        files_under(dir)
+            .into_iter()
+            .map(|(k, v)| {
+                let v = if cfg!(windows) {
+                    String::from_utf8_lossy(&v)
+                        .replace("\r\n", "\n")
+                        .into_bytes()
+                } else {
+                    v
+                };
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// P2b-4b — a checkpoint that took the folder too materializes it, end to
+    /// end through the frames: the config directory and the folder both, and
+    /// the answer names the folder's repository and the tree it was held to.
+    #[tokio::test]
+    async fn a_checkpoint_with_its_folder_materializes_both() {
+        let src = tempfile::tempdir().unwrap();
+        let (chain, blobs) = two_turns_with_a_folder(src.path());
+        let Some(ws) = chain[1].workspace.clone() else {
+            return eprintln!("no git here");
+        };
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        let bytes = frames_of(&chain, &config, &blobs).await;
+        let done =
+            materialize_from(&mut bytes.as_slice(), Os::this(), &Git::under(dst.path())).unwrap();
+        assert_eq!(
+            done.workspace,
+            Some(Placed {
+                repo: RepoKind::Shadow,
+                tree: ws.tree.clone()
+            })
+        );
+        assert_eq!(
+            files_under(&config),
+            files_under(&src.path().join("claude"))
+        );
+        assert_eq!(
+            lines_under(&dst.path().join("work")),
+            lines_under(&src.path().join("work"))
+        );
+    }
+
+    /// P2b-4b — a workspace whose commit does not hold the tree it claims is
+    /// refused before the folder is touched, and no config file lands either.
+    #[tokio::test]
+    async fn a_workspace_that_is_not_what_it_claims_writes_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        let (chain, blobs) = two_turns_with_a_folder(src.path());
+        let Some(first) = chain[0].workspace.clone() else {
+            return eprintln!("no git here");
+        };
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        let (mut target, planned) = plan(&chain, &dest(&config)).unwrap();
+        // A real tree, the first turn's, but not the commit's.
+        target.workspace.as_mut().unwrap().tree = first.tree;
+        let mut bytes = Vec::new();
+        assert!(
+            write_frames(&mut bytes, &target, &planned, &Blobs::Map(&blobs))
+                .await
+                .is_ok()
+        );
+        let e = materialize_from(&mut bytes.as_slice(), Os::this(), &Git::under(dst.path()))
+            .unwrap_err();
+        assert!(e.contains("not the checkpoint's"), "{e}");
+        assert!(!dst.path().join("work").exists(), "the folder is untouched");
+        assert_eq!(
+            files_under(&config),
+            BTreeMap::new(),
+            "no config file landed"
+        );
+    }
+
+    /// P2b-4b — for a Windows target, a name in the folder's tree that Windows
+    /// cannot hold is refused before the folder is touched. (The source is
+    /// Unix: on Windows, writing `aux.md` opens the AUX device instead.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_windows_target_refuses_a_name_in_the_folder_it_cannot_hold() {
+        let src = tempfile::tempdir().unwrap();
+        write(
+            &src.path().join("work"),
+            "notes/aux.md",
+            b"a device, on Windows\n",
+        );
+        let (chain, blobs) = two_turns_with_a_folder(src.path());
+        if chain[1].workspace.is_none() {
+            return eprintln!("no git here");
+        }
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        let bytes = frames_of(&chain, &config, &blobs).await;
+        let e = materialize_from(&mut bytes.as_slice(), Os::Windows, &Git::under(dst.path()))
+            .unwrap_err();
+        assert!(
+            e.contains("notes/aux.md") && e.contains("keeps for a device"),
+            "{e}"
+        );
+        assert!(!dst.path().join("work").exists(), "the folder is untouched");
+    }
+
     /// A link in the target's allowlisted directories is never written
     /// through, and what it points at is left as it was.
     #[cfg(unix)]
@@ -1102,7 +1492,7 @@ mod tests {
         )
         .unwrap();
         let bytes = frames_of(&chain, &config, &blobs).await;
-        let e = materialize_from(&mut bytes.as_slice(), Os::this()).unwrap_err();
+        let e = materialize_from(&mut bytes.as_slice(), Os::this(), &Git::on_path()).unwrap_err();
         assert!(e.contains("not a directory of its own"), "{e}");
         assert_eq!(files_under(&elsewhere), BTreeMap::new());
         assert!(!place_of(&config, &history()).exists(), "nothing written");
@@ -1136,13 +1526,13 @@ mod tests {
                 got.display()
             ),
         );
-        let (target, chunks) = plan(&chain, HID, &config).unwrap();
+        let (target, planned) = plan(&chain, &dest(&config)).unwrap();
         let done = run_as(
             &cat,
             None,
             path.clone(),
             &target,
-            &chunks,
+            &planned,
             &Blobs::Map(&blobs),
             fast,
         )
@@ -1152,7 +1542,8 @@ mod tests {
             done,
             Done {
                 files: 3,
-                removed: 0
+                removed: 0,
+                workspace: None
             }
         );
         assert_eq!(
@@ -1171,14 +1562,14 @@ mod tests {
             blobs.insert(Digest::of(&blob), blob);
         }
         chain.push(cp);
-        let (target, chunks) = plan(&chain, HID, &config).unwrap();
+        let (target, planned) = plan(&chain, &dest(&config)).unwrap();
         let refuses = child("refuses.sh", "echo 'the folder is not allowed' >&2; exit 1");
         let e = run_as(
             &refuses,
             None,
             path.clone(),
             &target,
-            &chunks,
+            &planned,
             &Blobs::Map(&blobs),
             fast,
         )
@@ -1192,7 +1583,7 @@ mod tests {
             None,
             path,
             &target,
-            &chunks,
+            &planned,
             &Blobs::Map(&lacking),
             fast,
         )

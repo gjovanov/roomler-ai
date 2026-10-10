@@ -265,7 +265,7 @@ cannot yet say it; whether it should is FR-45's open AC8.
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`main.rs:4759`): `capture-smoke: portal=<status>
+line an operator can act on (`main.rs:4764`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
