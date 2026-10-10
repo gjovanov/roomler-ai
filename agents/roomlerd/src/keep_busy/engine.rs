@@ -58,6 +58,15 @@ pub const CALIBRATION_LIMIT: u32 = 2;
 /// A `dt` larger than this (a stalled thread, a suspended laptop) is
 /// clamped, so the pointer never leaps along the curve.
 const MAX_STEP: Duration = Duration::from_millis(100);
+/// The least time between two of the engine's OWN moves. Each move must
+/// land on a different idle-clock reading, or `settle` cannot see it land:
+/// `GetLastInputInfo` advances with the system timer (10–16 ms), and the
+/// "seconds since" clocks carry a tolerance (`IdleMarker::tolerance`). Two
+/// moves inside one timer tick read as ONE event. Before this spacing the
+/// calibration's back leg followed the out leg by a few milliseconds, so it
+/// usually never registered and the engine called the host `not_landing`.
+/// Two 15.6 ms ticks, and above every host's tolerance.
+pub const MIN_MOVE_GAP: Duration = Duration::from_millis(32);
 /// While paused, a person who keeps working extends the pause. Republishing
 /// every extension would flood the viewers; this is the floor between them.
 const EXTENSION_REPUBLISH: Duration = Duration::from_secs(5);
@@ -289,6 +298,9 @@ pub trait Host {
     fn safe_box_at(&mut self, p: (i32, i32)) -> Option<Rect>;
     /// Bumped by the arbiter on every controller-caused injection.
     fn remote_epoch(&self) -> u64;
+    /// Block the engine's thread for `d` (the real host sleeps; the fake
+    /// advances its clock). Only for [`MIN_MOVE_GAP`].
+    fn wait(&mut self, d: Duration);
 }
 
 /// What someone asked for, and who.
@@ -369,6 +381,8 @@ pub struct Engine {
     seed: u64,
     rev: u64,
     last_publish: Option<Instant>,
+    /// When the engine last moved the pointer ([`MIN_MOVE_GAP`]).
+    last_move_at: Option<Instant>,
     warn: Vec<&'static str>,
     detector: &'static str,
 }
@@ -397,6 +411,7 @@ impl Engine {
             seed,
             rev: 1,
             last_publish: None,
+            last_move_at: None,
             warn: Vec::new(),
             detector: "clock+cursor",
         }
@@ -714,7 +729,7 @@ impl Engine {
         } else {
             (cur.0 + CALIBRATION_NUDGE_PX, cur.1)
         };
-        if let Err(e) = host.move_to(out) {
+        if let Err(e) = self.move_spaced(host, out) {
             return self.host_error(e, now);
         }
         let mid = host.settle(before);
@@ -722,10 +737,14 @@ impl Engine {
             Ok(c) => c,
             Err(e) => return self.host_error(e, now),
         };
-        if let Err(e) = host.move_to(cur) {
+        // Spaced from the out leg, so the two land on different clock readings.
+        if let Err(e) = self.move_spaced(host, cur) {
             return self.host_error(e, now);
         }
         let after = mid.and_then(|m| host.settle(m));
+        // The legs took real time (the spacing, two settles): schedule from
+        // after them.
+        let now = host.now();
         let back = match host.cursor() {
             Ok(c) => c,
             Err(e) => return self.host_error(e, now),
@@ -762,6 +781,20 @@ impl Engine {
         self.run = Some(self.new_run(act, (cur.0 as f64, cur.1 as f64), safe, now));
         self.set_phase(Phase::Running, None, None, now);
         self.next_wake = Some(now + self.running_cadence(act));
+    }
+
+    /// Every move the engine makes, at least [`MIN_MOVE_GAP`] after its
+    /// previous one: closer, and the idle clock reads the two as one event.
+    fn move_spaced(&mut self, host: &mut impl Host, p: (i32, i32)) -> Result<(), HostError> {
+        if let Some(t) = self.last_move_at {
+            let since = host.now().saturating_duration_since(t);
+            if since < MIN_MOVE_GAP {
+                host.wait(MIN_MOVE_GAP - since);
+            }
+        }
+        let r = host.move_to(p);
+        self.last_move_at = Some(host.now());
+        r
     }
 
     fn running_cadence(&self, act: &Activation) -> Duration {
@@ -861,7 +894,7 @@ impl Engine {
             return;
         }
         let before = self.baseline.unwrap_or(IdleMarker::exact(0));
-        if let Err(e) = host.move_to(target) {
+        if let Err(e) = self.move_spaced(host, target) {
             return self.host_error(e, now);
         }
         self.expected = Some(target);
@@ -1078,12 +1111,18 @@ mod tests {
         warp: Option<Warp>,
         move_err: Option<HostError>,
         reads_while_absent: u32,
+        /// `Some(ms)`: the idle clock is a TIMESTAMP of this granularity, as
+        /// `GetLastInputInfo`'s system-timer tick is, so two events inside
+        /// one tick read as one. `None`: a counter every event moves.
+        tick_ms: Option<u64>,
+        started: Instant,
     }
 
     impl Fake {
         fn new() -> Fake {
+            let now = Instant::now();
             Fake {
-                now: Instant::now(),
+                now,
                 wall: 1_000_000,
                 session: SessionState::Present,
                 marker: 100,
@@ -1096,19 +1135,31 @@ mod tests {
                 warp: None,
                 move_err: None,
                 reads_while_absent: 0,
+                tick_ms: None,
+                started: now,
             }
         }
         fn advance(&mut self, d: Duration) {
             self.now += d;
             self.wall += d.as_millis() as u64;
         }
+        /// An input event reaching the idle clock.
+        fn register(&mut self) {
+            self.marker = match self.tick_ms {
+                Some(t) => {
+                    let ms = self.now.saturating_duration_since(self.started).as_millis() as u64;
+                    1_000 + ms / t * t
+                }
+                None => self.marker + 1,
+            };
+        }
         /// A key, a scroll or a click: the clock moves, the pointer doesn't.
         fn human_key(&mut self) {
-            self.marker += 1;
+            self.register();
         }
         fn human_move(&mut self, to: (i32, i32)) {
             self.cursor = to;
-            self.marker += 1;
+            self.register();
         }
         /// An app moving the pointer: no input event at all.
         fn app_warp(&mut self, to: (i32, i32)) {
@@ -1117,7 +1168,7 @@ mod tests {
         fn controller(&mut self, to: (i32, i32)) {
             self.remote += 1;
             self.cursor = to;
-            self.marker += 1;
+            self.register();
         }
     }
 
@@ -1150,7 +1201,7 @@ mod tests {
             self.moves.push(p);
             self.cursor = self.warp.map(|w| w(p)).unwrap_or(p);
             if self.clock_registers {
-                self.marker += 1;
+                self.register();
             }
             Ok(())
         }
@@ -1169,6 +1220,9 @@ mod tests {
         }
         fn remote_epoch(&self) -> u64 {
             self.remote
+        }
+        fn wait(&mut self, d: Duration) {
+            self.advance(d);
         }
     }
 
@@ -1232,6 +1286,31 @@ mod tests {
         on(&mut e, &mut f, Pattern::Circle);
         assert_eq!(f.moves[0], (960 - CALIBRATION_NUDGE_PX, 520));
         assert_eq!(f.moves[1], (960, 520));
+    }
+
+    /// `GetLastInputInfo` advances with the system timer, so two moves inside
+    /// one ~15.6 ms tick read as ONE event. The calibration's back leg used to
+    /// follow the out leg by milliseconds, never registered, and the host read
+    /// as `not_landing` — most enables on a real Windows box. Every own move
+    /// is now spaced by `MIN_MOVE_GAP`, a recalibration's first move included.
+    #[test]
+    fn calibration_and_running_survive_a_coarse_idle_clock() {
+        let mut f = Fake::new();
+        f.tick_ms = Some(16);
+        let mut e = Engine::new(1);
+        on(&mut e, &mut f, Pattern::Circle);
+        let s = e.snapshot(f.now);
+        assert_eq!((s.phase, s.reason), (Phase::Running, None));
+        run_for(&mut e, &mut f, Duration::from_secs(2));
+        let s = e.snapshot(f.now);
+        assert_eq!((s.phase, s.reason), (Phase::Running, None));
+
+        // A new pattern while running recalibrates at once.
+        e.set_on(settings(Pattern::Star), "Alice".into(), f.wall, f.now)
+            .unwrap();
+        e.tick(&mut f);
+        let s = e.snapshot(f.now);
+        assert_eq!((s.phase, s.reason), (Phase::Running, None));
     }
 
     /// A pointer stuck at one spot round-trips "home → home" perfectly once
