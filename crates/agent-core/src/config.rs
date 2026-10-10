@@ -453,6 +453,14 @@ pub struct AgentConfig {
     /// themselves, and their account must map in `hive_accounts`.
     #[serde(default)]
     pub hive_adopt: bool,
+    /// FR-90 decision 15 — on a Mac, run sessions as an account whose `sudo`
+    /// needs no password. Default OFF: such a start is refused, because
+    /// macOS's `sudo` reads the account's groups from the directory, so the
+    /// session would have root whatever groups it drops. Never pushable:
+    /// whether an agent on this machine may be root is the device owner's
+    /// call alone. Linux needs no such key: a session there cannot `sudo`.
+    #[serde(default)]
+    pub hive_allow_passwordless_sudo: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2235,6 +2243,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_update_wait_secs: None,
         hive_core_memory: false,
         hive_adopt: false,
+        hive_allow_passwordless_sudo: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

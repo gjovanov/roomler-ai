@@ -24,6 +24,13 @@
 //! Only the PRIMARY enrollment's. `hive_enabled` and the account map belong to
 //! the device's owner; a secondary org's admin must not start sessions on a
 //! device that org merely borrows — the rule `rc:agent.update` already follows.
+//!
+//! # Root on a Mac (decision 15)
+//!
+//! [`sudo`]: a Mac refuses a start as an account whose `sudo` needs no
+//! password, unless the device's owner allows it. Its `sudo` reads the
+//! account's groups from the directory, so the groups a session drops
+//! (decision 13) cannot keep it from root there.
 
 //!
 //! # Reading a session from a browser (P0d-2)
@@ -78,6 +85,7 @@ mod lines;
 mod procs;
 mod sidecar;
 mod store;
+mod sudo;
 mod supervisor;
 mod toolbelt;
 pub mod view;

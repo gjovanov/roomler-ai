@@ -177,6 +177,12 @@ pub enum HiveRefusal {
     LaunchFailed,
     /// The device already runs `hive_max_sessions` sessions.
     AtCapacity,
+    /// FR-90 decision 15 — macOS: the account the session would run as may
+    /// use `sudo` without a password, and the device's own
+    /// `hive_allow_passwordless_sudo` is off. A Mac's `sudo` reads the
+    /// account's groups from the directory, so no group a session drops can
+    /// stop it, and the session would have root.
+    PasswordlessSudo,
     /// A word this build does not know.
     Other,
 }
@@ -192,12 +198,13 @@ impl HiveRefusal {
             Self::HarnessMissing => "harness_missing",
             Self::LaunchFailed => "launch_failed",
             Self::AtCapacity => "at_capacity",
+            Self::PasswordlessSudo => "passwordless_sudo",
             Self::Other => "other",
         }
     }
 
     /// Every word this build knows.
-    pub const ALL: [HiveRefusal; 8] = [
+    pub const ALL: [HiveRefusal; 9] = [
         Self::HiveDisabled,
         Self::NoAccount,
         Self::NoConsoleUser,
@@ -205,6 +212,7 @@ impl HiveRefusal {
         Self::HarnessMissing,
         Self::LaunchFailed,
         Self::AtCapacity,
+        Self::PasswordlessSudo,
         Self::Other,
     ];
 }
@@ -543,6 +551,7 @@ mod tests {
                 "harness_missing",
                 "launch_failed",
                 "at_capacity",
+                "passwordless_sudo",
                 "other",
             ]
         );
