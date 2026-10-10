@@ -277,21 +277,33 @@ account is resolved in the parent (`getpwnam_r`, `getgrouplist`), uid 0 is refus
 ([`exec.rs:949`](../agents/roomlerd/src/exec.rs#L949)), and the child only calls
 `setgroups`, `setgid` and `setuid`, then checks that they took.
 
-⚠️ **A session cannot `sudo`** (decision 13), as Windows denies its sessions the
-Administrators group:
+⚠️ **A session holds no administrator group** (decision 13), as Windows denies its
+sessions the Administrators group:
 - It holds none of the account's administrator groups
   ([`exec.rs:1022`](../agents/roomlerd/src/exec.rs#L1022)): root's own, the sudoers groups
   (`wheel`, `sudo`, macOS's `admin`) and those whose socket or device is root by another
   door (`docker`, `lxd`, `incus`, `libvirt`, `disk`). An account whose primary group is one
-  is refused.
-- It holds fewer groups than NGROUPS_MAX, because `sudo` reads the process's own list only
-  while it is under that maximum.
-- On Linux the harness starts with `no_new_privs`
-  ([`exec.rs:1154`](../agents/roomlerd/src/exec.rs#L1154)), so nothing it runs gains a
+  is refused ([`exec.rs:1087`](../agents/roomlerd/src/exec.rs#L1087)). The kernel then
+  grants the session nothing by those groups: no docker or libvirt socket, no disk
+  device, no write into macOS's `/Applications` (`root:admin 775`).
+- On Linux the harness also starts with `no_new_privs`
+  ([`exec.rs:1144`](../agents/roomlerd/src/exec.rs#L1144)), so nothing it runs gains a
   privilege by exec: no `sudo`, whatever sudoers says of the account.
 
-macOS has no such switch, so a sudoers rule that names the account by user still applies
-there; one by group no longer does.
+| A session, as an account whose `sudo` needs no password | Linux | macOS |
+|---|---|---|
+| holds `sudo`, `wheel` or `admin` | no | no: a write into `/Applications` is refused |
+| `sudo` by a rule that names the account | refused, by `no_new_privs` | **allowed** |
+| `sudo` by a rule that names a group (`%admin`, `%sudo`) | refused, the same way | **allowed** |
+
+⚠️ **On macOS a session can still `sudo`** wherever its account may without a password.
+macOS has no `no_new_privs`, and its `sudo` reads the account's groups from the
+directory, never from the process. Field-measured on macOS 15.7.7 (sudo 1.9.13p2), the
+only passwordless rule being `%admin ALL=(ALL) NOPASSWD: ALL`: a session without the
+admin group got `sudo-rc=0`, and its write into `/Applications` was refused. There, map an
+account whose `sudo` asks for a password, as macOS's does unless someone changed it: a
+session cannot type one. `id` misleads on a Mac too: it reads the directory, so it lists
+`admin` in a session that does not hold it.
 
 The daemon never writes into a tree the account owns. It starts `/bin/sh -c` with a
 fixed script ([`WRAPPER`](../agents/roomlerd/src/hive/supervisor.rs#L93)) and
@@ -755,11 +767,9 @@ first, so the child holds fewer groups and never more
 ([`exec.rs:1004`](../agents/roomlerd/src/exec.rs#L1004) `within_ngroups_max`). Exec, SSH
 and the PTY share the fix, since they share the path.
 
-⚠️ **Open: administrator groups on Unix (decision 13).** On Windows a session's token
-has Administrators deny-only. On Linux and macOS a session runs with the mapped
-account's groups, `admin`, `wheel` or `sudo` included, so an account with
-passwordless `sudo` lets a session reach root through a `sudo` a person approves.
-Until that is decided, map an account that holds only what the agent should have.
+The cap is for `setgroups` alone. `sudo` never reads that list on a Mac, and a Linux
+session cannot run `sudo` at all, so nothing is cut below the maximum. What a session
+holds of the administrator groups is in §3.
 
 ---
 
@@ -776,6 +786,7 @@ Until that is decided, map an account that holds only what the agent should have
 | AC8: a fact reaches the next session and not the running one ([`brain.md`](brain.md)) | ✅ | — | — |
 | AC20: a session survives a service restart, a restart at an approval and a crash; a changed gate ends it | ✅ | ✅ | ✅ |
 | AC21: an adopted session is its owner's alone, and read only | ✅ | — | not built |
+| Decision 13: a session holds no administrator group and cannot `sudo` | ✅ `27(sudo)` gone, `sudo` refused | ⚠️ the group gone, `sudo` still allowed (§3) | — |
 
 Linux ran on a throwaway stack (a local server, loopback TURN, a root daemon in WSL),
 macOS and Windows on throwaway VMs enrolled in the test organization on prod

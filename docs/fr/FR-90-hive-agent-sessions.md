@@ -1608,21 +1608,33 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     groups from a session's groups on Unix, as Windows does; or keep them, and say in the
     configuration reference that mapping an administrator gives the agent what that administrator
     has. *Decided 2026-10-10 by the operator, on the recommendation: dropped, as Windows does.*
-    Built so that a session cannot `sudo` even where its account may without a password:
+    Built, and field-verified (§8), so that a session holds none of those groups and on Linux
+    cannot `sudo` at all:
     - It holds none of the account's administrator groups (`exec.rs:1022`): root's own, the
       sudoers groups and those whose socket or device is root by another door (`docker`, `lxd`,
-      `incus`, `libvirt`, `disk`). An account whose primary group is one is refused.
-    - It holds fewer groups than NGROUPS_MAX (`exec.rs:1088`), because `sudo` reads the
-      process's own list only while it is under that maximum, and the group database, which still
-      names every group, once it is full.
-    - On Linux the harness starts with `no_new_privs` (`exec.rs:1154`), so nothing it runs gains
-      a privilege by exec: no `sudo`, whatever sudoers says of the account by name.
-    - ⚠️ macOS has no such switch. There a sudoers rule that names the account by user still
-      lets its session use it; one by group no longer does. exec, SSH and the PTY are unchanged.
+      `incus`, `libvirt`, `disk`). An account whose primary group is one is refused
+      (`exec.rs:1087`). The kernel then grants the session nothing by those groups.
+    - On Linux the harness starts with `no_new_privs` (`exec.rs:1144`), so nothing it runs gains
+      a privilege by exec: no `sudo`, whatever sudoers says of the account.
+    - ⚠️ macOS has no such switch, and its `sudo` reads the account's groups from the directory,
+      never from the process. A session there can still use any rule its account may use without
+      a password, whether the rule names the account or one of its groups: decision 15. As first
+      built (#1934), the docs said a group rule no longer applied on macOS, and a session's list
+      was also kept below NGROUPS_MAX for `sudo`'s `adaptive` group source. The field run
+      disproved the first, and the second bought nothing (a Linux session cannot run `sudo`; a
+      Mac's never reads the list), so both are gone. exec, SSH and the PTY are unchanged.
 14. **P2b's git** (P2-0). *Decided 2026-10-10 by the operator, on the recommendation:* checkpoints
     use the account's own `git`, plumbing only and through a temporary index, run as the account,
     never a git embedded in the daemon. A device without `git` skips workspace checkpoints, and the
     room says so.
+15. **A Mac account whose `sudo` needs no password** (decision 13's field run, §8). A session as
+    that account can become root, whatever groups it holds. macOS asks for a password by default,
+    and a session cannot type one, so this is an account someone gave `NOPASSWD`. Options: refuse
+    to start a session as such an account unless the device owner allows it (a device-owned key,
+    default off; the wrapper runs `sudo -n -l` as the account before it becomes the harness, and
+    success means a passwordless rule exists); or leave it as documented, in the configuration
+    reference and `docs/hive.md`. A Seatbelt profile that denies `sudo` would collide with Claude
+    Code's own macOS sandbox, which P3 turns on.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
@@ -1712,6 +1724,9 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-10 | the same, each file's size, SHA-256, file id (the NTFS file index; the inode) and bytes kept after every turn; on Linux, the harness under `strace -f` (opens, renames, truncates, unlinks) | probe 3: is the history only appended to, across turns, a `--resume` and a `/compact`? | ✅ Only appended. Every snapshot's history began with the previous one's bytes under the same file id. Windows: 150,802 → 161,823 → 172,457 → 217,383 → 217,893 at the exit → 223,868 after a resume, file id `26740122789429559` throughout. Linux: 144,569 → 155,482 → 165,416 → 210,032 → 210,545 → 216,493 after a resume, inode `34966077` throughout, and across `/compact` (216,493 → 228,386) a `compact_boundary` and the summary were appended below what was there. Every write-open of the history and the sub-agent transcript was an `O_APPEND` open (`O_WRONLY\|O_CREAT\|O_APPEND`, at times tried with `O_EXCL` first), and no `O_TRUNC`, rename or truncate touched them. In the container, Bun's `io_uring_setup` was refused `EPERM`, so every file call was a syscall strace saw. Inside the allowlist, `agent-<id>.meta.json` is written whole (a temporary, then a rename) and a tool result once (`O_TRUNC`, a new name). Outside it, `.claude.json` is replaced by a rename and `sessions/<pid>.json` rewritten in place |
 | 2026-10-10 | the same, with a `SessionStart` hook in the daemon's `--settings` that prints `additionalContext` with a marker | probe 4: under `-p` with stream-json input, does it reach the model on a resume, and with which `source`? | ✅ Yes, on both OSes. A start ran the hook with `source: "startup"`, before `system/init`. `--resume` ran it with `source: "resume"`, its stdin also carrying `seconds_since_last_response`, `context_tokens`, `prompt_cache_likely_expired` and `estimated_cache_write_usd`. The model got a `system` message after the new prompt: "SessionStart hook additional context: HIVE-NOTE-9Q2 source=resume …". The history keeps each run, as `hook_success` (the hook's stdout) and `hook_additional_context`, so the start's note came back with every later resume. With `"matcher": "resume"`, it ran on the resume only. A hook that printed nothing left nothing, in the history or the request |
 | 2026-10-10 | the same | probe 5: `--resume <parent> --fork-session` with an id Hive chose | ✅ `--session-id <new>` beside them is honoured: `system/init`, every event's `session_id`, the result and the request's `x-claude-code-session-id` carried it. In the design's shape (the fork's own config directory, pinned to `hive-<fork>`, holding the parent's allowlist under that name and nothing else), the fork read `projects/hive-<fork>/<parent>.jsonl` and the model got every parent turn. It wrote `projects/hive-<fork>/<fork>.jsonl`, the fork's `history_path()`, and a second launch, Hive's ordinary `--resume <fork>`, appended to it. The parent's files kept their bytes and file ids. The fork's history is the parent's conversation stamped with the fork's `sessionId` (60 lines from 71). It copies neither `subagents/` nor `tool-results/`, and its `<persisted-output>` pointer still names the parent's file. Without `--session-id`, the fork took a random id (`d8f56471-…`), read from `system/init`. Linux behaved the same with a chosen id |
+| 2026-10-10 | released 0.4.123, then a candidate of master `81accc83a` (decision 13; 0.4.121 by number, so the update channel stays above it), on a vmtest Ubuntu VM (`ubuntu/installer/system`, kept), its root daemon re-enrolled non-ephemeral, `auto_update` off; `vmtest` mapped to the org's admin, in `sudo` (27) and `adm`, with cloud-init's `vmtest ALL=(ALL) NOPASSWD:ALL` naming it by user (`%sudo` asks for a password); Claude Code 2.1.296; the model key in a root-only file, the VM destroyed after | decision 13 on Linux: one Bash call from the viewer, `id; grep NoNewPrivs /proc/self/status; sudo -n true; echo sudo-rc=$?` | ❌ on 0.4.123: `groups=1000(vmtest),4(adm),27(sudo)`, `NoNewPrivs: 0`, `sudo-rc=0`, so the session could become root. ✅ on the candidate, with the same account, sudoers and folder: `groups=1000(vmtest),4(adm)`, `NoNewPrivs: 1`, `sudo: The "no new privileges" flag is set, which prevents sudo from running as root.`, `sudo-rc=1`. Both turns ended normally. Aside: in both, a safety classifier stopped one of the model's replies, and the notice Claude Code then injects as a user message showed in the transcript as written by "Someone" |
+| 2026-10-10 | the macOS tart VM (`macos/installer/system`, kept): macOS 15.7.7, sudo 1.9.13p2, `admin` in 17 groups, `/Applications` `root:admin 775`. No agent: as root, a fork that calls `setgroups` (15 of `admin`'s groups, with and without `admin`), `setgid` and `setuid` as Hive's launcher does, then runs `sudo -n true`, `touch /Applications/x` and `id` | decision 13's premise on macOS: does `sudo` read the process's own groups? First under the VM's own rules, two of them naming `admin` by user; then with those parked, `%admin ALL=(ALL) NOPASSWD: ALL` the only passwordless rule | ❌ for the premise. Without the group, the kernel refused the write into `/Applications` (`Permission denied`; it succeeded with the group), so the drop took. `sudo -n true` succeeded both ways under each set of rules, the group-only one included: macOS's `sudo` reads the account's groups from the directory. In the same process `id` and Python's `os.getgroups()` still listed 80 (`admin`), since on macOS both read the directory too |
+| 2026-10-10 | the same VM, its root daemon re-enrolled non-ephemeral, the update helper opted out, `admin` mapped, `%admin … NOPASSWD` the only passwordless rule; released 0.4.123, then two candidates (0.4.121 by number): `8e1f53f09` (P1h-3's, with #1927, without decision 13) and master `81accc83a` | decision 13 on macOS, in a session: `id -Gn; sudo -n true; echo sudo-rc=$?; touch /Applications/.hive-d13 && echo apps-write=ok` | 0.4.123 refused the start, `launch_failed` "/var is a symbolic link", as P1h-3 found (#1927 ships in 0.4.124). Without decision 13: `sudo-rc=0`, `apps-write=ok`. With it: `sudo-rc=0` and `touch: /Applications/.hive-d13: Permission denied`. `id -Gn` listed `admin` both times. On macOS the drop reaches the kernel's checks, never `sudo`, so the docs #1934 shipped (a group rule no longer applies there) were wrong. They are corrected, and the rest is decision 15 |
 
 ## 9. Related
 
