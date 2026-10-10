@@ -258,6 +258,7 @@ mod tests {
                 turn: 1,
                 files: vec![],
                 skipped: vec![],
+                workspace: None,
             }),
         ];
         for ev in all {
@@ -277,6 +278,7 @@ mod tests {
             turn: 5,
             files: vec![f],
             skipped: vec![],
+            workspace: None,
         });
         let v: serde_json::Value = serde_json::from_str(&ev.to_json()).unwrap();
         assert_eq!(v["kind"], "checkpoint");
