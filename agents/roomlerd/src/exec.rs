@@ -965,6 +965,8 @@ mod unix_priv {
             }
             groups.resize(ngroups as usize, 0);
         }
+        // SAFETY: sysconf takes a constant and touches no memory of ours.
+        let groups = within_ngroups_max(groups, unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) });
 
         Ok(Account {
             uid,
@@ -973,6 +975,25 @@ mod unix_priv {
             home,
             name: account.to_string(),
         })
+    }
+
+    /// FR-90 P1h-3 — no more supplementary groups than this system's
+    /// `setgroups` takes (`max`, its `NGROUPS_MAX`): it refuses the whole list
+    /// when it is longer. That is 16 on macOS, where an account's list easily
+    /// runs past it: a tart VM's `admin` is in 17 groups. Field-found: every
+    /// agent session on a Mac failed "starting the harness: Invalid argument
+    /// (os error 22)", and so would exec, SSH and the PTY as such an account.
+    /// The list keeps its order (`getgrouplist` puts the primary group first)
+    /// and loses its tail, so the child holds fewer groups, never more. A
+    /// `max` the system did not give (sysconf's -1, or 0) changes nothing.
+    fn within_ngroups_max(mut groups: Vec<libc::gid_t>, max: libc::c_long) -> Vec<libc::gid_t> {
+        if let Ok(max) = usize::try_from(max)
+            && max > 0
+            && groups.len() > max
+        {
+            groups.truncate(max);
+        }
+        groups
     }
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
@@ -1126,6 +1147,28 @@ mod unix_priv {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// FR-90 P1h-3 — a group list longer than the system's NGROUPS_MAX
+        /// (16 on macOS) loses its tail, in order; a shorter one, or a limit
+        /// the system did not give, is untouched; and this host's own limit
+        /// is one `setgroups` takes.
+        #[test]
+        fn a_group_list_is_cut_to_what_setgroups_takes() {
+            let seventeen: Vec<libc::gid_t> = (100..117).collect();
+            assert_eq!(
+                within_ngroups_max(seventeen.clone(), 16),
+                (100..116).collect::<Vec<_>>()
+            );
+            assert_eq!(within_ngroups_max(seventeen.clone(), 65536), seventeen);
+            assert_eq!(within_ngroups_max(seventeen.clone(), -1), seventeen);
+            assert_eq!(within_ngroups_max(seventeen.clone(), 0), seventeen);
+            assert_eq!(within_ngroups_max(vec![20], 16), vec![20]);
+            // SAFETY: sysconf takes a constant and touches no memory of ours.
+            let here = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+            assert!(here > 0, "this host gives an NGROUPS_MAX: {here}");
+            #[cfg(target_os = "macos")]
+            assert_eq!(here, 16, "macOS's NGROUPS_MAX");
+        }
 
         #[test]
         fn root_is_refused_through_the_named_path() {
