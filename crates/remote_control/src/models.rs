@@ -4444,6 +4444,39 @@ mod tests {
     /// recording on behind the owner's back. Both stay device-owned, so no
     /// `record_*` key may exist here. Spelled out in full, for the same reason
     /// as the relay test: a new field must make this stop compiling.
+    /// FR-92 — the `keep_busy_*` twin. `keep_busy_enabled` is the device
+    /// owner's consent to a controller keeping this pointer moving after the
+    /// session has ended; a server that could push it would turn that on
+    /// behind the owner's back on every device in the tenant. Spelled out in
+    /// full, so a new `DesiredConfig` field must make this stop compiling.
+    #[test]
+    fn no_keep_busy_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("keep_busy"),
+            "a keep_busy* key reached DesiredConfig -- a server-pushable keep-busy opt-in: {json}"
+        );
+        let back: DesiredConfig =
+            serde_json::from_str(r#"{"exec_enabled":true,"keep_busy_enabled":true,"revision":1}"#)
+                .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("keep_busy"),
+            "a keep_busy* key survived a decode/encode round trip"
+        );
+    }
+
     #[test]
     fn no_record_key_is_server_pushable_via_desired_config() {
         let full = DesiredConfig {

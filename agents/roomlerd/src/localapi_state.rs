@@ -1110,6 +1110,10 @@ impl LocalApiState for DaemonState {
                 // console gate on `record_*` keys has already run.
                 #[cfg(feature = "recording")]
                 crate::recording::remote::adopt(&cfg);
+                // FR-92 — keep busy's owner gate is live too: off stops a
+                // keep-busy in progress and refuses a new one, and the cap
+                // word follows on the next heartbeat.
+                crate::keep_busy::set_device_enabled(cfg.keep_busy_enabled);
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".

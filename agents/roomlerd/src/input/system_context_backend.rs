@@ -79,7 +79,8 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use super::enigo_backend;
-use super::{InputInjector, InputMsg};
+use super::enigo_backend::Job;
+use super::{InputInjector, InputMsg, PxJob};
 use crate::system_context::desktop_rebind;
 use tunnel_core::env::node_env;
 
@@ -97,13 +98,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindow
 /// successfully attached to `WinSta0` AND constructed `Enigo`; then
 /// returns. After that all `inject` calls just push onto the mpsc.
 pub struct SystemContextInjector {
-    tx: std_mpsc::Sender<InputMsg>,
+    tx: std_mpsc::Sender<Job>,
     has_perm: bool,
 }
 
 impl SystemContextInjector {
     pub fn new() -> Result<Self> {
-        let (tx, rx) = std_mpsc::channel::<InputMsg>();
+        let (tx, rx) = std_mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
@@ -171,11 +172,29 @@ impl SystemContextInjector {
 /// Worker loop. Receives `InputMsg` commands; rebinds the thread's
 /// desktop on each one (cheap; self-deduping); dispatches via the
 /// shared enigo dispatcher.
-fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
+fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
     let mut events_since_log: u64 = 0;
     let mut consec_dispatch_errors: u64 = 0;
     let mut key_events: u64 = 0;
-    while let Ok(msg) = rx.recv() {
+    while let Ok(job) = rx.recv() {
+        let msg = match job {
+            Job::Input(msg) => msg,
+            // FR-92 — keep-busy's reads and moves run on THIS thread, after
+            // the same rebind an event gets: a GetCursorPos from a thread
+            // still bound to a stale desktop answers for the wrong one.
+            Job::Px(px) => {
+                if let Ok(desktop_rebind::DesktopChange::Switched(name)) =
+                    desktop_rebind::try_change_desktop()
+                {
+                    tracing::info!(%name, "system-context input: rebound desktop before a keep-busy job");
+                    if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                        enigo = fresh;
+                    }
+                }
+                enigo_backend::run_px_job(&mut enigo, px);
+                continue;
+            }
+        };
         events_since_log = events_since_log.wrapping_add(1);
         // rc.121 — rc.120 PROVED this is NOT UIPI on REGAL-112500982 (worker
         // integrity=System 0x4000 > foreground powershell.exe High 0x3000 ⇒
@@ -311,12 +330,24 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
 impl InputInjector for SystemContextInjector {
     fn inject(&mut self, event: InputMsg) -> Result<()> {
         self.tx
-            .send(event)
+            .send(Job::Input(event))
             .map_err(|_| anyhow!("system-context input worker exited"))
     }
 
     fn has_permission(&self) -> bool {
         self.has_perm
+    }
+
+    fn cursor_px(&mut self) -> Result<(i32, i32)> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Locate(reply)))
+    }
+
+    fn move_px(&mut self, x: i32, y: i32) -> Result<()> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Move { x, y, reply }))
+    }
+
+    fn buttons_held(&mut self) -> Result<bool> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Buttons(reply)))
     }
 }
 

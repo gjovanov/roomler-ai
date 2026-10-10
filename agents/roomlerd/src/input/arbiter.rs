@@ -131,6 +131,29 @@ struct SessCore {
     last_input: Instant,
 }
 
+/// FR-92 — why a session may not switch keep-busy on or off. (An org's
+/// deny is not here: it is device-wide — the strictest of every enrolled
+/// org — and the engine itself refuses, with `org_denied`, whoever asks.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepBusyRefusal {
+    /// Not a registered session (already closed).
+    Unknown,
+    /// The session holds no INPUT grant — keep-busy is input.
+    NoInput,
+    /// Exclusive mode, and another session holds the floor.
+    NotFloorHolder,
+}
+
+impl KeepBusyRefusal {
+    pub fn wire(self) -> &'static str {
+        match self {
+            KeepBusyRefusal::Unknown => "unknown_session",
+            KeepBusyRefusal::NoInput => "no_input_permission",
+            KeepBusyRefusal::NotFloorHolder => "not_floor_holder",
+        }
+    }
+}
+
 /// What the worker should do with one event.
 #[derive(Debug, PartialEq)]
 pub enum EventPlan {
@@ -485,6 +508,32 @@ impl ArbiterState {
         true
     }
 
+    /// FR-92 — is any session holding a mouse button? A keep-busy move
+    /// spliced into a controller's drag would drag whatever they hold.
+    pub fn any_button_held(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|c| c.held.iter().any(|h| matches!(h, Held::Btn(_))))
+    }
+
+    /// FR-92 — may `session` switch keep-busy on or off? The same bar as
+    /// injecting: an INPUT grant, and the floor in exclusive mode. Returns
+    /// the controller's display name for the `set_by` the host and the
+    /// other viewers see.
+    pub fn keep_busy_may_set(&self, session: ObjectId) -> Result<String, KeepBusyRefusal> {
+        let core = self
+            .sessions
+            .get(&session)
+            .ok_or(KeepBusyRefusal::Unknown)?;
+        if !core.can_input {
+            return Err(KeepBusyRefusal::NoInput);
+        }
+        if self.mode == Mode::Exclusive && self.holder.is_some_and(|h| h != session) {
+            return Err(KeepBusyRefusal::NotFloorHolder);
+        }
+        Ok(core.name.clone())
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let participant = |id: &ObjectId| -> Option<Participant> {
             self.sessions.get(id).map(|c| Participant {
@@ -560,7 +609,51 @@ enum Cmd {
         session: ObjectId,
         mode: Mode,
     },
+    /// FR-92 — keep-busy's engine asks the ONE injector to read or move.
+    KeepBusy(KbReq),
+    /// FR-92 — a controller asked to switch keep-busy on or off; the
+    /// arbiter holds the grant and the floor, so it decides.
+    KeepBusySet {
+        session: ObjectId,
+        request: crate::keep_busy::SetRequest,
+    },
 }
+
+/// FR-92 — a keep-busy request, answered on `reply` from the arbiter thread
+/// (where the one OS injector lives).
+pub struct KbReq {
+    pub op: KbOp,
+    pub reply: std::sync::mpsc::SyncSender<KbReply>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KbOp {
+    /// The cursor, in desktop pixels.
+    Locate,
+    /// A real-input absolute move to desktop pixel `(x, y)`.
+    Move { x: i32, y: i32 },
+    /// Is a physical mouse button held?
+    Buttons,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KbReply {
+    Located(i32, i32),
+    Moved,
+    Buttons(bool),
+    /// Refused: a controller is holding a mouse button.
+    RemoteButtonHeld,
+    /// This backend has no pixel-space read/move.
+    Unsupported,
+    /// The injector exists but the OS has not granted it (macOS
+    /// Accessibility).
+    NoPermission,
+    Failed(String),
+}
+
+/// How long the keep-busy engine waits for the arbiter: the injector
+/// thread's own bound plus room for a queue of controller events ahead.
+pub const KB_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct Sinks {
     control: DcStash,
@@ -641,6 +734,27 @@ impl Arbiter {
     pub fn set_mode(&self, session: ObjectId, mode: Mode) {
         let _ = self.tx.try_send(Cmd::SetMode { session, mode });
     }
+
+    /// FR-92 — run one keep-busy request on the injector and wait (bounded)
+    /// for the answer. Called from the keep-busy engine thread, never from
+    /// a tokio task.
+    pub fn keep_busy(&self, op: KbOp) -> KbReply {
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        if self
+            .tx
+            .try_send(Cmd::KeepBusy(KbReq { op, reply }))
+            .is_err()
+        {
+            return KbReply::Failed("input arbiter queue full".into());
+        }
+        rx.recv_timeout(KB_REPLY_TIMEOUT)
+            .unwrap_or_else(|_| KbReply::Failed("input arbiter did not answer".into()))
+    }
+
+    /// FR-92 — a controller's `rc:keep-busy.set`.
+    pub fn keep_busy_set(&self, session: ObjectId, request: crate::keep_busy::SetRequest) {
+        let _ = self.tx.try_send(Cmd::KeepBusySet { session, request });
+    }
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
@@ -686,6 +800,9 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                         "input arbiter: release-all on session close"
                     );
                     inject_all(&mut injector, &releases);
+                    // FR-92 — a released button moves the pointer first
+                    // (#1945): keep-busy must re-anchor, not fight it.
+                    crate::keep_busy::note_remote_input();
                 }
                 sinks.remove(&session);
                 if state.session_count() > 0 {
@@ -705,6 +822,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                         "input arbiter: input DC closed — released held keys"
                     );
                     inject_all(&mut injector, &releases);
+                    crate::keep_busy::note_remote_input();
                 }
             }
             Cmd::Event { session, msg } => {
@@ -727,7 +845,43 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                             inject_all(&mut injector, &pre);
                         }
                         inject_all(&mut injector, std::slice::from_ref(&msg));
+                        // FR-92 — a controller's input reached the OS: a
+                        // remote person is active. A heartbeat is not input.
+                        if !matches!(msg, InputMsg::Heartbeat { .. }) {
+                            crate::keep_busy::note_remote_input();
+                        }
                     }
+                }
+            }
+            Cmd::KeepBusy(req) => {
+                let reply = keep_busy_op(&state, &mut injector, req.op);
+                let _ = req.reply.try_send(reply);
+            }
+            Cmd::KeepBusySet { session, request } => {
+                // Accepted requests are answered by the engine's broadcast;
+                // a refusal goes to the asking viewer alone, with its reason.
+                let refused = match state.keep_busy_may_set(session) {
+                    Ok(name) => (!crate::keep_busy::submit_from_session(session, name, request))
+                        .then_some("unsupported"),
+                    Err(refusal) => {
+                        tracing::info!(
+                            %session,
+                            refusal = refusal.wire(),
+                            "keep-busy: a session's request refused"
+                        );
+                        Some(refusal.wire())
+                    }
+                };
+                if let Some(why) = refused
+                    && let Some(s) = sinks.get(&session)
+                {
+                    let stash = s.control.clone();
+                    let payload = crate::keep_busy::state_json(Some(why));
+                    handle.spawn(async move {
+                        if let Some(dc) = stash.lock().await.clone() {
+                            let _ = dc.send_text(payload).await;
+                        }
+                    });
                 }
             }
             Cmd::RequestFloor { session } => {
@@ -735,6 +889,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 tracing::info!(%session, granted, "input arbiter: floor request");
                 if !releases.is_empty() {
                     inject_all(&mut injector, &releases);
+                    crate::keep_busy::note_remote_input();
                 }
                 broadcast_state(&state, &sinks, &handle);
             }
@@ -743,6 +898,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 tracing::info!(%holder, %to, granted, "input arbiter: floor grant");
                 if !releases.is_empty() {
                     inject_all(&mut injector, &releases);
+                    crate::keep_busy::note_remote_input();
                 }
                 // Broadcast even on a refusal: the requester may have left, or
                 // the floor may have moved, and both ends need the truth.
@@ -782,6 +938,60 @@ fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs:
         if let Err(e) = inj.inject(m.clone()) {
             tracing::debug!(%e, "input arbiter: inject failed");
         }
+    }
+}
+
+/// FR-92 — run one keep-busy request against the ONE injector.
+///
+/// ⚠️ The injector is created lazily and then cached for the life of the
+/// process — a `NoopInjector` included. Remote control's first event used to
+/// be the only creator, and a session implies a display. Keep-busy may be
+/// first (a boot-time restore), so an injector without the OS's permission
+/// is answered for and NOT cached: a Noop cached before a display exists
+/// would silently break every later controller's input. (The engine also
+/// sends nothing before its host confirms an interactive session.)
+fn keep_busy_op(
+    state: &ArbiterState,
+    injector: &mut Option<Box<dyn super::InputInjector + Send>>,
+    op: KbOp,
+) -> KbReply {
+    if matches!(op, KbOp::Move { .. }) && state.any_button_held() {
+        return KbReply::RemoteButtonHeld;
+    }
+    if injector.is_none() {
+        let fresh = super::open_default();
+        if !fresh.has_permission() {
+            return classify_unpermitted(fresh);
+        }
+        *injector = Some(fresh);
+    }
+    let Some(inj) = injector.as_mut() else {
+        return KbReply::Unsupported;
+    };
+    if !inj.has_permission() {
+        return KbReply::NoPermission;
+    }
+    let result = match op {
+        KbOp::Locate => inj.cursor_px().map(|(x, y)| KbReply::Located(x, y)),
+        KbOp::Move { x, y } => inj.move_px(x, y).map(|()| KbReply::Moved),
+        KbOp::Buttons => inj.buttons_held().map(KbReply::Buttons),
+    };
+    result.unwrap_or_else(|e| {
+        if e.is::<super::PxUnsupported>() {
+            KbReply::Unsupported
+        } else {
+            KbReply::Failed(e.to_string())
+        }
+    })
+}
+
+/// An injector the OS has not granted: a Noop (no backend at all) has no
+/// pixel read either; a real backend without permission (macOS
+/// Accessibility) does.
+fn classify_unpermitted(mut inj: Box<dyn super::InputInjector + Send>) -> KbReply {
+    match inj.cursor_px() {
+        Err(e) if e.is::<super::PxUnsupported>() => KbReply::Unsupported,
+        _ => KbReply::NoPermission,
     }
 }
 
@@ -1324,5 +1534,46 @@ mod tests {
                 "the lowest surviving INPUT session must take the floor"
             );
         }
+    }
+
+    /// FR-92 — keep-busy is input: it needs the INPUT grant, the floor in
+    /// exclusive mode, and an org that allows it.
+    #[test]
+    fn keep_busy_needs_the_input_grant_the_floor_and_the_org() {
+        let mut st = ArbiterState::default();
+        let (a, b, viewer) = (sid(), sid(), sid());
+        let now = Instant::now();
+        st.open(a, "A".into(), true, Some(Mode::Exclusive), now);
+        st.open(b, "B".into(), true, None, now);
+        st.open(viewer, "V".into(), false, None, now);
+        assert_eq!(st.keep_busy_may_set(a), Ok("A".to_string()));
+        assert_eq!(
+            st.keep_busy_may_set(b),
+            Err(KeepBusyRefusal::NotFloorHolder)
+        );
+        assert_eq!(st.keep_busy_may_set(viewer), Err(KeepBusyRefusal::NoInput));
+        assert_eq!(st.keep_busy_may_set(sid()), Err(KeepBusyRefusal::Unknown));
+        assert!(st.set_mode(a, Mode::Free));
+        assert_eq!(st.keep_busy_may_set(b), Ok("B".to_string()));
+    }
+
+    /// FR-92 — a keep-busy move spliced into a controller's drag would drag
+    /// whatever they hold, so a held BUTTON blocks it. A held key does not.
+    #[test]
+    fn only_a_held_mouse_button_blocks_keep_busy_moves() {
+        let mut st = ArbiterState::default();
+        let a = sid();
+        let now = Instant::now();
+        st.open(a, "A".into(), true, None, now);
+        assert!(!st.any_button_held());
+        st.plan(a, &key(0x04, true), now);
+        assert!(!st.any_button_held(), "a held key is not a drag");
+        st.plan(a, &click(true), now);
+        assert!(st.any_button_held());
+        st.plan(a, &click(false), now);
+        assert!(!st.any_button_held());
+        st.plan(a, &click(true), now);
+        let _ = st.close(a);
+        assert!(!st.any_button_held(), "a closed session holds nothing");
     }
 }
