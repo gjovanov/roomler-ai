@@ -3830,6 +3830,14 @@ async fn handle_server_msg(
         ServerMsg::KeepBusyPolicy { denied } => {
             info!(org = %ctx.label, denied, "keep-busy: org policy received");
             crate::keep_busy::set_org_policy(tenant_id, denied);
+            // P3 — on a supervised Mac keep busy runs in the GUI worker,
+            // which hears no org itself: hand it every org's word (the
+            // strictest), now and on each attach. Deliberately NOT through
+            // `delegable_inbound`: that path is primary-only, and a
+            // secondary org's deny must reach the worker too.
+            if let Some(delegate) = delegate {
+                delegate.note_keep_busy_policy(tenant_id, denied);
+            }
         }
 
         // Remote config (docs/remote-config.md) — reconcile against a pushed

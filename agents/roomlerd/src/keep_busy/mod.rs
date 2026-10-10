@@ -30,6 +30,8 @@ pub mod wire;
 
 #[cfg(feature = "enigo-input")]
 mod arbiter_io;
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+mod host_mac;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 mod host_win;
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
@@ -61,14 +63,21 @@ pub fn remote_input_epoch() -> u64 {
     REMOTE_INPUT_EPOCH.load(Ordering::Relaxed)
 }
 
-/// Is keep-busy built for this host at all? Windows (FR-92 P1) and Linux
-/// X11 (P3); macOS follows. A Wayland desktop is detected at run time and
+/// Is keep-busy built for this host at all? Windows (FR-92 P1), Linux X11
+/// (P3a) and macOS (P3b). A Wayland desktop is detected at run time and
 /// reported `unavailable` with its reason — the cap word stays, so the
-/// viewer can say why. The cap word also needs the device owner's
-/// `keep_busy_enabled`.
+/// viewer can say why. On a supervised Mac BOTH processes run an engine: the
+/// GUI worker's is the one that moves (sessions are delegated to it), and
+/// the root daemon's waits as "nobody signed in" — it has no GUI session —
+/// while handing the worker the orgs' policy. The cap word also needs the
+/// device owner's `keep_busy_enabled`.
 pub fn supported_here() -> bool {
     cfg!(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        ),
         feature = "enigo-input"
     ))
 }
@@ -107,7 +116,7 @@ static DEVICE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// far from zero, so `t − idle` never underflows on a host that has been idle
 /// longer than this process has been up.
 #[cfg_attr(
-    not(all(target_os = "linux", feature = "enigo-input")),
+    not(all(any(target_os = "linux", target_os = "macos"), feature = "enigo-input")),
     allow(dead_code)
 )]
 pub(crate) fn mono_us() -> u64 {
@@ -336,8 +345,19 @@ fn run(
             &enrolled_tenants,
         );
     }
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    {
+        run_with(
+            engine,
+            rx,
+            out,
+            host_mac::MacHost::new(),
+            host_mac::warnings,
+            &enrolled_tenants,
+        );
+    }
     #[cfg(not(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     )))]
     {
@@ -378,7 +398,7 @@ pub fn person_switch(
 
 #[cfg_attr(
     not(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     )),
     allow(dead_code)
@@ -699,6 +719,85 @@ mod tests {
         assert_eq!(person_switch(true, true, false, None), Restore(None));
         // Nothing ran: nothing to adopt.
         assert_eq!(person_switch(false, true, true, None), Restore(None));
+    }
+
+    /// The code part of a line: what precedes a `//` comment. Comments name
+    /// the banned APIs on purpose — to say why they are not used.
+    fn code_of(line: &str) -> &str {
+        line.split("//").next().unwrap_or("")
+    }
+
+    /// FR-92 AC8 — keep busy tells a person from itself WITHOUT a hook, raw
+    /// input, a keyboard poll or an event tap: each is what a keylogger looks
+    /// like to EDR, and a GPO-locked desktop running EDR is in the acceptance
+    /// bar. This scans the module's own sources, every host included, and the
+    /// injector's keep-busy reads. The banned names are assembled at run time,
+    /// so this file cannot trip its own scan. Mouse BUTTON state may be read
+    /// (once per resume); the keyboard's never.
+    #[test]
+    fn no_keylogger_shaped_api_anywhere_in_keep_busy() {
+        let sources: [(&str, &str); 11] = [
+            ("mod.rs", include_str!("mod.rs")),
+            ("engine.rs", include_str!("engine.rs")),
+            ("patterns.rs", include_str!("patterns.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("wire.rs", include_str!("wire.rs")),
+            ("arbiter_io.rs", include_str!("arbiter_io.rs")),
+            ("logind.rs", include_str!("logind.rs")),
+            ("host_win.rs", include_str!("host_win.rs")),
+            ("host_x11.rs", include_str!("host_x11.rs")),
+            ("host_mac.rs", include_str!("host_mac.rs")),
+            (
+                "input/enigo_backend.rs",
+                include_str!("../input/enigo_backend.rs"),
+            ),
+        ];
+        let banned: Vec<String> = [
+            // Windows: hooks, raw input, keyboard state.
+            ["SetWindows", "HookEx"],
+            ["RegisterRaw", "InputDevices"],
+            ["GetRaw", "InputData"],
+            ["GetKeyboard", "State"],
+            // macOS: event taps, global monitors, HID managers.
+            ["CGEventTap", "Create"],
+            ["addGlobalMonitor", "ForEvents"],
+            ["IOHIDManager", "Create"],
+            // X11: the RECORD extension, raw XInput2 key events, keymap polls.
+            ["record_create", "_context"],
+            ["XRecord", "CreateContext"],
+            ["RawKey", "Press"],
+            ["query_", "keymap"],
+            ["XQuery", "Keymap"],
+            // Linux: reading input devices directly.
+            ["/dev/input/", "event"],
+        ]
+        .iter()
+        .map(|p| p.concat())
+        .collect();
+        let key_state = ["GetAsync", "KeyState"].concat();
+        for (name, src) in sources {
+            let lines: Vec<&str> = src.lines().map(code_of).collect();
+            for (i, code) in lines.iter().enumerate() {
+                for b in &banned {
+                    assert!(!code.contains(b.as_str()), "{name}:{}: uses {b}", i + 1);
+                }
+                // `GetAsyncKeyState` only ever with mouse buttons nearby: every
+                // `VK_` within six lines of it must be a BUTTON.
+                if code.contains(key_state.as_str()) {
+                    let lo = i.saturating_sub(6);
+                    let hi = (i + 7).min(lines.len());
+                    for near in &lines[lo..hi] {
+                        for tok in near.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            assert!(
+                                !tok.starts_with("VK_") || tok.contains("BUTTON"),
+                                "{name}:{}: {key_state} beside a keyboard key ({tok})",
+                                i + 1
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
