@@ -784,7 +784,7 @@ jobs:
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source,audio --test export
 
-      - name: The recorder's pointer on X11 (FR-85 P1d) — XFixes against a real X server
+      - name: The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11 — against a real X server
         # FR-85 P1d. XShm frames carry no pointer, so on X11 the recorder
         # draws it, from XFixes `GetCursorImage` placed by the monitor's origin
         # on the root window. A unit test cannot fake a server's answer, so
@@ -792,10 +792,22 @@ jobs:
         # reads back there, less its hotspot and less a monitor's origin.
         # ROOMLERD_TEST_X11 turns a missing server into a failure: the step
         # cannot pass by running nothing.
+        #
+        # FR-92 P3 — keep busy's X11 host, against the same Xvfb: XTest motion
+        # resets the MIT-SCREEN-SAVER idle counter; the whole engine
+        # calibrates and runs through the arbiter's own injector and keeps the
+        # server's idle near zero; a key typed by ANOTHER client pauses it.
+        # Both tests print an `x11-real:` line and both are grepped, so a
+        # filter that matched nothing cannot pass either. `--test-threads=1`:
+        # every test here shares ONE display, and to keep busy another test's
+        # pointer move IS a person (measured: in parallel it paused, correctly,
+        # 0.3 s in).
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
-          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture --lib capture::pointer -- --nocapture
+          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input --lib -- capture::pointer keep_busy::host_x11 --nocapture --test-threads=1 | tee /tmp/x11-tests.log
+          grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
+          grep -q "x11-real: ran with idle" /tmp/x11-tests.log
 
   rust:
     # The name the five lanes above shared when they were one job. It builds
