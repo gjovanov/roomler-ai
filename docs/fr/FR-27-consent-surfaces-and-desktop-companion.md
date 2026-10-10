@@ -323,7 +323,7 @@ in place of `Permission denied (os error 13)` for everything else.
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
 | 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on all three surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s. The Linux banner, where the companion reaches its daemon: 33 ms, 65.8 s held, 0.54 s Reconnect, 4.0 s drop. ⚠️ A Linux SYSTEM install's companion cannot reach its root daemon at all, so it has no banner and no Disconnect: #1911, which P11 fixes |
-| 11 | **The person at a Linux system install's screen reaches the daemon (#1911).** A socket in the person's own runtime dir, 0600 and theirs, admitting them or root (`SO_PEERCRED`), serving only the safety surface: status, the viewing sessions, their Disconnect, consent, and the recording state. It follows the active graphical session's user. The daemon's root-only socket is unchanged. Design above. Docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`, `docs/installation.md` | `ROOMLERD_PERSON_SOCKET=0` (the pre-P11 behaviour) | **implemented** — RED on record: 0.4.122, 2026-10-09 (the P10 Linux run: "Service offline", `Permission denied (os error 13)` for the person). GREEN owed on a vmtest system install with the socket untouched |
+| 11 | **The person at a Linux system install's screen reaches the daemon (#1911).** A socket in the person's own runtime dir, 0600 and theirs, admitting them or root (`SO_PEERCRED`), serving only the safety surface: status, the viewing sessions, their Disconnect, consent, and the recording state. It follows the active graphical session's user. The daemon's root-only socket is unchanged. Design above. Docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`, `docs/installation.md` | `ROOMLERD_PERSON_SOCKET=0` (the pre-P11 behaviour) | **field-verified on the 0.4.124 candidate** (2026-10-10, the log): RED on the released 0.4.123, then GREEN on the same vmtest system install after the upgrade, with the daemon's socket untouched and the companion left on 0.4.123. Ships in 0.4.124, whose tag waits on the operator's call on #1915, which rides with it |
 
 ## Acceptance criteria
 
@@ -434,18 +434,28 @@ Ticked only where a run is recorded in the field log below.
         on the throwaway guest to exercise the banner itself
 - **P11** — on a Linux **system** install with the daemon's socket untouched,
   the person at the screen reaches what is theirs and nothing else (#1911):
-  - [ ] the companion reads "Connected", not "Service offline", and as the
-        person `roomler status` answers
-  - [ ] the banner shows for a session, and its one-click Disconnect ends it as
-        `host_disconnect` (the P10 checks)
-  - [ ] as the person, an administrative verb (`roomler peers`, a `config set`)
+  - [x] the companion reads "Connected", not "Service offline", and as the
+        person `roomler status` answers — **the 0.4.124 candidate, 2026-10-10**
+        (the log): "● Connected" in the stream, where 0.4.123 read "Service
+        offline", on the unchanged 0.4.123 companion
+  - [x] the banner shows for a session, and its one-click Disconnect ends it as
+        `host_disconnect` (the P10 checks) — `host_disconnect` 32 ms after the
+        click, no break-glass beside the notice, 65.8 s held with no request,
+        the audit, Reconnect in 566 ms
+  - [x] as the person, an administrative verb (`roomler peers`, a `config set`)
         is refused with the pointer to `sudo`, and the daemon's own
-        `/var/run/roomler` socket is still 0700 / 0600 root
-  - [ ] the socket is the person's (0600, their uid), and it is gone after
-        they log out; it is never served for the greeter or for root
-  - [ ] docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`,
+        `/var/run/roomler` socket is still 0700 / 0600 root — both verbs
+        refused with the pointer; the root socket unchanged
+  - [x] the socket is the person's (0600, their uid), and it is gone after
+        they log out; it is never served for the greeter or for root —
+        `srw------- vmtest:vmtest`. It was gone 18 s after the logout,
+        removed by the daemon (the runtime dir survived). There was none in
+        the greeter's runtime dir. Root at the seat is by construction (`step()`
+        ignores uid 0, locked by `the_socket_follows_the_person_at_the_seat`);
+        GDM on this image refuses a root login, so it is not field-tested
+  - [x] docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`,
         `docs/installation.md`, and a row in `docs/README.md` if a new page is
-        added
+        added — all three in #1918; no new page, so no index row
 
 ## Deviations (accepted, recorded up front)
 
@@ -912,3 +922,46 @@ The click went to where the page showed the button.
 All three P10 surfaces now have field evidence: the macOS banner, the Windows badge, and
 the Linux banner where it can reach its daemon. On a Linux system install it cannot, and
 that is #1911.
+
+### 2026-10-10 — P11 on a Linux system install: RED on 0.4.123, GREEN on the 0.4.124 candidate
+
+The setup was one vmtest cell: Ubuntu 24.04, GNOME on Wayland, the installer `.deb`s, a **system** (root) daemon, kept with `--keep`.
+- **First, RED:** the released **0.4.123**.
+- **Then, GREEN:** the **0.4.124 candidate**, installed over it on the same guest. It came from rehearsal run 38008544269 of the bump branch, unsigned, with the `.deb`'s SHA-256 checked against its sidecar.
+- **The daemon's socket was never touched.**
+- **The companion stayed on the RELEASED 0.4.123 throughout.** P11 needs no companion change, since the companion already tries the person's own `$XDG_RUNTIME_DIR/roomler.sock` first. This run is the proof.
+
+| check | 0.4.123 (RED) | 0.4.124 candidate (GREEN) |
+|---|---|---|
+| the person socket | none | `/run/user/1000/roomler.sock`, `srw-------`, the person's (`vmtest:vmtest`) |
+| the daemon's own socket | `/var/run/roomler` `drwx------ root:root`, socket `srw------- root:root` | unchanged |
+| `roomler status` as the person | `Permission denied (os error 13)` | answers: the device, `version 0.4.124`, `mode service (SYSTEM)` |
+| `roomler peers`, and `roomler config set auto_update false`, as the person | `Permission denied (os error 13)` | refused with the pointer "… Everything else goes to the daemon's own socket — run `sudo roomler …`"; the config line is unchanged |
+| the companion, in the stream of a live session | "● Service offline", "Not enrolled yet" and "The Roomler service is not running on this computer right now" | "● Connected", naming the enrolled device |
+| the banner during a session | none | *"Being viewed by vmtest admin · keyboard + mouse"*, with Disconnect (mutter centres it, as on 10-09) |
+| one click on its Disconnect | — | see below |
+| the person logs out | — | see below |
+
+**One click on Disconnect (GREEN):**
+- `rc:terminate reason=host_disconnect` arrived **32 ms** after the click.
+- The notice showed with **no break-glass button** (#1917, live since the 00:32Z promote).
+- For the next **65.8 s** there were no `rc:session.request` messages.
+- The audit ends with `host_disconnect`.
+- Reconnect connected in **566 ms**.
+- An ordinary drop after that auto-reconnected in **4.0 s** with no click.
+
+**The person logs out (GREEN):**
+- The greeter (`gdm`, class greeter) took the seat.
+- **18 s** later the daemon logged `person socket: nobody at the seat now; closing uid=1000`, and the socket was gone.
+- `/run/user/1000` itself survived, because an SSH session held it. So the daemon removed the socket, not logind.
+- There was **no socket** in the greeter's `/run/user/124`.
+
+Not field-tested: root at the seat, since GDM on this image refuses a root login. `step()` ignores uid 0 by construction, locked by `the_socket_follows_the_person_at_the_seat`.
+
+Found: the socket's own lifecycle lines never reach the log.
+- **The lines exist.** `localapi: person-at-the-device socket up` / `… down` are emitted at info by the `roomler_localapi` crate.
+- **The filter drops them.** That target is below every default filter: `roomlerd=info,tunnel_core=info,warn` in the generated units, and the binary's own default adds only the daemon's pre-FR-21 target. Only roomlerd's `person socket: …` lines (a move, a stop, a failure) are seen.
+- **The result.** `ls`, not `roomler logs`, answers "is the person socket up?".
+- **Why it is a follow-up.** Units already on disk set `RUST_LOG` wholesale, so a fix there needs the care FR-21's rename of the daemon's own target did (`logging.rs`, `mirror_legacy_log_target`).
+
+The guest was destroyed by name afterwards.
