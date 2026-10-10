@@ -802,9 +802,10 @@ holds of the administrator groups is in §3.
 | AC4, first half: a primary cut off from the server stops calling the model after `offline_grace` | ✅ refused at 125 s, forwarded again after the reconnect | — | — |
 | AC5: an approval answered from a phone; the stub holds no tool arguments | ✅ | — | — |
 | AC6: a reader's message never reaches the harness | ✅ | — | — |
-| AC7: an update waits for a running turn, and logs it | ✅ a dry run, 80 s | ✅ a real install by the helper, 135 s | ✅ a real install, 140 s |
+| AC7: an update waits for a running turn, and logs it | ✅ a real install, 85 s (and a dry run, 80 s) | ✅ a real install by the helper, 135 s | ✅ a real install, 140 s |
 | AC8: a fact reaches the next session and not the running one ([`brain.md`](brain.md)) | ✅ | — | — |
 | AC20: a session survives a service restart, a restart at an approval and a crash; a changed gate ends it | ✅ | ✅ | ✅ |
+| AC20: a session survives an update's restart | ✅ 0.4.123 → 0.4.124, the codeword kept | not yet | not yet |
 | AC21: an adopted session is its owner's alone, and read only | ✅ | — | not built |
 | Decision 13: a session holds no administrator group and cannot `sudo` | ✅ `27(sudo)` gone, `sudo` refused | ⚠️ the group gone, `sudo` still allowed (§3) | — |
 | Decision 15: a Mac refuses a start as an account whose `sudo` needs no password | — | ✅ refused under a rule by user and by group; started with the owner's key, and on a Mac whose `sudo` asks | — |
