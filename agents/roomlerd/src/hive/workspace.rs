@@ -37,9 +37,6 @@
 //! ⚠️ A workspace that cannot be taken never fails the checkpoint. The config
 //! directory is what a resume needs, so the workspace is skipped, in words.
 
-// P2b-3's `hive-checkpoint` is its caller; until then only its tests run it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -93,7 +90,7 @@ impl Git {
     }
 
     #[cfg(test)]
-    fn under(ceiling: &Path) -> Self {
+    pub(crate) fn under(ceiling: &Path) -> Self {
         Self {
             program: PathBuf::from("git"),
             ceiling: Some(ceiling.to_path_buf()),
