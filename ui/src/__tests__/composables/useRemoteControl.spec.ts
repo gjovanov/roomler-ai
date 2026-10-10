@@ -1943,6 +1943,30 @@ describe('RC_RECONNECT_LADDER_MS', () => {
 })
 
 describe('parseControlInbound', () => {
+  it('FR-92: parses rc:keep-busy.state, and drops a malformed one', () => {
+    const r = parseControlInbound(
+      JSON.stringify({
+        t: 'rc:keep-busy.state',
+        rev: 3,
+        available: true,
+        on: true,
+        phase: 'running',
+        pattern: 'star',
+        size: 's',
+        speed: 'fast',
+        resume_after_s: 10,
+        warn: [],
+      }),
+    )
+    expect(r?.kind).toBe('keep_busy')
+    if (r?.kind === 'keep_busy') {
+      expect(r.state.on).toBe(true)
+      expect(r.state.pattern).toBe('star')
+      expect(r.state.resumeAfterS).toBe(10)
+    }
+    expect(parseControlInbound('{"t":"rc:keep-busy.state","on":"maybe"}')).toBeNull()
+  })
+
   it('parses rc:clock.echo (FR-1 P7) and rejects non-numeric fields', () => {
     const r = parseControlInbound('{"t":"rc:clock.echo","t0":1500,"agent_us":5000}')
     expect(r).toEqual({ kind: 'clock_echo', t0: 1500, agentUs: 5000 })
