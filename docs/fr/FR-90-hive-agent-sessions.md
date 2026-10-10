@@ -326,7 +326,7 @@ sequenceDiagram
     participant F as hosted.json
     participant N as roomlerd, next start
     participant S as server
-    Note over D,F: a launch writes the session's entry; a turn writes its number before its stub
+    Note over D,F: a launch writes the session's entry, and a turn writes its number before its stub
     D->>D: SIGTERM, an update, a requested restart: begin_shutdown()
     D--xD: the harness dies a moment later: kept, nothing reported
     N->>F: read this enrollment's entries
