@@ -618,13 +618,17 @@ jobs:
 
       - name: Rust cache
         # FR-6 wave 21 (#773): restores rust-recorder-audio's family and never
-        # saves one of its own. That lane builds these features plus `audio`,
-        # and `cargo tree` resolves the two graphs to the SAME features for
-        # every shared crate (the only differences: roomlerd itself, which
-        # always rebuilds, and the 7 audio-only crates). So its family is a
-        # strict superset of this lane's, and a second copy cost ~570 MB of the
-        # free 10 GB pool. Same workflow env ⇒ same env hash ⇒ the prefix
-        # restore finds it. rust-lint's cache step carries the general notes.
+        # saves one of its own; a second copy cost ~600 MB of the free 10 GB
+        # pool. That lane builds these features plus `audio`, and `cargo tree`
+        # resolves the two TEST graphs to the same features for every shared
+        # crate (only roomlerd and the 7 audio-only crates differ), so the
+        # tests here reuse it. NOT a full superset: this lane's non-test
+        # `cargo build -p roomlerd` (no dev-dependency features under resolver
+        # v2) needs tokio and ~25 dependents in a variant the audio lane never
+        # builds, and rebuilds them. Measured on #1939: 273 s for the lane
+        # against 221-295 s on master, off the CI critical path. Same workflow
+        # env ⇒ same env hash ⇒ the prefix restore finds the family.
+        # rust-lint's cache step carries the general notes.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:

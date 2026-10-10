@@ -194,8 +194,11 @@ itself on the affected run's page. Baseline when the program started: releases t
   the first was wrong. "Only ~167 MB" holds per family, but the copy is in EVERY family:
   179 MB (1,186 packages) × 12 ≈ 2.1 GB, a fifth of the pool.
   `.github/actions/cargo-cache-trim` drops the `.crate` archives before each save. The
-  plain recorder lane restores `recorder-audio`'s family and keeps none of its own (~570
-  MB): `cargo tree` resolves the two graphs to identical features for every shared crate.
+  plain recorder lane restores `recorder-audio`'s family and keeps none of its own (~600
+  MB). `cargo tree` resolves the two TEST graphs to identical features for every shared
+  crate. The lane's non-test `cargo build` still rebuilds tokio and ~25 dependents, in a
+  variant without dev-dependency features that the audio lane never builds. That cost was
+  within master's range (log).
 - **Resolved by wave 16 (merged 09-29, field-verified 10-01): a new CI step's dependency builds
   stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
   open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
@@ -453,3 +456,18 @@ itself on the affected run's page. Baseline when the program started: releases t
   - `cargo tree -p roomlerd -e normal,build,dev --target x86_64-unknown-linux-gnu`: the plain
     recorder graph and the `+audio` graph differ in roomlerd itself and 7 audio-only crates
     (alsa, alsa-sys, audiopus, audiopus_sys, cmake, cpal, dasp_sample), and in nothing else.
+    ⚠ That comparison covered the TEST graphs only. On the PR (run 38081437008) the plain
+    lane restored `v0-rust-ci-recorder-audio-…` and still compiled 40 crates against
+    master's 15. The extra 25 (tokio, hyper, reqwest, quinn, openssl, webrtc-dtls, …) are
+    the variant its non-test `cargo build -p roomlerd` needs: resolver v2 unifies no
+    dev-dependency features there, and the audio lane never builds it. The lane took 273 s
+    against 221–295 s over master's last six runs, off the CI critical path. The trim logged
+    `dropped 183 MB of .crate archives`.
+  - The 10 GB limit alone already made saves land again. Master run 38080443848 saved
+    `ci-recorder-audio` (`Sent 623761050 of 623761050 (100.0%)`), most families had fresh
+    entries from 19:24–19:54Z, and no budget warning appeared. But LRU evicted
+    `ci-unit` and `ci-lint` at once: two families absent from the 10-09 measurement
+    (`ci-integration` 1,124 MB and `installer-smoke-windows` 594 MB) make the full working
+    set ~13.4 GB, not 10.9. By that arithmetic wave 21's cuts leave ~10.4 GB, still over
+    the limit. The next cut is sized from the first master run's measured families, not
+    from this estimate.
