@@ -1072,24 +1072,19 @@ mod unix_priv {
     /// FR-90 decision 13 — the account as an agent session holds it.
     #[cfg(hive_host)]
     fn resolve_session(account: &str) -> Result<Account, String> {
-        // SAFETY: sysconf takes a constant and touches no memory of ours.
-        let max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
-        session_view(resolve(account)?, &admin_gids(), max)
+        session_view(resolve(account)?, &admin_gids())
     }
 
-    /// The pure half of [`resolve_session`]: no administrator group, and
-    /// fewer groups than `max` (the system's NGROUPS_MAX). Fewer, not at most:
-    /// `sudo` reads the process's own group list only while it is under that
-    /// maximum (its `group_source = adaptive`), and the group database, which
-    /// still names every group, once it is full. An account whose PRIMARY
-    /// group is an administrator group is refused, since everything its
-    /// session made would be that group's.
+    /// The pure half of [`resolve_session`]: none of the administrator
+    /// groups, so the kernel grants the session nothing by them: a docker or
+    /// libvirt socket, a disk device, macOS's admin-writable `/Applications`.
+    /// They are not what stops `sudo`. On Linux `no_new_privs` does that; on
+    /// macOS nothing does, because its `sudo` reads the account's groups from
+    /// the directory, never from the process (field-measured, FR-90 §8). An
+    /// account whose PRIMARY group is an administrator group is refused, since
+    /// everything its session made would be that group's.
     #[cfg(hive_host)]
-    fn session_view(
-        mut a: Account,
-        admin: &[libc::gid_t],
-        max: libc::c_long,
-    ) -> Result<Account, String> {
+    fn session_view(mut a: Account, admin: &[libc::gid_t]) -> Result<Account, String> {
         if admin.contains(&a.gid) {
             return Err(format!(
                 "{}'s primary group (gid {}) is an administrator group, and an agent session \
@@ -1098,12 +1093,6 @@ mod unix_priv {
             ));
         }
         a.groups.retain(|g| !admin.contains(g));
-        if let Ok(max) = usize::try_from(max)
-            && max > 1
-            && a.groups.len() >= max
-        {
-            a.groups.truncate(max - 1);
-        }
         Ok(a)
     }
 
@@ -1120,9 +1109,10 @@ mod unix_priv {
     /// FR-90 decision 13 — [`drop_to`] as an agent session runs: the account
     /// without its administrator groups, and on Linux with `no_new_privs` set,
     /// so nothing the session starts gains a privilege by exec. No setuid
-    /// `sudo`, whatever sudoers says of the account by name, and no file
-    /// capability. macOS has no such switch: a sudoers rule that names the
-    /// account still lets its session use it; one by group no longer does.
+    /// `sudo`, whatever sudoers says of the account, and no file capability.
+    /// macOS has no such switch, and its `sudo` reads groups from the
+    /// directory: a session there may use any rule its account may use
+    /// without a password, whether the rule names the account or a group.
     #[cfg(hive_host)]
     pub(super) fn drop_to_session(
         cmd: &mut tokio::process::Command,
@@ -1321,9 +1311,9 @@ mod unix_priv {
         use super::*;
 
         /// FR-90 decision 13 — an agent session holds none of its account's
-        /// administrator groups and fewer groups than NGROUPS_MAX, in order,
-        /// and an account whose primary group is one is refused; gid 0 is
-        /// always one, and this host's own root group resolves to it.
+        /// administrator groups and every other group, in order, and an
+        /// account whose primary group is one is refused; gid 0 is always
+        /// one, and this host's own root group resolves to it.
         #[cfg(hive_host)]
         #[test]
         fn an_agent_session_holds_no_administrator_group() {
@@ -1335,28 +1325,24 @@ mod unix_priv {
                 name: "a".into(),
             };
             let admin = [0, 80, 27];
-            let a = session_view(acct(20, vec![20, 12, 61, 80, 0, 33]), &admin, 16).unwrap();
+            let a = session_view(acct(20, vec![20, 12, 61, 80, 0, 33]), &admin).unwrap();
             assert_eq!(
                 a.groups,
                 vec![20, 12, 61, 33],
                 "macOS's admin and gid 0 leave, in order"
             );
-            let refused = session_view(acct(80, vec![80, 20]), &admin, 16).unwrap_err();
+            let refused = session_view(acct(80, vec![80, 20]), &admin).unwrap_err();
             assert!(
                 refused.contains("primary group (gid 80) is an administrator group"),
                 "{refused}"
             );
-            let full = session_view(acct(20, (100..116).collect()), &admin, 16).unwrap();
+            // A full list keeps every group: sudo never reads this list on
+            // macOS, so cutting one more would cost a group and stop nothing.
+            let sixteen: Vec<libc::gid_t> = (100..116).collect();
+            let full = session_view(acct(20, sixteen.clone()), &admin).unwrap();
             assert_eq!(
-                full.groups.len(),
-                15,
-                "a full list is cut below NGROUPS_MAX"
-            );
-            let unknown = session_view(acct(20, (100..120).collect()), &admin, -1).unwrap();
-            assert_eq!(
-                unknown.groups.len(),
-                20,
-                "a max the system did not give cuts nothing"
+                full.groups, sixteen,
+                "no group but an administrator one leaves"
             );
 
             assert!(admin_gids().contains(&0));
