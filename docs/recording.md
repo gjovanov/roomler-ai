@@ -221,14 +221,21 @@ but the recorder skipped would only be a courtesy.
 ```mermaid
 flowchart TD
     BYTES["a recording's first bytes"] --> WHO{"who runs the recorder?"}
-    WHO -->|"the person at the console<br/>— the recorder IS that user"| PROBE{"the chosen folder survives a real<br/>create + write + delete probe?"}
-    WHO -->|"nobody signed in<br/>— SYSTEM / root, unattended"| SVC["the daemon's OWN data dir,<br/>locked down: a protected DACL<br/>(SYSTEM + Administrators) or mode 0700.<br/>Never record_dir"]
-    PROBE -->|"yes"| INFOLDER["stage in &lt;folder&gt;/.roomler-partial/,<br/>create_new, no reparse / no symlink,<br/>rename into place on finish"]
-    PROBE -->|"no — OneDrive, Controlled Folder<br/>Access, or a read-only unit sandbox"| SPOOL["stage in the recorder's OWN data dir<br/>(same uid), reason named<br/>(onedrive / cfa / sandboxed);<br/>roomler-desktop, the same uid, moves it in"]
-    INFOLDER --> SIDE["the &lt;name&gt;.roomler.json sidecar beside it"]
-    SPOOL --> SIDE
-    SVC --> SIDE
+    WHO -->|"nobody signed in<br/>— SYSTEM / root, unattended"| SVC["the daemon's own folder (%PROGRAMDATA% on Windows),<br/>locked down: a protected DACL<br/>(SYSTEM + Administrators) or mode 0700;<br/>a link on the path is refused. Never record_dir"]
+    WHO -->|"the person at the console<br/>— the recorder IS that user"| CFG{"record_dir set, and it passes a real<br/>create + write + delete probe?"}
+    CFG -->|"yes"| STAGE["stage in &lt;folder&gt;/.roomler-partial/&lt;name&gt;.partial,<br/>create_new, rename into place on finish"]
+    CFG -->|"not set, or it failed the probe"| DEF{"Videos/Roomler: not under OneDrive<br/>or a network share, and passes the probe?"}
+    DEF -->|"yes"| STAGE
+    DEF -->|"no — OneDrive, Controlled Folder Access,<br/>a folder policy, the user unit's sandbox"| ALT{"~/Roomler Recordings<br/>passes the probe?"}
+    ALT -->|"yes"| STAGE
+    ALT -->|"no"| DATA["the recorder's own data dir<br/>(local, never roaming)"]
+    DATA --> STAGE
+    STAGE --> SIDE["the &lt;name&gt;.roomler.json sidecar beside it;<br/>the Recordings view shows why a fallback was taken"]
+    SVC --> STAGE
 ```
+
+Nothing moves a fallback's file back into the folder that refused it; that was
+weighed and deferred (below).
 
 - ⚠️ **The probe is a real write.** Defender's Controlled Folder Access lets
   `metadata()` succeed and then blocks the write. OneDrive's Known Folder Move
