@@ -710,12 +710,6 @@ jobs:
           path: ${{ runner.temp }}/msi-logs/
           retention-days: 7
 
-      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
-      # without the crate archives every family used to duplicate.
-      - name: Trim the cargo cache before it is saved
-        if: always()
-        uses: ./.github/actions/cargo-cache-trim
-
   # macOS had NO installer coverage at all until rc.454, and the platform
   # shipped for months with an install that could not work: the pkg payload was
   # the .app and nothing else (no CLI), the privileged half was gated on a
@@ -1225,11 +1219,5 @@ jobs:
           launchctl print system/com.roomler.update >/dev/null 2>&1 \
             || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
           echo "  opt-in restores the helper"
-
-      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
-      # without the crate archives every family used to duplicate.
-      - name: Trim the cargo cache before it is saved
-        if: always()
-        uses: ./.github/actions/cargo-cache-trim
 
 # RETIRED-NAME-ANCHOR-END
