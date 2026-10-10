@@ -16,8 +16,8 @@
 //! ⚠️ Asked AS ROOT, `sudo -l -U <account>`, never as the account. Listing
 //! another account's rules authenticates nobody. Asking as the account
 //! (`sudo -n -l`) would fail on every Mac whose `sudo` asks for a password,
-//! which is every Mac nobody changed, and leave "a password is required" in
-//! its log at every start.
+//! which is every Mac nobody changed, and have PAM try to authenticate the
+//! account at every start, in the unified log (field-measured, FR-90 §8).
 
 use roomler_ai_remote_control::hive::HiveRefusal;
 

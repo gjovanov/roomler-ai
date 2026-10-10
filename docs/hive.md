@@ -319,9 +319,11 @@ flowchart TD
 ```
 
 ⚠️ The check asks **as root**, never as the account. Listing another account's rules
-authenticates nobody. Asked as the account (`sudo -n -l`), it would fail on every Mac whose
-`sudo` asks for a password, the default, and log "a password is required" at every start. A
-Mac nobody changed lists `(ALL) ALL`, which asks, so it starts sessions as before.
+authenticates nobody: in the field the root listing left only directory lookups in the
+unified log. Asked as the account (`sudo -n -l`), it would fail on every Mac whose `sudo`
+asks for a password, the default, and have PAM try to authenticate the account at every
+start (`pam_sm_authenticate(): … Error obtaining the authtok`). A Mac nobody changed lists
+`(ALL) ALL`, which asks, so it starts sessions as before.
 
 The daemon never writes into a tree the account owns. It starts `/bin/sh -c` with a
 fixed script ([`WRAPPER`](../agents/roomlerd/src/hive/supervisor.rs#L93)) and
@@ -805,7 +807,7 @@ holds of the administrator groups is in §3.
 | AC20: a session survives a service restart, a restart at an approval and a crash; a changed gate ends it | ✅ | ✅ | ✅ |
 | AC21: an adopted session is its owner's alone, and read only | ✅ | — | not built |
 | Decision 13: a session holds no administrator group and cannot `sudo` | ✅ `27(sudo)` gone, `sudo` refused | ⚠️ the group gone, `sudo` still allowed (§3) | — |
-| Decision 15: a Mac refuses a start as an account whose `sudo` needs no password | — | not yet | — |
+| Decision 15: a Mac refuses a start as an account whose `sudo` needs no password | — | ✅ refused under a rule by user and by group; started with the owner's key, and on a Mac whose `sudo` asks | — |
 
 Linux ran on a throwaway stack (a local server, loopback TURN, a root daemon in WSL),
 macOS and Windows on throwaway VMs enrolled in the test organization on prod
