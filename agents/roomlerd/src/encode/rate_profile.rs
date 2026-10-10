@@ -1195,14 +1195,23 @@ mod tests {
     /// and cargo runs #[test] fns in parallel threads.
     #[test]
     fn codec_factor_defaults_and_env_override() {
+        // RELAY_ENV_LOCK, not "no other test touches these": `policy::tests`
+        // READS `RATE_FACTOR_HEVC` through `rate_plan` and pins the ceilings it
+        // produces, under this same lock. A write here between two of its reads
+        // flips them (factor 50 puts a relay ceiling under the 3 Mbps clamp).
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _saved = tunnel_core::env::test_env::Saved::cleared("RATE_FACTOR_HEVC");
         // Built-in matrix (2026-07-28: HEVC 100 → 125, field-measured).
         assert_eq!(codec_rate_factor_pct("H264"), 150);
         assert_eq!(codec_rate_factor_pct("HEVC"), 125);
         assert_eq!(codec_rate_factor_pct("VP9"), 125);
         assert_eq!(codec_rate_factor_pct("AV1"), 100);
 
-        // SAFETY: no other test in this crate touches these vars (set_var
-        // is unsafe in edition 2024 because of cross-thread env races).
+        // SAFETY: serialised by RELAY_ENV_LOCK against every test that reads
+        // `RATE_FACTOR_*` (set_var is unsafe in edition 2024 because of
+        // cross-thread env races).
         unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_HEVC", "140") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 140);
         // Clamped to 50–400.
@@ -1223,6 +1232,14 @@ mod tests {
     /// factor, clamped and garbage-tolerant like it. One fn on purpose: env.
     #[test]
     fn chroma_column_defaults_and_env_override() {
+        // Same lock as the codec column: `rate_plan` multiplies this factor in,
+        // so any `policy::tests` case at a VP9 4:4:4 cell would read what this
+        // writes. None exists today (they are all HEVC); the lock keeps that an
+        // accident nobody has to remember.
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _saved = tunnel_core::env::test_env::Saved::cleared("RATE_FACTOR_VP9_444");
         for codec in ["H264", "HEVC", "VP9"] {
             assert_eq!(chroma_rate_factor_pct(codec, false), 100);
             assert_eq!(chroma_rate_factor_pct(codec, true), 150);

@@ -1799,6 +1799,13 @@ mod tests {
     /// `Some(detect())` turns this red.) No other lib test fills the lock.
     #[test]
     fn not_probed_never_triggers_a_probe() {
+        // It reads `ENCODER_CELLS_DENY` twice (inside `summarize_cached` and
+        // in the final `assert_eq!`), and three tests rewrite that var under
+        // DENY_ENV_LOCK; without the lock, one of their writes can land
+        // between the two reads.
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let before = CACHED_CAPS.get().is_some();
         let summary = summarize_cached();
         let after = CACHED_CAPS.get().is_some();
