@@ -1186,6 +1186,19 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// FR-92 — keep busy's state, for the tray and `roomler keep-busy`.
+    async fn keep_busy_status(&self) -> Response {
+        Response::KeepBusy(crate::keep_busy::local_info(&crate::keep_busy::snapshot()))
+    }
+
+    /// FR-92 — the person at the machine stops keep busy. Waits (briefly)
+    /// for the engine, so the answer usually already reads "off".
+    async fn keep_busy_off(&self) -> Response {
+        let s = crate::keep_busy::stop_locally_and_wait(Duration::from_millis(800)).await;
+        tracing::info!(on = s.on, "localapi: keep busy stopped at this computer");
+        Response::KeepBusy(crate::keep_busy::local_info(&s))
+    }
+
     #[cfg(feature = "recording")]
     async fn recordings_list(&self) -> Response {
         match &self.recorder {

@@ -157,6 +157,41 @@ pub fn stop_locally() {
     });
 }
 
+/// [`stop_locally`], then wait (bounded) for the engine to say it is off, so
+/// the tray and the CLI can answer with the truth instead of a guess.
+pub async fn stop_locally_and_wait(timeout: Duration) -> Snapshot {
+    let Some(mut rx) = subscribe() else {
+        return snapshot();
+    };
+    stop_locally();
+    let _ = tokio::time::timeout(timeout, async {
+        while rx.borrow_and_update().on {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    snapshot()
+}
+
+/// The LocalAPI's view of a snapshot (`roomler keep-busy status`, the tray).
+pub fn local_info(s: &Snapshot) -> tunnel_core::localapi::KeepBusyInfo {
+    tunnel_core::localapi::KeepBusyInfo {
+        available: s.available,
+        on: s.on,
+        phase: s.phase.wire().into(),
+        reason: s.reason.map(|r| r.wire().into()),
+        sentence: s.reason.map(|r| r.sentence().into()),
+        paused_by: s.paused_by.map(|p| p.wire().into()),
+        resumes_in_ms: s.resumes_in.map(|d| d.as_millis() as u64),
+        pattern: s.settings.pattern.wire().into(),
+        set_by: s.set_by.clone(),
+        set_at_ms: s.set_at_ms,
+        auto_off_at_ms: s.settings.auto_off_at_ms,
+    }
+}
+
 /// The owner's `keep_busy_enabled` changed (it is a live key).
 pub fn set_device_enabled(enabled: bool) {
     DEVICE_ENABLED.store(enabled, Ordering::Relaxed);
