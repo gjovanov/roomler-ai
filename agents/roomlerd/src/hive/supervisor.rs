@@ -2141,6 +2141,9 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
 /// P1i-2 — a session's runtime directory on Windows, under a root that is
 /// SYSTEM's and Administrators' alone; the session's own directory is also
 /// readable by its account (`peer`). Each launch gives each its DACL again.
+/// P1i-4 — the account may examine the two above it, and nothing more
+/// ([`crate::hive_win::PRIVATE_DIR_SDDL`]): Claude Code refuses a settings
+/// file whose path it cannot examine.
 #[cfg(windows)]
 fn session_dir(runtime: &Path, dir: &Path, peer: &str) -> Result<(), String> {
     use crate::hive_win::{PRIVATE_DIR_SDDL, dir_with_dacl, session_dir_sddl};
@@ -5039,5 +5042,83 @@ done
         assert!(!config_claude_md(&r, sid).exists());
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+}
+
+/// P1i-4 — a session's directories on Windows, as the session's own account
+/// meets them: a restricted Medium copy of this process's token, its
+/// Administrators group deny-only, on a thread of its own.
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+
+    /// Examine `p` as libuv's `lstat` does (Claude Code is a Bun build, whose
+    /// file system on Windows is libuv's): `FILE_READ_ATTRIBUTES`, with backup
+    /// semantics so a directory opens, and the reparse point itself.
+    fn examine(p: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(p)
+    }
+
+    /// Field-found on Windows 11: Claude Code examines each component of its
+    /// `--settings` path, and refused the session's file because its account
+    /// could examine neither the store's directory nor the runtime root.
+    #[test]
+    fn a_sessions_account_examines_the_directories_on_its_way_and_lists_none() {
+        let base = tempfile::tempdir().unwrap();
+        let runtime = base.path().join("hive").join("run");
+        let hive = runtime.parent().unwrap().to_path_buf();
+        let me = crate::win_token::own_user_sid().unwrap();
+        let mine = runtime.join("s1");
+        session_dir(&runtime, &mine, &me).unwrap();
+        let settings = mine.join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        // Another session's, run as another account (LocalService).
+        let theirs = runtime.join("s2");
+        session_dir(&runtime, &theirs, "S-1-5-19").unwrap();
+
+        let (examined, listed, other) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let token = crate::win_token::restricted_medium_copy().unwrap();
+                // SAFETY: a live token opened for impersonation; the thread is
+                // this test's alone, and reverts before it ends.
+                assert_ne!(unsafe { ImpersonateLoggedOnUser(token.raw()) }, 0);
+                // The test's own folder first: proof the thread really is that
+                // account, since an impersonation Windows refused fails every
+                // open, not just the ones under test.
+                let own = base.path().to_path_buf();
+                let examined: Vec<(String, Result<(), String>)> =
+                    [&own, &hive, &runtime, &mine, &settings]
+                        .into_iter()
+                        .map(|p| {
+                            let r = examine(p).map(drop).map_err(|e| e.to_string());
+                            (p.display().to_string(), r)
+                        })
+                        .collect();
+                let listed = [&hive, &runtime].map(|p| std::fs::read_dir(p).is_ok());
+                let other = examine(&theirs).is_ok();
+                // SAFETY: ends this thread's impersonation.
+                assert_ne!(unsafe { RevertToSelf() }, 0);
+                (examined, listed, other)
+            })
+            .join()
+            .unwrap()
+        });
+        for (p, r) in &examined {
+            assert!(r.is_ok(), "the session's account cannot examine {p}: {r:?}");
+        }
+        assert_eq!(
+            listed,
+            [false, false],
+            "it lists neither the store nor the runtime root"
+        );
+        assert!(!other, "nor examines another session's directory");
     }
 }
