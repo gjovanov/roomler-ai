@@ -1070,6 +1070,41 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled.value = resp.remote_ssh_enabled
   }
 
+  // ── FR-92 — keep busy, the org deny ─────────────────────────────
+  //
+  // Keep busy is ON by default; an org owner can deny it org-wide (some
+  // orgs ban mouse jigglers because they defeat a screen-lock policy). The
+  // device enforces it and a deny also stops one already running.
+
+  /** Whether the org DENIES keep busy. `null` until fetched / on a 403 —
+   *  same "not an admin ≠ a value" rule as the exec and SSH switches. */
+  const orgKeepBusyDenied = ref<boolean | null>(null)
+
+  async function fetchOrgKeepBusyDenied(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgKeepBusyDenied.value = null
+      return
+    }
+    try {
+      const resp = await api.get<{ keep_busy_denied: boolean }>(
+        `/tenant/${tenantId}/keep-busy-settings`,
+      )
+      orgKeepBusyDenied.value = resp.keep_busy_denied
+    } catch {
+      orgKeepBusyDenied.value = null
+    }
+  }
+
+  /** Set the deny. MANAGE_TENANT server-side; pushed to online devices at
+   *  once and to the rest at their next connect. */
+  async function setOrgKeepBusyDenied(tenantId: string, denied: boolean) {
+    const resp = await api.put<{ keep_busy_denied: boolean }>(
+      `/tenant/${tenantId}/keep-busy-settings`,
+      { keep_busy_denied: denied },
+    )
+    orgKeepBusyDenied.value = resp.keep_busy_denied
+  }
+
   // ── FR-51 — ephemeral enrollment keys ────────────────────────────
   //
   // A reusable credential that mints self-removing devices (CI runners,
@@ -1296,6 +1331,9 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled,
     fetchOrgSshEnabled,
     setOrgSshEnabled,
+    orgKeepBusyDenied,
+    fetchOrgKeepBusyDenied,
+    setOrgKeepBusyDenied,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,

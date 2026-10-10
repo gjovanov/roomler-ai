@@ -3822,6 +3822,16 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-92 — this org's keep-busy policy (on every connect, and on
+        // change). Honoured from EVERY org, not just the primary: a deny is
+        // the safe direction, and the device applies the strictest of all its
+        // orgs — any one org's deny stops keep busy here and refuses it until
+        // that org allows it again. Persisted, so it holds at boot.
+        ServerMsg::KeepBusyPolicy { denied } => {
+            info!(org = %ctx.label, denied, "keep-busy: org policy received");
+            crate::keep_busy::set_org_policy(tenant_id, denied);
+        }
+
         // Remote config (docs/remote-config.md) — reconcile against a pushed
         // desired state, then SAY what happened.
         //

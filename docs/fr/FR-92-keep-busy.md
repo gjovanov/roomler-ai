@@ -224,8 +224,16 @@ stateDiagram-v2
   - **Standing:** reconciled on connect after `ConfigPush` (both `true` and `false`, so a re-allow while
     offline clears), and pushed on change through `publish_rc_ctrl` → an `apply_rc_ctrl` arm, because
     the PUT can land on any pod. Both are cap-gated (`supports_keep_busy`).
+  - **The word reappearing counts as a connect.** When the owner turns `keep_busy_enabled` back
+    on, the agent re-announces its caps on a heartbeat, and the policy is pushed then. Without
+    this, a deny made while the word was absent would never arrive. It is pushed only on the
+    reappearance: caps are also re-announced for the record word and for a worker's permissions.
   - **On the agent:** the effective deny is the strictest of every enrolled org's last-known deny,
     persisted. An old server (no push) means allowed.
+  - **An org the device has left drops out.** At each start, a stored policy from an org that is
+    no longer the primary or in `[[orgs]]` is dropped (`prune_departed_orgs`). Otherwise leaving
+    an org that had denied keep busy would deny it on that device for good, because no server
+    would ever push that org's re-allow.
   - **Device-wide, so no per-session field.** Under strictest-of a deny is device-wide, and the
     engine itself refuses every enable while it holds (`org_denied`, to every viewer). The connect
     reconcile reaches the agent before any session request, and a change is pushed at once. A
@@ -270,8 +278,8 @@ stateDiagram-v2
 | P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | #1948, merged `a9fc3f0de` |
 | P2 | Viewer: composable, menu, previews, chip | the cap word | #1949, merged `28fd63c19` |
 | P3 | macOS + X11 hosts and their keep-busy-only lock probes; Wayland and portal reported `unavailable` | per-host cap word | — |
-| P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | PR open |
-| P5 | Org deny: tenant key, routes, admin UI, `Request` field, connect + cross-pod push, delegation forwarding; heartbeat brief, badge, audit | the org switch (default allowed) | — |
+| P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | #1951, merged `51dfd2466` |
+| P5 | Org deny: tenant key, routes, admin UI; a standing `rc:agent.keep_busy_policy` on every connect and on every change, across pods. No per-session `Request` field (§3f). Forwarding to a supervised Mac's worker moves to P3. Deferred to P5b: the heartbeat brief, the device-list badge, the audit | the org switch (default allowed) | PR open |
 | P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | — |
 
 ## 5. Acceptance criteria

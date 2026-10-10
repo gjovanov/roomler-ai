@@ -427,6 +427,23 @@ describe('useAgentStore', () => {
     expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/ssh-settings`)
   })
 
+  it('FR-92: the keep-busy org switch is a DENY, read and set on its own route', async () => {
+    mockApi.get.mockResolvedValueOnce({ keep_busy_denied: false })
+    asOwner()
+    const s = useAgentStore()
+    await s.fetchOrgKeepBusyDenied(TENANT_ID)
+    expect(s.orgKeepBusyDenied).toBe(false)
+    expect(s.orgSshEnabled).toBeNull()
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/keep-busy-settings`)
+    mockApi.put.mockResolvedValueOnce({ keep_busy_denied: true })
+    await s.setOrgKeepBusyDenied(TENANT_ID, true)
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/keep-busy-settings`,
+      { keep_busy_denied: true },
+    ])
+    expect(s.orgKeepBusyDenied).toBe(true)
+  })
+
   it('a 403 on the ssh org switch leaves it UNKNOWN, not "off"', async () => {
     mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
     asOwner()
@@ -447,6 +464,7 @@ describe('useAgentStore', () => {
   it.each([
     ['exec', 'fetchOrgExecEnabled', 'orgExecEnabled'],
     ['ssh', 'fetchOrgSshEnabled', 'orgSshEnabled'],
+    ['keep-busy', 'fetchOrgKeepBusyDenied', 'orgKeepBusyDenied'],
     ['ephemeral-keys', 'fetchOrgEphemeralKeysEnabled', 'orgEphemeralKeysEnabled'],
   ] as const)(
     'the %s org switch is NOT fetched without MANAGE_TENANT',

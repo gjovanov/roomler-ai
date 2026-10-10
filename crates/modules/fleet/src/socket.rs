@@ -151,6 +151,8 @@ pub async fn handle_agent_socket(
     // FR-90 P1j — and mirrors adopted terminal sessions; `hive` is its
     // prefix too.
     let adopts_hive = caps.has_rpc(RpcCap::HiveAdopt);
+    // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
+    let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -165,6 +167,9 @@ pub async fn handle_agent_socket(
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
     state.rc_hub.set_agent_record_support(agent_id, records);
+    state
+        .rc_hub
+        .set_agent_keep_busy_support(agent_id, supports_keep_busy);
     state.rc_hub.set_agent_hive_support(agent_id, runs_hive);
     state
         .rc_hub
@@ -263,6 +268,13 @@ pub async fn handle_agent_socket(
                  rc:agent.config; update it or apply the config locally"
             );
         }
+    }
+
+    // FR-92 — the org's keep-busy policy, on EVERY connect and BOTH ways: a
+    // re-allow made while the device was offline must clear the deny it
+    // persisted. Cap-gated (equality) — a pre-FR-92 agent cannot parse it.
+    if supports_keep_busy {
+        push_keep_busy_policy_on_connect(&state, tenant_id, agent_id, &registered_tx).await;
     }
 
     // FR-40 — reconcile-on-connect for a rotation order the device has not
@@ -594,6 +606,26 @@ pub async fn handle_agent_socket(
                                         agent_id,
                                         crate::hub::RecordSupport::from_caps(caps),
                                     );
+                                    // FR-92 — the owner re-allowed keep busy on
+                                    // the device, so its word reappeared: hand it
+                                    // the org's policy NOW, or a deny made while
+                                    // the word was absent would never reach it.
+                                    // Only on the reappearance — caps are also
+                                    // re-announced for the record word and the
+                                    // worker's permissions.
+                                    let keep_busy = advertises_keep_busy(caps);
+                                    let had_keep_busy = state
+                                        .rc_hub
+                                        .set_agent_keep_busy_support(agent_id, keep_busy);
+                                    if keep_busy && !had_keep_busy {
+                                        push_keep_busy_policy_on_connect(
+                                            &state,
+                                            tenant_id,
+                                            agent_id,
+                                            &registered_tx,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 if let Err(e) = state
                                     .agents
@@ -996,6 +1028,34 @@ pub async fn pump_server_messages(
         let mut guard = socket_tx.lock().await;
         if guard.send(Message::text(json)).await.is_err() {
             break;
+        }
+    }
+}
+
+/// FR-92 — does this agent parse the org's keep-busy policy? Equality on
+/// `AgentCaps.input`, never a prefix match.
+fn advertises_keep_busy(caps: &roomler_ai_remote_control::models::AgentCaps) -> bool {
+    caps.input.iter().any(|w| w == "keep-busy")
+}
+
+/// FR-92 — read the org's keep-busy deny and hand it to this connection.
+/// A failed read sends nothing: the device keeps the value it persisted,
+/// which is the conservative outcome for a deny and an allow alike.
+async fn push_keep_busy_policy_on_connect(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    tx: &mpsc::Sender<ServerMsg>,
+) {
+    match state.tenants.base.find_by_id(tenant_id).await {
+        Ok(t) => {
+            let denied = t.settings.keep_busy_denied;
+            if tx.try_send(ServerMsg::KeepBusyPolicy { denied }).is_err() {
+                debug!(%agent_id, "keep-busy: policy not queued (connection closing)");
+            }
+        }
+        Err(e) => {
+            warn!(%agent_id, %e, "keep-busy: tenant read failed — org policy not pushed");
         }
     }
 }
