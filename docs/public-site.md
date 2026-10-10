@@ -109,7 +109,17 @@ a name that changes with its content, so every file the generator publishes is
 revalidated on every load (`expires -1`, §5), and it is what moves a reader to new bytes.
 
 - The search index is hashed too; its URL reaches `search.js` through `data-search-index`.
+- The top bar's logo is hashed the same way: the generator publishes the SPA's own
+  `ui/src/assets/brand/roomler-logo.svg` (`logo` in `SiteAssets`), so the two never drift.
 - `social-preview.png` keeps a stable name: `ui/index.html` names it as the SPA's `og:image`.
+  It is final artwork from the brand kit, as is the repo root's copy that GitHub shows; there
+  is no source to re-render it from.
+- **The favicon set keeps root paths** (`ui/public/`: `favicon.svg`, `favicon.ico`,
+  `apple-touch-icon.png`, the manifest and its icons), because browsers ask for
+  `/favicon.ico` and `/apple-touch-icon.png` on their own. ⚠️ Those names fall under the same
+  year-long `immutable` rule, so a returning visitor keeps an old icon after its bytes change.
+  `favicon.svg` is linked as `/favicon.svg?v=2` from both `ui/index.html` and
+  `theme/shell.ts`; bump the `v` in both when the file changes.
 - `LEGACY_UNHASHED_ASSETS` ([`site.ts:38`](../ui/docs/site.ts)), when on, also publishes each
   file under its old plain name, for HTML a browser cached before revalidation began. Pre-FR-87
   HTML carried no `Cache-Control` at all, so a browser could hold it under heuristic caching

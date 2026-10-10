@@ -6,7 +6,7 @@
     <!-- Navbar -->
     <v-app-bar flat color="transparent" class="landing-nav">
       <v-toolbar-title class="font-weight-bold text-h5">
-        <span class="text-primary">Roomler</span>
+        <img :src="BRAND_LOGO_LIGHT" alt="Roomler" width="127" height="36" class="landing-brand-logo" />
       </v-toolbar-title>
       <v-spacer />
       <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
@@ -207,6 +207,7 @@ import { useRoute } from 'vue-router'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
+import { BRAND_LOGO_LIGHT } from '@/composables/useBrand'
 import { enrollCommands } from '@/utils/enrollCommands'
 import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, type Plan } from '@/utils/landing'
 
@@ -261,6 +262,12 @@ onMounted(async () => {
 .landing-page {
   background: linear-gradient(180deg, #f5faf9 0%, #ffffff 40%);
   color: #1a1a2e;
+}
+/* The page forces the light theme, so the light lockup always fits. */
+.landing-brand-logo {
+  display: block;
+  height: 36px;
+  width: auto;
 }
 
 .landing-nav {

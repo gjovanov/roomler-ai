@@ -27,10 +27,8 @@
         title=""
         @click="rail = false"
       />
-      <v-list-item v-else title="Roomler" style="cursor: pointer" @click="goHome">
-        <template #prepend>
-          <v-icon color="primary">mdi-forum</v-icon>
-        </template>
+      <v-list-item v-else style="cursor: pointer" @click="goHome">
+        <img :src="brandLogo" alt="Roomler" width="113" height="32" class="app-brand-logo" />
         <template v-if="!mobile" #append>
           <v-btn
             icon="mdi-chevron-double-left"
@@ -606,6 +604,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
+import { useBrand } from '@/composables/useBrand'
 import SpotlightTour from '@/components/tutorial/SpotlightTour.vue'
 import { useSpotlightTour } from '@/composables/useSpotlightTour'
 import { usePageViews } from '@/composables/usePageViews'
@@ -680,6 +679,7 @@ watch(
 )
 const router = useRouter()
 const theme = useTheme()
+const { logo: brandLogo } = useBrand()
 
 const isOnCallPage = computed(() => route.name === 'room-call')
 
@@ -1133,6 +1133,13 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* The brand row: the lockup (symbol + wordmark) at the row's icon height. */
+.app-brand-logo {
+  display: block;
+  height: 32px;
+  width: auto;
+}
+
 /* The nav's scrollbar was the OS default — thick and permanently visible
    once Devices is expanded. Thin overlay style instead, thumb shown only
    while the pointer is over the drawer. The 6px webkit width stays

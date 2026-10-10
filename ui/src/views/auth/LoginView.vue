@@ -6,7 +6,7 @@
       <v-col cols="12" sm="8" md="4">
         <v-card class="pa-3 pa-md-4">
           <v-card-title class="text-center text-h5 mb-4">
-            <v-icon color="primary" class="mr-2">mdi-forum</v-icon>
+            <img :src="brandMark" alt="" width="28" height="28" class="mr-2" style="vertical-align: middle" />
             {{ $t('auth.login') }}
           </v-card-title>
 
@@ -77,6 +77,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
+import { useBrand } from '@/composables/useBrand'
 import { carriedQuery, signupAttribution, startOAuth, type Landing } from '@/utils/attribution'
 
 const auth = useAuthStore()
@@ -84,6 +85,7 @@ const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()
 const { rules } = useValidation()
+const { mark: brandMark } = useBrand()
 
 const formRef = ref()
 const username = ref('')
