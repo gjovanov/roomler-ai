@@ -200,6 +200,12 @@ fn save_unchecked(path: &Path, s: &Stored) -> std::io::Result<()> {
 /// (`session_user_profile_dir`, SeTcb), the same file the user-context
 /// worker writes through its own `project_dirs()`, and reads and writes it
 /// AS that user ([`load_from`], [`save_to`]).
+///
+/// Linux, root daemon: the person signed in at our display (logind), stored
+/// under ROOT's own data dir as `keep-busy-<uid>.json` — never in their home.
+/// A root write into a directory the person controls can be steered by a
+/// link they plant (the symlink-to-`/etc/shadow` class); a file in root's
+/// directory cannot. `None` while nobody is signed in (a greeter is nobody).
 pub fn default_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -210,7 +216,72 @@ pub fn default_path() -> Option<PathBuf> {
             );
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if is_root() {
+            let person = super::logind::session_for_display(None).filter(|s| s.is_user())?;
+            return crate::appdirs::project_dirs()
+                .map(|d| d.data_local_dir().join(root_store_name(person.uid)));
+        }
+    }
     crate::appdirs::project_dirs().map(|d| d.data_local_dir().join(FILE_NAME))
+}
+
+/// A root daemon's store for the person with `uid`.
+pub fn root_store_name(uid: u32) -> String {
+    format!("keep-busy-{uid}.json")
+}
+
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Can the person signed in change under this running process? A Windows
+/// SystemContext worker serves whoever is at the console, and a root Linux
+/// daemon outlives every login; a user-context worker, a per-user daemon
+/// and a macOS GUI worker each run AS one person for their whole life.
+pub fn person_can_change() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win_identity::process_is_local_system()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        is_root()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Did anyone leave keep busy on, so that a login has something to
+/// restore? Only a root Linux daemon can answer cheaply (every person's
+/// store is in its own directory) and needs to: finding the person there
+/// spawns `loginctl`. Elsewhere the answer is "maybe".
+pub fn someone_left_it_on() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if is_root() {
+            return crate::appdirs::project_dirs()
+                .is_some_and(|d| any_left_on_in(d.data_local_dir()));
+        }
+    }
+    true
+}
+
+/// Any `keep-busy-<uid>.json` in `dir` that is on?
+pub fn any_left_on_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("keep-busy-") && name.ends_with(".json") && load_from(&e.path()).on
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +307,38 @@ mod tests {
             std::env::temp_dir().join(format!("roomlerd-keep-busy-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join(FILE_NAME)
+    }
+
+    /// A root daemon keeps one store per person, in its own directory, and
+    /// can tell without asking logind whether any of them is on.
+    #[test]
+    fn a_root_daemon_keeps_each_persons_store_apart() {
+        assert_eq!(root_store_name(1000), "keep-busy-1000.json");
+        let dir = tmp("root").parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!any_left_on_in(&dir), "nothing stored");
+        save_to(
+            &dir.join(root_store_name(1000)),
+            &Stored::default().with_activation(None),
+        )
+        .unwrap();
+        assert!(!any_left_on_in(&dir), "stored, but off");
+        save_to(
+            &dir.join(FILE_NAME),
+            &Stored::default().with_activation(Some(&act())),
+        )
+        .unwrap();
+        assert!(
+            !any_left_on_in(&dir),
+            "a per-user daemon's own file is nobody's per-person store"
+        );
+        save_to(
+            &dir.join(root_store_name(1001)),
+            &Stored::default().with_activation(Some(&act())),
+        )
+        .unwrap();
+        assert!(any_left_on_in(&dir));
+        assert!(!any_left_on_in(&dir.join("missing")));
     }
 
     #[test]
