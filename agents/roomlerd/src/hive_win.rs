@@ -788,7 +788,20 @@ pub unsafe fn run_prep(who: SpawnAs, cmdline: &str, timeout: Duration) -> Result
 /// a daemon that runs as SYSTEM or as an elevated administrator. A session's
 /// restricted Medium token, whose Administrators group is deny-only, reads none
 /// of it.
-pub const PRIVATE_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+///
+/// P1i-4 — except one grant, on the directory itself: `FILE_READ_ATTRIBUTES |
+/// SYNCHRONIZE` (`0x100080`) for Authenticated Users, inherited by nothing.
+/// Both directories lie on the way to every session's files
+/// (`…\hive\run\<sid>\settings.json`), and Claude Code examines each component
+/// of a path it is handed and refuses the file when one cannot be examined:
+/// "Refusing to read a file whose path could not be vetted". Field-found on
+/// Windows 11, Claude Code 2.1.296, which `FILE_READ_ATTRIBUTES` alone let
+/// through; `SYNCHRONIZE` too, because `CreateFileW` asks for it with every
+/// synchronous open, libuv's `lstat` and Rust's among them. The grant is a stat
+/// of the directory alone: it lists nothing, so the sessions' ids stay unknown,
+/// and another session's directory stays unexaminable, its own DACL granting
+/// only its account.
+pub const PRIVATE_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x100080;;;AU)";
 
 /// A session's own runtime directory: its account (`peer`) may also list,
 /// traverse and read it (`0x1200a9`) for its settings, its MCP config and its
