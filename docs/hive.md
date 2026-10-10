@@ -73,7 +73,7 @@ in the device's store and in no Mongo document, object-store file, server log li
 or frame the server sent the browser. It found one leak when it was written: the
 `ended` detail carried the harness's last 400 bytes of stderr to the server. Those
 are a note in the transcript now, and the server hears only how the harness ended
-([`describe_end`](../agents/roomlerd/src/hive/supervisor.rs#L2988)).
+([`describe_end`](../agents/roomlerd/src/hive/supervisor.rs#L2996)).
 
 **Statuses.** The record mirrors what the device reports. Every transition a device
 drives is a compare-and-set on the session's device (the authenticated socket's,
@@ -104,7 +104,7 @@ ends, and a report for a turn older than the newest stub changes nothing
 
 The cost is what that turn cost. Claude Code's `total_cost_usd` is its process's
 running total, so the device subtracts what the process had spent at the previous
-turn's end ([`supervisor.rs:2641`](../agents/roomlerd/src/hive/supervisor.rs#L2641)).
+turn's end ([`supervisor.rs:2649`](../agents/roomlerd/src/hive/supervisor.rs#L2649)).
 
 **The transcript** is a hash chain ([`chain.rs`](../crates/hive-node/src/chain.rs)).
 Each event carries the session's `seq` (gapless from 1), the `fence` of the lease
@@ -239,6 +239,7 @@ Hive key appears in a serialised `DesiredConfig`. The user-facing reference is
 | `hive_update_wait_secs` | 1800 | how long an update waits for running turns; `0` never waits (§7) |
 | `hive_core_memory` | off | show the org's core memory to the sessions here ([`brain.md`](brain.md)) |
 | `hive_adopt` | off | let this device's people adopt their terminal sessions; off on Windows whatever it says (§8) |
+| `hive_allow_passwordless_sudo` | off | macOS: run sessions as an account whose `sudo` needs no password, which gives them root; off, such a start is refused (§3) |
 
 ### Who may drive
 
@@ -258,7 +259,7 @@ the harness, over that driver's own viewer peer.
 |---|---|---|
 | Naming a driver is the owner's alone, and the person must hold `HIVE_RUN`. At most 16 besides the owner, held by the update's own filter | driving runs code on the device as the session's account, since a driver answers approvals too | [`participants.rs:196`](../crates/modules/hive/src/participants.rs#L196) |
 | A change ends the person's open views (`role_changed`), and the view they reopen is minted afresh | a grant carries `may_prompt` as it was minted | server [`view.rs:597`](../crates/modules/hive/src/view.rs#L597) |
-| ⚠️ The device decides whom it lets act as its account. A driver other than the starter prompts and answers only when the device's own `hive_accounts` maps them to the account the session runs as; otherwise the view is read only, and `hello` says why (`driving_refused`). The starter is recognised by id, from the start order, never through the map | the gate that survives a wrong server (decision 8). A server before P1c-2 sends no address, and the starter must not be locked out of their own session | [`drives_here`](../agents/roomlerd/src/hive/supervisor.rs#L929) |
+| ⚠️ The device decides whom it lets act as its account. A driver other than the starter prompts and answers only when the device's own `hive_accounts` maps them to the account the session runs as; otherwise the view is read only, and `hello` says why (`driving_refused`). The starter is recognised by id, from the start order, never through the map | the gate that survives a wrong server (decision 8). A server before P1c-2 sends no address, and the starter must not be locked out of their own session | [`drives_here`](../agents/roomlerd/src/hive/supervisor.rs#L937) |
 | The model reads who asked, as `[Name] text`. A slash command goes as typed, and the name loses brackets and control characters and is cut to 64 characters | several drivers can share a session, and a display name must not be able to close the label | [`launch.rs:299`](../crates/hive-node/src/launch.rs#L299) `attributed_prompt` |
 | A stub's `prompted_by` and an approval's `answered_by` are believed only when they name a driver | both are the device's word | [`room.rs:172`](../crates/modules/hive/src/room.rs#L172), [`room.rs:250`](../crates/modules/hive/src/room.rs#L250) |
 | A member removed from the org drives nothing anywhere, and their views end at once | rejoining the org must not hand back a seat nobody offered again | [`hooks.rs:127`](../crates/modules/hive/src/hooks.rs#L127) |
@@ -293,17 +294,34 @@ sessions the Administrators group:
 | A session, as an account whose `sudo` needs no password | Linux | macOS |
 |---|---|---|
 | holds `sudo`, `wheel` or `admin` | no | no: a write into `/Applications` is refused |
-| `sudo` by a rule that names the account | refused, by `no_new_privs` | **allowed** |
-| `sudo` by a rule that names a group (`%admin`, `%sudo`) | refused, the same way | **allowed** |
+| `sudo` by a rule that names the account | refused, by `no_new_privs` | **would be allowed**, so the start is refused |
+| `sudo` by a rule that names a group (`%admin`, `%sudo`) | refused, the same way | **would be allowed**, so the start is refused |
 
-⚠️ **On macOS a session can still `sudo`** wherever its account may without a password.
-macOS has no `no_new_privs`, and its `sudo` reads the account's groups from the
-directory, never from the process. Field-measured on macOS 15.7.7 (sudo 1.9.13p2), the
-only passwordless rule being `%admin ALL=(ALL) NOPASSWD: ALL`: a session without the
-admin group got `sudo-rc=0`, and its write into `/Applications` was refused. There, map an
-account whose `sudo` asks for a password, as macOS's does unless someone changed it: a
-session cannot type one. `id` misleads on a Mac too: it reads the directory, so it lists
-`admin` in a session that does not hold it.
+⚠️ **On macOS the groups cannot stop `sudo`.** macOS has no `no_new_privs`, and its `sudo`
+reads the account's groups from the directory, never from the process. Field-measured on
+macOS 15.7.7 (sudo 1.9.13p2), with `%admin ALL=(ALL) NOPASSWD: ALL` the only passwordless
+rule: a session without the admin group got `sudo-rc=0`, while its write into
+`/Applications` was refused. `id` misleads on a Mac too: it reads the directory, so it
+lists `admin` in a session that does not hold it.
+
+So a Mac refuses to START a session as an account whose `sudo` needs no password
+(decision 15, [`hive/sudo.rs`](../agents/roomlerd/src/hive/sudo.rs)), unless its owner sets
+`hive_allow_passwordless_sudo`:
+
+```mermaid
+flowchart TD
+    S["a start (or a resume after a restart), on a Mac,<br/>past every other gate"] --> A{"hive_allow_passwordless_sudo?"}
+    A -->|on| L["launch"]
+    A -->|off| Q["as root: sudo -l -U &lt;account&gt;<br/>(LC_ALL=C, 10 s)"]
+    Q -->|"a NOPASSWD rule, or !authenticate"| R1["refused: passwordless_sudo"]
+    Q -->|"every rule asks, or no sudo at all"| L
+    Q -->|"no answer, or one it cannot read"| R2["refused: launch_failed, in words"]
+```
+
+⚠️ The check asks **as root**, never as the account. Listing another account's rules
+authenticates nobody. Asked as the account (`sudo -n -l`), it would fail on every Mac whose
+`sudo` asks for a password, the default, and log "a password is required" at every start. A
+Mac nobody changed lists `(ALL) ALL`, which asks, so it starts sessions as before.
 
 The daemon never writes into a tree the account owns. It starts `/bin/sh -c` with a
 fixed script ([`WRAPPER`](../agents/roomlerd/src/hive/supervisor.rs#L93)) and
@@ -319,7 +337,7 @@ leads its own process group, so a stop reaches the tools it started.
 |---|---|
 | the session's config directory (`CLAUDE_CONFIG_DIR`) | `~<account>/.roomler/hive/<session>/claude`, with the project name pinned to `hive-<harness uuid>` (`CLAUDE_CODE_PROJECT_DIR_NAME`), so the history and the auto-memory live under one `projects/hive-<uuid>/` whatever the folder is ([`launch.rs:109`](../crates/hive-node/src/launch.rs#L109)) |
 | the runtime directory, the daemon's | `/run/roomler-hive/<session>` on Linux, `/var/run/roomler-hive/<session>` on macOS, root's and `0755`: `settings.json` and `mcp.json` (root's, `0644`), `toolbelt.sock` (the account's, `0600`), and `memory/` |
-| the harness, with `hive_harness` unset | the first executable of `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude` (macOS) and `/usr/bin/claude` ([`supervisor.rs:2201`](../agents/roomlerd/src/hive/supervisor.rs#L2201)) |
+| the harness, with `hive_harness` unset | the first executable of `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude` (macOS) and `/usr/bin/claude` ([`supervisor.rs:2209`](../agents/roomlerd/src/hive/supervisor.rs#L2209)) |
 
 **The launch is rebuilt in full every time**, because a resume restores neither
 `--settings` nor `--mcp-config` ([`launch.rs:166`](../crates/hive-node/src/launch.rs#L166)):
@@ -340,7 +358,7 @@ claude -p --input-format stream-json --output-format stream-json --verbose --inc
 | `--strict-mcp-config` | a repository's `.mcp.json` cannot shadow `roomler`, the server that decides what runs |
 | `--disallowedTools AskUserQuestion` | it would reach the permission tool as a tool call whose answer must carry the person's choices, which no card asks for; the model asks in its reply instead |
 | `settings.json` holds `permissions.deny: ["Read(//proc/**)"]`, `sandbox.autoAllowBashIfSandboxed: false` and no `apiKeyHelper` ([`launch.rs:344`](../crates/hive-node/src/launch.rs#L344)) | the Read tool runs inside the harness, so `/proc/self/environ` would hand the model its environment; a sandbox that comes on, ours or the user's, must not take Bash out of the approvals; nothing in the session can print the provider's key |
-| `--resume` exactly when Claude Code's own history exists (`projects/hive-<uuid>/<uuid>.jsonl`), `--session-id` otherwise, for every launch ([`supervisor.rs:1964`](../agents/roomlerd/src/hive/supervisor.rs#L1964)) | Claude Code refuses both other ways round: "Session ID … is already in use", "No conversation found". The daemon only checks that the entry exists, and never reads it |
+| `--resume` exactly when Claude Code's own history exists (`projects/hive-<uuid>/<uuid>.jsonl`), `--session-id` otherwise, for every launch ([`supervisor.rs:1972`](../agents/roomlerd/src/hive/supervisor.rs#L1972)) | Claude Code refuses both other ways round: "Session ID … is already in use", "No conversation found". The daemon only checks that the entry exists, and never reads it |
 | ⚠️ no `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` | on Linux it sandboxes every command, and without bubblewrap and socat Bash then refuses everything. It was the real reason P0's sessions could not run `whoami` (P1a-3) |
 
 ### Windows
@@ -374,7 +392,7 @@ flowchart LR
 | The harness is created suspended, assigned to its own Job Object (`KILL_ON_JOB_CLOSE`, no breakaway), and only then resumed. It inherits its three standard handles and nothing else | none of its tools escapes the job, and no other session's pipe leaks into it | [`spawn_into_job`](../agents/roomlerd/src/win_service/supervisor.rs#L2277), [`JobObject`](../agents/roomlerd/src/win_service/supervisor.rs#L2160) |
 | The environment is the user's own block with the session's variables laid over it by name, case-insensitively, and a NUL in a name or a value is refused | `Path` and `PATH` are one variable, and a NUL could smuggle in an entry of its own | [`merge_env_block`](../agents/roomlerd/src/win_service/supervisor.rs#L2573) |
 | The harness is `hive_harness`, else the native installer's `%USERPROFILE%\.local\bin\claude.exe`, else npm's `%APPDATA%\npm\claude.cmd` run through `cmd.exe /d /v:off /s /c`. An argument holding one of cmd's metacharacters is refused, never escaped | npm's shim passes the line on again with `%*` inside an `IF (…)` block, and no quoting is right for both readers | [`hive_win.rs:523`](../agents/roomlerd/src/hive_win.rs#L523) `harness_command_line` |
-| A stop closes the harness's stdin, then ends its job after the grace | no signal reaches a console-less process | [`hive/supervisor.rs:2976`](../agents/roomlerd/src/hive/supervisor.rs#L2976) |
+| A stop closes the harness's stdin, then ends its job after the grace | no signal reaches a console-less process | [`hive/supervisor.rs:2984`](../agents/roomlerd/src/hive/supervisor.rs#L2984) |
 
 ---
 
@@ -406,7 +424,7 @@ Code without its permission tool. Every call that needs one then errors ("MCP to
 mcp__roomler__approve … not found") and the harness exits 1: nothing runs
 unapproved. So a start whose account cannot execute the relay at all is refused
 `launch_failed` at once, rather than dying at its first approval
-([`executable_by`](../agents/roomlerd/src/hive/supervisor.rs#L2382)).
+([`executable_by`](../agents/roomlerd/src/hive/supervisor.rs#L2390)).
 
 ```mermaid
 sequenceDiagram
@@ -479,7 +497,7 @@ session has no model access: its own config directory holds no login of its own.
 A restart still takes every harness down. Under systemd (`KillMode=control-group`)
 a stop reaches the daemon and then every process in its unit. Under launchd, and for
 a daemon nothing supervises, the daemon takes them down itself as it leaves
-([`wind_down`](../agents/roomlerd/src/hive/supervisor.rs#L1333): SIGTERM to each
+([`wind_down`](../agents/roomlerd/src/hive/supervisor.rs#L1341): SIGTERM to each
 harness's process group, SIGKILL after 3 s). On Windows a harness lives in its
 worker's Job Object and goes with it. What survives is the session: the next daemon
 resumes it with the same Claude Code conversation.
@@ -505,15 +523,15 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | `hosted.json` sits beside the store, root's, `0600`, written whole. Per session it holds the launch's inputs (fence, account, the folder as asked, the starter and their address, Claude Code's session id), the turns begun, the turn in progress and who asked for it, its open approvals, and the harness's pid and start time | after a restart the device holds nothing else: the replay of its last reports lived in memory | [`hosted.rs`](../agents/roomlerd/src/hive/hosted.rs) |
-| A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:2605`](../agents/roomlerd/src/hive/supervisor.rs#L2605) |
-| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3582`](../agents/roomlerd/src/main.rs#L3582), [`supervisor.rs:1297`](../agents/roomlerd/src/hive/supervisor.rs#L1297) |
-| A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:1357`](../agents/roomlerd/src/hive/supervisor.rs#L1357) |
-| The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:1166`](../agents/roomlerd/src/hive/supervisor.rs#L1166) |
-| ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:1199`](../agents/roomlerd/src/hive/supervisor.rs#L1199) |
-| A recorded pid is signalled only while its start time still matches: the boot id and the `/proc` start time on Linux, `proc_pidinfo` on macOS, `GetProcessTimes` on Windows. Pids 0 and 1 never are | two harnesses on one history would both write it, and whatever holds that pid since must be left alone | [`procs.rs:30`](../agents/roomlerd/src/hive/procs.rs#L30), [`supervisor.rs:2939`](../agents/roomlerd/src/hive/supervisor.rs#L2939) |
-| The cut turn is reported `interrupted`, naming who asked; its approvals are reported `withdrawn`; the transcript says the session resumed. The first turn of a resumed process reports no cost | Claude Code restores its running total only from a clean exit's `cost-state`, so where that process starts counting is unknown, and no number is better than a wrong one | [`supervisor.rs:1660`](../agents/roomlerd/src/hive/supervisor.rs#L1660) |
+| A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:2613`](../agents/roomlerd/src/hive/supervisor.rs#L2613) |
+| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3582`](../agents/roomlerd/src/main.rs#L3582), [`supervisor.rs:1305`](../agents/roomlerd/src/hive/supervisor.rs#L1305) |
+| A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:1365`](../agents/roomlerd/src/hive/supervisor.rs#L1365) |
+| The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:1174`](../agents/roomlerd/src/hive/supervisor.rs#L1174) |
+| ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:1207`](../agents/roomlerd/src/hive/supervisor.rs#L1207) |
+| A recorded pid is signalled only while its start time still matches: the boot id and the `/proc` start time on Linux, `proc_pidinfo` on macOS, `GetProcessTimes` on Windows. Pids 0 and 1 never are | two harnesses on one history would both write it, and whatever holds that pid since must be left alone | [`procs.rs:30`](../agents/roomlerd/src/hive/procs.rs#L30), [`supervisor.rs:2947`](../agents/roomlerd/src/hive/supervisor.rs#L2947) |
+| The cut turn is reported `interrupted`, naming who asked; its approvals are reported `withdrawn`; the transcript says the session resumed. The first turn of a resumed process reports no cost | Claude Code restores its running total only from a clean exit's `cost-state`, so where that process starts counting is unknown, and no number is better than a wrong one | [`supervisor.rs:1668`](../agents/roomlerd/src/hive/supervisor.rs#L1668) |
 | A session resumed 3 times in a row, each time without outliving the resume by 2 minutes, is ended instead | a resume that takes the daemon down must not become a crash loop | [`supervisor.rs:146`](../agents/roomlerd/src/hive/supervisor.rs#L146) |
-| A stop that arrives before the session resumed ends it with no launch | | [`supervisor.rs:1036`](../agents/roomlerd/src/hive/supervisor.rs#L1036) |
+| A stop that arrives before the session resumed ends it with no launch | | [`supervisor.rs:1044`](../agents/roomlerd/src/hive/supervisor.rs#L1044) |
 
 ⚠️ Prompts waiting behind a turn are lost when a restart cuts it. An update waits the
 turn out (§7); a crash does not. ⚠️ `hosted.json` is not synced to disk: a clean
@@ -524,7 +542,7 @@ then the manifest ends what could not be resumed.
 
 On every connection of its primary enrollment the device sends `rc:hive.manifest`:
 the sessions it runs NOW, ids and fences only
-([`supervisor.rs:1141`](../agents/roomlerd/src/hive/supervisor.rs#L1141)). The server
+([`supervisor.rs:1149`](../agents/roomlerd/src/hive/supervisor.rs#L1149)). The server
 ends each session it holds as running there that the list leaves out, as
 `not_on_device` (or `stopped`, for one being stopped), tells its room and withdraws
 its open approvals ([`agent_socket.rs:464`](../crates/modules/hive/src/agent_socket.rs#L464)).
@@ -736,7 +754,7 @@ again on one already there.
   unknown, and another session's directory stays closed, its own DACL granting only
   its account. The unit test runs as a restricted Medium copy of its own token, and
   fails on the old DACL
-  ([`supervisor.rs:5156`](../agents/roomlerd/src/hive/supervisor.rs#L5156)).
+  ([`supervisor.rs:5165`](../agents/roomlerd/src/hive/supervisor.rs#L5165)).
 
 ### macOS: the `/var` link
 
@@ -787,6 +805,7 @@ holds of the administrator groups is in §3.
 | AC20: a session survives a service restart, a restart at an approval and a crash; a changed gate ends it | ✅ | ✅ | ✅ |
 | AC21: an adopted session is its owner's alone, and read only | ✅ | — | not built |
 | Decision 13: a session holds no administrator group and cannot `sudo` | ✅ `27(sudo)` gone, `sudo` refused | ⚠️ the group gone, `sudo` still allowed (§3) | — |
+| Decision 15: a Mac refuses a start as an account whose `sudo` needs no password | — | not yet | — |
 
 Linux ran on a throwaway stack (a local server, loopback TURN, a root daemon in WSL),
 macOS and Windows on throwaway VMs enrolled in the test organization on prod
