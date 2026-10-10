@@ -22,8 +22,8 @@
 //! re-sent the stops it has not confirmed, and the starts it never answered
 //! (within [`hive_limits::START_REDELIVERY_WINDOW_SECS`]; older ones are
 //! `lost`, not launched an hour after someone gave up on them). A device that
-//! reconnects as a build without Hive cannot be running anything: its
-//! pending stops end and its pending starts are lost.
+//! reconnects as a build without Hive cannot be running anything: what it ran
+//! ends, its pending stops end and its pending starts are lost.
 //!
 //! # What is over stays over
 //!
@@ -41,8 +41,10 @@
 //! connection also carries `rc:hive.manifest`, the sessions the device runs
 //! NOW; the server ends each one it holds as running there that the list
 //! leaves out ([`end_what_the_device_does_not_run`]). An unanswered start is
-//! not "running" — reconcile owns it — and no manifest at all (an older
-//! build) changes nothing.
+//! not "running" — reconcile owns it — and no manifest at all from a build
+//! that runs Hive (an older one) changes nothing. A build WITHOUT Hive sends
+//! none either, and runs none of them: reconcile ends them as an empty
+//! manifest would ([`reconcile_on_connect`]).
 
 use std::collections::HashSet;
 
@@ -451,7 +453,8 @@ async fn apply_reports(
 /// daemon restarted, or the harness ended and the word was lost past its
 /// replay — and nothing else would ever say so (finding 7). Ended here, with
 /// its room told and its open approvals withdrawn. An oversized list is not
-/// a device's, and changes nothing: the safe direction.
+/// a device's, and changes nothing: the safe direction. A connection without
+/// `hive` gets the empty list from [`reconcile_on_connect`].
 async fn end_what_the_device_does_not_run(
     state: &HiveState,
     tenant_id: ObjectId,
@@ -559,6 +562,22 @@ pub(crate) async fn reconcile_on_connect(
     tenant_id: ObjectId,
     device_id: ObjectId,
 ) {
+    // Read once. The hub records a connection's caps before its hello runs
+    // (`fleet/src/socket.rs`), so this is `Some` unless it is gone already.
+    let supports_hive = state.fleet.rc_hub.agent_supports_hive(device_id);
+    // ⚠️ A build without `hive` runs no session, and sends no manifest to say
+    // so: what the record holds as running here would read `idle` for ever.
+    // Field, 2026-10-10: a Windows device ran an accepted session, then
+    // updated itself to 0.4.123, whose build has no `hive`. A crash-loop
+    // rollback to an older build, or a build made without `hive`, does the
+    // same. So it gets the empty manifest, before what is pending is read: a
+    // session ended here is pending nothing, and `end_now` and `mark_lost`
+    // below miss one already ended, so none is noted twice. Only on
+    // `Some(false)`: `None` is a device no longer connected here, and unknown
+    // is not "no".
+    if supports_hive == Some(false) {
+        end_what_the_device_does_not_run(state, tenant_id, device_id, &[]).await;
+    }
     let pending = match state.sessions.needing_delivery(tenant_id, device_id).await {
         Ok(p) => p,
         Err(e) => {
@@ -569,11 +588,7 @@ pub(crate) async fn reconcile_on_connect(
     if pending.is_empty() {
         return;
     }
-    let runs_hive = state
-        .fleet
-        .rc_hub
-        .agent_supports_hive(device_id)
-        .unwrap_or(false);
+    let runs_hive = supports_hive.unwrap_or(false);
     let now_ms = DateTime::now().timestamp_millis();
 
     for s in pending {
