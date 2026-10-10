@@ -835,6 +835,15 @@ jobs:
     name: macOS overlay compile check
     runs-on: macos-latest
     timeout-minutes: 25
+    # FR-6 wave 22 (#773): this job's cargo cache lives on the seed-cache
+    # release, not in the Actions cache (see .github/actions/ci-seed-restore),
+    # and publishing a release asset needs `contents: write`. Only a master
+    # push publishes; a fork PR's token is read-only regardless.
+    permissions:
+      contents: write
+    env:
+      # rust-cache set this for the job; with it gone, set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -843,13 +852,14 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        id: seed
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          key: macos-overlay-check
-          # Only a master push saves (FR-6 wave 14 — the note above the Rust
-          # lanes): a PR-ref cache only its own PR can reuse, and each one
-          # evicts master entries every PR restores from.
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: macos-overlay-check
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
@@ -986,6 +996,19 @@ jobs:
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
             --test-threads=1 --nocapture
 
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: (github.ref == 'refs/heads/master' || github.head_ref == 'ci/fr6-wave22-seed-store') && steps.seed.outcome == 'success'  # TEMP-W22-VALIDATION: remove before merge
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: macos-overlay-check
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   windows-overlay-clippy:
     # Windows-only code was entirely UN-LINTED: the Rust lanes run on
     # ubuntu-latest, so their `-D warnings` never compiles the 66
@@ -1002,6 +1025,11 @@ jobs:
     name: Windows overlay clippy
     runs-on: windows-latest
     timeout-minutes: 40
+    # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -1012,12 +1040,15 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 22 (#773): see macos-overlay-check and the action.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-windows-clippy
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: windows-clippy
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
       # `ssh-server` is in the set because this is the ONLY lane that lints the
@@ -1048,6 +1079,19 @@ jobs:
         run: |
           cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
 
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: (github.ref == 'refs/heads/master' || github.head_ref == 'ci/fr6-wave22-seed-store') && steps.seed.outcome == 'success'  # TEMP-W22-VALIDATION: remove before merge
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-clippy
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   windows-recorder:
     # FR-85 P1e — the recorder's identity rule is Windows code that no other
     # lane compiles: every recorder test step above runs on Linux, and the
@@ -1067,8 +1111,12 @@ jobs:
     name: Windows recorder identity (FR-85)
     runs-on: windows-latest
     timeout-minutes: 45
+    # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
+    permissions:
+      contents: write
     env:
       ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -1079,12 +1127,15 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 22 (#773): see macos-overlay-check and the action.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-windows-recorder
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: windows-recorder
       - name: Clippy roomlerd (recording, incl. tests)
         run: cargo clippy -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --tests -- -D warnings
       - name: The identity rule — unit tests (the table, argv, env, impersonation)
@@ -1114,6 +1165,19 @@ jobs:
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
           cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: (github.ref == 'refs/heads/master' || github.head_ref == 'ci/fr6-wave22-seed-store') && steps.seed.outcome == 'success'  # TEMP-W22-VALIDATION: remove before merge
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-recorder
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
   ffmpeg-encoder-check:
     # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored
