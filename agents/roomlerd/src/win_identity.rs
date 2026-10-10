@@ -119,6 +119,62 @@ pub fn session_user_profile_dir() -> Option<String> {
     }
 }
 
+/// Run `f` on this thread AS the user signed in to this process's session.
+/// For a SYSTEM writer touching a path that user controls — their profile.
+///
+/// ⚠️ Every file access inside `f` is checked against THEIR token. That is
+/// the point: a profile folder is the user's to rearrange, so a SYSTEM write
+/// there can be steered by a junction plus an object-manager link to ANY
+/// path SYSTEM can write (the classic arbitrary-file-overwrite escalation).
+/// Validating the path first does not close it — the link can be swapped
+/// between the check and the write. Impersonated, the write can only land
+/// where the user could have written anyway.
+///
+/// `None` when nobody is signed in to the session, when the token cannot be
+/// had (`WTSQueryUserToken` needs SYSTEM with `SeTcbPrivilege`), or when
+/// impersonation is refused. Then `f` has not run: a privileged writer that
+/// cannot become the user does not fall back to writing as itself.
+pub fn as_session_user<T>(f: impl FnOnce() -> T) -> Option<T> {
+    use windows_sys::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+
+    /// Ends the impersonation even if `f` panics.
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: ends this thread's impersonation.
+            if unsafe { RevertToSelf() } == 0 {
+                // A thread left wearing someone else's identity would run
+                // whatever it does next as the wrong account. There is no
+                // safe way on; the service manager restarts us.
+                std::process::abort();
+            }
+        }
+    }
+
+    let mut session: u32 = 0;
+    // SAFETY: as in `session_user_profile_dir`.
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } == 0 {
+        return None;
+    }
+    let token = match crate::win_service::supervisor::query_user_token(session) {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(%e, session, "as_session_user: no user token for this session");
+            return None;
+        }
+    };
+    // SAFETY: a live primary token from `WTSQueryUserToken`. Should the
+    // impersonation be refused, Windows hands the thread an identification
+    // token instead and every open fails: closed, never open.
+    if unsafe { ImpersonateLoggedOnUser(token.raw()) } == 0 {
+        tracing::warn!(session, "as_session_user: ImpersonateLoggedOnUser refused");
+        return None;
+    }
+    let _revert = Revert;
+    Some(f())
+}
+
 /// This process's OWN profile directory, from its own token — an
 /// unprivileged writer's home. A registry read, unlike the known-folder
 /// lookups `directories::UserDirs` makes (those verify every folder they
@@ -254,5 +310,17 @@ mod tests {
     #[test]
     fn a_non_system_caller_gets_no_session_profile() {
         assert_eq!(session_user_profile_dir(), None);
+    }
+
+    /// FR-92 — with no session user's token to become, the closure does NOT
+    /// run: a privileged writer that cannot act as the person must never act
+    /// as itself instead. (A test runner is not SYSTEM, so the token is
+    /// refused, exactly as when nobody is signed in.)
+    #[test]
+    fn without_the_session_users_token_nothing_runs() {
+        assert!(!process_is_local_system());
+        let mut ran = false;
+        assert_eq!(as_session_user(|| ran = true), None);
+        assert!(!ran);
     }
 }
