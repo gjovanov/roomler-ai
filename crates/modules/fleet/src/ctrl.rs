@@ -36,6 +36,22 @@ pub async fn publish_rc_ctrl(state: &Core, evt: &str, mut fields: serde_json::Va
 /// misses are no-ops (the entity lives elsewhere or is already gone).
 pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
     match ctrl.get("evt").and_then(|v| v.as_str()) {
+        // FR-92 — an org admin changed the keep-busy deny on another pod:
+        // push it to this pod's agents of that tenant (the ones that parse it).
+        Some("keep_busy_policy") => {
+            let (Some(tid), Some(denied)) = (
+                ctrl.get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+                ctrl.get("denied").and_then(|v| v.as_bool()),
+            ) else {
+                return;
+            };
+            let n = hub.push_keep_busy_policy(tid, denied);
+            if n > 0 {
+                info!(tenant = %tid, denied, agents = n, "rc ctrl: keep-busy policy applied from another pod");
+            }
+        }
         Some("consent") => {
             let (Some(sid), Some(granted)) = (
                 ctrl.get("session_id")

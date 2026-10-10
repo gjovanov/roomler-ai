@@ -449,6 +449,10 @@
       "methods": "DELETE"
     },
     {
+      "path": "/api/tenant/{tenant_id}/keep-busy-settings",
+      "methods": "GET,HEAD,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/magic-dns",
       "methods": "GET,HEAD,PUT"
     },
@@ -3940,6 +3944,7 @@
     "rc:agent.update",
     "rc:agent.config",
     "rc:agent.key_rotate",
+    "rc:agent.keep_busy_policy",
     "rc:agent.join_org",
     "rc:rpc.exec",
     "rc:rpc.cancel",

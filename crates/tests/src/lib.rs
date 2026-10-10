@@ -71,6 +71,8 @@ mod hive_tests;
 #[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
+mod keep_busy_tests;
+#[cfg(test)]
 mod key_rotation_tests;
 #[cfg(test)]
 mod member_tests;

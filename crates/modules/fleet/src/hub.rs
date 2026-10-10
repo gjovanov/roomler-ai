@@ -128,6 +128,10 @@ pub struct ConnectedAgent {
     /// OFF and a rollback alike. Anything but [`RecordSupport::Serves`] ⇒
     /// `create_session` strips `Permissions::RECORD`.
     pub record_support: RecordSupport,
+    /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
+    /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
+    /// would log every policy frame as an unknown `rc:*` at WARN.
+    pub supports_keep_busy: bool,
     /// FR-90 — the agent advertises `hive`: it answers `rc:hive.start` with
     /// `rc:hive.start_ack` and reports sessions with `rc:hive.state`. Per
     /// CONNECTION, for [`Self::supports_ssh_grant_ack`]'s reason — a stored
@@ -419,6 +423,9 @@ impl Hub {
             // FR-85 P3 — set by `set_agent_record_support` right after
             // registration; `None` (RECORD stripped) until it is.
             record_support: RecordSupport::None,
+            // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
+            // policy frame is ever pushed to this connection.
+            supports_keep_busy: false,
             // FR-90 — set by `set_agent_hive_support`; `false` = no session
             // frame is ever pushed to this connection.
             supports_hive: false,
@@ -1636,6 +1643,40 @@ impl Hub {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.record_support = support;
         }
+    }
+
+    /// FR-92 — record whether this connection parses the keep-busy policy
+    /// (its hello's, or a heartbeat's, `AgentCaps.input` has `keep-busy`).
+    /// Returns what it was before, so a caller can act on the word
+    /// REAPPEARING rather than on every caps announcement; `false` for an
+    /// agent this pod does not hold.
+    pub fn set_agent_keep_busy_support(&self, agent_id: ObjectId, supports: bool) -> bool {
+        match self.inner.agents.get_mut(&agent_id) {
+            Some(mut entry) => std::mem::replace(&mut entry.supports_keep_busy, supports),
+            None => false,
+        }
+    }
+
+    /// FR-92 — push an org's keep-busy policy to every agent of `tenant_id`
+    /// connected to THIS pod that parses it. Returns how many it reached. A
+    /// tenant's sockets live on one pod (tenant affinity), but the admin's
+    /// PUT can land on any: the caller also publishes the change on the rc
+    /// ctrl lane, and every pod runs this for its own agents.
+    pub fn push_keep_busy_policy(&self, tenant_id: ObjectId, denied: bool) -> usize {
+        let targets: Vec<ObjectId> = self
+            .inner
+            .agents
+            .iter()
+            .filter(|a| a.tenant_id == tenant_id && a.supports_keep_busy)
+            .map(|a| a.agent_id)
+            .collect();
+        targets
+            .into_iter()
+            .filter(|id| {
+                self.send_to_agent(*id, ServerMsg::KeepBusyPolicy { denied })
+                    .is_ok()
+            })
+            .count()
     }
 
     /// FR-90 — record whether this connection runs Hive sessions (`hive`),

@@ -63,6 +63,7 @@ pub mod consent_consumer;
 pub mod ctrl;
 pub mod enroll_key;
 pub mod hub;
+pub mod keep_busy;
 pub mod nudge;
 pub mod presence;
 pub mod releases;
@@ -317,6 +318,11 @@ impl Module for FleetState {
             "/",
             get(agent_exec::get_org_settings).put(agent_exec::set_org_settings),
         );
+        // FR-92 — the org's keep-busy deny (MANAGE_TENANT to set).
+        let keep_busy_settings = Router::new().route(
+            "/",
+            get(keep_busy::get_org_settings).put(keep_busy::set_org_settings),
+        );
         // FR-51 P2 — the ephemeral-key class switch (MANAGE_TENANT).
         let ephemeral_key_settings = Router::new().route(
             "/",
@@ -378,6 +384,7 @@ impl Module for FleetState {
             .nest("/tenant/{tenant_id}/agent", agent)
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
+            .nest("/tenant/{tenant_id}/keep-busy-settings", keep_busy_settings)
             .nest(
                 "/tenant/{tenant_id}/ephemeral-key-settings",
                 ephemeral_key_settings,

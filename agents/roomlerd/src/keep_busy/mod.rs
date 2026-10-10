@@ -74,7 +74,13 @@ pub enum Command {
         why: Reason,
     },
     DeviceEnabled(bool),
-    OrgDenied(bool),
+    /// One enrolled org's policy (`tenant` = its hex id). The engine thread
+    /// keeps the last value per org, persists it, and applies the STRICTEST:
+    /// any org's deny stops keep busy here.
+    OrgPolicy {
+        tenant: String,
+        denied: bool,
+    },
 }
 
 struct Service {
@@ -94,12 +100,15 @@ pub(crate) fn wall_ms() -> u64 {
 }
 
 /// Start the engine thread — once per process, from inside the tokio
-/// runtime. `device_enabled` is the owner's `keep_busy_enabled`.
+/// runtime. `device_enabled` is the owner's `keep_busy_enabled`;
+/// `enrolled_tenants` is every org this device is enrolled in (the primary
+/// and each `[[orgs]]` entry, enabled or not), so a stored deny from an org
+/// it has LEFT can be dropped ([`prune_departed_orgs`]).
 ///
 /// ⚠️ It initialises the input arbiter FIRST: `arbiter::global()` captures
 /// the tokio handle at its first call, and the engine thread (a plain std
 /// thread) must never be that first caller.
-pub fn start(device_enabled: bool) {
+pub fn start(device_enabled: bool, enrolled_tenants: Vec<String>) {
     DEVICE_ENABLED.store(device_enabled, Ordering::Relaxed);
     if !supported_here() {
         return;
@@ -113,7 +122,7 @@ pub fn start(device_enabled: bool) {
         let (out, state) = tokio::sync::watch::channel(engine.snapshot(now));
         std::thread::Builder::new()
             .name("keep-busy".into())
-            .spawn(move || run(engine, rx, out))
+            .spawn(move || run(engine, rx, out, enrolled_tenants))
             .expect("spawn keep-busy thread");
         Service { tx, state }
     });
@@ -128,7 +137,8 @@ fn submit(cmd: Command) {
 }
 
 /// A controller's `rc:keep-busy.set`, already authorised by the arbiter
-/// (the session holds INPUT, the floor, and its org allows it). `false`
+/// (the session holds INPUT and, in exclusive mode, the floor). An org deny
+/// is the engine's to refuse — it is device-wide. `false`
 /// when this host cannot run keep-busy — the arbiter then answers that
 /// viewer with the reason, since no engine broadcast will.
 pub fn submit_from_session(session: ObjectId, name: String, req: SetRequest) -> bool {
@@ -198,9 +208,35 @@ pub fn set_device_enabled(enabled: bool) {
     submit(Command::DeviceEnabled(enabled));
 }
 
-/// The org's deny (strictest of every enrolled org).
-pub fn set_org_denied(denied: bool) {
-    submit(Command::OrgDenied(denied));
+/// One enrolled org's keep-busy policy, as its server pushed it
+/// (`rc:agent.keep_busy_policy`, on every connect and on change).
+pub fn set_org_policy(tenant: &str, denied: bool) {
+    submit(Command::OrgPolicy {
+        tenant: tenant.to_string(),
+        denied,
+    });
+}
+
+/// The strictest of every enrolled org's last-known policy: one deny is
+/// enough. Pure, so the rule is a unit test.
+pub fn org_denied(policies: &std::collections::BTreeMap<String, bool>) -> bool {
+    policies.values().any(|d| *d)
+}
+
+/// Drop the stored policy of every org this device is no longer enrolled
+/// in, and say how many went. Without it, leaving an org that had denied
+/// keep busy would deny it here for good: no server would ever push that
+/// org's re-allow. An empty `enrolled` (no identity known) drops nothing.
+pub fn prune_departed_orgs(
+    policies: &mut std::collections::BTreeMap<String, bool>,
+    enrolled: &[String],
+) -> usize {
+    if enrolled.is_empty() {
+        return 0;
+    }
+    let before = policies.len();
+    policies.retain(|tenant, _| enrolled.iter().any(|e| e == tenant));
+    before - policies.len()
 }
 
 /// Should `AgentCaps.input` carry `keep-busy`? Built for this host, the
@@ -248,7 +284,12 @@ pub fn state_json(refused: Option<&str>) -> String {
 /// How often host warnings (focus-follows-mouse, …) are re-read.
 const WARNINGS_EVERY: Duration = Duration::from_secs(300);
 
-fn run(engine: Engine, rx: Receiver<Command>, out: tokio::sync::watch::Sender<Snapshot>) {
+fn run(
+    engine: Engine,
+    rx: Receiver<Command>,
+    out: tokio::sync::watch::Sender<Snapshot>,
+    enrolled_tenants: Vec<String>,
+) {
     #[cfg(all(target_os = "windows", feature = "enigo-input"))]
     {
         run_with(
@@ -257,11 +298,12 @@ fn run(engine: Engine, rx: Receiver<Command>, out: tokio::sync::watch::Sender<Sn
             out,
             host_win::WinHost::new(),
             host_win::warnings,
+            &enrolled_tenants,
         );
     }
     #[cfg(not(all(target_os = "windows", feature = "enigo-input")))]
     {
-        let _ = (engine, rx, out);
+        let _ = (engine, rx, out, enrolled_tenants);
     }
 }
 
@@ -275,11 +317,24 @@ fn run_with<H: Host>(
     out: tokio::sync::watch::Sender<Snapshot>,
     mut host: H,
     warnings: fn() -> Vec<&'static str>,
+    enrolled_tenants: &[String],
 ) {
     let path = state::default_path();
     let mut stored = path.as_deref().map(state::load_from).unwrap_or_default();
     let start = Instant::now();
-    if stored.org_denied.values().any(|d| *d) {
+    let departed = prune_departed_orgs(&mut stored.org_denied, enrolled_tenants);
+    if departed > 0 {
+        tracing::info!(
+            departed,
+            "keep-busy: dropped the stored policy of orgs this device has left"
+        );
+        if let Some(p) = path.as_deref()
+            && let Err(e) = state::save_to(p, &stored)
+        {
+            tracing::warn!(path = %p.display(), error = %e, "keep-busy: could not save the store");
+        }
+    }
+    if org_denied(&stored.org_denied) {
         engine.set_org_denied(true, start);
     }
     if let Some(act) = stored.activation(wall_ms()) {
@@ -303,6 +358,18 @@ fn run_with<H: Host>(
         };
         let now = Instant::now();
         match msg {
+            // The org policy needs the store, so it is handled here.
+            Ok(Command::OrgPolicy { tenant, denied }) => {
+                if stored.org_denied.get(&tenant) != Some(&denied) {
+                    stored.org_denied.insert(tenant, denied);
+                    if let Some(p) = path.as_deref()
+                        && let Err(e) = state::save_to(p, &stored)
+                    {
+                        tracing::warn!(path = %p.display(), error = %e, "keep-busy: could not save the store");
+                    }
+                }
+                engine.set_org_denied(org_denied(&stored.org_denied), now);
+            }
             Ok(cmd) => apply(&mut engine, cmd, now),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -372,7 +439,8 @@ fn apply(engine: &mut Engine, cmd: Command, now: Instant) {
             engine.turn_off(why, now);
         }
         Command::DeviceEnabled(b) => engine.set_device_enabled(b, now),
-        Command::OrgDenied(b) => engine.set_org_denied(b, now),
+        // Handled in the loop, where the store is.
+        Command::OrgPolicy { .. } => {}
     }
 }
 
@@ -431,6 +499,37 @@ mod tests {
             Some((65535, 65535))
         );
         assert_eq!(normalise_virtual(0, 0, 0, 0, 1, 1080), None);
+    }
+
+    /// FR-92 — the strictest of every enrolled org: one deny is enough, and
+    /// an org that never said anything (an older server) does not deny.
+    #[test]
+    fn one_orgs_deny_is_enough_and_silence_is_not_a_deny() {
+        let mut m = std::collections::BTreeMap::new();
+        assert!(!org_denied(&m), "no org has spoken: allowed");
+        m.insert("primary".to_string(), false);
+        assert!(!org_denied(&m));
+        m.insert("secondary".to_string(), true);
+        assert!(org_denied(&m), "a secondary org's deny holds device-wide");
+        m.insert("secondary".to_string(), false);
+        assert!(!org_denied(&m), "a re-allow clears it");
+    }
+
+    /// FR-92 — a device that LEFT an org which had denied keep busy must
+    /// not stay denied for good: no server will ever push that org's
+    /// re-allow. An empty enrolled list (no identity known) drops nothing.
+    #[test]
+    fn leaving_an_org_drops_its_stored_deny() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("primary".to_string(), false);
+        m.insert("left".to_string(), true);
+        assert_eq!(prune_departed_orgs(&mut m, &[]), 0);
+        assert!(org_denied(&m), "nothing known: the deny stands");
+        let enrolled = ["primary".to_string(), "joined-but-silent".to_string()];
+        assert_eq!(prune_departed_orgs(&mut m, &enrolled), 1);
+        assert!(!org_denied(&m), "the departed org's deny is gone");
+        assert_eq!(m.len(), 1);
+        assert_eq!(prune_departed_orgs(&mut m, &enrolled), 0, "idempotent");
     }
 
     #[test]
