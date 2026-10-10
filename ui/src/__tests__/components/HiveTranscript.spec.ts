@@ -197,6 +197,55 @@ describe('HiveTranscript — tool calls (FR-90 P1f)', () => {
   })
 })
 
+describe('HiveTranscript — checkpoints (FR-90 P2b)', () => {
+  const file = (path: string, changed: boolean) => ({
+    path,
+    growth: 'whole',
+    mode: 0o600,
+    len: 3,
+    hash: 'a'.repeat(64),
+    ...(changed ? { chunks: [{ offset: 0, len: 3, hash: 'a'.repeat(64) }] } : {}),
+  })
+
+  it('says what a checkpoint kept, never as an event this version cannot show', async () => {
+    hoisted.viewer = makeViewer(
+      [
+        {
+          kind: 'checkpoint',
+          n: 2,
+          turn: 4,
+          files: [file('CLAUDE.md', false), file('projects/hive-x/x.jsonl', true), file('projects/hive-x/memory/MEMORY.md', false)],
+          workspace: { repo: 'own', tree: 'b'.repeat(40), commit: 'c'.repeat(40), pack: [{ offset: 0, len: 9, hash: 'd'.repeat(64) }] },
+        },
+        {
+          kind: 'checkpoint',
+          n: 3,
+          turn: 5,
+          files: [file('CLAUDE.md', false)],
+          workspace: { repo: 'own', tree: 'b'.repeat(40), commit: 'c'.repeat(40) },
+        },
+        {
+          kind: 'checkpoint',
+          n: 4,
+          turn: 6,
+          files: [],
+          skipped: [{ path: 'the workspace', why: 'git was not found' }],
+        },
+      ],
+      [],
+      true,
+    )
+    const w = await render()
+    const lines = w.findAll('.hive-checkpoint').map((l) => l.text())
+    expect(lines).toEqual([
+      "💾 Checkpoint 2: 1 of 3 of the agent's files changed; the folder committed",
+      "💾 Checkpoint 3: 0 of 1 of the agent's files changed; the folder unchanged",
+      "💾 Checkpoint 4: 0 of 0 of the agent's files changed; the folder not kept (git was not found)",
+    ])
+    expect(w.text()).not.toContain('cannot show')
+  })
+})
+
 describe('HiveTranscript — a long session (FR-90 P1f-2)', () => {
   const note = (n: number) => ({ kind: 'note', text: `n${n}` })
 

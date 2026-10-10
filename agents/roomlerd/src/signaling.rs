@@ -4217,6 +4217,9 @@ async fn handle_server_msg(
                     user_email,
                     caller,
                     resume,
+                    // FR-90 P2c sets it from the wire, for a session the
+                    // server joined as replicated.
+                    replicated: false,
                 },
                 ctx.is_primary,
                 outbound_tx.clone(),
