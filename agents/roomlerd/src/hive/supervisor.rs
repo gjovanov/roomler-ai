@@ -555,16 +555,54 @@ fn store_wanted(hive: &HiveConfig, store_exists: bool) -> bool {
     hive.enabled || hive.adopt || store_exists
 }
 
-/// Create `dir` if missing and lock it to the daemon's account. A link
-/// anywhere on the path is refused, never followed.
+/// Create `dir` if missing and lock it to the daemon's account. A link on
+/// the path that someone other than root could have made is refused, never
+/// followed ([`untrusted_link`]).
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> Result<(), String> {
-    if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+    if let Some(link) = untrusted_link(dir) {
         return Err(format!("{} is a symbolic link", link.display()));
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// P1h-3 — the first link on `path`'s way that someone other than root could
+/// have made, or `None`. A link that root owns, in a directory that root owns
+/// and that nobody else may write to, could only have been made by root, so
+/// following it gives nothing away: macOS's own `/var` → `/private/var` is one,
+/// and the root daemon's data directory is under it (`/var/root`).
+/// Field-found: with every link refused, as FR-85's
+/// [`roomler_node_core::recording_dir::link_component`] refuses them, a Mac
+/// opened no store and refused every session "/var is a symbolic link". Any
+/// other link on the way is refused, as before.
+#[cfg(unix)]
+fn untrusted_link(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    let mut cur = PathBuf::new();
+    for c in path.components() {
+        cur.push(c.as_os_str());
+        if matches!(c, Component::RootDir | Component::Prefix(_)) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let root_made = m.uid() == 0
+                    && cur
+                        .parent()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .is_some_and(|p| p.uid() == 0 && p.mode() & 0o022 == 0);
+                if !root_made {
+                    return Some(cur);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    None
 }
 
 /// P1i-2 — on Windows: a protected DACL of SYSTEM and Administrators, set as
@@ -2978,6 +3016,50 @@ fn describe_end(
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
+
+    /// P1h-3 — a link root made, in a directory only root writes to, is
+    /// followed, where FR-85's check refuses it; a link anyone else could have
+    /// made is refused, and named. The system link is macOS's own `/var`, or
+    /// `/var/run` on Ubuntu: the first link this host's root owns.
+    #[test]
+    fn a_link_root_made_is_followed_and_any_other_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let system = ["/var", "/var/run", "/lib", "/bin", "/sbin", "/tmp", "/etc"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| {
+                std::fs::symlink_metadata(p)
+                    .is_ok_and(|m| m.file_type().is_symlink() && m.uid() == 0)
+            });
+        if let Some(link) = system {
+            let under = link.join("roomler-p1h3-probe");
+            assert_eq!(
+                untrusted_link(&under),
+                None,
+                "{} is root's own",
+                link.display()
+            );
+            assert_eq!(
+                roomler_node_core::recording_dir::link_component(&under).as_deref(),
+                Some(link),
+                "FR-85's check, unchanged, still refuses every link"
+            );
+        }
+
+        // A link in a directory anyone may write to: whoever runs this test,
+        // root included, could not tell who made it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(untrusted_link(&link.join("hive")), Some(link.clone()));
+        let refused = private_dir(&link.join("hive")).unwrap_err();
+        assert!(refused.contains("is a symbolic link"), "{refused}");
+        assert!(!real.join("hive").exists(), "nothing made through the link");
+        assert_eq!(untrusted_link(&real.join("hive")), None);
+    }
 
     /// P1h-2 — `hive` is in the release builds, so every device starts a
     /// supervisor: one whose owner never turned agent sessions on keeps no
