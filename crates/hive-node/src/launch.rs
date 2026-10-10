@@ -161,8 +161,8 @@ impl LaunchSpec {
     /// The argument vector, without the program.
     ///
     /// Headless, stream-json both ways: the daemon writes prompts to stdin and
-    /// reads events from stdout. No secret ever appears here — the model
-    /// credential comes from `apiKeyHelper` in the settings file.
+    /// reads events from stdout. No secret ever appears here: the model is
+    /// reached through the daemon's loopback sidecar, with a per-session token.
     pub fn args(&self) -> Vec<OsString> {
         let mut a: Vec<OsString> = [
             "-p",
