@@ -2,7 +2,7 @@
 
 **Issue:** [#1827](https://github.com/gjovanov/roomler-ai/issues/1827) · **Status:** in progress
 — design approved 2026-10-07; P0a (device core), P0b (server module), P0c (device
-supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) merged; P1i-0 (Windows sessions' design) merged; P1i-1 (the Windows launcher's building blocks) merged; P1i-2 (Windows sessions wired: `hive_host` on Windows, the identity rule, the toolbelt's pipe) merged; P1i-3 (`hive` in the Windows release build) in review · **Owner:** agent platform — the `hive`, `vault` and
+supervisor) and P0d-1 (the session room, turn stubs) merged, P0d-2a, P0d-2b (the viewer peer), P0d-3 (the UI), P0e (the model sidecar) and P0f (the canary test, AC2 on one device) merged — P0's build is complete; AC1 field-verified on a throwaway stack (2026-10-07), and its six findings fixed in P0g (merged); AC3 and AC4 partly field-verified (§5, §8); P1a-1 and P1a-2 (approvals: the device, the UI and the server) merged and field-run, AC5 ticked (2026-10-08); P1a-3 (Bash that runs on any host) and P1b (a restarted device's sessions end) merged and field-run; P1c-1 (drivers, the server) merged; P1c-2a (drivers, the device) merged; P1c-3 (drivers, the UI) merged, AC6 ticked on its field run; P1c-2b (AC6 as a CI test) merged; P1d-1 (the updater waits for running turns, AC7 on Linux field-verified) merged; P1d-2 (a restart resumes what the device hosted; AC20 on Linux field-verified) merged; P1e (core memory from a hand-curated brain) merged, AC8 ticked (field-verified 2026-10-08, and in CI); P1f (the transcript's renderers, P1f-1, and the long list, P1f-2) merged; P1g (the org gate, so prod can serve one test organization) and P1g-2 (a `hive.tenants` list is the switch) merged; P1h-1 (sessions on macOS: the build, and the daemon takes its harnesses down) merged; prod serves agent sessions to the test organization only (2026-10-09); P1j-1 (`adopt`, the server) merged; P1j-2 (`adopt`, the device) merged; P1j-3 (`roomler hive adopt`) and P1j-4 (`adopt`, the UI) merged; P1j-5 (the field run) merged, AC21 field-verified; P1h-2 (the macOS helper waits for agent turns; `hive` in the Linux and macOS release builds) merged; P1i-0 (Windows sessions' design) merged; P1i-1 (the Windows launcher's building blocks) merged; P1i-2 (Windows sessions wired: `hive_host` on Windows, the identity rule, the toolbelt's pipe) merged; P1i-3 (`hive` in the Windows release build) merged; P1i-4 (the Windows field run: AC3, AC7 and AC20 there, a remote-desktop connection swapping no worker) field-verified · **Owner:** agent platform — the `hive`, `vault` and
 `knowhow` modules, `roomlerd` feature `hive`, the SPA · **Anchors:** master `29ef33d58` ·
 **Design:** [`../roomler-hive-design.md`](../roomler-hive-design.md) (v0.4: the full design, the
 review of v0.2 and the decisions) · **Builds on:** [FR-69](FR-69-modular-monolith.md) (modules),
@@ -471,10 +471,14 @@ release build gains `hive` only in P1i-3, and a device's `hive_enabled` stays of
 no device changes yet. Two rows of the design table above were wrong, and the code follows what
 is true:
 
-- **The daemon is not always SYSTEM.** The process that hosts sessions is the service's worker,
-  which the service runs as SYSTEM only while a controller is connected or before anyone signs in
-  (SystemContext). The rest of the time the worker is the console user, elevated
-  (`ROOMLERD_ELEVATE_WORKER`, on by default), and `WTSQueryUserToken` refuses it. So
+- **The daemon is not always SYSTEM.** The process that hosts sessions is the service's worker.
+  On a device installed with SystemContext (`ROOMLERD_ENABLE_SYSTEM_SWAP`) the service runs it as
+  SYSTEM, in the console session, all the time: since 0.3.0-rc.7 every cycle reads as if a
+  controller were connected (`win_service/supervisor.rs:852`), so `decide_spawn` (`:729`) never
+  swaps it as one connects or leaves. Without SystemContext the worker is the console user,
+  elevated (`ROOMLERD_ELEVATE_WORKER`, on by default), and `WTSQueryUserToken` refuses it.
+  *Corrected by P1i-4's field run (§8): P1i-0 had the worker swap as a controller connects, from
+  the swap's original gate, which rc.7 retired.* So
   `console_user` (`hive_win.rs:135`) takes the console session's token when this daemon is SYSTEM
   (`:159`), the filtered one for a UAC administrator, and otherwise a restricted, Medium copy of
   the daemon's own token (`:144`). That second case is FR-85's recorder rule: every administrator
@@ -496,8 +500,8 @@ is true:
 
 ```mermaid
 flowchart LR
-    SVC["the service (SYSTEM, session 0)"] -- "no controller" --> U["worker: the console user, elevated"]
-    SVC -- "a controller connects" --> S["worker: SYSTEM (SystemContext)"]
+    SVC["the service (SYSTEM, session 0)"] -- "installed without SystemContext" --> U["worker: the console user, elevated"]
+    SVC -- "installed with SystemContext: always" --> S["worker: SYSTEM, in the console session"]
     U -- "a restricted, Medium copy of its own token" --> H["harness: the console user at Medium,<br/>in its Job Object"]
     S -- "WTSQueryUserToken (filtered)" --> H
     U --- D[("%ProgramData%\roomler\roomler\hive<br/>hive.db · hosted.json · run\&lt;session&gt;<br/>owner Administrators · SYSTEM + Administrators<br/>hive and run: a stat for anyone signed in")]
@@ -514,13 +518,17 @@ flowchart LR
 | the key helper | `hive/sidecar.rs:182`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
 | adopting | `hive/gates.rs:65`: `hive_adopt` reads off on Windows, so the device never advertises `hive-adopt` | the owner's word on Unix, off on Windows |
 
-⚠️ **A worker swap ends the harnesses.** On a device installed with SystemContext, a controller
-connecting or leaving swaps the worker, and a session's harness goes with the worker that started
-it: its Job Object closes. The next worker resumes the session (P1d-2): Claude Code is relaunched
-with `--resume`, and a turn that was running is reported cut. So a remote-desktop connection to a
-Windows device interrupts its running agent turns, once as it connects and once as it ends.
-P1i-4's field run measures it. Keeping a session through a swap needs hosting outside the swapped
-worker, which is a later phase.
+⚠️ **What ends a session's harness on Windows, and what does not.** A session's harness lives in
+the Job Object of the worker that started it, so it goes when that worker goes: a service restart,
+an update, a crash, and the console session changing (a sign-in, a sign-out, a switch of user), on
+which the service starts a worker in the new session. The next worker resumes the session if its
+gates still allow it (P1d-2): Claude Code is relaunched with `--resume`, and a turn that was
+running is reported cut (AC20). A remote-desktop connection is not one of them: with SystemContext
+the worker is SYSTEM from the start and stays so, and without it the worker is the console user
+throughout. Measured in P1i-4 (§8): a remote-desktop session to the device left the worker's and
+the harness's processes as they were, and a turn waiting at an approval through it ran afterwards.
+*Corrected: P1i-0 to P1i-3 said a remote-desktop connection swaps the worker and cuts the running
+turns.*
 
 The supervisor's own tests drive a `/bin/sh` stand-in for Claude Code and stay on Linux and
 macOS. On Windows CI the lane runs `hive::` as Windows compiles it.
@@ -796,7 +804,7 @@ What each rule is, and where it lives:
 | P1i-1 | the launcher and its refusals (`no_console_user`, the console-user mapping), `roomlerd hive-prep`, the suspended start into a Job Object, `resolve_harness` on Windows; compiled and unit-tested on Windows CI | `hive` not in the Windows release build; device `hive_enabled = false` | **merged** #1909 `49f6d820a` |
 | P1i-2 | the toolbelt over a named pipe; take-down and a crash's leftover by Job Object and creation time; the resume (`hosted.json`) on Windows | the same | **merged** #1913 `fb8a4e1bd` |
 | P1i-3 | `hive` in the Windows release build | device `hive_enabled = false`, the default | **merged** #1915 `8b55886ac` |
-| P1i-4 | the field run on a Windows VM in the test org: AC3, AC7 and AC20 on Windows (§8). Its first finding, fixed: Claude Code could not examine the store's directory or the runtime root, so it refused every session's settings | — | in progress |
+| P1i-4 | the field run on a Windows VM in the test org: AC3, AC7 and AC20 on Windows (§8). Two findings: (1) Claude Code could not examine the store's directory or the runtime root, so it refused every session's settings (fixed, #1919); (2) a session stays `idle` once its device's agent no longer runs sessions (its fix is in review). A remote-desktop connection swaps no worker, as P1i-0 expected it would | — | **field-verified** 2026-10-10 |
 | P1j-1 | `adopt`, the server (§3h): `rc:hive.adopt` → `rc:hive.adopt_ack`, `RpcCap::HiveAdopt` (`hive-adopt`, equality-matched), the record with `origin: adopted` and no title, the keys resolved to exactly one member, the same record for a repeated offer, no drivers (a 409), the audit (`action: adopt`) | a device's `hive_adopt` (P1j-2), and the org gate | **merged** #1890 `27628762d` |
 | P1j-2 | `adopt`, the device (§3h): `hive_adopt` (never pushable), the adopt socket and its protocol (`localapi::hive_adopt`), the peer's account from the kernel, the account's keys, the transcript JSONL into the store, turn stubs, the liveness sweep, the manifest, the stop, the viewer on `hive_adopt` alone | device `hive_adopt = false`, the default | **merged** #1891 `d4274ee92` |
 | P1j-3 | `roomler hive adopt` · `unadopt` · `hook` (§3h): the person's own user-level hooks, merged and removed exactly; the hook streams what it reads, whole lines only; the hook client and the daemon tested together | the person's own settings | **merged** #1892 `c0b8f68ad`, with finding (1) of P1j-5's field run |
@@ -850,7 +858,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   model: the same `whoami` printed `hivetest` without the variable and was refused with it. P1a-3
   drops it.* *Linux, field-verified 2026-10-08 on P1a-3's build: a turn ran `whoami` through Bash, as
   the mapped account, and it printed **`hivetest`** (4 s, no approval needed: it is a read-only
-  command). macOS and Windows are P1; the box stays open for them.*
+  command). macOS and Windows are P1; the box stays open for them.* *Windows, field-verified
+  2026-10-10 on P1i-4's candidate (master with #1919, built as 0.4.121) on a vmtest Win11 guest
+  installed with SystemContext (§8): a turn ran `whoami` through Bash and it printed **`vmtest`**,
+  the console user. The harness's process token read `VMTEST-WIN\vmtest`, Medium integrity, its
+  Administrators group unusable, and so did the toolbelt relay it started, under a SYSTEM worker.
+  With the owner's mapping removed a start was refused `no_account`; with the console user signed
+  out, `no_console_user`. macOS is P1h-3; the box stays open for it.*
 - [ ] **AC4:** cutting a primary's network stops its model calls within `offline_grace` (120 s), and
   an executor holding a stale fence makes zero model calls (mock-llm capture). *First half
   field-verified 2026-10-07, on the real device, with the session's own token against its sidecar.
@@ -904,7 +918,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   dry run (§8): an update pushed during a real turn was downloaded and verified, then deferred
   ("update deferred — agent turns running", logged at 0 s and 60 s). The turn waited 40 s at an
   approval, then ran 40 s. The update went ahead 3 s after the turn ended ("the agent turns are
-  done — installing", 80 s waited). The box stays open for macOS and Windows.*
+  done — installing", 80 s waited). The box stays open for macOS and Windows.* *Windows,
+  field-verified 2026-10-10 on P1i-4's candidate, with a real install, since a release build has no
+  dry run (§8): an update pushed during a turn waiting at its approval was downloaded, its signature
+  verified (G ROX LTD), and deferred ("update deferred — agent turns running", at 0 s and 60 s).
+  Allow came 2 min 14 s after the push, and the update went ahead 4 s after the turn ended ("the
+  agent turns are done — installing", 140 s waited). The device came back as 0.4.123, its
+  SystemContext kept. The box stays open for macOS.*
 - [x] **AC8:** a fact added to the brain appears in the next session's core memory and not in the
   running one; a write over a scope's budget fails visibly. *Field-verified 2026-10-08 on the P1e
   build (§8): a session started after a fact answered with it, the session already running did not,
@@ -953,9 +973,15 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   - *A crash (SIGKILL): the session resumed.*
   - *`hive_enabled = false` across a restart: the session ended "not resumed after the device
     restarted: agent sessions are off on this device (hive_enabled)".*
+  - *Windows, field-verified 2026-10-10 on P1i-4's candidate (§8): a service restart (the
+    session resumed and answered **TOPAZ-31**, its turns carrying on to 3); a restart while a turn
+    waited at an approval ("⏹ Turn 4 — interrupted", the approval "⏹ withdrawn", the command never
+    run); a crash (the worker killed outright: resumed 4.3 s later); `hive_enabled = false` across
+    a restart (ended, saying why). The update's restart is not run there either: the only newer
+    release, 0.4.123, has no `hive` on Windows.*
   - *Open: an update's restart takes the same two paths, the internal shutdown and then
-    systemd's restart, but is not field-run here, because the dry run installs nothing. macOS and
-    Windows are also open.*
+    systemd's restart, but is not field-run here, because the dry run installs nothing. macOS is
+    also open.*
 - [x] **AC21:** a terminal session adopted on a device whose owner allows it (`hive_adopt`)
   appears to its owner alone — another member, an org admin and a device manager each get a
   404 — renders through the viewer, takes no prompt from anywhere, and an account two people
@@ -1101,6 +1127,10 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-09 | released 0.4.123 (its Windows MSI has no `hive`), a vmtest Win11 guest installed with SystemContext and kept | the red half: a start on that device | ✅ as it should be: refused `device_unsupported`, "the device's agent does not run agent sessions — update it, or it was built without them" (23:26:23Z) |
 | 2026-10-09 | P1i-4's field candidate (master `74ba15b86`, built as 0.4.121, unsigned) on the same guest: 0.4.123 uninstalled, the candidate's MSI with `ENABLE_SYSTEM_CONTEXT=1`, enrolled NOT ephemeral (a stopped ephemeral daemon unenrolls itself, and AC20 restarts the service); Git for Windows 2.56.0.2 and Claude Code 2.1.296 (native) for `vmtest`; the model key in a file only SYSTEM and Administrators may read | a start, as the console user | ❌ finding (1). The device advertised `hive`, `hive-view` and `hive-memory`, not `hive-adopt`; its worker was SYSTEM in the console session. A start was accepted in 0.38 s with `account: vmtest`, and the session ended 1.1 s later, "the harness exited with code 1". Its last words: "Cannot use settings file …\hive\run\<sid>\settings.json: Refusing to read a file whose path could not be vetted (a component that could not be examined, or a symbolic link chain too long to follow)". The store's directory and the runtime root granted SYSTEM and Administrators alone. A copy of that tree on the guest, Claude Code run with `vmtest`'s filtered token (a Limited scheduled task, Medium integrity): the same refusal in 3 s; with `(A;;0x80;;;AU)` on the two directories, or `(A;;0x100080;;;AU)`, vetted. **Fixed:** both grant `FILE_READ_ATTRIBUTES \| SYNCHRONIZE` to Authenticated Users, inherited by nothing. Its unit test, run as a restricted Medium copy of its own token, fails on the old DACL ("cannot examine …\hive: Access is denied") and with `0x80` alone, which `CreateFileW`'s own `SYNCHRONIZE` defeats |
 | 2026-10-09 | the same candidate | AC3's two refusals | ✅ With the owner's mapping removed: refused `no_account`, "the device maps no local account to you (hive_accounts)" (23:50:10Z). With the mapping back and the console user signed out (`logoff`), the worker came back as SYSTEM in session 2, and a start was refused `no_console_user`, "nobody is signed in at the console (session 2 has no user)" (23:51:27Z) |
+| 2026-10-10 | the rebuilt candidate (master with #1919, 0.4.121, unsigned, SHA-256 `99872dc6…`) on the same guest, installed over the first with `ENABLE_SYSTEM_CONTEXT=1`, the enrollment and the owner's keys kept | a start, and AC3's `whoami` | ✅ The store's directory and the runtime root now read `(A;;0x100080;;;AU)`, and the session's harness stayed up: `claude.exe` as `vmtest` in the console session. A turn asked for `whoami` and `whoami.exe /groups`, and `whoami` printed **`vmtest`**. The second needed an approval, which the viewer granted ("✅ Allowed by vmtest admin"): the toolbelt's named pipe, end to end. Git Bash's `whoami.exe` is GNU's, though, which refused `/groups`, so the tokens were read from outside instead: the harness `VMTEST-WIN\vmtest`, integrity `0x2000` (Medium), Administrators unusable; the toolbelt relay it started, the same; the worker SYSTEM in session 1, the service SYSTEM in session 0. Two observations about the harness, not Roomler: the model's first answer was stopped by a safety classifier, and Claude Code's note telling the model so showed in the viewer as "Someone"; and the session's model read `claude-opus-5-5` at the first turn and `claude-opus-4-8` from the second on. Model spend: $0.55 |
+| 2026-10-10 | the same | AC20 on Windows: a service restart, a restart at an approval, a crash, a gate changed | ✅ (A) A codeword taught (turn 2), then `Restart-Service`. The daemon logged "the daemon is stopping — its sessions are kept", took the harness down, and the next one logged "resuming what this device hosted" 2.4 s later and relaunched it with `--resume`: a new `claude.exe`, `vmtest`, Medium. Asked "What was the codeword I gave you earlier?", the session answered **TOPAZ-31** (2 s), and the stub read "✅ Turn 3". (B) A `touch` waiting at its approval, then a restart: "⏹ Turn 4 — interrupted" and "🔐 Approval · turn 4 — ⏹ withdrawn", and the file was never made. (D) The worker killed outright (`Stop-Process -Force`): its harness went with the Job Object within a second, and the next worker resumed the session 4.3 s later, with nothing said on the way out. (C) `hive_enabled = false` across a restart: "a hosted session was not resumed … agent sessions are off on this device (hive_enabled)", no harness launched, and the room read "⏹ Session ended — … not resumed after the device restarted: agent sessions are off on this device (hive_enabled)" |
+| 2026-10-10 | the same | a remote-desktop session during a session: the "worker swap" P1i-0 expected | ✅ No swap. The harness's own remote-desktop check (Playwright from mars: frames decoded and advancing) connected and left. The worker kept its pid (SYSTEM, session 1) and the harness its own, and the device logged no stop and no resume. Again with a turn waiting at its approval through the whole remote-desktop session: allowed afterwards, it ran ("✅ Turn 5 — done · 1 step · 20 s", the file made). The code agrees: with SystemContext the worker is SYSTEM from the start (`win_service/supervisor.rs:852`), and `decide_spawn` (`:729`) never swaps it as a controller connects. §3d and the configuration reference are corrected |
+| 2026-10-10 | the same, with `auto_update = true` and the updater's recent-install marker freshened before the restart, so its at-start check was suppressed ("at-startup check suppressed by recent-install cooldown"): a release build has no dry run, and 0.4.123 was the only newer release | AC7 on Windows: an update pushed during a turn waiting at its approval | ✅ The first push came inside the marker's 300 s, and was refused too ("forced update suppressed by recent-install cooldown"). The second (00:35:32Z, pin `agent-v0.4.123`) downloaded the MSI, logged "installer signature verified … signer=G ROX LTD", then "update deferred — agent turns running" (`turns=1`, `waited_secs=0`, `max_secs=1800`), and again at 60 s. Allow came at 00:37:46, the turn ended at 00:37:49, and "the agent turns are done — installing" followed at 00:37:53 (`waited_secs=140`). The device came back as 0.4.123 with SystemContext kept (`ROOMLERD_ENABLE_SYSTEM_SWAP=1`). ❌ Finding (2): the session stayed `idle` on the server. 0.4.123's Windows build has no `hive`, so its agent sent no manifest and P1b's reconcile never ran. Fix in review: a device that comes back with an agent that runs no sessions ends the ones it ran. Model spend: $0.31, and $0.86 for the whole run on its stubs (a resumed harness's first turn shows none) |
 
 ## 9. Related
 
