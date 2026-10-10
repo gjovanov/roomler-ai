@@ -2447,6 +2447,17 @@ where
                             .into(),
                     }
                 }
+                // FR-92 — and whether a controller may keep this console's
+                // pointer moving: it is the console person's mouse. Equality.
+                Ok(Request::ConfigSet { key, .. })
+                    if key == "keep_busy_enabled" && !peer.is_console_user() =>
+                {
+                    Response::Error {
+                        message: "only the person at this device's console can change \
+                              whether keep busy is allowed here"
+                            .into(),
+                    }
+                }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
                 }

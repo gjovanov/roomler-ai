@@ -3811,6 +3811,11 @@ async fn run_cmd(
     // local `ConfigSet` re-seeds them; the server cannot reach them).
     #[cfg(feature = "recording")]
     roomlerd::recording::remote::adopt(&cfg);
+    // FR-92 — the keep-busy engine: restores a keep-busy the signed-in
+    // person left on (it waits for an unlocked session before touching the
+    // pointer), and answers `rc:keep-busy.*` from any viewer. Started here,
+    // inside the runtime, because it initialises the input arbiter.
+    roomlerd::keep_busy::start(cfg.keep_busy_enabled);
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(daemon_state);
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every

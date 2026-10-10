@@ -1084,6 +1084,15 @@ impl AgentPeer {
                         // `shared ×N` badge). Deliver both now.
                         crate::input::arbiter::global().control_ready(session_id);
                         crate::media_share::replay_video_info(session_id);
+                        // FR-92 — the current keep-busy state, once, now that
+                        // there is a channel for it; later changes ride the
+                        // session's emitter.
+                        if crate::keep_busy::subscribe().is_some() {
+                            let dc_init = dc.clone();
+                            tokio::spawn(async move {
+                                let _ = dc_init.send_text(crate::keep_busy::state_json(None)).await;
+                            });
+                        }
                         attach_control_handler(
                             dc,
                             session_id,
@@ -1242,6 +1251,38 @@ impl AgentPeer {
                         let snap = rx.borrow().clone();
                         if let Some(s) = snap
                             && !emit_layout(&stash, &s).await
+                        {
+                            return;
+                        }
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = until.cancelled() => {}
+                    _ = run => {}
+                }
+            });
+        }
+
+        // FR-92 — keep-busy emitter: forwards the engine's state as
+        // `rc:keep-busy.state` over the control DC on every change. Like the
+        // layout emitter, the watch sender is PROCESS-GLOBAL and never
+        // closes, so the session's end is the exit (#1738). The first value
+        // goes out when the control DC opens (the `control` arm), because
+        // the stash is still empty here.
+        if let Some(mut rx) = crate::keep_busy::subscribe() {
+            let stash = control_dc.clone();
+            let until = session_end.clone();
+            tokio::spawn(async move {
+                let run = async move {
+                    while rx.changed().await.is_ok() {
+                        let payload = {
+                            let s = rx.borrow();
+                            crate::keep_busy::wire::state_payload(&s, None).to_string()
+                        };
+                        let dc = stash.lock().await.clone();
+                        if let Some(dc) = dc
+                            && dc.send_text(payload).await.is_err()
                         {
                             return;
                         }
@@ -8599,6 +8640,30 @@ fn attach_control_handler(
                             ),
                         }
                     });
+                }
+                // FR-92 — keep busy. The ARBITER decides whether this session
+                // may switch it (it holds the INPUT grant, the floor and the
+                // session's org policy); the engine then answers EVERY viewer
+                // with `rc:keep-busy.state`. A refusal goes to this one only.
+                "rc:keep-busy.set" => {
+                    match crate::keep_busy::wire::parse_set(&val, crate::keep_busy::wall_ms()) {
+                        Ok(req) => crate::input::arbiter::global().keep_busy_set(session_id, req),
+                        Err(why) => {
+                            debug!(%session_id, why, "control: rc:keep-busy.set malformed");
+                            if let Some(dc) = dc_for_reply.upgrade() {
+                                let _ = dc
+                                    .send_text(crate::keep_busy::state_json(Some("bad_request")))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                "rc:keep-busy.get" => {
+                    if let Some(dc) = dc_for_reply.upgrade()
+                        && let Err(e) = dc.send_text(crate::keep_busy::state_json(None)).await
+                    {
+                        debug!(%session_id, %e, "control: rc:keep-busy.state send failed");
+                    }
                 }
                 "rc:clock" => {
                     // FR-1 P7 — viewer clock probe. Echo `t0` VERBATIM (the

@@ -21,17 +21,17 @@ use enigo::{
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
-use super::{Button, InputInjector, InputMsg, WheelMode};
+use super::{Button, InputInjector, InputMsg, PxJob, WheelMode};
 use tunnel_core::env::node_env;
 
 pub struct EnigoInjector {
-    tx: std_mpsc::Sender<InputMsg>,
+    tx: std_mpsc::Sender<Job>,
     has_perm: bool,
 }
 
 impl EnigoInjector {
     pub fn new() -> Result<Self> {
-        let (tx, rx) = std_mpsc::channel::<InputMsg>();
+        let (tx, rx) = std_mpsc::channel::<Job>();
         // Construct Enigo on the worker thread — we never want to move it
         // between threads. Use a ready-ack channel to surface init errors.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
@@ -78,10 +78,15 @@ impl EnigoInjector {
     }
 }
 
-fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
-    while let Ok(msg) = rx.recv() {
-        if let Err(e) = dispatch(&mut enigo, msg) {
-            tracing::debug!(%e, "input event dropped");
+fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
+    while let Ok(job) = rx.recv() {
+        match job {
+            Job::Input(msg) => {
+                if let Err(e) = dispatch(&mut enigo, msg) {
+                    tracing::debug!(%e, "input event dropped");
+                }
+            }
+            Job::Px(job) => run_px_job(&mut enigo, job),
         }
     }
 }
@@ -595,13 +600,156 @@ fn hid_to_key(code: u32) -> Option<Key> {
 impl InputInjector for EnigoInjector {
     fn inject(&mut self, event: InputMsg) -> Result<()> {
         self.tx
-            .send(event)
+            .send(Job::Input(event))
             .map_err(|_| anyhow!("input worker exited"))
     }
 
     fn has_permission(&self) -> bool {
         self.has_perm
     }
+
+    fn cursor_px(&mut self) -> Result<(i32, i32)> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Locate(reply)))
+    }
+
+    fn move_px(&mut self, x: i32, y: i32) -> Result<()> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Move { x, y, reply }))
+    }
+
+    fn buttons_held(&mut self) -> Result<bool> {
+        super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Buttons(reply)))
+    }
+}
+
+/// What the input thread runs: a controller's event, or (FR-92) a
+/// pixel-space job for keep-busy. One channel, so a read is ordered after
+/// every event queued before it.
+pub(super) enum Job {
+    Input(InputMsg),
+    Px(PxJob),
+}
+
+/// FR-92 — run one pixel-space job on the input thread. Shared with the
+/// SystemContext backend, which calls it after its desktop rebind.
+pub(super) fn run_px_job(enigo: &mut Enigo, job: PxJob) {
+    match job {
+        PxJob::Locate(reply) => {
+            let _ = reply.try_send(locate_px(enigo));
+        }
+        PxJob::Move { x, y, reply } => {
+            let _ = reply.try_send(move_px_now(enigo, x, y));
+        }
+        PxJob::Buttons(reply) => {
+            let _ = reply.try_send(buttons_held_now());
+        }
+    }
+}
+
+/// The cursor in desktop pixels. Windows: `GetCursorPos` — the process is
+/// per-monitor-v2 DPI aware (`dpi.rs`), so these are physical virtual-screen
+/// pixels, the same space [`move_px_now`] writes.
+#[cfg(target_os = "windows")]
+fn locate_px(_enigo: &mut Enigo) -> Result<(i32, i32)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: a stack POINT the call writes; 0 = failure (e.g. a desktop
+    // this thread cannot read), surfaced as an error.
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return Err(anyhow!(
+            "GetCursorPos failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((pt.x, pt.y))
+}
+
+/// The cursor in desktop pixels, through enigo — the same coordinate space
+/// its `move_mouse(Abs)` writes (global display space on macOS, the root
+/// window on X11).
+#[cfg(not(target_os = "windows"))]
+fn locate_px(enigo: &mut Enigo) -> Result<(i32, i32)> {
+    enigo.location().map_err(|e| anyhow!("enigo location: {e}"))
+}
+
+/// An absolute move to desktop pixel `(x, y)` as a REAL input event, so the
+/// OS idle clock resets. Windows: `SendInput(MOVE | ABSOLUTE | VIRTUALDESK)`
+/// normalised over the virtual screen — enigo 0.6.1's own absolute move has
+/// no `VIRTUALDESK` and reaches the primary display only.
+#[cfg(target_os = "windows")]
+fn move_px_now(_enigo: &mut Enigo, x: i32, y: i32) -> Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: GetSystemMetrics has no preconditions.
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let (dx, dy) = crate::keep_busy::normalise_virtual(x, y, vx, vy, vw, vh)
+        .ok_or_else(|| anyhow!("no virtual screen ({vw}x{vh})"))?;
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    // SAFETY: one valid INPUT record; cbSize is its size.
+    let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        // 0 = blocked by another thread (UIPI) or a desktop we cannot reach.
+        return Err(anyhow!(
+            "SendInput sent {sent} of 1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn move_px_now(enigo: &mut Enigo, x: i32, y: i32) -> Result<()> {
+    enigo
+        .move_mouse(x, y, Coordinate::Abs)
+        .map_err(|e| anyhow!("move_mouse: {e}"))
+}
+
+/// Is a physical mouse button held? Windows: `GetAsyncKeyState` for the
+/// five MOUSE buttons only — never a keyboard key: polling key state is what
+/// a keylogger looks like to EDR. Read once per keep-busy resume.
+#[cfg(target_os = "windows")]
+fn buttons_held_now() -> Result<bool> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .into_iter()
+        // SAFETY: GetAsyncKeyState has no preconditions; the high bit is
+        // "down now".
+        .any(|vk| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0);
+    Ok(held)
+}
+
+/// Not wired off Windows yet (FR-92 P3: `CGEventSourceButtonState`, the X11
+/// pointer mask). The engine treats "cannot tell" as "not held".
+#[cfg(not(target_os = "windows"))]
+fn buttons_held_now() -> Result<bool> {
+    Err(anyhow::Error::new(super::PxUnsupported))
 }
 
 #[cfg(test)]
