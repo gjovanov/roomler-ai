@@ -106,12 +106,21 @@ pub fn available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunnel_core::env::test_env::Saved;
+
+    /// Both tests below write `USE_FFMPEG` and then assert on it, and libtest
+    /// runs them on parallel threads of ONE process: unserialised, the first
+    /// one's "unset → ON" can read the second one's `"0"`, and the second's
+    /// "`0` → OFF" can read the first one's clear. Nothing outside this module
+    /// writes the var; its other readers (`caps`, `peer`, `encode::mod`) are
+    /// pump or probe paths whose tests assert nothing that depends on it.
+    static USE_FFMPEG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn available_default_on_when_env_unset() {
-        // SAFETY: tests share the process env; this module is the only
-        // one touching ROOMLERD_USE_FFMPEG so no concurrent reads.
-        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
+        let _guard = USE_FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshots, clears, and restores on drop, including on a failed assert.
+        let _saved = Saved::cleared("USE_FFMPEG");
         // rc.107 — DEFAULT ON in the ffmpeg-encoder build (HEVC-over-DC is
         // the primary path); the feature-off build hardwires available()=false.
         #[cfg(feature = "ffmpeg-encoder")]
@@ -129,7 +138,8 @@ mod tests {
     #[cfg(feature = "ffmpeg-encoder")]
     #[test]
     fn ffmpeg_backend_enabled_default_on_with_explicit_opt_out() {
-        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
+        let _guard = USE_FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _saved = Saved::cleared("USE_FFMPEG");
         assert!(ffmpeg_backend_enabled(), "rc.107: unset → ON (default)");
         for on in ["1", "true", "TRUE", "yes", "On", "whatever"] {
             unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "USE_FFMPEG", on) };
@@ -145,7 +155,6 @@ mod tests {
                 "value {off:?} should explicitly disable the FFmpeg backend"
             );
         }
-        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
     }
 
     /// rc.66 link verification. Exercises the FFmpeg dep so a missing
