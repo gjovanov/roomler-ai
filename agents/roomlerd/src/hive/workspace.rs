@@ -160,23 +160,7 @@ fn take(
         return Err(format!("{sid:?} is not a session id"));
     }
     let repo = find_repo(git, folder, state_dir)?;
-    let index = repo.git_dir.join(format!("hive-{sid}.index"));
-    clear_stale_lock(&repo.git_dir.join(format!("hive-{sid}.index.lock")));
-    if repo.kind == RepoKind::Own {
-        // Seeded from the person's index, so only what changed re-hashes; the
-        // person's own index is read, never written.
-        let theirs = repo.git_dir.join("index");
-        if theirs.is_file() {
-            std::fs::copy(&theirs, &index).map_err(|e| format!("copying the index: {e}"))?;
-        } else {
-            let _ = std::fs::remove_file(&index);
-        }
-    }
-    run(
-        cmd(git, folder, Some(&repo), Some(&index)).args(["add", "-A", "--", "."]),
-        "add",
-    )?;
-    let tree = write_tree(git, folder, &repo, &index)?;
+    let (tree, _) = read_folder(git, folder, &repo, sid)?;
     let head = match repo.kind {
         RepoKind::Own => run(
             cmd(git, folder, Some(&repo), None).args([
@@ -284,6 +268,35 @@ fn clear_stale_lock(lock: &Path) {
     }
 }
 
+/// The folder as git reads it, through the session's temporary index
+/// (`hive-<sid>.index` in the repository's git directory): every file, tracked
+/// or not, ignores honoured. Its tree, and the index that holds it. In the
+/// person's own repository the index is seeded from theirs, so only what
+/// changed is hashed again; theirs is read, never written.
+fn read_folder(
+    git: &Git,
+    folder: &Path,
+    repo: &Repo,
+    sid: &str,
+) -> Result<(String, PathBuf), String> {
+    let index = repo.git_dir.join(format!("hive-{sid}.index"));
+    clear_stale_lock(&repo.git_dir.join(format!("hive-{sid}.index.lock")));
+    if repo.kind == RepoKind::Own {
+        let theirs = repo.git_dir.join("index");
+        if theirs.is_file() {
+            std::fs::copy(&theirs, &index).map_err(|e| format!("copying the index: {e}"))?;
+        } else {
+            let _ = std::fs::remove_file(&index);
+        }
+    }
+    run(
+        cmd(git, folder, Some(repo), Some(&index)).args(["add", "-A", "--", "."]),
+        "add",
+    )?;
+    let tree = write_tree(git, folder, repo, &index)?;
+    Ok((tree, index))
+}
+
 /// The repository `folder` is in, or its shadow in `state_dir`.
 fn find_repo(git: &Git, folder: &Path, state_dir: &Path) -> Result<Repo, String> {
     let inside = cmd(git, folder, None, None)
@@ -311,6 +324,12 @@ fn find_repo(git: &Git, folder: &Path, state_dir: &Path) -> Result<Repo, String>
         // `false`: inside a repository's git directory, not its work tree.
         return Err("the folder is inside a repository's git directory".into());
     }
+    shadow(git, folder, state_dir)
+}
+
+/// The shadow repository of a folder in no repository: `<state_dir>/shadow.git`,
+/// made the first time.
+fn shadow(git: &Git, folder: &Path, state_dir: &Path) -> Result<Repo, String> {
     let git_dir = state_dir.join("shadow.git");
     if !git_dir.join("HEAD").is_file() {
         std::fs::create_dir_all(state_dir)
@@ -419,6 +438,345 @@ fn pack_objects(
     Ok(pack)
 }
 
+// ─── P2b-4b: the reverse — a checkpoint's workspace put into a folder ───────
+
+/// Where a materialize puts the workspace: the folder's own repository, or a
+/// shadow for a folder in none. A missing folder gets a shadow, and is made
+/// only when the workspace is switched into it.
+pub(crate) struct Place {
+    repo: Repo,
+    folder: PathBuf,
+    missing: bool,
+}
+
+impl Place {
+    /// Where git runs: in the folder, or in the git directory while the
+    /// folder is still missing.
+    fn cwd(&self) -> &Path {
+        if self.missing {
+            &self.repo.git_dir
+        } else {
+            &self.folder
+        }
+    }
+
+    pub(crate) fn kind(&self) -> RepoKind {
+        self.repo.kind
+    }
+}
+
+/// The place for materializing into `folder`, whose shadow, for a folder in
+/// no repository, lives in `state_dir`.
+pub(crate) fn place_for(git: &Git, folder: &Path, state_dir: &Path) -> Result<Place, String> {
+    match std::fs::symlink_metadata(folder) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(Place {
+            repo: find_repo(git, folder, state_dir)?,
+            folder: folder.to_path_buf(),
+            missing: false,
+        }),
+        Ok(_) => Err(format!(
+            "{} is not a directory of its own",
+            folder.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Place {
+            repo: shadow(git, folder, state_dir)?,
+            folder: folder.to_path_buf(),
+            missing: true,
+        }),
+        Err(e) => Err(format!("{}: {e}", folder.display())),
+    }
+}
+
+/// One pack of `len` bytes from `r`, into the place's repository through
+/// `git index-pack --stdin --fix-thin`: git checks every object as it lands,
+/// and resolves a thin pack's deltas against the packs before it. Nothing
+/// else of the repository changes; the objects of a materialize refused
+/// later are referenced by nothing, and git's own gc takes them.
+pub(crate) fn index_pack(
+    git: &Git,
+    place: &Place,
+    r: &mut impl Read,
+    len: u64,
+) -> Result<(), String> {
+    let mut c = cmd(git, place.cwd(), Some(&place.repo), None);
+    c.args(["index-pack", "--stdin", "--fix-thin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(spawn_err)?;
+    let mut stderr = child.stderr.take();
+    let said = std::thread::spawn(move || {
+        let mut s = Vec::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = e.read_to_end(&mut s);
+        }
+        s
+    });
+    // The stream's own failure, as against git's refusing the pack.
+    let mut short: Option<String> = None;
+    let mut left = len;
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut buf = vec![0u8; 1 << 16];
+        while left > 0 {
+            let want = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
+            match r.read(&mut buf[..want]) {
+                Ok(0) => {
+                    short = Some("the stream ends inside a pack".into());
+                    break;
+                }
+                Ok(n) => {
+                    if stdin.write_all(&buf[..n]).is_err() {
+                        // git stopped reading: its own word says why.
+                        break;
+                    }
+                    left -= n as u64;
+                }
+                Err(e) => {
+                    short = Some(format!("reading a pack: {e}"));
+                    break;
+                }
+            }
+        }
+        // `stdin` dropped: the pack's end.
+    }
+    if short.is_some() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("waiting for git index-pack: {e}"))?;
+    let said = said.join().unwrap_or_default();
+    if let Some(why) = short {
+        return Err(why);
+    }
+    if !status.success() {
+        return Err(format!("git index-pack failed: {}", tail(&said)));
+    }
+    if left > 0 {
+        return Err("git index-pack stopped reading the pack".into());
+    }
+    Ok(())
+}
+
+/// The tree `commit` holds, as git hashed it from what the packs brought:
+/// the checkpoint's word about its `tree` is held to it.
+pub(crate) fn tree_of(git: &Git, place: &Place, commit: &str) -> Result<String, String> {
+    run(
+        cmd(git, place.cwd(), Some(&place.repo), None).args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{commit}^{{tree}}"),
+        ]),
+        "rev-parse",
+    )
+    .map_err(|_| format!("the packs hold no commit {commit}"))
+}
+
+/// Every path `tree` holds, recursively, `/`-separated from its root: what
+/// the target's file system is held to before the folder is touched.
+pub(crate) fn tree_paths(git: &Git, place: &Place, tree: &str) -> Result<Vec<String>, String> {
+    let out = cmd(git, place.cwd(), Some(&place.repo), None)
+        .args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", tree])
+        .output()
+        .map_err(spawn_err)?;
+    if !out.status.success() {
+        return Err(format!("git ls-tree failed: {}", tail(&out.stderr)));
+    }
+    out.stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            String::from_utf8(s.to_vec())
+                .map_err(|_| "the workspace holds a name that is not UTF-8".to_string())
+        })
+        .collect()
+}
+
+/// What the folder holds now, read as a checkpoint reads it, and the index
+/// that holds it; a missing folder holds the empty tree.
+pub(crate) struct Current {
+    tree: String,
+    index: PathBuf,
+}
+
+/// The folder's current state, and whether it is one a materialize may
+/// replace: nothing yet; exactly what its own `HEAD` holds (a clean clone);
+/// exactly what this session last left in it (a member that was this
+/// session's primary before: moving back); or already `tree`. Anything else
+/// is the person's own work, and is refused.
+pub(crate) fn judge(git: &Git, place: &Place, sid: &str, tree: &str) -> Result<Current, String> {
+    let empty = empty_tree(git, place)?;
+    let index = place.repo.git_dir.join(format!("hive-{sid}.index"));
+    let now = if place.missing {
+        let _ = std::fs::remove_file(&index);
+        empty.clone()
+    } else {
+        read_folder(git, &place.folder, &place.repo, sid)?.0
+    };
+    let current = Current { tree: now, index };
+    if current.tree == empty || current.tree == tree {
+        return Ok(current);
+    }
+    let rev = |spec: String| {
+        run(
+            cmd(git, place.cwd(), Some(&place.repo), None).args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &spec,
+            ]),
+            "rev-parse",
+        )
+        .ok()
+        .filter(|s| !s.is_empty())
+    };
+    if place.repo.kind == RepoKind::Own {
+        let at_head = if place.repo.prefix.is_empty() {
+            "HEAD^{tree}".to_string()
+        } else {
+            format!("HEAD:{}", place.repo.prefix.trim_end_matches('/'))
+        };
+        if rev(at_head).as_deref() == Some(current.tree.as_str()) {
+            return Ok(current);
+        }
+    }
+    if rev(format!("refs/hive/{sid}/head^{{tree}}")).as_deref() == Some(current.tree.as_str()) {
+        return Ok(current);
+    }
+    Err("the folder holds work of its own, neither its HEAD's nor this session's".into())
+}
+
+/// Move the folder from what it holds (`from`) to `tree` with git's own
+/// two-tree switch (`read-tree -m -u`): what `tree` lacks is removed, what it
+/// changes is rewritten with this repository's line endings and filters, and
+/// an untracked file in the way is refused before anything is written. The
+/// person's `HEAD`, branches and index are never touched. Then the folder is
+/// held to `tree` again, read as a checkpoint reads it, and the commit kept
+/// under `refs/hive/<sid>/head`, where the next checkpoint here starts.
+pub(crate) fn switch(
+    git: &Git,
+    place: &Place,
+    sid: &str,
+    from: &Current,
+    tree: &str,
+    commit: &str,
+) -> Result<(), String> {
+    if place.missing {
+        std::fs::create_dir_all(&place.folder)
+            .map_err(|e| format!("making {}: {e}", place.folder.display()))?;
+    }
+    if from.tree != tree {
+        let (w0, w1) = whole_trees(git, place, sid, from, tree)?;
+        run(
+            cmd(git, &place.folder, Some(&place.repo), Some(&from.index)).args([
+                "read-tree",
+                "-m",
+                "-u",
+                &w0,
+                &w1,
+            ]),
+            "read-tree",
+        )?;
+    }
+    let (after, _) = read_folder(git, &place.folder, &place.repo, sid)?;
+    if after != tree {
+        return Err(format!(
+            "the folder reads as {after} after the switch, not the checkpoint's {tree}"
+        ));
+    }
+    run(
+        cmd(git, &place.folder, Some(&place.repo), None).args([
+            "update-ref",
+            &format!("refs/hive/{sid}/head"),
+            commit,
+        ]),
+        "update-ref",
+    )?;
+    Ok(())
+}
+
+/// The two trees the switch moves the index between. A shadow, and a folder
+/// at its repository's top, hold the folder's tree whole. A folder inside a
+/// repository holds a subtree: the switch is between the whole repository's
+/// trees, the index's as it is and the same with the folder's subtree
+/// swapped for `tree`, so everything outside the folder stays as it is.
+fn whole_trees(
+    git: &Git,
+    place: &Place,
+    sid: &str,
+    from: &Current,
+    tree: &str,
+) -> Result<(String, String), String> {
+    if place.repo.kind == RepoKind::Shadow || place.repo.prefix.is_empty() {
+        let w0 = if place.missing {
+            empty_tree(git, place)?
+        } else {
+            from.tree.clone()
+        };
+        return Ok((w0, tree.to_string()));
+    }
+    let w0 = run(
+        cmd(git, &place.folder, Some(&place.repo), Some(&from.index)).arg("write-tree"),
+        "write-tree",
+    )?;
+    let swap = place.repo.git_dir.join(format!("hive-{sid}.swap.index"));
+    let _ = std::fs::remove_file(&swap);
+    let w1 = swapped(git, place, &swap, &w0, tree);
+    let _ = std::fs::remove_file(&swap);
+    Ok((w0, w1?))
+}
+
+/// The whole tree `w0` with the folder's subtree swapped for `tree`, built in
+/// the scratch index `swap`.
+fn swapped(git: &Git, place: &Place, swap: &Path, w0: &str, tree: &str) -> Result<String, String> {
+    let folder = &place.folder;
+    let git_at = |index: &Path| cmd(git, folder, Some(&place.repo), Some(index));
+    run(git_at(swap).args(["read-tree", w0]), "read-tree")?;
+    // The folder's entries out, by their paths relative to it.
+    let listed = git_at(swap)
+        .args(["ls-files", "-z", "--", "."])
+        .output()
+        .map_err(spawn_err)?;
+    if !listed.status.success() {
+        return Err(format!("git ls-files failed: {}", tail(&listed.stderr)));
+    }
+    let mut c = git_at(swap);
+    c.args(["update-index", "-z", "--force-remove", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(spawn_err)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&listed.stdout)
+            .map_err(|e| format!("writing to git update-index: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for git update-index: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git update-index failed: {}", tail(&out.stderr)));
+    }
+    run(
+        git_at(swap).args([
+            "read-tree",
+            &format!("--prefix={}", place.repo.prefix),
+            tree,
+        ]),
+        "read-tree --prefix",
+    )?;
+    run(git_at(swap).arg("write-tree"), "write-tree")
+}
+
+/// The empty tree, as this repository's object format names it.
+fn empty_tree(git: &Git, place: &Place) -> Result<String, String> {
+    let mut c = cmd(git, place.cwd(), Some(&place.repo), None);
+    c.args(["hash-object", "-t", "tree", "-w", "--stdin"])
+        .stdin(Stdio::null());
+    run(&mut c, "hash-object")
+}
+
 /// `git`, run in `folder` against `repo` (and `index`), with nothing of the
 /// caller's git environment, no hook, no fsmonitor and no automatic gc.
 fn cmd(git: &Git, folder: &Path, repo: Option<&Repo>, index: Option<&Path>) -> Command {
@@ -485,7 +843,7 @@ fn tail(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const SID: &str = "6aca8ef5dac84dd57e492eb7";
 
@@ -816,6 +1174,311 @@ mod tests {
             None,
         ));
         assert!(!lock.exists(), "cleared, and git let go of its own");
+    }
+
+    /// Every file under `dir` but its `.git`, by `/`-separated path. A move
+    /// keeps git's tree, not the bytes (design §6.3): a Windows checkout ends
+    /// its lines as its git is configured to, so lines compare as LF there.
+    fn work_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(dir: &Path, rel: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let name = e.file_name().into_string().unwrap();
+                if rel.is_empty() && name == ".git" {
+                    continue;
+                }
+                let r = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if e.file_type().unwrap().is_dir() {
+                    walk(&e.path(), &r, out);
+                } else {
+                    let bytes = std::fs::read(e.path()).unwrap();
+                    let bytes = if cfg!(windows) {
+                        String::from_utf8_lossy(&bytes)
+                            .replace("\r\n", "\n")
+                            .into_bytes()
+                    } else {
+                        bytes
+                    };
+                    out.insert(r, bytes);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        if dir.exists() {
+            walk(dir, "", &mut out);
+        }
+        out
+    }
+
+    /// What `hive-materialize` does with a workspace's packs, the last
+    /// checkpoint being `last`: the packs in, the tree held to, the folder
+    /// judged and switched.
+    fn materialize_into(
+        git: &Git,
+        folder: &Path,
+        state: &Path,
+        packs: &[&[u8]],
+        last: &WorkspaceSnap,
+    ) -> Result<RepoKind, String> {
+        let place = place_for(git, folder, state)?;
+        for pack in packs {
+            index_pack(git, &place, &mut &pack[..], pack.len() as u64)?;
+        }
+        assert_eq!(tree_of(git, &place, &last.commit)?, last.tree);
+        let current = judge(git, &place, SID, &last.tree)?;
+        switch(git, &place, SID, &current, &last.tree, &last.commit)?;
+        Ok(place.kind())
+    }
+
+    /// P2b-4b — a shadow's checkpoints, put into a folder that is not there
+    /// yet, give the folder back; the next checkpoint's pack, thin against the
+    /// last, moves it on, because what it holds is what the session left.
+    #[test]
+    fn a_shadow_materializes_into_a_missing_folder_and_moves_on_with_the_next() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let git = Git::under(root.path());
+        let src = root.path().join("src");
+        write(&src, "a.txt", "one\n");
+        write(&src, "sub/b.txt", "bee\n");
+        let src_state = root.path().join("src-state");
+        let (one, p1) = taken(checkpoint(&git, &src, &src_state, SID, 1, 1, None));
+        write(&src, "a.txt", "one, changed\n");
+        std::fs::remove_file(src.join("sub/b.txt")).unwrap();
+        write(&src, "c.txt", "sea\n");
+        let (two, p2) = taken(checkpoint(&git, &src, &src_state, SID, 2, 2, Some(&one)));
+        let (p1, p2) = (p1.concat(), p2.concat());
+
+        let dst = root.path().join("dst");
+        let dst_state = root.path().join("dst-state");
+        let kind = materialize_into(&git, &dst, &dst_state, &[&p1, &p2], &two).unwrap();
+        assert_eq!(kind, RepoKind::Shadow);
+        assert_eq!(work_files(&dst), work_files(&src));
+        let shadow = dst_state.join("shadow.git");
+        assert_eq!(
+            person(&shadow, &["rev-parse", &format!("refs/hive/{SID}/head")]),
+            two.commit
+        );
+
+        write(&src, "d.txt", "dee\n");
+        let (three, p3) = taken(checkpoint(&git, &src, &src_state, SID, 3, 3, Some(&two)));
+        materialize_into(&git, &dst, &dst_state, &[&p3.concat()], &three).unwrap();
+        assert_eq!(work_files(&dst), work_files(&src), "moved on");
+    }
+
+    /// P2b-4b — into a clean clone of the same repository, the session's
+    /// changes land in the work tree, tracked and untracked, and the person's
+    /// `HEAD`, branches and index stay as they were.
+    #[test]
+    fn a_clean_clone_is_switched_and_the_persons_head_and_index_stay() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let src = tmp.path();
+        write(src, "a.txt", "one, changed\n");
+        write(src, "b.txt", "new\n");
+        let src_state = tempfile::tempdir().unwrap();
+        let (snap, pack) = taken(checkpoint(
+            &Git::on_path(),
+            src,
+            src_state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
+
+        let parent = tempfile::tempdir().unwrap();
+        person(
+            parent.path(),
+            &["clone", "-q", &src.display().to_string(), "clone"],
+        );
+        let dst = parent.path().join("clone");
+        let git_dir = PathBuf::from(person(&dst, &["rev-parse", "--absolute-git-dir"]));
+        let head = person(&dst, &["rev-parse", "HEAD"]);
+        let index = std::fs::read(git_dir.join("index")).unwrap();
+        let branches = person(&dst, &["for-each-ref", "refs/heads"]);
+        let dst_state = tempfile::tempdir().unwrap();
+        let kind = materialize_into(
+            &Git::on_path(),
+            &dst,
+            dst_state.path(),
+            &[&pack.concat()],
+            &snap,
+        )
+        .unwrap();
+        assert_eq!(kind, RepoKind::Own);
+        assert_eq!(work_files(&dst), work_files(src));
+        assert_eq!(person(&dst, &["rev-parse", "HEAD"]), head);
+        assert_eq!(std::fs::read(git_dir.join("index")).unwrap(), index);
+        assert_eq!(person(&dst, &["for-each-ref", "refs/heads"]), branches);
+        assert_eq!(
+            person(&dst, &["rev-parse", &format!("refs/hive/{SID}/head")]),
+            snap.commit
+        );
+    }
+
+    /// P2b-4b — a folder inside a repository takes back only its own subtree;
+    /// everything outside it in the clone stays as it was.
+    #[test]
+    fn a_folder_inside_a_repository_takes_back_only_its_subtree() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        person(src, &["init", "-q"]);
+        write(src, "top.txt", "outside the session\n");
+        write(src, "sub/x.txt", "inside\n");
+        write(src, "sub/gone.txt", "to be removed\n");
+        person(src, &["add", "-A"]);
+        person(src, &["commit", "-q", "-m", "first"]);
+        write(src, "sub/x.txt", "inside, changed\n");
+        write(src, "sub/y.txt", "new inside\n");
+        std::fs::remove_file(src.join("sub/gone.txt")).unwrap();
+        let src_state = tempfile::tempdir().unwrap();
+        let (snap, pack) = taken(checkpoint(
+            &Git::on_path(),
+            &src.join("sub"),
+            src_state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
+        assert_eq!(snap.prefix, "sub/");
+
+        let parent = tempfile::tempdir().unwrap();
+        person(
+            parent.path(),
+            &["clone", "-q", &src.display().to_string(), "clone"],
+        );
+        let dst = parent.path().join("clone");
+        write(&dst, "top.txt", "the person's own, outside the folder\n");
+        let dst_state = tempfile::tempdir().unwrap();
+        materialize_into(
+            &Git::on_path(),
+            &dst.join("sub"),
+            dst_state.path(),
+            &[&pack.concat()],
+            &snap,
+        )
+        .unwrap();
+        assert_eq!(work_files(&dst.join("sub")), work_files(&src.join("sub")));
+        assert_eq!(
+            std::fs::read_to_string(dst.join("top.txt")).unwrap(),
+            "the person's own, outside the folder\n",
+            "outside the folder, nothing moves"
+        );
+    }
+
+    /// P2b-4b — a folder holding work of its own, neither its `HEAD`'s nor
+    /// this session's, is refused, and left as it was.
+    #[test]
+    fn a_folder_with_work_of_its_own_is_refused_and_left_as_it_was() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let src = tmp.path();
+        write(src, "a.txt", "the session's\n");
+        let src_state = tempfile::tempdir().unwrap();
+        let (snap, pack) = taken(checkpoint(
+            &Git::on_path(),
+            src,
+            src_state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
+        let pack = pack.concat();
+
+        let parent = tempfile::tempdir().unwrap();
+        person(
+            parent.path(),
+            &["clone", "-q", &src.display().to_string(), "clone"],
+        );
+        let dst = parent.path().join("clone");
+        write(&dst, "a.txt", "the person's own\n");
+        let dst_state = tempfile::tempdir().unwrap();
+        let e =
+            materialize_into(&Git::on_path(), &dst, dst_state.path(), &[&pack], &snap).unwrap_err();
+        assert!(e.contains("work of its own"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).unwrap(),
+            "the person's own\n"
+        );
+
+        // A folder in no repository, holding files that are not the session's.
+        let other = tempfile::tempdir().unwrap();
+        let folder = other.path().join("folder");
+        write(&folder, "notes.txt", "someone else's\n");
+        let git = Git::under(other.path());
+        let e = materialize_into(&git, &folder, &other.path().join("state"), &[&pack], &snap)
+            .unwrap_err();
+        assert!(e.contains("work of its own"), "{e}");
+        assert_eq!(
+            work_files(&folder).keys().collect::<Vec<_>>(),
+            ["notes.txt"]
+        );
+    }
+
+    /// P2b-4b — a folder whose git cannot give the tree back is said to, and
+    /// the session's ref is not moved: here a blob with CRLF line ends, into a
+    /// repository that turns them into LF as it reads (`core.autocrlf=input`).
+    /// (Unix: on Windows the source's own git would have turned them already.)
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_hold_the_tree_is_said_to_and_its_ref_stays() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let src = tempfile::tempdir().unwrap();
+        person(src.path(), &["init", "-q"]);
+        person(src.path(), &["config", "core.autocrlf", "false"]);
+        write(src.path(), "dos.txt", "one\r\ntwo\r\n");
+        let state = tempfile::tempdir().unwrap();
+        let (snap, pack) = taken(checkpoint(
+            &Git::on_path(),
+            src.path(),
+            state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
+
+        let dst = tempfile::tempdir().unwrap();
+        person(dst.path(), &["init", "-q"]);
+        person(dst.path(), &["config", "core.autocrlf", "input"]);
+        let dst_state = tempfile::tempdir().unwrap();
+        let e = materialize_into(
+            &Git::on_path(),
+            dst.path(),
+            dst_state.path(),
+            &[&pack.concat()],
+            &snap,
+        )
+        .unwrap_err();
+        assert!(e.contains("after the switch"), "{e}");
+        let ours = cmd(&Git::on_path(), dst.path(), None, None)
+            .args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/hive/{SID}/head"),
+            ])
+            .output()
+            .unwrap();
+        assert!(!ours.status.success(), "the ref is not moved");
     }
 
     /// No `git`, or a session id that is not one, skips the workspace in words.

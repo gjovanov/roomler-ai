@@ -934,12 +934,12 @@ flowchart TD
 
 | Step | What it guards | Where |
 |---|---|---|
-| the repository | its own, or the one the folder is in; a shadow for a folder in none, and a refusal inside a git directory | [`workspace.rs:291`](../agents/roomlerd/src/hive/workspace.rs#L291) |
-| the index | `$gd/hive-<sid>.index`, a copy of the person's: theirs is read, never written | [`workspace.rs:167`](../agents/roomlerd/src/hive/workspace.rs#L167) |
-| the tree | `write-tree --prefix` for a folder inside a repository, so nothing outside the folder is taken and the repository's `.gitignore` still keeps a `.env` out | [`workspace.rs:338`](../agents/roomlerd/src/hive/workspace.rs#L338) |
-| the commit | "Roomler Hive" as author, never the person; `--no-gpg-sign`, so a person's `commit.gpgSign` never waits on their key; the last checkpoint's commit as parent | [`workspace.rs:242`](../agents/roomlerd/src/hive/workspace.rs#L242) |
-| the pack | thin against the last checkpoint, whole for the first; at most 512 MiB | [`workspace.rs:362`](../agents/roomlerd/src/hive/workspace.rs#L362) |
-| every command | no hook (`core.hooksPath` names nowhere), no fsmonitor, no automatic gc, none of the caller's `GIT_*` environment | [`workspace.rs:427`](../agents/roomlerd/src/hive/workspace.rs#L427) |
+| the repository | its own, or the one the folder is in; a shadow for a folder in none, and a refusal inside a git directory | [`workspace.rs:304`](../agents/roomlerd/src/hive/workspace.rs#L304) |
+| the index | `$gd/hive-<sid>.index`, a copy of the person's: theirs is read, never written | [`workspace.rs:276`](../agents/roomlerd/src/hive/workspace.rs#L276) |
+| the tree | `write-tree --prefix` for a folder inside a repository, so nothing outside the folder is taken and the repository's `.gitignore` still keeps a `.env` out | [`workspace.rs:357`](../agents/roomlerd/src/hive/workspace.rs#L357) |
+| the commit | "Roomler Hive" as author, never the person; `--no-gpg-sign`, so a person's `commit.gpgSign` never waits on their key; the last checkpoint's commit as parent | [`workspace.rs:226`](../agents/roomlerd/src/hive/workspace.rs#L226) |
+| the pack | thin against the last checkpoint, whole for the first; at most 512 MiB | [`workspace.rs:381`](../agents/roomlerd/src/hive/workspace.rs#L381) |
+| every command | no hook (`core.hooksPath` names nowhere), no fsmonitor, no automatic gc, none of the caller's `GIT_*` environment | [`workspace.rs:785`](../agents/roomlerd/src/hive/workspace.rs#L785) |
 
 ⚠️ **The first checkpoint's commit has no parent.** Its pack holds the whole tree and
 none of the person's history, because a member has nothing else to resolve a delta
@@ -1037,7 +1037,7 @@ flowchart LR
 | the request | `checkpoint.json` in the session's runtime directory, the daemon's own: made `0600` and handed to the account through its descriptor, never by a path ([`checkpointer.rs:527`](../agents/roomlerd/src/hive/checkpointer.rs#L527)); on Windows it takes the session directory's DACL |
 | a failure | logged with the session and the number, and said once per reason in the transcript ("Checkpoint 3 was not taken: …"); the session goes on |
 | the daemon going down | starts none, and says no failure: the child went down with it (systemd signals the whole cgroup at once), and the next daemon's next checkpoint takes what this one would have (P1d-2) |
-| a lock left behind | a lock on the checkpoint's own index older than 300 s is cleared ([`workspace.rs:272`](../agents/roomlerd/src/hive/workspace.rs#L272)). A KILL or a power cut leaves one, and it would refuse every checkpoint after it for good; no checkpoint holds one longer than its 120 s |
+| a lock left behind | a lock on the checkpoint's own index older than 300 s is cleared ([`workspace.rs:256`](../agents/roomlerd/src/hive/workspace.rs#L256)). A KILL or a power cut leaves one, and it would refuse every checkpoint after it for good; no checkpoint holds one longer than its 120 s |
 | the room | a `checkpoint` event is one line: "💾 Checkpoint 2: 1 of 3 of the agent's files changed; the folder committed", or the folder unchanged, or not kept and why |
 
 ⚠️ Nothing sets `replicated` before P2c, so no device takes a checkpoint yet. Three
@@ -1063,7 +1063,7 @@ session's last checkpoint back on the device that will run it, and the daemon ne
 writes a path in the account's tree. So it starts `roomlerd hive-materialize` as the
 target's account and streams it the files
 ([`materializer.rs`](../agents/roomlerd/src/hive/materializer.rs)). P2b-4a builds both
-sides for the config directory; P2b-4b adds the workspace. Nothing calls it before P2e.
+sides for the config directory; P2b-4b adds the folder (below). Nothing calls it before P2e.
 
 ```mermaid
 sequenceDiagram
@@ -1085,12 +1085,12 @@ sequenceDiagram
 
 | Step | What it guards | Where |
 |---|---|---|
-| the plan | every path in the allowlist; each file's chunks from its last start-over, adding up to its entry. A history is streamed, never held whole | [`materializer.rs:133`](../agents/roomlerd/src/hive/materializer.rs#L133) · [`checkpoint.rs:722`](../crates/hive-node/src/checkpoint.rs#L722) `chunks_of` |
-| the stream | each blob held to its chunk before it goes; a blob the store lacks ends the stream short, the child writes nothing, and the daemon's own word is the answer | [`materializer.rs:232`](../agents/roomlerd/src/hive/materializer.rs#L232) |
-| the names | the allowlist again, in order. On Windows: no device name (`aux.md` is AUX, `COM1.log` is COM1), none of `<>:"\|?*` or a control character, no trailing dot or space, at most 259 characters where it goes. On Windows and macOS: no two names that differ only in case | [`materializer.rs:529`](../agents/roomlerd/src/hive/materializer.rs#L529) |
-| the places | every directory on the way is one of its own, never a link to one, and no file goes where a directory is | [`materializer.rs:615`](../agents/roomlerd/src/hive/materializer.rs#L615) |
-| the files | staged beside where they go, `0600` whatever mode the checkpoint's OS kept, and each held to its entry's length and hash; only then are they renamed into place | [`materializer.rs:461`](../agents/roomlerd/src/hive/materializer.rs#L461) |
-| what goes | inside the allowlist, a file the checkpoint does not list is removed, never through a link and no deeper than a checkpoint looks; nothing outside it is touched (a login, the harness's own state) | [`materializer.rs:751`](../agents/roomlerd/src/hive/materializer.rs#L751) |
+| the plan | every path in the allowlist; each file's chunks from its last start-over, adding up to its entry. A history is streamed, never held whole | [`materializer.rs:190`](../agents/roomlerd/src/hive/materializer.rs#L190) · [`checkpoint.rs:722`](../crates/hive-node/src/checkpoint.rs#L722) `chunks_of` |
+| the stream | each blob held to its chunk before it goes; a blob the store lacks ends the stream short, the child writes nothing, and the daemon's own word is the answer | [`materializer.rs:350`](../agents/roomlerd/src/hive/materializer.rs#L350) |
+| the names | the allowlist again, in order. On Windows: no device name (`aux.md` is AUX, `COM1.log` is COM1), none of `<>:"\|?*` or a control character, no trailing dot or space, at most 259 characters where it goes. On Windows and macOS: no two names that differ only in case | [`materializer.rs:714`](../agents/roomlerd/src/hive/materializer.rs#L714) |
+| the places | every directory on the way is one of its own, never a link to one, and no file goes where a directory is | [`materializer.rs:848`](../agents/roomlerd/src/hive/materializer.rs#L848) |
+| the files | staged beside where they go, `0600` whatever mode the checkpoint's OS kept, and each held to its entry's length and hash; only then are they renamed into place | [`materializer.rs:594`](../agents/roomlerd/src/hive/materializer.rs#L594) |
+| what goes | inside the allowlist, a file the checkpoint does not list is removed, never through a link and no deeper than a checkpoint looks; nothing outside it is touched (a login, the harness's own state) | [`materializer.rs:984`](../agents/roomlerd/src/hive/materializer.rs#L984) |
 
 ⚠️ **What comes in is another device's word.** A checkpoint was taken by whichever
 member was primary, and this daemon only relays it. Unchecked, a path that climbs out
@@ -1113,8 +1113,58 @@ thread of its own feeds the child's pipe
 The files are written `0600` because a checkpoint taken on Windows records mode 0,
 and restoring that on Linux would leave the account unable to read its own history.
 
-The rest of P2 is next (spec §3b and §4): the rest of P2b (the workspace's materialize, P2b-4b),
-membership and placement (P2c), the QUIC carrier and the stream (P2d), promotion and
+### P2b-4b: `hive-materialize`, the folder as the account
+
+The same child takes the session's folder back too, after the config directory's files
+are staged ([`workspace.rs`](../agents/roomlerd/src/hive/workspace.rs)). The daemon
+sends the packs that bring the last checkpoint's commit
+([`materializer.rs:248`](../agents/roomlerd/src/hive/materializer.rs#L248)):
+back from it along each `base` to a whole pack, past the turns that changed nothing,
+and oldest first, so each thin pack finds its base in the repository already.
+
+```mermaid
+flowchart TD
+    P["place_for(): the folder's own repository,<br/>or a shadow (a missing folder is made only at the switch)"] --> I["index-pack --stdin --fix-thin, pack by pack:<br/>git checks every object as it lands"]
+    I --> T{"the commit's tree, as git hashed it,<br/>the checkpoint's?"}
+    T -- no --> R["refused: nothing in the folder,<br/>no config file placed"]
+    T -- yes --> N{"every name in the tree<br/>one this OS can hold?"}
+    N -- no --> R
+    N -- yes --> J{"judge(): the folder holds nothing,<br/>its HEAD's tree, the session's own last tree here,<br/>or already the checkpoint's?"}
+    J -- no --> R
+    J -- yes --> S["switch(): read-tree -m -u from its tree to the checkpoint's,<br/>through the session's temporary index"]
+    S --> V{"the folder reads back as the tree?"}
+    V -- no --> F["said, and the ref not moved"]
+    V -- yes --> D["the session's ref = the commit;<br/>then the config files placed"]
+```
+
+| Step | What it guards | Where |
+|---|---|---|
+| the place | the folder's own repository, at its prefix, or a shadow in the session's state directory; a link where the folder goes is refused | [`workspace.rs:470`](../agents/roomlerd/src/hive/workspace.rs#L470) |
+| the packs | each through `git index-pack --stdin --fix-thin`, which checks every object as it lands. Nothing else of the repository changes; the objects of a materialize refused later are referenced by nothing, and git's own gc takes them | [`workspace.rs:495`](../agents/roomlerd/src/hive/workspace.rs#L495) |
+| the tree | the commit's tree, as git hashed it, must be the one the checkpoint names | [`materializer.rs:672`](../agents/roomlerd/src/hive/materializer.rs#L672) |
+| the names | every path in the tree held to the same rules as the config directory's: Windows' names and lengths where it goes, and on Windows and macOS two names that are one there, files or the directories on their way (`Dir/a` beside `dir/b`) | [`materializer.rs:765`](../agents/roomlerd/src/hive/materializer.rs#L765) |
+| the folder | only one it is safe to replace: holding nothing yet, exactly its own `HEAD`'s tree (a clean clone), exactly what this session last left in it (a former primary: moving back), or already the checkpoint's. Anything else is the person's own work, and is refused | [`workspace.rs:608`](../agents/roomlerd/src/hive/workspace.rs#L608) |
+| the switch | git's own two-tree `read-tree -m -u`, through the session's temporary index: what the tree lacks is removed, what it changes is rewritten with the repository's line endings and filters, and an untracked file in the way is refused before anything is written | [`workspace.rs:657`](../agents/roomlerd/src/hive/workspace.rs#L657) |
+| a folder inside a repository | the switch is between the whole repository's trees, the index's and the same with the folder's subtree swapped, so nothing outside the folder moves | [`workspace.rs:704`](../agents/roomlerd/src/hive/workspace.rs#L704) |
+| the end | the folder read back as a checkpoint reads it must be the tree; only then is `refs/hive/<sid>/head` the commit, where the next checkpoint here starts | [`workspace.rs:657`](../agents/roomlerd/src/hive/workspace.rs#L657) |
+
+⚠️ **The person's `HEAD`, branches and index are never touched**, as the checkpoint
+side never touches them. In a clean clone the session's changes land in the work tree
+as uncommitted changes, which is what they were where the checkpoint was taken.
+
+⚠️ **A move keeps git's tree, not the bytes** (design §6.3). Line endings follow the
+target's git configuration, so a Windows checkout with `core.autocrlf=true` lands with
+CRLF. That is why the folder is held to the tree id, never byte for byte. A folder whose
+git cannot give the tree back — a CRLF blob into a repository with
+`core.autocrlf=input` — is said to, and its ref is not moved.
+
+⚠️ **A switch that fails part way is not undone.** Every check runs before the folder is
+touched, and git refuses an untracked file in the way before it writes. But a write that
+fails part way (a full disk) leaves the folder between the two trees. The ref is not
+moved, the config files are not placed, and the materialize says so.
+
+The rest of P2 is next (spec §3b and §4): membership and placement (P2c), the QUIC
+carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the
 field run (P2k). Its server switch is `hive.replicaset` and its device switch
