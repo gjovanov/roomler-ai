@@ -1254,6 +1254,16 @@ pub enum Request {
     /// FR-85 — delete one recording (and its sidecar) from the folder, by file
     /// name. Console user only. Returns [`Response::RecordingDeleted`].
     RecordingDelete { name: String },
+    /// FR-92 — keep busy on this device (pointer patterns that keep it active
+    /// until switched off): what it is doing and why. Read-only. Returns
+    /// [`Response::KeepBusy`].
+    KeepBusyStatus,
+    /// FR-92 — stop keep busy. Open to every peer the endpoint admits, the
+    /// person socket included: stopping is the safe direction, and it is the
+    /// person's own pointer. There is deliberately no local "on" — only an
+    /// `INPUT` session from the viewer turns it on. Returns
+    /// [`Response::KeepBusy`].
+    KeepBusyOff,
     /// FR-84 D5b — one page of the devices THIS device may see (itself
     /// included): `GET /api/agent/self/devices` on the org's server, asked by
     /// the daemon with that org's agent token. The server searches, sorts and
@@ -1580,6 +1590,9 @@ pub enum Response {
     Recording(RecordingState),
     /// FR-85 — the recordings folder and what is in it.
     Recordings(RecordingsListing),
+    /// FR-92 — keep busy's state, answering [`Request::KeepBusyStatus`] and
+    /// [`Request::KeepBusyOff`].
+    KeepBusy(KeepBusyInfo),
     /// FR-85 — the result of [`Request::RecordingDelete`].
     RecordingDeleted {
         ok: bool,
@@ -1670,6 +1683,54 @@ pub struct RecordStartOpts {
     /// Record the microphone. Local only, by construction.
     #[serde(default)]
     pub microphone: bool,
+}
+
+/// FR-92 — keep busy on this device: what the engine is doing, and why.
+/// The codes are the agent's (`docs/fr/FR-92-keep-busy.md`); `sentence` is its
+/// own wording of `reason`, ready to show — the tray and the CLI never
+/// compose their own.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeepBusyInfo {
+    /// Keep busy can run here at all: built for this host, and allowed by
+    /// the device owner and the org.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub on: bool,
+    /// `off` · `calibrating` · `running` · `paused` · `locked` · `unavailable`.
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentence: Option<String>,
+    /// `local` · `remote`, while paused for a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes_in_ms: Option<u64>,
+    /// The pattern's wire name (`circle`, `heart`, …).
+    #[serde(default)]
+    pub pattern: String,
+    /// Who turned it on (a controller's display name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_off_at_ms: Option<u64>,
+}
+
+impl KeepBusyInfo {
+    /// What a service that cannot run keep busy answers.
+    pub fn unavailable() -> Self {
+        KeepBusyInfo {
+            phase: "unavailable".into(),
+            reason: Some("unsupported".into()),
+            sentence: Some("Unavailable on this computer.".into()),
+            ..Default::default()
+        }
+    }
 }
 
 /// FR-85 — what the recorder is doing now, and how the last recording ended.
@@ -2127,6 +2188,15 @@ pub trait LocalApiState: Send + Sync {
     async fn record_status(&self) -> Response {
         Response::Recording(RecordingState::unavailable(NO_RECORDER))
     }
+    /// FR-92 — keep busy's state.
+    async fn keep_busy_status(&self) -> Response {
+        Response::KeepBusy(KeepBusyInfo::unavailable())
+    }
+    /// FR-92 — stop keep busy (any admitted peer; checked by nobody, on
+    /// purpose — see [`Request::KeepBusyOff`]).
+    async fn keep_busy_off(&self) -> Response {
+        Response::KeepBusy(KeepBusyInfo::unavailable())
+    }
     /// FR-85 — the recordings folder and its recordings.
     async fn recordings_list(&self) -> Response {
         Response::Error {
@@ -2239,7 +2309,12 @@ pub fn person_may(req: &Request) -> bool {
         | Request::RcDisconnect { .. }
         | Request::ConsentPending
         | Request::ConsentDecide { .. }
-        | Request::RecordStatus => true,
+        | Request::RecordStatus
+        // FR-92 — keep busy moves the person's own pointer: they must see it
+        // and be able to stop it from the companion, even on a system
+        // install where this socket is all they can reach.
+        | Request::KeepBusyStatus
+        | Request::KeepBusyOff => true,
         Request::Peers
         | Request::Flows
         | Request::Ping { .. }
@@ -2327,6 +2402,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordStart { .. }
         | Request::RecordStop
         | Request::RecordStatus
+        | Request::KeepBusyStatus
+        | Request::KeepBusyOff
         | Request::RecordingsList
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
@@ -2479,6 +2556,11 @@ where
                 // starting, stopping and deleting are the console user's alone.
                 Ok(Request::RecordStatus) => state.record_status().await,
                 Ok(Request::RecordingsList) => state.recordings_list().await,
+                // FR-92 — keep busy: reading AND stopping are open to every
+                // local client. Stopping is the safe direction; there is no
+                // local "on" to gate.
+                Ok(Request::KeepBusyStatus) => state.keep_busy_status().await,
+                Ok(Request::KeepBusyOff) => state.keep_busy_off().await,
                 Ok(
                     Request::RecordStart { .. }
                     | Request::RecordStop
@@ -3780,6 +3862,23 @@ impl Client {
     pub async fn record_status(&mut self) -> std::io::Result<RecordingState> {
         match self.request(&Request::RecordStatus).await? {
             Response::Recording(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-92 — keep busy's state on this device.
+    pub async fn keep_busy_status(&mut self) -> std::io::Result<KeepBusyInfo> {
+        match self.request(&Request::KeepBusyStatus).await? {
+            Response::KeepBusy(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-92 — stop keep busy. Answers with the state once the engine has
+    /// applied it (or after a short wait — then `on` may still read true).
+    pub async fn keep_busy_off(&mut self) -> std::io::Result<KeepBusyInfo> {
+        match self.request(&Request::KeepBusyOff).await? {
+            Response::KeepBusy(s) => Ok(s),
             other => Err(unexpected_response(other)),
         }
     }
@@ -5824,6 +5923,9 @@ mod tests {
             r#"{"t":"consent_pending"}"#,
             r#"{"t":"consent_decide","d":{"session_id":"6ac95ff543d358ac1a427048","allow":true}}"#,
             r#"{"t":"record_status"}"#,
+            // FR-92 — it is the person's own pointer.
+            r#"{"t":"keep_busy_status"}"#,
+            r#"{"t":"keep_busy_off"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -5848,6 +5950,44 @@ mod tests {
         ];
         for req in refused {
             assert!(!person_may(&req), "the person socket must refuse {req:?}");
+        }
+    }
+
+    /// FR-92 — the keep-busy verbs and their answer on the wire, and a
+    /// service without keep busy says why instead of failing the request.
+    #[tokio::test]
+    async fn keep_busy_verbs_round_trip_and_default_to_unavailable() {
+        assert_eq!(
+            serde_json::to_string(&Request::KeepBusyStatus).unwrap(),
+            r#"{"t":"keep_busy_status"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::KeepBusyOff).unwrap(),
+            r#"{"t":"keep_busy_off"}"#
+        );
+        let info = KeepBusyInfo {
+            available: true,
+            on: true,
+            phase: "paused".into(),
+            reason: Some("user_active".into()),
+            sentence: Some("Paused: someone is using this computer.".into()),
+            paused_by: Some("local".into()),
+            resumes_in_ms: Some(23_000),
+            pattern: "heart".into(),
+            set_by: Some("Alice".into()),
+            set_at_ms: Some(5),
+            auto_off_at_ms: None,
+        };
+        let j = serde_json::to_string(&Response::KeepBusy(info.clone())).unwrap();
+        let back: Response = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, Response::KeepBusy(info));
+        // Older agents' default: unavailable, with a reason.
+        match ask_scoped(Scope::Full, r#"{"t":"keep_busy_status"}"#).await {
+            Response::KeepBusy(s) => {
+                assert!(!s.available && !s.on);
+                assert_eq!(s.reason.as_deref(), Some("unsupported"));
+            }
+            other => panic!("expected KeepBusy, got {other:?}"),
         }
     }
 

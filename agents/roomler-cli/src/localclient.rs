@@ -1801,6 +1801,65 @@ pub async fn record_status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler keep-busy status` — FR-92.
+pub async fn keep_busy_status(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let s = client.keep_busy_status().await.map_err(daemon_err)?;
+    print_keep_busy(&s, json)
+}
+
+/// `roomler keep-busy off` — FR-92. Stopping is always allowed here.
+pub async fn keep_busy_off(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let s = client.keep_busy_off().await.map_err(daemon_err)?;
+    print_keep_busy(&s, json)?;
+    if s.on && !json {
+        println!("(the stop is being applied — `roomler keep-busy status` will show it)");
+    }
+    Ok(())
+}
+
+fn print_keep_busy(s: &localapi::KeepBusyInfo, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(s)?);
+        return Ok(());
+    }
+    println!("{}", keep_busy_line(s));
+    if let Some(by) = &s.set_by
+        && s.on
+    {
+        println!("  turned on by {by}");
+    }
+    Ok(())
+}
+
+/// One line for `roomler keep-busy status`. The agent's own sentence for
+/// the reason, never a CLI paraphrase.
+pub(crate) fn keep_busy_line(s: &localapi::KeepBusyInfo) -> String {
+    let sentence = s.sentence.as_deref();
+    if !s.on {
+        return match (s.reason.as_deref(), sentence) {
+            (Some("stopped_by_controller"), _) | (None, _) => "keep busy: off".into(),
+            (_, Some(t)) => format!("keep busy: off — {t}"),
+            _ => "keep busy: off".into(),
+        };
+    }
+    let mut line = format!("keep busy: {} ({})", s.phase, s.pattern);
+    if let Some(t) = sentence {
+        line.push_str(" — ");
+        line.push_str(t);
+    }
+    if let Some(ms) = s.resumes_in_ms
+        && s.phase == "paused"
+    {
+        line.push_str(&format!(
+            " Resumes in {} s if nothing else happens.",
+            ms.div_ceil(1000)
+        ));
+    }
+    line
+}
+
 /// `roomler record ls` — the recordings folder, why it is that one, and what
 /// is in it (newest first).
 pub async fn recordings_ls(json: bool) -> Result<()> {
@@ -2812,6 +2871,35 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-92 — the line uses the agent's own sentence and never a paraphrase;
+    /// a plain stop from the viewer reads as a plain "off".
+    #[test]
+    fn keep_busy_line_reads_the_agents_words() {
+        let mut s = localapi::KeepBusyInfo {
+            available: true,
+            on: true,
+            phase: "paused".into(),
+            reason: Some("user_active".into()),
+            sentence: Some("Paused: someone is using this computer.".into()),
+            resumes_in_ms: Some(22_100),
+            pattern: "heart".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_busy_line(&s),
+            "keep busy: paused (heart) — Paused: someone is using this computer. Resumes in 23 s if nothing else happens."
+        );
+        s.on = false;
+        s.reason = Some("stopped_locally".into());
+        s.sentence = Some("Turned off at this computer.".into());
+        assert_eq!(
+            keep_busy_line(&s),
+            "keep busy: off — Turned off at this computer."
+        );
+        s.reason = Some("stopped_by_controller".into());
+        assert_eq!(keep_busy_line(&s), "keep busy: off");
+    }
 
     fn peer(name: &str, org: &str) -> PeerInfo {
         PeerInfo {

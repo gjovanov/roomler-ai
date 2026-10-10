@@ -329,6 +329,15 @@ enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// Keep busy (FR-92): whether a remote controller left this computer's
+    /// pointer moving in a pattern to keep it active, and stop it. It pauses
+    /// by itself whenever someone uses the computer. There is no local "on":
+    /// only a remote-desktop session with input turns it on.
+    #[command(name = "keep-busy")]
+    KeepBusy {
+        #[command(subcommand)]
+        action: KeepBusyAction,
+    },
     /// FR-90 — Claude Code sessions you run in a terminal, adopted into
     /// Roomler: mirrored by this device and shown to you alone, read-only.
     Hive {
@@ -614,6 +623,20 @@ enum RecordAction {
     Rm {
         /// File name, as `record ls` shows it.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeepBusyAction {
+    /// Whether keep busy is on, what it is doing, and who turned it on.
+    Status {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Stop keep busy on this computer.
+    Off {
+        #[command(flatten)]
+        fmt: OutputFmt,
     },
 }
 
@@ -983,6 +1006,10 @@ where
             RecordAction::Status { fmt } => localclient::record_status(fmt.json).await,
             RecordAction::Ls { fmt } => localclient::recordings_ls(fmt.json).await,
             RecordAction::Rm { name } => localclient::recording_rm(&name).await,
+        },
+        Command::KeepBusy { action } => match action {
+            KeepBusyAction::Status { fmt } => localclient::keep_busy_status(fmt.json).await,
+            KeepBusyAction::Off { fmt } => localclient::keep_busy_off(fmt.json).await,
         },
         Command::Restart { reason, no_wait } => {
             localclient::restart(&reason, no_wait, daemon_exe(origin)).await
@@ -1449,6 +1476,27 @@ mod tests {
             }
             other => panic!("expected Devices, got {other:?}"),
         }
+    }
+
+    /// FR-92 — `status` and `off`, and deliberately no `on`: only a
+    /// remote-desktop session with input turns keep busy on.
+    #[test]
+    fn parses_keep_busy_verbs_and_has_no_local_on() {
+        let cli = Cli::try_parse_from(["roomler", "keep-busy", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::KeepBusy {
+                action: KeepBusyAction::Status { .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["roomler", "keep-busy", "off"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::KeepBusy {
+                action: KeepBusyAction::Off { .. }
+            }
+        ));
+        assert!(Cli::try_parse_from(["roomler", "keep-busy", "on"]).is_err());
     }
 
     #[test]
