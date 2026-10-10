@@ -8,12 +8,19 @@ name: Cache janitor
 # for this repo's cadence: several releases and PR merges a day each save
 # 0.5–1.5 GB.
 #
-# The limit is 20 GB since 2026-09-28 (it was the free 10 GB; raised by the
-# operator — paid, `PUT repos/{repo}/actions/cache/storage-limit`). Master's
-# own working set is ~12 GB (FR-6 wave 14), which at 10 GB kept its families
-# evicting each other: one PR run in seven hit a cold lane. The janitor's
-# rules below still matter at 20 GB — they are what keeps a lockfile
-# rotation (a second ~12 GB generation) from filling the headroom.
+# The limit is the free 10 GB again since 2026-10-10. From 2026-09-28 it was
+# 20 GB (raised by the operator, paid, `PUT repos/{repo}/actions/cache/
+# storage-limit`), and everything above 10 GB draws on the ACCOUNT's Actions
+# budget, which another repository's paid minutes can exhaust. When that
+# happened the pool went read-only ("Cache reservation failed: You have reached
+# your configured budget") and every lane restored an ever-older generation
+# (2026-10-09). So master's working set was made to fit the free tier instead
+# (FR-6 wave 21): no family carries the crate archives any more
+# (`.github/actions/cargo-cache-trim`), and the plain recorder lane restores the
+# audio lane's family instead of keeping its own. At 10 GB the rules below are
+# what keep a lockfile rotation (every family saving a new generation in one
+# run) from evicting a live family: superseded generations go right after the
+# run.
 #
 # Policy per cache entry:
 #   - PR merge-ref caches idle > 48 h  → delete (the PR run that made

@@ -363,6 +363,12 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
 
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
+
   rust-unit:
     name: Rust unit tests (server + crates)
     timeout-minutes: 30
@@ -468,6 +474,12 @@ jobs:
       # composite above.
       - name: Test the desktop companion (roomler-desktop)
         run: cargo test -p roomler-desktop --bins
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
 
   rust-agent:
     name: Agent tests (vp9-444, overlay, kernel TUN)
@@ -581,6 +593,12 @@ jobs:
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
             --test-threads=1 --nocapture
 
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
+
   rust-recorder:
     name: Recorder tests (FR-85)
     timeout-minutes: 30
@@ -599,15 +617,20 @@ jobs:
         uses: ./.github/actions/cargo-cache-salt
 
       - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+        # FR-6 wave 21 (#773): restores rust-recorder-audio's family and never
+        # saves one of its own. That lane builds these features plus `audio`,
+        # and `cargo tree` resolves the two graphs to the SAME features for
+        # every shared crate (the only differences: roomlerd itself, which
+        # always rebuilds, and the 7 audio-only crates). So its family is a
+        # strict superset of this lane's, and a second copy cost ~570 MB of the
+        # free 10 GB pool. Same workflow env ⇒ same env hash ⇒ the prefix
+        # restore finds it. rust-lint's cache step carries the general notes.
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          shared-key: ci-recorder
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: ci-recorder-audio
+          save-if: false
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -729,6 +752,12 @@ jobs:
           grep -q "$H/Videos/Roomler" "$OUT" || { echo "::error::under the sandbox the recorder did not choose ~/Videos/Roomler"; exit 1; }
           grep -q HOME_READ_ONLY "$OUT" || { echo "::error::the sandbox left the rest of home writable"; exit 1; }
 
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
+
   rust-recorder-audio:
     name: Recorder tests with audio + X11 pointer (FR-85)
     timeout-minutes: 30
@@ -787,6 +816,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
           xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture --lib capture::pointer -- --nocapture
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
 
   rust:
     # The name the five lanes above shared when they were one job. It builds
@@ -977,6 +1012,12 @@ jobs:
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
             --test-threads=1 --nocapture
 
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
+
   windows-overlay-clippy:
     # Windows-only code was entirely UN-LINTED: the Rust lanes run on
     # ubuntu-latest, so their `-D warnings` never compiles the 66
@@ -1038,6 +1079,12 @@ jobs:
         # as a mapping, and then this whole file fails to parse.
         run: |
           cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
 
   windows-recorder:
     # FR-85 P1e — the recorder's identity rule is Windows code that no other
@@ -1105,6 +1152,12 @@ jobs:
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
           cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
 
   ffmpeg-encoder-check:
     # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored
@@ -1247,6 +1300,12 @@ jobs:
         # They need the library present, not a GPU.
         run: cargo test -p roomlerd --features ffmpeg-encoder --lib
 
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
+
   recording-ffmpeg:
     # FR-85 P4 — the recorder and the export engine against the vendored
     # FFmpeg that carries the AAC encoder and the H.264 decoder (the
@@ -1353,6 +1412,12 @@ jobs:
           cargo test -p roomlerd --features "$REC_FEATURES" --lib recording::
           cargo test -p roomlerd --features "$REC_FEATURES" --test recorder
           cargo test -p roomlerd --features "$REC_FEATURES" --test export
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
 
   fr-registry:
     name: FR registry integrity
@@ -1743,3 +1808,9 @@ jobs:
           printf '%s\n' "$F" | grep -qx 'mediasoup' || { echo "::error::positive control failed: full does not list mediasoup"; fail=1; }
           printf '%s\n' "$F" | grep -qx 'roomler-ai-tunnel-core' || { echo "::error::positive control failed: full does not list roomler-ai-tunnel-core"; fail=1; }
           exit $fail
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim
