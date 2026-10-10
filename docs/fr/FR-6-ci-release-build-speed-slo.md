@@ -98,6 +98,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 20 | 10-06 | The Linux desktop companion builds in a parallel job (`build-linux-companion`, its own seed family `agent-linux-companion`, the SAME cached apt set as `build-linux`) instead of serially at the end of `build-linux`, the Linux twin of wave 18 | #1938 |
 | 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and two cuts to master's working set: the plain recorder lane restores `recorder-audio`'s family (works, ~600 MB); a `cargo-cache-trim` step dropped the crate archives before each save (**a no-op**: rust-cache's own `cargo metadata` downloads them again before saving) | #1939 |
 | 21b | 10-10 | The trim removed from all 14 jobs. The integration lane builds with `line-tables-only` instead of full debuginfo | #1944 |
+| 22 | 10-11 | **Six cargo caches move to the free release-asset store** (`seed-cache` assets `ci-<family>-<os>-<arch>-*`, `.github/actions/ci-seed-restore` + `ci-seed-save`): integration, both installer smokes, and `ci.yml`'s macOS overlay check and two Windows lanes. The Actions cache keeps only the seven Linux lanes plus apt and bun | #1954 |
 
 ## Acceptance criteria
 
@@ -206,6 +207,15 @@ itself on the affected run's page. Baseline when the program started: releases t
     the lever", was right, for this reason rather than its size.
   - Wave 21b: the integration lane builds with line tables instead of FULL debuginfo,
     which its 1.1 GB family still carried. Its `RUST_BACKTRACE=1` keeps file:line.
+  - **Wave 22, the operator's choice (2026-10-11): keep the free tier permanently, by moving
+    caches out of the pool rather than paying for a bigger one.** The ten hot `ci.yml`
+    families alone came to ~9.3 GiB, so moving only the three rarely-run families
+    (integration, both installer smokes) would still have left the pool at its limit. Six
+    jobs moved: those three plus `ci.yml`'s macOS overlay check and two Windows lanes.
+    They restore from and publish to the `seed-cache` release, like the release seeds.
+    `ci-seed-save` prunes local packages' units with their fingerprints and skips an
+    unchanged cache, as rust-cache does. The pool keeps the seven Linux lanes plus apt and
+    bun, ~7.6 GiB, which leaves room for a full rotation.
 - **Resolved by wave 16 (merged 09-29, field-verified 10-01): a new CI step's dependency builds
   stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
   open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
@@ -492,3 +502,28 @@ itself on the affected run's page. Baseline when the program started: releases t
     unpacked source. rust-cache's post step runs exactly that call before it saves, with
     the output captured, so the deleted archives come back unseen. The trim also cost
     every job that hidden re-download.
+- 2026-10-11: **wave 22 validated on its own PR (#1954)**. A temporary clause let the PR
+  branch publish, so the PR could prove the whole cycle before merging; it was removed
+  before merge.
+  - Run 1 (cold): every one of the six found no `ci-*` asset, built cold, pruned and
+    published.
+
+    | Job | Cold | Target (MB, pruned → kept) | Published (cargo + target) |
+    |---|---|---|---|
+    | integration | 25.2 min | 6,302 → 3,464 | 191 + 856 MB |
+    | installer-smoke-windows | 18.2 | 1,715 → 1,501 | 196 + 416 |
+    | windows-recorder | 13.3 | 3,204 → 2,278 | 191 + 591 |
+    | macos-pkg-smoke | 11.5 | 2,437 → 1,998 | 191 + 595 |
+    | windows-clippy | 11.4 | 2,703 → 2,108 | 191 + 555 |
+    | macos-overlay-check | 11.0 | 3,720 → 3,038 | 190 + 844 |
+
+  - Run 2 (`gh run rerun`, same commit): all six restored `same key`, logged `cache
+    up-to-date`, and published nothing. Warm times: integration 12.3 min, Windows MSI 10.2,
+    Windows recorder 6.4, macOS pkg 6.1, Windows clippy 5.2, macOS overlay 7.3. The
+    cargo-installed `cargo-wix` came back from the cache: the WiX step took 68 s
+    (compiling it) on run 1 and 11 s on run 2.
+  - The macOS overlay check's restore cap went 4,000 → 6,000 MB, since its fresh target is
+    already 3,038 MB.
+  - A dry run in WSL caught one bug before any of this: without `zstd`, `tar` left 0-byte
+    archives, and the first draft uploaded them over the good cache. `ci-seed-save` now
+    refuses a failed pack.
