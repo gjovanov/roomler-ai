@@ -1449,7 +1449,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   passes (step log on #1827).*
 - [ ] **AC19:** docs created with mermaid diagrams, tables and `file:line` anchors —
   `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md` — and indexed in
-  `docs/README.md`.
+  `docs/README.md`. *`docs/hive.md` (agent sessions through P1, and P2a's member store)
+  and `docs/brain.md` (P1e's core memory) exist and are indexed (2026-10-10).
+  `docs/vault.md` and `docs/knowhow.md` come with P3 and P4.*
 - [ ] **AC20:** a session survives a restart of its device's daemon — an update, a service restart,
   a crash. The next daemon resumes it with the same Claude Code session and its history, so the next
   prompt's answer can use an earlier turn. Its turn numbers carry on, a turn the restart cut is
