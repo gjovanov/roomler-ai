@@ -161,6 +161,9 @@ pub struct StartOrder {
     pub user_email: String,
     pub caller: String,
     pub resume: bool,
+    /// P2b-3b — checkpoint each turn's end: a session the server joined as
+    /// replicated. Nothing sets it before P2c.
+    pub replicated: bool,
 }
 
 /// FR-90 P1e — a session's core memory, as `rc:hive.memory` carries it.
@@ -245,6 +248,8 @@ struct Spawned {
     toolbelt: Toolbelt,
     /// P1d-2 — launched with `--resume`: the harness has its history.
     history: bool,
+    /// P2b-3b — a replicated session's checkpoints; `None` for every other.
+    checkpoints: Option<super::checkpointer::Checkpoints>,
 }
 
 /// P1d-2 — where a session the device hosted stood when its last daemon
@@ -339,6 +344,11 @@ pub struct Supervisor {
     adopted: Mutex<adopt::AdoptedFile>,
     /// P1j — adopt offers waiting for the server's word, by offer id.
     adopt_offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<adopt::OfferAnswer>>>,
+    /// P2b-3b — how a test's sessions take their checkpoints (in-process,
+    /// failing, never finishing); a device always runs `hive-checkpoint` as
+    /// the account.
+    #[cfg(test)]
+    checkpoint_runner: Option<super::checkpointer::Runner>,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
@@ -701,7 +711,18 @@ impl Supervisor {
             memory: Mutex::new(HashMap::new()),
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            checkpoint_runner: None,
         }
+    }
+
+    /// P2b-3b — how this daemon's sessions take their checkpoints.
+    fn checkpoint_runner(&self) -> super::checkpointer::Runner {
+        #[cfg(test)]
+        if let Some(run) = &self.checkpoint_runner {
+            return run.clone();
+        }
+        super::checkpointer::Runner::Subprocess
     }
 
     /// P1e — keep a session's core memory for its start's launch. A document
@@ -1262,6 +1283,7 @@ impl Supervisor {
             caller: "this device's resume".into(),
             // Decided by the history on disk, as for every launch.
             resume: false,
+            replicated: h.replicated,
         };
         let answer = self.start_locked(order, true).await;
         if answer.refused.is_some() {
@@ -1764,6 +1786,7 @@ impl Supervisor {
             token,
             toolbelt,
             history,
+            checkpoints,
         } = self.spawn(order, account, folder, sidecar, approvals_tx, shown)?;
         // P1h — who the harness is, for whoever must take it down later: this
         // daemon when it leaves, or the next one after a crash.
@@ -1825,6 +1848,7 @@ impl Supervisor {
                         quick_resumes: 0,
                         harness_pid: pid,
                         harness_started: started.clone(),
+                        replicated: order.replicated,
                     });
                 None
             }
@@ -1845,6 +1869,7 @@ impl Supervisor {
                 waiting,
                 approvals: approvals_rx,
                 toolbelt,
+                checkpoints,
             };
             match run(&sup, session, fence, child, inputs, store, resumed).await {
                 Some(detail) => sup.finish(session, fence, token.as_deref(), detail),
@@ -2010,6 +2035,24 @@ impl Supervisor {
             .kill_on_drop(true)
             // Its own process group, so a stop reaches the tools it started.
             .process_group(0);
+        // P2b-3b — a replicated session checkpoints each turn's end, as its
+        // account, with the harness's own PATH so its `git` is found.
+        let checkpoints = order.replicated.then(|| {
+            super::checkpointer::Checkpoints::new(
+                self.checkpoint_runner(),
+                super::checkpointer::Place {
+                    runtime_dir: dir.clone(),
+                    account: matches!(self.launcher, Launcher::AsMappedAccount)
+                        .then(|| account.to_string()),
+                    owner,
+                    env: unix_base_env(&home, account, Some(&path)),
+                    harness_session: spec.session.clone(),
+                    config_dir: spec.config_dir(),
+                    folder: spec.folder.clone(),
+                    state_dir: spec.state_dir.clone(),
+                },
+            )
+        });
         match &self.launcher {
             // The one privilege path exec, SSH and the PTY share (verified,
             // uid 0 refused), as an agent session runs (decision 13): none of
@@ -2034,6 +2077,7 @@ impl Supervisor {
                 token,
                 toolbelt,
                 history: spec.resume,
+                checkpoints,
             }),
             // The toolbelt goes with the failed start: dropping it removes
             // its socket.
@@ -2156,12 +2200,30 @@ impl Supervisor {
         // SAFETY: `console` holds the token `who` names, across the call.
         let started = unsafe { spawn_into_job(who, &line, Some(&spec.folder), &env, true, &job) };
         drop(console);
+        // P2b-3b — a replicated session checkpoints each turn's end, as the
+        // console user, whom `account` names.
+        let checkpoints = order.replicated.then(|| {
+            super::checkpointer::Checkpoints::new(
+                self.checkpoint_runner(),
+                super::checkpointer::Place {
+                    runtime_dir: dir.clone(),
+                    account: Some(account.to_string()),
+                    owner: None,
+                    env: Vec::new(),
+                    harness_session: spec.session.clone(),
+                    config_dir: spec.config_dir(),
+                    folder: spec.folder.clone(),
+                    state_dir: spec.state_dir.clone(),
+                },
+            )
+        });
         match started {
             Ok(child) => Ok(Spawned {
                 child: hive_win::HarnessChild::new(child, job),
                 token,
                 toolbelt,
                 history: spec.resume,
+                checkpoints,
             }),
             Err(e) => {
                 if let Some(token) = &token {
@@ -2413,7 +2475,7 @@ fn executable_by(path: &Path, uid: u32, groups: &[u32]) -> bool {
 /// toolbelt's relay. After a package upgrade replaced it under a running
 /// daemon, Linux names the old inode `<path> (deleted)`; the path itself
 /// holds the new binary, and a relay is a relay in every version.
-fn own_exe() -> Result<String, String> {
+pub(super) fn own_exe() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locating the daemon's binary: {e}"))?;
     let path = exe
         .to_str()
@@ -2461,6 +2523,12 @@ struct Task<'a> {
     /// P1a — the approvals open now, in the order the toolbelt reported
     /// them: the task's own view, so the run state follows the transcript.
     open_approvals: Vec<String>,
+    /// P2b-3b — the session's checkpoints, when it is replicated.
+    checkpoints: Option<super::checkpointer::Checkpoints>,
+    /// P2b-3b — a turn ended and its checkpoint is still to be taken: the
+    /// run loop takes it ([`checkpoint_or_stop`]) before the next prompt
+    /// begins.
+    checkpoint_due: bool,
 }
 
 /// What a session task is fed, and the count of prompts it holds.
@@ -2470,6 +2538,8 @@ struct Inputs {
     /// P1a — the toolbelt's approvals as they open and close.
     approvals: mpsc::Receiver<ApprovalEvent>,
     toolbelt: Toolbelt,
+    /// P2b-3b — the session's checkpoints, when it is replicated.
+    checkpoints: Option<super::checkpointer::Checkpoints>,
 }
 
 impl Task<'_> {
@@ -2580,11 +2650,19 @@ impl Task<'_> {
     }
 
     async fn prompt(&mut self, author: Option<Author>, text: String) {
-        if self.current.is_some() {
+        if self.current.is_some() || self.checkpoint_due {
             self.queued.push_back((author, text));
             return;
         }
         self.begin(author, text).await;
+    }
+
+    /// The next prompt waiting begins; with none, the session settles.
+    async fn next_prompt(&mut self) {
+        match self.queued.pop_front() {
+            Some((author, text)) => self.begin(author, text).await,
+            None => self.settle_state(),
+        }
     }
 
     /// Write one prompt and open its turn.
@@ -2681,9 +2759,14 @@ impl Task<'_> {
             self.sup.hosted_update(self.session, |h| h.running = None);
             self.turn_report(status, duration_ms, cost_usd);
             self.current = None;
-            match self.queued.pop_front() {
-                Some((author, text)) => self.begin(author, text).await,
-                None => self.settle_state(),
+            // P2b-3b — a replicated session's checkpoint: at the turn's end,
+            // before the next prompt begins, so it holds the files as the
+            // turn left them. The run loop takes it, where a stop is still
+            // heard.
+            if self.checkpoints.is_some() {
+                self.checkpoint_due = true;
+            } else {
+                self.next_prompt().await;
             }
         }
     }
@@ -2771,6 +2854,7 @@ async fn run(
         waiting,
         mut approvals,
         toolbelt,
+        checkpoints,
     } = inputs;
     let Some(stdout) = child.stdout.take() else {
         return Some("the harness has no stdout".into());
@@ -2800,12 +2884,14 @@ async fn run(
             _ => Some(0.0),
         },
         open_approvals: Vec::new(),
+        checkpoints,
+        checkpoint_due: false,
     };
     let mut lines = LineReader::new(BufReader::new(stdout), MAX_LINE);
     let limits = Limits::default();
     let mut stopped: Option<String> = None;
 
-    loop {
+    'session: loop {
         tokio::select! {
             // Biased to stdout: whatever the harness already printed is
             // recorded before the next prompt goes in, so the transcript's
@@ -2822,6 +2908,15 @@ async fn run(
                         Ok(parsed) => {
                             for ev in parsed.record {
                                 task.on_event(ev).await;
+                                if std::mem::take(&mut task.checkpoint_due) {
+                                    if let Some(reason) =
+                                        checkpoint_or_stop(&mut task, &mut input).await
+                                    {
+                                        stopped = Some(reason);
+                                        break 'session;
+                                    }
+                                    task.next_prompt().await;
+                                }
                             }
                             if !parsed.skipped.is_empty() {
                                 debug!(session = %session, skipped = ?parsed.skipped, "hive: stream-json lines not recorded");
@@ -2913,6 +3008,51 @@ async fn run(
         );
     }
     Some(describe_end(stopped.as_deref(), status, said))
+}
+
+/// P2b-3b — the checkpoint at the end of the turn that just ended, with the
+/// session still listening: a prompt that arrives meanwhile waits behind it,
+/// and a stop is a stop. A stop abandons the checkpoint — its child's whole
+/// group is ended, and no checkpoint is recorded — and the next one takes
+/// everything since the last one kept. `Some(reason)` when stopped.
+///
+/// ⚠️ A daemon going down says nothing (P1d-2): the child goes down with it
+/// (systemd signals the whole cgroup at once), and the next daemon's next
+/// checkpoint takes what this one would have. So none is started once the
+/// daemon is stopping, and one that failed is said in the transcript only
+/// when the daemon did not go down with it.
+async fn checkpoint_or_stop(
+    task: &mut Task<'_>,
+    input: &mut mpsc::Receiver<Input>,
+) -> Option<String> {
+    if task.sup.going_down() {
+        return None;
+    }
+    let taken = {
+        let c = task.checkpoints.as_mut()?;
+        let taking = c.after_turn(&task.store, &task.sid, task.fence, task.count);
+        tokio::pin!(taking);
+        loop {
+            tokio::select! {
+                // Biased to the checkpoint: one that is done is kept, even
+                // with a stop waiting behind it.
+                biased;
+                taken = &mut taking => break taken,
+                cmd = input.recv() => match cmd {
+                    Some(Input::Prompt { author, text }) => task.queued.push_back((author, text)),
+                    Some(Input::Stop { reason }) => return Some(reason),
+                    None => return Some("supervisor".into()),
+                },
+            }
+        }
+    };
+    if let Err(failed) = taken
+        && !task.sup.went_down_with_daemon().await
+        && let Some(c) = task.checkpoints.as_mut()
+    {
+        c.say(&task.store, &task.sid, task.fence, failed);
+    }
+    None
 }
 
 /// Seconds since the epoch, for what the device hosts.
@@ -3348,6 +3488,7 @@ done
             quick_resumes: 0,
             harness_pid: None,
             harness_started: None,
+            replicated: false,
         };
         f(&mut h);
         Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT).put(h);
@@ -3396,6 +3537,7 @@ done
             user_email: "dev@example.com".into(),
             caller: "Dev".into(),
             resume: false,
+            replicated: false,
         }
     }
 
@@ -3662,6 +3804,204 @@ done
             .unwrap();
         assert_eq!(ended, (Some(5), Some(0.25)), "the harness's own figures");
         r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// P2b-3b — a replicated session checkpoints each turn's end: the event
+    /// lands after the turn's own, numbered on and built on the one before —
+    /// the history from where that one left it, the folder's commit on its
+    /// commit — with every blob it names kept first. A session that is not
+    /// replicated records none.
+    #[tokio::test]
+    async fn a_replicated_session_checkpoints_each_turns_end_and_no_other_does() {
+        use super::super::checkpointer::Runner;
+        use roomler_hive_node::checkpoint::{Checkpoint, Growth, RepoKind};
+        let mut r = rig_with(
+            true,
+            4,
+            |_| {},
+            |mut s| {
+                // The rig's root is under /tmp: git's discovery stops there.
+                s.checkpoint_runner = Some(Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s
+            },
+        );
+        let mut o = order(&r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        std::fs::write(r.root.path().join("work").join("notes.md"), "first\n").unwrap();
+        for _ in 0..2 {
+            r.sup.prompt(sid, None, "hi".into()).unwrap();
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        }
+        let events = r.store.events(&sid.to_hex());
+        let cps: Vec<&Checkpoint> = events
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Checkpoint(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cps.len(), 2, "one per turn");
+        assert_eq!((cps[0].n, cps[0].turn), (1, 1));
+        assert_eq!((cps[1].n, cps[1].turn), (2, 2));
+        let kinds: Vec<&str> = events.iter().map(TranscriptEvent::kind).collect();
+        let turn_end = kinds.iter().position(|k| *k == "turn").unwrap();
+        let first = kinds.iter().position(|k| *k == "checkpoint").unwrap();
+        assert!(first > turn_end, "after the turn's own end: {kinds:?}");
+        let (w1, w2) = (
+            cps[0].workspace.as_ref().expect("git on the test host"),
+            cps[1].workspace.as_ref().unwrap(),
+        );
+        assert_eq!(
+            w1.repo,
+            RepoKind::Shadow,
+            "the rig's folder is in no repository"
+        );
+        assert!(!w1.pack.is_empty());
+        assert_eq!(w1.base, None, "the first commit starts the chain");
+        // The fake keeps every prompt in the folder (`.stdin`), so the second
+        // turn changed a file there; the commit it wrote is on the first's.
+        assert_ne!(w2.commit, w1.commit);
+        assert_eq!(w2.base.as_deref(), Some(w1.commit.as_str()));
+        assert!(!w2.pack.is_empty());
+        let history = |c: &Checkpoint| {
+            c.files
+                .iter()
+                .find(|f| f.growth == Growth::Append && f.path.ends_with(".jsonl"))
+                .cloned()
+                .expect("the history is checkpointed")
+        };
+        let (h1, h2) = (history(cps[0]), history(cps[1]));
+        assert_eq!(h1.chunks[0].offset, 0);
+        assert_eq!(
+            h2.chunks.iter().map(|c| c.offset).collect::<Vec<_>>(),
+            [h1.len],
+            "only the line the second turn appended"
+        );
+        for chunk in cps
+            .iter()
+            .flat_map(|c| c.files.iter().flat_map(|f| &f.chunks))
+            .chain(&w1.pack)
+            .chain(&w2.pack)
+        {
+            assert!(
+                r.store.has_blob(&sid.to_hex(), chunk.hash.0).await.unwrap(),
+                "blob {} kept",
+                chunk.hash
+            );
+        }
+        r.sup.stop(sid, 1, "owner".into());
+
+        let o = order(&r);
+        let plain = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, plain).await.0, HiveRunState::Idle);
+        r.sup.prompt(plain, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, plain).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, plain).await.0, HiveRunState::Idle);
+        assert!(
+            !r.store
+                .events(&plain.to_hex())
+                .iter()
+                .any(|e| matches!(e, TranscriptEvent::Checkpoint(_))),
+            "not replicated: no checkpoint"
+        );
+        r.sup.stop(plain, 1, "owner".into());
+    }
+
+    /// A replicated session on `run`, started and idle.
+    async fn replicated_on(run: super::super::checkpointer::Runner) -> (Rig, ObjectId) {
+        let mut r = rig_with(
+            true,
+            4,
+            |_| {},
+            |mut s| {
+                s.checkpoint_runner = Some(run);
+                s
+            },
+        );
+        let mut o = order(&r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        (r, sid)
+    }
+
+    /// P2b-3b — a checkpoint that fails is said in the transcript once per
+    /// reason, not at every turn's end, and the session goes on: each prompt
+    /// is answered.
+    #[tokio::test]
+    async fn a_failed_checkpoint_is_said_once_and_the_session_goes_on() {
+        use super::super::checkpointer::Runner;
+        let (mut r, sid) = replicated_on(Runner::Failing("the disk is full")).await;
+        for _ in 0..2 {
+            r.sup.prompt(sid, None, "hi".into()).unwrap();
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        }
+        let events = r.store.events(&sid.to_hex());
+        let notes: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Note { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, ["Checkpoint 1 was not taken: the disk is full"]);
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e, TranscriptEvent::Turn { .. }))
+            .count();
+        assert_eq!(turns, 2, "both prompts answered");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TranscriptEvent::Checkpoint(_)))
+        );
+        r.sup.stop(sid, 1, "owner".into());
+    }
+
+    /// P2b-3b — a checkpoint that never finishes holds the next prompt back,
+    /// never the session: a prompt sent meanwhile is not written to the
+    /// harness, and a stop still stops it.
+    #[tokio::test]
+    async fn a_stop_is_heard_while_a_checkpoint_runs_and_a_prompt_waits_behind_it() {
+        use super::super::checkpointer::Runner;
+        let (mut r, sid) = replicated_on(Runner::Hangs).await;
+        r.sup.prompt(sid, None, "first".into()).unwrap();
+        // The turn ends; its checkpoint never does.
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("the turn ends within 10 s")
+                .expect("the reporter is open");
+            if let ClientMsg::HiveTurn {
+                session_id,
+                status: Some(HiveTurnStatus::Ok),
+                ..
+            } = msg
+                && session_id == sid
+            {
+                break;
+            }
+        }
+        r.sup.prompt(sid, None, "second".into()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let stdin = std::fs::read_to_string(r.root.path().join("work").join(".stdin")).unwrap();
+        assert!(stdin.contains("first"));
+        assert!(!stdin.contains("second"), "waits behind the checkpoint");
+        assert_eq!(r.sup.run_state(sid), Some(HiveRunState::Running));
+        r.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            until_ended(&mut r, sid).await.as_deref(),
+            Some("stopped (owner)")
+        );
     }
 
     /// Claude Code's `total_cost_usd` is its PROCESS's running total; a turn
@@ -4672,6 +5012,7 @@ done
             quick_resumes: 0,
             harness_pid: Some(pid),
             harness_started: Some("an earlier process".into()),
+            replicated: false,
         };
         reap_leftover(&h).await;
         h.harness_started = None;

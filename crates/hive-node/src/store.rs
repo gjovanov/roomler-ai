@@ -540,6 +540,46 @@ impl Store {
             .is_some())
     }
 
+    /// FR-90 P2b-3b — the newest event of `session` whose kind is `kind`: where
+    /// a resumed session's next checkpoint starts. The `kind` column is set by
+    /// a build that knows the kind, so a checkpoint an older daemon stored is
+    /// not found, and the next one takes everything again: more bytes, never a
+    /// wrong checkpoint.
+    pub fn last_of_kind(
+        &self,
+        session: &str,
+        kind: &str,
+    ) -> Result<Option<EventEnvelope>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, fence, ts_ms, prev_hash, event_json FROM events
+                 WHERE session = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1",
+                params![session, kind],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((seq, fence, ts_ms, prev, event_json)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(EventEnvelope {
+            session: session.to_string(),
+            seq: seq as u64,
+            fence: fence as u64,
+            ts_ms,
+            prev_hash: to_hash(&prev, session, seq as u64)?,
+            event_json,
+        }))
+    }
+
     /// Events of `session` after `after_seq`, oldest first, at most `limit`.
     pub fn page(
         &self,
@@ -764,6 +804,33 @@ mod tests {
         assert_eq!(page[2].hash(), tip.hash);
         assert_eq!(s.page("s1", 2, 10).unwrap().len(), 1);
         assert_eq!(s.page("s1", 0, 2).unwrap().len(), 2);
+    }
+
+    /// FR-90 P2b-3b — the newest event of a kind, by session: none before one
+    /// is appended, then always the latest, and never another session's.
+    #[test]
+    fn the_last_event_of_a_kind_is_the_newest_and_the_sessions_own() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(s.last_of_kind("s1", "note").unwrap().is_none());
+        let note = |t: &str| TranscriptEvent::Note { text: t.into() };
+        let mut tip = None;
+        for (i, e) in [ev("a"), note("n1"), ev("b"), note("n2"), ev("c")]
+            .iter()
+            .enumerate()
+        {
+            let env = EventEnvelope::next("s1", tip, 1, i as i64, e);
+            tip = Some(s.append(&env).unwrap());
+        }
+        s.append(&EventEnvelope::next("s2", None, 1, 0, &note("theirs")))
+            .unwrap();
+        let last = s.last_of_kind("s1", "note").unwrap().unwrap();
+        assert_eq!(last.seq, 4);
+        assert_eq!(
+            TranscriptEvent::from_json(&last.event_json),
+            Some(note("n2"))
+        );
+        assert_eq!(s.last_of_kind("s2", "note").unwrap().unwrap().seq, 1);
+        assert!(s.last_of_kind("s1", "checkpoint").unwrap().is_none());
     }
 
     #[test]

@@ -25,11 +25,6 @@
 //! order, at its length and hash; the sizes within the limits. A member checks
 //! the whole of each file again when it assembles it.
 
-// P2b-3b's turn-end trigger is the daemon side's caller; until then only its
-// tests run it, and not all of it on every OS. The child side
-// (`checkpoint_args`, `checkpoint_main`) is `main`'s. Remove with P2b-3b.
-#![allow(dead_code)]
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -308,6 +303,256 @@ fn allowed(path: &str, allow: &[checkpoint::AllowEntry]) -> bool {
 /// large workspace hashes and packs all of it.
 pub(crate) const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 
+// A lock on a checkpoint's index is stale only well past the time any
+// checkpoint, and the grace its group is ended in, may hold it.
+const _: () = assert!(workspace::STALE_LOCK.as_secs() > CHECKPOINT_TIMEOUT.as_secs() + 60);
+
+/// How the checkpoint's child is run.
+#[derive(Clone)]
+pub(crate) enum Runner {
+    /// `roomlerd hive-checkpoint`, as the account: what a device does.
+    Subprocess,
+    /// In this process, through the same frames and checks: tests, where the
+    /// binary is the test harness and not `roomlerd`. Git's discovery stops at
+    /// `ceiling`, so a repository around the test's temp directory is never
+    /// written to.
+    /// The supervisor's tests are Unix's; so is every test runner.
+    #[cfg(all(test, unix))]
+    InProcess { ceiling: PathBuf },
+    /// Every checkpoint fails, for this reason (tests).
+    #[cfg(all(test, unix))]
+    Failing(&'static str),
+    /// No checkpoint ever finishes (tests).
+    #[cfg(all(test, unix))]
+    Hangs,
+}
+
+/// A checkpoint that was not taken: its number, and why.
+pub(crate) struct Failed {
+    n: u64,
+    why: String,
+}
+
+/// A replicated session's checkpoints (P2b-3b): built at launch for a session
+/// the server joined as replicated, and owned by its task, which calls
+/// [`Checkpoints::after_turn`] at each turn's end.
+pub(crate) struct Checkpoints {
+    run: Runner,
+    /// The daemon's own directory for the session: where the request goes.
+    runtime_dir: PathBuf,
+    /// The account the child runs as; `None` when the session runs as the
+    /// daemon (the test launcher).
+    account: Option<String>,
+    /// The account's ids, to hand it the request (Unix).
+    owner: Option<(u32, u32)>,
+    /// The child's environment on Unix: the account's own, as the harness's.
+    /// Windows starts it with the console user's own block instead.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    harness_session: String,
+    config_dir: PathBuf,
+    folder: PathBuf,
+    state_dir: PathBuf,
+    /// The last checkpoint taken, where the next one starts.
+    last: Option<Checkpoint>,
+    /// Whether `last` has been read back from the store (a resume).
+    loaded: bool,
+    /// The last failure said in the transcript, so each is said once.
+    failed: Option<String>,
+}
+
+/// Where a session's checkpoints are taken from, and as whom.
+pub(crate) struct Place {
+    pub runtime_dir: PathBuf,
+    pub account: Option<String>,
+    pub owner: Option<(u32, u32)>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub harness_session: String,
+    pub config_dir: PathBuf,
+    pub folder: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl Checkpoints {
+    pub(crate) fn new(run: Runner, place: Place) -> Self {
+        Self {
+            run,
+            runtime_dir: place.runtime_dir,
+            account: place.account,
+            owner: place.owner,
+            env: place.env,
+            harness_session: place.harness_session,
+            config_dir: place.config_dir,
+            folder: place.folder,
+            state_dir: place.state_dir,
+            last: None,
+            loaded: false,
+            failed: None,
+        }
+    }
+
+    /// Take the checkpoint after `turn` and keep it: its blobs first, so a
+    /// member that sees the event can fetch every one, then the event. One
+    /// that fails is logged and answered, for the caller to [`Self::say`];
+    /// the session goes on either way.
+    pub(crate) async fn after_turn(
+        &mut self,
+        store: &super::store::StoreHandle,
+        sid: &str,
+        fence: u64,
+        turn: u32,
+    ) -> Result<(), Failed> {
+        if !self.loaded {
+            self.loaded = true;
+            if let Ok(Some(env)) = store.last_of_kind(sid, "checkpoint").await
+                && let Some(roomler_hive_node::TranscriptEvent::Checkpoint(c)) =
+                    roomler_hive_node::TranscriptEvent::from_json(&env.event_json)
+            {
+                self.last = Some(c);
+            }
+        }
+        let n = self.last.as_ref().map_or(1, |c| c.n + 1);
+        let req = Request {
+            v: REQUEST_V,
+            sid: sid.to_string(),
+            harness_session: self.harness_session.clone(),
+            config_dir: self.config_dir.clone(),
+            folder: self.folder.clone(),
+            state_dir: self.state_dir.clone(),
+            n,
+            turn,
+            previous: self.last.clone(),
+        };
+        let failed = |why: String| {
+            tracing::warn!(session = sid, n, %why, "hive: a checkpoint was not taken");
+            Failed { n, why }
+        };
+        let (cp, blobs) = self.take(&req).await.map_err(failed)?;
+        for blob in blobs {
+            store
+                .put_blob(sid, blob)
+                .await
+                .map_err(|e| failed(format!("its blobs could not be kept: {e}")))?;
+        }
+        tracing::info!(
+            session = sid,
+            n,
+            turn,
+            files = cp.files.len(),
+            workspace = cp.workspace.is_some(),
+            "hive: a checkpoint was taken"
+        );
+        store.append(
+            sid,
+            fence,
+            roomler_hive_node::TranscriptEvent::Checkpoint(cp.clone()),
+        );
+        self.last = Some(cp);
+        self.failed = None;
+        Ok(())
+    }
+
+    /// Say in the transcript that a checkpoint was not taken: once per
+    /// reason, not at every turn's end while the reason holds.
+    pub(crate) fn say(
+        &mut self,
+        store: &super::store::StoreHandle,
+        sid: &str,
+        fence: u64,
+        failed: Failed,
+    ) {
+        if self.failed.as_deref() == Some(failed.why.as_str()) {
+            return;
+        }
+        store.append(
+            sid,
+            fence,
+            roomler_hive_node::TranscriptEvent::Note {
+                text: format!("Checkpoint {} was not taken: {}", failed.n, failed.why),
+            },
+        );
+        self.failed = Some(failed.why);
+    }
+
+    async fn take(&self, req: &Request) -> Result<(Checkpoint, Vec<Vec<u8>>), String> {
+        match &self.run {
+            #[cfg(all(test, unix))]
+            Runner::InProcess { ceiling } => {
+                let (cp, blobs) = produce(req, &Git::under(ceiling))?;
+                let mut bytes = Vec::new();
+                write_frames(&mut bytes, &cp, &blobs).map_err(|e| e.to_string())?;
+                let (cp, blobs) = read_frames(&bytes)?;
+                check(req, &cp, &blobs)?;
+                Ok((cp, blobs))
+            }
+            #[cfg(all(test, unix))]
+            Runner::Failing(why) => Err((*why).to_string()),
+            #[cfg(all(test, unix))]
+            Runner::Hangs => std::future::pending().await,
+            Runner::Subprocess => {
+                let path = write_request(&self.runtime_dir, req, self.owner)?;
+                let exe = PathBuf::from(super::supervisor::own_exe()?);
+                #[cfg(unix)]
+                {
+                    run_as(
+                        &exe,
+                        &path,
+                        req,
+                        self.account.as_deref(),
+                        self.env.clone(),
+                        CHECKPOINT_TIMEOUT,
+                    )
+                    .await
+                }
+                #[cfg(windows)]
+                {
+                    let account = self.account.clone().ok_or("no account to run as")?;
+                    let req = req.clone();
+                    tokio::task::spawn_blocking(move || {
+                        run_as_console_user(&exe, &path, &req, &account, CHECKPOINT_TIMEOUT)
+                    })
+                    .await
+                    .map_err(|e| format!("the checkpoint's thread: {e}"))?
+                }
+            }
+        }
+    }
+}
+
+/// The request, where only the daemon writes and the account reads it: the
+/// session's runtime directory, the daemon's own. On Unix the file is made
+/// `0600` and handed to the account through its descriptor, never by a path;
+/// on Windows it takes the session directory's DACL, readable by the account
+/// alone. Replaced whole, through a rename.
+fn write_request(dir: &Path, req: &Request, owner: Option<(u32, u32)>) -> Result<PathBuf, String> {
+    let bytes = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    let path = dir.join("checkpoint.json");
+    let tmp = dir.join("checkpoint.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let fail = |e: std::io::Error| format!("{}: {e}", tmp.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(fail)?;
+        f.write_all(&bytes).map_err(fail)?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(fail)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = owner;
+        std::fs::write(&tmp, &bytes).map_err(fail)?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// The daemon's side on Unix: start `exe hive-checkpoint <request_path>` as
 /// `account` (none in tests: as the daemon), with `env` and nothing of the
 /// daemon's own, and hold what it writes to `req`.
@@ -331,7 +576,8 @@ pub(crate) async fn run_as(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        // Its own group, so a timeout reaches the git it started.
+        // Its own group, which a timeout or an abandoned checkpoint ends
+        // whole, the git it started included ([`Group`]).
         .process_group(0);
     if let Some(account) = account {
         crate::exec::apply_session_run_as(&mut cmd, account)?;
@@ -340,6 +586,56 @@ pub(crate) async fn run_as(
     let (cp, blobs) = read_frames(&out)?;
     check(req, &cp, &blobs)?;
     Ok((cp, blobs))
+}
+
+/// How long an ended checkpoint's group has between TERM and KILL.
+#[cfg(unix)]
+const GROUP_GRACE: Duration = Duration::from_secs(2);
+
+/// The checkpoint's process group (`process_group(0)`: its id is the
+/// leader's pid), signalled whole when the checkpoint is ended — a timeout,
+/// too much output, or abandoned by a stop or a daemon going down (dropped).
+/// `kill_on_drop` and `start_kill` reach the leader alone and would leave a
+/// `git add` hashing the whole folder behind it.
+///
+/// ⚠️ TERM first: git removes its lock files on TERM, never on KILL, and a
+/// lock left on the checkpoint's index refuses every checkpoint after it.
+/// ⚠️ Only while the leader is unreaped: once reaped, the id may name
+/// someone else's group, so it is forgotten the moment the leader is waited
+/// for.
+#[cfg(unix)]
+struct Group(Option<libc::pid_t>);
+
+#[cfg(unix)]
+impl Group {
+    fn signal(&self, sig: libc::c_int) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: a plain syscall; the group's leader is our unreaped
+            // child, so `pgid` names no one else's.
+            unsafe { libc::killpg(pgid, sig) };
+        }
+    }
+
+    /// TERM to all of it, a moment to go, then KILL; the leader is reaped
+    /// either way.
+    async fn end(&mut self, child: &mut tokio::process::Child) {
+        self.signal(libc::SIGTERM);
+        if tokio::time::timeout(GROUP_GRACE, child.wait())
+            .await
+            .is_err()
+        {
+            self.signal(libc::SIGKILL);
+            let _ = child.wait().await;
+        }
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.signal(libc::SIGTERM);
+    }
 }
 
 /// Run `cmd` and answer its stdout, at most `max` bytes and within `timeout`;
@@ -354,6 +650,15 @@ async fn read_child(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("starting {CHECKPOINT_SUBCOMMAND}: {e}"))?;
+    // After `child`, so dropped before it: the group is signalled while its
+    // leader is still unreaped. Never 0 or 1: `killpg(0, _)` is the daemon's
+    // own group.
+    let mut group = Group(
+        child
+            .id()
+            .and_then(|p| libc::pid_t::try_from(p).ok())
+            .filter(|&p| p > 1),
+    );
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take();
     let said = tokio::spawn(async move {
@@ -365,29 +670,33 @@ async fn read_child(
     });
     let done = tokio::time::timeout(timeout, async {
         let mut out = Vec::new();
-        let read = (&mut stdout).take(max + 1).read_to_end(&mut out).await;
-        let status = child.wait().await;
-        (read.map(|_| out), status)
+        match (&mut stdout).take(max + 1).read_to_end(&mut out).await {
+            Err(e) => Err(format!("reading {CHECKPOINT_SUBCOMMAND}: {e}")),
+            // Ended, not waited for: it may be blocked writing the rest.
+            Ok(_) if out.len() as u64 > max => Err(format!(
+                "{CHECKPOINT_SUBCOMMAND} wrote more than {max} bytes"
+            )),
+            Ok(_) => Ok((out, child.wait().await)),
+        }
     })
     .await;
     let (out, status) = match done {
-        Ok(v) => v,
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            group.end(&mut child).await;
+            return Err(e);
+        }
         Err(_) => {
-            let _ = child.start_kill();
+            group.end(&mut child).await;
             return Err(format!(
                 "{CHECKPOINT_SUBCOMMAND} did not finish within {} s",
                 timeout.as_secs()
             ));
         }
     };
-    let out = out.map_err(|e| format!("reading {CHECKPOINT_SUBCOMMAND}: {e}"))?;
+    // Waited for: the group's id is no longer this checkpoint's to signal.
+    group.0 = None;
     let status = status.map_err(|e| format!("waiting for {CHECKPOINT_SUBCOMMAND}: {e}"))?;
-    if out.len() as u64 > max {
-        let _ = child.start_kill();
-        return Err(format!(
-            "{CHECKPOINT_SUBCOMMAND} wrote more than {max} bytes"
-        ));
-    }
     if !status.success() {
         let said = said.await.unwrap_or_default();
         let said = String::from_utf8_lossy(&said);
@@ -654,6 +963,75 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.contains("did not finish"), "{e}");
+    }
+
+    /// A checkpoint that is ended takes everything it started with it — its
+    /// group, never the leader alone — TERM first, whether it ran out of time
+    /// or was abandoned (a stop drops it). The grandchild stands for a `git
+    /// add` hashing the folder, and leaves word only when TERM reaches it: a
+    /// KILL cannot be trapped, and would leave a git's lock files behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ended_checkpoint_takes_everything_it_started_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path(), 1, None);
+        let request_path = tmp.path().join("checkpoint.json");
+        let path = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        let with_a_grandchild = |name: &str| {
+            let p = tmp.path().join(name);
+            let termed = tmp.path().join(format!("{name}.termed"));
+            let body = format!(
+                "sh -c 'trap \"echo > {}; exit 0\" TERM; while :; do sleep 0.05; done' &\nwait",
+                termed.display()
+            );
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (p, termed)
+        };
+        let termed_within = |f: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !f.exists() {
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            true
+        };
+
+        let (late, late_termed) = with_a_grandchild("late.sh");
+        let e = run_as(
+            &late,
+            &request_path,
+            &req,
+            None,
+            path.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("did not finish"), "{e}");
+        assert!(termed_within(&late_termed), "the timeout reached the group");
+
+        let (dropped, dropped_termed) = with_a_grandchild("dropped.sh");
+        let abandoned = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_as(
+                &dropped,
+                &request_path,
+                &req,
+                None,
+                path,
+                Duration::from_secs(60),
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "still running when it was dropped");
+        assert!(
+            termed_within(&dropped_termed),
+            "dropping it reached the group"
+        );
     }
 
     /// A request of another version is refused, not read by guesswork.
