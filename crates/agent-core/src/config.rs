@@ -1352,6 +1352,20 @@ pub struct AgentConfig {
     /// microphone is never a remote option.
     #[serde(default)]
     pub record_remote_audio: bool,
+    /// FR-92 — let a remote controller holding INPUT turn on keep busy here:
+    /// mouse patterns that keep this computer active (no screensaver, idle
+    /// lock or "Away") until switched off, paused whenever a real person uses
+    /// it. Default ON (operator decision, 2026-10-10). Read LIVE: off also
+    /// stops a keep-busy in progress, and the capability follows on the next
+    /// heartbeat.
+    ///
+    /// ⚠️ Device-owned: structurally absent from `DesiredConfig` (the
+    /// `keep_busy_` twin of the `record_` prefix test), so no server can turn
+    /// it back on. ⚠️ While keep busy runs it overrides `power_policy =
+    /// never`: injected input is user activity, and user activity defeats
+    /// idle sleep.
+    #[serde(default = "default_true")]
+    pub keep_busy_enabled: bool,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2372,6 +2386,7 @@ pub fn test_fixture() -> AgentConfig {
         record_dir: None,
         record_remote_enabled: false,
         record_remote_audio: false,
+        keep_busy_enabled: true,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

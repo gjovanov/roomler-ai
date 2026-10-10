@@ -116,6 +116,21 @@ fn resolve_machine_global(base: &Path) -> PathBuf {
     }
 }
 
+/// FR-92 — `<profile>\AppData\Local\<org>\<segment>\data`: what
+/// [`project_dirs`]`().data_local_dir()` resolves to for the OWNER of
+/// `profile`, computed from the profile path so a SYSTEM worker can reach the
+/// signed-in person's per-user data (its own `project_dirs` is SYSTEM's).
+/// Windows only, like the workers that need it.
+#[cfg(target_os = "windows")]
+pub fn data_local_dir_in_profile(profile: &Path) -> PathBuf {
+    profile
+        .join("AppData")
+        .join("Local")
+        .join(ORG)
+        .join(app_segment())
+        .join("data")
+}
+
 /// The SCM-service log directory (`%PROGRAMDATA%\roomler\<segment>\service-logs`).
 ///
 /// P3e lever E: canonical home for the path both sides need — the daemon's
@@ -441,6 +456,29 @@ fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-92 — the profile-relative form must name the SAME directory the
+    /// person's own `project_dirs()` does, or a SystemContext worker and a
+    /// user-context worker would keep two different keep-busy stores.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn data_local_dir_in_profile_matches_the_owners_project_dirs() {
+        let Some(profile) = std::env::var_os("USERPROFILE") else {
+            return;
+        };
+        let Some(dirs) = project_dirs() else {
+            return;
+        };
+        // Only meaningful when LocalAppData sits in its default place.
+        let default_local = Path::new(&profile).join("AppData").join("Local");
+        if !dirs.data_local_dir().starts_with(&default_local) {
+            return;
+        }
+        assert_eq!(
+            data_local_dir_in_profile(Path::new(&profile)),
+            dirs.data_local_dir()
+        );
+    }
 
     // `tree_exists` / segment resolution touch the real HOME/APPDATA, so we
     // don't assert on live paths here (that would be environment-dependent).

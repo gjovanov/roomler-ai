@@ -1605,6 +1605,16 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-85 - let a remote recording include what this computer plays (default off; needs record_remote_enabled). The microphone is never recorded remotely. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "keep_busy_enabled",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: off stops a keep-busy in progress and refuses a new one; the
+        // capability follows on the next heartbeat.
+        live: true,
+        kind: "bool",
+        description: "FR-92 - let a remote controller turn on keep busy: mouse patterns that keep this computer active (no screensaver, idle lock or Away) until switched off, paused whenever someone uses the computer (default on). Off also stops it. While it runs it keeps the computer awake, whatever power_policy says. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1873,6 +1883,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "record_dir" => cfg.record_dir.clone(),
         "record_remote_enabled" => Some(fmt_bool(cfg.record_remote_enabled)),
         "record_remote_audio" => Some(fmt_bool(cfg.record_remote_audio)),
+        "keep_busy_enabled" => Some(fmt_bool(cfg.keep_busy_enabled)),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1919,6 +1930,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
         "record_remote_enabled" => cfg.record_remote_enabled = parse_bool_or(value, false)?,
         "record_remote_audio" => cfg.record_remote_audio = parse_bool_or(value, false)?,
+        // FR-92 — cleared means the default, which is ON (operator decision
+        // 2026-10-10); the owner turns it off by setting it false.
+        "keep_busy_enabled" => cfg.keep_busy_enabled = parse_bool_or(value, true)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
@@ -2711,6 +2725,7 @@ mod tests {
             "files_dir",
             "record_remote_enabled",
             "record_remote_audio",
+            "keep_busy_enabled",
         ]
         .into_iter()
         .map(String::from)

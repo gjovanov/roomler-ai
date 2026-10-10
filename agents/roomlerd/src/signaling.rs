@@ -1247,6 +1247,9 @@ async fn connect_once(
     // FR-85 P3b — what the hello told the server about remote recording, so
     // the heartbeat re-announces the moment the owner's gate changes it.
     let mut last_announced_record: Vec<String> = hello_caps.record.clone();
+    // FR-92 — and whether the hello advertised keep-busy, so a flipped
+    // `keep_busy_enabled` reaches the server within a beat.
+    let mut last_announced_keep_busy = hello_caps.input.iter().any(|w| w == "keep-busy");
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
@@ -1790,13 +1793,16 @@ async fn connect_once(
                     .then(|| delegate.as_ref().and_then(|d| d.effective_record()))
                     .flatten()
                     .unwrap_or_else(record_caps);
+                let keep_busy_now = crate::keep_busy::advertised();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
+                    && keep_busy_now == last_announced_keep_busy
                 {
                     None
                 } else {
                     last_announced_permissions = caps_now.clone();
                     last_announced_record = record_now.clone();
+                    last_announced_keep_busy = keep_busy_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -5022,6 +5028,12 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
         caps.multi_org.push("tun".into());
     }
     caps.record = record_caps();
+    // FR-92 — `keep-busy` follows the owner's LIVE `keep_busy_enabled`, so,
+    // like the record words, it is appended at every announcement and never
+    // inside the memoized, config-blind `detect()`.
+    if crate::keep_busy::advertised() {
+        caps.input.push("keep-busy".into());
+    }
     caps
 }
 

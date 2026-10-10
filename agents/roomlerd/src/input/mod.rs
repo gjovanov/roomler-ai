@@ -203,6 +203,77 @@ pub trait InputInjector: Send {
     /// On macOS this maps to the Accessibility privilege; on Wayland to
     /// membership in the `input` group / uinput permission.
     fn has_permission(&self) -> bool;
+
+    /// FR-92 — the cursor, in DESKTOP pixels (the virtual screen on Windows,
+    /// global display space on macOS, the root window on X11). Read on the
+    /// injector thread, so a SystemContext worker's desktop rebind covers the
+    /// read as well as the write. Default: [`PxUnsupported`].
+    fn cursor_px(&mut self) -> Result<(i32, i32)> {
+        Err(anyhow::Error::new(PxUnsupported))
+    }
+
+    /// FR-92 — move the cursor to desktop pixel `(x, y)` with REAL input,
+    /// which resets the OS idle clock (a warp — `SetCursorPos`,
+    /// `CGWarpMouseCursorPosition`, `XWarpPointer` — would move the pixel
+    /// and reset nothing). Never goes through [`InputMsg`]'s normalised,
+    /// primary-display mapping. Default: [`PxUnsupported`].
+    fn move_px(&mut self, _x: i32, _y: i32) -> Result<()> {
+        Err(anyhow::Error::new(PxUnsupported))
+    }
+
+    /// FR-92 — is a physical mouse button held right now? Read once per
+    /// keep-busy resume, never polled. Default: [`PxUnsupported`].
+    fn buttons_held(&mut self) -> Result<bool> {
+        Err(anyhow::Error::new(PxUnsupported))
+    }
+}
+
+/// FR-92 — the backend has no pixel-space read/move (Noop, uinput, a
+/// portal-owned route). Distinct from a transient failure: keep-busy reports
+/// it as unavailable rather than retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PxUnsupported;
+
+impl std::fmt::Display for PxUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this input backend has no pixel-space cursor read/move")
+    }
+}
+
+impl std::error::Error for PxUnsupported {}
+
+/// FR-92 — a pixel-space job for an injector THREAD, answered on `reply`.
+/// The enigo and SystemContext backends carry these on the same channel as
+/// their [`InputMsg`]s, so a read is ordered after every event queued
+/// before it.
+#[cfg(feature = "enigo-input")]
+pub(crate) enum PxJob {
+    Locate(std::sync::mpsc::SyncSender<Result<(i32, i32)>>),
+    Move {
+        x: i32,
+        y: i32,
+        reply: std::sync::mpsc::SyncSender<Result<()>>,
+    },
+    Buttons(std::sync::mpsc::SyncSender<Result<bool>>),
+}
+
+/// How long a caller waits for an injector thread to answer a [`PxJob`]. A
+/// stuck injector thread must not hang the arbiter (and with it every
+/// controller's input) behind a keep-busy read.
+pub const PX_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Send `make(reply)` to an injector thread and wait (bounded) for the answer.
+#[cfg(feature = "enigo-input")]
+pub(crate) fn px_round_trip<T, J>(
+    tx: &std::sync::mpsc::Sender<J>,
+    make: impl FnOnce(std::sync::mpsc::SyncSender<Result<T>>) -> J,
+) -> Result<T> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<T>>(1);
+    tx.send(make(reply_tx))
+        .map_err(|_| anyhow::anyhow!("input worker exited"))?;
+    reply_rx
+        .recv_timeout(PX_REPLY_TIMEOUT)
+        .map_err(|_| anyhow::anyhow!("input worker did not answer within {PX_REPLY_TIMEOUT:?}"))?
 }
 
 pub struct NoopInjector;
