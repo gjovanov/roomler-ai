@@ -293,8 +293,10 @@ nothing about (`starting`, or `stopping`, with no `accepted_at`) stays reconcile
 Such a build runs no session and sends no manifest, so a Windows device that updated itself to
 0.4.123, whose build has no `hive`, left its accepted session `idle` for ever; a crash-loop rollback
 or a build made without `hive` does the same. The reconcile of a connection the hub records without
-`hive` now ends those sessions as an empty manifest would, before it reads what is pending, and a
-device not connected on that pod decides nothing (`crates/modules/hive/src/agent_socket.rs:578`).
+`hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
+reads only its own registration: a connection a newer one displaced, or one already gone, decides
+nothing (`crates/modules/hive/src/agent_socket.rs:589`, `crates/modules/fleet/src/hub.rs:1661`
+`agent_supports_hive_on`).
 
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash
 or `systemctl restart` kills every harness, and P1b then ends the sessions. P1d is in two steps.
