@@ -169,10 +169,10 @@ the grid can always show the device's current key.
 
 | record | lives in | written by | what it is |
 |---|---|---|---|
-| the **order** | `agents.key_rotation` (`KeyRotationRequest`, `models.rs:1597`) | the route | what was asked, when, by whom — and `public_key_before`, the key held at that moment |
-| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:3124`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | the route, one call site, both arms | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:731-738`) |
-| the **claim** | `agents.key_rotation_report` (`KeyRotationReport`, `models.rs:1648`) | `rc:agent.key_rotated` ingest (`agent_socket.rs:173` → `agent_arms.rs:81-125`) | the device's account; `reported_at` is server-stamped, `detail` re-clamped on receipt |
-| the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:1679`) | the overlay join | the public key and epoch the device actually presented, and when |
+| the **order** | `agents.key_rotation` (`KeyRotationRequest`, `models.rs:1619`) | the route | what was asked, when, by whom — and `public_key_before`, the key held at that moment |
+| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:3146`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | the route, one call site, both arms | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:731-738`) |
+| the **claim** | `agents.key_rotation_report` (`KeyRotationReport`, `models.rs:1670`) | `rc:agent.key_rotated` ingest (`agent_socket.rs:173` → `agent_arms.rs:81-125`) | the device's account; `reported_at` is server-stamped, `detail` re-clamped on receipt |
+| the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:1701`) | the overlay join | the public key and epoch the device actually presented, and when |
 
 ⚠️ **Never fold them.** A later **refusal** for the same `request_id` is withheld
 rather than written over a `rotated` claim (`dao/agent.rs:737-754`) — a rotation that
@@ -239,9 +239,9 @@ on every connect rather than only when nobody is watching. Three field cycles on
 
 | cycle | what the run showed | the rule it left |
 |---|---|---|
-| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:5487`, `:5512`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:737-754`) |
+| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:5561`, `:5586`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:737-754`) |
 | 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`signaling.rs:2338-2360`) |
-| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:5497`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
+| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:5571`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
 
 ⚠️ The dying-session copy of the report was lost in **3 of the 4** ordered runs. The
 re-send on the new session is the reliable path, and the identity rule is what keeps
@@ -252,7 +252,7 @@ the grid honest for a device that has not yet updated to it — a 0.4.25 device 
 
 | key | where | default | effect |
 |---|---|---|---|
-| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:847-851`, `config_surface.rs:1048-1053`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
+| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:867-851`, `config_surface.rs:1072-1053`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
 | `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1400`, `:1525-1527`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 
@@ -306,9 +306,9 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:597`, `:629`, `:643`, test `:4369`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:1610-1614` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:597`, `:628`, `:642`, test `:4391`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:1610-1614` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:1920`, `:629`; owner `network` (`:1359`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1597`, `:1623`, `:1648`, `:1679`, `:3124`, `:5497`, `:5512` |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1619`, `:1645`, `:1670`, `:1701`, `:3146`, `:5571`, `:5586` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:180-193`, `:250-272` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:173` → `agent_arms.rs:81-125` |
@@ -318,7 +318,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4143-4284`, `:2338-2360`, `:2370-2382`, `:819-836` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:213-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:847-851`, `:1400`, `:1525-1527`; `config_surface.rs:1048-1053` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:867-851`, `:1420`, `:1525-1527`; `config_surface.rs:1072-1053` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1169-1196`, `:1964-2033`; `ui/src/stores/agents.ts:877-884` |
 
 ## Not built

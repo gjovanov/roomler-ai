@@ -619,10 +619,9 @@ pub enum RpcCap {
     /// own `hive_enabled` (default off), `hive_accounts` and `hive_roots`
     /// still decide whether anything runs.
     ///
-    /// ⚠️ The design names `hive-replica` next (a replica that holds copies
-    /// of sessions). `hive` will be its prefix, and the two mean different
-    /// things — running sessions is not holding other people's — so matching
-    /// stays equality, as for `ssh` / `ssh-consent`.
+    /// ⚠️ `hive` is the prefix of `hive-replica` (P2c), and the two mean
+    /// different things — running sessions is not holding copies of other
+    /// devices' — so matching stays equality, as for `ssh` / `ssh-consent`.
     Hive,
     /// FR-90 P0d-2 — `rc:hive.view.*`: the agent serves a session's
     /// transcript to a browser over a data-only WebRTC peer. It answers a view
@@ -653,6 +652,25 @@ pub enum RpcCap {
     /// a person starts from Roomler is not mirroring the ones they started in a
     /// terminal. Equality-matched, locked by test.
     HiveAdopt,
+    /// FR-90 P2c — the agent holds copies of its owner's sessions run on other
+    /// devices: its own `hive_replica` (default off, never pushable) is on.
+    /// Advertised only then — the gate that survives a compromised server — so
+    /// a device that does not advertise it is never placed in a replicaset,
+    /// and it refuses a join on its own word too.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: running sessions is
+    /// not holding copies of other devices'. Equality-matched, locked by test.
+    HiveReplica,
+    /// FR-90 P2c — the agent offers itself as an archive replica: its own
+    /// `hive_archive` (default off, never pushable) is on, beside
+    /// `hive_replica`. An archive holds every session the org's rules allow
+    /// once an `ADMINISTRATOR` designates it: offering is the device's,
+    /// designating the org's.
+    ///
+    /// ⚠️ Neither `hive` nor `hive-replica` is this promise: a replica that is
+    /// no archive holds its owner's own sessions only. Equality-matched,
+    /// locked by test.
+    HiveArchive,
 }
 
 impl RpcCap {
@@ -677,11 +695,13 @@ impl RpcCap {
             Self::HiveView => "hive-view",
             Self::HiveMemory => "hive-memory",
             Self::HiveAdopt => "hive-adopt",
+            Self::HiveReplica => "hive-replica",
+            Self::HiveArchive => "hive-archive",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 13] = [
+    pub const ALL: [RpcCap; 15] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -695,6 +715,8 @@ impl RpcCap {
         Self::HiveView,
         Self::HiveMemory,
         Self::HiveAdopt,
+        Self::HiveReplica,
+        Self::HiveArchive,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4526,6 +4548,8 @@ mod tests {
         assert_eq!(RpcCap::HiveView.wire(), "hive-view");
         assert_eq!(RpcCap::HiveMemory.wire(), "hive-memory");
         assert_eq!(RpcCap::HiveAdopt.wire(), "hive-adopt");
+        assert_eq!(RpcCap::HiveReplica.wire(), "hive-replica");
+        assert_eq!(RpcCap::HiveArchive.wire(), "hive-archive");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4543,7 +4567,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 6] = [
+        const KNOWN: [(RpcCap, RpcCap); 8] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4559,6 +4583,11 @@ mod tests {
             // FR-90 P1j — nor "mirrors adopted terminal sessions". Locked by
             // `hive_does_not_imply_hive_adopt`.
             (RpcCap::Hive, RpcCap::HiveAdopt),
+            // FR-90 P2c — nor "holds copies of other devices' sessions", nor
+            // "offers itself as an archive". Locked by
+            // `hive_replica_and_hive_archive_are_promises_of_their_own`.
+            (RpcCap::Hive, RpcCap::HiveReplica),
+            (RpcCap::Hive, RpcCap::HiveArchive),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -4744,10 +4773,10 @@ mod tests {
         assert!(acking.has_rpc(RpcCap::SshGrantAck));
     }
 
-    /// FR-90 — `hive` is matched by equality, in both directions that will
-    /// matter: the replica verb the design names next must not read as "runs
-    /// sessions", and no existing verb reads as `hive`. A device that holds
-    /// copies of other people's sessions has not agreed to run them.
+    /// FR-90 — `hive` is matched by equality, in both directions that
+    /// matter: the replica verb (P2c) must not read as "runs sessions", and no
+    /// other verb reads as `hive`. A device that holds copies of other
+    /// devices' sessions has not agreed to run them.
     #[test]
     fn hive_is_matched_by_equality() {
         let runs = AgentCaps {
@@ -4764,7 +4793,11 @@ mod tests {
             !replica_only.has_rpc(RpcCap::Hive),
             "a verb that merely starts with `hive` must not read as `hive`"
         );
-        assert!(RpcCap::from_wire("hive-replica").is_none());
+        assert_eq!(
+            RpcCap::from_wire("hive-replica"),
+            Some(RpcCap::HiveReplica),
+            "its own verb, never `hive`'s"
+        );
     }
 
     /// FR-90 P0d-2 — `hive` (runs sessions) does not imply `hive-view`
@@ -4828,6 +4861,40 @@ mod tests {
         assert!(!adopts.has_rpc(RpcCap::Hive));
         assert_eq!(RpcCap::from_wire("hive-adopt"), Some(RpcCap::HiveAdopt));
         assert!(RpcCap::from_wire("hive-adopted").is_none());
+    }
+
+    /// FR-90 P2c — holding copies of other devices' sessions, and offering to
+    /// be an archive of the org's, are promises of their own: neither follows
+    /// from running sessions, nor one from the other. A device placed by a
+    /// verb it never advertised would be handed sessions its owner never
+    /// agreed to hold.
+    #[test]
+    fn hive_replica_and_hive_archive_are_promises_of_their_own() {
+        let runs = AgentCaps {
+            rpc: vec!["hive".into(), "hive-view".into(), "hive-adopt".into()],
+            ..Default::default()
+        };
+        assert!(!runs.has_rpc(RpcCap::HiveReplica));
+        assert!(!runs.has_rpc(RpcCap::HiveArchive));
+        let replica = AgentCaps {
+            rpc: vec!["hive-replica".into()],
+            ..Default::default()
+        };
+        assert!(replica.has_rpc(RpcCap::HiveReplica));
+        assert!(
+            !replica.has_rpc(RpcCap::HiveArchive),
+            "a replica is no archive"
+        );
+        assert!(!replica.has_rpc(RpcCap::Hive), "nor runs sessions");
+        let archive = AgentCaps {
+            rpc: vec!["hive-archive".into()],
+            ..Default::default()
+        };
+        assert!(archive.has_rpc(RpcCap::HiveArchive));
+        assert!(!archive.has_rpc(RpcCap::HiveReplica));
+        assert_eq!(RpcCap::from_wire("hive-archive"), Some(RpcCap::HiveArchive));
+        assert!(RpcCap::from_wire("hive-replicas").is_none());
+        assert!(RpcCap::from_wire("hive-archives").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
@@ -5455,6 +5522,13 @@ mod tests {
             // FR-90 decision 15 — whether an agent on a Mac may be root; a
             // server that could set it could give itself root on the device.
             "hive_allow_passwordless_sudo",
+            // FR-90 P2c — whether this device holds copies of other devices'
+            // sessions, offers itself as the org's archive, and how much it
+            // keeps: a server that could set them could copy every session to
+            // a device of its choosing.
+            "hive_replica",
+            "hive_archive",
+            "hive_store_quota",
         ] {
             assert!(
                 !keys.contains(&forbidden),

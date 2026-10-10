@@ -442,6 +442,30 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - macOS: run agent sessions as an account whose sudo needs no password. Off, such a start is refused: macOS's sudo reads the account's groups from the directory, so the session would have root whatever groups it drops. No effect on Linux, where a session cannot sudo at all. Never settable by the server. Default: OFF.",
     },
     KeyMeta {
+        key: "hive_replica",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - hold copies of the agent sessions this device's owner runs on their other devices, so a session can move here when its device is gone. A copy is everything the agent saw, in plain text on this device. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
+        key: "hive_archive",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - offer this device as the organization's archive replica: once an administrator designates it, it holds every agent session the organization's rules allow, for their retention. Needs hive_replica on. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
+        key: "hive_store_quota_mib",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-90 - the most this device keeps of the agent sessions it holds as a replica, in MiB (1-4194304). Never settable by the server. Empty = no bound but the disk's.",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1734,6 +1758,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_core_memory" => Some(fmt_bool(cfg.hive_core_memory)),
         "hive_adopt" => Some(fmt_bool(cfg.hive_adopt)),
         "hive_allow_passwordless_sudo" => Some(fmt_bool(cfg.hive_allow_passwordless_sudo)),
+        "hive_replica" => Some(fmt_bool(cfg.hive_replica)),
+        "hive_archive" => Some(fmt_bool(cfg.hive_archive)),
+        "hive_store_quota_mib" => cfg.hive_store_quota_mib.map(|n| n.to_string()),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2008,6 +2035,12 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "hive_adopt" => cfg.hive_adopt = parse_bool_or(value, false)?,
         "hive_allow_passwordless_sudo" => {
             cfg.hive_allow_passwordless_sudo = parse_bool_or(value, false)?
+        }
+        "hive_replica" => cfg.hive_replica = parse_bool_or(value, false)?,
+        "hive_archive" => cfg.hive_archive = parse_bool_or(value, false)?,
+        "hive_store_quota_mib" => {
+            cfg.hive_store_quota_mib =
+                parse_u32_range("hive_store_quota_mib", value, 1, 4 * 1024 * 1024)?
         }
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
@@ -3921,6 +3954,36 @@ mod tests {
         apply(&mut cfg, "hive_adopt", None).unwrap();
         assert!(!cfg.hive_adopt, "cleared is off");
         assert!(apply(&mut cfg, "hive_adopt", Some("sometimes")).is_err());
+    }
+
+    /// FR-90 P2c — holding copies of sessions, offering the device as an
+    /// archive, and how much it keeps are the device owner's: off and unbound
+    /// until they say so, and so again when cleared.
+    #[test]
+    fn hive_replica_archive_and_quota_are_the_owners_and_off_by_default() {
+        let mut cfg = crate::config::test_fixture();
+        for key in ["hive_replica", "hive_archive"] {
+            let e = entry_for(&cfg, key).unwrap();
+            assert_eq!(e.default.as_deref(), Some("false"), "{key}");
+            assert_eq!(e.group, Group::Access.wire());
+            apply(&mut cfg, key, Some("true")).unwrap();
+            apply(&mut cfg, key, None).unwrap();
+            assert!(apply(&mut cfg, key, Some("sometimes")).is_err());
+        }
+        assert!(!cfg.hive_replica && !cfg.hive_archive, "cleared is off");
+        apply(&mut cfg, "hive_replica", Some("true")).unwrap();
+        assert!(cfg.hive_replica);
+        apply(&mut cfg, "hive_archive", Some("true")).unwrap();
+        assert!(cfg.hive_archive);
+
+        assert_eq!(cfg.hive_store_quota_mib, None);
+        apply(&mut cfg, "hive_store_quota_mib", Some("10240")).unwrap();
+        assert_eq!(cfg.hive_store_quota_mib, Some(10240));
+        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("0")).is_err());
+        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("4194305")).is_err());
+        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("10GiB")).is_err());
+        apply(&mut cfg, "hive_store_quota_mib", None).unwrap();
+        assert_eq!(cfg.hive_store_quota_mib, None, "cleared is unbound");
     }
 
     /// FR-90 decision 15 — a Mac session as an account whose `sudo` needs no
