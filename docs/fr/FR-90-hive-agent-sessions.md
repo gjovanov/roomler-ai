@@ -1418,7 +1418,10 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   helper ("update deferred — agent turns running", `by="update-helper"`, at 0 s, 60 s and
   120 s). The update went ahead 2.4 s after the turn ended ("the agent turns are done —
   installing", 135 s waited; the helper's "the daemon holds for its agent turns waited_secs=135
-  cut=0"). With Linux and Windows done, the box is ticked.*
+  cut=0"). With Linux and Windows done, the box is ticked.* *Linux again on 2026-10-10, with a
+  real install (§8): released 0.4.123, an update to 0.4.124 pushed 15 s into a 90 s turn, deferred
+  at 0 s and 60 s, and installed 4 s after the turn ended ("the agent turns are done —
+  installing", 85 s waited).*
 - [x] **AC8:** a fact added to the brain appears in the next session's core memory and not in the
   running one; a write over a scope's budget fails visibly. *Field-verified 2026-10-08 on the P1e
   build (§8): a session started after a fact answered with it, the session already running did not,
@@ -1483,11 +1486,14 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     `hive_enabled = false` across a restart (ended, saying why). Three restarts within 120 s also
     met P1d-2's guard, "the daemon restarted 3 times within 120 s of resuming it", and that
     session ended rather than resume a fourth time.*
-  - *Open: an update's restart takes the same two paths, the internal shutdown and then
-    systemd's restart, but is not field-run here, because the dry run installs nothing. On Windows
-    and macOS the only newer release, 0.4.123, cannot resume a session (Windows' build has no
-    `hive`, and macOS's opens no store, #1927), so the update's restart waits for a release that
-    carries #1927.*
+  - *An update's restart, Linux, field-verified 2026-10-10 (§8): released 0.4.123, a real update
+    to 0.4.124 pushed during a running turn. It waited for the turn (AC7), installed, and the new
+    daemon resumed the session 9 s after the old one left ("The device restarted, and this session
+    resumed"). Asked for the codeword taught before the update, it answered **LUMEN-62**, its turns
+    carrying on to 8.*
+  - *Open: an update's restart on macOS (the root helper's install) and on Windows (the MSI). The
+    first release that resumes sessions on both, 0.4.124 (#1927, #1919), is now out, so a candidate
+    that carries them can update to it.*
 - [x] **AC21:** a terminal session adopted on a device whose owner allows it (`hive_adopt`)
   appears to its owner alone — another member, an org admin and a device manager each get a
   404 — renders through the viewer, takes no prompt from anywhere, and an account two people
@@ -1741,6 +1747,8 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-10 | the same VM, its root daemon re-enrolled non-ephemeral, the update helper opted out, `admin` mapped, `%admin … NOPASSWD` the only passwordless rule; released 0.4.123, then two candidates (0.4.121 by number): `8e1f53f09` (P1h-3's, with #1927, without decision 13) and master `81accc83a` | decision 13 on macOS, in a session: `id -Gn; sudo -n true; echo sudo-rc=$?; touch /Applications/.hive-d13 && echo apps-write=ok` | 0.4.123 refused the start, `launch_failed` "/var is a symbolic link", as P1h-3 found (#1927 ships in 0.4.124). Without decision 13: `sudo-rc=0`, `apps-write=ok`. With it: `sudo-rc=0` and `touch: /Applications/.hive-d13: Permission denied`. `id -Gn` listed `admin` both times. On macOS the drop reaches the kernel's checks, never `sudo`, so the docs #1934 shipped (a group rule no longer applies there) were wrong. They are corrected, and the rest is decision 15 |
 | 2026-10-10 | released 0.4.124 (decision 13, no decision 15), then a candidate of #1936 (`dabfad133`, 0.4.121 by number), on a fresh kept macOS tart VM: macOS 15.7.7, sudo 1.9.13p2, the root daemon re-enrolled non-ephemeral, the update helper opted out, `admin` mapped; first the VM's own rules (two naming `admin` by user), then `%admin ALL=(ALL) NOPASSWD: ALL` alone, then no passwordless rule at all, as on a Mac nobody changed | decision 15: a start as an account whose `sudo` needs no password | ❌ on 0.4.124, by-user rules: the session started, and `sudo -n true; echo sudo-rc=$?` printed `sudo-rc=0` (its write into `/Applications` was refused, decision 13). ✅ on the candidate: refused under the by-user rules, and again under the group rule alone, with the detail "admin may use sudo without a password, which would give the agent root on this Mac: its sudo reads the account's groups from the directory, so a session cannot drop them. Give admin a sudo that asks for a password, or set hive_allow_passwordless_sudo". The record's word read `other`: prod's server predates #1936 and decodes the new word leniently, still a refusal. With `hive_allow_passwordless_sudo = true` the start was accepted. With no passwordless rule it was accepted, and the session's `sudo -n true` printed `sudo: a password is required`, `rc=1` |
 | 2026-10-10 | the same VM; the unified log (`log show`, `process == "sudo"`) read for a window that held no other `sudo` | what each way of asking costs | ✅ The daemon's root `sudo -l -U admin`, at a start, logged only directory lookups ("Resolve user group list (>17 groups)"). `sudo -n -l` run as `admin`, under no passwordless rule, printed `a password is required` and had PAM try to authenticate the account: `pam_sm_authenticate(): SmartCard - User admin is not paired with any smartcard`, `OpenDirectory - Error obtaining the authtok`. Asked as the account, every start on a default Mac would make that attempt |
+| 2026-10-10 | released 0.4.123 on a vmtest Ubuntu VM (`ubuntu/installer/system`, kept, the release downgraded in by `dpkg -i`), its root daemon re-enrolled non-ephemeral, `vmtest` mapped; `auto_update = true`, with the updater's own `update-attempt` marker freshened first so its at-start check stayed off (300 s) | AC7 with a real install on Linux: an update to 0.4.124 pushed 15 s into a foreground 90 s command (`ping -c 90`; Claude Code puts a `sleep` in the background and ends the turn) | ✅ "update deferred — agent turns running" at 0 s and 60 s (`turns=1`, the session named), then "the agent turns are done — installing" 4 s after the turn ended, 85 s waited. `apt-get` installed it and the new daemon came up 8 s later, as 0.4.124. Found first: with `auto_update = false` a pushed update is dropped outright ("update trigger dropped — auto-update is off on this device"), the device owner's opt-out winning over the server's push, so a field run that pins a release must turn it on to take a pushed update |
+| 2026-10-10 | the same | AC20, an update's restart: a session taught a codeword (**LUMEN-62**, turn 1) before the update | ✅ The new daemon logged "resuming what this device hosted before it restarted sessions=1" 9 s after the old one left (20:04:31 → 20:04:40), and the room said "The device restarted, and this session resumed." Asked for the codeword, it answered **LUMEN-62**: the history crossed 0.4.123 → 0.4.124. Its turns carried on to 8 |
 
 ## 9. Related
 
