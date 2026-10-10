@@ -139,6 +139,8 @@ pub enum Reason {
     NotLanding,
     Unsupported,
     Portal,
+    /// A Wayland desktop: XTest reaches only Xwayland's own pointer.
+    Wayland,
     NoIdleClock,
     NoPermission,
     DeviceDisabled,
@@ -160,6 +162,7 @@ impl Reason {
             Reason::NotLanding => "not_landing",
             Reason::Unsupported => "unsupported",
             Reason::Portal => "portal",
+            Reason::Wayland => "wayland",
             Reason::NoIdleClock => "no_idle_clock",
             Reason::NoPermission => "no_permission",
             Reason::DeviceDisabled => "device_disabled",
@@ -191,6 +194,9 @@ impl Reason {
             Reason::Portal => {
                 "Unavailable: on this desktop the pointer is driven through a screen-sharing portal, which keep busy does not use yet."
             }
+            Reason::Wayland => {
+                "Unavailable on a Wayland desktop: the agent can move the real pointer only in an X11 session."
+            }
             Reason::NoIdleClock => {
                 "Unavailable: this desktop does not report when it was last used, so a person could not take over."
             }
@@ -212,6 +218,7 @@ impl Reason {
             self,
             Reason::Unsupported
                 | Reason::Portal
+                | Reason::Wayland
                 | Reason::NoIdleClock
                 | Reason::NoPermission
                 | Reason::DeviceDisabled
@@ -245,9 +252,12 @@ pub enum SessionState {
     Unsupported(Reason),
 }
 
-/// The OS idle clock as a marker that changes whenever input arrives.
-/// `GetLastInputInfo` gives an exact tick (tolerance 0); clocks that report
-/// "seconds since" are turned into an absolute instant with some jitter.
+/// The OS idle clock as a marker that changes whenever input arrives: the
+/// instant of the last input, as `value ± tolerance` in the host's own unit.
+/// `GetLastInputInfo` gives an exact tick (tolerance 0). Clocks that report
+/// "time since" give an INTERVAL: the host only knows that the clock was read
+/// somewhere between asking and hearing back, so the last input lies in
+/// `[sent − idle, received − idle]` — however late the answer was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdleMarker {
     pub value: u64,
@@ -261,8 +271,24 @@ impl IdleMarker {
             tolerance: 0,
         }
     }
-    fn differs(&self, other: &IdleMarker) -> bool {
-        self.value.abs_diff(other.value) > self.tolerance.max(other.tolerance)
+    /// Different last inputs: the two intervals do not overlap. A slow read
+    /// widens its own interval instead of shifting it, so latency can never
+    /// make the engine's own move look like a person.
+    pub fn differs(&self, other: &IdleMarker) -> bool {
+        self.value.abs_diff(other.value) > self.tolerance + other.tolerance
+    }
+
+    /// A "time since the last input" reading the clock answered somewhere
+    /// between `sent_us` and `recv_us` (µs, one monotonic clock): the last
+    /// input lies in `[sent − idle, recv − idle]`, widened by the clock's own
+    /// `grain_us`.
+    pub fn within(sent_us: u64, recv_us: u64, idle_us: u64, grain_us: u64) -> IdleMarker {
+        let lo = sent_us.saturating_sub(idle_us);
+        let hi = recv_us.max(sent_us).saturating_sub(idle_us);
+        IdleMarker {
+            value: lo + (hi - lo) / 2,
+            tolerance: (hi - lo).div_ceil(2) + grain_us,
+        }
     }
 }
 
@@ -555,6 +581,21 @@ impl Engine {
         self.set_phase(Phase::Locked, Some(Reason::NoSession), None, now);
         self.bump();
         self.next_wake = Some(now);
+    }
+
+    /// A different person signed in (or everyone signed out): their own
+    /// stored keep busy — or none — replaces whatever ran. Not a turn-off:
+    /// the previous person's preference stays theirs, so no reason is shown.
+    pub fn switch_person(&mut self, activation: Option<Activation>, now: Instant) {
+        self.activation = None;
+        self.reset_run();
+        self.hold_until = None;
+        self.next_wake = None;
+        self.set_phase(Phase::Off, None, None, now);
+        self.bump();
+        if let Some(a) = activation {
+            self.restore(a, now);
+        }
     }
 
     pub fn turn_off(&mut self, why: Reason, now: Instant) {
@@ -1293,6 +1334,26 @@ mod tests {
     /// follow the out leg by milliseconds, never registered, and the host read
     /// as `not_landing` — most enables on a real Windows box. Every own move
     /// is now spaced by `MIN_MOVE_GAP`, a recalibration's first move included.
+    /// A "time since" reading is an interval: the clock answered somewhere
+    /// between asking and hearing back. The same last input read again —
+    /// even across a slow answer — overlaps; a newer input does not.
+    #[test]
+    fn a_time_since_reading_is_an_interval_that_latency_only_widens() {
+        let m = IdleMarker::within(1_000, 1_400, 0, 0);
+        assert_eq!((m.value, m.tolerance), (1_200, 200));
+        // The same input (at ~1000–1400), read later and promptly.
+        let again = IdleMarker::within(5_000, 5_010, 3_800, 0);
+        assert!(!again.differs(&m), "{again:?} vs {m:?}");
+        // The same input, read later and SLOWLY: wider, still the same.
+        let slow = IdleMarker::within(5_000, 9_000, 3_800, 0);
+        assert!(!slow.differs(&m), "{slow:?} vs {m:?}");
+        // A newer input.
+        let newer = IdleMarker::within(5_000, 5_010, 2_000, 0);
+        assert!(newer.differs(&m));
+        // The grain widens both sides.
+        assert_eq!(IdleMarker::within(1_000, 1_000, 0, 7).tolerance, 7);
+    }
+
     #[test]
     fn calibration_and_running_survive_a_coarse_idle_clock() {
         let mut f = Fake::new();
@@ -1513,6 +1574,41 @@ mod tests {
         assert!(s.on);
         // Someone signs in: they get the floor first.
         f.session = SessionState::Present;
+        e.tick(&mut f);
+        assert_eq!(e.snapshot(f.now).reason, Some(Reason::UserActive));
+        run_for(&mut e, &mut f, Duration::from_secs(31));
+        assert_eq!(e.snapshot(f.now).phase, Phase::Running);
+    }
+
+    /// A different person signs in: whatever ran stops with NO reason shown
+    /// (it was not turned off — it was someone else's), and their own stored
+    /// keep busy, if any, starts the way a boot restore does.
+    #[test]
+    fn a_new_person_gets_their_own_keep_busy_and_never_the_last_ones() {
+        let mut f = Fake::new();
+        let mut e = Engine::new(1);
+        on(&mut e, &mut f, Pattern::Heart);
+        run_for(&mut e, &mut f, Duration::from_secs(1));
+        assert_eq!(e.snapshot(f.now).phase, Phase::Running);
+
+        e.switch_person(None, f.now);
+        let s = e.snapshot(f.now);
+        assert_eq!((s.on, s.phase, s.reason), (false, Phase::Off, None));
+        let frozen = f.moves.len();
+        run_for(&mut e, &mut f, Duration::from_secs(5));
+        assert_eq!(f.moves.len(), frozen, "not one more move");
+
+        let theirs = Activation {
+            settings: settings(Pattern::Wave),
+            set_by: "Bob".into(),
+            set_at_ms: 9,
+        };
+        e.switch_person(Some(theirs), f.now);
+        let s = e.snapshot(f.now);
+        assert!(s.on);
+        assert_eq!(s.set_by.as_deref(), Some("Bob"));
+        assert_eq!(s.settings.pattern, Pattern::Wave);
+        // As at boot: they have the floor first, then it runs.
         e.tick(&mut f);
         assert_eq!(e.snapshot(f.now).reason, Some(Reason::UserActive));
         run_for(&mut e, &mut f, Duration::from_secs(31));

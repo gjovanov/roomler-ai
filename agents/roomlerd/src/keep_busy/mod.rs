@@ -22,12 +22,18 @@
 //! See `docs/fr/FR-92-keep-busy.md`.
 
 pub mod engine;
+#[cfg(target_os = "linux")]
+pub mod logind;
 pub mod patterns;
 pub mod state;
 pub mod wire;
 
+#[cfg(feature = "enigo-input")]
+mod arbiter_io;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 mod host_win;
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+mod host_x11;
 
 pub use wire::SetRequest;
 
@@ -55,11 +61,16 @@ pub fn remote_input_epoch() -> u64 {
     REMOTE_INPUT_EPOCH.load(Ordering::Relaxed)
 }
 
-/// Is keep-busy built for this host at all? v1 is Windows (FR-92 P1);
-/// macOS and X11 follow in P3, Wayland later. The cap word also needs the
-/// device owner's `keep_busy_enabled`.
+/// Is keep-busy built for this host at all? Windows (FR-92 P1) and Linux
+/// X11 (P3); macOS follows. A Wayland desktop is detected at run time and
+/// reported `unavailable` with its reason — the cap word stays, so the
+/// viewer can say why. The cap word also needs the device owner's
+/// `keep_busy_enabled`.
 pub fn supported_here() -> bool {
-    cfg!(all(target_os = "windows", feature = "enigo-input"))
+    cfg!(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    ))
 }
 
 /// What the engine thread is asked to do.
@@ -91,6 +102,19 @@ struct Service {
 static SERVICE: OnceLock<Service> = OnceLock::new();
 /// The device owner's `keep_busy_enabled`, mirrored for the cap word.
 static DEVICE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Process-local microseconds for the hosts' "time since" clocks — offset
+/// far from zero, so `t − idle` never underflows on a host that has been idle
+/// longer than this process has been up.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+pub(crate) fn mono_us() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    (1u64 << 50) + start.elapsed().as_micros() as u64
+}
 
 pub(crate) fn wall_ms() -> u64 {
     SystemTime::now()
@@ -301,14 +325,62 @@ fn run(
             &enrolled_tenants,
         );
     }
-    #[cfg(not(all(target_os = "windows", feature = "enigo-input")))]
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    {
+        run_with(
+            engine,
+            rx,
+            out,
+            host_x11::X11Host::new(),
+            host_x11::warnings,
+            &enrolled_tenants,
+        );
+    }
+    #[cfg(not(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    )))]
     {
         let _ = (engine, rx, out, enrolled_tenants);
     }
 }
 
+/// How often the signed-in person is looked up again, where it can change
+/// under a running process ([`state::person_can_change`]).
+const PERSON_EVERY: Duration = Duration::from_secs(10);
+
+/// What a change of signed-in person does to keep busy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersonSwitch {
+    /// Their own stored keep busy — or none — replaces whatever ran.
+    Restore(Option<engine::Activation>),
+    /// Keep what runs, and store it as theirs: it was turned on while nobody
+    /// was signed in — a technician at the login screen, signing them in.
+    Adopt,
+}
+
+/// The person at the machine changed (`someone` = a person is signed in
+/// now). Their own stored keep busy wins; failing that, one turned on while
+/// NOBODY was signed in becomes theirs; anything else stops — keep busy is
+/// never handed from one person to another. Pure, so the rule is a test.
+pub fn person_switch(
+    running: bool,
+    set_while_nobody: bool,
+    someone: bool,
+    theirs: Option<engine::Activation>,
+) -> PersonSwitch {
+    match theirs {
+        Some(a) => PersonSwitch::Restore(Some(a)),
+        None if someone && running && set_while_nobody => PersonSwitch::Adopt,
+        None => PersonSwitch::Restore(None),
+    }
+}
+
 #[cfg_attr(
-    not(all(target_os = "windows", feature = "enigo-input")),
+    not(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    )),
     allow(dead_code)
 )]
 fn run_with<H: Host>(
@@ -319,9 +391,15 @@ fn run_with<H: Host>(
     warnings: fn() -> Vec<&'static str>,
     enrolled_tenants: &[String],
 ) {
-    let path = state::default_path();
+    // Whose store this is can change under a running process (a SYSTEM
+    // worker, a root Linux daemon): then the person is looked up again.
+    let person_moves = state::person_can_change();
+    let mut path = state::default_path();
     let mut stored = path.as_deref().map(state::load_from).unwrap_or_default();
     let start = Instant::now();
+    let mut person_at = start + PERSON_EVERY;
+    // The running keep busy was turned on while nobody was signed in.
+    let mut set_while_nobody = false;
     let departed = prune_departed_orgs(&mut stored.org_denied, enrolled_tenants);
     if departed > 0 {
         tracing::info!(
@@ -352,11 +430,62 @@ fn run_with<H: Host>(
     let mut last_logged = (engine.snapshot(start).phase, engine.snapshot(start).reason);
 
     loop {
-        let msg = match engine.next_wake() {
+        let wake = match (engine.next_wake(), person_moves) {
+            (w, false) => w,
+            (Some(w), true) => Some(w.min(person_at)),
+            (None, true) => Some(person_at),
+        };
+        let msg = match wake {
             Some(w) => rx.recv_timeout(w.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         let now = Instant::now();
+        // Who is signed in, BEFORE a turn-on is applied: it must land in that
+        // person's store, and never be undone by a switch a moment later.
+        let asks_on = matches!(msg, Ok(Command::Set { .. }));
+        if person_moves && (now >= person_at || asks_on) {
+            person_at = now + PERSON_EVERY;
+            // With nothing running and nothing stored for anyone, there is
+            // nothing a login could restore — skip the lookup (on a root
+            // Linux daemon it spawns `loginctl`).
+            if asks_on || engine.is_on() || state::someone_left_it_on() {
+                let now_path = state::default_path();
+                if now_path != path {
+                    let mut theirs = now_path
+                        .as_deref()
+                        .map(state::load_from)
+                        .unwrap_or_default();
+                    // The org's word is the DEVICE's, not a person's.
+                    theirs.org_denied = stored.org_denied.clone();
+                    let decision = person_switch(
+                        engine.is_on(),
+                        set_while_nobody,
+                        now_path.is_some(),
+                        theirs.activation(wall_ms()),
+                    );
+                    tracing::info!(
+                        signed_in = now_path.is_some(),
+                        adopted = decision == PersonSwitch::Adopt,
+                        "keep-busy: the person at this computer changed"
+                    );
+                    match decision {
+                        PersonSwitch::Adopt => {
+                            theirs = theirs.with_activation(engine.activation());
+                        }
+                        PersonSwitch::Restore(act) => engine.switch_person(act, now),
+                    }
+                    path = now_path;
+                    stored = theirs;
+                    if let Some(p) = path.as_deref()
+                        && let Err(e) = state::save_to(p, &stored)
+                    {
+                        tracing::warn!(path = %p.display(), error = %e, "keep-busy: could not save the store");
+                    }
+                    last_act = engine.activation().cloned();
+                    set_while_nobody = false;
+                }
+            }
+        }
         match msg {
             // The org policy needs the store, so it is handled here.
             Ok(Command::OrgPolicy { tenant, denied }) => {
@@ -385,6 +514,12 @@ fn run_with<H: Host>(
         }
         // Persist on/off edges only — never pause/resume.
         if engine.activation() != last_act.as_ref() {
+            if last_act.is_none() {
+                set_while_nobody = path.is_none();
+            }
+            if engine.activation().is_none() {
+                set_while_nobody = false;
+            }
             last_act = engine.activation().cloned();
             stored = stored.with_activation(last_act.as_ref());
             if let Some(p) = path.as_deref()
@@ -530,6 +665,40 @@ mod tests {
         assert!(!org_denied(&m), "the departed org's deny is gone");
         assert_eq!(m.len(), 1);
         assert_eq!(prune_departed_orgs(&mut m, &enrolled), 0, "idempotent");
+    }
+
+    fn act(by: &str) -> engine::Activation {
+        engine::Activation {
+            settings: Settings::default(),
+            set_by: by.into(),
+            set_at_ms: 1,
+        }
+    }
+
+    /// FR-92 P3 — a new person at the machine gets THEIR keep busy, never
+    /// the last person's; one turned on while nobody was signed in (a
+    /// technician at the login screen) becomes the person's who signs in.
+    #[test]
+    fn keep_busy_is_never_handed_from_one_person_to_another() {
+        use PersonSwitch::*;
+        // Their own store wins, whatever ran.
+        assert_eq!(
+            person_switch(true, false, true, Some(act("Bob"))),
+            Restore(Some(act("Bob")))
+        );
+        assert_eq!(
+            person_switch(true, true, true, Some(act("Bob"))),
+            Restore(Some(act("Bob")))
+        );
+        // Alice's keep busy, and Bob signs in with none stored: it stops.
+        assert_eq!(person_switch(true, false, true, None), Restore(None));
+        // Turned on at the login screen, then Bob signs in: it is his.
+        assert_eq!(person_switch(true, true, true, None), Adopt);
+        // Everyone signed out: it stops (it stays stored for its owner).
+        assert_eq!(person_switch(true, false, false, None), Restore(None));
+        assert_eq!(person_switch(true, true, false, None), Restore(None));
+        // Nothing ran: nothing to adopt.
+        assert_eq!(person_switch(false, true, true, None), Restore(None));
     }
 
     #[test]
