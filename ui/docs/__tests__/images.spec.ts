@@ -142,4 +142,21 @@ describe("the repo's own images", () => {
   it('size the social card as its IHDR says (1280×640, read with node Buffer)', () => {
     expect(imageSize(readFileSync(join(ui, 'docs/assets/social-preview.png')))).toEqual({ width: 1280, height: 640 })
   })
+
+  it('keep the logo lockup at 422×120, which the top bars draw at 113×32', () => {
+    expect(imageSize(readFileSync(join(ui, 'src/assets/brand/roomler-logo.svg')))).toEqual({ width: 422, height: 120 })
+    expect(imageSize(readFileSync(join(ui, 'src/assets/brand/roomler-logo-dark.svg')))).toEqual({ width: 422, height: 120 })
+  })
+
+  it('name only icons that exist, at the size the manifest states', () => {
+    const manifest = JSON.parse(readFileSync(join(ui, 'public/site.webmanifest'), 'utf8')) as {
+      icons: Array<{ src: string; sizes: string }>
+    }
+    expect(manifest.icons.length).toBeGreaterThan(0)
+    for (const icon of manifest.icons) {
+      const [width, height] = icon.sizes.split('x').map(Number)
+      expect(imageSize(readFileSync(join(ui, 'public', icon.src)))).toEqual({ width, height })
+    }
+    expect(imageSize(readFileSync(join(ui, 'public/apple-touch-icon.png')))).toEqual({ width: 180, height: 180 })
+  })
 })

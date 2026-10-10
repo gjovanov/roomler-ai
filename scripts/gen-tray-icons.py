@@ -15,9 +15,10 @@ companion could not start on macOS at all. The setup wizard carried the same
 files are missing), so the one EXE a new user double-clicks had a blank icon
 in Explorer and the taskbar — FR-84 S2 gave it a real one.
 
-Generated rather than hand-drawn so the mark stays in step with
-`ui/public/favicon.svg` (a #1565C0 rounded square with a white R) and so
-regenerating is a command rather than an afternoon in a paint program.
+Generated rather than hand-drawn so regenerating is a command rather than an
+afternoon in a paint program. The mark is the web favicon as it was before the
+2026-10 logo (a #1565C0 rounded square with a white R): the native icon sets
+have not moved to the new logo, so `ui/public/favicon.svg` no longer matches.
 
     python3 scripts/gen-tray-icons.py                   # the companion (default)
     python3 scripts/gen-tray-icons.py --target setup    # the setup wizard
@@ -40,7 +41,7 @@ except ImportError:  # pragma: no cover - developer tooling
     sys.exit("this needs Pillow:  pip install pillow")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BRAND = (21, 101, 192, 255)  # #1565C0, from favicon.svg
+BRAND = (21, 101, 192, 255)  # #1565C0, from the pre-2026-10 favicon.svg
 SETUP = (46, 125, 50, 255)  # #2E7D32 — the wizard's green (operator, 2026-09-25)
 WHITE = (255, 255, 255, 255)
 RED = (229, 57, 53, 255)  # #E53935 — the dot on the tray while recording (FR-85)
@@ -79,7 +80,7 @@ def _mark(size: int, fg, bg):
     n = size * SS
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    # favicon.svg uses rx=6 on a 32px box — keep that ratio at every size.
+    # The pre-2026-10 favicon.svg used rx=6 on a 32px box — keep that ratio.
     d.rounded_rectangle([0, 0, n - 1, n - 1], radius=int(n * 6 / 32), fill=bg)
 
     font = _font(int(n * 0.66))
