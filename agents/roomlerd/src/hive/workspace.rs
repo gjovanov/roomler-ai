@@ -40,12 +40,17 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use roomler_hive_node::checkpoint::{RepoKind, WorkspaceSnap, chunk_bytes};
 
 /// The largest pack one checkpoint carries. A workspace whose first pack is
 /// larger is skipped: it is not one a member can be handed each turn.
 pub(crate) const MAX_PACK: usize = 512 * 1024 * 1024;
+
+/// A lock older than this on a checkpoint's own index is stale: no checkpoint
+/// is let run this long (`CHECKPOINT_TIMEOUT`, 120 s), so none still holds it.
+pub(crate) const STALE_LOCK: Duration = Duration::from_secs(300);
 
 /// Who the checkpoint commits say made them: never the person, whose name
 /// would then sign a commit they did not write.
@@ -156,6 +161,7 @@ fn take(
     }
     let repo = find_repo(git, folder, state_dir)?;
     let index = repo.git_dir.join(format!("hive-{sid}.index"));
+    clear_stale_lock(&repo.git_dir.join(format!("hive-{sid}.index.lock")));
     if repo.kind == RepoKind::Own {
         // Seeded from the person's index, so only what changed re-hashes; the
         // person's own index is read, never written.
@@ -257,6 +263,25 @@ fn take(
         },
         blobs,
     })
+}
+
+/// Remove the lock a git left on the checkpoint's own index when it was ended
+/// before it could: a KILL, a power cut. Left, it refuses every checkpoint
+/// after it, for good. Only an old one is removed: a running checkpoint's is
+/// never older than its time limit, and the index is the session's alone.
+fn clear_stale_lock(lock: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(lock) else {
+        return;
+    };
+    let stale = meta.file_type().is_file()
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STALE_LOCK);
+    if stale {
+        let _ = std::fs::remove_file(lock);
+    }
 }
 
 /// The repository `folder` is in, or its shadow in `state_dir`.
@@ -753,6 +778,44 @@ mod tests {
         let shadow = state.path().join("shadow.git");
         let listed = person(&shadow, &["ls-tree", "-r", "--name-only", &snap.tree]);
         assert_eq!(listed, "f.txt");
+    }
+
+    /// A lock a git left on the checkpoint's own index, ended before it could
+    /// remove it, is cleared once it is older than any checkpoint runs; a
+    /// younger one is a checkpoint still running, and the add refuses.
+    #[test]
+    fn a_stale_lock_on_the_checkpoints_index_is_cleared_and_a_live_one_kept() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let dir = tmp.path();
+        let state = tempfile::tempdir().unwrap();
+        let git_dir = PathBuf::from(person(dir, &["rev-parse", "--absolute-git-dir"]));
+        let lock = git_dir.join(format!("hive-{SID}.index.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        match checkpoint(&Git::on_path(), dir, state.path(), SID, 1, 1, None) {
+            Outcome::Skipped(why) => assert!(why.starts_with("git add failed"), "{why}"),
+            other => panic!("a live lock is kept: {other:?}"),
+        }
+        assert!(lock.exists());
+        let old = std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        taken(checkpoint(
+            &Git::on_path(),
+            dir,
+            state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
+        assert!(!lock.exists(), "cleared, and git let go of its own");
     }
 
     /// No `git`, or a session id that is not one, skips the workspace in words.

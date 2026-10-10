@@ -85,6 +85,10 @@ pub(crate) struct HostedSession {
     pub harness_pid: Option<u32>,
     #[serde(default)]
     pub harness_started: Option<String>,
+    /// P2b-3b — the server joined it as replicated, so each turn's end is
+    /// checkpointed; a resume keeps doing so. Absent in a file from before.
+    #[serde(default)]
+    pub replicated: bool,
 }
 
 /// A turn in progress.
@@ -267,6 +271,7 @@ mod tests {
             quick_resumes: 0,
             harness_pid: None,
             harness_started: None,
+            replicated: false,
         }
     }
 
