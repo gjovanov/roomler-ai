@@ -97,7 +97,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 19 | 10-01 | The release Linux x86_64 job installs every package from one cached apt set (`release-linux-u2204-v1`, the master rehearsal saves it, tags restore it) instead of three raw `apt-get` steps against the mirror | #1806 |
 | 20 | 10-06 | The Linux desktop companion builds in a parallel job (`build-linux-companion`, its own seed family `agent-linux-companion`, the SAME cached apt set as `build-linux`) instead of serially at the end of `build-linux`, the Linux twin of wave 18 | #1938 |
 | 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and two cuts to master's working set: the plain recorder lane restores `recorder-audio`'s family (works, ~600 MB); a `cargo-cache-trim` step dropped the crate archives before each save (**a no-op**: rust-cache's own `cargo metadata` downloads them again before saving) | #1939 |
-| 21b | 10-10 | The trim removed from all 14 jobs. The integration lane builds with `line-tables-only` instead of full debuginfo | #PR21B |
+| 21b | 10-10 | The trim removed from all 14 jobs. The integration lane builds with `line-tables-only` instead of full debuginfo | #1944 |
 
 ## Acceptance criteria
 
