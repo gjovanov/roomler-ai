@@ -185,6 +185,11 @@ export interface AgentCapabilities {
    *  Empty / unset on older agents / non-Windows hosts — the browser
    *  hides the layout chip + picker. Mirrors `AgentCaps.layout`. */
   layout?: string[]
+  /** P6 input arbitration, and FR-92. Known values, matched by equality:
+   *  'arbiter', 'exclusive', 'ghost-cursor', and 'keep-busy' — this agent
+   *  can run keep busy here and its owner allows it, so the viewer offers
+   *  the Keep busy menu. Mirrors `AgentCaps.input`. */
+  input?: string[]
   /** FR-77 — every cell (codec × chroma format) the host can produce, one
    *  entry per encoder (codec × backend) the start-up probe actually opened.
    *  Absent on agents older than FR-77: `cellsFromCaps()` then derives the
