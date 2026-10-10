@@ -113,6 +113,7 @@ impl AgentDao {
             // FR-27 — unknown until the device's first heartbeat, for the same
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
+            keep_busy: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -415,6 +416,7 @@ impl AgentDao {
         agent_id: ObjectId,
         warm_relay: Option<&str>,
         companion_version: Option<&str>,
+        keep_busy: Option<&roomler_ai_remote_control::models::KeepBusyBrief>,
     ) -> DaoResult<bool> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -449,6 +451,17 @@ impl AgentDao {
             }
             None => {
                 unset.insert("companion_version", "");
+            }
+        }
+        // FR-92 P5b — keep busy, by the same present/absent rule: a device
+        // that stops saying (an older build after a rollback, a supervised
+        // Mac's daemon) must read as unknown, not as the last thing it said.
+        match keep_busy.and_then(|b| bson::to_bson(b).ok()) {
+            Some(b) => {
+                set.insert("keep_busy", b);
+            }
+            None => {
+                unset.insert("keep_busy", "");
             }
         }
         let update = if unset.is_empty() {

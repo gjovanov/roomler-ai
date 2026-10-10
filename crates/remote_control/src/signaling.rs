@@ -374,6 +374,12 @@ pub enum ClientMsg {
         /// exactly the skew the operator hit on macOS.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         companion_version: Option<String>,
+        /// FR-92 P5b — keep busy, as this device runs it: shown on the device
+        /// list, never enforced on. `None` = nothing to report (no keep busy
+        /// here, a pre-P5b agent, or a supervised Mac's daemon, which cannot
+        /// speak for its GUI worker). Additive like `companion_version`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_busy: Option<crate::models::KeepBusyBrief>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -4682,6 +4688,7 @@ mod tests {
             srflx_count: Some(2),
             warm_relay: Some("5.9.157.221:12586".into()),
             companion_version: Some("0.4.16".into()),
+            keep_busy: None,
             // FR-43 P2c — absent means "no news", which is the steady state.
             caps: None,
         };
@@ -4705,11 +4712,16 @@ mod tests {
                 warm_relay,
                 companion_version,
                 caps,
+                keep_busy,
             } => {
                 // FR-43 P2c — the steady state is ABSENT, and that is the
                 // property worth asserting: caps ride the heartbeat only when
                 // they change, so an ordinary beat must carry none.
                 assert!(caps.is_none(), "an ordinary heartbeat must not carry caps");
+                // FR-92 P5b — and a beat that has nothing to say about keep
+                // busy says nothing: the key is absent on the wire.
+                assert!(keep_busy.is_none());
+                assert!(!s.contains("keep_busy"), "{s}");
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
@@ -4739,6 +4751,7 @@ mod tests {
             serde_json::from_str::<ClientMsg>(stage1).unwrap(),
             ClientMsg::AgentHeartbeat {
                 companion_version: None,
+                keep_busy: None,
                 ..
             }
         ));
@@ -4807,6 +4820,7 @@ mod tests {
             // server reading it cannot tell it apart from an old agent (both
             // mean "nothing to show").
             companion_version: None,
+            keep_busy: None,
             caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -6238,6 +6252,55 @@ mod tests {
         }
     }
 
+    /// FR-92 P5b — the keep-busy brief rides the heartbeat both ways, and a
+    /// heartbeat from an agent that predates it still parses, as "nothing to
+    /// say". An off brief carries no pattern and no name.
+    #[test]
+    fn keep_busy_brief_rides_the_heartbeat_and_is_optional() {
+        use crate::models::KeepBusyBrief;
+        let old = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":0}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::AgentHeartbeat { keep_busy, .. } => assert!(keep_busy.is_none()),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let brief = KeepBusyBrief {
+            on: true,
+            phase: "paused".into(),
+            reason: Some("user_active".into()),
+            pattern: Some("heart".into()),
+            set_by: Some("Alice".into()),
+        };
+        let hb = ClientMsg::AgentHeartbeat {
+            rss_mb: 0,
+            cpu_pct: 0.0,
+            active_sessions: 0,
+            sys: None,
+            srflx_count: None,
+            warm_relay: None,
+            caps: None,
+            companion_version: None,
+            keep_busy: Some(brief.clone()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&hb).unwrap();
+        assert_eq!(v["keep_busy"]["phase"], "paused");
+        assert_eq!(v["keep_busy"]["set_by"], "Alice");
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::AgentHeartbeat { keep_busy, .. } => assert_eq!(keep_busy, Some(brief)),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let off = KeepBusyBrief {
+            on: false,
+            phase: "off".into(),
+            reason: None,
+            pattern: None,
+            set_by: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            r#"{"on":false,"phase":"off"}"#
+        );
+    }
+
     #[test]
     fn key_rotated_report_roundtrip_and_public_only() {
         use crate::models::KeyRotationOutcome;
@@ -7239,6 +7302,7 @@ mod tests {
             srflx_count: None,
             warm_relay: None,
             companion_version: None,
+            keep_busy: None,
             caps: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
@@ -7256,6 +7320,7 @@ mod tests {
             srflx_count: None,
             warm_relay: None,
             companion_version: None,
+            keep_busy: None,
             caps: Some(Box::new(AgentCaps {
                 permissions: Some(vec!["screen-capture".into(), "input".into()]),
                 has_input_permission: true,

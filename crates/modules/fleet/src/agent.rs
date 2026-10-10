@@ -431,6 +431,11 @@ pub struct AgentResponse {
     /// different situations into one string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub companion_version: Option<String>,
+    /// FR-92 P5b — keep busy as the device last reported it. Omitted when the
+    /// device does not say (no keep busy there, an older agent, a supervised
+    /// Mac's daemon): unknown, never "off".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_busy: Option<roomler_ai_remote_control::models::KeepBusyBrief>,
     pub status: AgentStatus,
     /// FR-51 — this device enrolled as temporary: the reaper removes it after
     /// its inactivity TTL, and removal is final (hard delete, no tombstone).
@@ -1467,6 +1472,7 @@ fn to_agent_response(
         os: a.os,
         agent_version: a.agent_version,
         companion_version: a.companion_version,
+        keep_busy: a.keep_busy,
         status: a.status,
         ephemeral: a.ephemeral,
         ephemeral_ttl_secs: a.ephemeral_ttl_secs,
