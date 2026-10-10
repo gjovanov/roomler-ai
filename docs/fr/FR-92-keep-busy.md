@@ -266,11 +266,11 @@ stateDiagram-v2
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | Claim: issue #1942, this spec, the ledger row | Docs only | this PR |
-| P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | PR open |
-| P2 | Viewer: composable, menu, previews, chip | the cap word | — |
+| P0 | Claim: issue #1942, this spec, the ledger row | Docs only | #1943, merged `058d6304a` |
+| P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | #1948, merged `a9fc3f0de` |
+| P2 | Viewer: composable, menu, previews, chip | the cap word | #1949, merged `28fd63c19` |
 | P3 | macOS + X11 hosts and their keep-busy-only lock probes; Wayland and portal reported `unavailable` | per-host cap word | — |
-| P4 | LocalAPI verbs (person socket), CLI, companion tray, notification, banner row | — | — |
+| P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | PR open |
 | P5 | Org deny: tenant key, routes, admin UI, `Request` field, connect + cross-pod push, delegation forwarding; heartbeat brief, badge, audit | the org switch (default allowed) | — |
 | P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | — |
 

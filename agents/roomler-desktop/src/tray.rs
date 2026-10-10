@@ -11,6 +11,10 @@
 //!                           the recorder (a light poll, every 3 s), and
 //!                           the ICON turns red while any recording runs,
 //!                           this device's own or a controller's
+//!   - Stop keep busy     — FR-92: shows while a controller has left keep
+//!                           busy on (pattern · phase) and stops it; disabled
+//!                           ("Keep busy: off") otherwise — there is no local
+//!                           "on". A light poll, every 3 s
 //!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Welcome tour…      — FR-84 D6: the first-run tour, again
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
@@ -37,6 +41,14 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let open_web = MenuItem::with_id(app, "open_web", "Open Roomler…", true, None::<&str>)?;
     // FR-85 — disabled until the service says it has a recorder.
     let record = MenuItem::with_id(app, RECORD_ITEM_ID, "Start recording", false, None::<&str>)?;
+    // FR-92 — disabled while keep busy is off: there is no local "on".
+    let keep_busy = MenuItem::with_id(
+        app,
+        KEEP_BUSY_ITEM_ID,
+        "Keep busy: off",
+        false,
+        None::<&str>,
+    )?;
     let onboarding = MenuItem::with_id(app, "onboarding", "Onboarding…", true, None::<&str>)?;
     let welcome = MenuItem::with_id(app, "welcome", "Welcome tour…", true, None::<&str>)?;
     let check_updates_item = MenuItem::with_id(
@@ -54,6 +66,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             &open_status,
             &open_web,
             &record,
+            &keep_busy,
             &onboarding,
             &welcome,
             &check_updates_item,
@@ -66,6 +79,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         "open_status" => show_window(app, "/overview"),
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
+        KEEP_BUSY_ITEM_ID => stop_keep_busy(app),
         "onboarding" => show_window(app, "/onboarding"),
         "welcome" => show_window(app, "/welcome"),
         "check_updates" => check_updates(app),
@@ -95,6 +109,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     };
 
     spawn_recording_watch(app.clone(), record);
+    spawn_keep_busy_watch(keep_busy);
 
     // FR-27 — ADOPT the tray Tauri already created from `app.trayIcon` in
     // tauri.conf.json instead of building a second one.
@@ -154,6 +169,71 @@ const FALLBACK_TRAY_ID: &str = "roomler-desktop-tray";
 
 /// FR-85 — the Start/Stop recording menu item.
 const RECORD_ITEM_ID: &str = "record_toggle";
+/// FR-92 — the keep-busy item: its state, and Stop.
+const KEEP_BUSY_ITEM_ID: &str = "keep_busy_stop";
+
+/// FR-92 — the tray's keep-busy item: `(text, enabled)`. Enabled only while
+/// keep busy is on, and then it is a Stop — the person at the device must
+/// always be able to end what a controller left running on their pointer.
+/// `None` (no service answered yet, or an older one) reads as off.
+fn keep_busy_labels(state: Option<&roomler_localapi::KeepBusyInfo>) -> (String, bool) {
+    match state {
+        Some(s) if s.on => {
+            let pattern = {
+                let mut c = s.pattern.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => "Pattern".into(),
+                }
+            };
+            (format!("Stop keep busy ({pattern} · {})", s.phase), true)
+        }
+        _ => ("Keep busy: off".into(), false),
+    }
+}
+
+/// FR-92 — keep the item in step with the device, every 3 s (the same
+/// cadence and connection pool as the recording item).
+fn spawn_keep_busy_watch<R: Runtime>(item: MenuItem<R>) {
+    tauri::async_runtime::spawn(async move {
+        let mut shown: Option<(String, bool)> = None;
+        loop {
+            let answer = match roomler_localapi::connect().await {
+                Ok(mut c) => c.keep_busy_status().await.ok(),
+                Err(_) => None,
+            };
+            let labels = keep_busy_labels(answer.as_ref());
+            if shown.as_ref() != Some(&labels) {
+                let _ = item.set_text(&labels.0);
+                let _ = item.set_enabled(labels.1);
+                if let Some(s) = answer.as_ref()
+                    && s.on
+                {
+                    tracing::info!(
+                        pattern = %s.pattern,
+                        set_by = s.set_by.as_deref().unwrap_or("-"),
+                        "tray: keep busy is on"
+                    );
+                }
+                shown = Some(labels);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// FR-92 — the person at the device stops keep busy.
+fn stop_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
+    tauri::async_runtime::spawn(async move {
+        let outcome = match roomler_localapi::connect().await {
+            Ok(mut c) => c.keep_busy_off().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(%e, "tray: could not stop keep busy");
+        }
+    });
+}
 
 /// FR-85 — the configured tray's icon while nothing records: the menu-bar
 /// template `app.trayIcon` names.
@@ -446,6 +526,30 @@ fn check_updates<R: Runtime>(app: &AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-92 — the item is a Stop exactly while keep busy is on; off, an
+    /// older service, or no answer at all leave it disabled (there is no
+    /// local "on" to offer).
+    #[test]
+    fn keep_busy_item_is_a_stop_only_while_it_is_on() {
+        assert_eq!(keep_busy_labels(None), ("Keep busy: off".into(), false));
+        let mut s = roomler_localapi::KeepBusyInfo {
+            on: true,
+            phase: "paused".into(),
+            pattern: "heart".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_busy_labels(Some(&s)),
+            ("Stop keep busy (Heart · paused)".into(), true)
+        );
+        s.on = false;
+        assert_eq!(keep_busy_labels(Some(&s)), ("Keep busy: off".into(), false));
+        assert_eq!(
+            keep_busy_labels(Some(&roomler_localapi::KeepBusyInfo::unavailable())),
+            ("Keep busy: off".into(), false)
+        );
+    }
 
     /// FR-85 — the tray says what the recorder is doing, and a service
     /// without a recorder (or none at all) leaves the item disabled rather
