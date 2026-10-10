@@ -6,7 +6,9 @@ description: "Why I built Roomler: an open-source, self-hosted TeamViewer altern
 date: 2026-09-25T22:45:13Z
 updated: 2026-09-29T22:20:00Z
 author: goran
-tags: [teamviewer, remote-desktop, self-hosting, open-source, unattended-access]
+tags: [teamviewer, remote-desktop, self-hosting, open-source, unattended-access, teamviewer-alternative]
+hero: self-hosted-teamviewer-alternative-hero.svg
+heroAlt: Your laptop at home shows the office PC's live desktop in a browser tab, encrypted end to end, while nobody is at the office PC and no one-time password is needed
 ogImage: self-hosted-teamviewer-alternative-og.png
 ogImageAlt: A browser tab showing the live desktop of an office PC, connected directly and encrypted end to end
 related: [/docs/compare/teamviewer/, /docs/remote-desktop/unattended-access/, /docs/start/self-hosting/]
