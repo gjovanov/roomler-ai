@@ -289,6 +289,15 @@ Reconcile never re-sends that session, because it is no longer `starting`. With 
 outlived its harness for ever. The P1b field run found one, 2026-10-08. A start the device has said
 nothing about (`starting`, or `stopping`, with no `accepted_at`) stays reconcile's.
 
+⚠️ **A device that comes back without `hive` ends what it ran** (found in the field, 2026-10-10).
+Such a build runs no session and sends no manifest, so a Windows device that updated itself to
+0.4.123, whose build has no `hive`, left its accepted session `idle` for ever; a crash-loop rollback
+or a build made without `hive` does the same. The reconcile of a connection the hub records without
+`hive` now ends those sessions as an empty manifest would, before it reads what is pending, and it
+reads only its own registration: a connection a newer one displaced, or one already gone, decides
+nothing (`crates/modules/hive/src/agent_socket.rs:589`, `crates/modules/fleet/src/hub.rs:1661`
+`agent_supports_hive_on`).
+
 **Updates and restarts (P1d).** Today a session's harness is the daemon's child: an update, a crash
 or `systemctl restart` kills every harness, and P1b then ends the sessions. P1d is in two steps.
 
