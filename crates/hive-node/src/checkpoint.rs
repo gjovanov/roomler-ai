@@ -52,8 +52,10 @@ pub const MAX_FILES: usize = 10_000;
 /// is in the allowlist.
 pub const MAX_NEW_BYTES: u64 = 512 * 1024 * 1024;
 
-/// How deep a directory in the allowlist is walked.
-const MAX_DEPTH: usize = 8;
+/// How deep a directory in the allowlist is walked, by [`take`] and by a
+/// target clearing what a checkpoint no longer lists (P2b-4): the same depth,
+/// so neither touches what the other cannot see.
+pub const MAX_DEPTH: usize = 8;
 
 /// A BLAKE3 hash, as `b3sum` prints it on the wire.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -85,6 +87,30 @@ impl Digest {
             out[i] = digit(pair[0])? << 4 | digit(pair[1])?;
         }
         Some(Self(out))
+    }
+}
+
+/// A [`Digest`] of bytes that arrive in pieces: how a target checks a file it
+/// is streamed (P2b-4).
+pub struct Hasher(blake3::Hasher);
+
+impl Hasher {
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finish(&self) -> Digest {
+        Digest::of_hasher(&self.0)
+    }
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -686,11 +712,63 @@ fn io_err(path: &str, source: std::io::Error) -> CheckpointError {
     }
 }
 
+/// The chunks that make `path` as the last of `checkpoints` (oldest first) has
+/// it, in order from offset 0, and that checkpoint's entry for it: what
+/// [`assemble`] joins, for a caller that streams the blobs instead of holding
+/// the file (P2b-4, a target's materialize). A chunk at offset 0 starts the
+/// file over, and so does a checkpoint that does not list it. Each chunk
+/// follows the one before it, and they add up to the entry's `len`; each
+/// blob's hash is the reader's to check, and the whole file's.
+pub fn chunks_of<'a>(
+    path: &str,
+    checkpoints: impl IntoIterator<Item = &'a Checkpoint>,
+) -> Result<(Vec<Chunk>, &'a FileSnap), CheckpointError> {
+    let bad = |why: String| CheckpointError::Inconsistent {
+        path: path.to_string(),
+        why,
+    };
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut len = 0u64;
+    let mut last: Option<&FileSnap> = None;
+    for cp in checkpoints {
+        let Some(snap) = cp.files.iter().find(|f| f.path == path) else {
+            last = None;
+            chunks.clear();
+            len = 0;
+            continue;
+        };
+        for chunk in &snap.chunks {
+            if chunk.offset == 0 {
+                chunks.clear();
+                len = 0;
+            }
+            if chunk.offset != len {
+                return Err(bad(format!(
+                    "checkpoint {} has a chunk at {}, after {len} bytes",
+                    cp.n, chunk.offset
+                )));
+            }
+            len += chunk.len;
+            chunks.push(chunk.clone());
+        }
+        last = Some(snap);
+    }
+    let Some(last) = last else {
+        return Err(bad("the last checkpoint does not list it".into()));
+    };
+    if len != last.len {
+        return Err(bad(format!(
+            "the chunks add up to {len} bytes, and the last checkpoint's entry says {}",
+            last.len
+        )));
+    }
+    Ok((chunks, last))
+}
+
 /// A member's half: the bytes of `path` as of the last of `checkpoints`
-/// (oldest first), from the chunks they name and the blobs `blob` finds. Each
-/// chunk must hash to its name and follow the one before it, and the whole
-/// must hash to the last checkpoint's `hash`. A chunk at offset 0 starts the
-/// file over.
+/// (oldest first), from the chunks they name ([`chunks_of`]) and the blobs
+/// `blob` finds. Each chunk must hash to its name and follow the one before
+/// it, and the whole must hash to the last checkpoint's `hash`.
 pub fn assemble<'a>(
     path: &str,
     checkpoints: impl IntoIterator<Item = &'a Checkpoint>,
@@ -700,46 +778,24 @@ pub fn assemble<'a>(
         path: path.to_string(),
         why,
     };
+    let (chunks, last) = chunks_of(path, checkpoints)?;
+    // Never sized from `len`: it is a member's word, and the blobs may not exist.
     let mut bytes: Vec<u8> = Vec::new();
-    let mut last: Option<&FileSnap> = None;
-    for cp in checkpoints {
-        let Some(snap) = cp.files.iter().find(|f| f.path == path) else {
-            last = None;
-            bytes.clear();
-            continue;
-        };
-        for chunk in &snap.chunks {
-            if chunk.offset == 0 {
-                bytes.clear();
-            }
-            if chunk.offset != bytes.len() as u64 {
-                return Err(bad(format!(
-                    "checkpoint {} has a chunk at {}, after {} bytes",
-                    cp.n,
-                    chunk.offset,
-                    bytes.len()
-                )));
-            }
-            let data = blob(&chunk.hash)
-                .ok_or_else(|| bad(format!("the blob {} is missing", chunk.hash)))?;
-            if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
-                return Err(bad(format!(
-                    "the blob {} is not what was named",
-                    chunk.hash
-                )));
-            }
-            bytes.extend_from_slice(&data);
+    for chunk in &chunks {
+        let data =
+            blob(&chunk.hash).ok_or_else(|| bad(format!("the blob {} is missing", chunk.hash)))?;
+        if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
+            return Err(bad(format!(
+                "the blob {} is not what was named",
+                chunk.hash
+            )));
         }
-        last = Some(snap);
+        bytes.extend_from_slice(&data);
     }
-    let Some(last) = last else {
-        return Err(bad("the last checkpoint does not list it".into()));
-    };
-    if bytes.len() as u64 != last.len || Digest::of(&bytes) != last.hash {
+    if Digest::of(&bytes) != last.hash {
         return Err(bad(format!(
-            "the chunks add up to {} bytes that do not hash to checkpoint {}'s",
-            bytes.len(),
-            last.len
+            "the chunks add up to {} bytes that do not hash to the last checkpoint's",
+            bytes.len()
         )));
     }
     Ok(bytes)
@@ -945,6 +1001,69 @@ mod tests {
             workspace: None,
         });
         assert_eq!(assemble("m", &cps, |d| store.get(d).cloned()).unwrap(), b"");
+    }
+
+    /// P2b-4 — the chunks a target streams are the ones `assemble` joins: from
+    /// the last start-over on, and only since a removed file came back; they
+    /// add up to the last entry, and an entry they do not reach is refused
+    /// before a blob is read.
+    #[test]
+    fn the_chunks_a_target_streams_are_the_ones_assemble_joins() {
+        let mut store = HashMap::new();
+        let (a, ba) = snapshot_append("h", 0, b"one\n", None);
+        let (b, bb) = snapshot_append("h", 0, b"one\ntwo\n", Some((a.len, a.hash)));
+        // Shrank: taken again from its first byte.
+        let (c, bc) = snapshot_append("h", 0, b"new\n", Some((b.len, b.hash)));
+        let (d, bd) = snapshot_append("h", 0, b"new\nmore\n", Some((c.len, c.hash)));
+        for blobs in [ba, bb, bc, bd] {
+            blobs_of(&mut store, blobs);
+        }
+        let cp = |n: u64, files: Vec<FileSnap>| Checkpoint {
+            n,
+            turn: n as u32,
+            files,
+            skipped: vec![],
+            workspace: None,
+        };
+        let chain = [
+            cp(1, vec![a]),
+            cp(2, vec![b]),
+            cp(3, vec![c]),
+            cp(4, vec![d]),
+        ];
+        let (chunks, last) = chunks_of("h", &chain).unwrap();
+        assert_eq!(chunks.iter().map(|c| c.offset).collect::<Vec<_>>(), [0, 4]);
+        assert_eq!(last.len, 9);
+        let streamed: Vec<u8> = chunks.iter().flat_map(|c| store[&c.hash].clone()).collect();
+        assert_eq!(
+            streamed,
+            assemble("h", &chain, |h| store.get(h).cloned()).unwrap()
+        );
+        assert_eq!(streamed, b"new\nmore\n");
+
+        let (back, bback) = snapshot_append("h", 0, b"again\n", None);
+        blobs_of(&mut store, bback);
+        let returned: Vec<Checkpoint> = chain
+            .iter()
+            .cloned()
+            .chain([cp(5, vec![]), cp(6, vec![back])])
+            .collect();
+        let (since, _) = chunks_of("h", &returned).unwrap();
+        assert_eq!(since.len(), 1, "only since it came back");
+        assert_eq!(store[&since[0].hash], b"again\n");
+        assert!(
+            chunks_of("h", &returned[..5]).is_err(),
+            "the last does not list it"
+        );
+        assert!(
+            chunks_of("h", &chain[3..]).is_err(),
+            "a chunk past offset 0 with nothing before it"
+        );
+
+        let mut short = chain[0].clone();
+        short.files[0].len = 99;
+        let e = chunks_of("h", [&short]).unwrap_err();
+        assert!(e.to_string().contains("entry says 99"), "{e}");
     }
 
     /// A member refuses what does not add up: a missing blob, a blob that is
