@@ -11,21 +11,111 @@
 //! ([`crate::chain::check_next`]) inside one transaction with its index row, so
 //! the store can never hold a gap, a broken link or a stale writer's event, and
 //! the index never disagrees with the events.
+//!
+//! # What a member keeps (FR-90 P2a)
+//!
+//! A member that does not run a session keeps the same events, applied as the
+//! primary sent them ([`Store::apply`]), and four things beside them, each in a
+//! table of its own:
+//!
+//! - `floors`: each session's fence floor ([`Store::raise_floor`]), which
+//!   refuses a stale writer before the new primary's first event lands;
+//! - `divergent`: an older fence's tail that a promotion cut off
+//!   ([`Store::set_aside_after`]), the one rewrite the store allows;
+//! - `blobs` and `blob_refs`: content-addressed bytes (a history's chunks, a
+//!   checkpoint's pack), each kept for the sessions that hold it
+//!   ([`Store::put_blob`]);
+//! - `purged`: the ids of sessions purged here, so none is ever taken back
+//!   ([`Store::purge`]).
+//!
+//! ⚠️ They are NEW tables, and `user_version` stays 1. A daemon from before
+//! P2a, which the updater's crash-loop rollback can put back on a device at
+//! any time, opens the file, serves the events it holds and never looks at
+//! them. A new column on `events` would cost it every transcript.
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
-use crate::chain::{ChainError, ChainTip, EventEnvelope, check_next};
+use crate::chain::{ChainError, ChainTip, EventEnvelope, check_next_with_floor};
 use crate::event::TranscriptEvent;
 
 /// The schema this build writes. A newer file is refused rather than written
 /// with an older idea of its shape.
+///
+/// ⚠️ Still 1 with P2a's tables: every daemon before P2a refuses a file whose
+/// version is higher, so raising it would strand a rolled-back daemon's
+/// transcripts. New state goes in new tables instead ([`P2A_TABLES`]).
 const SCHEMA_VERSION: i64 = 1;
+
+/// P0a's tables: all a daemon from before P2a knows. ⚠️ Never change these
+/// statements. A rolled-back daemon runs its own copy of them on this file
+/// (the test `a_daemon_from_before_p2a_reads_what_p2a_wrote`).
+const P0A_TABLES: &str = "CREATE TABLE IF NOT EXISTS events (
+                 session    TEXT    NOT NULL,
+                 seq        INTEGER NOT NULL,
+                 fence      INTEGER NOT NULL,
+                 ts_ms      INTEGER NOT NULL,
+                 prev_hash  BLOB    NOT NULL,
+                 hash       BLOB    NOT NULL,
+                 kind       TEXT,
+                 event_json TEXT    NOT NULL,
+                 PRIMARY KEY (session, seq)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS tips (
+                 session TEXT PRIMARY KEY,
+                 seq     INTEGER NOT NULL,
+                 hash    BLOB    NOT NULL,
+                 fence   INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                 text,
+                 session UNINDEXED,
+                 seq UNINDEXED,
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );";
+
+/// FR-90 P2a: what a member keeps beside its events. Each table is new and
+/// made only when missing, so the file stays one a daemon before P2a opens.
+const P2A_TABLES: &str = "CREATE TABLE IF NOT EXISTS floors (
+                 session TEXT    PRIMARY KEY,
+                 fence   INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS divergent (
+                 session      TEXT    NOT NULL,
+                 seq          INTEGER NOT NULL,
+                 fence        INTEGER NOT NULL,
+                 ts_ms        INTEGER NOT NULL,
+                 prev_hash    BLOB    NOT NULL,
+                 hash         BLOB    NOT NULL,
+                 kind         TEXT,
+                 event_json   TEXT    NOT NULL,
+                 set_aside_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS divergent_session ON divergent (session, seq);
+             CREATE TABLE IF NOT EXISTS blobs (
+                 hash BLOB NOT NULL PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS blob_refs (
+                 session TEXT NOT NULL,
+                 hash    BLOB NOT NULL,
+                 PRIMARY KEY (session, hash)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS blob_refs_hash ON blob_refs (hash);
+             CREATE TABLE IF NOT EXISTS purged (
+                 session   TEXT    PRIMARY KEY,
+                 purged_ms INTEGER NOT NULL
+             ) WITHOUT ROWID;";
 
 /// At most this many sessions per search filter — a view grant names sessions
 /// explicitly, and a filter larger than this is a caller bug.
 pub const MAX_SEARCH_SESSIONS: usize = 500;
+
+/// The most one blob holds. A blob is a chunk (of a history, a pack, a file),
+/// not a whole of any size: the store's one writer holds it in memory and
+/// writes it in one transaction, so a producer chunks anything larger.
+pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -41,6 +131,33 @@ pub enum StoreError {
     CorruptHash { session: String, seq: u64 },
     #[error("a search may name at most {MAX_SEARCH_SESSIONS} sessions, not {0}")]
     TooManySessions(usize),
+    /// P2a: the session was purged here, and removal is final.
+    #[error("session {session} was purged on this device: removal is final")]
+    Purged { session: String },
+    /// P2a: a set-aside needs a floor; without one no fence is older than it.
+    #[error("session {session} has no fence floor: no tail is older than it, so none is set aside")]
+    NoFloor { session: String },
+    /// P2a: the tail holds an event of the floor's fence or a newer one.
+    #[error(
+        "event {seq} of session {session} is of fence {fence}, not older than the floor ({floor}): it is never set aside"
+    )]
+    NotOlderThanFloor {
+        session: String,
+        seq: u64,
+        fence: u64,
+        floor: u64,
+    },
+    /// P2a: a set-aside past what the store holds.
+    #[error("session {session} holds no event {seq} (its tip is {tip})")]
+    NotHeld { session: String, seq: u64, tip: u64 },
+    /// P2a: bytes a peer sent under a name they do not hash to.
+    #[error("bytes that hash to {actual} came as the blob {named}")]
+    BlobMismatch { named: String, actual: String },
+    /// P2a: a stored blob's bytes no longer hash to its name.
+    #[error("the blob {hash} no longer hashes to its name")]
+    CorruptBlob { hash: String },
+    #[error("a blob holds at most {MAX_BLOB_BYTES} bytes, not {0}")]
+    BlobTooLarge(usize),
 }
 
 /// One full-text match.
@@ -50,6 +167,12 @@ pub struct SearchHit {
     pub seq: u64,
     /// The matching text around the hit, with matches wrapped in `[` `]`.
     pub snippet: String,
+}
+
+/// The name a blob is kept under: the BLAKE3 hash of its bytes, as `b3sum`
+/// prints it.
+pub fn blob_hash(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
 }
 
 /// The replica store.
@@ -79,31 +202,8 @@ impl Store {
         if found > SCHEMA_VERSION {
             return Err(StoreError::NewerSchema { found });
         }
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events (
-                 session    TEXT    NOT NULL,
-                 seq        INTEGER NOT NULL,
-                 fence      INTEGER NOT NULL,
-                 ts_ms      INTEGER NOT NULL,
-                 prev_hash  BLOB    NOT NULL,
-                 hash       BLOB    NOT NULL,
-                 kind       TEXT,
-                 event_json TEXT    NOT NULL,
-                 PRIMARY KEY (session, seq)
-             ) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS tips (
-                 session TEXT PRIMARY KEY,
-                 seq     INTEGER NOT NULL,
-                 hash    BLOB    NOT NULL,
-                 fence   INTEGER NOT NULL
-             ) WITHOUT ROWID;
-             CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
-                 text,
-                 session UNINDEXED,
-                 seq UNINDEXED,
-                 tokenize = 'unicode61 remove_diacritics 2'
-             );",
-        )?;
+        conn.execute_batch(P0A_TABLES)?;
+        conn.execute_batch(P2A_TABLES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -131,12 +231,33 @@ impl Store {
         .transpose()
     }
 
-    /// Append one event: checked against the tip, written with its index row
-    /// and the new tip in one transaction.
+    /// Append one of this device's own events: checked against the tip and
+    /// the session's floor, written with its index row and the new tip in one
+    /// transaction. Refused for a purged session.
     pub fn append(&mut self, env: &EventEnvelope) -> Result<ChainTip, StoreError> {
+        self.extend(env)
+    }
+
+    /// FR-90 P2a: apply an event another member sent, exactly as it came.
+    /// Its JSON and its hash are the primary's, never re-wrapped, so this copy
+    /// chains to the same `(seq, hash)` as the primary's own store. The checks
+    /// are [`Self::append`]'s: a gap, a broken link, a fence older than the
+    /// tip's or the floor, or a purged session is refused, and nothing of it
+    /// is kept.
+    pub fn apply(&mut self, env: &EventEnvelope) -> Result<ChainTip, StoreError> {
+        self.extend(env)
+    }
+
+    fn extend(&mut self, env: &EventEnvelope) -> Result<ChainTip, StoreError> {
         let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, &env.session)? {
+            return Err(StoreError::Purged {
+                session: env.session.clone(),
+            });
+        }
         let tip = Self::tip_in(&tx, &env.session)?;
-        check_next(tip, env)?;
+        let floor = Self::floor_in(&tx, &env.session)?;
+        check_next_with_floor(tip, floor, env)?;
         let next = env.tip();
         Self::insert(&tx, env, &next)?;
         tx.commit()?;
@@ -180,6 +301,243 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// FR-90 P2a: the session's fence floor, if the server raised one.
+    pub fn floor(&self, session: &str) -> Result<Option<u64>, StoreError> {
+        Self::floor_in(&self.conn, session)
+    }
+
+    fn floor_in(conn: &Connection, session: &str) -> Result<Option<u64>, StoreError> {
+        let fence: Option<i64> = conn
+            .query_row(
+                "SELECT fence FROM floors WHERE session = ?1",
+                params![session],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(fence.map(|f| f as u64))
+    }
+
+    /// FR-90 P2a: raise the session's fence floor to `fence`, the newest
+    /// fence the server says exists. It is raised before any event of that
+    /// fence exists, so from here on an event of an older fence is refused
+    /// whoever writes it: this device's own append, or one another member
+    /// sends. The floor only rises: the higher of the two is kept and
+    /// returned. Refused for a purged session.
+    pub fn raise_floor(&mut self, session: &str, fence: u64) -> Result<u64, StoreError> {
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        // Compared here, as u64: SQLite would compare the stored i64s.
+        let floor = Self::floor_in(&tx, session)?.map_or(fence, |f| f.max(fence));
+        tx.execute(
+            "INSERT INTO floors (session, fence) VALUES (?1, ?2)
+             ON CONFLICT(session) DO UPDATE SET fence = ?2",
+            params![session, floor as i64],
+        )?;
+        tx.commit()?;
+        Ok(floor)
+    }
+
+    /// FR-90 P2a: set aside the tail a promotion cut off. The events after
+    /// `seq` leave `events` and the index for the `divergent` table, kept as
+    /// they were, and the event at `seq` is the tip again (`seq` 0 leaves the
+    /// session with no events). Returns how many moved.
+    ///
+    /// ⚠️ This is the only rewrite the store allows, and only of an OLDER
+    /// fence's tail: every event after `seq` must be of a fence below the
+    /// session's floor. One of the floor's fence or a newer one is the
+    /// current primary's and is never set aside; the call is refused and
+    /// nothing moves. Without a floor no fence is older than it, so nothing
+    /// is set aside either. Refused for a purged session.
+    pub fn set_aside_after(&mut self, session: &str, seq: u64) -> Result<u64, StoreError> {
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        let tip = Self::tip_in(&tx, session)?.map_or(0, |t| t.seq);
+        if seq > tip {
+            return Err(StoreError::NotHeld {
+                session: session.to_string(),
+                seq,
+                tip,
+            });
+        }
+        if seq == tip {
+            return Ok(0);
+        }
+        let Some(floor) = Self::floor_in(&tx, session)? else {
+            return Err(StoreError::NoFloor {
+                session: session.to_string(),
+            });
+        };
+        // Every fence of the tail, compared here, as u64.
+        let first_not_older = {
+            let mut stmt = tx.prepare(
+                "SELECT seq, fence FROM events WHERE session = ?1 AND seq > ?2 ORDER BY seq",
+            )?;
+            let rows = stmt.query_map(params![session, seq as i64], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            })?;
+            let mut found = None;
+            for row in rows {
+                let (at, fence) = row?;
+                if fence >= floor {
+                    found = Some((at, fence));
+                    break;
+                }
+            }
+            found
+        };
+        if let Some((at, fence)) = first_not_older {
+            return Err(StoreError::NotOlderThanFloor {
+                session: session.to_string(),
+                seq: at,
+                fence,
+                floor,
+            });
+        }
+        let moved = tx.execute(
+            "INSERT INTO divergent
+                 (session, seq, fence, ts_ms, prev_hash, hash, kind, event_json, set_aside_ms)
+             SELECT session, seq, fence, ts_ms, prev_hash, hash, kind, event_json, ?3
+             FROM events WHERE session = ?1 AND seq > ?2",
+            params![session, seq as i64, now_ms()],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE session = ?1 AND seq > ?2",
+            params![session, seq as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM events_fts WHERE session = ?1 AND seq > ?2",
+            params![session, seq as i64],
+        )?;
+        if seq == 0 {
+            tx.execute("DELETE FROM tips WHERE session = ?1", params![session])?;
+        } else {
+            let (hash, fence): (Vec<u8>, i64) = tx.query_row(
+                "SELECT hash, fence FROM events WHERE session = ?1 AND seq = ?2",
+                params![session, seq as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let hash = to_hash(&hash, session, seq)?;
+            tx.execute(
+                "UPDATE tips SET seq = ?2, hash = ?3, fence = ?4 WHERE session = ?1",
+                params![session, seq as i64, hash.as_slice(), fence],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved as u64)
+    }
+
+    /// FR-90 P2a: keep `bytes` as a blob of `session`, named by their BLAKE3
+    /// hash, which is returned. Bytes another session already holds are
+    /// stored once. Refused for a purged session.
+    pub fn put_blob(&mut self, session: &str, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+        self.keep_blob(session, bytes, None)
+    }
+
+    /// FR-90 P2a: keep bytes a peer sent as the blob `hash`. Refused unless
+    /// they hash to it, and then nothing is kept under either name: what a
+    /// name holds here is always what the name says.
+    pub fn put_named_blob(
+        &mut self,
+        session: &str,
+        hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.keep_blob(session, bytes, Some(hash)).map(|_| ())
+    }
+
+    /// The one way a blob is written: its name is computed here, from the
+    /// bytes, whatever name it came under.
+    fn keep_blob(
+        &mut self,
+        session: &str,
+        bytes: &[u8],
+        named: Option<&[u8; 32]>,
+    ) -> Result<[u8; 32], StoreError> {
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(StoreError::BlobTooLarge(bytes.len()));
+        }
+        let hash = blob_hash(bytes);
+        if let Some(named) = named
+            && *named != hash
+        {
+            return Err(StoreError::BlobMismatch {
+                named: hex(named),
+                actual: hex(&hash),
+            });
+        }
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        // Already here and intact: kept as it is. Here but not these bytes
+        // (damaged on disk): replaced by bytes that do hash to its name.
+        let held: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT data FROM blobs WHERE hash = ?1",
+                params![hash.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if held.as_deref() != Some(bytes) {
+            tx.execute(
+                "INSERT INTO blobs (hash, data) VALUES (?1, ?2)
+                 ON CONFLICT(hash) DO UPDATE SET data = excluded.data",
+                params![hash.as_slice(), bytes],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO blob_refs (session, hash) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![session, hash.as_slice()],
+        )?;
+        tx.commit()?;
+        Ok(hash)
+    }
+
+    /// FR-90 P2a: the blob `hash`, if `session` holds it. A blob another
+    /// session holds is not this one's to read. Checked as it is read: bytes
+    /// that no longer hash to their name are an error, never handed out.
+    pub fn get_blob(&self, session: &str, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT b.data FROM blob_refs r JOIN blobs b ON b.hash = r.hash
+                 WHERE r.session = ?1 AND r.hash = ?2",
+                params![session, hash.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match data {
+            Some(bytes) if blob_hash(&bytes) != *hash => {
+                Err(StoreError::CorruptBlob { hash: hex(hash) })
+            }
+            data => Ok(data),
+        }
+    }
+
+    /// FR-90 P2a: whether `session` holds the blob `hash`.
+    pub fn has_blob(&self, session: &str, hash: &[u8; 32]) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM blob_refs r JOIN blobs b ON b.hash = r.hash
+                 WHERE r.session = ?1 AND r.hash = ?2",
+                params![session, hash.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Events of `session` after `after_seq`, oldest first, at most `limit`.
@@ -270,17 +628,52 @@ impl Store {
     }
 
     /// Delete everything this store holds for `session` — the purge a tombstone
-    /// orders. Returns how many events were removed.
+    /// orders — and keep its id, with when (FR-90 P2a). From then on an
+    /// append, an apply, a floor, a set-aside or a blob for it is refused
+    /// (`purged`), so a member that comes back with an old stream cannot bring
+    /// it back. Returns how many events were removed, set-aside ones included.
+    ///
+    /// A blob goes with the last session that holds it; one another session
+    /// holds too stays.
     pub fn purge(&mut self, session: &str) -> Result<u64, StoreError> {
         let tx = self.conn.transaction()?;
         let n = tx.execute("DELETE FROM events WHERE session = ?1", params![session])?;
+        let set_aside = tx.execute("DELETE FROM divergent WHERE session = ?1", params![session])?;
         tx.execute(
             "DELETE FROM events_fts WHERE session = ?1",
             params![session],
         )?;
         tx.execute("DELETE FROM tips WHERE session = ?1", params![session])?;
+        tx.execute("DELETE FROM floors WHERE session = ?1", params![session])?;
+        tx.execute(
+            "DELETE FROM blobs WHERE hash IN (SELECT hash FROM blob_refs WHERE session = ?1)
+               AND hash NOT IN (SELECT hash FROM blob_refs WHERE session <> ?1)",
+            params![session],
+        )?;
+        tx.execute("DELETE FROM blob_refs WHERE session = ?1", params![session])?;
+        // The first purge's time is kept; a repeated one changes nothing.
+        tx.execute(
+            "INSERT INTO purged (session, purged_ms) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![session, now_ms()],
+        )?;
         tx.commit()?;
-        Ok(n as u64)
+        Ok((n + set_aside) as u64)
+    }
+
+    /// FR-90 P2a: whether `session` was purged here.
+    pub fn is_purged(&self, session: &str) -> Result<bool, StoreError> {
+        Self::purged_in(&self.conn, session)
+    }
+
+    fn purged_in(conn: &Connection, session: &str) -> Result<bool, StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM purged WHERE session = ?1",
+                params![session],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Every session this store holds, with its tip.
@@ -318,6 +711,17 @@ fn to_hash(raw: &[u8], session: &str, seq: u64) -> Result<[u8; 32], StoreError> 
         session: session.to_string(),
         seq,
     })
+}
+
+fn hex(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// Plain words → an FTS5 query: every whitespace-separated word becomes a quoted
@@ -474,5 +878,688 @@ mod tests {
             Store::open(&path),
             Err(StoreError::NewerSchema { .. })
         ));
+    }
+
+    // ---- FR-90 P2a: the member's store ----
+
+    /// The primary's envelopes for `texts`, under `fence`, after `tip`: what a
+    /// member is sent.
+    fn sent(
+        session: &str,
+        mut tip: Option<ChainTip>,
+        fence: u64,
+        texts: &[&str],
+    ) -> Vec<EventEnvelope> {
+        let mut out = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            let env = EventEnvelope::next(session, tip, fence, 1_000 + i as i64, &ev(t));
+            tip = Some(env.tip());
+            out.push(env);
+        }
+        out
+    }
+
+    fn apply_all(store: &mut Store, envs: &[EventEnvelope]) -> ChainTip {
+        let mut tip = None;
+        for env in envs {
+            tip = Some(store.apply(env).unwrap());
+        }
+        tip.expect("at least one envelope")
+    }
+
+    fn count(s: &Store, sql: &str) -> i64 {
+        s.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn an_applied_envelope_is_kept_exactly_as_it_came() {
+        // The primary's own store, and its first event as it would be sent:
+        // an odd key order and spacing, and the primary's clock.
+        let mut primary = Store::open_in_memory().unwrap();
+        let first = EventEnvelope {
+            session: "s1".into(),
+            seq: 1,
+            fence: 1,
+            ts_ms: 42,
+            prev_hash: GENESIS,
+            event_json: r#"{"text":"kept as sent" ,  "kind":"note"}"#.into(),
+        };
+        primary.append(&first).unwrap();
+        append_all(&mut primary, "s1", 1, &["two", "three"]);
+        let envs = primary.page("s1", 0, 10).unwrap();
+
+        let mut member = Store::open_in_memory().unwrap();
+        let tip = apply_all(&mut member, &envs);
+        assert_eq!(member.page("s1", 0, 10).unwrap(), envs, "byte for byte");
+        assert_eq!(
+            tip,
+            primary.tip("s1").unwrap().unwrap(),
+            "the same (seq, hash)"
+        );
+        assert_eq!(tip.hash, envs[2].hash());
+        // Indexed as it would be on the primary.
+        assert_eq!(member.search("kept", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_refuses_a_gap_a_broken_link_and_a_stale_fence() {
+        let mut s = Store::open_in_memory().unwrap();
+        let tip = apply_all(&mut s, &sent("s1", None, 3, &["a", "b"]));
+
+        let mut gap = sent("s1", Some(tip), 3, &["ghostgap"]).remove(0);
+        gap.seq = 4;
+        assert!(matches!(
+            s.apply(&gap),
+            Err(StoreError::Chain(ChainError::Gap {
+                expected: 3,
+                got: 4
+            }))
+        ));
+
+        let mut broken = sent("s1", Some(tip), 3, &["ghostbroken"]).remove(0);
+        broken.prev_hash = [7; 32];
+        assert!(matches!(
+            s.apply(&broken),
+            Err(StoreError::Chain(ChainError::Broken { seq: 3 }))
+        ));
+
+        let stale = sent("s1", Some(tip), 2, &["ghoststale"]).remove(0);
+        assert!(matches!(
+            s.apply(&stale),
+            Err(StoreError::Chain(ChainError::StaleFence {
+                current: 3,
+                got: 2
+            }))
+        ));
+
+        assert_eq!(s.tip("s1").unwrap(), Some(tip), "the tip did not move");
+        assert_eq!(s.page("s1", 0, 10).unwrap().len(), 2);
+        for word in ["ghostgap", "ghostbroken", "ghoststale"] {
+            assert!(s.search(word, None, 10).unwrap().is_empty(), "{word}");
+        }
+    }
+
+    #[test]
+    fn the_floor_refuses_an_older_fence_from_an_apply_and_from_an_append() {
+        let mut s = Store::open_in_memory().unwrap();
+        let tip = apply_all(&mut s, &sent("s1", None, 1, &["one", "two"]));
+        assert_eq!(s.raise_floor("s1", 2).unwrap(), 2);
+
+        // The old primary's next event: fence 1 still follows the tip's, but
+        // not the floor.
+        let late = sent("s1", Some(tip), 1, &["latecomer"]).remove(0);
+        assert!(matches!(
+            s.apply(&late),
+            Err(StoreError::Chain(ChainError::StaleFence {
+                current: 2,
+                got: 1
+            }))
+        ));
+        // This device's own event at the old fence: the same.
+        assert!(matches!(
+            s.append(&late),
+            Err(StoreError::Chain(ChainError::StaleFence {
+                current: 2,
+                got: 1
+            }))
+        ));
+        assert_eq!(s.tip("s1").unwrap(), Some(tip));
+        assert!(s.search("latecomer", None, 10).unwrap().is_empty());
+
+        // The new primary's first event continues the chain.
+        let next = sent("s1", Some(tip), 2, &["resumed"]).remove(0);
+        assert_eq!(s.apply(&next).unwrap().seq, 3);
+    }
+
+    #[test]
+    fn a_floor_raised_before_any_event_holds_for_the_first() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.raise_floor("s1", 3).unwrap();
+        let at_2 = sent("s1", None, 2, &["early"]).remove(0);
+        assert!(matches!(
+            s.apply(&at_2),
+            Err(StoreError::Chain(ChainError::StaleFence {
+                current: 3,
+                got: 2
+            }))
+        ));
+        let at_3 = sent("s1", None, 3, &["first"]).remove(0);
+        assert_eq!(s.apply(&at_3).unwrap().seq, 1);
+    }
+
+    #[test]
+    fn the_floor_only_rises() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(s.floor("s1").unwrap(), None);
+        assert_eq!(s.raise_floor("s1", 3).unwrap(), 3);
+        assert_eq!(s.raise_floor("s1", 2).unwrap(), 3, "a lower word keeps it");
+        assert_eq!(s.floor("s1").unwrap(), Some(3));
+        assert_eq!(s.raise_floor("s1", 5).unwrap(), 5);
+        assert_eq!(s.floor("s2").unwrap(), None, "per session");
+    }
+
+    #[test]
+    fn a_purged_session_is_refused_with_purged_and_cannot_come_back() {
+        let mut s = Store::open_in_memory().unwrap();
+        let envs = sent("s1", None, 1, &["one", "two", "three"]);
+        apply_all(&mut s, &envs[..2]);
+        s.purge("s1").unwrap();
+        assert!(s.is_purged("s1").unwrap());
+        assert!(!s.is_purged("s2").unwrap());
+
+        let purged = |r: Result<_, StoreError>| matches!(r, Err(StoreError::Purged { .. }));
+        // The stream it had, resumed where it stopped, or replayed from the start.
+        assert!(purged(s.apply(&envs[2]).map(|_| ())));
+        assert!(purged(s.apply(&envs[0]).map(|_| ())));
+        // The device's own append, a floor, a set-aside, a blob.
+        let own = EventEnvelope::next("s1", None, 1, 0, &ev("own"));
+        assert!(purged(s.append(&own).map(|_| ())));
+        assert!(purged(s.raise_floor("s1", 2).map(|_| ())));
+        assert!(purged(s.set_aside_after("s1", 0).map(|_| ())));
+        assert!(purged(s.put_blob("s1", b"chunk").map(|_| ())));
+        assert!(purged(s.put_named_blob(
+            "s1",
+            &blob_hash(b"chunk"),
+            b"chunk"
+        )));
+
+        assert_eq!(s.tip("s1").unwrap(), None, "nothing came back");
+        assert!(s.page("s1", 0, 10).unwrap().is_empty());
+        assert!(s.sessions().unwrap().is_empty());
+        assert_eq!(s.floor("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn purge_keeps_the_id_and_when_and_removes_all_the_session_held() {
+        let mut s = Store::open_in_memory().unwrap();
+        apply_all(&mut s, &sent("s1", None, 1, &["one", "two", "cutword"]));
+        s.raise_floor("s1", 2).unwrap();
+        assert_eq!(s.set_aside_after("s1", 2).unwrap(), 1);
+        let only_mine = s.put_blob("s1", b"s1 alone").unwrap();
+        let shared = s.put_blob("s1", b"both").unwrap();
+        append_all(&mut s, "s2", 1, &["other"]);
+        s.put_blob("s2", b"both").unwrap();
+
+        assert_eq!(s.purge("s1").unwrap(), 3, "two events and one set aside");
+        let when: i64 = s
+            .conn
+            .query_row(
+                "SELECT purged_ms FROM purged WHERE session = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(when > 1_700_000_000_000, "{when}");
+        for table in ["events", "divergent", "tips", "floors", "blob_refs"] {
+            assert_eq!(
+                count(
+                    &s,
+                    &format!("SELECT count(*) FROM {table} WHERE session = 's1'")
+                ),
+                0,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM events_fts WHERE session = 's1'"),
+            0
+        );
+        // A blob only s1 held is gone; one s2 holds too stays, for s2.
+        assert!(!s.has_blob("s1", &only_mine).unwrap());
+        assert!(!s.has_blob("s1", &shared).unwrap());
+        assert!(s.has_blob("s2", &shared).unwrap());
+        assert_eq!(count(&s, "SELECT count(*) FROM blobs"), 1);
+        assert_eq!(s.tip("s2").unwrap().map(|t| t.seq), Some(1));
+
+        // Purging again changes nothing, and keeps the first time.
+        assert_eq!(s.purge("s1").unwrap(), 0);
+        let again: i64 = s
+            .conn
+            .query_row(
+                "SELECT purged_ms FROM purged WHERE session = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, when);
+    }
+
+    #[test]
+    fn an_older_fences_tail_is_set_aside_and_the_chain_goes_on_at_the_floor() {
+        let mut s = Store::open_in_memory().unwrap();
+        let envs = sent(
+            "s1",
+            None,
+            1,
+            &["one", "two", "three", "cutfour", "cutfive"],
+        );
+        apply_all(&mut s, &envs);
+        s.raise_floor("s1", 2).unwrap();
+
+        assert_eq!(s.set_aside_after("s1", 3).unwrap(), 2);
+        let tip = s.tip("s1").unwrap().unwrap();
+        assert_eq!(tip, envs[2].tip(), "the event at seq 3 is the tip again");
+        assert_eq!(s.page("s1", 0, 10).unwrap(), envs[..3].to_vec());
+        assert!(s.search("cutfour", None, 10).unwrap().is_empty());
+        assert!(s.search("cutfive", None, 10).unwrap().is_empty());
+
+        // The tail is kept as it was.
+        let kept: Vec<(i64, i64, Vec<u8>, String)> = s
+            .conn
+            .prepare("SELECT seq, fence, hash, event_json FROM divergent WHERE session = 's1' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        for ((seq, fence, hash, json), env) in kept.iter().zip(&envs[3..]) {
+            assert_eq!(*seq as u64, env.seq);
+            assert_eq!(*fence as u64, env.fence);
+            assert_eq!(hash.as_slice(), env.hash().as_slice());
+            assert_eq!(json, &env.event_json);
+        }
+
+        // The new primary's events continue from seq 3, at the floor's fence.
+        let after = sent("s1", Some(tip), 2, &["newfour"]);
+        assert_eq!(s.apply(&after[0]).unwrap().seq, 4);
+        assert_eq!(s.search("newfour", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_tail_of_the_floors_fence_is_never_set_aside() {
+        let mut s = Store::open_in_memory().unwrap();
+        let old = sent("s1", None, 1, &["one", "two"]);
+        let tip = apply_all(&mut s, &old);
+        s.raise_floor("s1", 2).unwrap();
+        // The current primary's events, at the floor's fence.
+        apply_all(&mut s, &sent("s1", Some(tip), 2, &["three", "fourword"]));
+
+        assert!(matches!(
+            s.set_aside_after("s1", 1),
+            Err(StoreError::NotOlderThanFloor {
+                seq: 3,
+                fence: 2,
+                floor: 2,
+                ..
+            })
+        ));
+        // Nothing moved.
+        assert_eq!(s.tip("s1").unwrap().map(|t| t.seq), Some(4));
+        assert_eq!(s.page("s1", 0, 10).unwrap().len(), 4);
+        assert_eq!(count(&s, "SELECT count(*) FROM divergent"), 0);
+        assert_eq!(s.search("fourword", None, 10).unwrap().len(), 1);
+        // A fence newer than the floor is the current primary's too.
+        let mut t = Store::open_in_memory().unwrap();
+        let tip = apply_all(&mut t, &sent("s1", None, 1, &["one"]));
+        t.raise_floor("s1", 2).unwrap();
+        apply_all(&mut t, &sent("s1", Some(tip), 3, &["newer"]));
+        assert!(matches!(
+            t.set_aside_after("s1", 1),
+            Err(StoreError::NotOlderThanFloor {
+                seq: 2,
+                fence: 3,
+                floor: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn nothing_is_set_aside_without_a_floor_or_past_the_tip() {
+        let mut s = Store::open_in_memory().unwrap();
+        apply_all(&mut s, &sent("s1", None, 1, &["one", "two"]));
+        assert!(matches!(
+            s.set_aside_after("s1", 1),
+            Err(StoreError::NoFloor { .. })
+        ));
+        s.raise_floor("s1", 2).unwrap();
+        assert!(matches!(
+            s.set_aside_after("s1", 3),
+            Err(StoreError::NotHeld { seq: 3, tip: 2, .. })
+        ));
+        assert_eq!(
+            s.set_aside_after("s1", 2).unwrap(),
+            0,
+            "nothing after the tip"
+        );
+        assert_eq!(s.tip("s1").unwrap().map(|t| t.seq), Some(2));
+    }
+
+    #[test]
+    fn setting_aside_from_zero_leaves_no_events_and_a_chain_from_genesis() {
+        let mut s = Store::open_in_memory().unwrap();
+        apply_all(&mut s, &sent("s1", None, 1, &["one", "two"]));
+        s.raise_floor("s1", 2).unwrap();
+        assert_eq!(s.set_aside_after("s1", 0).unwrap(), 2);
+        assert_eq!(s.tip("s1").unwrap(), None);
+        assert!(s.sessions().unwrap().is_empty());
+        let fresh = sent("s1", None, 2, &["first again"]).remove(0);
+        assert_eq!(fresh.prev_hash, GENESIS);
+        assert_eq!(s.apply(&fresh).unwrap().seq, 1);
+    }
+
+    #[test]
+    fn a_blob_round_trips_under_its_blake3_name() {
+        let mut s = Store::open_in_memory().unwrap();
+        let bytes = b"a chunk of a session's history".to_vec();
+        let hash = s.put_blob("s1", &bytes).unwrap();
+        assert_eq!(hash, *blake3::hash(&bytes).as_bytes());
+        assert!(s.has_blob("s1", &hash).unwrap());
+        assert_eq!(s.get_blob("s1", &hash).unwrap(), Some(bytes.clone()));
+        // The same bytes sent by a peer under their own name: kept, once.
+        s.put_named_blob("s1", &hash, &bytes).unwrap();
+        assert_eq!(count(&s, "SELECT count(*) FROM blobs"), 1);
+        // An empty blob is a blob.
+        let empty = s.put_blob("s1", b"").unwrap();
+        assert_eq!(s.get_blob("s1", &empty).unwrap(), Some(Vec::new()));
+        // Absent is absent.
+        assert_eq!(s.get_blob("s1", &[9; 32]).unwrap(), None);
+        assert!(!s.has_blob("s1", &[9; 32]).unwrap());
+    }
+
+    #[test]
+    fn a_blob_that_does_not_hash_to_its_name_is_never_stored() {
+        let mut s = Store::open_in_memory().unwrap();
+        let bytes = b"what the peer sent";
+        let named = blob_hash(b"what the event names");
+        let err = s.put_named_blob("s1", &named, bytes).unwrap_err();
+        assert!(matches!(err, StoreError::BlobMismatch { .. }), "{err}");
+        // Under neither name.
+        assert!(!s.has_blob("s1", &named).unwrap());
+        assert!(!s.has_blob("s1", &blob_hash(bytes)).unwrap());
+        assert_eq!(count(&s, "SELECT count(*) FROM blobs"), 0);
+        assert_eq!(count(&s, "SELECT count(*) FROM blob_refs"), 0);
+    }
+
+    #[test]
+    fn a_tampered_blob_is_refused_when_read_and_mended_by_its_bytes() {
+        let mut s = Store::open_in_memory().unwrap();
+        let bytes = b"checkpoint pack".to_vec();
+        let hash = s.put_blob("s1", &bytes).unwrap();
+        s.conn
+            .execute(
+                "UPDATE blobs SET data = ?1 WHERE hash = ?2",
+                params![b"checkpoint pAck".as_slice(), hash.as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            s.get_blob("s1", &hash),
+            Err(StoreError::CorruptBlob { .. })
+        ));
+        // The right bytes, put again, mend it.
+        s.put_blob("s1", &bytes).unwrap();
+        assert_eq!(s.get_blob("s1", &hash).unwrap(), Some(bytes));
+    }
+
+    #[test]
+    fn a_blob_is_read_only_by_the_sessions_that_hold_it() {
+        let mut s = Store::open_in_memory().unwrap();
+        let hash = s.put_blob("s1", b"s1's history").unwrap();
+        assert!(!s.has_blob("s2", &hash).unwrap());
+        assert_eq!(s.get_blob("s2", &hash).unwrap(), None);
+        s.put_blob("s2", b"s1's history").unwrap();
+        assert!(s.has_blob("s2", &hash).unwrap());
+        assert_eq!(count(&s, "SELECT count(*) FROM blobs"), 1, "stored once");
+    }
+
+    #[test]
+    fn a_blob_over_the_limit_is_refused() {
+        let mut s = Store::open_in_memory().unwrap();
+        let big = vec![0u8; MAX_BLOB_BYTES + 1];
+        assert!(matches!(
+            s.put_blob("s1", &big),
+            Err(StoreError::BlobTooLarge(n)) if n == MAX_BLOB_BYTES + 1
+        ));
+        assert_eq!(count(&s, "SELECT count(*) FROM blobs"), 0);
+    }
+
+    /// What a daemon from before P2a runs on the store it opens: P0a's own
+    /// statements (`8e41174ed`, the only schema a released daemon wrote),
+    /// verbatim. ⚠️ Frozen on purpose: a rolled-back daemon runs ITS copy,
+    /// not this build's, so never edit these to match the current code.
+    mod p0a {
+        use super::*;
+
+        const INIT: &str = "CREATE TABLE IF NOT EXISTS events (
+                 session    TEXT    NOT NULL,
+                 seq        INTEGER NOT NULL,
+                 fence      INTEGER NOT NULL,
+                 ts_ms      INTEGER NOT NULL,
+                 prev_hash  BLOB    NOT NULL,
+                 hash       BLOB    NOT NULL,
+                 kind       TEXT,
+                 event_json TEXT    NOT NULL,
+                 PRIMARY KEY (session, seq)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS tips (
+                 session TEXT PRIMARY KEY,
+                 seq     INTEGER NOT NULL,
+                 hash    BLOB    NOT NULL,
+                 fence   INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                 text,
+                 session UNINDEXED,
+                 seq UNINDEXED,
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );";
+
+        /// P0a's `Store::open`: refuse a newer schema, make its tables, mark
+        /// the file as schema 1.
+        pub fn open(path: &Path) -> Connection {
+            let conn = Connection::open(path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+            let found: i64 = conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert!(
+                found <= 1,
+                "a daemon from before P2a refuses schema {found}"
+            );
+            conn.execute_batch(INIT).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn
+        }
+
+        pub fn tip(conn: &Connection, session: &str) -> Option<ChainTip> {
+            conn.query_row(
+                "SELECT seq, hash, fence FROM tips WHERE session = ?1",
+                params![session],
+                |r| {
+                    Ok(ChainTip {
+                        seq: r.get::<_, i64>(0)? as u64,
+                        hash: r.get::<_, Vec<u8>>(1)?.try_into().unwrap(),
+                        fence: r.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .unwrap()
+        }
+
+        pub fn page(conn: &Connection, session: &str) -> Vec<EventEnvelope> {
+            conn.prepare(
+                "SELECT seq, fence, ts_ms, prev_hash, event_json FROM events
+             WHERE session = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            )
+            .unwrap()
+            .query_map(params![session, 0i64, 1_000i64], |r| {
+                Ok(EventEnvelope {
+                    session: session.to_string(),
+                    seq: r.get::<_, i64>(0)? as u64,
+                    fence: r.get::<_, i64>(1)? as u64,
+                    ts_ms: r.get(2)?,
+                    prev_hash: r.get::<_, Vec<u8>>(3)?.try_into().unwrap(),
+                    event_json: r.get(4)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        }
+
+        pub fn search(conn: &Connection, word: &str) -> Vec<(String, u64)> {
+            conn.prepare(
+                "SELECT session, seq, snippet(events_fts, 0, '[', ']', '…', 12)
+             FROM events_fts WHERE events_fts MATCH ?1 ORDER BY rank LIMIT 100",
+            )
+            .unwrap()
+            .query_map(params![format!("\"{word}\"")], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        }
+
+        /// P0a's `Store::append`: the tip's check, then the three writes.
+        pub fn append(conn: &mut Connection, env: &EventEnvelope) {
+            let tx = conn.transaction().unwrap();
+            let tip = tip(&tx, &env.session);
+            crate::chain::check_next(tip, env).unwrap();
+            let next = env.tip();
+            let event = env.event();
+            tx.execute(
+                "INSERT INTO events (session, seq, fence, ts_ms, prev_hash, hash, kind, event_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    env.session,
+                    env.seq as i64,
+                    env.fence as i64,
+                    env.ts_ms,
+                    env.prev_hash.as_slice(),
+                    next.hash.as_slice(),
+                    event.as_ref().map(TranscriptEvent::kind),
+                    env.event_json,
+                ],
+            )
+            .unwrap();
+            if let Some(text) = event.as_ref().and_then(TranscriptEvent::search_text) {
+                tx.execute(
+                    "INSERT INTO events_fts (text, session, seq) VALUES (?1, ?2, ?3)",
+                    params![text, env.session, env.seq as i64],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO tips (session, seq, hash, fence) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session) DO UPDATE SET seq = ?2, hash = ?3, fence = ?4",
+                params![
+                    env.session,
+                    next.seq as i64,
+                    next.hash.as_slice(),
+                    next.fence as i64
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+    }
+
+    /// The updater's crash-loop rollback puts a daemon from before P2a back on
+    /// a device whose store P2a wrote: a floor, a set-aside tail, a blob, a
+    /// purged session. It must open the file, serve every event it holds,
+    /// keep appending, and see none of the rest; and the next P2a daemon must
+    /// find all of it again.
+    #[test]
+    fn a_daemon_from_before_p2a_reads_what_p2a_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let blob;
+        {
+            let mut s = Store::open(&path).unwrap();
+            let old = sent("s1", None, 1, &["alpha", "bravo", "charlie", "stalefour"]);
+            apply_all(&mut s, &old);
+            s.raise_floor("s1", 2).unwrap();
+            assert_eq!(s.set_aside_after("s1", 3).unwrap(), 1);
+            apply_all(&mut s, &sent("s1", Some(old[2].tip()), 2, &["newfour"]));
+            blob = s.put_blob("s1", b"a history chunk").unwrap();
+            append_all(&mut s, "s2", 1, &["purgeword"]);
+            s.purge("s2").unwrap();
+        }
+
+        // The rolled-back daemon.
+        {
+            let mut old = p0a::open(&path);
+            let events = p0a::page(&old, "s1");
+            assert_eq!(events.len(), 4);
+            let mut tip = None;
+            for env in &events {
+                crate::chain::check_next(tip, env).expect("a whole chain");
+                tip = Some(env.tip());
+            }
+            assert_eq!(p0a::tip(&old, "s1"), tip, "its tip is the chain's end");
+            assert_eq!(tip.map(|t| (t.seq, t.fence)), Some((4, 2)));
+            assert_eq!(p0a::search(&old, "newfour"), vec![("s1".to_string(), 4)]);
+            assert!(
+                p0a::search(&old, "stalefour").is_empty(),
+                "no stale index row"
+            );
+            assert!(p0a::search(&old, "purgeword").is_empty());
+            assert_eq!(p0a::tip(&old, "s2"), None);
+            // It keeps running its session.
+            let fifth = EventEnvelope::next("s1", tip, 2, 5, &ev("fifthword"));
+            p0a::append(&mut old, &fifth);
+            assert_eq!(p0a::search(&old, "fifthword").len(), 1);
+        }
+
+        // The next P2a daemon finds everything again.
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.tip("s1").unwrap().map(|t| t.seq), Some(5));
+        assert_eq!(s.page("s1", 0, 10).unwrap().len(), 5);
+        assert_eq!(s.floor("s1").unwrap(), Some(2));
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM divergent WHERE session = 's1'"),
+            1
+        );
+        assert_eq!(
+            s.get_blob("s1", &blob).unwrap(),
+            Some(b"a history chunk".to_vec())
+        );
+        assert!(s.is_purged("s2").unwrap());
+        let replay = sent("s2", None, 1, &["purgeword"]).remove(0);
+        assert!(matches!(s.apply(&replay), Err(StoreError::Purged { .. })));
+        let user_version: i64 = s
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, 1);
+    }
+
+    /// The other way: a device's P1 store, made by a daemon from before P2a,
+    /// opens under P2a with every event, gains the new tables, and its
+    /// sessions go on.
+    #[test]
+    fn a_store_from_before_p2a_opens_and_gains_the_new_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let mut tip = None;
+        {
+            let mut old = p0a::open(&path);
+            for (i, word) in ["oldone", "oldtwo"].iter().enumerate() {
+                let env = EventEnvelope::next("s1", tip, 1, i as i64, &ev(word));
+                p0a::append(&mut old, &env);
+                tip = Some(env.tip());
+            }
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.tip("s1").unwrap(), tip);
+        assert_eq!(s.page("s1", 0, 10).unwrap().len(), 2);
+        assert_eq!(s.search("oldtwo", None, 10).unwrap().len(), 1);
+        for table in ["floors", "divergent", "blobs", "blob_refs", "purged"] {
+            assert_eq!(
+                count(
+                    &s,
+                    &format!(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+                    )
+                ),
+                1,
+                "{table}"
+            );
+        }
+        assert_eq!(append_all(&mut s, "s1", 1, &["newthree"]).seq, 3);
     }
 }

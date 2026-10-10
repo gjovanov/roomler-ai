@@ -9,7 +9,9 @@
 //!
 //! - **One writer.** A member refuses an event whose fence is older than the
 //!   newest fence it has seen, so a partitioned old primary cannot append after
-//!   a promotion moved the lease (`fence + 1`).
+//!   a promotion moved the lease (`fence + 1`). The newest fence seen is the
+//!   tip's, or the session's floor when the server raised one first
+//!   ([`check_next_with_floor`], FR-90 P2a).
 //! - **No holes.** An event is accepted only as the direct successor of the
 //!   member's tip.
 //! - **Provable sameness.** Two members holding the same `(seq, hash)` hold the
@@ -111,7 +113,8 @@ fn put(h: &mut blake3::Hasher, bytes: &[u8]) {
 pub struct ChainTip {
     pub seq: u64,
     pub hash: [u8; 32],
-    /// The newest fence seen — an event with an older one is refused.
+    /// The fence of the event at `seq` — an event with an older one is
+    /// refused. A session's floor ([`check_next_with_floor`]) can be newer.
     pub fence: u64,
 }
 
@@ -163,6 +166,33 @@ pub fn check_next(tip: Option<ChainTip>, next: &EventEnvelope) -> Result<(), Cha
             Ok(())
         }
     }
+}
+
+/// FR-90 P2a — [`check_next`], with the session's fence FLOOR as well: the
+/// newest fence the server has said exists, raised before any event of that
+/// fence does. The tip's fence moves only when an event lands, so without a
+/// floor a member keeps taking a stale writer's late events until the new
+/// primary's first one arrives; with it, an event of a fence older than the
+/// floor is refused at once, and for a session this member holds nothing of
+/// yet. `None` is no floor, and then this is exactly [`check_next`].
+///
+/// The floor is checked first, against the newer of it and the tip's fence,
+/// for the reason [`check_next`] checks the fence first.
+pub fn check_next_with_floor(
+    tip: Option<ChainTip>,
+    floor: Option<u64>,
+    next: &EventEnvelope,
+) -> Result<(), ChainError> {
+    // `None` orders below every `Some`, so this is the newest fence seen.
+    if let Some(current) = tip.map(|t| t.fence).max(floor)
+        && next.fence < current
+    {
+        return Err(ChainError::StaleFence {
+            current,
+            got: next.fence,
+        });
+    }
+    check_next(tip, next)
 }
 
 /// `[u8; 32]` as lowercase hex in JSON.
@@ -314,6 +344,78 @@ mod tests {
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
         assert_eq!(back.hash(), ev.hash());
+    }
+
+    /// P2a — the case the floor exists for: the promotion moved the lease to
+    /// fence 2, no event of fence 2 exists yet, and the old primary (fence 1)
+    /// sends its next event. The tip alone would take it.
+    #[test]
+    fn the_floor_refuses_an_older_fence_before_any_event_of_the_new_one() {
+        let chain = chain_of(2, 1);
+        let tip = chain[1].tip();
+        let late = EventEnvelope::next("s1", Some(tip), 1, 9, &note("late"));
+        check_next(Some(tip), &late).expect("the tip alone takes the stale writer's event");
+        assert_eq!(
+            check_next_with_floor(Some(tip), Some(2), &late),
+            Err(ChainError::StaleFence { current: 2, got: 1 })
+        );
+        // The new primary's first event continues the same chain.
+        let first = EventEnvelope::next("s1", Some(tip), 2, 9, &note("resumed"));
+        check_next_with_floor(Some(tip), Some(2), &first).unwrap();
+    }
+
+    /// P2a — a floor holds for a session this member holds nothing of yet:
+    /// a joiner's floor arrives before its first event.
+    #[test]
+    fn the_floor_holds_before_the_first_event() {
+        let at_1 = chain_of(1, 1).remove(0);
+        assert_eq!(
+            check_next_with_floor(None, Some(3), &at_1),
+            Err(ChainError::StaleFence { current: 3, got: 1 })
+        );
+        let at_3 = chain_of(1, 3).remove(0);
+        check_next_with_floor(None, Some(3), &at_3).unwrap();
+        // The floor never excuses what check_next refuses.
+        let mut not_first = at_3.clone();
+        not_first.seq = 2;
+        assert_eq!(
+            check_next_with_floor(None, Some(3), &not_first),
+            Err(ChainError::Gap {
+                expected: 1,
+                got: 2
+            })
+        );
+    }
+
+    /// P2a — the newer of the floor and the tip's fence is what counts, so a
+    /// floor below the tip's fence changes nothing, and no floor is exactly
+    /// `check_next`.
+    #[test]
+    fn the_newer_of_the_floor_and_the_tip_counts_and_no_floor_is_check_next() {
+        let chain = chain_of(2, 5);
+        let tip = chain[1].tip();
+        let stale = EventEnvelope::next("s1", Some(tip), 4, 9, &note("late"));
+        let ok = EventEnvelope::next("s1", Some(tip), 5, 9, &note("next"));
+        let mut gap = ok.clone();
+        gap.seq = 9;
+        for floor in [None, Some(1), Some(5)] {
+            assert_eq!(
+                check_next_with_floor(Some(tip), floor, &stale),
+                Err(ChainError::StaleFence { current: 5, got: 4 }),
+                "floor {floor:?}"
+            );
+            check_next_with_floor(Some(tip), floor, &ok).unwrap();
+        }
+        for next in [&stale, &ok, &gap, &chain[0]] {
+            assert_eq!(
+                check_next_with_floor(Some(tip), None, next),
+                check_next(Some(tip), next)
+            );
+            assert_eq!(
+                check_next_with_floor(None, None, next),
+                check_next(None, next)
+            );
+        }
     }
 
     #[test]
