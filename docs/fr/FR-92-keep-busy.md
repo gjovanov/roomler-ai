@@ -120,9 +120,15 @@ Divergence with no clock evidence means an app warped or confined the cursor. Th
 EDR flags each as a keylogger, and GPO-locked corporate desktops with EDR are in the acceptance bar.
 Mouse-*button* state is read **once per resume**, never polled.
 
-**Calibration** on every enable and resume: read the cursor, move it to the same point, and require the
-position to round-trip **and** the idle clock to register the move. Otherwise
-`unavailable:calibration_failed`.
+**Calibration** on every enable and resume: read the cursor, move it **3 px out and back**, verify the
+pointer reached each leg, and require the idle clock to register the moves. Otherwise
+`unavailable:calibration_failed` (or `not_landing` when the clock never moves).
+
+Two details matter:
+- A move to the same point may not count as input anywhere.
+- A pointer stuck at the anchor round-trips "home → home" perfectly. Only checking the out-leg catches it.
+
+A test pins this (P1).
 
 **Resume** when the human has been idle for `resume_after`, no button is held, the session is unlocked
 and present. The engine re-anchors at the **current** cursor and continues from the nearest point of the
@@ -183,10 +189,8 @@ stateDiagram-v2
   the host, the idle clock and `keep_busy_enabled` allow it, and it follows the key at heartbeat time,
   like the `record` cap. Matching is equality, and unknown words are ignored.
 - **LocalAPI:** `keep_busy_status` / `keep_busy_off` → `keep_busy`.
-- **Server → agent:**
-  - `ServerMsg::Request.keep_busy_denied: Option<bool>` (additive).
-  - `ServerMsg::KeepBusyPolicy { denied }`, tag `rc:agent.keep_busy_policy`, owned by fleet in
-    `namespace()`.
+- **Server → agent:** `ServerMsg::KeepBusyPolicy { denied }`, tag `rc:agent.keep_busy_policy`,
+  owned by fleet in `namespace()`. It is the only server→agent keep-busy message (§3f).
 
 ### 3e. Persistence — per signed-in person
 
@@ -217,14 +221,17 @@ stateDiagram-v2
 - **Org: `TenantSettings.keep_busy_denied`** (default false = allowed).
   - `GET/PUT /api/tenant/{tid}/keep-busy-settings`: reading needs MANAGE_AGENTS, writing needs
     MANAGE_TENANT, following exec-settings (`fleet/src/agent_exec.rs`).
-  - **Enable time:** `resolve_session_authz` (`modules/remote/src/controller.rs` L410) already loads the
-    tenant; its result reaches `ServerMsg::Request` and then the control handler. A supervised Mac
-    carries it in `SessionParams`.
   - **Standing:** reconciled on connect after `ConfigPush` (both `true` and `false`, so a re-allow while
     offline clears), and pushed on change through `publish_rc_ctrl` → an `apply_rc_ctrl` arm, because
     the PUT can land on any pod. Both are cap-gated (`supports_keep_busy`).
   - **On the agent:** the effective deny is the strictest of every enrolled org's last-known deny,
-    persisted. An old server (`None`) means allowed.
+    persisted. An old server (no push) means allowed.
+  - **Device-wide, so no per-session field.** Under strictest-of a deny is device-wide, and the
+    engine itself refuses every enable while it holds (`org_denied`, to every viewer). The connect
+    reconcile reaches the agent before any session request, and a change is pushed at once. A
+    `keep_busy_denied` field on `ServerMsg::Request` would only repeat that, at the cost of threading
+    it through the session authz, the hub, the cross-pod relay JSON and the macOS delegation. That
+    design was dropped in P1 (see §8).
 
 ### 3g. Host side
 
@@ -260,7 +267,7 @@ stateDiagram-v2
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | Claim: issue #1942, this spec, the ledger row | Docs only | this PR |
-| P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | — |
+| P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | PR open |
 | P2 | Viewer: composable, menu, previews, chip | the cap word | — |
 | P3 | macOS + X11 hosts and their keep-busy-only lock probes; Wayland and portal reported `unavailable` | per-host cap word | — |
 | P4 | LocalAPI verbs (person socket), CLI, companion tray, notification, banner row | — | — |
@@ -318,8 +325,9 @@ stateDiagram-v2
 - **State "beside the config" or inside `config.toml`.** The hardened machine-global dir is not
   writable by the default user worker, and `config.toml` has several writers.
 - **Device-wide state.** It would start moving a different person's mouse after they sign in.
-- **A per-session org flag alone.** It cannot stop an instance that outlived its session, so the
-  standing push exists.
+- **A per-session org flag, alone or beside the push.** Alone, it cannot stop an instance that
+  outlived its session, so the standing push exists. Beside the push it is redundant: the deny is
+  device-wide (strictest of every enrolled org), and the engine refuses every enable while it holds.
 
 ## 9. Field-verification log
 

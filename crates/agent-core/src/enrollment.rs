@@ -270,6 +270,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         record_dir: None,
         record_remote_enabled: false,
         record_remote_audio: false,
+        // FR-92 — on by default (operator decision 2026-10-10); the owner
+        // turns it off.
+        keep_busy_enabled: true,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
