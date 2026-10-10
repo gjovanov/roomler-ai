@@ -1555,6 +1555,142 @@ async fn a_start_its_device_can_no_longer_run_is_lost_and_the_room_says_so() {
     assert_eq!(items.iter().filter(|m| ended(m)).count(), 1, "{items:#?}");
 }
 
+/// P1b's other door. A build without `hive` runs no session and sends no
+/// manifest, so what its device ran stayed live on the record. Field,
+/// 2026-10-10: a Windows device ran an accepted session, updated itself to
+/// 0.4.123, whose build has no `hive`, and the session read `idle` for ever.
+/// Back without `hive`, the device runs none of what it ran: each session
+/// ends (`not_on_device`, or `stopped` for one being stopped), its room is
+/// told once, and its open approval is withdrawn. The control comes first:
+/// the same device back WITH `hive`, its manifest naming both, keeps them.
+#[tokio::test]
+async fn a_device_back_without_agent_sessions_ends_the_ones_it_ran() {
+    // It polls the records, the rooms and the device's row.
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hivenohive").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-nohive", RUNS_HIVE).await;
+    let ran = started_session(&app, &tid, &token, &mut dev).await;
+    let stopping = started_session(&app, &tid, &token, &mut dev).await;
+    for sid in [&ran, &stopping] {
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+        )
+        .await;
+        wait_status(&app, &tid, &token, sid, "idle").await;
+    }
+    let room_of = |s: Value| s["room_id"].as_str().expect("a room").to_string();
+    let room = room_of(get_session(&app, &tid, &token, &ran).await.1);
+    let stopping_room = room_of(get_session(&app, &tid, &token, &stopping).await.1);
+    let a1 = format!("{ran}!a1");
+    let approval = || {
+        let db = app.db.clone();
+        async move {
+            db.collection::<Document>("agent_approvals")
+                .find_one(doc! { "approval_id": "a1" })
+                .await
+                .unwrap()
+                .expect("on the record")
+        }
+    };
+    let ended = |m: &Value, sid: &str| {
+        bound_to(m, sid)
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("⏹ Session ended"))
+    };
+
+    // The control: back WITH `hive`, its manifest naming both. The approval
+    // it opens next is applied after the manifest, from the same ordered
+    // queue, so its stub says the manifest was read.
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let mut ws = connect(&app, &dev.token, &dev.machine, RUNS_HIVE).await;
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.manifest", "sessions": [
+            {"session_id": ran, "fence": 1},
+            {"session_id": stopping, "fence": 1}
+        ]}),
+    )
+    .await;
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.approval", "session_id": ran, "fence": 1,
+               "approval_id": "a1", "turn": 1, "status": "open"}),
+    )
+    .await;
+    wait_messages(&app, &tid, &token, &room, "the approval's stub", |items| {
+        items.iter().any(|m| bound_to(m, &a1))
+    })
+    .await;
+    for sid in [&ran, &stopping] {
+        let (_, s) = get_session(&app, &tid, &token, sid).await;
+        assert_eq!(s["status"], "idle", "what the manifest names stays: {s}");
+    }
+    assert_eq!(approval().await.get_str("status").unwrap(), "open");
+
+    // Away again, and a stop is queued for one of them.
+    drop(ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let (code, queued) = stop(&app, &tid, &token, &stopping).await;
+    assert_eq!(code, 200);
+    assert_eq!(queued["outcome"], "queued", "{queued}");
+
+    // Back as a build WITHOUT `hive`: it sends no manifest and runs nothing.
+    let mut ws = connect(&app, &dev.token, &dev.machine, NO_HIVE).await;
+    let s = wait_status(&app, &tid, &token, &ran, "ended").await;
+    assert_eq!(s["end_reason"], "not_on_device", "{s}");
+    let s = wait_status(&app, &tid, &token, &stopping, "ended").await;
+    assert_eq!(s["end_reason"], "stopped", "{s}");
+
+    let items = wait_messages(&app, &tid, &token, &room, "the ended note", |items| {
+        items.iter().any(|m| ended(m, &ran))
+    })
+    .await;
+    let note = items.iter().find(|m| ended(m, &ran)).unwrap();
+    let text = note["content"].as_str().unwrap();
+    assert!(text.contains("its device no longer runs it"), "{text}");
+    let withdrawn = "🔐 **Approval** · turn 1 — ⏹ withdrawn";
+    wait_messages(
+        &app,
+        &tid,
+        &token,
+        &room,
+        "the approval withdrawn",
+        |items| {
+            items
+                .iter()
+                .any(|m| bound_to(m, &a1) && m["content"] == withdrawn)
+        },
+    )
+    .await;
+    assert_eq!(approval().await.get_str("status").unwrap(), "withdrawn");
+    wait_messages(
+        &app,
+        &tid,
+        &token,
+        &stopping_room,
+        "the stopped session's note",
+        |items| items.iter().any(|m| ended(m, &stopping)),
+    )
+    .await;
+
+    // Nothing is pushed to a build that would drop it, and meanwhile no
+    // room is told twice.
+    assert!(
+        !device_hears(&mut ws, "rc:hive.stop", Duration::from_millis(500)).await,
+        "a stop was pushed to a build without `hive`"
+    );
+    for (sid, room) in [(&ran, &room), (&stopping, &stopping_room)] {
+        let (_, items) = room_messages(&app, &tid, &token, room).await;
+        let notes = items.iter().filter(|m| ended(m, sid)).count();
+        assert_eq!(notes, 1, "{items:#?}");
+    }
+}
+
 /// A stop for a device that is away is queued, and delivered when it
 /// connects — the same path as an online one.
 #[tokio::test]

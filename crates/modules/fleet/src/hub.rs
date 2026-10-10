@@ -1652,6 +1652,20 @@ impl Hub {
         self.inner.agents.get(&agent_id).map(|a| a.supports_hive)
     }
 
+    /// FR-90 — whether THIS connection advertises `hive`. `tx` is the sender
+    /// [`Self::register_agent`] returned to it, matched as
+    /// [`Self::unregister_agent`] matches a displaced handler's. `None` = not
+    /// online on this pod, or a newer connection holds the slot. A newer
+    /// entry is never an older connection's word, least of all while it is
+    /// half-registered: it reads `false` until its caps are recorded.
+    pub fn agent_supports_hive_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| ptr_eq(&a.tx, tx))
+            .map(|a| a.supports_hive)
+    }
+
     /// FR-90 — push a Hive frame (`rc:hive.start` / `rc:hive.stop`) to a
     /// device, checked in the lookup that sends it so a reconnect cannot fall
     /// between the check and the push: offline (or another tenant's —
@@ -3742,6 +3756,51 @@ mod tests {
             !hub.is_agent_online(agent_id),
             "matching-tx unregister must remove the entry"
         );
+    }
+
+    #[tokio::test]
+    async fn hive_support_is_the_word_of_the_connection_that_holds_the_slot() {
+        // FR-90: an agent socket's hello reconciles the device's agent
+        // sessions on what ITS connection advertised. A displaced connection
+        // reading the newer entry instead, half-registered with the `false`
+        // placeholder, would end the sessions of a device that runs them.
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (tenant, owner) = (ObjectId::new(), ObjectId::new());
+        let (old, _cancel1, _rx1) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
+        assert_eq!(
+            hub.agent_supports_hive_on(agent_id, &old),
+            Some(false),
+            "a registration reads `false` until its caps are recorded"
+        );
+        hub.set_agent_hive_support(agent_id, true);
+        assert_eq!(hub.agent_supports_hive_on(agent_id, &old), Some(true));
+
+        // A newer connection takes the slot: whatever its entry says, from
+        // the placeholder on, the old connection has no word.
+        let (new, _cancel2, _rx2) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
+        assert_eq!(
+            hub.agent_supports_hive_on(agent_id, &old),
+            None,
+            "a half-registered newer entry read as the displaced connection's `false`"
+        );
+        assert_eq!(hub.agent_supports_hive_on(agent_id, &new), Some(false));
+        for supports in [true, false] {
+            hub.set_agent_hive_support(agent_id, supports);
+            assert_eq!(
+                hub.agent_supports_hive_on(agent_id, &old),
+                None,
+                "the newer entry ({supports}) read as the displaced connection's word"
+            );
+            assert_eq!(hub.agent_supports_hive_on(agent_id, &new), Some(supports));
+        }
+
+        // Once nobody holds the slot, nobody has a word.
+        assert!(hub.unregister_agent(agent_id, Some(&new)));
+        assert_eq!(hub.agent_supports_hive_on(agent_id, &new), None);
+        assert_eq!(hub.agent_supports_hive_on(agent_id, &old), None);
     }
 
     // ─── Fleet RPC broker ────────────────────────────────────────────
