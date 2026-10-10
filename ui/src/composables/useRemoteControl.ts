@@ -65,6 +65,7 @@ import {
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import { useSnackbar } from './useSnackbar'
 import { useRemoteRecording, type RecordChannel } from './useRemoteRecording'
+import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
@@ -944,6 +945,8 @@ export const APPS_UNAVAILABLE_NO_REASON =
 
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
+  /** FR-92 — the device's keep-busy state (to every viewer, on change). */
+  | { kind: 'keep_busy'; state: KeepBusyState }
   | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
@@ -1114,6 +1117,11 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   }
   if (obj.t === 'rc:apps.launch.reply') {
     return { kind: 'apps_launch_reply', id: strOrNull(obj.id), reply: parseAppsActionReply(obj) }
+  }
+  // FR-92 — keep busy. The device owns the state; this only renders it.
+  if (obj.t === 'rc:keep-busy.state') {
+    const state = parseKeepBusyState(obj)
+    return state ? { kind: 'keep_busy', state } : null
   }
   // rc.227 Ã¢ÂÂ keyboard-layout snapshot from the agent (Windows hosts).
   // Defensive filtering: malformed installed entries are dropped, a
@@ -4077,6 +4085,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /** FR-92 — the device's keep-busy state; `null` until an agent that has
+   *  the feature says something (older agents never do). */
+  const keepBusy = ref<KeepBusyState | null>(null)
   /** rc.227 Ã¢ÂÂ the remote host's keyboard-layout state, pushed by
    *  Windows agents as `rc:layout` over the control DC (on change;
    *  first snapshot arrives with the first input event). Null on old
@@ -5629,6 +5640,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } catch {
       /* drop */
     }
+  }
+
+  /** FR-92 — ask the device to turn keep busy on (with these settings) or
+   *  off. The device decides — its arbiter checks this session's INPUT
+   *  grant, the floor and the org — and answers every viewer with
+   *  `rc:keep-busy.state`; a refusal comes back to this viewer alone. */
+  function setKeepBusy(req: KeepBusyRequest) {
+    sendControl(keepBusySetMessage(req))
   }
 
   /** P6 — toggle the device's arbitration mode in-session (INPUT-granted
@@ -7465,6 +7484,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
     hostLocked.value = false
+    keepBusy.value = null
     currentDesktop.value = 'Default'
     videoInfo.value = null
     // FR-80 — a host whose permission was restored must not keep showing
@@ -8542,6 +8562,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const parsed = parseControlInbound(ev.data)
       if (parsed?.kind === 'host_locked') {
         hostLocked.value = parsed.locked
+      } else if (parsed?.kind === 'keep_busy') {
+        keepBusy.value = parsed.state
       } else if (parsed?.kind === 'clock_echo') {
         // FR-1 P7 — clock probe round trip complete; fold the sample.
         handleClockEcho(parsed.t0, parsed.agentUs)
@@ -11052,6 +11074,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * padlock overlay frame.
      */
     hostLocked,
+    keepBusy,
+    setKeepBusy,
     /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */

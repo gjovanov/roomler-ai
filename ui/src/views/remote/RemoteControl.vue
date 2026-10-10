@@ -352,6 +352,15 @@
         <v-icon start size="x-small">mdi-record</v-icon>
         REC · reconnecting
       </v-chip>
+      <!-- FR-92 — keep busy. The device owns the state; the menu renders
+           `rc:keep-busy.state` and asks for changes. -->
+      <KeepBusyMenu
+        v-if="rc.phase.value === 'connected' && (agentSupportsKeepBusy || rc.keepBusy.value)"
+        :state="rc.keepBusy.value"
+        :can-control="rc.inputGranted.value"
+        :agent-id="agentId"
+        @set="rc.setKeepBusy"
+      />
       <v-menu
         v-if="rc.phase.value === 'connected' && rc.recordGranted.value"
         :close-on-content-click="false"
@@ -1909,6 +1918,7 @@ import {
 } from '@/composables/useRemoteRecording'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
+import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 
 const route = useRoute()
@@ -2760,6 +2770,12 @@ watch(
 
 // ── rc.227 — remote keyboard-layout chip + manual picker ──
 const agentLayoutCaps = computed<string[]>(() => agent.value?.capabilities?.layout ?? [])
+// FR-92 — the agent can run keep busy here and its owner allows it. Equality,
+// never a prefix match. An org deny keeps the word: the menu then shows the
+// control disabled with the device's own reason.
+const agentSupportsKeepBusy = computed<boolean>(
+  () => agent.value?.capabilities?.input?.includes('keep-busy') ?? false,
+)
 /** Pretty layout label via Intl.DisplayNames ("bg-BG" → "Bulgarian
  *  (Bulgaria)" in the viewer's language); raw tag on failure (the
  *  agent falls back to a hex LANGID for layouts the OS can't name). */
