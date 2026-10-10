@@ -148,6 +148,9 @@
         <div v-else-if="e.event.kind === 'compaction'" class="text-caption text-medium-emphasis">
           {{ $t('hive.viewer.compacted') }}
         </div>
+        <div v-else-if="e.event.kind === 'checkpoint'" class="text-caption text-medium-emphasis hive-checkpoint">
+          {{ checkpointLine(e.event) }}
+        </div>
         <div v-else class="text-caption text-medium-emphasis">
           {{ $t('hive.viewer.unknownKind', { kind: asText(e.event.kind) }) }}
         </div>
@@ -315,6 +318,28 @@ function resolvedLine(e: any): string {
     default:
       return t('hive.viewer.approval.other', { outcome: asText(e.outcome) })
   }
+}
+
+/**
+ * FR-90 P2b — what a checkpoint kept for the session's replicas: how many of
+ * its files changed, and the folder (committed, unchanged, or not taken, and
+ * why). No file's content is ever in the event.
+ */
+function checkpointLine(e: any): string {
+  const files: Array<{ chunks?: unknown[] }> = Array.isArray(e.files) ? e.files : []
+  const changed = files.filter((f) => Array.isArray(f.chunks) && f.chunks.length > 0).length
+  const head = `💾 ${t('hive.viewer.checkpoint', { n: asText(e.n), changed, files: files.length })}`
+  const skipped: Array<{ path?: unknown; why?: unknown }> = Array.isArray(e.skipped) ? e.skipped : []
+  const folderSkipped = skipped.find((s) => s.path === 'the workspace')
+  if (e.workspace && typeof e.workspace === 'object') {
+    const pack = (e.workspace as { pack?: unknown[] }).pack
+    const committed = Array.isArray(pack) && pack.length > 0
+    return `${head}; ${t(committed ? 'hive.viewer.checkpointFolderCommitted' : 'hive.viewer.checkpointFolderSame')}`
+  }
+  if (folderSkipped) {
+    return `${head}; ${t('hive.viewer.checkpointFolderSkipped', { why: asText(folderSkipped.why) })}`
+  }
+  return head
 }
 
 const statusColor = computed(() => {

@@ -48,6 +48,19 @@ export type TranscriptEvent =
   | { kind: 'approval_requested'; id: string; tool_name: string; tool_use_id?: string | null; input: unknown }
   /** `outcome`: allowed · denied · expired · withdrawn (a newer word is shown as is). */
   | { kind: 'approval_resolved'; id: string; outcome: string; by?: string | null; message?: string | null }
+  /**
+   * FR-90 P2b — what a checkpoint kept for the replicas: each file by path,
+   * length and hash (a file this checkpoint changed carries `chunks`), and the
+   * folder as a git commit. Never a file's content.
+   */
+  | {
+      kind: 'checkpoint'
+      n: number
+      turn: number
+      files: Array<{ path: string; growth: string; len: number; hash: string; chunks?: unknown[] }>
+      skipped?: Array<{ path: string; why: string }>
+      workspace?: { repo: string; tree: string; commit: string; pack?: unknown[] } | null
+    }
   /** A kind this build does not know: shown as such, never dropped. */
   | { kind: string; [field: string]: unknown }
 

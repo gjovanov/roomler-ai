@@ -239,6 +239,10 @@
       "turnError": "Turn ended with an error",
       "started": "Session started — model {model}, in {cwd}",
       "compacted": "The agent compacted its context.",
+      "checkpoint": "Checkpoint {n}: {changed} of {files} of the agent's files changed",
+      "checkpointFolderCommitted": "the folder committed",
+      "checkpointFolderSame": "the folder unchanged",
+      "checkpointFolderSkipped": "the folder not kept ({why})",
       "unknownKind": "An event this version cannot show ({kind}).",
       "tool": {
         "background": "Runs in the background",
