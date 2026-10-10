@@ -162,6 +162,48 @@ pub struct Skipped {
     pub why: String,
 }
 
+/// Where a checkpoint's workspace commit is written (P2b-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoKind {
+    /// The repository the folder is in: the commit is written there, under
+    /// `refs/hive/<sid>/head`, and nothing else of the person's changes.
+    Own,
+    /// A folder in no repository: a private bare repository in the session's
+    /// state directory, never a `.git` inside the person's folder.
+    Shadow,
+}
+
+/// The workspace as one checkpoint has it (P2b-2): a git commit of the
+/// folder's tree, written through a temporary index by the account's own git,
+/// and the pack that carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnap {
+    pub repo: RepoKind,
+    /// The folder's place in its repository (`git rev-parse --show-prefix`),
+    /// `/`-terminated; empty at the repository's top, and in a shadow.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    /// The folder's tree, as git names it.
+    pub tree: String,
+    /// The commit `refs/hive/<sid>/head` points at: its tree is `tree`, and
+    /// its parent the last checkpoint's commit. The first has no parent, so
+    /// its pack holds the whole tree and no history.
+    pub commit: String,
+    /// The last checkpoint's commit, which this pack is thin against. A member
+    /// applies the packs in order, so it holds every object the deltas name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// The person's `HEAD` when it was taken, in their own repository: where a
+    /// teleport into a clone of it starts from (P2f).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// The pack, as blobs ([`chunk_bytes`]). Empty when the tree is the last
+    /// checkpoint's: no commit is written for a turn that changed no file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pack: Vec<Chunk>,
+}
+
 /// What one checkpoint took ([`take`]): the `checkpoint` event's body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -175,12 +217,68 @@ pub struct Checkpoint {
     pub files: Vec<FileSnap>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
+    /// The workspace, when one was taken (P2b-2). A device without `git`
+    /// takes none, and `skipped` says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSnap>,
+}
+
+/// `bytes` as chunks of at most [`CHUNK_MAX`] from offset 0, and their blobs:
+/// how a whole thing, a pack among them, is carried.
+pub fn chunk_bytes(bytes: &[u8]) -> (Vec<Chunk>, Vec<Vec<u8>>) {
+    let mut chunks = Vec::new();
+    let mut blobs = Vec::new();
+    let mut offset = 0u64;
+    for piece in bytes.chunks(CHUNK_MAX) {
+        chunks.push(Chunk {
+            offset,
+            len: piece.len() as u64,
+            hash: Digest::of(piece),
+        });
+        offset += piece.len() as u64;
+        blobs.push(piece.to_vec());
+    }
+    (chunks, blobs)
+}
+
+/// The bytes `chunks` name, in order from offset 0, each checked against its
+/// hash: how a member or a target reads a pack back.
+pub fn join_chunks(
+    what: &str,
+    chunks: &[Chunk],
+    blob: impl Fn(&Digest) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, CheckpointError> {
+    let bad = |why: String| CheckpointError::Inconsistent {
+        path: what.to_string(),
+        why,
+    };
+    let mut bytes = Vec::new();
+    for chunk in chunks {
+        if chunk.offset != bytes.len() as u64 {
+            return Err(bad(format!(
+                "a chunk at {}, after {} bytes",
+                chunk.offset,
+                bytes.len()
+            )));
+        }
+        let data =
+            blob(&chunk.hash).ok_or_else(|| bad(format!("the blob {} is missing", chunk.hash)))?;
+        if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
+            return Err(bad(format!(
+                "the blob {} is not what was named",
+                chunk.hash
+            )));
+        }
+        bytes.extend_from_slice(&data);
+    }
+    Ok(bytes)
 }
 
 /// Where the last checkpoint left each file: its `len` and `hash`, by path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Previous {
     files: BTreeMap<String, (u64, Digest)>,
+    workspace: Option<WorkspaceSnap>,
 }
 
 impl Previous {
@@ -189,7 +287,7 @@ impl Previous {
         Self::default()
     }
 
-    /// Where `last` left every file it listed.
+    /// Where `last` left every file it listed, and its workspace.
     pub fn from_checkpoint(last: &Checkpoint) -> Self {
         Self {
             files: last
@@ -197,11 +295,18 @@ impl Previous {
                 .iter()
                 .map(|f| (f.path.clone(), (f.len, f.hash)))
                 .collect(),
+            workspace: last.workspace.clone(),
         }
     }
 
     fn get(&self, path: &str) -> Option<(u64, Digest)> {
         self.files.get(path).copied()
+    }
+
+    /// The last checkpoint's workspace: the commit the next one's parent and
+    /// pack base are (P2b-2).
+    pub fn workspace(&self) -> Option<&WorkspaceSnap> {
+        self.workspace.as_ref()
     }
 }
 
@@ -380,16 +485,7 @@ pub fn snapshot_whole(
     let mut chunks = Vec::new();
     let mut blobs = Vec::new();
     if !unchanged {
-        let mut offset = 0u64;
-        for piece in bytes.chunks(CHUNK_MAX) {
-            chunks.push(Chunk {
-                offset,
-                len: piece.len() as u64,
-                hash: Digest::of(piece),
-            });
-            offset += piece.len() as u64;
-            blobs.push(piece.to_vec());
-        }
+        (chunks, blobs) = chunk_bytes(bytes);
         if bytes.is_empty() {
             // An empty file still starts over: one empty chunk says so.
             chunks.push(Chunk {
@@ -494,6 +590,7 @@ pub fn take(
             turn,
             files,
             skipped,
+            workspace: None,
         },
         blobs,
     ))
@@ -758,6 +855,7 @@ mod tests {
                 turn: i as u32 + 1,
                 files: vec![f],
                 skipped: vec![],
+                workspace: None,
             })
             .collect();
         let got = assemble("h", &cps, |d| store.get(d).cloned()).unwrap();
@@ -799,6 +897,7 @@ mod tests {
             turn: 1,
             files: vec![f],
             skipped: vec![],
+            workspace: None,
         });
         assert_eq!(assemble("h", &cps, |d| store.get(d).cloned()).unwrap(), b"");
     }
@@ -843,6 +942,7 @@ mod tests {
             turn: 1,
             files: vec![f],
             skipped: vec![],
+            workspace: None,
         });
         assert_eq!(assemble("m", &cps, |d| store.get(d).cloned()).unwrap(), b"");
     }
@@ -857,6 +957,7 @@ mod tests {
             turn: 1,
             files: vec![one.clone()],
             skipped: vec![],
+            workspace: None,
         };
         let missing = assemble("h", [&cp], |_| None).unwrap_err();
         assert!(missing.to_string().contains("missing"), "{missing}");
@@ -869,6 +970,7 @@ mod tests {
             turn: 1,
             files: vec![gap],
             skipped: vec![],
+            workspace: None,
         };
         let store: HashMap<Digest, Vec<u8>> = b1.into_iter().map(|b| (Digest::of(&b), b)).collect();
         let err = assemble("h", [&cp_gap], |d| store.get(d).cloned()).unwrap_err();
@@ -997,6 +1099,26 @@ mod tests {
         );
     }
 
+    /// A pack is carried as chunks from 0 and read back checked: a chunk out
+    /// of place, missing or not what was named is refused.
+    #[test]
+    fn a_pack_is_carried_in_chunks_and_read_back_checked() {
+        let pack: Vec<u8> = (0..(CHUNK_MAX + 10)).map(|i| (i % 251) as u8).collect();
+        let (chunks, blobs) = chunk_bytes(&pack);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].offset, CHUNK_MAX as u64);
+        let store: HashMap<Digest, Vec<u8>> =
+            blobs.into_iter().map(|b| (Digest::of(&b), b)).collect();
+        assert_eq!(
+            join_chunks("pack", &chunks, |d| store.get(d).cloned()).unwrap(),
+            pack
+        );
+        let swapped = [chunks[1].clone(), chunks[0].clone()];
+        assert!(join_chunks("pack", &swapped, |d| store.get(d).cloned()).is_err());
+        assert!(join_chunks("pack", &chunks, |_| None).is_err());
+        assert_eq!(chunk_bytes(b"").0, vec![], "nothing to carry");
+    }
+
     /// The checkpoint is the `checkpoint` event's body, and round-trips through
     /// its JSON with hashes as hex.
     #[test]
@@ -1010,6 +1132,19 @@ mod tests {
                 path: "CLAUDE.md".into(),
                 why: "a link".into(),
             }],
+            workspace: Some(WorkspaceSnap {
+                repo: RepoKind::Own,
+                prefix: "sub/".into(),
+                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                commit: "1e1f7e0c3a2b4d5e6f708192a3b4c5d6e7f80912".into(),
+                base: None,
+                head: Some("aa".repeat(20)),
+                pack: vec![Chunk {
+                    offset: 0,
+                    len: 2,
+                    hash: Digest::of(b"PK"),
+                }],
+            }),
         };
         let json = serde_json::to_string(&cp).unwrap();
         assert!(json.contains(&Digest::of(b"a\n").to_string()), "{json}");
