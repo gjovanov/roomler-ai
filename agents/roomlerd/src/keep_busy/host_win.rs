@@ -148,6 +148,10 @@ impl Host for WinHost {
     fn remote_epoch(&self) -> u64 {
         super::remote_input_epoch()
     }
+
+    fn wait(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 /// Host settings that change what keep-busy should say, not what it does.
