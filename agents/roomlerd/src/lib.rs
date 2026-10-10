@@ -91,6 +91,9 @@ pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
 pub mod peer;
+/// FR-27 P11 — the person-at-the-device socket of a Linux system install.
+#[cfg(target_os = "linux")]
+pub mod person_socket;
 pub mod pgp_verify;
 pub mod post_install;
 pub mod preflight;
