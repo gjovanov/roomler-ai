@@ -960,8 +960,8 @@ Not field-tested: root at the seat, since GDM on this image refuses a root login
 
 Found: the socket's own lifecycle lines never reach the log.
 - **The lines exist.** `localapi: person-at-the-device socket up` / `… down` are emitted at info by the `roomler_localapi` crate.
-- **The filter drops them.** That target is below every default filter: `roomlerd=info,tunnel_core=info,warn` in the generated units, and the binary's own default adds only `roomler_agent`. Only roomlerd's `person socket: …` lines (a move, a stop, a failure) are seen.
+- **The filter drops them.** That target is below every default filter: `roomlerd=info,tunnel_core=info,warn` in the generated units, and the binary's own default adds only the daemon's pre-FR-21 target. Only roomlerd's `person socket: …` lines (a move, a stop, a failure) are seen.
 - **The result.** `ls`, not `roomler logs`, answers "is the person socket up?".
-- **Why it is a follow-up.** Units already on disk set `RUST_LOG` wholesale, so a fix there needs the care the `roomler_agent` → `roomlerd` rename did (`logging.rs`, `mirror_legacy_log_target`).
+- **Why it is a follow-up.** Units already on disk set `RUST_LOG` wholesale, so a fix there needs the care FR-21's rename of the daemon's own target did (`logging.rs`, `mirror_legacy_log_target`).
 
 The guest was destroyed by name afterwards.
