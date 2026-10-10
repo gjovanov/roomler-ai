@@ -2501,6 +2501,41 @@ mod tests {
     }
 
     #[test]
+    fn stream_holds_a_partial_literal_at_a_forced_cut() {
+        // The test above never ends a forcing push mid-literal: both of its
+        // tokens are complete by the time a cut happens, so the literal pass
+        // masks them and the hold-back is never consulted. Here the first
+        // part of a literal ENDS the push that forces the cut, at every split
+        // offset. Only the hold-back keeps that part off the wire: the
+        // literal pass can mask only what is complete.
+        let token = shaped("agenttoken", 24);
+        let r = Redactor::new([token.clone()]);
+        for k in 1..token.len() {
+            let mut first = vec![b'x'; CARRY_CAP + 100];
+            first.extend_from_slice(&token.as_bytes()[..k]);
+            let mut rest = token.as_bytes()[k..].to_vec();
+            rest.extend_from_slice(b" tail\n");
+
+            let mut sr = StreamRedactor::new(&r);
+            let mut out = sr.push(&first);
+            assert!(
+                !out.is_empty(),
+                "the push did not force a cut, so this case proves nothing"
+            );
+            out.extend_from_slice(&sr.push(&rest));
+            out.extend_from_slice(&sr.finish());
+
+            let mut whole = first.clone();
+            whole.extend_from_slice(&rest);
+            assert_eq!(out, r.apply_bytes(&whole), "split at {k}");
+            assert!(
+                !out.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the literal leaked through a forced cut split at {k}"
+            );
+        }
+    }
+
+    #[test]
     fn stream_idle_flush_releases_a_prompt_but_holds_a_partial_secret() {
         let token = shaped("agenttoken", 24);
         let r = Redactor::new([token.clone()]);
