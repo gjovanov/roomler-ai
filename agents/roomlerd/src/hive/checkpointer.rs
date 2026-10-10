@@ -281,7 +281,7 @@ pub(crate) fn check(req: &Request, cp: &Checkpoint, blobs: &[Vec<u8>]) -> Result
 
 /// Whether `path` is one of the allowlist's files, or a file under one of its
 /// directories, with nothing in it that could step outside.
-fn allowed(path: &str, allow: &[checkpoint::AllowEntry]) -> bool {
+pub(super) fn allowed(path: &str, allow: &[checkpoint::AllowEntry]) -> bool {
     let shaped = !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')
@@ -577,135 +577,22 @@ pub(crate) async fn run_as(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         // Its own group, which a timeout or an abandoned checkpoint ends
-        // whole, the git it started included ([`Group`]).
+        // whole, the git it started included ([`super::child::run_fed`]).
         .process_group(0);
     if let Some(account) = account {
         crate::exec::apply_session_run_as(&mut cmd, account)?;
     }
-    let out = read_child(cmd, timeout, MAX_OUTPUT).await?;
+    let out = super::child::run_fed(
+        cmd,
+        CHECKPOINT_SUBCOMMAND,
+        super::child::nothing,
+        timeout,
+        MAX_OUTPUT,
+    )
+    .await?;
     let (cp, blobs) = read_frames(&out)?;
     check(req, &cp, &blobs)?;
     Ok((cp, blobs))
-}
-
-/// How long an ended checkpoint's group has between TERM and KILL.
-#[cfg(unix)]
-const GROUP_GRACE: Duration = Duration::from_secs(2);
-
-/// The checkpoint's process group (`process_group(0)`: its id is the
-/// leader's pid), signalled whole when the checkpoint is ended — a timeout,
-/// too much output, or abandoned by a stop or a daemon going down (dropped).
-/// `kill_on_drop` and `start_kill` reach the leader alone and would leave a
-/// `git add` hashing the whole folder behind it.
-///
-/// ⚠️ TERM first: git removes its lock files on TERM, never on KILL, and a
-/// lock left on the checkpoint's index refuses every checkpoint after it.
-/// ⚠️ Only while the leader is unreaped: once reaped, the id may name
-/// someone else's group, so it is forgotten the moment the leader is waited
-/// for.
-#[cfg(unix)]
-struct Group(Option<libc::pid_t>);
-
-#[cfg(unix)]
-impl Group {
-    fn signal(&self, sig: libc::c_int) {
-        if let Some(pgid) = self.0 {
-            // SAFETY: a plain syscall; the group's leader is our unreaped
-            // child, so `pgid` names no one else's.
-            unsafe { libc::killpg(pgid, sig) };
-        }
-    }
-
-    /// TERM to all of it, a moment to go, then KILL; the leader is reaped
-    /// either way.
-    async fn end(&mut self, child: &mut tokio::process::Child) {
-        self.signal(libc::SIGTERM);
-        if tokio::time::timeout(GROUP_GRACE, child.wait())
-            .await
-            .is_err()
-        {
-            self.signal(libc::SIGKILL);
-            let _ = child.wait().await;
-        }
-        self.0 = None;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.signal(libc::SIGTERM);
-    }
-}
-
-/// Run `cmd` and answer its stdout, at most `max` bytes and within `timeout`;
-/// a child that fails says why in its stderr's tail.
-#[cfg(unix)]
-async fn read_child(
-    mut cmd: tokio::process::Command,
-    timeout: Duration,
-    max: u64,
-) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncReadExt;
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("starting {CHECKPOINT_SUBCOMMAND}: {e}"))?;
-    // After `child`, so dropped before it: the group is signalled while its
-    // leader is still unreaped. Never 0 or 1: `killpg(0, _)` is the daemon's
-    // own group.
-    let mut group = Group(
-        child
-            .id()
-            .and_then(|p| libc::pid_t::try_from(p).ok())
-            .filter(|&p| p > 1),
-    );
-    let mut stdout = child.stdout.take().ok_or("no stdout")?;
-    let stderr = child.stderr.take();
-    let said = tokio::spawn(async move {
-        let mut s = Vec::new();
-        if let Some(e) = stderr {
-            let _ = e.take(4096).read_to_end(&mut s).await;
-        }
-        s
-    });
-    let done = tokio::time::timeout(timeout, async {
-        let mut out = Vec::new();
-        match (&mut stdout).take(max + 1).read_to_end(&mut out).await {
-            Err(e) => Err(format!("reading {CHECKPOINT_SUBCOMMAND}: {e}")),
-            // Ended, not waited for: it may be blocked writing the rest.
-            Ok(_) if out.len() as u64 > max => Err(format!(
-                "{CHECKPOINT_SUBCOMMAND} wrote more than {max} bytes"
-            )),
-            Ok(_) => Ok((out, child.wait().await)),
-        }
-    })
-    .await;
-    let (out, status) = match done {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            group.end(&mut child).await;
-            return Err(e);
-        }
-        Err(_) => {
-            group.end(&mut child).await;
-            return Err(format!(
-                "{CHECKPOINT_SUBCOMMAND} did not finish within {} s",
-                timeout.as_secs()
-            ));
-        }
-    };
-    // Waited for: the group's id is no longer this checkpoint's to signal.
-    group.0 = None;
-    let status = status.map_err(|e| format!("waiting for {CHECKPOINT_SUBCOMMAND}: {e}"))?;
-    if !status.success() {
-        let said = said.await.unwrap_or_default();
-        let said = String::from_utf8_lossy(&said);
-        return Err(format!(
-            "{CHECKPOINT_SUBCOMMAND} failed ({status}): {}",
-            said.trim()
-        ));
-    }
-    Ok(out)
 }
 
 /// The daemon's side on Windows: start `exe hive-checkpoint <request_path>`

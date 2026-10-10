@@ -1059,16 +1059,60 @@ pub unsafe fn run_checkpoint(
     timeout: Duration,
     max: u64,
 ) -> Result<Vec<u8>, String> {
+    // SAFETY: forwarded from the caller.
+    unsafe { run_fed(who, cmdline, None, "the checkpoint", timeout, max) }
+}
+
+// ─── FR-90 P2b-4a: a materialize, fed as the console user ───────────────────
+
+/// The command line that runs `roomlerd hive-materialize`, which reads its
+/// frames on stdin.
+pub fn materialize_command_line(exe: &Path) -> Result<String, String> {
+    Ok(format!(
+        "{} {}",
+        program(exe)?,
+        crate::hive::MATERIALIZE_SUBCOMMAND
+    ))
+}
+
+/// [`run_checkpoint`], with `feed` written to the child's stdin when given:
+/// each buffer as it arrives, on a thread of its own, and the pipe closed —
+/// the child's end of input — once every sender is dropped. A child that
+/// stops reading ends the thread, and with it the receiver, so the sender
+/// learns it at its next send. `what` names the child in a refusal.
+///
+/// # Safety
+/// As [`run_prep`]: `SpawnAs::User`'s token must stay alive across the call.
+pub unsafe fn run_fed(
+    who: SpawnAs,
+    cmdline: &str,
+    feed: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    what: &str,
+    timeout: Duration,
+    max: u64,
+) -> Result<Vec<u8>, String> {
     let job = JobObject::kill_on_close().map_err(|e| format!("{e:#}"))?;
     // SAFETY: forwarded from the caller.
-    let child = unsafe { supervisor::spawn_into_job(who, cmdline, None, &[], false, &job) }
-        .map_err(|e| format!("{e:#}"))?;
+    let child =
+        unsafe { supervisor::spawn_into_job(who, cmdline, None, &[], feed.is_some(), &job) }
+            .map_err(|e| format!("{e:#}"))?;
     let CapturedChild {
         process,
         stdout,
         stderr,
-        ..
+        stdin,
     } = child;
+    if let (Some(pipe), Some(mut feed)) = (stdin, feed) {
+        // Not joined: it ends when the senders are dropped, or at the first
+        // write the child no longer reads.
+        std::thread::spawn(move || {
+            while let Some(buf) = feed.blocking_recv() {
+                if supervisor::write_all_to_pipe(&pipe, &buf).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     // Each pipe drained on its own thread (one read to the end first
     // deadlocks on the other), each against its own budget.
     let out_budget = Arc::new(AtomicU64::new(max.saturating_add(1)));
@@ -1087,18 +1131,18 @@ pub unsafe fn run_checkpoint(
         .unwrap_or_default();
     if !finished {
         return Err(format!(
-            "the checkpoint did not finish within {} s",
+            "{what} did not finish within {} s",
             timeout.as_secs()
         ));
     }
     if over || bytes.len() as u64 > max {
-        return Err(format!("the checkpoint wrote more than {max} bytes"));
+        return Err(format!("{what} wrote more than {max} bytes"));
     }
     match process.try_wait() {
         Ok(Some(0)) => Ok(bytes),
-        Ok(Some(code)) if said.is_empty() => Err(format!("the checkpoint failed (exit {code})")),
+        Ok(Some(code)) if said.is_empty() => Err(format!("{what} failed (exit {code})")),
         Ok(Some(_)) => Err(said),
-        Ok(None) => Err("the checkpoint had not ended".into()),
+        Ok(None) => Err(format!("{what} had not ended")),
         Err(e) => Err(format!("{e:#}")),
     }
 }
@@ -1439,6 +1483,61 @@ mod tests {
             let e = run_checkpoint(SpawnAs::Daemon, &cmd("echo 0123456789"), PREP_TIMEOUT, 4)
                 .unwrap_err();
             assert!(e.contains("more than 4 bytes"), "{e}");
+        }
+    }
+
+    /// FR-90 P2b-4a — what is fed reaches the child's stdin, whose end of
+    /// input is the sender's drop; a child that does not read is answered in
+    /// its own words, and the sender learns the pipe is gone.
+    #[test]
+    fn a_fed_child_reads_its_stdin_and_one_that_stops_closes_the_feed() {
+        let delayed = |script: &str| {
+            format!(
+                "{} /v:on /d /c \"{script}\"",
+                program(&system_cmd()).unwrap()
+            )
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        tx.blocking_send(b"hello\r\n".to_vec()).unwrap();
+        drop(tx);
+        // SAFETY: `Daemon` carries no token.
+        let out = unsafe {
+            run_fed(
+                SpawnAs::Daemon,
+                &delayed("set /p X=& echo got !X!"),
+                Some(rx),
+                "the materialize",
+                PREP_TIMEOUT,
+                1024,
+            )
+        }
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "got hello");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        tx.blocking_send(vec![b'x'; 1 << 20]).unwrap();
+        // SAFETY: as above.
+        let e = unsafe {
+            run_fed(
+                SpawnAs::Daemon,
+                &cmd("echo the folder is not allowed 1>&2 & exit 1"),
+                Some(rx),
+                "the materialize",
+                PREP_TIMEOUT,
+                1024,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(e, "the folder is not allowed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match tx.try_send(vec![b'y']) {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                _ => {
+                    assert!(Instant::now() < deadline, "the feed never learned");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
     }
 
