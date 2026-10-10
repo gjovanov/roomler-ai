@@ -76,6 +76,54 @@ flowchart TB
   classic UDP hole-punch, described in detail below.
 - **Phase D (relay)** — last resort; see "Relay" below.
 
+### When the LAN tier is gated: a VPN capture, or a dead own route
+
+FR-33 gates the LAN tier off when a packet to a LAN neighbour would leave
+through another interface. That is a corporate VPN's split-prefix capture
+(`crates/tunnel-core/src/overlay/path.rs:900`). Routing around a capture is
+VPN policy evasion, so the gate only reports it. The fix belongs in the VPN
+profile.
+
+The same lookup also fires when the interface's **own** prefix route is broken
+underneath it. On CORPLAP-3 (2026-10-10), AnyConnect in split-exclude listed
+the home LAN `192.168.8.0/24` as non-secured, yet the Wi-Fi's own on-link row
+carried next hop `192.168.0.1`, a gateway from a network the laptop had left.
+ARP left it `Incomplete`. Windows skipped the row, a LAN packet fell through to
+the VPN's `0.0.0.0/0`, FR-33 read "captured", and the pair relayed. An on-link
+ping answered in 1 ms. AnyConnect's own "Routing table - Original" snapshot
+already held the stale row, so a VPN reconnect does not cure it.
+
+That case is repaired, not reported
+(`crates/tunnel-core/src/overlay/lan_repair.rs:165`, run from the network-state
+sample before the capture probe at `netstate.rs:537`):
+
+```mermaid
+flowchart TD
+    A["LAN address on interface I, prefix P"] --> B{"I's own row for P:<br/>next hop set and outside P?"}
+    B -- "no (on-link, or missing)" --> N["nothing to repair<br/>(FR-33 reports any capture)"]
+    B -- "yes: dead row" --> C{"another interface routes P<br/>or anything inside it?"}
+    C -- yes --> X["a capture: stand aside<br/>(remove our halves)"]
+    C -- no --> D{"the dead next hop belongs to another interface?<br/>(its row's next hop, or inside its subnet)"}
+    D -- yes --> X
+    D -- no --> R["install P on-link as two halves (plen+1)<br/>on I, metric 0; the dead row is left as it is"]
+```
+
+| Check | Why |
+|---|---|
+| Next hop outside the prefix | A next hop has to be on-link, so this row can never carry a packet. |
+| No other interface routes the prefix (`lan_repair.rs:154`) | A VPN captures a LAN with rows of its own (Check Point's two `/25`s via its adapter). Then this is a capture, never ours to route around. |
+| The dead next hop belongs to no other interface (`lan_repair.rs:142`) | A LAN row pointed *into* a tunnel (its gateway, its subnet) is how a VPN could block a LAN it does not exclude. A stale gateway belongs to nobody. |
+| Two halves, not a replacement | They outrank the dead row by length, and nobody's row is deleted or edited. |
+| Stateless | Every sample re-derives the verdict from the table. Halves are removed when the row heals, the interface moves to another network, a capture appears, or the switch is off. A restart leaves nothing orphaned. |
+
+> ⚠️ The repair never lifts a real capture. When a capture is real, the VPN's
+> filter drops the LAN traffic too (FR-33 pktmon, 2026-09-03), so nothing could
+> pass anyway, and pretending otherwise would bring back FR-33's futile probes.
+
+Switch: `ROOMLERD_OVERLAY_LAN_ROUTE_REPAIR` / config `overlay_lan_route_repair`
+(Windows; default on; off removes the halves). Each install is one WARN line
+naming the prefix, the interface and the dead next hop.
+
 ## Phase C: the hole-punch, precisely
 
 Two facts about this codebase's WireGuard make the punch simpler than a generic
