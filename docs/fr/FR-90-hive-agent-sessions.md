@@ -517,6 +517,43 @@ places the canary must not be. AC17 is P5's, because it needs a card. P2 builds 
 every member offline, the room shows the stubs, where the session lives and when each member was
 last seen. The box waits for the card.
 
+**P2a, the member's store, as built.** The store and its one writer can now do everything a member
+does with what it is sent. Nothing sends them anything yet: no frame, no server change, and no caller
+outside tests until the join (P2c), the stream (P2d), the purge (P2g) and an archive replica's search
+(P2i). A device's own appends pass the same floor and `purged` checks, and P1 creates neither, so a
+running device behaves as before.
+
+| Piece | Where | What its tests pin |
+|---|---|---|
+| apply | `Store::apply` (`crates/hive-node/src/store.rs:247`); on the writer, `StoreHandle::apply` (`agents/roomlerd/src/hive/store.rs:246`) | the envelope is kept byte for byte, so the member ends on the primary's `(seq, hash)`; a gap, a broken link, a stale fence, the floor and `purged` are each refused, with nothing kept or indexed; the answer comes once it is committed; it reaches the live feed once it lands, and never when refused |
+| the floor | table `floors`; `Store::raise_floor` (`:328`, it only rises) and `floor`; `check_next_with_floor` (`crates/hive-node/src/chain.rs:181`) for `append` and `apply` alike, `check_next` unchanged | an older fence is refused before any event of the new one exists, and before a session's first event; the device's own append is refused the same way; with no floor the check is exactly `check_next` |
+| the divergent tail | table `divergent`; `Store::set_aside_after` (`:357`) | an older fence's tail leaves `events` and the index, kept as it was, and the event at `seq` is the tip again; a tail holding the floor's fence or a newer one is refused and nothing moves; nothing moves without a floor |
+| blobs | tables `blobs` (named by BLAKE3) and `blob_refs` (which sessions hold each); `put_blob`, `put_named_blob`, `get_blob`, `has_blob` (`:442`–`:530`); at most 64 MiB each | the name is computed from the bytes; a peer's bytes sent under another name are kept under neither; a damaged blob is an error when read, and the right bytes mend it; a session reads only the blobs it holds |
+| purged ids | table `purged` (`session`, `purged_ms`); `Store::purge` (`:638`) also removes the floor, the set-aside tail, the session's blob references and every blob no other session holds; `is_purged` | an append, an apply, a floor, a set-aside or a blob for a purged session is refused `purged`, a stream replayed from seq 1 included; the first purge's time is kept |
+| the writer | `Member` (`agents/roomlerd/src/hive/store.rs:71`): apply, the floor raised and read, a set-aside, a blob put, read and checked, purge, `is_purged`, search; each answered on a oneshot with the store's own error (`WriterError`) | search covers only the sessions named, and an empty list finds nothing. These tests run on Linux, macOS and Windows CI (`hive::`) |
+
+⚠️ The four tables are new (`P2A_TABLES`, `store.rs:80`), each made only when missing, and
+`user_version` stays 1 (`:49`). `a_daemon_from_before_p2a_reads_what_p2a_wrote` runs P0a's own
+statements, frozen, on a store P2a wrote: every event is served, the chain checks, search finds
+nothing set aside or purged, the old daemon appends, and P2a then finds its floor, tail, blob and
+purged id again. `origin/master`'s own crate did the same once, outside CI.
+
+Blobs are kept per session, which the design leaves open: a purge must know which blobs are a
+session's (a history chunk is the conversation), and a member serving one session's blob must not
+hand out another's.
+
+⚠️ "Committed" is SQLite's WAL with `synchronous = NORMAL`: an acked event survives a daemon crash,
+not a power cut, so the tip a member reports after a restart is what counts.
+
+⚠️ Open for P2e, found while building P2a. A raised floor refuses every event of an older fence,
+that fence's own history included. Three members still need such events: one behind the drained tip
+when its floor rises (an offline member gets its floor before anything else), one joining a promoted
+session with its floor raised, and one whose tail was set aside to a checkpoint before the promotion
+point. Each would be refused for good. P2e must either raise the floor together with the drained tip,
+so that an older fence is refused only past it, or raise a lagging member's floor only once it holds
+that tip. A viewer following a copy whose tail is set aside keeps a cursor past the new tip and would
+skip the new events, so its grant must end there.
+
 ### 3c. Chat and the viewer peer
 
 A session is a `Secret` room with a generic `binding = {module, ref}`; turns are stub messages by an
@@ -1234,7 +1271,7 @@ What each rule is, and where it lives:
 | P1 | sessions in chat: drivers and composer modes, renderers, approvals via `--permission-prompt-tool`, notifications without content, a virtualized list; Windows (console user) and macOS; updater deferral; `adopt`; core memory from a hand-curated brain | org flag `hive.enabled` | — |
 | P2 | the replicaset (§3b "P2 — the replicaset, as designed"): replication, membership policy, archive replicas, promotion, teleport, path map, resume note, fork, purge tombstones, full-text search on archive replicas | `hive.replicaset = false` (every session lives on its primary alone, as in P1); device `hive_replica = false` | — |
 | P2-0 | the replicaset's design (§3b "P2 … as designed"): what a member holds and what the primary streams; the carrier (Hive's own grants over tunnel-core's QUIC ladder: direct, TURN/UDP, TURNS/443, `quic-derp-v1`); what the server learns (each member's own tip); placement and decision 2's defaults; the archive image and decision 1; promotion and what stops two primaries; teleport, fork, the resume note; purges and retention; AC22–AC26 | docs only | **merged** #1924 `c6f4c03b2` |
-| P2a | the member's store: a received envelope applied through the chain's check; the fence floor; an older fence's tail set aside, never the floor's; content-addressed blobs; purged ids kept; search and purge on the daemon's writer; new tables only, `user_version` still 1, so a rolled-back daemon opens the store | nothing sends it a frame | — |
+| P2a | the member's store (§3b "P2a … as built"): a received envelope applied through the chain's check; the fence floor; an older fence's tail set aside, never the floor's; content-addressed blobs; purged ids kept; search and purge on the daemon's writer; new tables only, `user_version` still 1, so a rolled-back daemon opens the store | nothing sends it a frame | in review #1930 |
 | P2b | checkpoints as the account: `roomlerd hive-checkpoint` at each turn's end (the history's new bytes, a commit through a temporary index and its thin pack, the config allowlist) and `roomlerd hive-materialize` (the reverse, the tree id checked, Windows' name and length refusals), on Unix and as the console user on Windows; the `checkpoint` event; first, the zero-spend probes of Claude Code | taken only for a session the server joined as replicated (P2c) | — |
 | P2c | membership and placement: `hive_policies` with decision 2's defaults; the candidates (the owner's own devices by `enrolled_by` and `owner_user_id`, and designated archive replicas), restricted tags that only narrow, never an ephemeral device or a secondary org; `agent_sessions.replicaset`; `rc:hive.replica.join` · `join_ack` · `tip` · `manifest`; `RpcCap::HiveReplica` and `HiveArchive`; the device's `hive_replica`, `hive_archive` and `hive_store_quota`, never pushable and in the lock test; core's `agent_updated` hook (a device's tags or owner changed) | `hive.replicaset = false`; device `hive_replica = false` | — |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
