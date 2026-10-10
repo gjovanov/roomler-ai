@@ -95,6 +95,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 17 | 10-01 | The Actions budget set to $10 (the operator): above the free 10 GB the pool had been **read-only** since the 20 GB raise. And the profiles job's SFU build deps (cmake + libclang) come from the lanes' cached apt sets instead of a raw `apt-get` against the mirror | #1805 |
 | 18 | 10-01 | The macOS desktop companion builds in a parallel job (`build-macos-companion`, its own seed family `agent-macos-companion`) instead of serially at the end of `build-macos`, which collects the binary where it used to build it | #1804 |
 | 19 | 10-01 | The release Linux x86_64 job installs every package from one cached apt set (`release-linux-u2204-v1`, the master rehearsal saves it, tags restore it) instead of three raw `apt-get` steps against the mirror | #1806 |
+| 20 | 10-06 | The Linux desktop companion builds in a parallel job (`build-linux-companion`, its own seed family `agent-linux-companion`, the SAME cached apt set as `build-linux`) instead of serially at the end of `build-linux`, the Linux twin of wave 18 | #1938 |
 
 ## Acceptance criteria
 
@@ -137,16 +138,30 @@ itself on the affected run's page. Baseline when the program started: releases t
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
-- The warm Windows floor now includes per-release workspace rebuilds (`version.workspace`
-  bump invalidates every crate) under the size-optimized `cgu=1` profile, plus Azure
-  signing steps. If normal-delta tags still exceed 10 min: relax `cgu=1` in CI (undoes
-  part of P3e's size wins), decouple the per-release version bump (touches self-update
-  identity), or paid 8-core runners. **Measured 2026-10-01, now that macOS and Linux are
-  off the critical path (waves 18–19): they do** (agent-v0.4.115, 14.9 min). The MSI job
-  is the pole (9.2–14.9 min across 12 tags), and most of it is ONE crate: `roomlerd`'s
-  final compile, single-threaded under `cgu=1`, swings 349–586 s with the runner on
-  identical code. Every remaining lever is one of the three above, and each is an
-  operator decision.
+- The warm Windows floor is the per-release rebuild of every path crate under the
+  size-optimized `cgu=1` profile, plus Azure signing steps. **Measured 2026-10-01, now
+  that macOS and Linux are off the critical path (waves 18–19):** normal-delta tags still
+  exceed 10 min (agent-v0.4.115, 14.9 min). The MSI job is the pole (9.2–14.9 min across
+  12 tags), and most of it is `roomlerd`'s own compile. Three levers were proposed:
+  relax `cgu=1`, decouple the per-release version bump, or pay for 8-core runners. The
+  2026-10-06 probe (log) narrowed them to one:
+  - **Decoupling the version bump cannot help.** The path crates rebuild because the
+    checkout gives every source file a newer mtime than the seed's dep-info, not because
+    of the version. A rehearsal on the SAME commit as its seed rebuilt all 19 of them, and
+    cargo's fingerprint log names the cause for each: `StaleItem(ChangedFile { stale:
+    <source>, … })`, at an identical 0.4.116.
+  - **Bigger runners cannot help on their own.** Under `cgu=1` the compile runs on one
+    core, so extra cores sit idle. The runner is an AMD EPYC 7763 with **2 physical cores
+    (4 threads)**, and Defender real-time scanning is already off (exclusions `C:\`,
+    `D:\`), so that is not a lever either.
+  - **`codegen-units` for `roomlerd` alone is the one real lever, and it buys ~2 min:**
+    roomlerd's lib + bin took 355 → 244 s (`cgu=4`, −31%) on one runner and 496 → 358 s
+    (−28%) on another; `cgu=16` was no better than 4, and `opt-level=2` at `cgu=1` saved
+    nothing. Its size cost on the shipped binary is not yet measured. The bin (`main.rs`)
+    alone takes 100–230 s after the lib, much of it plausibly the lib's generics
+    monomorphized again, since release builds don't share generics across crates. Moving
+    `main.rs` into the lib is the structural candidate, unmeasured. Runner variance is
+    ±40% on identical work.
 - Runner-pool queue time is outside repo control (observed 35–70 min during bursts);
   rehearsal concurrency caps our own contribution. A self-hosted Windows runner is the
   reserve option.
@@ -372,3 +387,30 @@ itself on the affected run's page. Baseline when the program started: releases t
   - Fleet uptake at 23:25Z: 1 of 8 online devices on 0.4.115 (zeus, updated by hand);
     the rest follow their updaters (~4 h, the Mac's helper ~6 h). 0.4.115 changes nothing
     a device runs, so uptake proves the artifacts, not a behaviour.
+- 2026-10-06: **wave 20 rehearsal** (run 37538752420, `publish_release=false` on the
+  branch). Every job green. `build-linux-companion` built cold in 7.4 min ("no
+  seed-agent-linux-companion-Linux-X64 seed yet"), published its family (447 MB target +
+  70 MB cargo), and restored the same apt entry as `build-linux`
+  (`cache-apt-pkgs_c4273460…`) with no fallback. `build-linux` took 9.1 min including a
+  69 s seed save that tag builds skip, so about 8.0 min on a tag, against 10.8 on
+  agent-v0.4.116 and 10.2 on the master rehearsal before it (37237655417).
+- 2026-10-06: **the codegen probe** (branch `ci/fr6-cgu-probe`, never merged, run
+  37539178203). It restored the release lane's Windows seed read-only and rebuilt
+  `roomlerd` once per variant on one machine, two machines in opposite orders. lib + bin
+  seconds:
+
+  | Variant | Runner A | Runner B |
+  |---|---|---|
+  | `cgu=1` (as released) | 355 (repeat: 354) | 496 |
+  | `cgu=4` | 244 | 358 |
+  | `cgu=16` | 258 | 384 |
+  | `cgu=1`, `opt-level=2` | 369 | 502 (repeat: 502) |
+
+  The bin alone took 100–230 s after the lib. Build 1 also logged cargo's fingerprint
+  reasons: every path crate was `StaleItem(ChangedFile)` (checkout mtime newer than the
+  seed's dep-info) at the seed's own version, which retires "decouple the version bump" as
+  a lever. Runner facts: AMD EPYC 7763, 2 cores / 4 threads, Defender real-time
+  protection off with `C:\` and `D:\` excluded. The first attempt (run 37537408392) built
+  green in 10m35s and then died on its own `grep`: GitHub runs `bash -e -o pipefail`, and
+  `dtolnay/rust-toolchain` sets `CARGO_TERM_COLOR=always`, so an anchored grep over the
+  log matched nothing.
