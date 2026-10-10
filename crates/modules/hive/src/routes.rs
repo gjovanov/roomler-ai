@@ -114,6 +114,10 @@ pub(crate) fn device_refusal_message(word: &str) -> &'static str {
         "harness_missing" => "the agent harness is not installed on the device",
         "launch_failed" => "the device could not start the agent harness",
         "at_capacity" => "the device is already running as many sessions as it allows",
+        "passwordless_sudo" => {
+            "the account the device would run you as may use sudo without a password, which \
+             would give the agent root (hive_allow_passwordless_sudo)"
+        }
         _ => "the device refused the session",
     }
 }
@@ -694,11 +698,18 @@ mod tests {
         assert_eq!(words.len(), all.len());
     }
 
-    /// A device word this build does not know still reads as a refusal.
+    /// Every word the device can send has its own message, and a word this
+    /// build does not know still reads as a refusal.
     #[test]
     fn every_device_refusal_has_a_message() {
-        for r in roomler_ai_remote_control::hive::HiveRefusal::ALL {
-            assert!(!device_refusal_message(r.as_str()).is_empty());
+        use roomler_ai_remote_control::hive::HiveRefusal;
+        let fallback = device_refusal_message("from_2027");
+        for r in HiveRefusal::ALL {
+            let m = device_refusal_message(r.as_str());
+            assert!(!m.is_empty());
+            if r != HiveRefusal::Other {
+                assert_ne!(m, fallback, "{r:?} has no message of its own");
+            }
         }
         assert_eq!(
             device_refusal_message("from_2027"),

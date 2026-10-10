@@ -5419,6 +5419,9 @@ mod tests {
             // FR-90 P1j — whether this machine reports on its terminals at
             // all (decision 11): the device owner's alone.
             "hive_adopt",
+            // FR-90 decision 15 — whether an agent on a Mac may be root; a
+            // server that could set it could give itself root on the device.
+            "hive_allow_passwordless_sudo",
         ] {
             assert!(
                 !keys.contains(&forbidden),

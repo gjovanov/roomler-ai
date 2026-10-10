@@ -898,6 +898,14 @@ impl Supervisor {
             Ok(s) => s.clone(),
             Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e.clone()),
         };
+        // Decision 15 — on a Mac, an account whose `sudo` needs no password
+        // gives its session root, whatever groups the session drops.
+        if matches!(self.launcher, Launcher::AsMappedAccount)
+            && let Err((r, detail)) =
+                super::sudo::gate(&account, self.cfg.allow_passwordless_sudo).await
+        {
+            return Answer::refused(r, detail);
+        }
         // P0e — with a model credential configured, the harness reaches the
         // provider only through the loopback sidecar, with a session token;
         // the key itself never enters the session.
@@ -3204,6 +3212,7 @@ done
             update_wait: super::gates::DEFAULT_UPDATE_WAIT,
             core_memory: false,
             adopt: false,
+            allow_passwordless_sudo: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();

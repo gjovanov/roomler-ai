@@ -434,6 +434,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - let the people who use this device adopt the Claude Code sessions they run in a terminal (roomler hive adopt): mirrored into this device's store and shown to their owner alone, read-only. Each person still opts in, and their account must map in hive_accounts. Never settable by the server. Default: OFF.",
     },
     KeyMeta {
+        key: "hive_allow_passwordless_sudo",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - macOS: run agent sessions as an account whose sudo needs no password. Off, such a start is refused: macOS's sudo reads the account's groups from the directory, so the session would have root whatever groups it drops. No effect on Linux, where a session cannot sudo at all. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1715,6 +1723,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_update_wait_secs" => cfg.hive_update_wait_secs.map(|n| n.to_string()),
         "hive_core_memory" => Some(fmt_bool(cfg.hive_core_memory)),
         "hive_adopt" => Some(fmt_bool(cfg.hive_adopt)),
+        "hive_allow_passwordless_sudo" => Some(fmt_bool(cfg.hive_allow_passwordless_sudo)),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -1983,6 +1992,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // owner's choice to let updates cut turns at once.
         "hive_core_memory" => cfg.hive_core_memory = parse_bool_or(value, false)?,
         "hive_adopt" => cfg.hive_adopt = parse_bool_or(value, false)?,
+        "hive_allow_passwordless_sudo" => {
+            cfg.hive_allow_passwordless_sudo = parse_bool_or(value, false)?
+        }
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -3894,6 +3906,23 @@ mod tests {
         apply(&mut cfg, "hive_adopt", None).unwrap();
         assert!(!cfg.hive_adopt, "cleared is off");
         assert!(apply(&mut cfg, "hive_adopt", Some("sometimes")).is_err());
+    }
+
+    /// FR-90 decision 15 — a Mac session as an account whose `sudo` needs no
+    /// password is the device owner's to allow: off until they say so, and
+    /// off again when cleared.
+    #[test]
+    fn hive_allow_passwordless_sudo_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.hive_allow_passwordless_sudo);
+        let e = entry_for(&cfg, "hive_allow_passwordless_sudo").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        apply(&mut cfg, "hive_allow_passwordless_sudo", Some("true")).unwrap();
+        assert!(cfg.hive_allow_passwordless_sudo);
+        apply(&mut cfg, "hive_allow_passwordless_sudo", None).unwrap();
+        assert!(!cfg.hive_allow_passwordless_sudo, "cleared is off");
+        assert!(apply(&mut cfg, "hive_allow_passwordless_sudo", Some("yes-ish")).is_err());
     }
 
     /// FR-90 — what `config set` refuses for the Hive keys, so a typo is a
