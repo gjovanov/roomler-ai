@@ -310,9 +310,11 @@ jobs:
         # its own libvpx; libvpx 1.16.x changes the header-include order in a
         # way that triggers a known bindgen forward-declaration bug, so do not
         # bump beyond apt's version here. xcb + alsa for capture and audio; the
-        # GTK/WebKit + ayatana set for the desktop companion further down;
+        # GTK/WebKit + ayatana set for the desktop companion, which builds in
+        # build-linux-companion from this same cached set (FR-6 wave 20);
         # patchelf for the FFmpeg bundling step. Bump `version:` whenever this
-        # list changes.
+        # list changes, in BOTH jobs: they must stay byte-identical to share one
+        # cache entry.
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
@@ -684,16 +686,128 @@ jobs:
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
 
-      # FR-27 — the Linux desktop companion, as a SEPARATE package.
-      #
-      # Until now `roomler-desktop` shipped for Windows and macOS only
-      # (`install.sh` said so out loud), which meant a Linux desktop had no
-      # consent prompt and no "being viewed" indicator at all — the daemon's
-      # native overlay is Windows-only. It already COMPILED on Linux (workspace
-      # clippy in ci.yml walks it with webkit2gtk installed); only packaging
-      # was missing. Its GTK/WebKit + ayatana build deps come from the cached
-      # apt set at the top of this job (FR-6 wave 19): they used to be a raw
-      # `apt-get` here, which spent 512 s in the mirror stall of 2026-10-01.
+      # The desktop companion's .deb (FR-27) is built by build-linux-companion,
+      # in parallel with this job (FR-6 wave 20).
+
+      # Distro-agnostic path for hosts with no dpkg/apt — see
+      # docs/linux-self-update.md. Free here: the payload is already staged
+      # for cargo-deb, so this is a tar over the same tree.
+      - name: Stage the universal tarball
+        id: tar
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          sh scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
+          echo "artifact=roomlerd-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: |
+            ${{ steps.pack.outputs.artifact }}
+            ${{ steps.pack.outputs.artifact }}.sha256
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+          retention-days: 30
+
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-linux
+
+  # ---------------------------------------------------------------------------
+  # 1a. Linux x86_64 desktop companion (FR-27) — its own .deb, in parallel.
+  #
+  # FR-6 wave 20 (#773): this built at the END of build-linux, after the
+  # agent, and added 131-142 s to the critical path of every release
+  # (agent-v0.4.115/0.4.116), the Linux twin of what wave 18 moved off the
+  # macOS job. The companion shares nothing with the agent's build: it links
+  # GTK/WebKit, not FFmpeg or libvpx, and packages separately. The release job
+  # flattens every artifact by extension, so this .deb reaches the Release by
+  # the same path it always took.
+  # ---------------------------------------------------------------------------
+  build-linux-companion:
+    name: Build desktop companion .deb (Linux x86_64)
+    needs: validate-version
+    # 22.04 for the same glibc reason as build-linux (see there).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure apt retries and refresh the index
+        # See build-linux: a stale index makes the cached step below install
+        # nothing and still report success.
+        run: |
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+
+      - name: Install system build deps (cached apt)
+        # ⚠️ Byte-identical `packages` and `version` to build-linux, so both
+        # jobs restore ONE cache entry and this job never meets the mirror on
+        # its own (FR-6 wave 19). The companion uses only the GTK/WebKit +
+        # ayatana part; the rest costs nothing on a cache hit.
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
+          version: release-linux-u2204-v1
+
+      - name: Verify the companion's build deps landed (fallback to apt-get)
+        # Same shape as build-linux's guard, narrowed to what this build
+        # consults: pkg-config modules, never the action's status or dpkg.
+        run: |
+          set -euo pipefail
+          pkgs="pkg-config libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev"
+          check() {
+            sudo ldconfig
+            for m in glib-2.0 gtk+-3.0 libsoup-3.0 javascriptcoregtk-4.1 webkit2gtk-4.1 ayatana-appindicator3-0.1; do
+              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
+            done
+          }
+          if ! check; then
+            echo "::warning::the cached apt set did not deliver the companion's build deps; installing directly"
+            sudo apt-get update -qq
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $pkgs
+          fi
+          check || { echo "::error::companion build deps still missing after the fallback install"; exit 1; }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Its OWN family: the agent-linux seed stops carrying the companion's
+        # artifacts now that build-linux no longer builds it. Same scheme as
+        # every other lane (see build-linux and .github/actions/seed-cache-restore).
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: agent-linux-companion
+
+      - name: Install cargo-deb
+        # Idempotent, as in build-linux: the seed restores ~/.cargo/bin with
+        # the tool already present, and a plain `cargo install` errors on it.
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+
+      # FR-27: until the companion shipped here, a Linux desktop had no consent
+      # prompt and no "being viewed" indicator at all (the daemon's native
+      # overlay is Windows-only).
       - name: Build the desktop companion
         run: cargo build -p roomler-desktop --release
 
@@ -718,47 +832,25 @@ jobs:
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
 
-      # Distro-agnostic path for hosts with no dpkg/apt — see
-      # docs/linux-self-update.md. Free here: the payload is already staged
-      # for cargo-deb, so this is a tar over the same tree.
-      - name: Stage the universal tarball
-        id: tar
-        run: |
-          set -euo pipefail
-          version="${{ needs.validate-version.outputs.version }}"
-          sh scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
-          echo "artifact=roomlerd-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-deb
+          name: linux-companion-deb
           path: |
-            ${{ steps.pack.outputs.artifact }}
-            ${{ steps.pack.outputs.artifact }}.sha256
             ${{ steps.pack_desktop.outputs.artifact }}
             ${{ steps.pack_desktop.outputs.artifact }}.sha256
-            ${{ steps.tar.outputs.artifact }}
-            ${{ steps.tar.outputs.artifact }}.sha256
+          if-no-files-found: error
           retention-days: 30
 
       - name: Save cargo seed (new lockfile generation)
-        # always(): preserves cache-on-failure semantics -- a rehearsal
-        # that builds and then dies later must still seed (the 07-28
-        # incident). Non-tag only: tag-ref saves are unrestorable dead
-        # weight. A same-lockfile twin save loses the reservation and
-        # warns -- harmless.
+        # always() and non-tag only, for the reasons on build-linux's save.
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
-        # GH_TOKEN powers the action's generation-retirement step (keeps
-        # the 2 newest generations of this family, deletes the rest) —
-        # without it, generations piled to 9.5 GB in a day and LRU evicted
-        # the CI lane's caches instead (run 32198738776).
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: agent-linux
+          shared-key: agent-linux-companion
 
   # ---------------------------------------------------------------------------
   # 1b. Linux aarch64 — the same .deb for arm64 hosts.
@@ -3092,7 +3184,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -3231,12 +3323,13 @@ jobs:
       always() &&
       needs.validate-version.outputs.is_release == 'false' &&
       (needs.build-linux.result == 'failure' ||
+       needs.build-linux-companion.result == 'failure' ||
        needs.build-linux-arm64.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.build-windows-companions.result == 'failure' ||
        needs.build-macos-companion.result == 'failure' ||
        needs.build-macos.result == 'failure')
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -3292,12 +3385,13 @@ jobs:
       always() &&
       needs.validate-version.outputs.is_release == 'false' &&
       needs.build-linux.result == 'success' &&
+      needs.build-linux-companion.result == 'success' &&
       needs.build-linux-arm64.result == 'success' &&
       needs.build-windows.result == 'success' &&
       needs.build-windows-companions.result == 'success' &&
       needs.build-macos-companion.result == 'success' &&
       needs.build-macos.result == 'success'
-    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
