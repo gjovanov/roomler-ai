@@ -89,6 +89,7 @@ mod sudo;
 mod supervisor;
 mod toolbelt;
 pub mod view;
+mod workspace;
 
 #[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
