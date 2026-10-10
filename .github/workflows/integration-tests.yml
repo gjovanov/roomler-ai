@@ -370,3 +370,9 @@ jobs:
           name: integration-log
           path: /tmp/itest.log
           retention-days: 7
+
+      # FR-6 wave 21 (#773): the job's LAST step, so the cache family saves
+      # without the crate archives every family used to duplicate.
+      - name: Trim the cargo cache before it is saved
+        if: always()
+        uses: ./.github/actions/cargo-cache-trim

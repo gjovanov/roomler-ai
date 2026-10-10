@@ -1,0 +1,33 @@
+name: cargo-cache-trim
+description: >-
+  FR-6 wave 21 (#773): drop the downloaded `.crate` archives from
+  `$CARGO_HOME/registry/cache` before Swatinem/rust-cache's post step saves the
+  job's cache family. Use it as a job's LAST step, with `if: always()`: a lane
+  with `cache-on-failure` saves after a failure too.
+  Why: every family carried its own copy of the whole lockfile's crate
+  downloads (179 MB for the 1,186 packages of 2026-10-09), so the 12 families
+  held ~2.1 GB of identical archives, a fifth of the free 10 GB pool this repo
+  has to fit in. Cargo re-downloads them from crates.io at the start of the next
+  run, in seconds. Nothing rebuilds because of it: compiled registry
+  dependencies are fingerprinted by package version, not by the archive, and
+  rust-cache keeps the EXTRACTED sources of `-sys` crates (their build scripts
+  watch directory mtimes, which a re-extraction would bump).
+  Only the files go; the directories stay, so rust-cache's own registry cleanup,
+  which scans them, finds them empty rather than missing.
+
+runs:
+  using: composite
+  steps:
+    - name: Drop the crate archives from the cargo cache family
+      shell: bash
+      run: |
+        dir="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+        # Windows runners hand bash a `C:\...` CARGO_HOME.
+        if command -v cygpath >/dev/null 2>&1; then dir=$(cygpath -u "$dir"); fi
+        if [ ! -d "$dir" ]; then
+          echo "no $dir: nothing to trim"
+          exit 0
+        fi
+        before=$(du -sm "$dir" 2>/dev/null | cut -f1)
+        find "$dir" -type f -name '*.crate' -delete
+        echo "dropped ${before:-?} MB of .crate archives; this job's cache family saves without them"

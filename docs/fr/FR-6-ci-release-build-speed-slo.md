@@ -96,6 +96,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 18 | 10-01 | The macOS desktop companion builds in a parallel job (`build-macos-companion`, its own seed family `agent-macos-companion`) instead of serially at the end of `build-macos`, which collects the binary where it used to build it | #1804 |
 | 19 | 10-01 | The release Linux x86_64 job installs every package from one cached apt set (`release-linux-u2204-v1`, the master rehearsal saves it, tags restore it) instead of three raw `apt-get` steps against the mirror | #1806 |
 | 20 | 10-06 | The Linux desktop companion builds in a parallel job (`build-linux-companion`, its own seed family `agent-linux-companion`, the SAME cached apt set as `build-linux`) instead of serially at the end of `build-linux`, the Linux twin of wave 18 | #1938 |
+| 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and master's working set cut to fit it: no family carries the crate archives (`cargo-cache-trim`, the last step of all 14 rust-cache jobs), and the plain recorder lane restores `recorder-audio`'s family | #1939 |
 
 ## Acceptance criteria
 
@@ -127,6 +128,9 @@ itself on the affected run's page. Baseline when the program started: releases t
       `…-4829dd40`, a prefix restore), while every other salted job restored master's key
       with a full match (run 36907082419)
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
+- [ ] **No cache write depends on the Actions budget** (wave 21): the limit is the free 10
+      GB, master's working set fits it with room for a family's rotation (≤ ~8.5 GB
+      steady), and master runs save with no "Cache reservation failed" warning
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       **not met.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
       waves 18 and 19, whose agent code is 0.4.114's) took **14.9 min**: Windows MSI
@@ -179,10 +183,22 @@ itself on the affected run's page. Baseline when the program started: releases t
   answered 402 until the account had a payment method). ⚠️ The limit alone was not
   enough: with the Actions budget at its default, the pool above the free 10 GB was
   read-only from 09-28 21:37Z until the operator set a $10 budget on 10-01 (log).
-  Trimming families (e.g.
-  `recorder` + `recorder-audio` sharing one) stays in reserve. The registry copy each
-  family carries is only ~167 MB for the whole lockfile, so deduplicating it is not
-  the lever.
+  **Reversed 2026-10-10 by wave 21: back to the free 10 GB, and master's working set cut
+  to fit it.** The budget (by then $20) is the ACCOUNT's, and the private `lgr` repository's
+  hosted minutes exhausted it on 10-07 (6,667 weighted minutes on October 1–9 against
+  2,000 included; macOS 57% of it). The pool went read-only again on 2026-10-09 ("Cache
+  reservation failed: You have reached your configured budget"), so every lane restored
+  an ever-older generation, though roomler-ai's own share of the bill was ~1 GB of
+  storage. A paid tier that another repository can switch off is not a design. Wave 21
+  takes the two cuts this paragraph once held in reserve. ⚠ The reasoning that dismissed
+  the first was wrong. "Only ~167 MB" holds per family, but the copy is in EVERY family:
+  179 MB (1,186 packages) × 12 ≈ 2.1 GB, a fifth of the pool.
+  `.github/actions/cargo-cache-trim` drops the `.crate` archives before each save. The
+  plain recorder lane restores `recorder-audio`'s family and keeps none of its own (~600
+  MB). `cargo tree` resolves the two TEST graphs to identical features for every shared
+  crate. The lane's non-test `cargo build` still rebuilds tokio and ~25 dependents, in a
+  variant without dev-dependency features that the audio lane never builds. That cost was
+  within master's range (log).
 - **Resolved by wave 16 (merged 09-29, field-verified 10-01): a new CI step's dependency builds
   stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
   open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
@@ -414,3 +430,44 @@ itself on the affected run's page. Baseline when the program started: releases t
   green in 10m35s and then died on its own `grep`: GitHub runs `bash -e -o pipefail`, and
   `dtolnay/rust-toolchain` sets `CARGO_TERM_COLOR=always`, so an anchored grep over the
   log matched nothing.
+- 2026-10-09/10: **the paid cache tier went read-only again; wave 21.**
+  - The pool was read-only: master CI run 37904595751's lint lane restored a stale
+    generation (`full match: false`), then `Cache reservation failed: You have reached your
+    configured budget, your cache is now read only to prevent additional charges`. The pool
+    held 11.48 GB in 16 entries against the 20 GB limit.
+  - The budget went elsewhere. roomler-ai's minutes are free (public repository), and its
+    storage was ~1 GB over the free tier. The private `lgr` repository's hosted jobs on
+    October 1–9, from the jobs API (the run-timing API's `billable` field now reads 0 for
+    every run, private ones included, so it measures nothing): Linux 1,895 min, Windows 491,
+    macOS 379. That is 6,667 weighted minutes against 2,000 included, macOS 57% of them, and
+    one Linux release job hung for 361 minutes. lgr's own fixes are lgr#125, which made macOS
+    and Windows on-demand, and lgr#126 (a self-hosted runner, and a 90 min cap on the
+    release build).
+  - Same day: the limit went back to 10 GB (`PUT …/actions/cache/storage-limit
+    max_cache_size_gb=10`, read back as `{"max_cache_size_gb":10}`).
+  - The family sizes the cuts were planned from (MB): unit 2148, lint 1585, agent 846,
+    macos-pkg-smoke 813, profiles 796, macos-overlay 760, windows-recorder 728,
+    recording-ffmpeg 693, ffmpeg-encoder 651, recorder-audio 594, recorder 573,
+    windows-clippy 417, plus apt and bun 333. The crate archives in master's lockfile total
+    179 MB (1,186 packages), and every family holds them.
+  - rust-cache's `cleanRegistry` (v2) keeps the extracted sources of `-sys` crates. A
+    re-extraction would bump directory mtimes that their build scripts watch. So the trim
+    deletes only the `.crate` files and keeps the directories, which that cleanup scans.
+  - `cargo tree -p roomlerd -e normal,build,dev --target x86_64-unknown-linux-gnu`: the plain
+    recorder graph and the `+audio` graph differ in roomlerd itself and 7 audio-only crates
+    (alsa, alsa-sys, audiopus, audiopus_sys, cmake, cpal, dasp_sample), and in nothing else.
+    ⚠ That comparison covered the TEST graphs only. On the PR (run 38081437008) the plain
+    lane restored `v0-rust-ci-recorder-audio-…` and still compiled 40 crates against
+    master's 15. The extra 25 (tokio, hyper, reqwest, quinn, openssl, webrtc-dtls, …) are
+    the variant its non-test `cargo build -p roomlerd` needs: resolver v2 unifies no
+    dev-dependency features there, and the audio lane never builds it. The lane took 273 s
+    against 221–295 s over master's last six runs, off the CI critical path. The trim logged
+    `dropped 183 MB of .crate archives`.
+  - The 10 GB limit alone already made saves land again. Master run 38080443848 saved
+    `ci-recorder-audio` (`Sent 623761050 of 623761050 (100.0%)`), most families had fresh
+    entries from 19:24–19:54Z, and no budget warning appeared. But LRU evicted
+    `ci-unit` and `ci-lint` at once: two families absent from the 10-09 measurement
+    (`ci-integration` 1,124 MB and `installer-smoke-windows` 594 MB) make the full working
+    set ~13.4 GB, not 10.9. By that arithmetic wave 21's cuts leave ~10.4 GB, still over
+    the limit. The next cut is sized from the first master run's measured families, not
+    from this estimate.
