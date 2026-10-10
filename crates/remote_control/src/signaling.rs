@@ -2202,6 +2202,22 @@ pub enum ServerMsg {
         request_id: String,
     },
 
+    /// FR-92 — this org's standing keep-busy policy. Sent on EVERY connect
+    /// (both ways, so a re-allow made while the device was offline clears
+    /// its persisted deny) and again whenever an org admin changes it.
+    ///
+    /// The device enforces it: the strictest of every org it is enrolled in
+    /// wins, a deny stops a keep busy already running, and the last value is
+    /// persisted so it holds at boot, before the device reconnects. The
+    /// server can only ADD a deny this way — `keep_busy_enabled` on the
+    /// device stays the owner's, and absent from `DesiredConfig`.
+    ///
+    /// ⚠️ Cap-gated on `AgentCaps.input` containing `keep-busy` (equality):
+    /// a pre-FR-92 agent cannot parse the tag and logs every unknown `rc:*`
+    /// frame at WARN.
+    #[serde(rename = "rc:agent.keep_busy_policy")]
+    KeepBusyPolicy { denied: bool },
+
     /// Multi-org — join an ADDITIONAL org from the admin UI ("Add to another
     /// organization"), so a device that can't be reached for a hands-on
     /// `roomler enroll` still gets a second enrollment.
@@ -6199,6 +6215,26 @@ mod tests {
         match serde_json::from_str::<ServerMsg>(&serde_json::to_string(&m).unwrap()).unwrap() {
             ServerMsg::KeyRotate { request_id } => assert_eq!(request_id, "req-1"),
             other => panic!("expected KeyRotate, got {other:?}"),
+        }
+    }
+
+    /// FR-92 — the org policy frame is exactly `{t, denied}`, both ways.
+    /// It can only carry a deny; a field that could turn keep busy ON from
+    /// the server would make it a server-forgeable input path.
+    #[test]
+    fn keep_busy_policy_frame_is_pinned() {
+        for denied in [true, false] {
+            let m = ServerMsg::KeepBusyPolicy { denied };
+            let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+            assert_eq!(v["t"], "rc:agent.keep_busy_policy");
+            assert_eq!(v["denied"], denied);
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["denied", "t"], "{v}");
+            match serde_json::from_str::<ServerMsg>(&v.to_string()).unwrap() {
+                ServerMsg::KeepBusyPolicy { denied: d } => assert_eq!(d, denied),
+                other => panic!("expected KeepBusyPolicy, got {other:?}"),
+            }
         }
     }
 

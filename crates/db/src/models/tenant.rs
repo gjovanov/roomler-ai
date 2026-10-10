@@ -140,6 +140,19 @@ pub struct TenantSettings {
     #[serde(default)]
     pub ephemeral_keys_enabled: bool,
 
+    /// FR-92 — the org-wide DENY for keep busy (pointer patterns a
+    /// controller can leave running on a device to keep it active). Unlike the
+    /// switches above this one is a deny, and `false` — the default, and what
+    /// every pre-feature row deserialises to — means ALLOWED: the operator's
+    /// decision is "on by default, with an org deny". Some orgs ban mouse
+    /// jigglers because they defeat a screen-lock policy; this is theirs.
+    ///
+    /// Delivered as a standing `rc:agent.keep_busy_policy` on every connect
+    /// and on change, and enforced BY THE DEVICE (the strictest of every org it
+    /// is enrolled in): a deny also stops a keep busy already running.
+    #[serde(default)]
+    pub keep_busy_denied: bool,
+
     /// FR-32 — how far plan-limit checks may go for this tenant. Defaults to
     /// `Warn`, so a pre-FR-32 tenant document deserialises into observe mode:
     /// every newly wired gate is measured and logged, and none of them refuse.
@@ -165,6 +178,7 @@ impl Default for TenantSettings {
             remote_exec_enabled: false,
             remote_ssh_enabled: false,
             ephemeral_keys_enabled: false,
+            keep_busy_denied: false,
             plan_enforcement: PlanEnforcement::default(),
         }
     }

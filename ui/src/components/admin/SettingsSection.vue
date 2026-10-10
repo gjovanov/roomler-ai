@@ -108,6 +108,43 @@
       </v-card-text>
     </v-card>
 
+    <!-- FR-92 — keep busy. Unlike the cards above this is ON by default
+         (operator decision) and the switch is the org's DENY, shown as
+         "allow" so on reads as on. The device enforces it; a deny also stops
+         a keep busy already running. -->
+    <v-card data-testid="org-keep-busy-card">
+      <v-card-title class="d-flex align-center">
+        <v-icon icon="mdi-cursor-default-gesture-outline" color="primary" class="mr-2" />
+        Keep busy
+      </v-card-title>
+      <v-card-text>
+        <p class="text-body-2 mb-3">
+          A controller with input can leave a device's pointer moving in a pattern so it stays
+          active: no screensaver, idle lock or "Away". It pauses whenever someone uses the
+          device. Some organizations do not allow this because it defeats a screen-lock policy.
+        </p>
+        <v-switch
+          :model-value="agentStore.orgKeepBusyDenied === false"
+          :loading="savingKeepBusy"
+          :disabled="savingKeepBusy || agentStore.orgKeepBusyDenied === null"
+          color="primary"
+          density="compact"
+          hide-details
+          label="Allow keep busy in this organization"
+          data-testid="org-keep-busy-switch"
+          @update:model-value="onToggleKeepBusy"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          On by default. Turning it off stops keep busy on every device in the organization,
+          immediately for devices that are online and at the next connect for the rest. A
+          device's owner can also turn it off on that device (<code>keep_busy_enabled</code>).
+        </div>
+        <v-alert v-if="keepBusyError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ keepBusyError }}
+        </v-alert>
+      </v-card-text>
+    </v-card>
+
     <!-- FR-51 gate 1. Its own card and its own server-side switch, like the
          two above: a standing credential that mints device identities is its
          own grant, not an implication of exec or SSH. -->
@@ -199,6 +236,23 @@ async function onToggleSsh(v: boolean | null) {
   }
 }
 
+// FR-92 — its own pair too. The switch shows "allow"; the server stores
+// the deny.
+const savingKeepBusy = ref(false)
+const keepBusyError = ref<string | null>(null)
+
+async function onToggleKeepBusy(allow: boolean | null) {
+  savingKeepBusy.value = true
+  keepBusyError.value = null
+  try {
+    await agentStore.setOrgKeepBusyDenied(props.tenantId, allow !== true)
+  } catch (e) {
+    keepBusyError.value = (e as Error).message
+  } finally {
+    savingKeepBusy.value = false
+  }
+}
+
 // FR-51 — its own pair, same isolation rule as exec vs SSH above.
 const savingKeys = ref(false)
 const keysError = ref<string | null>(null)
@@ -218,6 +272,7 @@ async function onToggleKeys(v: boolean | null) {
 onMounted(() => {
   void agentStore.fetchOrgExecEnabled(props.tenantId)
   void agentStore.fetchOrgSshEnabled(props.tenantId)
+  void agentStore.fetchOrgKeepBusyDenied(props.tenantId)
   void agentStore.fetchOrgEphemeralKeysEnabled(props.tenantId)
 })
 </script>
