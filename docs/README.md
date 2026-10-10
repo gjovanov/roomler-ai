@@ -51,6 +51,11 @@ flowchart TB
         UIX["ui.md"]
     end
 
+    subgraph hive["🐝 Agent sessions (Hive)"]
+        HIVE["hive.md"]
+        BRAIN["brain.md"]
+    end
+
     subgraph ops["🔧 Install & operate"]
         INST["installation.md"]
         DEP["deployment.md"]
@@ -63,9 +68,10 @@ flowchart TB
     ATA --> rd & net
     ARCH --> rd & net & collab
     ARCH --> MM
+    ARCH --> hive
     MM --> ops
     rd & net --> ops
-    rd & net & collab --> REF
+    rd & net & collab & hive --> REF
 ```
 
 ## Start here
@@ -125,6 +131,16 @@ same accounts and server.*
 |---|---|
 | [real-time.md](real-time.md) | The WebSocket surfaces: user events, presence, mediasoup signalling, the `rc:*` agent protocol, DERP |
 | [ui.md](ui.md) | Frontend map: views, stores, composables, the remote-desktop viewer, observability components |
+
+## 🐝 Agent sessions (Hive)
+
+*Coding agents on the org's own machines, watched and steered from a chat room. The
+transcript stays on the device; the server keeps the record.*
+
+| Doc | What it covers |
+|---|---|
+| [hive.md](hive.md) | Agent sessions as built through P1 (FR-90): a session as a record, a Secret room of turn stubs, and a transcript that stays on the device, read over a data-only viewer peer; who runs it on each platform (the mapped account under a root daemon on Linux and macOS, the console user at Medium integrity on Windows, where a SystemContext worker stays SYSTEM and a remote-desktop connection swaps nothing); the device's default-deny gates and who may drive; approvals over the per-session toolbelt (a Unix socket or a named pipe); the model sidecar that keeps the provider's key out of every session; restart and resume, the manifest, and what ends a harness; the update hold (the in-process updater on Linux and Windows, the root helper on macOS); `adopt` (Linux and macOS, owner-only); the `hive.tenants` org gate; platform notes (Windows' DACLs and the `FILE_READ_ATTRIBUTES` grant, macOS's `/var` link, the NGROUPS cap); what is field-verified; and P2a's member store, the first piece of P2's replicaset |
+| [brain.md](brain.md) | The brain's first layer, core memory kept by hand (FR-90 P1e): facts in three scopes (org, user, device), each with a character budget held by one conditional update, so a write that does not fit fails visibly (`409 over_budget`) and nothing is evicted; the org's brain revision, pinned by each session when it is created and rendered into a frozen snapshot; delivery in `rc:hive.memory` just before the start; the device-owned `hive_core_memory` gate, default off, and why; how the session reads the snapshot as its `CLAUDE.md` and auto-memory; and what the tests and the field run showed |
 
 ## 🔧 Install & operate
 
