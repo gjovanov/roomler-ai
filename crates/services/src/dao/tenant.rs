@@ -119,6 +119,24 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// FR-92 — the org's keep-busy DENY (`false` = allowed, the default).
+    pub async fn set_keep_busy_denied(
+        &self,
+        tenant_id: ObjectId,
+        denied: bool,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.keep_busy_denied": denied,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     /// Roomler SSH's org kill-switch (gate 1). A separate switch from
     /// [`Self::set_remote_exec_enabled`] because they are separate grants.
     pub async fn set_remote_ssh_enabled(
