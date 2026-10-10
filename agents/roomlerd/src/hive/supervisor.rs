@@ -1860,15 +1860,15 @@ impl Supervisor {
         approvals: mpsc::Sender<ApprovalEvent>,
         memory: Option<&CoreMemory>,
     ) -> Result<Spawned, (HiveRefusal, String)> {
-        // The account the session runs as: its home, the ids its toolbelt
-        // socket is handed to (`None`: it runs as the daemon), and its
-        // groups — what the kernel checks when the harness starts the relay.
+        // The account the session runs as: its home, its toolbelt socket's ids
+        // (`None`: it runs as the daemon), and the groups the SESSION holds,
+        // without its administrator groups (decision 13): what the relay needs.
         let (home, owner, uid, groups) = match &self.launcher {
             Launcher::AsMappedAccount => {
                 let home =
                     crate::exec::account_home(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
-                let (uid, gid, mut groups) =
-                    crate::exec::account_ids(account).map_err(|e| (HiveRefusal::NoAccount, e))?;
+                let (uid, gid, mut groups) = crate::exec::session_account_ids(account)
+                    .map_err(|e| (HiveRefusal::LaunchFailed, e))?;
                 groups.push(gid);
                 (home, Some((uid, gid)), uid, Some(groups))
             }
@@ -2003,12 +2003,12 @@ impl Supervisor {
             // Its own process group, so a stop reaches the tools it started.
             .process_group(0);
         match &self.launcher {
-            // The one privilege path exec, SSH and the PTY share: setgroups,
-            // setgid, setuid in the child, verified, uid 0 refused.
-            Launcher::AsMappedAccount => {
-                crate::exec::apply_run_as(&mut cmd, &crate::exec::RunAs::Named(account.to_string()))
-                    .map_err(|e| (HiveRefusal::NoAccount, e))?
-            }
+            // The one privilege path exec, SSH and the PTY share (verified,
+            // uid 0 refused), as an agent session runs (decision 13): none of
+            // the account's administrator groups, and on Linux no privilege
+            // gained by exec, so no `sudo` whatever sudoers says of it.
+            Launcher::AsMappedAccount => crate::exec::apply_session_run_as(&mut cmd, account)
+                .map_err(|e| (HiveRefusal::LaunchFailed, e))?,
             #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
             Launcher::AsDaemon { .. } => {}
         }

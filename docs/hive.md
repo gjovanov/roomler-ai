@@ -271,11 +271,27 @@ the harness, over that driver's own viewer peer.
 ### Linux and macOS
 
 The daemon runs as root, and a session runs as the account `hive_accounts` maps the
-starter to, through the one privilege path that exec, SSH and the PTY share:
-[`exec::apply_run_as`](../agents/roomlerd/src/exec.rs#L790) with `RunAs::Named`. The
+starter to, through the one privilege path that exec, SSH and the PTY share, as an agent session
+runs it: [`exec::apply_session_run_as`](../agents/roomlerd/src/exec.rs#L847). The
 account is resolved in the parent (`getpwnam_r`, `getgrouplist`), uid 0 is refused
-([`exec.rs:934`](../agents/roomlerd/src/exec.rs#L934)), and the child only calls
+([`exec.rs:949`](../agents/roomlerd/src/exec.rs#L949)), and the child only calls
 `setgroups`, `setgid` and `setuid`, then checks that they took.
+
+⚠️ **A session cannot `sudo`** (decision 13), as Windows denies its sessions the
+Administrators group:
+- It holds none of the account's administrator groups
+  ([`exec.rs:1022`](../agents/roomlerd/src/exec.rs#L1022)): root's own, the sudoers groups
+  (`wheel`, `sudo`, macOS's `admin`) and those whose socket or device is root by another
+  door (`docker`, `lxd`, `incus`, `libvirt`, `disk`). An account whose primary group is one
+  is refused.
+- It holds fewer groups than NGROUPS_MAX, because `sudo` reads the process's own list only
+  while it is under that maximum.
+- On Linux the harness starts with `no_new_privs`
+  ([`exec.rs:1154`](../agents/roomlerd/src/exec.rs#L1154)), so nothing it runs gains a
+  privilege by exec: no `sudo`, whatever sudoers says of the account.
+
+macOS has no such switch, so a sudoers rule that names the account by user still applies
+there; one by group no longer does.
 
 The daemon never writes into a tree the account owns. It starts `/bin/sh -c` with a
 fixed script ([`WRAPPER`](../agents/roomlerd/src/hive/supervisor.rs#L93)) and
@@ -736,7 +752,7 @@ The privilege path sets the account's supplementary groups from `getgrouplist`, 
 every session on that Mac failed "starting the harness: Invalid argument (os error
 22)". The list is now cut to `sysconf(_SC_NGROUPS_MAX)`, in order, the primary group
 first, so the child holds fewer groups and never more
-([`exec.rs:989`](../agents/roomlerd/src/exec.rs#L989) `within_ngroups_max`). Exec, SSH
+([`exec.rs:1004`](../agents/roomlerd/src/exec.rs#L1004) `within_ngroups_max`). Exec, SSH
 and the PTY share the fix, since they share the path.
 
 ⚠️ **Open: administrator groups on Unix (decision 13).** On Windows a session's token
