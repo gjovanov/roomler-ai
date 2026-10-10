@@ -831,10 +831,25 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// comes from the same lookup that refuses uid 0. Gated to its one consumer.
 #[cfg(all(hive_host, unix))]
 pub(crate) use unix_priv::account_home;
-/// The recorder's, and FR-90's toolbelt, whose socket is handed to the
-/// session's account — gated to exactly those two.
-#[cfg(any(all(target_os = "linux", feature = "recording"), all(hive_host, unix)))]
+/// The recorder's. FR-90 reads [`session_account_ids`] instead.
+#[cfg(all(target_os = "linux", feature = "recording"))]
 pub(crate) use unix_priv::account_ids;
+/// FR-90 decision 13 — an agent session's account as the session holds it,
+/// without its administrator groups: what the toolbelt's socket is handed to,
+/// and what the relay check reads.
+#[cfg(all(hive_host, unix))]
+pub(crate) use unix_priv::session_account_ids;
+
+/// FR-90 decision 13 — drop to `account` as an agent session runs: without its
+/// administrator groups, and on Linux unable to gain a privilege by exec
+/// ([`unix_priv::drop_to_session`]).
+#[cfg(all(hive_host, unix))]
+pub(crate) fn apply_session_run_as(
+    cmd: &mut tokio::process::Command,
+    account: &str,
+) -> Result<(), String> {
+    unix_priv::drop_to_session(cmd, account)
+}
 /// FR-85 P1e-unix — the recorder's identity on Linux resolves accounts here
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
 /// FR-90 P1j: and the adopt socket, which names the account its peer runs as.
@@ -996,9 +1011,166 @@ mod unix_priv {
         groups
     }
 
+    /// FR-90 decision 13 — the groups whose members can become root, or act
+    /// as it: root's own, the sudoers groups (`wheel`, `sudo`, `admin`, which
+    /// is macOS's and old Ubuntu's), and those whose socket or device is root
+    /// by another door (`docker`, `lxd`, `incus`, `libvirt`, `disk`). An agent
+    /// session holds none of them, as Windows makes its administrator groups
+    /// deny-only. A name this system has no group for is skipped; gid 0 is
+    /// always one.
+    #[cfg(hive_host)]
+    const ADMIN_EQUIVALENT_GROUPS: &[&str] = &[
+        "root", "wheel", "sudo", "admin", "docker", "lxd", "incus", "libvirt", "disk",
+    ];
+
+    /// The gids of [`ADMIN_EQUIVALENT_GROUPS`] on this system, 0 included.
+    #[cfg(hive_host)]
+    fn admin_gids() -> Vec<libc::gid_t> {
+        let mut gids = vec![0];
+        for name in ADMIN_EQUIVALENT_GROUPS {
+            if let Some(gid) = group_gid(name)
+                && !gids.contains(&gid)
+            {
+                gids.push(gid);
+            }
+        }
+        gids
+    }
+
+    /// A group's gid by name (`getgrnam_r`, its buffer grown as [`resolve`]
+    /// grows its own); `None` when there is no such group, or on an error.
+    #[cfg(hive_host)]
+    fn group_gid(name: &str) -> Option<libc::gid_t> {
+        let c_name = CString::new(name).ok()?;
+        let mut buf = vec![0 as libc::c_char; 1024];
+        // SAFETY: a plain C struct; all-zero is a valid, empty value.
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        loop {
+            // SAFETY: every pointer is to memory this frame owns, sized as
+            // passed; the answer points into `buf`, read before it moves.
+            let rc = unsafe {
+                libc::getgrnam_r(
+                    c_name.as_ptr(),
+                    &mut grp,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() {
+                return None;
+            }
+            return Some(grp.gr_gid);
+        }
+    }
+
+    /// FR-90 decision 13 — the account as an agent session holds it.
+    #[cfg(hive_host)]
+    fn resolve_session(account: &str) -> Result<Account, String> {
+        // SAFETY: sysconf takes a constant and touches no memory of ours.
+        let max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+        session_view(resolve(account)?, &admin_gids(), max)
+    }
+
+    /// The pure half of [`resolve_session`]: no administrator group, and
+    /// fewer groups than `max` (the system's NGROUPS_MAX). Fewer, not at most:
+    /// `sudo` reads the process's own group list only while it is under that
+    /// maximum (its `group_source = adaptive`), and the group database, which
+    /// still names every group, once it is full. An account whose PRIMARY
+    /// group is an administrator group is refused, since everything its
+    /// session made would be that group's.
+    #[cfg(hive_host)]
+    fn session_view(
+        mut a: Account,
+        admin: &[libc::gid_t],
+        max: libc::c_long,
+    ) -> Result<Account, String> {
+        if admin.contains(&a.gid) {
+            return Err(format!(
+                "{}'s primary group (gid {}) is an administrator group, and an agent session \
+                 never holds one",
+                a.name, a.gid
+            ));
+        }
+        a.groups.retain(|g| !admin.contains(g));
+        if let Ok(max) = usize::try_from(max)
+            && max > 1
+            && a.groups.len() >= max
+        {
+            a.groups.truncate(max - 1);
+        }
+        Ok(a)
+    }
+
+    /// FR-90 decision 13 — what an agent session's account is: its uid,
+    /// primary gid and the groups it holds ([`resolve_session`]).
+    #[cfg(hive_host)]
+    pub(crate) fn session_account_ids(
+        account: &str,
+    ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
+        let a = resolve_session(account)?;
+        Ok((a.uid, a.gid, a.groups))
+    }
+
+    /// FR-90 decision 13 — [`drop_to`] as an agent session runs: the account
+    /// without its administrator groups, and on Linux with `no_new_privs` set,
+    /// so nothing the session starts gains a privilege by exec. No setuid
+    /// `sudo`, whatever sudoers says of the account by name, and no file
+    /// capability. macOS has no such switch: a sudoers rule that names the
+    /// account still lets its session use it; one by group no longer does.
+    #[cfg(hive_host)]
+    pub(super) fn drop_to_session(
+        cmd: &mut tokio::process::Command,
+        account: &str,
+    ) -> Result<(), String> {
+        let acct = resolve_session(account)?;
+        cmd.env("HOME", &acct.home)
+            .env("USER", &acct.name)
+            .env("LOGNAME", &acct.name);
+        let mut as_account = drop_body(&acct);
+        // SAFETY: see `drop_body`; `no_new_privs` is one more bare syscall.
+        unsafe {
+            cmd.pre_exec(move || {
+                as_account()?;
+                #[cfg(target_os = "linux")]
+                no_new_privs()?;
+                Ok(())
+            })
+        };
+        Ok(())
+    }
+
+    /// `PR_SET_NO_NEW_PRIVS` on the calling process: from here on, no exec
+    /// gains a privilege, whether by setuid, setgid or a file capability, and
+    /// every child inherits it. Async-signal-safe: one syscall, no memory.
+    /// The arguments go as `c_ulong`, because `prctl` is variadic and the
+    /// kernel refuses this option unless the unused ones are exactly 0.
+    #[cfg(all(hive_host, target_os = "linux"))]
+    fn no_new_privs() -> std::io::Result<()> {
+        // SAFETY: a constant option and four integer arguments.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_NO_NEW_PRIVS,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
     /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
-    #[cfg(any(all(target_os = "linux", feature = "recording"), hive_host))]
+    #[cfg(all(target_os = "linux", feature = "recording"))]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
@@ -1147,6 +1319,82 @@ mod unix_priv {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// FR-90 decision 13 — an agent session holds none of its account's
+        /// administrator groups and fewer groups than NGROUPS_MAX, in order,
+        /// and an account whose primary group is one is refused; gid 0 is
+        /// always one, and this host's own root group resolves to it.
+        #[cfg(hive_host)]
+        #[test]
+        fn an_agent_session_holds_no_administrator_group() {
+            let acct = |gid, groups: Vec<libc::gid_t>| Account {
+                uid: 501,
+                gid,
+                groups,
+                home: "/Users/a".into(),
+                name: "a".into(),
+            };
+            let admin = [0, 80, 27];
+            let a = session_view(acct(20, vec![20, 12, 61, 80, 0, 33]), &admin, 16).unwrap();
+            assert_eq!(
+                a.groups,
+                vec![20, 12, 61, 33],
+                "macOS's admin and gid 0 leave, in order"
+            );
+            let refused = session_view(acct(80, vec![80, 20]), &admin, 16).unwrap_err();
+            assert!(
+                refused.contains("primary group (gid 80) is an administrator group"),
+                "{refused}"
+            );
+            let full = session_view(acct(20, (100..116).collect()), &admin, 16).unwrap();
+            assert_eq!(
+                full.groups.len(),
+                15,
+                "a full list is cut below NGROUPS_MAX"
+            );
+            let unknown = session_view(acct(20, (100..120).collect()), &admin, -1).unwrap();
+            assert_eq!(
+                unknown.groups.len(),
+                20,
+                "a max the system did not give cuts nothing"
+            );
+
+            assert!(admin_gids().contains(&0));
+            assert_eq!(group_gid("roomler-no-such-group-p1h3"), None);
+            #[cfg(target_os = "linux")]
+            assert_eq!(group_gid("root"), Some(0));
+            #[cfg(target_os = "macos")]
+            assert_eq!(group_gid("wheel"), Some(0));
+        }
+
+        /// FR-90 decision 13 — a child given `no_new_privs` in its pre-exec
+        /// runs with the kernel's NoNewPrivs flag set; one without it does
+        /// not. The check is the kernel's own word (`/proc/self/status`), so
+        /// a call the kernel refused, such as one with wrong arguments, fails
+        /// the spawn rather than passing quietly.
+        #[cfg(all(hive_host, target_os = "linux"))]
+        #[test]
+        fn a_session_child_cannot_gain_a_privilege_by_exec() {
+            use std::os::unix::process::CommandExt;
+            let flag = |set: bool| {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", "grep NoNewPrivs /proc/self/status"]);
+                if set {
+                    // SAFETY: one syscall, as `drop_to_session` makes it.
+                    unsafe { cmd.pre_exec(no_new_privs) };
+                }
+                let out = cmd.output().expect("spawn");
+                assert!(out.status.success(), "{out:?}");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            assert_eq!(flag(true), "NoNewPrivs:\t1");
+            // A runner that already runs with the flag (some containers do)
+            // hands it to every child, so the control means nothing there.
+            let ours = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            if ours.contains("NoNewPrivs:\t0") {
+                assert_eq!(flag(false), "NoNewPrivs:\t0");
+            }
+        }
 
         /// FR-90 P1h-3 — a group list longer than the system's NGROUPS_MAX
         /// (16 on macOS) loses its tail, in order; a shorter one, or a limit

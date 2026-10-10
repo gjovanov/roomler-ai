@@ -1585,6 +1585,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - Its "an adopted session becomes a managed one when promoted" half needs P2's replicaset.
 12. **P2's positions, for the operator to confirm** (P2-0, §3b "P2 … as designed"). The design
     takes each of these as its default; any can be changed before the sub-phase that builds it.
+    *Decided 2026-10-10 by the operator, on the recommendation: all five confirmed.*
     - *Who runs a hosted org's archive replica:* the org, on its own machines (decision 1, read with
       D1). An archive Roomler ran would hold plaintext transcripts in Roomler's cloud until
       encryption at rest (P7).
@@ -1606,7 +1607,22 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     the macOS tart VM, whose only account, `admin`, has it. Options: drop the admin-equivalent
     groups from a session's groups on Unix, as Windows does; or keep them, and say in the
     configuration reference that mapping an administrator gives the agent what that administrator
-    has.
+    has. *Decided 2026-10-10 by the operator, on the recommendation: dropped, as Windows does.*
+    Built so that a session cannot `sudo` even where its account may without a password:
+    - It holds none of the account's administrator groups (`exec.rs:1022`): root's own, the
+      sudoers groups and those whose socket or device is root by another door (`docker`, `lxd`,
+      `incus`, `libvirt`, `disk`). An account whose primary group is one is refused.
+    - It holds fewer groups than NGROUPS_MAX (`exec.rs:1088`), because `sudo` reads the
+      process's own list only while it is under that maximum, and the group database, which still
+      names every group, once it is full.
+    - On Linux the harness starts with `no_new_privs` (`exec.rs:1154`), so nothing it runs gains
+      a privilege by exec: no `sudo`, whatever sudoers says of the account by name.
+    - ⚠️ macOS has no such switch. There a sudoers rule that names the account by user still
+      lets its session use it; one by group no longer does. exec, SSH and the PTY are unchanged.
+14. **P2b's git** (P2-0). *Decided 2026-10-10 by the operator, on the recommendation:* checkpoints
+    use the account's own `git`, plumbing only and through a temporary index, run as the account,
+    never a git embedded in the daemon. A device without `git` skips workspace checkpoints, and the
+    room says so.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
