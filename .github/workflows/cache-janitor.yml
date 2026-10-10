@@ -14,13 +14,16 @@ name: Cache janitor
 # budget, which another repository's paid minutes can exhaust. When that
 # happened the pool went read-only ("Cache reservation failed: You have reached
 # your configured budget") and every lane restored an ever-older generation
-# (2026-10-09). So master's working set was made to fit the free tier instead
-# (FR-6 wave 21): no family carries the crate archives any more
-# (`.github/actions/cargo-cache-trim`), and the plain recorder lane restores the
-# audio lane's family instead of keeping its own. At 10 GB the rules below are
-# what keep a lockfile rotation (every family saving a new generation in one
-# run) from evicting a live family: superseded generations go right after the
-# run.
+# (2026-10-09). So master's working set is being cut to fit the free tier
+# (FR-6 waves 21-21b). The plain recorder lane restores the audio lane's
+# family instead of keeping its own, and the integration lane builds with line
+# tables instead of full debuginfo. ⚠ A step that deletes the crate archives
+# before the save CANNOT work. rust-cache's post step runs `cargo metadata
+# --all-features` first, and cargo needs a crate's `.crate` file even when its
+# source is already unpacked, so it downloads all of them again. Wave 21
+# shipped that trim and 21b removed it. At 10 GB the rules below are what keep
+# a lockfile rotation (every family saving a new generation in one run) from
+# evicting a live family: superseded generations go right after the run.
 #
 # Policy per cache entry:
 #   - PR merge-ref caches idle > 48 h  → delete (the PR run that made

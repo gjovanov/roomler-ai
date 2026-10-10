@@ -96,7 +96,8 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 18 | 10-01 | The macOS desktop companion builds in a parallel job (`build-macos-companion`, its own seed family `agent-macos-companion`) instead of serially at the end of `build-macos`, which collects the binary where it used to build it | #1804 |
 | 19 | 10-01 | The release Linux x86_64 job installs every package from one cached apt set (`release-linux-u2204-v1`, the master rehearsal saves it, tags restore it) instead of three raw `apt-get` steps against the mirror | #1806 |
 | 20 | 10-06 | The Linux desktop companion builds in a parallel job (`build-linux-companion`, its own seed family `agent-linux-companion`, the SAME cached apt set as `build-linux`) instead of serially at the end of `build-linux`, the Linux twin of wave 18 | #1938 |
-| 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and master's working set cut to fit it: no family carries the crate archives (`cargo-cache-trim`, the last step of all 14 rust-cache jobs), and the plain recorder lane restores `recorder-audio`'s family | #1939 |
+| 21 | 10-10 | The cache limit back to the **free 10 GB** (the paid tier went read-only when another repository spent the account's budget), and two cuts to master's working set: the plain recorder lane restores `recorder-audio`'s family (works, ~600 MB); a `cargo-cache-trim` step dropped the crate archives before each save (**a no-op**: rust-cache's own `cargo metadata` downloads them again before saving) | #1939 |
+| 21b | 10-10 | The trim removed from all 14 jobs. The integration lane builds with `line-tables-only` instead of full debuginfo | #1944 |
 
 ## Acceptance criteria
 
@@ -190,15 +191,21 @@ itself on the affected run's page. Baseline when the program started: releases t
   reservation failed: You have reached your configured budget"), so every lane restored
   an ever-older generation, though roomler-ai's own share of the bill was ~1 GB of
   storage. A paid tier that another repository can switch off is not a design. Wave 21
-  takes the two cuts this paragraph once held in reserve. ⚠ The reasoning that dismissed
-  the first was wrong. "Only ~167 MB" holds per family, but the copy is in EVERY family:
-  179 MB (1,186 packages) × 12 ≈ 2.1 GB, a fifth of the pool.
-  `.github/actions/cargo-cache-trim` drops the `.crate` archives before each save. The
-  plain recorder lane restores `recorder-audio`'s family and keeps none of its own (~600
-  MB). `cargo tree` resolves the two TEST graphs to identical features for every shared
-  crate. The lane's non-test `cargo build` still rebuilds tokio and ~25 dependents, in a
-  variant without dev-dependency features that the audio lane never builds. That cost was
-  within master's range (log).
+  took the two cuts this paragraph once held in reserve, and **only one of them works**.
+  - The plain recorder lane restores `recorder-audio`'s family and keeps none of its own
+    (~600 MB). `cargo tree` resolves the two TEST graphs to identical features for every
+    shared crate. The lane's non-test `cargo build` still rebuilds tokio and ~25
+    dependents, in a variant without dev-dependency features that the audio lane never
+    builds. That cost was within master's range (log).
+  - ⚠ **Dropping the crate archives cannot work, and wave 21b removed it.** Every family
+    does hold the whole lockfile's archives (179 MB, 1,186 packages, ≈2.1 GB across 12),
+    but rust-cache's post step runs `cargo metadata --all-features` before it saves, and
+    cargo needs a crate's `.crate` file even when the source is already unpacked. It
+    downloaded all 183 MB again, silently (rust-cache captures the output), and saved
+    them. The family sizes did not move (log). The old line, "deduplicating it is not
+    the lever", was right, for this reason rather than its size.
+  - Wave 21b: the integration lane builds with line tables instead of FULL debuginfo,
+    which its 1.1 GB family still carried. Its `RUST_BACKTRACE=1` keeps file:line.
 - **Resolved by wave 16 (merged 09-29, field-verified 10-01): a new CI step's dependency builds
   stayed out of the cache until the next key rotation** (wave 15 finding; root cause 4
   open again). The salt below shipped as `.github/actions/cargo-cache-salt`, hashing
@@ -471,3 +478,17 @@ itself on the affected run's page. Baseline when the program started: releases t
     set ~13.4 GB, not 10.9. By that arithmetic wave 21's cuts leave ~10.4 GB, still over
     the limit. The next cut is sized from the first master run's measured families, not
     from this estimate.
+- 2026-10-10: **wave 21's crate-archive trim was a no-op** (found on its first master run,
+  38083571444; removed by wave 21b):
+  - Every lane logged `dropped 183 MB of .crate archives`, and no family got smaller. The
+    unit lane restored 2,252,680,759 B and saved 2,252,534,802 B (146 KB apart). lint,
+    macOS overlay and recorder-audio were all within 0.1% of their sizes before the trim.
+  - A re-run of that unit job restored the post-trim archive (`full match: true`).
+    Cargo downloaded nothing, and the trim again found 183 MB of archives. They were in
+    the saved archive.
+  - The mechanism, reproduced in WSL with a throwaway `CARGO_HOME`: build a crate,
+    delete its `.crate` (its source stays unpacked), run `cargo metadata --all-features`,
+    and it prints `Downloaded itoa v1.0.18`. Cargo opens the archive before it checks the
+    unpacked source. rust-cache's post step runs exactly that call before it saves, with
+    the output captured, so the deleted archives come back unseen. The trim also cost
+    every job that hidden re-download.
