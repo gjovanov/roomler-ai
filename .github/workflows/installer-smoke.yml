@@ -90,10 +90,16 @@ jobs:
     name: per-User MSI install + uninstall (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 30
+    # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
+    # release asset (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
     env:
       # Mirrored so the payload-signing step's `if:` can test it -- secrets
       # are not available in step-level `if:` conditions.
       WIN_TEST_PFX_BASE64: ${{ secrets.WIN_TEST_PFX_BASE64 }}
+      # rust-cache set this for the job until wave 22; set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -105,19 +111,18 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Cache cargo
-        # FR-6 wave 14 (#773): only a master push saves. A PR-ref cache can be
-        # restored only by later runs of the same PR, and every one evicts
-        # master entries that all PRs restore from. (A "delete BEFORE
-        # restore" step used to precede this one; its exact key never matched
-        # the hashed key this block writes, so it deleted nothing — and on a
-        # PR it would have deleted master's cache had it ever matched.)
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 22 (#773): this job's cache lives on the seed-cache release,
+        # not in the Actions cache, whose free 10 GB holds the PR lanes (see
+        # .github/actions/ci-seed-restore). It carries the cargo-installed
+        # cargo-wix too, as rust-cache did.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: installer-smoke-windows
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: installer-smoke-windows
 
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
@@ -710,6 +715,19 @@ jobs:
           path: ${{ runner.temp }}/msi-logs/
           retention-days: 7
 
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: installer-smoke-windows
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   # macOS had NO installer coverage at all until rc.454, and the platform
   # shipped for months with an install that could not work: the pkg payload was
   # the .app and nothing else (no CLI), the privileged half was gated on a
@@ -729,6 +747,13 @@ jobs:
     # retires macos-14 by 2026-11-02).
     runs-on: macos-15
     timeout-minutes: 40
+    # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
+    # release asset (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
+    env:
+      # rust-cache set this for the job until wave 22; set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -742,10 +767,15 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 22 (#773): see the Windows job above and the action.
+        id: seed
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          key: macos-pkg-smoke
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: macos-pkg-smoke
 
       - name: Install system deps
         run: brew install cmake libvpx pkg-config
@@ -1219,5 +1249,18 @@ jobs:
           launchctl print system/com.roomler.update >/dev/null 2>&1 \
             || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
           echo "  opt-in restores the helper"
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: macos-pkg-smoke
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
 # RETIRED-NAME-ANCHOR-END

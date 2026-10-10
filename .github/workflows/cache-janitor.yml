@@ -14,10 +14,14 @@ name: Cache janitor
 # budget, which another repository's paid minutes can exhaust. When that
 # happened the pool went read-only ("Cache reservation failed: You have reached
 # your configured budget") and every lane restored an ever-older generation
-# (2026-10-09). So master's working set is being cut to fit the free tier
-# (FR-6 waves 21-21b). The plain recorder lane restores the audio lane's
-# family instead of keeping its own, and the integration lane builds with line
-# tables instead of full debuginfo. ⚠ A step that deletes the crate archives
+# (2026-10-09). So master's working set was cut to fit the free tier (FR-6
+# waves 21-22). The plain recorder lane restores the audio lane's family
+# instead of keeping its own; the integration lane builds with line tables
+# instead of full debuginfo. And six families no longer live here at all:
+# integration, both installer smokes, and ci.yml's macOS overlay and two
+# Windows lanes keep their cargo caches on the free `seed-cache` release
+# (.github/actions/ci-seed-restore + ci-seed-save). That leaves the Actions
+# cache the seven Linux lanes plus apt and bun, room for a full rotation. ⚠ A step that deletes the crate archives
 # before the save CANNOT work. rust-cache's post step runs `cargo metadata
 # --all-features` first, and cargo needs a crate's `.crate` file even when its
 # source is already unpacked, so it downloads all of them again. Wave 21

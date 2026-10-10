@@ -72,6 +72,10 @@ jobs:
     name: Integration suite (MongoDB + Redis)
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
+    # release asset (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
 
     services:
       # MongoDB is deliberately NOT a service container — see "Start MongoDB"
@@ -99,6 +103,8 @@ jobs:
       # what RUST_BACKTRACE above needs for file:line; the rest (types,
       # variables) serves a debugger, and nothing attaches one in CI.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # rust-cache set this for the job until wave 22; set it here.
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@v4
@@ -111,18 +117,19 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 22 (#773): this lane's cache (~1 GB) lives on the
+        # seed-cache release, not in the Actions cache, whose free 10 GB holds
+        # the PR lanes (see .github/actions/ci-seed-restore). The cap is above
+        # the default: a debug build of the whole server is the biggest target.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-integration
-          cache-on-failure: true
-          # FR-6 wave 14 (#773): only a master push saves. On 2026-09-27 a
-          # single PR run left a 1.1 GB `ci-integration` entry on its merge
-          # ref, restorable only by that PR, in a pool where PR-ref entries
-          # had pushed master's caches out by LRU.
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: integration
+          max-target-mb: "6000"
 
       - name: Start MongoDB (capped WiredTiger cache)
         # A service container cannot take command arguments, and this one
@@ -376,3 +383,16 @@ jobs:
           name: integration-log
           path: /tmp/itest.log
           retention-days: 7
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: integration
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
