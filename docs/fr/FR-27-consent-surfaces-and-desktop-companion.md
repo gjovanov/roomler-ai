@@ -694,10 +694,20 @@ screen-edge strips:
 |---|---|
 | shown at session start, no focus taken | banner up from +1.7 s; the census during the session had the banner at window layer 5 (a non-activating panel) while the menu bar stayed on the person's own app (TextEdit) throughout |
 | hides 2.5 s after the pointer leaves, after the 4 s first show | banner down at +6.2 s (pointer away since the fullscreen click) |
-| returns after a 1.2 s rest at the top edge | back up at +14.5 s after a top-edge `move` at +13.6 s, and again at +24.9 s after a second one at +24.0 s; hidden whenever the pointer was elsewhere |
+| returns after a 1.2 s rest at the top edge | back up at +14.5 s after a top-edge `move` at +13.6 s, and again at +24.9 s after a second one at +24.0 s; down again 3.0 s after the pointer left the top edge (`away` +18.3 s → +21.3 s), the one observation that times the 2.5 s hide itself. Each reveal came 0.9 s after its move's mark, shorter than the 1.2 s dwell: the harness's marks and frame times are not aligned that finely, so this run shows the reveal, not its exact delay |
 | stays while a recording runs | in a second session a remote recording ran ~87 s (`h264_videotoolbox`, native 3024×1964); the census had the banner on-screen at 0:03, 0:38 and 1:21 with the pointer parked at the top-right menu — far from the banner and well past the 4 s + 2.5 s window. It had auto-hidden and the recording brought it back (`tray::recording_now`). The A/B is the first session, which auto-hid at +6.2 s with no recording |
-| red frame for exactly the session's duration | the red frame was on every fullscreen frame until teardown (+40.2 s; session end +41.1 s); the census found four 2 px strips (`1512×2` top & bottom, `2×982` left & right) during the session and **zero** Roomler windows 60 s after it ended — the "gone after" the stream cannot show |
+| red frame for exactly the session's duration | the red frame was on every fullscreen frame of the live session, which did not end cleanly: the stream carried one frame between +32.7 s and +40.2 s, and at +40.2 s the viewer read "Connection lost — reconnecting (attempt 1)", consistent with the Mac's every-few-seconds drop that #1856 fixed later that day (in 0.4.119); the census found four 2 px strips (`1512×2` top & bottom, `2×982` left & right) during the session and **zero** Roomler windows 60 s after it ended — the "gone after" the stream cannot show |
 | the next click into the person's window acts | after a fresh banner reveal, one click into TextEdit placed the cursor and the typed "XY" appeared (then removed with two Backspaces). The banner did not steal focus |
+
+*Corrected 2026-10-10, after re-reading this run's frames.* As first written, this
+log called +40.2 s the teardown and said the banner was "hidden whenever the
+pointer was elsewhere". The frames say otherwise. The stream carried one frame
+between +32.7 s and +40.2 s, and the session was lost at +40.2 s. So the scene's
+last check never reached the
+Mac: hover the banner (+27.8 s), leave it (+33.1 s), expect a hide. In the last
+frames the controller's pointer is far away, but the Mac's own cursor is still on
+the banner. Every clause above still stands on the evidence it cites. A hide after
+the pointer has hovered the banner is **unobserved**.
 
 **"Being viewed by «name»" + a working Disconnect (macOS).** The banner reads
 "Being viewed by «owner name» · keyboard + mouse · «org» · «elapsed»". Clicking
@@ -756,7 +766,9 @@ Disconnect run proves the window now takes its first click for Stop recording
 too. A **direct** one-click Stop-recording run on the Mac is still owed: two
 attempts were lost, the first to the pre-#1858 every-few-seconds RC drop while
 the Mac was mid-update, the second to the device owner's own live session on the
-Mac. **#1852 stays open** for that one direct demonstration.
+Mac. That demonstration is tracked here. #1852 itself had already closed when
+#1854 merged (10:55Z, "Fixes #1852"), before this entry was written; it said
+"stays open" until the 2026-10-10 correction.
 
 ### 2026-10-09 — P10: the host's Disconnect must end the session for good (RED)
 
