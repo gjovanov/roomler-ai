@@ -526,7 +526,7 @@ sequenceDiagram
 |---|---|---|
 | `hosted.json` sits beside the store, root's, `0600`, written whole. Per session it holds the launch's inputs (fence, account, the folder as asked, the starter and their address, Claude Code's session id), the turns begun, the turn in progress and who asked for it, its open approvals, and the harness's pid and start time | after a restart the device holds nothing else: the replay of its last reports lived in memory | [`hosted.rs`](../agents/roomlerd/src/hive/hosted.rs) |
 | A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:2691`](../agents/roomlerd/src/hive/supervisor.rs#L2691) |
-| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3590`](../agents/roomlerd/src/main.rs#L3590), [`supervisor.rs:1327`](../agents/roomlerd/src/hive/supervisor.rs#L1327) |
+| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3598`](../agents/roomlerd/src/main.rs#L3598), [`supervisor.rs:1327`](../agents/roomlerd/src/hive/supervisor.rs#L1327) |
 | A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:1387`](../agents/roomlerd/src/hive/supervisor.rs#L1387) |
 | The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:1195`](../agents/roomlerd/src/hive/supervisor.rs#L1195) |
 | ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:1228`](../agents/roomlerd/src/hive/supervisor.rs#L1228) |
@@ -879,15 +879,15 @@ flowchart LR
 
 | Path, under the config directory | How Claude Code writes it | How a checkpoint takes it |
 |---|---|---|
-| `projects/hive-<id>/<id>.jsonl`, the history | appended to only | the bytes past the last checkpoint, up to the last whole line ([`checkpoint.rs:309`](../crates/hive-node/src/checkpoint.rs#L309)) |
+| `projects/hive-<id>/<id>.jsonl`, the history | appended to only | the bytes past the last checkpoint, up to the last whole line ([`checkpoint.rs:440`](../crates/hive-node/src/checkpoint.rs#L440)) |
 | `projects/hive-<id>/<id>/subagents/`: `agent-<id>.jsonl` | appended to only | the same |
-| the same directory: `agent-<id>.meta.json` | replaced by a rename | whole, when it changed ([`checkpoint.rs:371`](../crates/hive-node/src/checkpoint.rs#L371)) |
+| the same directory: `agent-<id>.meta.json` | replaced by a rename | whole, when it changed ([`checkpoint.rs:502`](../crates/hive-node/src/checkpoint.rs#L502)) |
 | `projects/hive-<id>/<id>/tool-results/` | each output written once | whole |
 | `projects/hive-<id>/memory/` | the auto-memory | whole |
 | `CLAUDE.md` | the session's own instructions (P1e) | whole |
 
 The chain is the state. A file's `len` and `hash` in the last checkpoint are where
-the next starts ([`checkpoint.rs:193`](../crates/hive-node/src/checkpoint.rs#L193)),
+the next starts ([`checkpoint.rs:317`](../crates/hive-node/src/checkpoint.rs#L317)),
 so nothing else is kept between turns. An appended file that shrank, or changed before
 its last offset, is taken again from its first byte. A chunk at offset 0 tells a
 member to start the file over, and an empty one is sent when no whole line has come
@@ -895,16 +895,16 @@ yet, so the old bytes never linger. Chunks are at most 4 MiB, cut at line ends w
 one is within reach. One checkpoint lists at most 10,000 files and adds at most
 512 MiB.
 
-⚠️ **An allowlist, never the directory** ([`checkpoint.rs:245`](../crates/hive-node/src/checkpoint.rs#L245)).
+⚠️ **An allowlist, never the directory** ([`checkpoint.rs:376`](../crates/hive-node/src/checkpoint.rs#L376)).
 The config directory's root holds a `peerToken` beside the harness's messaging socket
 and a `machineID`, so nothing outside the five paths is opened. The harness id must be
 a lowercase, hyphenated UUID, because it is part of every path.
 
-⚠️ **A link is never followed** ([`checkpoint.rs:521`](../crates/hive-node/src/checkpoint.rs#L521)).
+⚠️ **A link is never followed** ([`checkpoint.rs:644`](../crates/hive-node/src/checkpoint.rs#L644)).
 A link in the allowlist to the account's `~/.ssh` would copy a key to every member. A
 link, or a name that is not UTF-8, is listed as skipped and taken nowhere.
 
-A member's [`assemble`](../crates/hive-node/src/checkpoint.rs#L597) refuses what does
+A member's [`assemble`](../crates/hive-node/src/checkpoint.rs#L772) refuses what does
 not add up: a missing blob, a blob that does not hash to its name, a chunk out of
 place, or a whole that does not hash to the last checkpoint's. The event
 ([`event.rs:118`](../crates/hive-node/src/event.rs#L118)) is a flat object beside its
@@ -946,7 +946,7 @@ none of the person's history, because a member has nothing else to resolve a del
 against. Each later commit is the last checkpoint's child, and its pack is thin
 against it, so a target applies the packs in order (`git index-pack --fix-thin`). The
 person's `HEAD` is recorded beside the commit
-([`WorkspaceSnap`](../crates/hive-node/src/checkpoint.rs#L181)), for a teleport into a
+([`WorkspaceSnap`](../crates/hive-node/src/checkpoint.rs#L207)), for a teleport into a
 clone of the same repository (P2f).
 
 ⚠️ A turn that changed no file writes no commit and no pack. A workspace that cannot be
@@ -999,7 +999,7 @@ On Windows it runs as the user signed in at the console, whom `hive_accounts` mu
 
 ⚠️ **An ended checkpoint takes its `git` with it.** On Unix the child leads its own
 process group, and a timeout, too much output or an abandoned checkpoint signals the
-whole group ([`checkpointer.rs:607`](../agents/roomlerd/src/hive/checkpointer.rs#L607)
+whole group ([`child.rs:28`](../agents/roomlerd/src/hive/child.rs#L28)
 `Group`). Until P2b-3b it signalled the leader alone (`start_kill`, `kill_on_drop`),
 which left a `git add` hashing the folder behind it. TERM goes first, then KILL after
 2 s, because git removes its lock files on TERM and never on KILL. The group is
@@ -1056,7 +1056,64 @@ its next prompt. P2c must refuse such a folder up front, or bound the add.
 (`~/.codex/sessions`), so the Codex adapter (design §4, P7) brings its own allowlist;
 until then only a Claude Code session is replicated.
 
-The rest of P2 is next (spec §3b and §4): the rest of P2b (`hive-materialize`),
+### P2b-4a: `hive-materialize`, the config directory as the account
+
+The reverse of `hive-checkpoint`. A promotion (P2e) or a teleport (P2f) puts the
+session's last checkpoint back on the device that will run it, and the daemon never
+writes a path in the account's tree. So it starts `roomlerd hive-materialize` as the
+target's account and streams it the files
+([`materializer.rs`](../agents/roomlerd/src/hive/materializer.rs)). P2b-4a builds both
+sides for the config directory; P2b-4b adds the workspace. Nothing calls it before P2e.
+
+```mermaid
+sequenceDiagram
+    participant D as the daemon (root / SYSTEM)
+    participant S as the store
+    participant M as hive-materialize (as the account)
+    D->>D: plan(): the last checkpoint's files, and for each the<br/>chunks since it last started over (chunks_of)
+    D->>M: start it as the account (Unix: the session's privilege path;<br/>Windows: the console user, in a job)
+    D->>M: stdin: magic · header (every file's path, len, hash)
+    M->>M: refusal() and check_places(): every name and every place,<br/>before anything is written
+    loop each file, blob by blob
+        S-->>D: get_blob, held to its chunk
+        D->>M: the bytes
+        M->>M: staged beside where it goes, 0600, hashed as it arrives
+    end
+    M->>M: every file held to its entry, then all renamed into place,<br/>then what the checkpoint no longer lists removed
+    M-->>D: stdout: {"files": N, "removed": M}
+```
+
+| Step | What it guards | Where |
+|---|---|---|
+| the plan | every path in the allowlist; each file's chunks from its last start-over, adding up to its entry. A history is streamed, never held whole | [`materializer.rs:133`](../agents/roomlerd/src/hive/materializer.rs#L133) · [`checkpoint.rs:722`](../crates/hive-node/src/checkpoint.rs#L722) `chunks_of` |
+| the stream | each blob held to its chunk before it goes; a blob the store lacks ends the stream short, the child writes nothing, and the daemon's own word is the answer | [`materializer.rs:232`](../agents/roomlerd/src/hive/materializer.rs#L232) |
+| the names | the allowlist again, in order. On Windows: no device name (`aux.md` is AUX, `COM1.log` is COM1), none of `<>:"\|?*` or a control character, no trailing dot or space, at most 259 characters where it goes. On Windows and macOS: no two names that differ only in case | [`materializer.rs:529`](../agents/roomlerd/src/hive/materializer.rs#L529) |
+| the places | every directory on the way is one of its own, never a link to one, and no file goes where a directory is | [`materializer.rs:615`](../agents/roomlerd/src/hive/materializer.rs#L615) |
+| the files | staged beside where they go, `0600` whatever mode the checkpoint's OS kept, and each held to its entry's length and hash; only then are they renamed into place | [`materializer.rs:461`](../agents/roomlerd/src/hive/materializer.rs#L461) |
+| what goes | inside the allowlist, a file the checkpoint does not list is removed, never through a link and no deeper than a checkpoint looks; nothing outside it is touched (a login, the harness's own state) | [`materializer.rs:751`](../agents/roomlerd/src/hive/materializer.rs#L751) |
+
+⚠️ **What comes in is another device's word.** A checkpoint was taken by whichever
+member was primary, and this daemon only relays it. Unchecked, a path that climbs out
+with `..` would be written as the target's account wherever it can write, its
+`~/.bashrc` included. So the child holds every name to the allowlist again. A refusal at any step writes nothing, and
+the files it staged so far are removed.
+
+⚠️ **Windows' names are refused before anything moves.** A Linux session's memory can
+hold `aux.md` or `a:b.md`, which Windows cannot. Two names that differ only in case
+are one file on Windows and on a default macOS volume. P2f's prepare refuses such a
+session up front through the same `refusal`.
+
+⚠️ **A child that refuses is answered in its own words.** It stops reading, and the
+feed then meets a closed pipe, which would otherwise be all that is said
+([`child.rs:79`](../agents/roomlerd/src/hive/child.rs#L79)). On Unix the runner, its
+process group and its time limit are the ones `hive-checkpoint` uses. On Windows a
+thread of its own feeds the child's pipe
+([`hive_win.rs:1086`](../agents/roomlerd/src/hive_win.rs#L1086)).
+
+The files are written `0600` because a checkpoint taken on Windows records mode 0,
+and restoring that on Linux would leave the account unable to read its own history.
+
+The rest of P2 is next (spec §3b and §4): the rest of P2b (the workspace's materialize, P2b-4b),
 membership and placement (P2c), the QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the

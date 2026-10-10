@@ -79,10 +79,13 @@
 //! nothing is there yet — so a resume keeps what the session has.
 
 mod checkpointer;
+#[cfg(unix)]
+mod child;
 pub mod framing;
 pub mod gates;
 mod hosted;
 mod lines;
+mod materializer;
 mod procs;
 mod sidecar;
 mod store;
@@ -93,6 +96,7 @@ pub mod view;
 mod workspace;
 
 pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
+pub use materializer::{MATERIALIZE_SUBCOMMAND, materialize_args, materialize_main};
 #[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
