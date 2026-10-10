@@ -124,8 +124,34 @@ impl Stored {
     }
 }
 
-/// Read the store. Missing, unreadable or corrupt ⇒ the default (off).
+/// Run a store read or write with the right identity. Under a Windows
+/// SystemContext worker the file sits in the PERSON's profile, which they
+/// control, so it is touched as them (`win_identity::as_session_user`): a
+/// link they planted there must never steer a SYSTEM write. `None` when that
+/// identity cannot be had — nothing was touched.
+fn as_owner<T>(f: impl FnOnce() -> T) -> Option<T> {
+    #[cfg(target_os = "windows")]
+    {
+        if crate::win_identity::process_is_local_system() {
+            return crate::win_identity::as_session_user(f);
+        }
+    }
+    Some(f())
+}
+
+/// Read the store. Missing, unreadable or corrupt ⇒ the default (off) — and
+/// so is a store this process may not read as its owner.
 pub fn load_from(path: &Path) -> Stored {
+    as_owner(|| load_unchecked(path)).unwrap_or_else(|| {
+        tracing::warn!(
+            path = %path.display(),
+            "keep-busy: cannot act as the signed-in person — treating keep-busy as off"
+        );
+        Stored::default()
+    })
+}
+
+fn load_unchecked(path: &Path) -> Stored {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Stored::default();
     };
@@ -142,8 +168,18 @@ pub fn load_from(path: &Path) -> Stored {
     }
 }
 
-/// Write the store atomically (temp file + rename), creating the directory.
+/// Write the store atomically (temp file + rename), creating the directory —
+/// as the person whose store it is ([`as_owner`]).
 pub fn save_to(path: &Path, s: &Stored) -> std::io::Result<()> {
+    as_owner(|| save_unchecked(path, s)).unwrap_or_else(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot act as the signed-in person",
+        ))
+    })
+}
+
+fn save_unchecked(path: &Path, s: &Stored) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -162,7 +198,8 @@ pub fn save_to(path: &Path, s: &Stored) -> std::io::Result<()> {
 /// Windows: a SystemContext worker runs as SYSTEM, whose own profile is the
 /// wrong person — it resolves the console user's profile instead
 /// (`session_user_profile_dir`, SeTcb), the same file the user-context
-/// worker writes through its own `project_dirs()`.
+/// worker writes through its own `project_dirs()`, and reads and writes it
+/// AS that user ([`load_from`], [`save_to`]).
 pub fn default_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
