@@ -2211,6 +2211,75 @@ fn not_the_console_user() -> Response {
     }
 }
 
+/// FR-27 P11 — what a connection may ask, decided by WHICH socket it came in on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The daemon's own endpoints. Their ACL is the boundary, so every verb is
+    /// served (the per-verb console checks above still apply).
+    Full,
+    /// The person-at-the-device socket of a Linux system install
+    /// ([`serve_person_socket`]): only what that person needs to see who is
+    /// viewing their screen, end it, and answer a consent prompt.
+    Person,
+}
+
+/// FR-27 P11 — may the person-at-the-device socket serve this request?
+///
+/// ⚠️ Exhaustive on purpose, with no `_` arm. A verb added to [`Request`]
+/// must be put on one side of this line by hand, so the person socket can
+/// never pick up a new administrative verb by default. The allowed set is the
+/// safety surface the companion draws for the person: the status that says
+/// the service is up, the sessions behind the "Being viewed by …" banner, its
+/// Disconnect, the consent prompt and its answer, and whether a recording is
+/// running (the tray turns red).
+pub fn person_may(req: &Request) -> bool {
+    match req {
+        Request::Status
+        | Request::RcSessions
+        | Request::RcDisconnect { .. }
+        | Request::ConsentPending
+        | Request::ConsentDecide { .. }
+        | Request::RecordStatus => true,
+        Request::Peers
+        | Request::Flows
+        | Request::Ping { .. }
+        | Request::CreateForward { .. }
+        | Request::CreateSocks5 { .. }
+        | Request::KillFlow { .. }
+        | Request::RouteList
+        | Request::RouteAdd { .. }
+        | Request::RouteRemove { .. }
+        | Request::RouteSetEnabled { .. }
+        | Request::RouteUpdate { .. }
+        | Request::SetDeviceName { .. }
+        | Request::ConfigCleanupStale
+        | Request::ConfigGet
+        | Request::ConfigSet { .. }
+        | Request::TailLog { .. }
+        | Request::ExecRemote { .. }
+        | Request::SshSession { .. }
+        | Request::RecordStart { .. }
+        | Request::RecordStop
+        | Request::RecordingsList
+        | Request::RecordingDelete { .. }
+        | Request::Devices { .. }
+        | Request::Mesh { .. }
+        | Request::RestartDaemon { .. }
+        | Request::EncoderCaps
+        | Request::HiveUpdateHold => false,
+    }
+}
+
+/// FR-27 P11 — the answer to anything else on the person-at-the-device socket.
+fn not_on_the_person_socket() -> Response {
+    Response::Error {
+        message: "this is the person-at-the-device socket of a system install: it shows who is \
+                  viewing this screen, ends it, and answers consent prompts. Everything else \
+                  goes to the daemon's own socket — run `sudo roomler …`"
+            .into(),
+    }
+}
+
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
 /// No I/O — the pipe listener (P1-cont) reads a JSON line, deserialises a
 /// [`Request`], calls this, and writes the [`Response`] back.
@@ -2296,6 +2365,21 @@ pub async fn serve_connection_as<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    serve_connection_scoped(stream, state, peer, Scope::Full).await
+}
+
+/// [`serve_connection_as`] under a [`Scope`]. FR-27 P11: on a
+/// [`Scope::Person`] connection, a request [`person_may`] does not allow is
+/// answered with a refusal before it reaches any handler.
+pub async fn serve_connection_scoped<S>(
+    stream: S,
+    state: &dyn LocalApiState,
+    peer: ClientPeer,
+    scope: Scope,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
     // FR-90 P1h-2 — a hold this connection placed ends with it, however it
@@ -2307,6 +2391,11 @@ where
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
+                // FR-27 P11 — on the person-at-the-device socket, anything but the
+                // safety surface is refused before any handler runs.
+                Ok(ref req) if scope == Scope::Person && !person_may(req) => {
+                    not_on_the_person_socket()
+                }
                 // The async verbs — await them here; everything else is a pure sync
                 // dispatch through `handle`.
                 Ok(Request::Ping {
@@ -3008,6 +3097,213 @@ async fn accept_unix(
             }
         }
     }
+}
+
+/// FR-27 P11 — where a Linux system install's person-at-the-device socket
+/// lives: that person's own `$XDG_RUNTIME_DIR/roomler.sock` (logind's
+/// `/run/user/<uid>`). Their companion and their CLI already try it FIRST
+/// ([`unix_socket_candidates`]), so neither needs to know it exists.
+#[cfg(target_os = "linux")]
+pub fn person_socket_path(uid: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/run/user/{uid}")).join(LOCALAPI_SOCKET_NAME)
+}
+
+/// FR-27 P11 — the caller check on the person socket, per connection, from
+/// the kernel (`SO_PEERCRED`): the person it belongs to, or root. Unknown is
+/// neither.
+#[cfg(unix)]
+pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
+    matches!(peer.uid, Some(u) if u == owner_uid || u == 0)
+}
+
+/// FR-27 P11 — serve the person-at-the-device socket for `owner_uid` until
+/// `stop` flips true (or its sender goes away).
+///
+/// A Linux system daemon's own socket (`/var/run/roomler`, 0700 / 0600) is
+/// root-only, and rightly: it is the trust boundary for every administrative
+/// verb. But the person at the screen must still be able to see who is
+/// viewing it, end that, and answer a consent prompt, and their companion runs
+/// as them (#1911). This socket gives them exactly that and nothing more:
+/// - it lives in THEIR runtime dir, which logind created and they own — this
+///   function never creates it, and refuses a dir owned by anyone else;
+/// - it is made AS THEM ([`bind_as_person`]), so it is theirs and 0600 from
+///   the start, and no path operation runs with root's rights in their dir;
+/// - every connection's `SO_PEERCRED` uid must be theirs or root
+///   ([`person_peer_ok`]) — that check, not the file's mode, is what keeps
+///   every other account out;
+/// - every request goes through [`Scope::Person`] ([`person_may`]).
+///
+/// ⚠️ It never replaces a LIVE socket at that path (a per-user daemon of the
+/// same person would own it), removes a stale file only if it IS a socket,
+/// and on the way out unlinks only the entry it bound (`lstat`, never
+/// following a link).
+#[cfg(target_os = "linux")]
+pub async fn serve_person_socket(
+    path: std::path::PathBuf,
+    owner_uid: u32,
+    state: Arc<dyn LocalApiState>,
+    mut stop: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+    use tokio::net::UnixListener;
+
+    if *stop.borrow() {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "person socket path has no parent"))?;
+    let dir_meta = std::fs::metadata(dir)?;
+    if !dir_meta.is_dir() || dir_meta.uid() != owner_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory owned by uid {owner_uid}",
+                dir.display()
+            ),
+        ));
+    }
+    let owner_gid = dir_meta.gid();
+    let bind_path = path.clone();
+    let (std_listener, bound_ino) =
+        tokio::task::spawn_blocking(move || bind_as_person(&bind_path, owner_uid, owner_gid))
+            .await
+            .map_err(|e| Error::other(format!("person socket: the bind task failed: {e}")))??;
+    std_listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(std_listener)?;
+    tracing::info!(
+        path = %path.display(), uid = owner_uid,
+        "localapi: person-at-the-device socket up (FR-27 P11)"
+    );
+    // ⚠️ Connections are held HERE, not detached: when the person at the seat
+    // changes this listener is stopped, and a connection the previous person
+    // still holds open must not keep answering consent for the new person's
+    // screen. Stopping aborts every one of them.
+    let mut conns = tokio::task::JoinSet::new();
+    let served = loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break Ok(());
+                }
+            }
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            accept = listener.accept() => match accept {
+                Ok((stream, _addr)) => {
+                    let peer = ClientPeer {
+                        session_id: None,
+                        uid: stream.peer_cred().ok().map(|c| c.uid()),
+                    };
+                    if !person_peer_ok(&peer, owner_uid) {
+                        tracing::warn!(
+                            peer_uid = ?peer.uid, owner_uid,
+                            "localapi: person socket refused a caller that is neither its person nor root"
+                        );
+                        continue;
+                    }
+                    let st = state.clone();
+                    conns.spawn(async move {
+                        if let Err(e) = serve_connection_scoped(stream, &*st, peer, Scope::Person).await {
+                            tracing::debug!(error = %e, "localapi: person-socket client ended");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "localapi: person-socket accept failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    };
+    conns.shutdown().await;
+    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
+        let _ = std::fs::remove_file(&path);
+    }
+    tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
+    served
+}
+
+/// FR-27 P11 — make the person socket AS the person: check the path, clear a
+/// stale socket, bind, and chmod 0600, all with THIS thread's filesystem ids
+/// switched to theirs. Returns the listener and the inode it bound.
+///
+/// ⚠️ Load-bearing, not tidiness. The socket's directory belongs to the
+/// person, so they can swap its entry between any two calls the daemon makes
+/// on the PATH, and `chmod` and `chown` follow symlinks. A root daemon that
+/// bound the socket and then chown'ed the path could be raced into handing
+/// them `/etc/shadow`. With `setfsuid`/`setfsgid` (per-thread on Linux; glibc
+/// broadcasts only the POSIX set*id calls to every thread) the socket is born
+/// theirs, so there is no chown at all, and whatever a swapped entry
+/// redirects to is reached with THEIR rights, i.e. only what they already
+/// own. The previous ids are restored on every way out, error and panic
+/// included, before this blocking-pool thread serves anything else.
+#[cfg(target_os = "linux")]
+fn bind_as_person(
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    struct Restore {
+        uid: u32,
+        gid: u32,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: setfsuid/setfsgid change only this thread's filesystem
+            // ids. The uid first, which brings back the filesystem
+            // capabilities a non-zero fsuid drops.
+            unsafe {
+                libc::setfsuid(self.uid);
+                libc::setfsgid(self.gid);
+            }
+        }
+    }
+    // SAFETY: as above. The group first, while the fsuid is still ours.
+    let prev_gid = unsafe { libc::setfsgid(gid) } as u32;
+    let prev_uid = unsafe { libc::setfsuid(uid) } as u32;
+    let _restore = Restore {
+        uid: prev_uid,
+        gid: prev_gid,
+    };
+    // Both calls report the PREVIOUS id and fail silently; an invalid id
+    // changes nothing and reports the current one, which proves the switch.
+    // SAFETY: as above.
+    let (now_uid, now_gid) = unsafe {
+        (
+            libc::setfsuid(u32::MAX) as u32,
+            libc::setfsgid(u32::MAX) as u32,
+        )
+    };
+    if now_uid != uid || now_gid != gid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("could not act as uid {uid} to make its person socket"),
+        ));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!("{} is already served by another process", path.display()),
+        ));
+    }
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        std::fs::remove_file(path)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let ino = std::fs::symlink_metadata(path)?.ino();
+    Ok((listener, ino))
 }
 
 // ---------------------------------------------------------------------------
@@ -5483,6 +5779,200 @@ mod tests {
 
     fn is_console_refusal(r: &Response) -> bool {
         matches!(r, Response::Error { message } if message.contains("console"))
+    }
+
+    fn is_person_refusal(r: &Response) -> bool {
+        matches!(r, Response::Error { message } if message.contains("person-at-the-device socket"))
+    }
+
+    async fn ask_scoped(scope: Scope, line: &str) -> Response {
+        let (client, server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            let state = Mock;
+            serve_connection_scoped(server, &state, ClientPeer::UNKNOWN, scope).await
+        });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut clines = tokio::io::BufReader::new(crd).lines();
+        cwr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        let r = clines.next_line().await.unwrap().unwrap();
+        drop(cwr);
+        drop(clines);
+        srv.await.unwrap().unwrap();
+        serde_json::from_str(&r).unwrap()
+    }
+
+    /// FR-27 P11 — the person socket serves the safety surface and nothing
+    /// else. The match in [`person_may`] is exhaustive, so a NEW verb cannot
+    /// slip onto it by default; this pins which side today's verbs are on.
+    #[test]
+    fn person_may_is_exactly_the_safety_surface() {
+        let allowed = [
+            r#"{"t":"status"}"#,
+            r#"{"t":"rc_sessions"}"#,
+            r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
+            r#"{"t":"consent_pending"}"#,
+            r#"{"t":"consent_decide","d":{"session_id":"6ac95ff543d358ac1a427048","allow":true}}"#,
+            r#"{"t":"record_status"}"#,
+        ];
+        for j in allowed {
+            let req: Request = serde_json::from_str(j).unwrap();
+            assert!(person_may(&req), "the person must be able to: {j}");
+        }
+        let refused = [
+            Request::Peers,
+            Request::Flows,
+            Request::RouteList,
+            Request::ConfigGet,
+            Request::ConfigCleanupStale,
+            Request::RecordStop,
+            Request::RecordingsList,
+            Request::EncoderCaps,
+            Request::HiveUpdateHold,
+            Request::KillFlow { id: "f".into() },
+            Request::RouteRemove { id: "r".into() },
+            Request::SetDeviceName { name: "x".into() },
+            Request::RecordingDelete {
+                name: "x.mp4".into(),
+            },
+        ];
+        for req in refused {
+            assert!(!person_may(&req), "the person socket must refuse {req:?}");
+        }
+    }
+
+    /// FR-27 P11 — on a person-scope connection an administrative verb is
+    /// refused before any handler runs, with a pointer to `sudo`; the safety
+    /// surface is served; and the same verb on a full-scope connection is
+    /// served as ever.
+    #[tokio::test]
+    async fn a_person_connection_serves_the_safety_surface_and_refuses_the_rest() {
+        assert!(matches!(
+            ask_scoped(Scope::Person, r#"{"t":"status"}"#).await,
+            Response::Status(_)
+        ));
+        let r = ask_scoped(Scope::Person, r#"{"t":"config_get"}"#).await;
+        assert!(is_person_refusal(&r), "{r:?}");
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
+            "the refusal says where to go instead: {r:?}"
+        );
+        let r = ask_scoped(Scope::Person, r#"{"t":"peers"}"#).await;
+        assert!(is_person_refusal(&r), "{r:?}");
+        // The banner's Disconnect and the consent answer reach the state.
+        for j in [
+            r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
+            r#"{"t":"consent_decide","d":{"session_id":"6ac95ff543d358ac1a427048","allow":false}}"#,
+        ] {
+            let r = ask_scoped(Scope::Person, j).await;
+            assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
+        }
+        // The daemon's own socket is unchanged.
+        assert!(matches!(
+            ask_scoped(Scope::Full, r#"{"t":"peers"}"#).await,
+            Response::Peers(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_person_socket_admits_its_person_and_root_only() {
+        let as_uid = |uid: Option<u32>| ClientPeer {
+            session_id: None,
+            uid,
+        };
+        assert!(person_peer_ok(&as_uid(Some(1000)), 1000));
+        assert!(person_peer_ok(&as_uid(Some(0)), 1000));
+        assert!(!person_peer_ok(&as_uid(Some(1001)), 1000));
+        assert!(!person_peer_ok(&as_uid(None), 1000));
+    }
+
+    /// FR-27 P11 — the real socket: 0600 and the person's; serves and refuses
+    /// over an actual unix socket; never replaces a live socket; refuses a
+    /// non-socket file at the path; clears a stale socket; refuses a dir the
+    /// person does not own; and removes its own file on stop.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_person_socket_is_the_persons_and_never_takes_over() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-p11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roomler.sock");
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+
+        // A plain file at the path is not a socket: left alone, refused.
+        std::fs::write(&path, b"x").unwrap();
+        let (_tx0, rx0) = watch::channel(false);
+        let e = serve_person_socket(path.clone(), me, state.clone(), rx0)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        std::fs::remove_file(&path).unwrap();
+
+        // A stale socket (bound, then abandoned) is cleared and replaced.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let (tx, rx) = watch::channel(false);
+        let srv = tokio::spawn(serve_person_socket(path.clone(), me, state.clone(), rx));
+        let mut up = false;
+        for _ in 0..100 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(up, "the person socket came up over the stale one");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.uid(), me);
+
+        let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+        wr.write_all(b"{\"t\":\"config_get\"}\n").await.unwrap();
+        let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(is_person_refusal(&r), "{r:?}");
+        // This connection stays OPEN across the stop below, having just been
+        // served twice: the stop must cut it.
+
+        // A second server at the same path must not take the live one over.
+        let (_tx2, rx2) = watch::channel(false);
+        let e = serve_person_socket(path.clone(), me, state.clone(), rx2)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+
+        // Stop: the file it bound goes with it, and so does every connection
+        // it was serving — a person switched away keeps nothing open.
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+        assert!(!path.exists(), "the person socket removes its own file");
+        let _ = wr.write_all(b"{\"t\":\"status\"}\n").await;
+        let after =
+            tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line()).await;
+        assert!(
+            matches!(after, Ok(Ok(None)) | Ok(Err(_))),
+            "a connection held across the stop is cut, not served: {after:?}"
+        );
+
+        // A dir the person does not own is refused before anything is
+        // created in it (skipped as root, where `/` would be "owned").
+        if me != 0 {
+            let (_tx3, rx3) = watch::channel(false);
+            let e = serve_person_socket("/roomler-p11-never.sock".into(), me, state, rx3)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(!std::path::Path::new("/roomler-p11-never.sock").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.

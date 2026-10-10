@@ -259,6 +259,34 @@ device grid — an *order* the device answers with a locally minted key, never a
 the server chose or saw; the device's re-join under the new key is what the server
 verifies: [`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
 
+**The LocalAPI's ACL is the local trust boundary.** The daemon's local control
+endpoint carries administrative verbs: exec, SSH grants, config, routes, restart. On
+Windows it is a named pipe whose security descriptor admits `SYSTEM`,
+`Administrators` and the interactive user. On Unix a root daemon's socket is
+`/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
+the recording verbs require the console user (FR-85) and an update hold requires
+root (FR-90).
+
+⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911).** A Linux
+system install's companion runs as the desktop user and could not reach the root
+socket. That left the person at the screen with no "being viewed" banner, no
+Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
+`/run/user/<uid>/roomler.sock`:
+- it belongs to the user of the **active** graphical session only;
+- it is 0600 and theirs because it is **made as them**: the bind and the `chmod` run on a
+  thread switched to their filesystem ids (`setfsuid`/`setfsgid`). Their own directory
+  lets them swap the path between any two root calls, and `chmod`/`chown` follow
+  symlinks, so a root `chown` of that path could be raced into handing them
+  `/etc/shadow`. The daemon therefore never runs a root path operation there;
+- `SO_PEERCRED` is checked against that user or root on every connection;
+- it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
+  `ConsentDecide` and `RecordStatus`.
+
+The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
+new verb cannot reach it by default. Widening it is a security change and needs
+review like one. The root socket itself is unchanged. Kill switch:
+`ROOMLERD_PERSON_SOCKET=0`.
+
 ---
 
 ## 5 · Network-facing surfaces
