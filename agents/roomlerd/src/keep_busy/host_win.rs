@@ -22,9 +22,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SPI_GETACTIVEWINDOWTRACKING, SystemParametersInfoW,
 };
 
-use super::engine::{Host, HostError, IdleMarker, Reason, SessionState};
+use super::arbiter_io;
+use super::engine::{Host, HostError, IdleMarker, SessionState};
 use super::patterns::{self, Rect};
-use crate::input::arbiter::{self, KbOp, KbReply};
 use crate::lock_state::LockState;
 
 /// How long `settle` polls for our own move to land in `GetLastInputInfo`.
@@ -38,16 +38,6 @@ pub struct WinHost;
 impl WinHost {
     pub fn new() -> WinHost {
         WinHost
-    }
-}
-
-fn map_err(r: KbReply) -> HostError {
-    match r {
-        KbReply::RemoteButtonHeld => HostError::RemoteButtonHeld,
-        KbReply::Unsupported => HostError::Unsupported(Reason::Unsupported),
-        KbReply::NoPermission => HostError::Unsupported(Reason::NoPermission),
-        KbReply::Failed(e) => HostError::Failed(e),
-        other => HostError::Failed(format!("unexpected arbiter reply {other:?}")),
     }
 }
 
@@ -85,17 +75,11 @@ impl Host for WinHost {
     }
 
     fn cursor(&mut self) -> Result<(i32, i32), HostError> {
-        match arbiter::global().keep_busy(KbOp::Locate) {
-            KbReply::Located(x, y) => Ok((x, y)),
-            other => Err(map_err(other)),
-        }
+        arbiter_io::cursor()
     }
 
     fn move_to(&mut self, p: (i32, i32)) -> Result<(), HostError> {
-        match arbiter::global().keep_busy(KbOp::Move { x: p.0, y: p.1 }) {
-            KbReply::Moved => Ok(()),
-            other => Err(map_err(other)),
-        }
+        arbiter_io::move_to(p)
     }
 
     fn settle(&mut self, before: IdleMarker) -> Option<IdleMarker> {
@@ -114,10 +98,7 @@ impl Host for WinHost {
     }
 
     fn buttons_held(&mut self) -> Result<bool, HostError> {
-        match arbiter::global().keep_busy(KbOp::Buttons) {
-            KbReply::Buttons(b) => Ok(b),
-            other => Err(map_err(other)),
-        }
+        arbiter_io::buttons()
     }
 
     fn safe_box_at(&mut self, p: (i32, i32)) -> Option<Rect> {

@@ -337,8 +337,13 @@ libc = "0.2"
 # error, not a merge. Enabled by `viewer-indicator-x11` (FR-27) and by
 # `scrap-capture` (FR-29) independently; the crate itself is already in the
 # lockfile via enigo/arboard, so this buys a feature, not a dependency.
+#
+# FR-92 P3 (keep busy on X11, enabled by `enigo-input`) adds two protocol
+# modules: `screensaver` (MIT-SCREEN-SAVER — the idle counter that tells the
+# engine's own XTest moves from a person's) and `randr` (the monitor under
+# the pointer).
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["damage"], optional = true }
+x11rb = { version = "0.13", features = ["damage", "screensaver", "randr"], optional = true }
 
 # FR-36 P1 — DRM/KMS scanout capture (`drm-capture`). MIT, and its whole tree
 # (drm-ffi / drm-sys / drm-fourcc) is MIT too, so it is clean under FR-24's
@@ -505,8 +510,10 @@ vp9-444 = ["dep:env-libvpx-sys", "dep:dcv-color-primitives"]
 # comment above). Pure feature wiring; the C-level work happens at
 # build time inside env-libvpx-sys's build.rs.
 vp9-444-bindgen = ["env-libvpx-sys/generate"]
-# Enables the enigo-based input injection backend.
-enigo-input = ["dep:enigo"]
+# Enables the enigo-based input injection backend. On Linux it also brings
+# x11rb, which keep busy reads the X idle counter, buttons and monitors with
+# (FR-92 P3); the dependency is Linux-only, so elsewhere this adds nothing.
+enigo-input = ["dep:enigo", "dep:x11rb"]
 # Enables the clipboard data-channel handler — round-trip text +
 # PNG images between browser and agent via the `clipboard` DC, plus
 # the v2 change watcher for auto-sync. Cross-platform via arboard
