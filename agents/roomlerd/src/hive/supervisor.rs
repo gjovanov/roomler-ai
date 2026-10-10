@@ -534,9 +534,9 @@ fn store_path(wanted: impl FnOnce(&Path) -> bool) -> Result<Option<PathBuf>, Str
     let dir = roomler_node_core::appdirs::project_dirs()
         .map(|p| p.data_local_dir().join("hive"))
         .ok_or("no data directory for the replica store")?;
-    // P1i-2 — on Windows the service's machine-wide directory, which both of
-    // its workers reach (SYSTEM, and the console user elevated), so the worker
-    // a controller's arrival swaps in finds what the last one kept.
+    // P1i-2 — on Windows the service's machine-wide directory, which the
+    // worker reaches whether it is SYSTEM or the console user elevated, so a
+    // new worker finds what the last one kept.
     #[cfg(windows)]
     let dir = crate::hive_win::store_dir();
     let file = dir.join("hive.db");

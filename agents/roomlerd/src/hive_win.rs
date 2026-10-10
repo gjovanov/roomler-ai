@@ -10,9 +10,9 @@
 //! `hive_accounts` must map the starter to the console user, and with nobody
 //! signed in a start is refused `no_console_user`.
 //!
-//! The daemon that hosts sessions is the service's WORKER. It runs as SYSTEM
-//! (the SystemContext worker, while a controller is connected or before
-//! anyone signs in) or, most of the time, as the console user, elevated
+//! The daemon that hosts sessions is the service's WORKER. On a device
+//! installed with SystemContext it runs as SYSTEM, in the console session,
+//! all the time; without SystemContext, as the console user, elevated
 //! (`ROOMLERD_ELEVATE_WORKER`). [`console_user`] reaches the same person from
 //! either, at Medium integrity: FR-85's recorder rule, whose token code
 //! [`crate::win_token`] now holds for both.
@@ -773,12 +773,12 @@ pub unsafe fn run_prep(who: SpawnAs, cmdline: &str, timeout: Duration) -> Result
 
 // ─── P1i-2: where a session's files live, and who may touch them ────────────
 //
-// On Windows the daemon that hosts sessions is the WORKER, which the service
-// runs as SYSTEM, or (most of the time) as the console user, elevated
-// (`ROOMLERD_ELEVATE_WORKER`). A controller connecting swaps one for the
-// other. Both reach the service's machine-wide directory, so the store, what
-// the device hosts and each session's runtime files live there, and the worker
-// after a swap finds what the last one hosted. Every directory is owned by
+// On Windows the daemon that hosts sessions is the WORKER: SYSTEM on a device
+// installed with SystemContext, else the console user, elevated
+// (`ROOMLERD_ELEVATE_WORKER`); a remote-desktop connection changes neither.
+// Either reaches the service's machine-wide directory, so the store, what the
+// device hosts and each session's runtime files live there, and a new worker
+// finds what the last one hosted. Every directory is owned by
 // Administrators with a protected DACL, so a folder someone else made there
 // first is taken over, never trusted: as its owner its maker would keep
 // WRITE_DAC whatever the DACL said.
