@@ -111,6 +111,11 @@ pub enum TranscriptEvent {
         #[serde(default)]
         message: Option<String>,
     },
+    /// FR-90 P2b — what the primary checkpointed after a turn: every
+    /// allowlisted file of the session's config directory, by length and
+    /// hash, and the blobs this checkpoint added. In the chain like any event,
+    /// so two members at the same `(seq, hash)` hold the same files.
+    Checkpoint(crate::checkpoint::Checkpoint),
 }
 
 /// How an approval ends ([`TranscriptEvent::ApprovalResolved`]).
@@ -141,6 +146,7 @@ impl TranscriptEvent {
             Self::Note { .. } => "note",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ApprovalResolved { .. } => "approval_resolved",
+            Self::Checkpoint(_) => "checkpoint",
         }
     }
 
@@ -171,7 +177,8 @@ impl TranscriptEvent {
             Self::SessionInit { .. }
             | Self::Turn { .. }
             | Self::Compaction { .. }
-            | Self::ApprovalRequested { .. } => return None,
+            | Self::ApprovalRequested { .. }
+            | Self::Checkpoint(_) => return None,
         };
         (!text.trim().is_empty()).then_some(text)
     }
@@ -246,11 +253,40 @@ mod tests {
                 by: Some("Dev".into()),
                 message: None,
             },
+            TranscriptEvent::Checkpoint(crate::checkpoint::Checkpoint {
+                n: 1,
+                turn: 1,
+                files: vec![],
+                skipped: vec![],
+            }),
         ];
         for ev in all {
             let v: serde_json::Value = serde_json::from_str(&ev.to_json()).unwrap();
             assert_eq!(v["kind"], ev.kind(), "{ev:?}");
+            assert_eq!(TranscriptEvent::from_json(&ev.to_json()), Some(ev.clone()));
         }
+    }
+
+    /// FR-90 P2b — a checkpoint is a flat object beside its `kind`, and nothing
+    /// in it goes into the full-text index.
+    #[test]
+    fn a_checkpoint_event_is_flat_json_beside_its_kind() {
+        let (f, _) = crate::checkpoint::snapshot_append("h", 0o600, b"a\n", None);
+        let ev = TranscriptEvent::Checkpoint(crate::checkpoint::Checkpoint {
+            n: 2,
+            turn: 5,
+            files: vec![f],
+            skipped: vec![],
+        });
+        let v: serde_json::Value = serde_json::from_str(&ev.to_json()).unwrap();
+        assert_eq!(v["kind"], "checkpoint");
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["files"][0]["growth"], "append");
+        assert_eq!(
+            ev.search_text(),
+            None,
+            "nothing in it is for full-text search"
+        );
     }
 
     #[test]
