@@ -14,7 +14,9 @@
 //! - [`store`] — the replica store every member keeps (SQLite with an FTS5
 //!   index);
 //! - [`launch`] — the harness command line and environment for one session;
-//! - [`roots`] — confining a session's folder to the device's `hive_roots`.
+//! - [`roots`] — confining a session's folder to the device's `hive_roots`;
+//! - [`checkpoint`] — what a checkpoint takes of a session's config directory
+//!   (FR-90 P2b), and how a member puts it back together.
 //!
 //! What it deliberately does not do: spawn processes, drop privileges, or talk
 //! to the network. The daemon does those, with the one privilege path it
@@ -24,6 +26,7 @@
 //! `docs/fr/FR-90-hive-agent-sessions.md`.
 
 pub mod chain;
+pub mod checkpoint;
 pub mod event;
 pub mod launch;
 pub mod roots;

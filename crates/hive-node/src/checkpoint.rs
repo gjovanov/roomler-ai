@@ -1,0 +1,1018 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-90 P2b — what a checkpoint takes of a session's config directory, and how
+//! a member puts it back together.
+//!
+//! At each turn's end the primary checkpoints its session: the five allowlisted
+//! paths of Claude Code's config directory ([`allowlist`]), and later in P2b the
+//! workspace. The daemon never reads a path the session's account controls, so
+//! [`take`] runs AS THE ACCOUNT, in `roomlerd hive-checkpoint` (P2b-3). What it
+//! produces is a [`Checkpoint`], recorded in the chain as a `checkpoint` event
+//! (so two members at the same `(seq, hash)` hold the same files), and the
+//! blobs it names, each BLAKE3-named as the replica store keeps them.
+//!
+//! Two shapes of file, as P2b's probes found Claude Code writes them (spec §8):
+//!
+//! | File | How Claude Code writes it | How a checkpoint takes it |
+//! |---|---|---|
+//! | the history `<id>.jsonl`, a sub-agent's `agent-<id>.jsonl` | only appended to (`O_APPEND`) | the bytes past the last checkpoint, up to the last whole line |
+//! | everything else in the allowlist | replaced (a rename), or written once | whole, by hash, and only when it changed |
+//!
+//! The chain is the state: a file's `len` and `hash` in the last checkpoint are
+//! where the next one starts ([`Previous`]), so nothing else is kept between
+//! turns. A file that shrank, or changed before its last offset, is taken again
+//! from its first byte, and the checkpoint says so.
+//!
+//! ⚠️ **An allowlist, never the directory.** The config directory's root holds a
+//! `peerToken` beside the harness's messaging socket and a `machineID` (§3b's
+//! probes). Nothing outside the five paths is ever opened.
+//!
+//! ⚠️ **A link is never followed.** The allowlist holds Claude Code's own files;
+//! a link there to the account's `~/.ssh` would copy a key to every member. A
+//! link, or a name that is not UTF-8, is listed in [`Checkpoint::skipped`] and
+//! taken nowhere.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// The most one chunk holds. Well under the store's blob limit
+/// ([`crate::store::MAX_BLOB_BYTES`]), so a member carries and checks each one
+/// in memory.
+pub const CHUNK_MAX: usize = 4 * 1024 * 1024;
+
+/// The most files one checkpoint lists: a session's tool results accumulate,
+/// and a directory with more than this is not Claude Code's.
+pub const MAX_FILES: usize = 10_000;
+
+/// The most NEW bytes one checkpoint takes. A first checkpoint of a long
+/// history is tens of MB at most; past this, something other than a session
+/// is in the allowlist.
+pub const MAX_NEW_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How deep a directory in the allowlist is walked.
+const MAX_DEPTH: usize = 8;
+
+/// A BLAKE3 hash, as `b3sum` prints it on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Digest(pub [u8; 32]);
+
+impl Digest {
+    /// The hash of `bytes`, which is also the name the store keeps them under
+    /// ([`crate::store::blob_hash`]).
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(*blake3::hash(bytes).as_bytes())
+    }
+
+    fn of_hasher(h: &blake3::Hasher) -> Self {
+        Self(*h.finalize().as_bytes())
+    }
+
+    /// The hash from its 64 lowercase hex digits.
+    pub fn parse(hex: &str) -> Option<Self> {
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
+            let digit = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                _ => None,
+            };
+            out[i] = digit(pair[0])? << 4 | digit(pair[1])?;
+        }
+        Some(Self(out))
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Digest({self})")
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).ok_or_else(|| serde::de::Error::custom("not a BLAKE3 hash"))
+    }
+}
+
+/// One piece of a file, kept as a blob named by its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    /// Where in the file it starts.
+    pub offset: u64,
+    pub len: u64,
+    pub hash: Digest,
+}
+
+/// How a file is taken ([`snapshot_append`], [`snapshot_whole`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Growth {
+    /// Only ever appended to: the new bytes, up to the last whole line.
+    Append,
+    /// Replaced or written once: the whole file, when it changed.
+    Whole,
+}
+
+/// One allowlisted file, as this checkpoint has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSnap {
+    /// Relative to the config directory, `/`-separated on every OS.
+    pub path: String,
+    pub growth: Growth,
+    /// Unix permission bits (at most `0o777`); 0 where the OS keeps none.
+    pub mode: u32,
+    /// The bytes this checkpoint covers: for an appended file, up to its last
+    /// whole line, so a member never holds half a line.
+    pub len: u64,
+    /// The BLAKE3 hash of those bytes.
+    pub hash: Digest,
+    /// The blobs this checkpoint adds for the file: an appended file's new
+    /// bytes, or a changed file whole. Empty when it is as the last checkpoint
+    /// had it. A chunk at offset 0 starts the file over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<Chunk>,
+}
+
+/// A file in the allowlist this checkpoint did not take, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skipped {
+    pub path: String,
+    pub why: String,
+}
+
+/// What one checkpoint took ([`take`]): the `checkpoint` event's body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// 1 for a session's first checkpoint, one more each time after.
+    pub n: u64,
+    /// The turn it was taken after.
+    pub turn: u32,
+    /// Every allowlisted file there is now, in path order, changed or not: a
+    /// member that holds them all at these hashes holds this checkpoint. A file
+    /// the last checkpoint listed and this one does not was removed.
+    pub files: Vec<FileSnap>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Skipped>,
+}
+
+/// Where the last checkpoint left each file: its `len` and `hash`, by path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Previous {
+    files: BTreeMap<String, (u64, Digest)>,
+}
+
+impl Previous {
+    /// Nothing taken yet: a session's first checkpoint.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Where `last` left every file it listed.
+    pub fn from_checkpoint(last: &Checkpoint) -> Self {
+        Self {
+            files: last
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), (f.len, f.hash)))
+                .collect(),
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<(u64, Digest)> {
+        self.files.get(path).copied()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("{0:?} is not a harness session id (a UUID)")]
+    BadSession(String),
+    #[error("reading {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the allowlist holds more than {MAX_FILES} files")]
+    TooManyFiles,
+    #[error("a checkpoint takes at most {MAX_NEW_BYTES} new bytes, and this one would take {0}")]
+    TooLarge(u64),
+    /// A member's side: what it holds for `path` does not add up.
+    #[error("{path}: {why}")]
+    Inconsistent { path: String, why: String },
+}
+
+/// One allowlisted path, relative to the config directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowEntry {
+    pub rel: String,
+    pub is_dir: bool,
+}
+
+/// The five paths a checkpoint takes, for the session whose HARNESS id is
+/// `harness_session` (the pinned project directory is `hive-<id>`):
+///
+/// - `projects/hive-<id>/<id>.jsonl`, the history;
+/// - `projects/hive-<id>/<id>/subagents/`, sub-agent transcripts and their metadata;
+/// - `projects/hive-<id>/<id>/tool-results/`, outputs too large for the context;
+/// - `projects/hive-<id>/memory/`, the auto-memory;
+/// - `CLAUDE.md`, the session's own instructions (core memory, P1e).
+///
+/// The id must be a UUID, as Claude Code's `--session-id` requires: it is
+/// part of every path, and nothing else may be.
+pub fn allowlist(harness_session: &str) -> Result<[AllowEntry; 5], CheckpointError> {
+    let id = harness_id(harness_session)?;
+    let project = format!("projects/hive-{id}");
+    Ok([
+        AllowEntry {
+            rel: format!("{project}/{id}.jsonl"),
+            is_dir: false,
+        },
+        AllowEntry {
+            rel: format!("{project}/{id}/subagents"),
+            is_dir: true,
+        },
+        AllowEntry {
+            rel: format!("{project}/{id}/tool-results"),
+            is_dir: true,
+        },
+        AllowEntry {
+            rel: format!("{project}/memory"),
+            is_dir: true,
+        },
+        AllowEntry {
+            rel: "CLAUDE.md".to_string(),
+            is_dir: false,
+        },
+    ])
+}
+
+/// The id, in the lowercase hyphenated form Claude Code names files by.
+fn harness_id(harness_session: &str) -> Result<String, CheckpointError> {
+    let parsed = uuid::Uuid::parse_str(harness_session)
+        .map_err(|_| CheckpointError::BadSession(harness_session.to_string()))?;
+    let id = parsed.hyphenated().to_string();
+    if id != harness_session {
+        // Braced, simple or upper-case forms would name other files.
+        return Err(CheckpointError::BadSession(harness_session.to_string()));
+    }
+    Ok(id)
+}
+
+/// How a file at `rel` is taken: the history and a sub-agent's transcript are
+/// only appended to; everything else is taken whole.
+pub fn growth_of(rel: &str, harness_session: &str) -> Growth {
+    let project = format!("projects/hive-{harness_session}");
+    let history = format!("{project}/{harness_session}.jsonl");
+    let subagents = format!("{project}/{harness_session}/subagents/");
+    let appended = rel == history
+        || (rel.starts_with(&subagents)
+            && rel.ends_with(".jsonl")
+            && !rel[subagents.len()..].contains('/'));
+    if appended {
+        Growth::Append
+    } else {
+        Growth::Whole
+    }
+}
+
+/// An appended file at this checkpoint, from `bytes` (all of it as it is now)
+/// and where the last checkpoint left it. Returns the file's entry and the new
+/// blobs, in chunk order.
+///
+/// The checkpoint covers up to the last `\n`: the bytes after it are a line the
+/// harness is still writing, taken next time. When the file is shorter than the
+/// last checkpoint's `len`, or its first `len` bytes no longer hash to the last
+/// `hash`, the file is taken again from its first byte.
+pub fn snapshot_append(
+    path: &str,
+    mode: u32,
+    bytes: &[u8],
+    prev: Option<(u64, Digest)>,
+) -> (FileSnap, Vec<Vec<u8>>) {
+    let mut hasher = blake3::Hasher::new();
+    let mut start = 0usize;
+    let mut restarted = false;
+    if let Some((plen, phash)) = prev {
+        match usize::try_from(plen) {
+            Ok(plen) if plen <= bytes.len() => {
+                hasher.update(&bytes[..plen]);
+                if Digest::of_hasher(&hasher) == phash {
+                    start = plen;
+                } else {
+                    hasher = blake3::Hasher::new();
+                    restarted = plen > 0;
+                }
+            }
+            _ => restarted = plen > 0,
+        }
+    }
+    let rest = &bytes[start..];
+    let covered = rest.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let new = &rest[..covered];
+    hasher.update(new);
+    let mut chunks = Vec::new();
+    let mut blobs = Vec::new();
+    let mut offset = start as u64;
+    for piece in split_lines(new, CHUNK_MAX) {
+        chunks.push(Chunk {
+            offset,
+            len: piece.len() as u64,
+            hash: Digest::of(piece),
+        });
+        offset += piece.len() as u64;
+        blobs.push(piece.to_vec());
+    }
+    if restarted && chunks.is_empty() {
+        // Started over with no whole line yet: one empty chunk at 0 still
+        // tells a member to drop what it holds.
+        chunks.push(Chunk {
+            offset: 0,
+            len: 0,
+            hash: Digest::of(&[]),
+        });
+        blobs.push(Vec::new());
+    }
+    let snap = FileSnap {
+        path: path.to_string(),
+        growth: Growth::Append,
+        mode,
+        len: (start + covered) as u64,
+        hash: Digest::of_hasher(&hasher),
+        chunks,
+    };
+    (snap, blobs)
+}
+
+/// A whole file at this checkpoint: its entry, and its blobs when it is not
+/// what the last checkpoint had.
+pub fn snapshot_whole(
+    path: &str,
+    mode: u32,
+    bytes: &[u8],
+    prev: Option<(u64, Digest)>,
+) -> (FileSnap, Vec<Vec<u8>>) {
+    let hash = Digest::of(bytes);
+    let len = bytes.len() as u64;
+    let unchanged = prev == Some((len, hash));
+    let mut chunks = Vec::new();
+    let mut blobs = Vec::new();
+    if !unchanged {
+        let mut offset = 0u64;
+        for piece in bytes.chunks(CHUNK_MAX) {
+            chunks.push(Chunk {
+                offset,
+                len: piece.len() as u64,
+                hash: Digest::of(piece),
+            });
+            offset += piece.len() as u64;
+            blobs.push(piece.to_vec());
+        }
+        if bytes.is_empty() {
+            // An empty file still starts over: one empty chunk says so.
+            chunks.push(Chunk {
+                offset: 0,
+                len: 0,
+                hash,
+            });
+            blobs.push(Vec::new());
+        }
+    }
+    let snap = FileSnap {
+        path: path.to_string(),
+        growth: Growth::Whole,
+        mode,
+        len,
+        hash,
+        chunks,
+    };
+    (snap, blobs)
+}
+
+/// `bytes` cut into pieces of at most `max`, each ending at a `\n` where one
+/// is within reach; a line longer than `max` is cut where it must be.
+fn split_lines(bytes: &[u8], max: usize) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if rest.len() <= max {
+            out.push(rest);
+            break;
+        }
+        let cut = rest[..max]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(max, |i| i + 1);
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    out
+}
+
+/// Take a checkpoint of `config_dir` for the session whose harness id is
+/// `harness_session`: number `n`, after turn `turn`, from where `prev` left
+/// each file. Returns the checkpoint and its new blobs.
+///
+/// Runs as whoever calls it, which for a session is its account (P2b-3), and
+/// opens nothing outside the [`allowlist`].
+pub fn take(
+    config_dir: &Path,
+    harness_session: &str,
+    n: u64,
+    turn: u32,
+    prev: &Previous,
+) -> Result<(Checkpoint, Vec<Vec<u8>>), CheckpointError> {
+    let entries = allowlist(harness_session)?;
+    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in &entries {
+        let full = config_dir.join(&entry.rel);
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err(&entry.rel, e)),
+        };
+        if meta.file_type().is_symlink() {
+            skipped.push(Skipped {
+                path: entry.rel.clone(),
+                why: "a link".into(),
+            });
+        } else if entry.is_dir && meta.is_dir() {
+            walk(&full, &entry.rel, 0, &mut found, &mut skipped)?;
+        } else if !entry.is_dir && meta.is_file() {
+            found.push((entry.rel.clone(), full));
+        } else {
+            skipped.push(Skipped {
+                path: entry.rel.clone(),
+                why: "not the kind of file the allowlist names".into(),
+            });
+        }
+        if found.len() > MAX_FILES {
+            return Err(CheckpointError::TooManyFiles);
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut files = Vec::with_capacity(found.len());
+    let mut blobs = Vec::new();
+    let mut new_bytes = 0u64;
+    for (rel, full) in found {
+        let (snap, mut more) = take_file(&rel, &full, harness_session, prev.get(&rel))?;
+        new_bytes += more.iter().map(|b| b.len() as u64).sum::<u64>();
+        if new_bytes > MAX_NEW_BYTES {
+            return Err(CheckpointError::TooLarge(new_bytes));
+        }
+        files.push(snap);
+        blobs.append(&mut more);
+    }
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((
+        Checkpoint {
+            n,
+            turn,
+            files,
+            skipped,
+        },
+        blobs,
+    ))
+}
+
+fn take_file(
+    rel: &str,
+    full: &Path,
+    harness_session: &str,
+    prev: Option<(u64, Digest)>,
+) -> Result<(FileSnap, Vec<Vec<u8>>), CheckpointError> {
+    let meta = std::fs::symlink_metadata(full).map_err(|e| io_err(rel, e))?;
+    let mode = mode_of(&meta);
+    // Read whole: a history is MBs, and one read is one moment of the file,
+    // so the prefix check and the new bytes cannot disagree.
+    let bytes = std::fs::read(full).map_err(|e| io_err(rel, e))?;
+    Ok(match growth_of(rel, harness_session) {
+        Growth::Append => snapshot_append(rel, mode, &bytes, prev),
+        Growth::Whole => snapshot_whole(rel, mode, &bytes, prev),
+    })
+}
+
+/// The files under `dir` (relative path `rel`), depth-first in name order,
+/// never through a link.
+fn walk(
+    dir: &Path,
+    rel: &str,
+    depth: usize,
+    found: &mut Vec<(String, std::path::PathBuf)>,
+    skipped: &mut Vec<Skipped>,
+) -> Result<(), CheckpointError> {
+    if depth >= MAX_DEPTH {
+        skipped.push(Skipped {
+            path: rel.to_string(),
+            why: format!("deeper than {MAX_DEPTH} directories"),
+        });
+        return Ok(());
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| io_err(rel, e))? {
+        let entry = entry.map_err(|e| io_err(rel, e))?;
+        names.push(entry.file_name());
+    }
+    names.sort();
+    for name in names {
+        let Some(name_str) = name.to_str() else {
+            skipped.push(Skipped {
+                path: format!("{rel}/{}", name.to_string_lossy()),
+                why: "a name that is not UTF-8".into(),
+            });
+            continue;
+        };
+        let child_rel = format!("{rel}/{name_str}");
+        let child = dir.join(&name);
+        let meta = std::fs::symlink_metadata(&child).map_err(|e| io_err(&child_rel, e))?;
+        if meta.file_type().is_symlink() {
+            skipped.push(Skipped {
+                path: child_rel,
+                why: "a link".into(),
+            });
+        } else if meta.is_dir() {
+            walk(&child, &child_rel, depth + 1, found, skipped)?;
+        } else if meta.is_file() {
+            found.push((child_rel, child));
+            if found.len() > MAX_FILES {
+                return Err(CheckpointError::TooManyFiles);
+            }
+        } else {
+            skipped.push(Skipped {
+                path: child_rel,
+                why: "not a regular file".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+fn io_err(path: &str, source: std::io::Error) -> CheckpointError {
+    CheckpointError::Io {
+        path: path.to_string(),
+        source,
+    }
+}
+
+/// A member's half: the bytes of `path` as of the last of `checkpoints`
+/// (oldest first), from the chunks they name and the blobs `blob` finds. Each
+/// chunk must hash to its name and follow the one before it, and the whole
+/// must hash to the last checkpoint's `hash`. A chunk at offset 0 starts the
+/// file over.
+pub fn assemble<'a>(
+    path: &str,
+    checkpoints: impl IntoIterator<Item = &'a Checkpoint>,
+    blob: impl Fn(&Digest) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, CheckpointError> {
+    let bad = |why: String| CheckpointError::Inconsistent {
+        path: path.to_string(),
+        why,
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut last: Option<&FileSnap> = None;
+    for cp in checkpoints {
+        let Some(snap) = cp.files.iter().find(|f| f.path == path) else {
+            last = None;
+            bytes.clear();
+            continue;
+        };
+        for chunk in &snap.chunks {
+            if chunk.offset == 0 {
+                bytes.clear();
+            }
+            if chunk.offset != bytes.len() as u64 {
+                return Err(bad(format!(
+                    "checkpoint {} has a chunk at {}, after {} bytes",
+                    cp.n,
+                    chunk.offset,
+                    bytes.len()
+                )));
+            }
+            let data = blob(&chunk.hash)
+                .ok_or_else(|| bad(format!("the blob {} is missing", chunk.hash)))?;
+            if data.len() as u64 != chunk.len || Digest::of(&data) != chunk.hash {
+                return Err(bad(format!(
+                    "the blob {} is not what was named",
+                    chunk.hash
+                )));
+            }
+            bytes.extend_from_slice(&data);
+        }
+        last = Some(snap);
+    }
+    let Some(last) = last else {
+        return Err(bad("the last checkpoint does not list it".into()));
+    };
+    if bytes.len() as u64 != last.len || Digest::of(&bytes) != last.hash {
+        return Err(bad(format!(
+            "the chunks add up to {} bytes that do not hash to checkpoint {}'s",
+            bytes.len(),
+            last.len
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const ID: &str = "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9";
+
+    fn blobs_of(store: &mut HashMap<Digest, Vec<u8>>, blobs: Vec<Vec<u8>>) {
+        for b in blobs {
+            store.insert(Digest::of(&b), b);
+        }
+    }
+
+    #[test]
+    fn a_digest_prints_and_parses_as_b3sum_does() {
+        let d = Digest::of(b"abc");
+        let hex = d.to_string();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, blake3::hash(b"abc").to_hex().as_str());
+        assert_eq!(Digest::parse(&hex), Some(d));
+        assert_eq!(Digest::parse(&hex.to_uppercase()), None, "lowercase only");
+        assert_eq!(Digest::parse(&hex[..63]), None);
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, format!("\"{hex}\""));
+        assert_eq!(serde_json::from_str::<Digest>(&json).unwrap(), d);
+    }
+
+    /// The five paths, under the pinned project name, and nothing at the
+    /// config root but `CLAUDE.md`. Any id that is not a lowercase hyphenated
+    /// UUID is refused, since it is part of every path.
+    #[test]
+    fn the_allowlist_is_five_named_paths_and_the_id_must_be_a_uuid() {
+        let a = allowlist(ID).unwrap();
+        let rels: Vec<&str> = a.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            [
+                format!("projects/hive-{ID}/{ID}.jsonl").as_str(),
+                format!("projects/hive-{ID}/{ID}/subagents").as_str(),
+                format!("projects/hive-{ID}/{ID}/tool-results").as_str(),
+                format!("projects/hive-{ID}/memory").as_str(),
+                "CLAUDE.md",
+            ]
+        );
+        for bad in [
+            "../etc",
+            "",
+            &ID.to_uppercase(),
+            &format!("{{{ID}}}"),
+            &ID.replace('-', ""),
+        ] {
+            assert!(
+                matches!(allowlist(bad), Err(CheckpointError::BadSession(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_history_and_a_subagents_transcript_are_appended_the_rest_whole() {
+        let p = format!("projects/hive-{ID}");
+        assert_eq!(growth_of(&format!("{p}/{ID}.jsonl"), ID), Growth::Append);
+        assert_eq!(
+            growth_of(&format!("{p}/{ID}/subagents/agent-a1.jsonl"), ID),
+            Growth::Append
+        );
+        for whole in [
+            format!("{p}/{ID}/subagents/agent-a1.meta.json"),
+            format!("{p}/{ID}/subagents/deeper/agent-a1.jsonl"),
+            format!("{p}/{ID}/tool-results/t1.txt"),
+            format!("{p}/memory/MEMORY.md"),
+            "CLAUDE.md".to_string(),
+        ] {
+            assert_eq!(growth_of(&whole, ID), Growth::Whole, "{whole}");
+        }
+    }
+
+    /// An appended file is taken up to its last whole line, and the next
+    /// checkpoint takes only what came after; a member's chunks add up to the
+    /// file at each checkpoint.
+    #[test]
+    fn an_appended_file_is_taken_in_whole_lines_and_only_its_new_bytes() {
+        let mut store = HashMap::new();
+        let (one, b1) = snapshot_append("h", 0o600, b"{\"a\":1}\n{\"b\":", None);
+        assert_eq!(one.len, 8, "the half line waits for the next checkpoint");
+        assert_eq!(one.hash, Digest::of(b"{\"a\":1}\n"));
+        assert_eq!(one.chunks.len(), 1);
+        assert_eq!(one.chunks[0].offset, 0);
+        blobs_of(&mut store, b1);
+
+        let file = b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n";
+        let (two, b2) = snapshot_append("h", 0o600, file, Some((one.len, one.hash)));
+        assert_eq!(two.len, file.len() as u64);
+        assert_eq!(two.chunks.len(), 1);
+        assert_eq!(two.chunks[0].offset, 8, "only the new bytes");
+        assert_eq!(two.chunks[0].len, file.len() as u64 - 8);
+        blobs_of(&mut store, b2);
+
+        let (three, b3) = snapshot_append("h", 0o600, file, Some((two.len, two.hash)));
+        assert!(three.chunks.is_empty() && b3.is_empty(), "nothing new");
+        assert_eq!((three.len, three.hash), (two.len, two.hash));
+
+        let cps: Vec<Checkpoint> = [one, two, three]
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| Checkpoint {
+                n: i as u64 + 1,
+                turn: i as u32 + 1,
+                files: vec![f],
+                skipped: vec![],
+            })
+            .collect();
+        let got = assemble("h", &cps, |d| store.get(d).cloned()).unwrap();
+        assert_eq!(got, file);
+    }
+
+    /// A history that shrank, or changed before its last offset, is taken again
+    /// from its first byte, and a member starts it over.
+    #[test]
+    fn a_file_that_changed_behind_its_offset_is_taken_again_whole() {
+        let (one, _) = snapshot_append("h", 0, b"aaa\nbbb\n", None);
+        let (shrunk, _) = snapshot_append("h", 0, b"aaa\n", Some((one.len, one.hash)));
+        assert_eq!(shrunk.chunks[0].offset, 0);
+        assert_eq!(shrunk.len, 4);
+        let (rewritten, blobs) =
+            snapshot_append("h", 0, b"xxx\nbbb\nccc\n", Some((one.len, one.hash)));
+        assert_eq!(rewritten.chunks[0].offset, 0, "same length, other bytes");
+        assert_eq!(rewritten.len, 12);
+        assert_eq!(blobs.concat(), b"xxx\nbbb\nccc\n");
+
+        // Started over with no whole line yet: still a chunk at 0, empty, so a
+        // member drops what it held instead of keeping the old bytes.
+        let (partial, pblobs) = snapshot_append("h", 0, b"zz", Some((one.len, one.hash)));
+        assert_eq!(partial.len, 0);
+        assert_eq!(
+            partial.chunks,
+            vec![Chunk {
+                offset: 0,
+                len: 0,
+                hash: Digest::of(b"")
+            }]
+        );
+        let mut store = HashMap::new();
+        let (_, b1) = snapshot_append("h", 0, b"aaa\nbbb\n", None);
+        blobs_of(&mut store, b1);
+        blobs_of(&mut store, pblobs);
+        let cps = [one, partial].map(|f| Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![f],
+            skipped: vec![],
+        });
+        assert_eq!(assemble("h", &cps, |d| store.get(d).cloned()).unwrap(), b"");
+    }
+
+    /// A large append is cut at line ends under the chunk limit; a line longer
+    /// than the limit is cut where it must be, and the pieces still add up.
+    #[test]
+    fn a_large_append_is_cut_at_line_ends_and_a_huge_line_where_it_must() {
+        let line = |c: u8, n: usize| {
+            let mut l = vec![c; n];
+            l.push(b'\n');
+            l
+        };
+        let mut bytes = line(b'a', 10);
+        bytes.extend(line(b'b', 10));
+        bytes.extend(line(b'c', 30));
+        let pieces = split_lines(&bytes, 25);
+        assert_eq!(pieces[0], &bytes[..22], "two lines fit");
+        assert!(pieces[1].len() <= 25, "the long line is cut");
+        assert_eq!(pieces.concat(), bytes);
+        assert!(pieces.iter().all(|p| p.len() <= 25));
+    }
+
+    /// A whole file is taken when it changed and not otherwise; an empty file
+    /// is taken as one empty chunk, so a member writes it empty.
+    #[test]
+    fn a_whole_file_is_taken_only_when_it_changed() {
+        let (one, b1) = snapshot_whole("m", 0o644, b"# memory\n", None);
+        assert_eq!(one.chunks.len(), 1);
+        assert_eq!(b1.concat(), b"# memory\n");
+        let (same, b2) = snapshot_whole("m", 0o644, b"# memory\n", Some((one.len, one.hash)));
+        assert!(same.chunks.is_empty() && b2.is_empty());
+        let (empty, b3) = snapshot_whole("m", 0o644, b"", Some((one.len, one.hash)));
+        assert_eq!(empty.chunks.len(), 1);
+        assert_eq!(empty.chunks[0].len, 0);
+        assert_eq!(b3, vec![Vec::<u8>::new()]);
+        let mut store = HashMap::new();
+        blobs_of(&mut store, b1);
+        blobs_of(&mut store, b3);
+        let cps = [one, same, empty].map(|f| Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![f],
+            skipped: vec![],
+        });
+        assert_eq!(assemble("m", &cps, |d| store.get(d).cloned()).unwrap(), b"");
+    }
+
+    /// A member refuses what does not add up: a missing blob, a blob that is
+    /// not what was named, a gap.
+    #[test]
+    fn a_member_refuses_chunks_that_do_not_add_up() {
+        let (one, b1) = snapshot_append("h", 0, b"a\nb\n", None);
+        let cp = Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![one.clone()],
+            skipped: vec![],
+        };
+        let missing = assemble("h", [&cp], |_| None).unwrap_err();
+        assert!(missing.to_string().contains("missing"), "{missing}");
+        let wrong = assemble("h", [&cp], |_| Some(b"x\ny\n".to_vec())).unwrap_err();
+        assert!(wrong.to_string().contains("not what was named"), "{wrong}");
+        let mut gap = one;
+        gap.chunks[0].offset = 2;
+        let cp_gap = Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![gap],
+            skipped: vec![],
+        };
+        let store: HashMap<Digest, Vec<u8>> = b1.into_iter().map(|b| (Digest::of(&b), b)).collect();
+        let err = assemble("h", [&cp_gap], |d| store.get(d).cloned()).unwrap_err();
+        assert!(err.to_string().contains("after 0 bytes"), "{err}");
+    }
+
+    fn write(dir: &Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// A real config directory: the five paths are taken and nothing at the
+    /// root is opened (`.claude.json`, `sessions/…key`); a second checkpoint
+    /// takes only the history's new lines; a removed tool result drops out.
+    #[test]
+    fn take_walks_the_allowlist_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let p = format!("projects/hive-{ID}");
+        write(dir, &format!("{p}/{ID}.jsonl"), b"{\"t\":1}\n");
+        write(
+            dir,
+            &format!("{p}/{ID}/subagents/agent-a1.jsonl"),
+            b"{\"s\":1}\n",
+        );
+        write(
+            dir,
+            &format!("{p}/{ID}/subagents/agent-a1.meta.json"),
+            b"{}",
+        );
+        write(dir, &format!("{p}/{ID}/tool-results/t1.txt"), b"big output");
+        write(dir, &format!("{p}/memory/MEMORY.md"), b"- a fact\n");
+        write(dir, "CLAUDE.md", b"# rules\n");
+        // Outside the allowlist: never opened, never listed.
+        write(
+            dir,
+            ".claude.json",
+            b"{\"machineID\":\"m\",\"userID\":\"u\"}",
+        );
+        write(dir, "sessions/123.abc.key", b"{\"peerToken\":\"secret\"}");
+        write(dir, &format!("{p}/other.jsonl"), b"another session\n");
+
+        let (one, blobs) = take(dir, ID, 1, 1, &Previous::none()).unwrap();
+        let listed: Vec<&str> = one.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            listed,
+            // Path order: the id (`0b1c…`) sorts before `memory`.
+            [
+                "CLAUDE.md",
+                format!("{p}/{ID}.jsonl").as_str(),
+                format!("{p}/{ID}/subagents/agent-a1.jsonl").as_str(),
+                format!("{p}/{ID}/subagents/agent-a1.meta.json").as_str(),
+                format!("{p}/{ID}/tool-results/t1.txt").as_str(),
+                format!("{p}/memory/MEMORY.md").as_str(),
+            ]
+        );
+        let all = blobs.concat();
+        let has = |needle: &[u8]| all.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(b"peerToken") && !has(b"machineID") && !has(b"another session"));
+        assert!(one.skipped.is_empty());
+
+        // Turn 2: the history grows; a tool result goes.
+        let hist = dir.join(format!("{p}/{ID}.jsonl"));
+        std::fs::write(&hist, b"{\"t\":1}\n{\"t\":2}\n").unwrap();
+        std::fs::remove_file(dir.join(format!("{p}/{ID}/tool-results/t1.txt"))).unwrap();
+        let (two, blobs2) = take(dir, ID, 2, 2, &Previous::from_checkpoint(&one)).unwrap();
+        let history = two
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".jsonl") && !f.path.contains("subagents"))
+            .unwrap();
+        assert_eq!(history.chunks.len(), 1);
+        assert_eq!(history.chunks[0].offset, 8);
+        assert_eq!(blobs2.concat(), b"{\"t\":2}\n", "only the new line");
+        assert!(
+            two.files.iter().all(|f| !f.path.ends_with("t1.txt")),
+            "a removed file drops out"
+        );
+        assert!(
+            two.files
+                .iter()
+                .filter(|f| f.growth == Growth::Whole)
+                .all(|f| f.chunks.is_empty()),
+            "unchanged whole files carry no blobs"
+        );
+
+        // A member holding both rebuilds the history and every file.
+        let mut store = HashMap::new();
+        blobs_of(&mut store, blobs);
+        blobs_of(&mut store, blobs2);
+        let history_path = format!("{p}/{ID}.jsonl");
+        let rebuilt = assemble(&history_path, [&one, &two], |d| store.get(d).cloned()).unwrap();
+        assert_eq!(rebuilt, std::fs::read(&hist).unwrap());
+        let claude = assemble("CLAUDE.md", [&one, &two], |d| store.get(d).cloned()).unwrap();
+        assert_eq!(claude, b"# rules\n");
+    }
+
+    /// A link in the allowlist is listed as skipped and never followed, as a
+    /// path or inside a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_allowlist_is_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let secret = tmp.path().join("id_ed25519");
+        std::fs::write(&secret, b"PRIVATE KEY").unwrap();
+        let p = format!("projects/hive-{ID}");
+        std::fs::create_dir_all(dir.join(format!("{p}/memory"))).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join(format!("{p}/memory/MEMORY.md"))).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("CLAUDE.md")).unwrap();
+        let (cp, blobs) = take(dir, ID, 1, 1, &Previous::none()).unwrap();
+        assert!(cp.files.is_empty(), "{:?}", cp.files);
+        assert!(blobs.is_empty());
+        let skipped: Vec<(&str, &str)> = cp
+            .skipped
+            .iter()
+            .map(|s| (s.path.as_str(), s.why.as_str()))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("CLAUDE.md", "a link"),
+                (format!("{p}/memory/MEMORY.md").as_str(), "a link")
+            ]
+        );
+    }
+
+    /// The checkpoint is the `checkpoint` event's body, and round-trips through
+    /// its JSON with hashes as hex.
+    #[test]
+    fn a_checkpoint_round_trips_through_json() {
+        let (f, _) = snapshot_append("h", 0o600, b"a\n", None);
+        let cp = Checkpoint {
+            n: 3,
+            turn: 7,
+            files: vec![f],
+            skipped: vec![Skipped {
+                path: "CLAUDE.md".into(),
+                why: "a link".into(),
+            }],
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        assert!(json.contains(&Digest::of(b"a\n").to_string()), "{json}");
+        assert_eq!(serde_json::from_str::<Checkpoint>(&json).unwrap(), cp);
+    }
+}
