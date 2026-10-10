@@ -523,6 +523,19 @@ pub fn sample_snapshot() -> NetSnapshot {
             s.v4.sort_unstable();
         }
     }
+    // A LAN interface whose OWN prefix route is dead (its next hop is not on
+    // that LAN) is repaired first, so the capture probe below sees the table
+    // as it now is. Narrow by construction: it never routes around another
+    // interface's capture (`lan_repair` module docs).
+    #[cfg(windows)]
+    {
+        let lan_only: Vec<_> = lan_v4
+            .iter()
+            .filter(|(name, ..)| !ifaces.get(name).is_some_and(|i| i.vpn_class))
+            .cloned()
+            .collect();
+        super::lan_repair::reconcile(&lan_only);
+    }
     let lan_captures = if crate::env::flag("OVERLAY_LAN_CAPTURE_PROBE", true) {
         detect_lan_captures(&lan_v4, &ifaces)
     } else {

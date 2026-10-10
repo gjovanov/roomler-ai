@@ -909,6 +909,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Evict a competing VPN route only when it wins the route lookup; a mirror that loses every lookup is left alone (Windows). Built-in default: on.",
     },
     KeyMeta {
+        key: "overlay_lan_route_repair",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Repair a LAN interface's own prefix route when its next hop is not on that LAN (a VPN's stale gateway), by adding the prefix on-link as two halves; never routes around another interface's capture (Windows). Built-in default: on.",
+    },
+    KeyMeta {
         key: "overlay_tun_persist",
         group: Group::NetworkRouting,
         tier: Tier::Advanced,
@@ -1791,6 +1799,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_route_reclaim" => cfg.overlay_route_reclaim.map(fmt_bool),
         "overlay_route_evict_winners_only" => cfg.overlay_route_evict_winners_only.map(fmt_bool),
+        "overlay_lan_route_repair" => cfg.overlay_lan_route_repair.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
         "overlay_route_metric0" => cfg.overlay_route_metric0.map(fmt_bool),
         "overlay_route_win" => cfg.overlay_route_win.map(fmt_bool),
@@ -2307,6 +2316,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_route_evict_winners_only" => {
             cfg.overlay_route_evict_winners_only = parse_tribool(value)?
         }
+        "overlay_lan_route_repair" => cfg.overlay_lan_route_repair = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
         "overlay_route_metric0" => cfg.overlay_route_metric0 = parse_tribool(value)?,
         "overlay_route_win" => cfg.overlay_route_win = parse_tribool(value)?,

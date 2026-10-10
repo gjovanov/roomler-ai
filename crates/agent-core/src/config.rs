@@ -745,6 +745,13 @@ pub struct AgentConfig {
     /// every wave.
     #[serde(default)]
     pub overlay_route_evict_winners_only: Option<bool>,
+    /// Repair a LAN interface's OWN prefix route when its next hop is not on
+    /// that LAN (a VPN's stale gateway), by adding the prefix on-link as two
+    /// halves; never routes around another interface's capture. Windows only
+    /// (`ROOMLERD_OVERLAY_LAN_ROUTE_REPAIR`). Built-in default: on; off
+    /// removes the halves.
+    #[serde(default)]
+    pub overlay_lan_route_repair: Option<bool>,
     /// Keep the overlay TUN device alive across signaling reconnects
     /// (process-lifetime cache in the agent's TUN factory)
     /// (`ROOMLERD_OVERLAY_TUN_PERSIST`). Built-in default: on.
@@ -2299,6 +2306,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_evict: None,
         overlay_route_reclaim: None,
         overlay_route_evict_winners_only: None,
+        overlay_lan_route_repair: None,
         overlay_tun_persist: None,
         overlay_route_metric0: None,
         overlay_route_win: None,
@@ -2492,7 +2500,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2575,6 +2583,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83]
             "OVERLAY_ROUTE_EVICT_WINNERS_ONLY",
             cfg.overlay_route_evict_winners_only,
         ),
+        ("OVERLAY_LAN_ROUTE_REPAIR", cfg.overlay_lan_route_repair),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
         ("OVERLAY_ROUTE_METRIC0", cfg.overlay_route_metric0),
         ("OVERLAY_ROUTE_WIN", cfg.overlay_route_win),
