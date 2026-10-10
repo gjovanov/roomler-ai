@@ -858,7 +858,60 @@ a store P2a wrote.
 ⚠️ "Committed" is SQLite's WAL with `synchronous = NORMAL`: an acknowledged event
 survives a daemon crash, not a power cut.
 
-The rest of P2 is next (spec §3b and §4): checkpoints taken as the account (P2b),
+### P2b-1: what a checkpoint takes of the config directory
+
+A member can resume a session only with Claude Code's own files: the history that
+`--resume` reads byte for byte, the sub-agents' transcripts, the outputs too large
+for the context, the auto-memory and `CLAUDE.md`. At each turn's end the primary
+will take them as a **checkpoint** (P2b-3 runs it as the session's account), record
+it in the chain as a `checkpoint` event, and stream it with the blobs it names. P2b-1
+builds what decides what is taken, and how a member puts it back together
+([`checkpoint.rs`](../crates/hive-node/src/checkpoint.rs)). Nothing takes one yet.
+
+```mermaid
+flowchart LR
+    T["a turn ends"] --> C["take() as the account:<br/>the five allowlisted paths,<br/>never the config root"]
+    C -->|"a checkpoint event:<br/>every file's len · hash · new chunks"| S[("the primary's store")]
+    C -->|"blobs, BLAKE3-named"| S
+    S -->|"events, then blobs (P2d)"| M[("a member's store")]
+    M --> A["assemble(): each chunk's hash,<br/>its place, and the whole's hash"]
+```
+
+| Path, under the config directory | How Claude Code writes it | How a checkpoint takes it |
+|---|---|---|
+| `projects/hive-<id>/<id>.jsonl`, the history | appended to only | the bytes past the last checkpoint, up to the last whole line ([`checkpoint.rs:309`](../crates/hive-node/src/checkpoint.rs#L309)) |
+| `projects/hive-<id>/<id>/subagents/`: `agent-<id>.jsonl` | appended to only | the same |
+| the same directory: `agent-<id>.meta.json` | replaced by a rename | whole, when it changed ([`checkpoint.rs:371`](../crates/hive-node/src/checkpoint.rs#L371)) |
+| `projects/hive-<id>/<id>/tool-results/` | each output written once | whole |
+| `projects/hive-<id>/memory/` | the auto-memory | whole |
+| `CLAUDE.md` | the session's own instructions (P1e) | whole |
+
+The chain is the state. A file's `len` and `hash` in the last checkpoint are where
+the next starts ([`checkpoint.rs:193`](../crates/hive-node/src/checkpoint.rs#L193)),
+so nothing else is kept between turns. An appended file that shrank, or changed before
+its last offset, is taken again from its first byte. A chunk at offset 0 tells a
+member to start the file over, and an empty one is sent when no whole line has come
+yet, so the old bytes never linger. Chunks are at most 4 MiB, cut at line ends where
+one is within reach. One checkpoint lists at most 10,000 files and adds at most
+512 MiB.
+
+⚠️ **An allowlist, never the directory** ([`checkpoint.rs:245`](../crates/hive-node/src/checkpoint.rs#L245)).
+The config directory's root holds a `peerToken` beside the harness's messaging socket
+and a `machineID`, so nothing outside the five paths is opened. The harness id must be
+a lowercase, hyphenated UUID, because it is part of every path.
+
+⚠️ **A link is never followed** ([`checkpoint.rs:521`](../crates/hive-node/src/checkpoint.rs#L521)).
+A link in the allowlist to the account's `~/.ssh` would copy a key to every member. A
+link, or a name that is not UTF-8, is listed as skipped and taken nowhere.
+
+A member's [`assemble`](../crates/hive-node/src/checkpoint.rs#L597) refuses what does
+not add up: a missing blob, a blob that does not hash to its name, a chunk out of
+place, or a whole that does not hash to the last checkpoint's. The event
+([`event.rs:118`](../crates/hive-node/src/event.rs#L118)) is a flat object beside its
+`kind`, and nothing in it goes into the full-text index.
+
+The rest of P2 is next (spec §3b and §4): the rest of P2b (the workspace as a commit
+through the account's own git, `hive-checkpoint` and `hive-materialize`),
 membership and placement (P2c), the QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the
@@ -873,7 +926,7 @@ field run (P2k). Its server switch is `hive.replicaset` and its device switch
 |---|---|
 | the wire: frames, refusal words, limits | [`crates/remote_control/src/hive.rs`](../crates/remote_control/src/hive.rs); the `rc:hive.*` variants in [`signaling.rs`](../crates/remote_control/src/signaling.rs) (`ClientMsg` `:655`–`:865`, `ServerMsg` `:2821`–`:3000`); `RpcCap::Hive`, `HiveView`, `HiveMemory` and `HiveAdopt` in [`models.rs`](../crates/remote_control/src/models.rs) `:626`–`:655`, matched by equality, since `hive` is a prefix of the other three |
 | the server module | [`crates/modules/hive/src/`](../crates/modules/hive/src/): `lib.rs` (the module, routes, indexes), `routes.rs` (start, list, get, stop), `agent_socket.rs` (reports, reconcile, the manifest), `view.rs` (grants and their signalling), `participants.rs`, `access.rs`, `room.rs`, `dao.rs`, `hooks.rs` (removals), `scope.rs` (`hive.tenants`), `adopt.rs`, `brain.rs` |
-| the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs`, `launch.rs`, `roots.rs` |
+| the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs`, `launch.rs`, `roots.rs`, `checkpoint.rs` |
 | the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the session task, the resume), `supervisor/adopt.rs`, `toolbelt.rs`, `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
 | what builds it | the `hive` feature, and `cfg(hive_host)` on Linux, macOS and Windows ([`build.rs:52`](../agents/roomlerd/build.rs#L52)); the capabilities in [`caps.rs:1619`](../agents/roomlerd/src/encode/caps.rs#L1619) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
