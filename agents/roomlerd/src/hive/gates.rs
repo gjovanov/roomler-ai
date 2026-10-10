@@ -39,6 +39,9 @@ pub struct HiveConfig {
     /// P1j — whether this device's people may adopt their terminal
     /// sessions (`hive_adopt`).
     pub adopt: bool,
+    /// Decision 15 — whether a Mac runs sessions as an account whose `sudo`
+    /// needs no password (`hive_allow_passwordless_sudo`).
+    pub allow_passwordless_sudo: bool,
 }
 
 impl HiveConfig {
@@ -63,6 +66,7 @@ impl HiveConfig {
             // adopts there (the hooks CLI refuses), so the device must not
             // advertise `hive-adopt` or keep a store for it.
             adopt: cfg.hive_adopt && cfg!(unix),
+            allow_passwordless_sudo: cfg.hive_allow_passwordless_sudo,
         }
     }
 
@@ -79,6 +83,7 @@ impl HiveConfig {
             update_wait: DEFAULT_UPDATE_WAIT,
             core_memory: false,
             adopt: false,
+            allow_passwordless_sudo: false,
         }
     }
 }
