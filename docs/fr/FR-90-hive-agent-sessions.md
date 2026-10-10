@@ -1494,11 +1494,6 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       default that keeps both the person's and the device owner's consent, and it is what every
       other Hive surface already does.
     - Its "an adopted session becomes a managed one when promoted" half needs P2's replicaset.
-
-Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
-sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
-default LLM route is `node`; the database is the brain's source of truth; session cards default to
-`summary`.
 12. **P2's positions, for the operator to confirm** (P2-0, §3b "P2 … as designed"). The design
     takes each of these as its default; any can be changed before the sub-phase that builds it.
     - *Who runs a hosted org's archive replica:* the org, on its own machines (decision 1, read with
@@ -1515,6 +1510,11 @@ default LLM route is `node`; the database is the brain's source of truth; sessio
       can already mint itself a view grant to any session (design §13). Closing both takes a key
       the two devices share and the server never learns: FR-52's device-held binding (#1628)
       is that shape.
+
+Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
+sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
+default LLM route is `node`; the database is the brain's source of truth; session cards default to
+`summary`.
 
 ## 7. Out of scope
 
