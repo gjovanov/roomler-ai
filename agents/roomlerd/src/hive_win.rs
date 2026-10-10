@@ -1035,6 +1035,74 @@ impl HarnessChild {
     }
 }
 
+// ─── FR-90 P2b-3a: a checkpoint, taken as the console user ──────────────────
+
+/// The command line that runs `roomlerd hive-checkpoint <request>`.
+pub fn checkpoint_command_line(exe: &Path, request: &Path) -> Result<String, String> {
+    Ok(format!(
+        "{} {} {}",
+        program(exe)?,
+        crate::hive::CHECKPOINT_SUBCOMMAND,
+        quote_arg(utf8(request.as_os_str(), "the request's path")?)
+    ))
+}
+
+/// Run `cmdline` (a [`checkpoint_command_line`]) as `who` and answer what it
+/// wrote to stdout: at most `max` bytes, within `timeout`, else refused. In a
+/// job of its own, so a checkpoint that hangs is ended whole, its `git` too.
+///
+/// # Safety
+/// As [`run_prep`]: `SpawnAs::User`'s token must stay alive across the call.
+pub unsafe fn run_checkpoint(
+    who: SpawnAs,
+    cmdline: &str,
+    timeout: Duration,
+    max: u64,
+) -> Result<Vec<u8>, String> {
+    let job = JobObject::kill_on_close().map_err(|e| format!("{e:#}"))?;
+    // SAFETY: forwarded from the caller.
+    let child = unsafe { supervisor::spawn_into_job(who, cmdline, None, &[], false, &job) }
+        .map_err(|e| format!("{e:#}"))?;
+    let CapturedChild {
+        process,
+        stdout,
+        stderr,
+        ..
+    } = child;
+    // Each pipe drained on its own thread (one read to the end first
+    // deadlocks on the other), each against its own budget.
+    let out_budget = Arc::new(AtomicU64::new(max.saturating_add(1)));
+    let err_budget = Arc::new(AtomicU64::new(PREP_OUTPUT));
+    let out = std::thread::spawn(move || supervisor::read_pipe_to_end(&stdout, &out_budget));
+    let err = std::thread::spawn(move || supervisor::read_pipe_to_end(&stderr, &err_budget));
+    let finished = process.wait_for_exit(timeout);
+    if !finished {
+        let _ = job.terminate(1);
+        let _ = process.wait_for_exit(Duration::from_secs(5));
+    }
+    let (bytes, over) = out.join().unwrap_or_default();
+    let said = err
+        .join()
+        .map(|(b, _)| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
+    if !finished {
+        return Err(format!(
+            "the checkpoint did not finish within {} s",
+            timeout.as_secs()
+        ));
+    }
+    if over || bytes.len() as u64 > max {
+        return Err(format!("the checkpoint wrote more than {max} bytes"));
+    }
+    match process.try_wait() {
+        Ok(Some(0)) => Ok(bytes),
+        Ok(Some(code)) if said.is_empty() => Err(format!("the checkpoint failed (exit {code})")),
+        Ok(Some(_)) => Err(said),
+        Ok(None) => Err("the checkpoint had not ended".into()),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,6 +1416,30 @@ mod tests {
 
     fn cmd(script: &str) -> String {
         format!("{} /d /c \"{script}\"", program(&system_cmd()).unwrap())
+    }
+
+    /// FR-90 P2b-3a — a checkpoint's stdout comes back whole within its
+    /// budget; a failure says what its stderr said; more than the budget is
+    /// refused, never cut and passed on.
+    #[test]
+    fn a_checkpoints_stdout_comes_back_within_its_budget() {
+        // SAFETY: `Daemon` carries no token.
+        unsafe {
+            let out =
+                run_checkpoint(SpawnAs::Daemon, &cmd("echo HIVECP1"), PREP_TIMEOUT, 1024).unwrap();
+            assert_eq!(String::from_utf8_lossy(&out).trim(), "HIVECP1");
+            let e = run_checkpoint(
+                SpawnAs::Daemon,
+                &cmd("echo no such folder 1>&2 & exit 2"),
+                PREP_TIMEOUT,
+                1024,
+            )
+            .unwrap_err();
+            assert_eq!(e, "no such folder");
+            let e = run_checkpoint(SpawnAs::Daemon, &cmd("echo 0123456789"), PREP_TIMEOUT, 4)
+                .unwrap_err();
+            assert!(e.contains("more than 4 bytes"), "{e}");
+        }
     }
 
     #[test]

@@ -78,6 +78,7 @@
 //! each one into the session's config directory AS THE ACCOUNT, only when
 //! nothing is there yet — so a resume keeps what the session has.
 
+mod checkpointer;
 pub mod framing;
 pub mod gates;
 mod hosted;
@@ -91,6 +92,7 @@ mod toolbelt;
 pub mod view;
 mod workspace;
 
+pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
 #[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{

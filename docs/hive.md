@@ -526,7 +526,7 @@ sequenceDiagram
 |---|---|---|
 | `hosted.json` sits beside the store, root's, `0600`, written whole. Per session it holds the launch's inputs (fence, account, the folder as asked, the starter and their address, Claude Code's session id), the turns begun, the turn in progress and who asked for it, its open approvals, and the harness's pid and start time | after a restart the device holds nothing else: the replay of its last reports lived in memory | [`hosted.rs`](../agents/roomlerd/src/hive/hosted.rs) |
 | A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:2613`](../agents/roomlerd/src/hive/supervisor.rs#L2613) |
-| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3582`](../agents/roomlerd/src/main.rs#L3582), [`supervisor.rs:1305`](../agents/roomlerd/src/hive/supervisor.rs#L1305) |
+| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3590`](../agents/roomlerd/src/main.rs#L3590), [`supervisor.rs:1305`](../agents/roomlerd/src/hive/supervisor.rs#L1305) |
 | A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:1365`](../agents/roomlerd/src/hive/supervisor.rs#L1365) |
 | The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:1174`](../agents/roomlerd/src/hive/supervisor.rs#L1174) |
 | ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:1207`](../agents/roomlerd/src/hive/supervisor.rs#L1207) |
@@ -955,7 +955,50 @@ checkpoint: the config directory is what a resume needs, so the workspace is ski
 in words. The temporary index and `refs/hive/<sid>/*` stay in the person's repository
 until the session ends or is purged (P2g).
 
-The rest of P2 is next (spec §3b and §4): the rest of P2b (`hive-checkpoint` and
+### P2b-3a: `hive-checkpoint`, as the account
+
+The daemon never opens a path in the account's tree, so a checkpoint is taken by a
+child it starts as the account, `roomlerd hive-checkpoint <request>`, as the Unix
+wrapper and Windows' `hive-prep` already run
+([`checkpointer.rs`](../agents/roomlerd/src/hive/checkpointer.rs)). P2b-3a builds both
+sides. P2b-3b calls it at a turn's end, for a session the server joined as replicated
+(P2c).
+
+```mermaid
+sequenceDiagram
+    participant D as the daemon (root / SYSTEM)
+    participant C as hive-checkpoint (as the account)
+    participant S as the store
+    D->>D: the request into the session's runtime directory:<br/>dirs, n, turn, the last checkpoint
+    D->>C: start it as the account (Unix: the session's privilege path;<br/>Windows: the console user, in a job)
+    C->>C: take() the allowlist, and the workspace through git
+    C-->>D: stdout: magic · header · blobs
+    D->>D: read_frames (limits), then check() against the request
+    D->>S: P2b-3b: the blobs, then the checkpoint event
+```
+
+| On stdout | What the daemon holds it to |
+|---|---|
+| `HIVECP1\n` | the magic, or nothing is read |
+| u32 · JSON `{"checkpoint": …}` | at most 16 MiB; the request's `n` and `turn`; every path inside the allowlist, in order, taken the way the allowlist says, at most mode `0o777` ([`checkpointer.rs:206`](../agents/roomlerd/src/hive/checkpointer.rs#L206)) |
+| u32 · then u64 · bytes per blob | each the very blob its chunk names, by length and hash, in order (each file's, then the pack's); not one more or fewer; each at most 4 MiB ([`checkpointer.rs:164`](../agents/roomlerd/src/hive/checkpointer.rs#L164)) |
+| the workspace | git's ids only (40 or 64 hex digits), and a prefix that cannot step outside the repository |
+
+⚠️ **What comes back is the account's word, and the agent runs as that account.** The
+child is the daemon's own binary, but the account can reach it while it runs. So the
+daemon takes nothing on trust. A path like `../.ssh/id_ed25519` or `sessions/1.key`,
+a blob swapped for another, an extra or a missing one, or a `../` prefix is refused
+before the store sees any of it. A member still checks each whole file again when it
+assembles it.
+
+The child gets 120 s ([`checkpointer.rs:309`](../agents/roomlerd/src/hive/checkpointer.rs#L309)),
+runs in its own process group (on Windows, its own job), so a timeout ends its `git`
+too, and may write at most the limits' sum. On Unix it is started through the
+session's privilege path ([`checkpointer.rs:315`](../agents/roomlerd/src/hive/checkpointer.rs#L315)).
+On Windows it runs as the user signed in at the console, whom `hive_accounts` must name
+([`hive_win.rs:1056`](../agents/roomlerd/src/hive_win.rs#L1056)).
+
+The rest of P2 is next (spec §3b and §4): the rest of P2b (the turn-end trigger and
 `hive-materialize`),
 membership and placement (P2c), the QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive

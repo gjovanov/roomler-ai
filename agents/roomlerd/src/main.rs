@@ -1106,6 +1106,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // FR-90 P2b-3a — `roomlerd hive-checkpoint <request>`: a session's
+    // checkpoint, which the daemon runs AS THE SESSION'S ACCOUNT at a turn's
+    // end; it writes the checkpoint to stdout. None of the setup below is its.
+    #[cfg(hive_host)]
+    if let Some(request) = roomlerd::hive::checkpoint_args() {
+        std::process::exit(roomlerd::hive::checkpoint_main(&request));
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.
