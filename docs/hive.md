@@ -910,8 +910,53 @@ place, or a whole that does not hash to the last checkpoint's. The event
 ([`event.rs:118`](../crates/hive-node/src/event.rs#L118)) is a flat object beside its
 `kind`, and nothing in it goes into the full-text index.
 
-The rest of P2 is next (spec §3b and §4): the rest of P2b (the workspace as a commit
-through the account's own git, `hive-checkpoint` and `hive-materialize`),
+### P2b-2: the workspace, through the account's own git
+
+The folder a session works in is checkpointed as a git commit, by the account's own
+`git` and never a git built into the daemon (decision 14). It uses plumbing only,
+through a temporary index, so the person's index, branches and work tree stay as they
+were ([`workspace.rs`](../agents/roomlerd/src/hive/workspace.rs)). P2b-3 will run it
+inside `hive-checkpoint`, as the account; for now only its tests do.
+
+```mermaid
+flowchart TD
+    F{"the folder"} -->|"a repository's top"| O["its own repository:<br/>the whole tree"]
+    F -->|"inside a repository"| P["its own repository:<br/>the subtree at --show-prefix,<br/>its ignores honoured"]
+    F -->|"in none"| S["a shadow: &lt;state dir&gt;/shadow.git,<br/>nothing written into the folder"]
+    O --> I["GIT_INDEX_FILE=$gd/hive-&lt;sid&gt;.index<br/>(seeded from $gd/index) git add -A -- ."]
+    P --> I
+    S --> I
+    I --> W["write-tree [--prefix] → tree"]
+    W -->|"the last checkpoint's tree"| N["no commit, no pack"]
+    W -->|"changed"| C["commit-tree --no-gpg-sign [-p last]<br/>update-ref refs/hive/&lt;sid&gt;/head"]
+    C --> K["pack-objects --revs --thin:<br/>&lt;commit&gt; ^&lt;last&gt;, chunked as blobs"]
+```
+
+| Step | What it guards | Where |
+|---|---|---|
+| the repository | its own, or the one the folder is in; a shadow for a folder in none, and a refusal inside a git directory | [`workspace.rs:266`](../agents/roomlerd/src/hive/workspace.rs#L266) |
+| the index | `$gd/hive-<sid>.index`, a copy of the person's: theirs is read, never written | [`workspace.rs:161`](../agents/roomlerd/src/hive/workspace.rs#L161) |
+| the tree | `write-tree --prefix` for a folder inside a repository, so nothing outside the folder is taken and the repository's `.gitignore` still keeps a `.env` out | [`workspace.rs:313`](../agents/roomlerd/src/hive/workspace.rs#L313) |
+| the commit | "Roomler Hive" as author, never the person; `--no-gpg-sign`, so a person's `commit.gpgSign` never waits on their key; the last checkpoint's commit as parent | [`workspace.rs:236`](../agents/roomlerd/src/hive/workspace.rs#L236) |
+| the pack | thin against the last checkpoint, whole for the first; at most 512 MiB | [`workspace.rs:337`](../agents/roomlerd/src/hive/workspace.rs#L337) |
+| every command | no hook (`core.hooksPath` names nowhere), no fsmonitor, no automatic gc, none of the caller's `GIT_*` environment | [`workspace.rs:402`](../agents/roomlerd/src/hive/workspace.rs#L402) |
+
+⚠️ **The first checkpoint's commit has no parent.** Its pack holds the whole tree and
+none of the person's history, because a member has nothing else to resolve a delta
+against. Each later commit is the last checkpoint's child, and its pack is thin
+against it, so a target applies the packs in order (`git index-pack --fix-thin`). The
+person's `HEAD` is recorded beside the commit
+([`WorkspaceSnap`](../crates/hive-node/src/checkpoint.rs#L181)), for a teleport into a
+clone of the same repository (P2f).
+
+⚠️ A turn that changed no file writes no commit and no pack. A workspace that cannot be
+taken (no `git`, a pack over the limit, a folder inside a git directory) never fails the
+checkpoint: the config directory is what a resume needs, so the workspace is skipped,
+in words. The temporary index and `refs/hive/<sid>/*` stay in the person's repository
+until the session ends or is purged (P2g).
+
+The rest of P2 is next (spec §3b and §4): the rest of P2b (`hive-checkpoint` and
+`hive-materialize`),
 membership and placement (P2c), the QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the
