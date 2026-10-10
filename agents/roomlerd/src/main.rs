@@ -1114,6 +1114,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(roomlerd::hive::checkpoint_main(&request));
     }
 
+    // FR-90 P2b-4a — `roomlerd hive-materialize`: its reverse, a checkpoint
+    // written back into a session's config directory AS THE ACCOUNT, from the
+    // frames the daemon streams on its stdin.
+    #[cfg(hive_host)]
+    if roomlerd::hive::materialize_args() {
+        std::process::exit(roomlerd::hive::materialize_main());
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.
