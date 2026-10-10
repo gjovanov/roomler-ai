@@ -387,7 +387,7 @@ jobs:
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
       - name: Publish the cargo cache (release-asset store)
-        if: (github.ref == 'refs/heads/master' || github.head_ref == 'ci/fr6-wave22-seed-store') && steps.seed.outcome == 'success'  # TEMP-W22-VALIDATION: remove before merge
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
         continue-on-error: true
         uses: ./.github/actions/ci-seed-save
         env:
