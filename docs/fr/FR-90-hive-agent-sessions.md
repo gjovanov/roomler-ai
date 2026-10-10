@@ -1499,6 +1499,22 @@ Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the 
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
 default LLM route is `node`; the database is the brain's source of truth; session cards default to
 `summary`.
+12. **P2's positions, for the operator to confirm** (P2-0, §3b "P2 … as designed"). The design
+    takes each of these as its default; any can be changed before the sub-phase that builds it.
+    - *Who runs a hosted org's archive replica:* the org, on its own machines (decision 1, read with
+      D1). An archive Roomler ran would hold plaintext transcripts in Roomler's cloud until
+      encryption at rest (P7).
+    - *A restricted session before roles exist (P3):* a session whose primary device carries a
+      restricted tag (`prod` by default) replicates only to devices carrying it too (decision 2's
+      interim reading).
+    - *`hive_replica` and `hive_archive`:* device-owned and never pushable, like every Hive key
+      today (`crates/remote_control/src/models.rs:5401`).
+    - *Promote, teleport, fork and purge:* the session owner's, with `HIVE_RUN`. There is no
+      `HIVE_ADMIN` bit yet.
+    - *The server relays the QUIC fingerprint it could replace:* accepted for P2, since the server
+      can already mint itself a view grant to any session (design §13). Closing both takes a key
+      the two devices share and the server never learns: FR-52's device-held binding (#1628)
+      is that shape.
 
 ## 7. Out of scope
 
