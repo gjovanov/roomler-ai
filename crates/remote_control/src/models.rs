@@ -1463,12 +1463,14 @@ pub enum SshAccountMode {
 /// list is an allowlist, so leaving it out is sufficient; the trap is a later
 /// change that adds "the rest of the ssh_* surface" for symmetry.
 ///
-/// ⚠️ `ssh_exec_streaming` (FR-89) is ABSENT, and it is exactly that trap. It
-/// grants nothing — it only chooses whether a one-shot command's output
-/// streams or buffers — but a server able to flip a device's data path from
-/// under its owner is the move this whole surface refuses, and "it is only a
-/// performance knob" is how the symmetry argument gets made. It is the
-/// device's, like `ssh_enabled` and `exec_enabled`.
+/// ⚠️ `ssh_exec_streaming` (FR-89 D5) is ABSENT, and it is exactly that trap.
+/// It grants nothing — it only chooses whether a one-shot command's output
+/// streams or buffers — but it is the owner's kill switch for that data path,
+/// and a server able to set it could turn streaming back on under an owner
+/// who switched it off. "It is only a performance knob" is how the symmetry
+/// argument gets made. It is device-local like `ssh_max_privilege`; this is
+/// NOT the status of `exec_enabled` and `ssh_enabled`, which are fields
+/// below, settable behind the device's `remote_config_enabled`.
 ///
 /// ⚠️ `local_restart_enabled` (FR-84 D3) is ABSENT, and so is any notion of
 /// "restart after applying". The daemon restarts itself only when a LOCAL
