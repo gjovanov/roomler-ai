@@ -271,6 +271,43 @@ the click cannot be told anything; it sees the peer die after the grace and
 rides the ladder, which asks the device again when signalling returns — the
 pre-P10 behaviour, for the one case where the reason has no path to travel.
 
+### P11 — the person at a Linux system install's screen reaches the daemon (#1911)
+
+**What was wrong, measured on 0.4.122** (the P10 Linux run below). A Linux
+**system** install's root daemon binds its LocalAPI at `/var/run/roomler/roomler.sock`,
+with the directory at 0700 and the socket at 0600, both owned by root. The companion
+runs as the desktop user, so it read "Service offline". The banner never showed and the
+Disconnect was never offered. On GNOME/KDE Wayland, where the companion is the only
+surface (no `wlr-layer-shell`), consent had **no surface at all**. The root-only ACL is
+right: it is the trust boundary for every administrative verb (FR-43). So the fix is not
+to widen it.
+
+**Decision (operator, 2026-10-10): a narrowly scoped socket for the person at the
+device.** The other two options were a per-user worker, as on macOS (far larger, since
+Linux does capture and input as root and needs no worker for media), and a
+daemon-launched companion holding a one-shot secret (which misses a companion the person
+started themselves).
+
+| | What | Where |
+|---|---|---|
+| where | `/run/user/<uid>/roomler.sock`: the person's own `$XDG_RUNTIME_DIR/roomler.sock`, the path their companion and CLI ALREADY try first, so neither changes | `localapi::person_socket_path` |
+| whose | the user of the **active** graphical session on the seat, by the same `loginctl` walk the companion launch uses. Never the display manager's greeter, never a user switched away in the background (who must not answer consent for a view of someone else's desktop), never root (root uses the daemon's own socket). It moves when that person changes | `roomlerd::person_socket` (`step`, every 4 s) |
+| who may connect | the socket is MADE AS the person: bind and chmod 0600 run on a thread switched to their filesystem ids (`setfsuid`/`setfsgid`), so it is born theirs. ⚠️ Not a root bind followed by a chown: they own the dir, so they could swap the path to a symlink in between, and `chown` follows it (to `/etc/shadow`, say). Caught in self-review before merge. Each connection's `SO_PEERCRED` uid must be theirs or root | `bind_as_person`, `person_peer_ok` |
+| what it serves | `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`, `ConsentDecide` and `RecordStatus`, and nothing else. Anything else is answered with a pointer to `sudo roomler …`. The match is **exhaustive with no `_` arm**, so a verb added later must be placed by hand | `localapi::person_may`, `Scope::Person` |
+| what it never does | replace a LIVE socket at the path (a per-user daemon of that person owns it); remove a non-socket file; create the runtime dir (logind's); remove anything but the inode it bound | `serve_person_socket` |
+
+The root-only `/var/run/roomler` socket is **unchanged**. A per-user daemon starts no
+person socket: its own socket already is its person's. Windows (the pipe admits
+Interactive Users) and macOS (the per-user worker, FR-43) are unaffected.
+
+**Kill switch.** `ROOMLERD_PERSON_SOCKET=0` (or `false` / `off` / `no`) is the pre-P11
+behaviour.
+
+**Version matrix.** The companion and the CLI need no change: they already try the
+per-user path first. An older daemon serves no person socket, so the behaviour is as
+before. A CLI run as the person against a P11 daemon gets `Status`, and a clear refusal
+in place of `Permission denied (os error 13)` for everything else.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -285,7 +322,8 @@ pre-P10 behaviour, for the one case where the reason has no path to travel.
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 | 9 | The companion banner's Windows manners (macOS, Linux) — shown **without taking focus** (`orderFrontRegardless`; on macOS `show()` made it KEY, so the first click into the person's own window after every session start was lost), hides 2.5 s after the pointer leaves (after a 4 s first show), comes back after a 1.2 s rest at the top edge, stays while anything records, and a 2 px red frame round the screen for the session (macOS). Docs: `docs/desktop-companion.md` §12 | `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (banner stays, as before), `ROOMLER_DESKTOP_FRAME=0` (no frame) | **field-verified on the Mac, 0.4.117, 2026-10-08** (field log) — every clause held; the reveal logic's 6 unit tests stand |
-| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on all three surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s. The Linux banner, where the companion reaches its daemon: 33 ms, 65.8 s held, 0.54 s Reconnect, 4.0 s drop. ⚠️ A Linux SYSTEM install's companion cannot reach its root daemon at all, so it has no banner and no Disconnect: #1911 |
+| 10 | **The host's Disconnect ends the session for good** — the agent says it FIRST (`host_disconnect`, a new `EndReason`) and closes the peer after a grace; the hub forwards it to the controller as the device's word only; the viewer shows "The person at the device ended the session." with an explicit Reconnect and does not auto-reconnect; ordinary drops still do. Design + version matrix above. Docs: `docs/remote-control.md` §11.5, `docs/desktop-companion.md` §12 | `ROOMLERD_HOST_DISCONNECT_GRACE_MS=0` (close at once, the pre-P10 timing); the viewer needs none — an unknown reason is terminal | **shipped** — #1886 in agent **0.4.121** + `hosted-20261009-cac4761` (promoted 2026-10-09 07:42Z). RED on record: 0.4.119 + `hosted-20261005-d2dc0ef`, 2026-10-08 14:38:43Z. **GREEN on all three surfaces, 2026-10-09** (the field log). The Mac's banner: the reason at the viewer 72 ms after the click, 65 s held with no request, Reconnect explicit, an ordinary drop back in 6.3 s with no click. The Windows badge: told the server 1 ms after the click, 67 s held, Reconnect explicit, an ordinary drop back in 0.95 s. The Linux banner, where the companion reaches its daemon: 33 ms, 65.8 s held, 0.54 s Reconnect, 4.0 s drop. ⚠️ A Linux SYSTEM install's companion cannot reach its root daemon at all, so it has no banner and no Disconnect: #1911, which P11 fixes |
+| 11 | **The person at a Linux system install's screen reaches the daemon (#1911).** A socket in the person's own runtime dir, 0600 and theirs, admitting them or root (`SO_PEERCRED`), serving only the safety surface: status, the viewing sessions, their Disconnect, consent, and the recording state. It follows the active graphical session's user. The daemon's root-only socket is unchanged. Design above. Docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`, `docs/installation.md` | `ROOMLERD_PERSON_SOCKET=0` (the pre-P11 behaviour) | **implemented** — RED on record: 0.4.122, 2026-10-09 (the P10 Linux run: "Service offline", `Permission denied (os error 13)` for the person). GREEN owed on a vmtest system install with the socket untouched |
 
 ## Acceptance criteria
 
@@ -394,6 +432,20 @@ Ticked only where a run is recorded in the field log below.
         reaches its daemon, which a per-user install provides. On a SYSTEM
         install it cannot (a root-only socket, #1911); the run opened the socket
         on the throwaway guest to exercise the banner itself
+- **P11** — on a Linux **system** install with the daemon's socket untouched,
+  the person at the screen reaches what is theirs and nothing else (#1911):
+  - [ ] the companion reads "Connected", not "Service offline", and as the
+        person `roomler status` answers
+  - [ ] the banner shows for a session, and its one-click Disconnect ends it as
+        `host_disconnect` (the P10 checks)
+  - [ ] as the person, an administrative verb (`roomler peers`, a `config set`)
+        is refused with the pointer to `sudo`, and the daemon's own
+        `/var/run/roomler` socket is still 0700 / 0600 root
+  - [ ] the socket is the person's (0600, their uid), and it is gone after
+        they log out; it is never served for the greeter or for root
+  - [ ] docs: `docs/desktop-companion.md` §12, `docs/security-baseline.md`,
+        `docs/installation.md`, and a row in `docs/README.md` if a new page is
+        added
 
 ## Deviations (accepted, recorded up front)
 
