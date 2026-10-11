@@ -12,10 +12,16 @@
  * `E2E_INPUT_PLAN` picks what to send:
  *   - `points` (AC4): the pointer to three known points, a click, a wheel
  *     notch down, typed ASCII, and a letter typed under a held Shift.
- *   - `vanish` (#1945): press, drag, then CLOSE THE PAGE mid-drag. The agent
- *     releases the button the session still holds. That release must let go
- *     where the pointer is; one that moves first lands in the top-left pixel,
- *     GNOME's Activities hot corner.
+ *   - `close-mid-drag`: press, drag, then CLOSE THE PAGE. The page's own
+ *     unload path (`releaseHeldInputs`, on blur / tab hidden) lets go of the
+ *     button it holds. Measured 2026-10-11: it let go at the PRESS point, so
+ *     the host cursor snapped back from where the drag had reached.
+ *   - `crash-mid-drag` (#1945): press, drag, then CRASH THE RENDERER (CDP
+ *     `Page.crash`), so no page code runs at all. A browser that crashes or
+ *     loses its tab mid-drag. Only the agent can let go then: its arbiter
+ *     releases what the closing session held, and that release must not move
+ *     the pointer. One that moved first landed in the top-left pixel, GNOME's
+ *     Activities hot corner.
  *
  * Coordinates are normalised to the remote picture, as on the wire. The spec
  * finds the picture on the page (the largest live `<canvas>` or `<video>`,
@@ -82,6 +88,10 @@ async function picture(page: Page): Promise<Picture | null> {
       const srcW = el instanceof HTMLVideoElement ? el.videoWidth : el.width
       const srcH = el instanceof HTMLVideoElement ? el.videoHeight : el.height
       if (!srcW || !srcH || r.width < 50 || r.height < 50) continue
+      // 300×150 is a canvas nobody has drawn into yet (the HTML default), not
+      // a decoded picture. Measured: one run aimed at one, and every target
+      // missed. A real remote screen is far larger.
+      if (srcW < 320 || srcH < 200) continue
       if (!best || r.width * r.height > best.r.width * best.r.height) best = { r, srcW, srcH }
     }
     if (!best) return null
@@ -130,12 +140,20 @@ test.describe('vmtest viewer input (named agent)', () => {
     await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
     await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 90_000 })
 
+    // The same picture, at the same place, on two reads 500 ms apart: a
+    // stream still settling its size or layout is not one to aim at.
     let pic: Picture | null = null
     await expect
-      .poll(async () => (pic = await picture(page)) !== null, {
-        timeout: 60_000,
-        message: 'no decoded remote picture appeared',
-      })
+      .poll(
+        async () => {
+          const a = await picture(page)
+          await pause(page, 500)
+          const b = await picture(page)
+          pic = b
+          return a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b)
+        },
+        { timeout: 60_000, message: 'no decoded remote picture settled' },
+      )
       .toBe(true)
     const p = pic as unknown as Picture
     console.log(`[vmtest-input] picture ${JSON.stringify(p)}`)
@@ -147,7 +165,7 @@ test.describe('vmtest viewer input (named agent)', () => {
       sent('move', { fx, fy, px: Math.round(fx * p.srcW), py: Math.round(fy * p.srcH) })
     }
 
-    if (PLAN === 'vanish') {
+    if (PLAN === 'close-mid-drag' || PLAN === 'crash-mid-drag') {
       await moveTo(0.5, 0.5)
       await pause(page, 1_000)
       await page.mouse.down()
@@ -157,10 +175,21 @@ test.describe('vmtest viewer input (named agent)', () => {
         await pause(page, 150)
       }
       await pause(page, 1_500)
-      // The viewer vanishes with the button still held: no mouse-up is sent.
-      // The agent's release of that button is the event under test.
-      sent('vanish', { held_at_fx: 0.6, held_at_fy: 0.6 })
-      await page.close()
+      // The viewer vanishes with the button still held: no mouse-up from the
+      // test. What happens to that button is the event under test.
+      sent('vanish', { how: PLAN, held_at_fx: 0.6, held_at_fy: 0.6 })
+      if (PLAN === 'crash-mid-drag') {
+        // A crashed renderer runs no unload, blur or visibility handler, so
+        // the page cannot let go. Its sockets die with it, and only the
+        // agent's arbiter is left to release the button.
+        page.on('crash', () => sent('crashed'))
+        const cdp = await context.newCDPSession(page)
+        await cdp.send('Page.crash').catch(() => {
+          /* the crash tears down the session that sent it: expected */
+        })
+      } else {
+        await page.close()
+      }
       return
     }
 
