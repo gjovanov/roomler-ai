@@ -68,6 +68,8 @@ import {
   readyRecoveryAction,
   sessionGateAllows,
   nextStallAction,
+  nextStallTicks,
+  isDeadAir,
   classifyDegraded,
   RC_REHOME_MAX_REDIALS,
   rehomeRetryDecision,
@@ -3955,6 +3957,53 @@ describe('S3 resilience: nextStallAction', () => {
     // A live agent needs time to answer the keyframe probe before we
     // declare the pipe dead — at least 2 ticks.
     expect(RC_STALL_FAIL_TICKS - RC_STALL_PROBE_TICKS).toBeGreaterThanOrEqual(2)
+  })
+})
+
+// FR-93 — the agent said this session will produce no pixels (rc:media-
+// unavailable). Measured on the FR-93 lab before this: every attempt received
+// the reason, the watchdog tore each one down 10 s later, and after three the
+// viewer backed off with "its network may be blocking the connection".
+describe('FR-93: an agent that says it cannot capture is believed', () => {
+  /** Run the watchdog's two pure decisions over `ticks` frameless seconds. */
+  const actionsOver = (ticks: number, agentSaidNoPixels: boolean) => {
+    let stall = 0
+    const actions: string[] = []
+    for (let i = 0; i < ticks; i++) {
+      stall = nextStallTicks(stall, false, agentSaidNoPixels)
+      actions.push(nextStallAction(stall))
+    }
+    return actions
+  }
+
+  it('a frameless minute after the reason neither probes nor re-creates the session', () => {
+    const actions = actionsOver(60, true)
+    expect(actions.every((a) => a === 'none')).toBe(true)
+  })
+
+  it('without the reason, the same minute still probes and then re-creates (the control)', () => {
+    const actions = actionsOver(60, false)
+    expect(actions[RC_STALL_PROBE_TICKS - 1]).toBe('probe')
+    expect(actions[RC_STALL_FAIL_TICKS - 1]).toBe('reconnect')
+  })
+
+  it('progress resets the count, and so does the reason; nothing else does', () => {
+    expect(nextStallTicks(9, true, false)).toBe(0)
+    expect(nextStallTicks(9, false, true)).toBe(0)
+    expect(nextStallTicks(9, false, false)).toBe(10)
+  })
+
+  it('a stall count held at zero shows no media_stalled badge', () => {
+    const stall = nextStallTicks(RC_STALL_FAIL_TICKS, false, true)
+    expect(classifyDegraded({ pcState: 'connected', wsConnected: true, stallTicks: stall })).toBe(null)
+  })
+
+  it('a session that said why it has no frames is not dead air', () => {
+    expect(isDeadAir({ mediaEverFlowed: false, connected: true, agentSaidNoPixels: true })).toBe(false)
+    // The dead-air rule itself is unchanged.
+    expect(isDeadAir({ mediaEverFlowed: false, connected: true, agentSaidNoPixels: false })).toBe(true)
+    expect(isDeadAir({ mediaEverFlowed: true, connected: true, agentSaidNoPixels: false })).toBe(false)
+    expect(isDeadAir({ mediaEverFlowed: false, connected: false, agentSaidNoPixels: false })).toBe(false)
   })
 })
 
