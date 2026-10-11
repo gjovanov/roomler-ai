@@ -165,6 +165,8 @@ enum Member {
     /// chain in one go on this thread.
     AnswerHello {
         hello: roomler_hive_node::stream::MemberMsg,
+        /// P2d-3b — the session is not over on this device.
+        live: bool,
         reply: Reply<roomler_hive_node::stream::SourceMsg>,
     },
 }
@@ -516,12 +518,16 @@ impl StoreHandle {
         .await
     }
 
-    /// FR-90 P2d — the source's answer to a member's stream hello.
+    /// FR-90 P2d — the source's answer to a member's stream hello; `live`,
+    /// the device's word that the session is not over here (P2d-3b), goes
+    /// with it.
     pub(crate) async fn answer_hello(
         &self,
         hello: roomler_hive_node::stream::MemberMsg,
+        live: bool,
     ) -> Result<roomler_hive_node::stream::SourceMsg, WriterError> {
-        self.ask(|reply| Member::AnswerHello { hello, reply }).await
+        self.ask(|reply| Member::AnswerHello { hello, live, reply })
+            .await
     }
 }
 
@@ -702,8 +708,8 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
                 store, &session, fence,
             ));
         }
-        Member::AnswerHello { hello, reply } => {
-            let _ = reply.send(roomler_hive_node::stream::answer_hello(store, &hello));
+        Member::AnswerHello { hello, live, reply } => {
+            let _ = reply.send(roomler_hive_node::stream::answer_hello(store, &hello, live));
         }
     }
 }

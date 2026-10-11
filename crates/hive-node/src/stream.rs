@@ -11,8 +11,8 @@
 //! | Message | From | Says |
 //! |---|---|---|
 //! | `hello {v, session, fence, tip, floor, checkpoints}` | member | where its copy ends, and the `(seq, hash)` of its newest checkpoints |
-//! | `hello {v, tip}` | source | the member's copy is a prefix of its chain; the stream goes on from the member's tip |
-//! | `diverged {at}` | source | the member's tip is not in its chain: the newest checkpoint both hold, past which the member sets its copy aside |
+//! | `hello {v, tip, live}` | source | the member's copy is a prefix of its chain; the stream goes on from the member's tip. `live`: the session is not over on the source (P2d-3b) |
+//! | `diverged {at, tip, live}` | source | the member's tip is not in its chain: the newest checkpoint both hold, past which the member sets its copy aside |
 //! | `refused {reason}` | source | it cannot serve: a version it does not speak, a session it does not hold |
 //! | `events {events: [{seq, fence, ts_ms, prev_hash, len}]}`, then each event's JSON, `len` bytes | source | envelopes in `seq` order (P2d-3): from where the opening exchange left the member, then the live tail as it is appended |
 //! | `need {blobs}` | member | the blobs the next event names that it does not hold, by hash |
@@ -129,16 +129,38 @@ pub enum MemberMsg {
 pub enum SourceMsg {
     /// The member's copy is a prefix of the source's chain, which ends at
     /// `tip`.
-    Hello { v: u32, tip: Mark },
+    Hello {
+        v: u32,
+        tip: Mark,
+        /// P2d-3b — the session is not over on the source: it runs there,
+        /// or will resume there. A member caught up with one that is over
+        /// lets the stream go. Absent (an older source) = live.
+        #[serde(default = "live_unless_said")]
+        live: bool,
+    },
     /// The member's tip is not in the source's chain: `at` is the newest
     /// checkpoint both hold (genesis, if none), past which the member sets
     /// its copy aside and takes the source's events.
-    Diverged { at: Mark },
+    Diverged {
+        at: Mark,
+        /// P2d-3b — where the source's chain ends, as in `hello`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tip: Option<Mark>,
+        /// P2d-3b — as in `hello`.
+        #[serde(default = "live_unless_said")]
+        live: bool,
+    },
     /// The source cannot serve this stream.
     Refused { reason: String },
     /// P2d-3 — the next events, in `seq` order; each one's JSON follows the
     /// frame, `len` bytes, in the order listed.
     Events { events: Vec<EventMeta> },
+}
+
+/// What a source that does not say is taken to mean: the session is live,
+/// so the member keeps following.
+fn live_unless_said() -> bool {
+    true
 }
 
 /// P2d-3 — one event as an `events` frame lists it: its envelope but the
@@ -312,8 +334,10 @@ pub fn member_hello(store: &Store, session: &str, fence: u64) -> Result<MemberMs
 }
 
 /// The source's answer to a member's hello, from its own store. A first
-/// frame that is not a hello is refused (`not_a_hello`).
-pub fn answer_hello(store: &Store, hello: &MemberMsg) -> Result<SourceMsg, StoreError> {
+/// frame that is not a hello is refused (`not_a_hello`). `live` is the
+/// source's own word that the session is not over there (P2d-3b): it runs
+/// there, or will resume there. Both answers carry it, and the source's tip.
+pub fn answer_hello(store: &Store, hello: &MemberMsg, live: bool) -> Result<SourceMsg, StoreError> {
     let MemberMsg::Hello {
         v,
         session,
@@ -336,20 +360,26 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg) -> Result<SourceMsg, Store
             reason: "not_held".into(),
         });
     };
+    let own = Mark::of(own.seq, &own.hash);
     if holds(store, session, tip)? {
         return Ok(SourceMsg::Hello {
             v: STREAM_V,
-            tip: Mark::of(own.seq, &own.hash),
+            tip: own,
+            live,
         });
     }
     // Newest first, as the member listed them; at most as many as it may.
+    let mut at = Mark::genesis();
     for cp in checkpoints.iter().take(MAX_CHECKPOINTS) {
         if holds(store, session, cp)? {
-            return Ok(SourceMsg::Diverged { at: cp.clone() });
+            at = cp.clone();
+            break;
         }
     }
     Ok(SourceMsg::Diverged {
-        at: Mark::genesis(),
+        at,
+        tip: Some(own),
+        live,
     })
 }
 
@@ -412,12 +442,42 @@ mod tests {
                 "tip": {"seq": 0, "hash": "0".repeat(64)}, "floor": 1, "checkpoints": []
             })
         );
+        let zero = serde_json::json!({"seq": 0, "hash": "0".repeat(64)});
         let a = SourceMsg::Diverged {
             at: Mark::genesis(),
+            tip: Some(Mark::genesis()),
+            live: false,
         };
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
-            serde_json::json!({"t": "diverged", "at": {"seq": 0, "hash": "0".repeat(64)}})
+            serde_json::json!({"t": "diverged", "at": zero, "tip": zero, "live": false})
+        );
+        let h = SourceMsg::Hello {
+            v: 1,
+            tip: Mark::genesis(),
+            live: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&h).unwrap(),
+            serde_json::json!({"t": "hello", "v": 1, "tip": zero, "live": true})
+        );
+        // P2d-3b — an answer that does not say whether the session is live
+        // (a source of P2d-3a) is taken as live, and so followed.
+        assert_eq!(
+            serde_json::from_value::<SourceMsg>(
+                serde_json::json!({"t": "hello", "v": 1, "tip": zero})
+            )
+            .unwrap(),
+            h
+        );
+        assert_eq!(
+            serde_json::from_value::<SourceMsg>(serde_json::json!({"t": "diverged", "at": zero}))
+                .unwrap(),
+            SourceMsg::Diverged {
+                at: Mark::genesis(),
+                tip: None,
+                live: true,
+            }
         );
         assert_eq!(
             serde_json::to_value(SourceMsg::Refused {
@@ -458,13 +518,24 @@ mod tests {
         let own = mark_at(&store, 5);
         for tip in [Mark::genesis(), mark_at(&store, 3), own.clone()] {
             assert_eq!(
-                answer_hello(&store, &hello(tip, vec![])).unwrap(),
+                answer_hello(&store, &hello(tip, vec![]), true).unwrap(),
                 SourceMsg::Hello {
                     v: STREAM_V,
-                    tip: own.clone()
+                    tip: own.clone(),
+                    live: true,
                 }
             );
         }
+        // P2d-3b — the source's word on whether the session is over goes
+        // with it.
+        assert_eq!(
+            answer_hello(&store, &hello(own.clone(), vec![]), false).unwrap(),
+            SourceMsg::Hello {
+                v: STREAM_V,
+                tip: own,
+                live: false,
+            }
+        );
     }
 
     /// A tip the source's chain does not hold is answered `diverged`, at
@@ -479,6 +550,7 @@ mod tests {
             hash: "ee".repeat(32),
         };
         let common = mark_at(&store, 2);
+        let own = Some(mark_at(&store, 6));
         let theirs = Mark {
             seq: 3,
             hash: "dd".repeat(32),
@@ -486,16 +558,23 @@ mod tests {
         assert_eq!(
             answer_hello(
                 &store,
-                &hello(foreign.clone(), vec![theirs.clone(), common.clone()])
+                &hello(foreign.clone(), vec![theirs.clone(), common.clone()]),
+                true
             )
             .unwrap(),
-            SourceMsg::Diverged { at: common },
-            "the newest checkpoint both hold"
+            SourceMsg::Diverged {
+                at: common,
+                tip: own.clone(),
+                live: true,
+            },
+            "the newest checkpoint both hold, and where the source's chain ends"
         );
         assert_eq!(
-            answer_hello(&store, &hello(foreign.clone(), vec![theirs])).unwrap(),
+            answer_hello(&store, &hello(foreign.clone(), vec![theirs]), false).unwrap(),
             SourceMsg::Diverged {
-                at: Mark::genesis()
+                at: Mark::genesis(),
+                tip: own.clone(),
+                live: false,
             },
             "none both hold"
         );
@@ -504,9 +583,11 @@ mod tests {
             hash: "aa".repeat(32),
         };
         assert_eq!(
-            answer_hello(&store, &hello(ahead, vec![])).unwrap(),
+            answer_hello(&store, &hello(ahead, vec![]), true).unwrap(),
             SourceMsg::Diverged {
-                at: Mark::genesis()
+                at: Mark::genesis(),
+                tip: own,
+                live: true,
             },
             "a tip past the source's own end is not in its chain"
         );
@@ -538,7 +619,7 @@ mod tests {
             checkpoints: checkpoints.clone(),
         };
         assert_eq!(
-            answer_hello(&store, &older).unwrap(),
+            answer_hello(&store, &older, true).unwrap(),
             SourceMsg::Refused {
                 reason: "version".into()
             }
@@ -552,7 +633,7 @@ mod tests {
             checkpoints,
         };
         assert_eq!(
-            answer_hello(&store, &elsewhere).unwrap(),
+            answer_hello(&store, &elsewhere, true).unwrap(),
             SourceMsg::Refused {
                 reason: "not_held".into()
             }
@@ -591,7 +672,7 @@ mod tests {
         grow(&mut store, "s", 1, 1);
         let ack = ack_of(&store.tip("s").unwrap().unwrap());
         assert_eq!(
-            answer_hello(&store, &ack).unwrap(),
+            answer_hello(&store, &ack, true).unwrap(),
             SourceMsg::Refused {
                 reason: "not_a_hello".into()
             }

@@ -1648,6 +1648,15 @@ fn rpc_caps() -> Vec<String> {
     if crate::hive::archive_enabled() {
         caps.push(RpcCap::HiveArchive);
     }
+    // FR-90 P2d-3b — and carries the replica stream: serves a member's grant
+    // as a source and follows a dial as a member. While its store is open,
+    // whatever its owner says of holding copies: a primary serves its own
+    // sessions' members. Stripped from any connection but the primary
+    // enrollment's (the hello), like every Hive word.
+    #[cfg(hive_host)]
+    if crate::hive::stream_enabled() {
+        caps.push(RpcCap::HiveStream);
+    }
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
