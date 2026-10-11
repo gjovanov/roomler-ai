@@ -471,6 +471,37 @@ export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconne
 }
 
 /**
+ * FR-93 — one media-watchdog tick's stall count. Pure so the rule is testable.
+ *
+ * Progress resets it, and so does the agent having SAID this session will
+ * produce no pixels (`rc:media-unavailable`, FR-80). Silence is then the
+ * expected state, not a stall. Counted anyway, the watchdog probed with a
+ * keyframe nobody could answer, re-created the session (which took the
+ * reason off the screen), and after three rounds backed off with "its
+ * network may be blocking the connection", which was false. Measured on the
+ * FR-93 lab: every attempt received the reason, and every attempt was torn
+ * down 10 s later.
+ */
+export function nextStallTicks(prev: number, advanced: boolean, agentSaidNoPixels: boolean): number {
+  return advanced || agentSaidNoPixels ? 0 : prev + 1
+}
+
+/**
+ * FR-93 — is a session that is ending "dead air" (it reached `connected`
+ * and never delivered a frame)? Not when the agent said why there are no
+ * frames: that message came over the control channel, which is itself proof
+ * that the path to this browser works. Dead air raises the reconnect floor
+ * and tells the operator the device's network may be blocking them.
+ */
+export function isDeadAir(s: {
+  mediaEverFlowed: boolean
+  connected: boolean
+  agentSaidNoPixels: boolean
+}): boolean {
+  return !s.mediaEverFlowed && s.connected && !s.agentSaidNoPixels
+}
+
+/**
  * PR-1 rehome: how many consecutive `agent_on_other_pod` errors trigger
  * a socket re-key + redial before we stop cycling the socket. Past the
  * cap the dial inputs are evidently not the problem (a parked agent
@@ -4042,20 +4073,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         || cur.vp9Frames > lastMediaProgress.vp9Frames
         || cur.hevcFrames > lastMediaProgress.hevcFrames
       lastMediaProgress = cur
-      if (advanced) {
-        stallTicks = 0
-        // Media actually moving is the ONLY proof this pair has a working
-        // path — reaching `connected` is not. Reset the ladders here rather
-        // than on the connection state, so a session that connects and then
-        // sits in dead air keeps climbing instead of restarting at 250 ms.
-        if (!mediaEverFlowed) {
-          mediaEverFlowed = true
-          deadAirStreak.value = 0
-          reconnectAttempt.value = 0
-        }
-      } else {
-        stallTicks++
+      // Media actually moving is the ONLY proof this pair has a working
+      // path — reaching `connected` is not. Reset the ladders here rather
+      // than on the connection state, so a session that connects and then
+      // sits in dead air keeps climbing instead of restarting at 250 ms.
+      if (advanced && !mediaEverFlowed) {
+        mediaEverFlowed = true
+        deadAirStreak.value = 0
+        reconnectAttempt.value = 0
       }
+      // FR-93 — an agent that said it cannot capture is believed: no probe,
+      // no re-create, the reason stays on the screen.
+      stallTicks = nextStallTicks(stallTicks, advanced, mediaUnavailable.value !== null)
       degraded.value = classifyDegraded({
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
@@ -7346,7 +7375,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // count it, and let the dead-air ladder raise the floor on the delay.
     // `Math.max` so a genuinely flapping-but-working session keeps the fast
     // ladder — only the frameless case is slowed.
-    if (!mediaEverFlowed && phase.value === 'connected') {
+    if (
+      isDeadAir({
+        mediaEverFlowed,
+        connected: phase.value === 'connected',
+        agentSaidNoPixels: mediaUnavailable.value !== null,
+      })
+    ) {
       deadAirStreak.value += 1
     }
     const deadAir = deadAirDelayMs(deadAirStreak.value)
@@ -8592,6 +8627,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           `[rc] the host cannot capture its screen (${parsed.reason.code}) — ${parsed.reason.hint}`,
           parsed.reason.detail,
         )
+        // FR-93 — this arrived over the control channel, so the path to the
+        // device works: earlier frameless attempts were not a network
+        // problem, and a notice saying they were must not sit over the reason.
+        deadAirStreak.value = 0
+        reconnectAttempt.value = 0
+        notice.value = null
       } else if (parsed?.kind === 'control_state') {
         // P6 - arbiter state: participants rail + exclusive floor. Prune
         // ghost cursors of sessions that left.
