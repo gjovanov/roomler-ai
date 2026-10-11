@@ -99,7 +99,9 @@ commit — a `GITHUB_TOKEN` push triggers no workflow, by design — then dispat
 `release-setup.yml --ref setup-v<V>` with `publish_release=true` (dispatch is the documented
 exception). Running after the agent release, it can never block or poison it; a failure
 goes red with the manual command in the log. `release-setup.yml` pins `target_commitish` to
-the built commit (softprops otherwise defaults it to `master`), drops `skip_macos`, asserts
+the built commit (softprops otherwise defaults it to `master`) — since #2013 (2026-10-12) only
+when the release creates the tag, because GitHub refuses a target that changes
+`.github/workflows` relative to master — drops `skip_macos`, asserts
 the dispatched ref matches the version, and opens/closes a release-failure issue like the
 agent lane. The newest `setup-v*` then always sits near the top of the 100-release page the
 resolver caches, so the resolver needs no change.
