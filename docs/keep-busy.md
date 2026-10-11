@@ -387,7 +387,44 @@ does not spawn `loginctl` forever.
 |---|---|
 | **Tray** (`roomler-desktop`, `tray.rs` L47) | "Stop keep busy (Heart · paused)" while it is on, with the agent's sentence; "Keep busy: off" (disabled) otherwise. Polled every 3 s |
 | **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`. There is deliberately no `on` |
-| **LocalAPI** | Both verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` as SYSTEM or root included) |
+| **LocalAPI** | Both verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` as SYSTEM or root included). On a supervised Mac the root daemon asks the GUI worker (below) |
+
+**The supervised Mac.** Two processes, two engines: the root daemon starts one
+like every host does, but only the GUI worker in the person's session runs keep
+busy. The person's own clients reach the worker directly: the tray and a
+`roomler` run as the person dial the per-user socket first. A **root** client
+cannot: `roomler exec <mac> roomler keep-busy off` runs as root and lands on the
+root daemon's socket. So the daemon does not answer for itself while a worker is
+attached. It asks the worker over the delegation channel and answers with what
+the worker says (`localapi_state.rs` `keep_busy_answer`, L408; `delegate.rs`
+`ask_worker_keep_busy`, L664; the worker answers at `delegate_worker.rs` L353).
+
+```mermaid
+sequenceDiagram
+  participant C as roomler keep-busy off (root)
+  participant D as root daemon (LocalAPI)
+  participant W as GUI worker (keep busy runs here)
+  C->>D: KeepBusyOff
+  D->>W: DelegateFrame::KeepBusyAsk {id, off: true}
+  W->>W: stop locally, wait ≤ 800 ms for "off"
+  W->>D: DelegateFrame::KeepBusyTold {id, info}
+  D->>C: KeepBusy(info) — the worker's state
+```
+
+| Case | Answer |
+|---|---|
+| Worker attached and answering | the worker's state, after its stop for an `off` |
+| No worker attached (nobody signed in) | the daemon's own engine, as before: nothing runs there |
+| A worker that does not answer within 1.5 s (`KEEP_BUSY_ASK_WAIT`): an older build skips the frame | the daemon's own engine, after the wait |
+| The worker leaves mid-question | the daemon's own engine, at once: the channel's close ends the wait |
+
+> [!WARNING]
+> Before this relay the root daemon answered for its own engine, which never
+> runs on a supervised Mac. Field, 0.4.126, on a MacBook: with keep busy running
+> in the worker, a root `roomler keep-busy off` answered `on: false` and logged
+> `keep-busy: turned off reason="stopped_locally"`. Six seconds later the worker
+> still reported `running`, and the session's idle clock still read 6–505 ms. The
+> remote off-switch the LocalAPI row promises stopped nothing.
 
 ## 10. Platforms
 

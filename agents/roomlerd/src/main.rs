@@ -3827,6 +3827,15 @@ async fn run_cmd(
             daemon_state
         }
     };
+    // FR-92 — on a supervised Mac the GUI worker runs keep busy, so the root
+    // daemon's keep-busy verbs ask it: `roomler exec <mac> roomler keep-busy
+    // off` arrives HERE, as root, and never sees the worker's socket.
+    #[cfg(target_os = "macos")]
+    let daemon_state = if supervised {
+        daemon_state
+    } else {
+        daemon_state.with_keep_busy_worker(delegate_host.clone())
+    };
     // FR-85 P3b — the owner's remote-recording gates, live from here on (a
     // local `ConfigSet` re-seeds them; the server cannot reach them).
     #[cfg(feature = "recording")]
