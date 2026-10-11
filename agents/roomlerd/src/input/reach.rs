@@ -3,10 +3,13 @@
 //! FR-93 P1 — can a controller's input reach this desktop at all?
 //!
 //! An injector that reaches nothing does not fail. XTest into Xwayland
-//! SUCCEEDS and moves Xwayland's own pointer, which the compositor ignores; on
-//! GNOME 49 and later, whose Xwayland runs `-enable-ei-portal`, it reaches no
-//! window at all (measured on the FR-93 lab, GNOME 50). Before this, a session
-//! on such a host looked fully interactive and silently did nothing.
+//! SUCCEEDS and moves Xwayland's own pointer, which the compositor ignores.
+//! Where Xwayland sends XTest through EI it reaches no window at all. GNOME 49
+//! and later start it with `-enable-ei-portal`. KWin hands it an EI socket in
+//! its environment (`LIBEI_SOCKET`) instead, and gates it behind its own prompt.
+//! Both measured on the FR-93 lab: GNOME 50, and Plasma 6.7, where xdotool moved
+//! nothing and clicked nothing even in an X11 window. Before this, a session on
+//! such a host looked fully interactive and silently did nothing.
 //!
 //! So each session is told what its input will reach (`rc:input-reach` over
 //! the control channel, only when that is less than everything), decided from
@@ -59,8 +62,22 @@ pub(crate) enum XServer {
     Real,
     /// Xwayland: XTest reaches its own clients only.
     Xwayland,
-    /// Xwayland started with `-enable-ei-portal`: XTest reaches nothing.
-    XwaylandEi,
+    /// Xwayland sends XTest through EI: it reaches nothing.
+    XwaylandEi(EiRoute),
+}
+
+/// How an Xwayland reaches EI, which decides only the words of the reason.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EiRoute {
+    /// `-enable-ei-portal` on its command line: GNOME 49 and later.
+    Portal,
+    /// A `LIBEI_SOCKET` in its environment, handed over by the compositor:
+    /// KWin, measured on Plasma 6.7.
+    Compositor,
 }
 
 /// Allowed dead: each build constructs only its own platform.
@@ -153,14 +170,19 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
                  Xwayland{uinput_note}. {WAYLAND_FIX}"
             ),
         ),
-        XServer::XwaylandEi => verdict(
-            Reach::None,
-            format!(
-                "this is a Wayland desktop whose Xwayland sends XTest through the EI \
-                 portal (GNOME 49 and later), so it reaches no window at \
-                 all{uinput_note}. {WAYLAND_FIX}"
-            ),
-        ),
+        XServer::XwaylandEi(route) => {
+            let via = match route {
+                EiRoute::Portal => "the EI portal (GNOME 49 and later)",
+                EiRoute::Compositor => "KWin's input-emulation gate (KDE Plasma 6)",
+            };
+            verdict(
+                Reach::None,
+                format!(
+                    "this is a Wayland desktop whose Xwayland sends XTest through {via}, \
+                     so it reaches no window at all{uinput_note}. {WAYLAND_FIX}"
+                ),
+            )
+        }
         XServer::Absent => verdict(
             Reach::None,
             format!(
@@ -218,8 +240,10 @@ fn x_server() -> XServer {
     match crate::capture::x_server_xwayland(&display) {
         None => XServer::Absent,
         Some(false) => XServer::Real,
-        Some(true) if xwayland_uses_ei_portal(&display) => XServer::XwaylandEi,
-        Some(true) => XServer::Xwayland,
+        Some(true) => match xwayland_ei_route(&display) {
+            Some(route) => XServer::XwaylandEi(route),
+            None => XServer::Xwayland,
+        },
     }
 }
 
@@ -228,26 +252,30 @@ fn x_server() -> XServer {
     XServer::Absent
 }
 
-/// Does the Xwayland serving `display` run with `-enable-ei-portal`? Read from
-/// that process's own command line: GNOME starts it as `Xwayland :0 -rootless
-/// … -enable-ei-portal`. No process found means no.
+/// Does the Xwayland serving `display` send XTest through EI, and how? Read
+/// from that process: GNOME starts it as `Xwayland :0 -rootless …
+/// -enable-ei-portal`; KWin as `Xwayland :0 -auth … -rootless`, with a
+/// `LIBEI_SOCKET=/proc/self/fd/N` in its environment. No process found, or an
+/// environment this daemon may not read, means no EI: then the verdict claims
+/// XTest reaches X11 apps, the old wording, and not the honest "nothing".
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
-fn xwayland_uses_ei_portal(display: &str) -> bool {
-    let Some(number) = display_number(display) else {
-        return false;
-    };
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    procs.flatten().any(|p| {
+fn xwayland_ei_route(display: &str) -> Option<EiRoute> {
+    let number = display_number(display)?;
+    let procs = std::fs::read_dir("/proc").ok()?;
+    procs.flatten().find_map(|p| {
         let path = p.path();
         let is_xwayland = std::fs::read_to_string(path.join("comm"))
             .map(|c| c.trim() == "Xwayland")
             .unwrap_or(false);
-        is_xwayland
-            && std::fs::read(path.join("cmdline"))
-                .map(|cmd| cmdline_serves_with_ei(&cmd, number))
-                .unwrap_or(false)
+        if !is_xwayland {
+            return None;
+        }
+        let cmdline = std::fs::read(path.join("cmdline")).ok()?;
+        if !cmdline_serves(&cmdline, number) {
+            return None;
+        }
+        let environ = std::fs::read(path.join("environ")).unwrap_or_default();
+        ei_route(&cmdline, &environ)
     })
 }
 
@@ -266,16 +294,34 @@ fn display_number(display: &str) -> Option<&str> {
     (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(number)
 }
 
-/// The pure half of [`xwayland_uses_ei_portal`]: a NUL-separated command line
-/// that serves display `:number` and carries `-enable-ei-portal`.
+/// Does a NUL-separated command line serve display `:number`?
 #[cfg_attr(
     not(all(target_os = "linux", feature = "enigo-input")),
     allow(dead_code)
 )]
-fn cmdline_serves_with_ei(cmdline: &[u8], number: &str) -> bool {
+fn cmdline_serves(cmdline: &[u8], number: &str) -> bool {
     let want = format!(":{number}");
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    args.contains(&want.as_bytes()) && args.contains(&b"-enable-ei-portal".as_slice())
+    cmdline.split(|b| *b == 0).any(|a| a == want.as_bytes())
+}
+
+/// The pure half of [`xwayland_ei_route`]: from an Xwayland's NUL-separated
+/// command line and environment, how it reaches EI, if it does. An empty
+/// `LIBEI_SOCKET=` names no socket, so it does not count.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn ei_route(cmdline: &[u8], environ: &[u8]) -> Option<EiRoute> {
+    if cmdline
+        .split(|b| *b == 0)
+        .any(|a| a == b"-enable-ei-portal")
+    {
+        return Some(EiRoute::Portal);
+    }
+    environ
+        .split(|b| *b == 0)
+        .any(|v| v.len() > b"LIBEI_SOCKET=".len() && v.starts_with(b"LIBEI_SOCKET="))
+        .then_some(EiRoute::Compositor)
 }
 
 /// The `rc:input-reach` control-channel message. Built with serde, because a
@@ -308,9 +354,20 @@ mod tests {
     /// and its Xwayland routes XTest through the EI portal.
     #[test]
     fn gnome_50s_xwayland_reaches_nothing() {
-        let r = decide(&linux(XServer::XwaylandEi));
+        let r = decide(&linux(XServer::XwaylandEi(EiRoute::Portal)));
         assert_eq!(r.reach, Reach::None);
         assert!(r.reason.contains("EI portal"), "{}", r.reason);
+        assert!(r.reason.contains("portal_input"), "{}", r.reason);
+    }
+
+    /// The FR-93 lab's per-user Plasma 6.7 guest, stock: KWin's Xwayland
+    /// carries no `-enable-ei-portal`, yet XTest reached nothing, not even an
+    /// X11 window, because KWin handed it an EI socket.
+    #[test]
+    fn kwins_xwayland_reaches_nothing() {
+        let r = decide(&linux(XServer::XwaylandEi(EiRoute::Compositor)));
+        assert_eq!(r.reach, Reach::None);
+        assert!(r.reason.contains("KWin"), "{}", r.reason);
         assert!(r.reason.contains("portal_input"), "{}", r.reason);
     }
 
@@ -334,7 +391,12 @@ mod tests {
 
     #[test]
     fn uinput_or_a_portal_route_reaches_everything_whatever_the_x_server() {
-        for x in [XServer::Absent, XServer::XwaylandEi, XServer::Xwayland] {
+        for x in [
+            XServer::Absent,
+            XServer::XwaylandEi(EiRoute::Portal),
+            XServer::XwaylandEi(EiRoute::Compositor),
+            XServer::Xwayland,
+        ] {
             let uinput = Facts {
                 uinput_on: true,
                 uinput_ok: true,
@@ -356,7 +418,7 @@ mod tests {
         let f = Facts {
             uinput_on: true,
             uinput_ok: false,
-            ..linux(XServer::XwaylandEi)
+            ..linux(XServer::XwaylandEi(EiRoute::Portal))
         };
         let r = decide(&f);
         assert_eq!(r.reach, Reach::None);
@@ -418,13 +480,47 @@ mod tests {
             "-enable-ei-portal",
             "",
         ]);
-        assert!(cmdline_serves_with_ei(&gnome, "0"));
-        assert!(
-            !cmdline_serves_with_ei(&gnome, "1"),
-            "another display's Xwayland"
-        );
+        assert!(cmdline_serves(&gnome, "0"));
+        assert!(!cmdline_serves(&gnome, "1"), "another display's Xwayland");
+        assert_eq!(ei_route(&gnome, b""), Some(EiRoute::Portal));
         let older = cmdline(&["Xwayland", ":0", "-rootless", "-noreset", ""]);
-        assert!(!cmdline_serves_with_ei(&older, "0"));
+        assert!(cmdline_serves(&older, "0"));
+        assert_eq!(ei_route(&older, b"PATH=/usr/bin\0"), None);
+    }
+
+    /// Plasma 6.7's Xwayland, as the lab's KDE guest runs it: nothing about EI
+    /// on the command line, and the socket in the environment.
+    #[test]
+    fn plasmas_environment_is_recognised() {
+        let nul = |parts: &[&str]| parts.join("\0").into_bytes();
+        let kwin = nul(&[
+            "/usr/bin/Xwayland",
+            ":0",
+            "-auth",
+            "/run/user/1000/xauth_PPjmwd",
+            "-listenfd",
+            "8",
+            "-listenfd",
+            "9",
+            "-displayfd",
+            "86",
+            "-wm",
+            "93",
+            "-rootless",
+            "",
+        ]);
+        assert!(cmdline_serves(&kwin, "0"));
+        let env = nul(&[
+            "XDG_SESSION_TYPE=wayland",
+            "LIBEI_SOCKET=/proc/self/fd/65",
+            "WAYLAND_SOCKET=95",
+            "",
+        ]);
+        assert_eq!(ei_route(&kwin, &env), Some(EiRoute::Compositor));
+        // No socket, an empty one, or a look-alike name: no EI.
+        assert_eq!(ei_route(&kwin, &nul(&["WAYLAND_SOCKET=95", ""])), None);
+        assert_eq!(ei_route(&kwin, &nul(&["LIBEI_SOCKET=", ""])), None);
+        assert_eq!(ei_route(&kwin, &nul(&["XLIBEI_SOCKET=/x", ""])), None);
     }
 
     #[test]
