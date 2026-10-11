@@ -348,6 +348,12 @@ pub async fn put_policy(
     match state.policies.put(policy, body.revision).await? {
         Ok(stored) => {
             audit(&state, tid, auth.user_id, "set", None).await;
+            // P2c-4 — the org's live sessions are placed again under it. The
+            // policy is stored either way; one that could not be applied now
+            // is applied at the next change placement reads.
+            if let Err(e) = crate::placement::replace_tenant(&state, tid, None).await {
+                tracing::warn!(%e, tenant = %tid, "hive: the new policy was not applied to live sessions yet");
+            }
             Ok(Json(PolicyView::of(&stored, false)))
         }
         Err(Stale) => {

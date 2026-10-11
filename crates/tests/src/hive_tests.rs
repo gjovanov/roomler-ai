@@ -4346,3 +4346,222 @@ async fn a_pending_join_waits_for_a_connection_that_holds_copies() {
         "a member that refused holds nothing"
     );
 }
+
+// ─── P2c-4a — placement decided again ───────────────────────────────────────
+
+/// Set a device's tags through fleet's own route, as an admin does: the
+/// change that makes placement decide again (core's `agent_updated`).
+async fn tag(app: &TestApp, tid: &str, token: &str, device: &str, tags: &[&str]) {
+    let resp = app
+        .auth_put(&format!("/api/tenant/{tid}/agent/{device}"), token)
+        .json(&json!({ "tags": tags }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert_eq!(
+        status,
+        200,
+        "tags: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// A policy with decision 2's rules but `min`, written from `revision`.
+fn policy_min(min: u32, revision: i64) -> Value {
+    json!({
+        "replicaset": {
+            "min": min, "max": 4, "archive": true,
+            "prefer": ["owner_devices"], "restricted_tags": ["prod"],
+        },
+        "retention_days": 90,
+        "archive_devices": [],
+        "revision": revision,
+    })
+}
+
+/// A device's tags change, and placement decides again. An unrelated change
+/// moves nothing: a member that still qualifies is kept. A tag taken off
+/// makes the member leave, and a device that now qualifies takes its place
+/// and is joined; tagged again, the one that left stays leaving while its
+/// replacement still qualifies.
+#[tokio::test]
+async fn placement_is_decided_again_when_a_devices_tags_change() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivereplace").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-re-primary", RUNS_HIVE).await;
+    set_device(&app, &primary.agent_id, doc! { "tags": ["prod"] }).await;
+    let mut a = device(&app, &seeded, "mach-re-a", HOLDS_COPIES).await;
+    set_device(&app, &a.agent_id, doc! { "tags": ["prod"] }).await;
+    let mut b = device(&app, &seeded, "mach-re-b", HOLDS_COPIES).await;
+
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/re").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        members(&s),
+        [
+            (primary.agent_id.clone(), "primary".to_string()),
+            (a.agent_id.clone(), "owner".to_string()),
+        ],
+        "B lacks the restricted tag"
+    );
+    read_until(&mut a.ws, "rc:hive.replica.join")
+        .await
+        .expect("A's join");
+    send(
+        &mut a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    wait_member(&app, &tid, &admin, &sid, &a.agent_id, "A joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+
+    // An unrelated change: B now qualifies too, and nothing moves.
+    tag(&app, &tid, &admin, &b.agent_id, &["prod"]).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &a.agent_id).await["state"],
+        "joined"
+    );
+    assert!(
+        member_of(&app, &tid, &admin, &sid, &b.agent_id)
+            .await
+            .is_null(),
+        "min holds: B is not taken"
+    );
+    assert!(
+        arrives(
+            &mut b.ws,
+            "rc:hive.replica.join",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none()
+    );
+
+    // A's tag taken off: A leaves, B takes its place and is joined.
+    tag(&app, &tid, &admin, &a.agent_id, &[]).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &a.agent_id).await["state"],
+        "leaving"
+    );
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &b.agent_id).await["state"],
+        "pending"
+    );
+    let join = read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join");
+    assert_eq!(join["session_id"], sid.as_str());
+    // A's join answer, late, does not take it back.
+    send(
+        &mut a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+
+    // A tagged again: B still qualifies and is kept; A stays leaving.
+    tag(&app, &tid, &admin, &a.agent_id, &["prod"]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &a.agent_id).await["state"],
+        "leaving"
+    );
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &b.agent_id).await["state"],
+        "pending"
+    );
+    let (_, read) = get_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(read["replicaset"]["restricted_tags"], json!(["prod"]));
+
+    let tid_oid = ObjectId::parse_str(&tid).unwrap();
+    let replaced = app
+        .db
+        .collection::<Document>("hive_audit")
+        .count_documents(doc! { "tenant_id": tid_oid, "action": "place", "outcome": "replaced" })
+        .await
+        .unwrap();
+    assert_eq!(replaced, 1, "one change moved anyone: A out, B in");
+}
+
+/// A policy that asks for more copies places them on the live sessions it
+/// governs, and joins them.
+#[tokio::test]
+async fn a_policy_that_asks_for_more_copies_places_them() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivereplacepolicy").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut primary = device(&app, &seeded, "mach-rp-primary", RUNS_HIVE).await;
+    let mut b = device(&app, &seeded, "mach-rp-b", HOLDS_COPIES).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/rp").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(members(&s).len(), 1, "min 1: the primary alone");
+
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{p}");
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &b.agent_id).await["state"],
+        "pending"
+    );
+    read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join, from the policy change");
+    let (_, read) = get_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(
+        (
+            read["replicaset"]["min"].as_u64(),
+            read["replicaset"]["policy_revision"].as_i64()
+        ),
+        (Some(2), Some(2))
+    );
+}
+
+/// A member removed from the fleet leaves the sessions it held copies of, and
+/// another device that qualifies takes its place.
+#[tokio::test]
+async fn a_removed_member_leaves_and_another_takes_its_place() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivereplacegone").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-rg-primary", RUNS_HIVE).await;
+    let mut b = device(&app, &seeded, "mach-rg-b", HOLDS_COPIES).await;
+    let day_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+    set_device(&app, &b.agent_id, doc! { "last_seen_at": day_ago }).await;
+    let a = device(&app, &seeded, "mach-rg-a", HOLDS_COPIES).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/rg").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        members(&s)[1],
+        (a.agent_id.clone(), "owner".to_string()),
+        "A, seen last"
+    );
+
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/agent/{}", a.agent_id), &admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {}", resp.status());
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &a.agent_id).await["state"],
+        "leaving"
+    );
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &b.agent_id).await["state"],
+        "pending"
+    );
+    read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join, in A's place");
+}

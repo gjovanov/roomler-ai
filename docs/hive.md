@@ -266,7 +266,7 @@ the harness, over that driver's own viewer peer.
 | ⚠️ The device decides whom it lets act as its account. A driver other than the starter prompts and answers only when the device's own `hive_accounts` maps them to the account the session runs as; otherwise the view is read only, and `hello` says why (`driving_refused`). The starter is recognised by id, from the start order, never through the map | the gate that survives a wrong server (decision 8). A server before P1c-2 sends no address, and the starter must not be locked out of their own session | [`drives_here`](../agents/roomlerd/src/hive/supervisor.rs#L1005) |
 | The model reads who asked, as `[Name] text`. A slash command goes as typed, and the name loses brackets and control characters and is cut to 64 characters | several drivers can share a session, and a display name must not be able to close the label | [`launch.rs:299`](../crates/hive-node/src/launch.rs#L299) `attributed_prompt` |
 | A stub's `prompted_by` and an approval's `answered_by` are believed only when they name a driver | both are the device's word | [`room.rs:172`](../crates/modules/hive/src/room.rs#L172), [`room.rs:250`](../crates/modules/hive/src/room.rs#L250) |
-| A member removed from the org drives nothing anywhere, and their views end at once | rejoining the org must not hand back a seat nobody offered again | [`hooks.rs:127`](../crates/modules/hive/src/hooks.rs#L127) |
+| A member removed from the org drives nothing anywhere, and their views end at once | rejoining the org must not hand back a seat nobody offered again | [`hooks.rs:151`](../crates/modules/hive/src/hooks.rs#L151) |
 | Every change is a note in the room, and audited (`participant`) | who may prompt the agent is for everyone there to see | |
 
 ---
@@ -558,7 +558,7 @@ its open approvals ([`agent_socket.rs:524`](../crates/modules/hive/src/agent_soc
   `running`, `awaiting_approval`). The state usually lands before the answer, so a
   socket that drops between the two leaves `idle` with no `accepted_at`, and with
   `accepted_at` alone that session outlived its harness for ever
-  ([`dao.rs:404`](../crates/modules/hive/src/dao.rs#L404)). A start the device has
+  ([`dao.rs:405`](../crates/modules/hive/src/dao.rs#L405)). A start the device has
   said nothing about stays reconcile's, which re-sends an unanswered start for 10
   minutes and an unconfirmed stop on every connection
   ([`agent_socket.rs:627`](../crates/modules/hive/src/agent_socket.rs#L627)).
@@ -1259,7 +1259,7 @@ nothing for the retention, and never acknowledge a purge.
 database's answer: a **500**, never a `not_a_device` row in the audit blaming the caller.
 
 Every attempt lands in `hive_audit` as `action: policy`
-([`policy.rs:362`](../crates/modules/hive/src/policy.rs#L362)): `set`, or `refused` with
+([`policy.rs:368`](../crates/modules/hive/src/policy.rs#L368)): `set`, or `refused` with
 `no_permission`, `invalid`, `not_a_device`, `ephemeral` or `stale`.
 
 A policy only ever says where copies **may** go. Whether a device holds one is still its
@@ -1269,7 +1269,7 @@ owner's `hive_replica` (P2c-1), which no policy and no server can turn on.
 
 Placement chooses a session's members from the policy and the devices' stored rows. Its
 rules are one pure function, `place`
-([`placement.rs:140`](../crates/modules/hive/src/placement.rs#L140)), each rule a unit
+([`placement.rs:146`](../crates/modules/hive/src/placement.rs#L146)), each rule a unit
 test. With `hive.replicaset` on, the start route runs it before the record is written
 ([`routes.rs:425`](../crates/modules/hive/src/routes.rs#L425)) and keeps the result on the
 record as `replicaset` ([`model.rs:178`](../crates/modules/hive/src/model.rs#L178)), which
@@ -1290,15 +1290,15 @@ flowchart TD
 
 | Rule | Why | Where |
 |---|---|---|
-| A member offers: its last hello advertised `hive-replica`, and it is live, not ephemeral, and not the primary | the device owner's `hive_replica` is the gate that survives a compromised server; FR-51 hard-deletes an ephemeral row once it goes quiet | [`placement.rs:169`](../crates/modules/hive/src/placement.rs#L169), [`agent.rs:242`](../crates/services/src/dao/agent.rs#L242) |
-| The owner's own devices are those whose `owner_user_id` **and** `enrolled_by` both name the session's owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone: a device manager who hands someone a device must not receive that person's sessions on it | [`placement.rs:196`](../crates/modules/hive/src/placement.rs#L196) |
-| Archive replicas come first, in the policy's order: designated, offering `hive-archive`, and only while `archive` is on | the administrator's half and the device owner's half | [`placement.rs:177`](../crates/modules/hive/src/placement.rs#L177) |
-| The owner's devices fill to `min`, last seen first and ties by id; never more than `max` in all | decision 2, and the same answer whenever it is computed | [`placement.rs:206`](../crates/modules/hive/src/placement.rs#L206) |
-| A restricted tag only ever takes a device out | a copy is everything the agent saw | [`placement.rs:170`](../crates/modules/hive/src/placement.rs#L170) |
-| An adopted session is placed nowhere | decision 11; the adopt path records no replicaset at all | [`placement.rs:160`](../crates/modules/hive/src/placement.rs#L160) |
+| A member offers: its last hello advertised `hive-replica`, and it is live, not ephemeral, and not the primary | the device owner's `hive_replica` is the gate that survives a compromised server; FR-51 hard-deletes an ephemeral row once it goes quiet | [`placement.rs:175`](../crates/modules/hive/src/placement.rs#L175), [`agent.rs:242`](../crates/services/src/dao/agent.rs#L242) |
+| The owner's own devices are those whose `owner_user_id` **and** `enrolled_by` both name the session's owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone: a device manager who hands someone a device must not receive that person's sessions on it | [`placement.rs:208`](../crates/modules/hive/src/placement.rs#L208) |
+| Archive replicas come first, in the policy's order: designated, offering `hive-archive`, and only while `archive` is on | the administrator's half and the device owner's half | [`placement.rs:183`](../crates/modules/hive/src/placement.rs#L183) |
+| The owner's devices fill to `min`, last seen first and ties by id; never more than `max` in all | decision 2, and the same answer whenever it is computed | [`placement.rs:221`](../crates/modules/hive/src/placement.rs#L221) |
+| A restricted tag only ever takes a device out | a copy is everything the agent saw | [`placement.rs:176`](../crates/modules/hive/src/placement.rs#L176) |
+| An adopted session is placed nowhere | decision 11; the adopt path records no replicaset at all | [`placement.rs:166`](../crates/modules/hive/src/placement.rs#L166) |
 
 ⚠️ **A tag is compared without case**
-([`placement.rs:131`](../crates/modules/hive/src/placement.rs#L131)). A primary tagged
+([`placement.rs:137`](../crates/modules/hive/src/placement.rs#L137)). A primary tagged
 `Prod` is restricted by the policy's `prod`, and a device tagged `PROD` may hold its
 copies. A comparison that assumed one casing would leave that session unrestricted: a
 guard that assumes a casing is no guard.
@@ -1360,13 +1360,13 @@ sequenceDiagram
 | When | What the server does | Where |
 |---|---|---|
 | the primary accepts the start | sends each member that has not answered its join, in its role | [`agent_socket.rs:363`](../crates/modules/hive/src/agent_socket.rs#L363), [`replica.rs:109`](../crates/modules/hive/src/replica.rs#L109) |
-| a device connects | sends it every join it has still to answer, if THIS connection advertises `hive-replica`. A member placed before P2c-3a has no state, and counts as pending | [`agent_socket.rs:297`](../crates/modules/hive/src/agent_socket.rs#L297), [`replica.rs:128`](../crates/modules/hive/src/replica.rs#L128), [`dao.rs:553`](../crates/modules/hive/src/dao.rs#L553) |
-| a join answer arrives | the member is `joined`, or `refused` with the device's word | [`replica.rs:161`](../crates/modules/hive/src/replica.rs#L161), [`dao.rs:481`](../crates/modules/hive/src/dao.rs#L481) |
-| a tip arrives, alone or in a manifest | kept on the member's entry: the fence, `seq`, hash and newest checkpoint, and when it was heard | [`replica.rs:199`](../crates/modules/hive/src/replica.rs#L199), [`dao.rs:527`](../crates/modules/hive/src/dao.rs#L527) |
+| a device connects | sends it every join it has still to answer, if THIS connection advertises `hive-replica`. A member placed before P2c-3a has no state, and counts as pending | [`agent_socket.rs:297`](../crates/modules/hive/src/agent_socket.rs#L297), [`replica.rs:128`](../crates/modules/hive/src/replica.rs#L128), [`dao.rs:557`](../crates/modules/hive/src/dao.rs#L557) |
+| a join answer arrives | the member is `joined`, or `refused` with the device's word | [`replica.rs:161`](../crates/modules/hive/src/replica.rs#L161), [`dao.rs:482`](../crates/modules/hive/src/dao.rs#L482) |
+| a tip arrives, alone or in a manifest | kept on the member's entry: the fence, `seq`, hash and newest checkpoint, and when it was heard | [`replica.rs:199`](../crates/modules/hive/src/replica.rs#L199), [`dao.rs:531`](../crates/modules/hive/src/dao.rs#L531) |
 
 Each member on the record now carries `state` (`pending`, `joined` or `refused`,
 [`model.rs:224`](../crates/modules/hive/src/model.rs#L224)), the refusal, when it
-answered, and its tip ([`model.rs:249`](../crates/modules/hive/src/model.rs#L249)), all
+answered, and its tip ([`model.rs:255`](../crates/modules/hive/src/model.rs#L255)), all
 in the session view (`docs/api.md`). The primary is `joined` from its placement: it holds
 the session by running it.
 
@@ -1456,8 +1456,51 @@ back at each checkpoint, and is not counted.
 ⚠️ **A joined member holds no copy yet.** The copy comes with the carrier and the stream
 (P2d). Until then its tip is `seq` 0, and the server knows it as joined and empty.
 
-The rest of P2 is next (spec §3b and §4): the rest of membership (placement run again,
-and the `agent_updated` hook), the
+### P2c-4a: placement decided again
+
+A placement is not frozen at the start. When something it reads changes, the server
+decides again for every live placed session of the organization
+([`placement.rs:329`](../crates/modules/hive/src/placement.rs#L329)).
+
+| What changed | Who tells hive | Where |
+|---|---|---|
+| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1042`](../crates/modules/fleet/src/agent.rs#L1042), [`hooks.rs:149`](../crates/core/src/hooks.rs#L149), [`hooks.rs:111`](../crates/modules/hive/src/hooks.rs#L111) |
+| the policy, or its archive replicas | the policy write, after it is stored | [`policy.rs:354`](../crates/modules/hive/src/policy.rs#L354) |
+| a member removed from the fleet | the removal cascade, hive first, while the row is still there: the device is named as gone | [`hooks.rs:100`](../crates/modules/hive/src/hooks.rs#L100) |
+
+```mermaid
+flowchart TD
+    C["a tag, an owner, the policy, a removal"] --> P["place again, keeping what it holds:<br/>members that still qualify first, in their order"]
+    P --> N{"for each device it chooses"}
+    N -- "new" --> A["added pending, and joined<br/>once the primary runs the session"]
+    N -- "leaving" --> B["pending again, and joined again"]
+    N -- "a member already" --> K["kept as it is"]
+    P --> L{"for each member it no longer chooses"}
+    L --> X["leaving: its copy goes with the purge (P2g)"]
+```
+
+⚠️ **Deciding again moves no copy that need not move.** [`place`](../crates/modules/hive/src/placement.rs#L220)
+keeps the members a session holds, in their order, before it takes another device,
+active ones before leaving ones. Without that, tagging an unrelated device B would evict
+member A from a session only because B was seen more recently. A smaller `min` keeps the
+first members, and the rest leave.
+
+⚠️ **A leaving member keeps its copy until the purge.** Its state is `leaving`
+([`model.rs:237`](../crates/modules/hive/src/model.rs#L237)), and P2g sends it the purge
+once `min` holds elsewhere: make-before-break. A join answer in flight when it was let go
+does not take it back. If placement chooses it again, it is `pending` and is joined again;
+its store already holds the membership.
+
+⚠️ **Restricted tags still only grow.** Placement starts from the tags the session already
+carries, so a primary losing `prod` does not release the session to untagged devices.
+
+Each change that moved a member lands in `hive_audit` as `place` with outcome `replaced`.
+The row names the session's owner, since the decision was the system's, not a person's.
+A member that refused its join stays refused. A primary that started alone is not told
+when a member joins it later, so it takes no checkpoint for that member yet. That comes
+with P2c-4b, together with placing a session from before P2 when its primary connects.
+
+The rest of P2 is next (spec §3b and §4): the rest of membership (P2c-4b), the
 QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the

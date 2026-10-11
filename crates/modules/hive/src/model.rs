@@ -230,6 +230,11 @@ pub enum MemberState {
     Joined,
     /// The device refused; `refusal` says which of its gates.
     Refused,
+    /// P2c-4 — placement no longer chooses it: a tag taken off, its owner
+    /// changed, a smaller policy, the device removed. Its copy goes with the
+    /// purge (P2g), once `min` holds elsewhere; until then it keeps what it
+    /// holds, and placement choosing it again makes it `pending` again.
+    Leaving,
 }
 
 impl MemberState {
@@ -239,6 +244,7 @@ impl MemberState {
             Self::Pending => "pending",
             Self::Joined => "joined",
             Self::Refused => "refused",
+            Self::Leaving => "leaving",
         }
     }
 }
@@ -740,20 +746,17 @@ mod tests {
     /// P2c-3, with no state, reads as `pending`: its join is still to send.
     #[test]
     fn a_member_placed_before_p2c3_is_pending() {
-        assert_eq!(
-            [
-                MemberState::Pending,
-                MemberState::Joined,
-                MemberState::Refused
-            ]
-            .map(MemberState::as_str),
-            ["pending", "joined", "refused"]
-        );
-        for s in [
+        let all = [
             MemberState::Pending,
             MemberState::Joined,
             MemberState::Refused,
-        ] {
+            MemberState::Leaving,
+        ];
+        assert_eq!(
+            all.map(MemberState::as_str),
+            ["pending", "joined", "refused", "leaving"]
+        );
+        for s in all {
             assert_eq!(
                 bson::to_bson(&s).unwrap(),
                 bson::Bson::String(s.as_str().into())

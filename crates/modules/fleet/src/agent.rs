@@ -981,6 +981,8 @@ pub async fn update_agent(
     // row as well, so a removal between this read and those writes cannot
     // land one on the tombstone either.
     state.agents.find_live_in_tenant(tid, aid).await?;
+    // FR-90 P2c-4 — placement reads a device's tags and its owner.
+    let placement_inputs = body.owner_user_id.is_some() || body.tags.is_some();
 
     if let Some(owner) = body.owner_user_id {
         let owner_id = ObjectId::parse_str(&owner)
@@ -1033,6 +1035,16 @@ pub async fn update_agent(
     if let Some(routes) = body.routes {
         let normalized = normalize_routes(routes)?;
         state.agents.update_routes(tid, aid, &normalized).await?;
+    }
+    // FR-90 P2c-4 — and where the org's sessions are copied is decided again,
+    // through the core hooks (hive's). Stored first, decided after: a failure
+    // is the caller's to see, and a retry decides again from what is stored.
+    if placement_inputs {
+        state
+            .hooks
+            .agent_updated(tid, aid)
+            .await
+            .map_err(|e| ApiError::Internal(format!("placement was not decided again: {e}")))?;
     }
 
     // Hand back the refreshed row so the UI can patch without a refetch —
