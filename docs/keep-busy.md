@@ -21,11 +21,13 @@
 > | P7 | a **permanent history**: every on and off on every device, every change to the org's settings (§11) |
 > | P8 | the org's **default pattern** (§12) |
 > | P9 | **GNOME on Wayland**, and GNOME on Xorg under a root daemon, through uinput ([§2](#a-blind-host-gnome-through-uinput)) |
+> | P10 | a **local On**: the tray's "Start keep busy" and `roomler keep-busy on`, for the person at the computer only (§9) |
 >
 > Any other Wayland desktop is detected and reported unavailable, with its reason.
 >
-> Every enable comes from a remote-desktop session that holds input. There is no
-> local "on" and no server "on".
+> It is turned on from a remote-desktop session that holds input, or (P10) by
+> the person at the computer. There is no server "on", and `roomler exec` cannot
+> turn it on.
 
 Keep busy moves a device's pointer in a pattern so the computer stays
 **active**: no screensaver, no idle lock, no "Away" in Teams or Slack.
@@ -251,7 +253,7 @@ moves anything.
 | viewer → device (control DC, `peer.rs` L8648) | `rc:keep-busy.set {on, pattern, size, speed, resume_after_s, auto_off_min}` · `rc:keep-busy.get` |
 | device → every viewer (control DC) | `rc:keep-busy.state {available, on, phase, reason, sentence, paused_by, resumes_in_ms, pattern, …, set_by, warn}` (`wire.rs` `state_payload`, L76). A refusal goes only to the viewer that asked, with `refused` |
 | server → device | `rc:agent.keep_busy_policy {denied}` (`remote_control/src/signaling.rs` L2224) |
-| local client → device | LocalAPI `keep_busy_status` / `keep_busy_off` → `keep_busy` (`crates/localapi/src/lib.rs` L1260) |
+| local client → device | LocalAPI `keep_busy_status` / `keep_busy_off` / (P10) `keep_busy_on {opts}` → `keep_busy` (`crates/localapi/src/lib.rs` L1260) |
 | caps | `keep-busy` in `AgentCaps.input`, matched by equality, and following the owner's key at every announcement |
 
 ## 7. Gates
@@ -386,9 +388,40 @@ does not spawn `loginctl` forever.
 
 | Surface | What |
 |---|---|
-| **Tray** (`roomler-desktop`, `tray.rs` L47) | "Stop keep busy (Heart · paused)" while it is on, with the agent's sentence; "Keep busy: off" (disabled) otherwise. Polled every 3 s |
-| **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`. There is deliberately no `on` |
-| **LocalAPI** | Both verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` as SYSTEM or root included). On a supervised Mac the root daemon asks the GUI worker (below) |
+| **Tray** (`roomler-desktop`, `tray.rs` L47) | A toggle, polled every 3 s: "Stop keep busy (Heart · paused)" while it is on, whoever turned it on; **"Start keep busy"** while it is off and can run here (P10, the product default pattern); "Keep busy: unavailable", disabled, where it cannot. The click reads the state at that moment |
+| **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`, and (P10) `roomler keep-busy on [--pattern P] [--size s\|m\|l] [--speed slow\|normal\|fast] [--resume-after SECONDS] [--auto-off MINUTES]` |
+| **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` as SYSTEM or root included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
+
+**Who may turn it ON here (P10).** The person at the computer, and nobody
+standing in for them. `ClientPeer::may_start_keep_busy` (`crates/localapi`)
+answers per endpoint:
+
+```mermaid
+flowchart TD
+  P[a LocalAPI keep_busy_on] --> R{peer is root?}
+  R -- yes --> X[refused: roomler exec arrives as root]
+  R -- no --> W{Windows peer?}
+  W -- yes --> S{the active console session, and not session 0?}
+  S -- yes --> OK[the engine starts it: set_by = the person at this computer]
+  S -- no --> X2[refused: an RDP guest, a service, exec as SYSTEM]
+  W -- no --> E{which endpoint?}
+  E -- a per-user daemon's socket --> O{the socket's owner?}
+  O -- yes --> OK
+  O -- no --> X3[refused]
+  E -- the person socket of a system install --> OK
+```
+
+- **Not the recording verbs' gate**: on Unix that one lets root through, and
+  root is how `roomler exec` arrives. With it, the server could start
+  synthetic input on any exec-enabled device (FR-92 §7, §8).
+- **Never relayed**: a supervised Mac's root daemon refuses a local On rather
+  than pass it to the worker. The person's own clients reach the worker
+  directly.
+- The owner's `keep_busy_enabled = false` and an org deny refuse a local
+  start exactly as they refuse a viewer's. The answer then carries the
+  reason (`device_disabled`, `org_denied`).
+- Who is named: "the person at this computer". The account name is not
+  ours to show every viewer and the org's history.
 
 **The supervised Mac.** Two processes, two engines: the root daemon starts one
 like every host does, but only the GUI worker in the person's session runs keep

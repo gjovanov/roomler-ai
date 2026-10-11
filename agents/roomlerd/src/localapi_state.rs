@@ -1230,6 +1230,37 @@ impl LocalApiState for DaemonState {
         Response::KeepBusy(info)
     }
 
+    /// FR-92 P10 — the person at the console turns keep busy on. The
+    /// dispatcher has already refused everyone else (root, services,
+    /// `roomler exec`).
+    ///
+    /// ⚠️ Never relayed to a supervised Mac's GUI worker: the person's own
+    /// clients reach the worker's socket directly, and nothing that can only
+    /// reach the root daemon may start synthetic input. That daemon's own
+    /// engine never runs, so it says where to turn it on instead.
+    async fn keep_busy_on(&self, opts: tunnel_core::localapi::KeepBusyStartOpts) -> Response {
+        if self.keep_busy_worker.is_some() {
+            return Response::Error {
+                message: "keep busy runs in this Mac's GUI session: turn it on from the Roomler \
+                          menu-bar app, or with `roomler keep-busy on` as yourself"
+                    .into(),
+            };
+        }
+        match crate::keep_busy::start_locally_and_wait(&opts, crate::keep_busy::LOCAL_OFF_WAIT)
+            .await
+        {
+            Ok(s) => {
+                tracing::info!(
+                    on = s.on,
+                    reason = s.reason.map(|r| r.wire()).unwrap_or("-"),
+                    "localapi: keep busy turned on at this computer"
+                );
+                Response::KeepBusy(crate::keep_busy::local_info(&s))
+            }
+            Err(message) => Response::Error { message },
+        }
+    }
+
     #[cfg(feature = "recording")]
     async fn recordings_list(&self) -> Response {
         match &self.recorder {

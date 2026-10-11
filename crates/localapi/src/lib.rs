@@ -1260,10 +1260,18 @@ pub enum Request {
     KeepBusyStatus,
     /// FR-92 — stop keep busy. Open to every peer the endpoint admits, the
     /// person socket included: stopping is the safe direction, and it is the
-    /// person's own pointer. There is deliberately no local "on" — only an
-    /// `INPUT` session from the viewer turns it on. Returns
-    /// [`Response::KeepBusy`].
+    /// person's own pointer. Returns [`Response::KeepBusy`].
     KeepBusyOff,
+    /// FR-92 P10 — the person at the console turns keep busy ON (the tray's
+    /// "Start keep busy", `roomler keep-busy on`). Unlike status and off,
+    /// this is gated: the peer must be that person
+    /// ([`ClientPeer::may_start_keep_busy`]) — never root or a service, which
+    /// is how `roomler exec` arrives, so the server still cannot start
+    /// synthetic input (FR-92 §7). Returns [`Response::KeepBusy`].
+    KeepBusyOn {
+        #[serde(default)]
+        opts: KeepBusyStartOpts,
+    },
     /// FR-84 D5b — one page of the devices THIS device may see (itself
     /// included): `GET /api/agent/self/devices` on the org's server, asked by
     /// the daemon with that org's agent token. The server searches, sorts and
@@ -1733,6 +1741,50 @@ impl KeepBusyInfo {
     }
 }
 
+/// FR-92 P10 — what the person at the console asks for when turning keep
+/// busy on locally ([`Request::KeepBusyOn`]). Every field is optional:
+/// absent means the product default (circle, size m, normal speed, resume
+/// after 30 s, no auto-off). The values are the viewer's own wire names
+/// (`rc:keep-busy.set`), and the agent checks them with the same parser, so
+/// "circel" is refused, never quietly drawn as something else.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeepBusyStartOpts {
+    /// One of [`KEEP_BUSY_PATTERNS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// `s` · `m` · `l`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// `slow` · `normal` · `fast`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    /// How long the computer must be left alone before it resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after_s: Option<u64>,
+    /// Turn itself off after this many minutes; absent or 0 = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_off_min: Option<u64>,
+}
+
+/// FR-92 P10 — every keep-busy pattern's wire name, in the viewer's order:
+/// what `roomler keep-busy on --pattern` offers. The agent owns the list (a
+/// test there keeps this copy equal to it).
+pub const KEEP_BUSY_PATTERNS: [&str; 13] = [
+    "circle",
+    "triangle",
+    "square",
+    "star",
+    "figure8",
+    "heart",
+    "spirograph",
+    "lissajous",
+    "rose",
+    "wave",
+    "wander",
+    "subtle",
+    "shuffle",
+];
+
 /// FR-85 — what the recorder is doing now, and how the last recording ended.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordingState {
@@ -1895,6 +1947,43 @@ impl ClientPeer {
     /// ends, so no other local account may place one. Unknown is not root.
     pub fn is_root(&self) -> bool {
         self.uid == Some(0)
+    }
+
+    /// FR-92 P10 — may this peer turn keep busy ON? Only the person at the
+    /// console, on `scope`'s endpoint ([`peer_may_start_keep_busy`]).
+    pub fn may_start_keep_busy(&self, scope: Scope) -> bool {
+        peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
+    }
+}
+
+/// FR-92 P10 — the pure decision behind [`ClientPeer::may_start_keep_busy`].
+///
+/// Stricter than [`peer_is_console_user`] in one way that matters: **root
+/// never**. That gate lets root through on Unix, and root is exactly how
+/// `roomler exec` arrives there — so with it, the server could start
+/// synthetic input on any exec-enabled device, which FR-92 §7 rules out.
+/// - **Windows**: the active console session, and never session 0 (services
+///   and `roomler exec` as SYSTEM).
+/// - **A per-user daemon's own socket** (macOS GUI worker, Linux user
+///   daemon): its owner, who is the person.
+/// - **The person socket of a Linux system install** ([`Scope::Person`]):
+///   its ACL admits only the person it was made for.
+/// - Anything unknown: no.
+pub fn peer_may_start_keep_busy(
+    peer: &ClientPeer,
+    scope: Scope,
+    console_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    if peer.uid == Some(0) {
+        return false;
+    }
+    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
+        return p == c && p != 0;
+    }
+    match scope {
+        Scope::Person => peer.uid.is_some(),
+        Scope::Full => matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o),
     }
 }
 
@@ -2197,6 +2286,11 @@ pub trait LocalApiState: Send + Sync {
     async fn keep_busy_off(&self) -> Response {
         Response::KeepBusy(KeepBusyInfo::unavailable())
     }
+    /// FR-92 P10 — the person at the console turns keep busy on. The
+    /// dispatcher has already checked the peer IS that person.
+    async fn keep_busy_on(&self, _opts: KeepBusyStartOpts) -> Response {
+        Response::KeepBusy(KeepBusyInfo::unavailable())
+    }
     /// FR-85 — the recordings folder and its recordings.
     async fn recordings_list(&self) -> Response {
         Response::Error {
@@ -2281,6 +2375,16 @@ fn not_the_console_user() -> Response {
     }
 }
 
+/// FR-92 P10 — the answer to a keep-busy start from anyone but the person at
+/// the console.
+fn not_the_person_for_keep_busy() -> Response {
+    Response::Error {
+        message: "only the person at this device's console can turn keep busy on here — \
+                  not root, not a service, not `roomler exec` (anyone may stop it)"
+            .into(),
+    }
+}
+
 /// FR-27 P11 — what a connection may ask, decided by WHICH socket it came in on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -2312,9 +2416,12 @@ pub fn person_may(req: &Request) -> bool {
         | Request::RecordStatus
         // FR-92 — keep busy moves the person's own pointer: they must see it
         // and be able to stop it from the companion, even on a system
-        // install where this socket is all they can reach.
+        // install where this socket is all they can reach. P10 — and turn it
+        // on: this socket's ACL admits only that person (the start is gated
+        // again, on the peer, in the dispatcher).
         | Request::KeepBusyStatus
-        | Request::KeepBusyOff => true,
+        | Request::KeepBusyOff
+        | Request::KeepBusyOn { .. } => true,
         Request::Peers
         | Request::Flows
         | Request::Ping { .. }
@@ -2404,6 +2511,7 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordStatus
         | Request::KeepBusyStatus
         | Request::KeepBusyOff
+        | Request::KeepBusyOn { .. }
         | Request::RecordingsList
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
@@ -2557,10 +2665,16 @@ where
                 Ok(Request::RecordStatus) => state.record_status().await,
                 Ok(Request::RecordingsList) => state.recordings_list().await,
                 // FR-92 — keep busy: reading AND stopping are open to every
-                // local client. Stopping is the safe direction; there is no
-                // local "on" to gate.
+                // local client. Stopping is the safe direction.
                 Ok(Request::KeepBusyStatus) => state.keep_busy_status().await,
                 Ok(Request::KeepBusyOff) => state.keep_busy_off().await,
+                // P10 — turning it ON is the console person's alone: root
+                // never (how `roomler exec` arrives on Unix), session 0 never.
+                // The server must not be able to start synthetic input.
+                Ok(Request::KeepBusyOn { .. }) if !peer.may_start_keep_busy(scope) => {
+                    not_the_person_for_keep_busy()
+                }
+                Ok(Request::KeepBusyOn { opts }) => state.keep_busy_on(opts).await,
                 Ok(
                     Request::RecordStart { .. }
                     | Request::RecordStop
@@ -3878,6 +3992,16 @@ impl Client {
     /// applied it (or after a short wait — then `on` may still read true).
     pub async fn keep_busy_off(&mut self) -> std::io::Result<KeepBusyInfo> {
         match self.request(&Request::KeepBusyOff).await? {
+            Response::KeepBusy(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-92 P10 — turn keep busy on, as the person at this computer.
+    /// Answers with the state once the engine has applied it (or refused:
+    /// then `on` is false and `reason` says why).
+    pub async fn keep_busy_on(&mut self, opts: KeepBusyStartOpts) -> std::io::Result<KeepBusyInfo> {
+        match self.request(&Request::KeepBusyOn { opts }).await? {
             Response::KeepBusy(s) => Ok(s),
             other => Err(unexpected_response(other)),
         }
@@ -5831,6 +5955,135 @@ mod tests {
         assert!(!ClientPeer::UNKNOWN.is_console_user());
     }
 
+    /// FR-92 P10 — who may turn keep busy ON. Root never: it is how
+    /// `roomler exec` arrives on Unix, and [`peer_is_console_user`] would let
+    /// it through.
+    #[test]
+    fn the_keep_busy_start_decision_table() {
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            uid: None,
+        };
+        let unix = |u| ClientPeer {
+            session_id: None,
+            uid: Some(u),
+        };
+        let full = Scope::Full;
+        let person = Scope::Person;
+        // Windows: the active console session only; session 0 never.
+        assert!(peer_may_start_keep_busy(&win(1), full, Some(1), None));
+        assert!(
+            !peer_may_start_keep_busy(&win(2), full, Some(1), None),
+            "an RDP session"
+        );
+        assert!(
+            !peer_may_start_keep_busy(&win(0), full, Some(0), None),
+            "session 0"
+        );
+        assert!(
+            !peer_may_start_keep_busy(&win(1), full, None, None),
+            "no console"
+        );
+        // A per-user daemon: its owner — and NOT root, unlike the console gate.
+        assert!(peer_may_start_keep_busy(&unix(501), full, None, Some(501)));
+        assert!(
+            !peer_may_start_keep_busy(&unix(0), full, None, Some(501)),
+            "root"
+        );
+        assert!(
+            peer_is_console_user(&unix(0), None, Some(501)),
+            "the gate this one tightens"
+        );
+        assert!(
+            !peer_may_start_keep_busy(&unix(502), full, None, Some(501)),
+            "another user"
+        );
+        // A root daemon's own socket: only root reaches it, and root may not.
+        assert!(!peer_may_start_keep_busy(&unix(0), full, None, Some(0)));
+        // The person socket of a system install: its person; root never.
+        assert!(peer_may_start_keep_busy(&unix(1000), person, None, Some(0)));
+        assert!(!peer_may_start_keep_busy(&unix(0), person, None, Some(0)));
+        // Fail closed.
+        for scope in [full, person] {
+            assert!(!peer_may_start_keep_busy(
+                &ClientPeer::UNKNOWN,
+                scope,
+                Some(1),
+                Some(501)
+            ));
+        }
+    }
+
+    /// FR-92 P10 — the start's wire. A bare start (no options) is the
+    /// product default.
+    #[test]
+    fn the_keep_busy_start_round_trips() {
+        let req = Request::KeepBusyOn {
+            opts: KeepBusyStartOpts {
+                pattern: Some("wander".into()),
+                size: Some("l".into()),
+                speed: None,
+                resume_after_s: Some(10),
+                auto_off_min: Some(60),
+            },
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            j,
+            r#"{"t":"keep_busy_on","d":{"opts":{"pattern":"wander","size":"l","resume_after_s":10,"auto_off_min":60}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&j).unwrap(), req);
+        let bare: Request = serde_json::from_str(r#"{"t":"keep_busy_on","d":{}}"#).unwrap();
+        assert_eq!(
+            bare,
+            Request::KeepBusyOn {
+                opts: KeepBusyStartOpts::default()
+            }
+        );
+    }
+
+    /// FR-92 P10 — the gate in the dispatcher: root and an unknown peer are
+    /// refused before any state is asked; status and off stay open to them.
+    #[tokio::test]
+    async fn a_keep_busy_start_from_root_or_an_unknown_peer_is_refused() {
+        let root = ClientPeer {
+            session_id: None,
+            uid: Some(0),
+        };
+        for peer in [root, ClientPeer::UNKNOWN] {
+            let r = ask(peer, r#"{"t":"keep_busy_on","d":{}}"#).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("turn keep busy on")),
+                "{peer:?} → {r:?}"
+            );
+            assert!(matches!(
+                ask(peer, r#"{"t":"keep_busy_off"}"#).await,
+                Response::KeepBusy(_)
+            ));
+        }
+    }
+
+    /// FR-92 P10 — the person a per-user daemon runs as reaches the state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_keep_busy_start_from_the_person_reaches_the_state() {
+        let me = ClientPeer {
+            session_id: None,
+            uid: own_uid(),
+        };
+        if me.uid == Some(0) {
+            return; // a root test runner IS root: the case above covers it
+        }
+        assert!(matches!(
+            ask(
+                me,
+                r#"{"t":"keep_busy_on","d":{"opts":{"pattern":"circle"}}}"#
+            )
+            .await,
+            Response::KeepBusy(_)
+        ));
+    }
+
     #[test]
     fn the_recording_verbs_round_trip() {
         for req in [
@@ -5926,6 +6179,8 @@ mod tests {
             // FR-92 — it is the person's own pointer.
             r#"{"t":"keep_busy_status"}"#,
             r#"{"t":"keep_busy_off"}"#,
+            // P10 — and theirs to start (the peer is gated again on top).
+            r#"{"t":"keep_busy_on","d":{}}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();

@@ -627,6 +627,15 @@ mod tests {
 
     const ALL_SHAPES: [Pattern; 11] = SHUFFLE_ORDER;
 
+    /// FR-92 P10 — the LocalAPI's copy of the pattern names (what
+    /// `roomler keep-busy on --pattern` offers) is exactly this list, in this
+    /// order: the companion and the CLI cannot link the agent.
+    #[test]
+    fn the_localapi_pattern_list_is_ours() {
+        let ours: Vec<&str> = Pattern::ALL.iter().map(|p| p.wire()).collect();
+        assert_eq!(ours, tunnel_core::localapi::KEEP_BUSY_PATTERNS);
+    }
+
     #[test]
     fn wire_names_round_trip_and_match_by_equality() {
         for p in Pattern::ALL {
