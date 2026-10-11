@@ -54,7 +54,16 @@ install -D -m644 "$pkg/packaging/linux/roomlerd.service" "$root/usr/lib/systemd/
 install -D -m644 "$pkg/packaging/linux/roomler.service"  "$root/usr/lib/systemd/user/roomler.service"
 install -D -m644 "$pkg/packaging/linux/README.Debian"    "$root/usr/share/doc/roomler-agent/README.Debian"
 
-(cd /tmp && tar czf "${name}.tar.gz" "$name")
+# ⚠️ Files only, owned by root in the archive. A plain `tar czf` of the tree
+# records every DIRECTORY too (usr/, usr/bin/, usr/lib/ …) with the builder's
+# own uid (1001 on the CI runner). Extracting as root restores the archive's
+# owner, and GNU tar applies a directory entry's metadata to a directory that
+# already exists. Up to 0.4.126, install.sh's `sudo tar -C /` therefore made
+# /usr, /usr/bin and /usr/lib the property of whichever local account held uid
+# 1001. With no directory entries, extraction creates only missing parents,
+# root's, and never touches an existing directory.
+(cd /tmp && find "$name" \( -type f -o -type l \) -print | LC_ALL=C sort \
+    | tar --owner=0 --group=0 --numeric-owner --no-recursion -czf "${name}.tar.gz" -T -)
 mv "/tmp/${name}.tar.gz" .
 sha256sum "${name}.tar.gz" | awk '{print $1"  "$2}' > "${name}.tar.gz.sha256"
 

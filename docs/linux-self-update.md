@@ -115,6 +115,59 @@ axes:
 - format from the same PATH probe, with the tarball extracted to `/` under
   `sudo` and the units enabled as today
 
+## Ownership: a tarball install never hands a system directory to anyone
+
+⚠️ **Up to 0.4.126 every tarball install left `/usr` another account's.** The
+archive was a plain `tar czf` of the staged tree, so it recorded every
+*directory* too (`usr/`, `usr/bin/`, `usr/lib/` …) under the CI builder's uid,
+1001. `install.sh` extracted it with `sudo tar -xzf … -C /`. GNU tar running as
+root restores each entry's owner from the archive, and applies a directory
+entry's metadata to a directory that already exists. On the FR-93 lab (Fedora 44,
+the released 0.4.126) that left these owned by UID 1001, a person's account on
+these distributions:
+- `/usr`, `/usr/bin`, `/usr/lib`, `/usr/lib/systemd/{system,user}`,
+  `/usr/share`, `/usr/share/doc`;
+- and roomler's own files.
+
+Write access to every binary and every unit is root. Three layers close it, and
+each one alone stops new damage:
+
+```mermaid
+flowchart LR
+    A["archive<br/>(stage-linux-tarball.sh)"] -->|"files + symlinks only<br/>--owner=0 --group=0"| E["extraction<br/>(install.sh)"]
+    E -->|"--no-same-owner<br/>--no-overwrite-dir"| H["host"]
+    E -->|"repair_tarball_owners():<br/>root:root, the rpm-recorded mode"| H
+    D["the root daemon, every start<br/>(tarball_owner.rs)"] -->|"openat O_NOFOLLOW walk from /,<br/>fchown/fchmod on the handle"| H
+```
+
+| layer | where | what |
+|---|---|---|
+| the archive | `scripts/stage-linux-tarball.sh` | files and symlinks only, owned by 0:0 in the archive. With no directory entries, extraction creates only missing parents, as root, and never touches an existing directory |
+| the extraction | `scripts/install.sh` | `--no-same-owner --no-overwrite-dir`, so even the already-published archives cannot do it again. Then `repair_tarball_owners()` repairs a host an earlier install damaged: parent before child, stops at a symlink, takes the mode `rpm -qf` records for the path (Fedora ships `/usr/bin` and `/usr/lib` 0555), and otherwise only strips group and other write |
+| the daemon | `agents/roomlerd/src/tarball_owner.rs`, called from `run_cmd` after the instance lock | a damaged host updates through its OLD updater, which copies files and never looks at a directory. So the root daemon repairs at every start: a dozen `fstat`s on a healthy host |
+
+⚠️ The daemon's walk is root changing directories another account may own:
+the case where a symlink swap becomes a write anywhere. So it never resolves a
+path by name:
+- it opens `/`, then each component with `openat(…, O_NOFOLLOW)` from the
+  previous component's descriptor;
+- it changes owner and mode through the opened descriptor;
+- parents go before children;
+- files are opened `O_NONBLOCK` and checked to be regular.
+
+A symlink anywhere ends that walk and everything below it. ⚠️ With
+`O_DIRECTORY|O_NOFOLLOW` the kernel answers a symlink with **ENOTDIR**, not
+ELOOP, because it checks the type first. The walk asks the entry itself
+(`fstatat(…, AT_SYMLINK_NOFOLLOW)`) before it reports why.
+
+**Detection on a host:** `rpm -V filesystem` flags the directories `UG` (user and
+group changed). `sudo rpm --setugids filesystem && sudo rpm --setperms
+filesystem` restores the package's own directories, but not roomler's
+(`/usr/lib/roomler-agent`, the units). Re-running the fixed `install.sh` repairs
+both. Measured on the lab: the fixed `install.sh` repaired a damaged guest to a
+clean `rpm -V filesystem`, and changed nothing at all on a pristine one, with the
+old archive.
+
 ## Verification
 
 - **Unit**: picker preference matrix (deb-preferred with tooling present,
