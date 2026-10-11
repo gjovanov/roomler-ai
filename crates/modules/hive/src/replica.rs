@@ -8,12 +8,16 @@
 //! |---|---|
 //! | the primary accepts a start | each member placement chose is sent `rc:hive.replica.join` ([`send_joins`]) |
 //! | a device that holds copies connects | every join it has still to answer is sent again ([`reconcile_joins`]) |
+//! | a session gains its first member after it started (P2c-4) | its primary is sent `join {role: primary}`, and checkpoints from then on |
+//! | the primary connects | the primary's join it has still to answer `joined` is sent again ([`reconcile_joins`]) |
 //! | `rc:hive.replica.join_ack` | the member is `joined`, or `refused` with the device's word ([`on_join_ack`]) |
 //! | `rc:hive.replica.tip`, and each entry of `rc:hive.replica.manifest` | the member's tip is kept ([`on_tip`]) |
 //!
-//! ⚠️ A join is pushed only to a connection advertising `hive-replica`: the
-//! device answers it, and its owner lets it hold copies. Any other connection
-//! receives nothing, and the join waits, pending, for one that does.
+//! ⚠️ A member's join is pushed only to a connection advertising
+//! `hive-replica`: the device answers it, and its owner lets it hold copies.
+//! Any other connection receives nothing, and the join waits, pending, for
+//! one that does. The primary's goes to a connection that runs Hive: it holds
+//! no copy of another device's session, so its `hive_replica` is not asked.
 //! ⚠️ Everything a device says here is a claim, applied only where the record
 //! names that device as a member: a frame about someone else's session, or
 //! from a device placement did not choose, matches nothing.
@@ -33,13 +37,15 @@ use crate::agent_socket::clamp_words;
 use crate::model::{AgentSession, MemberState, MemberTip};
 use crate::placement::MemberRole;
 
-/// The role a member was placed in, as the join names it. `None` for the
-/// primary, which is never sent one, and for a word this build cannot name.
+/// The role a member was placed in, as the join names it. `None` for a word
+/// this build cannot name.
 pub(crate) fn wire_role(role: &str) -> Option<HiveReplicaRole> {
     if role == MemberRole::Archive.as_str() {
         Some(HiveReplicaRole::Archive)
     } else if role == MemberRole::Owner.as_str() {
         Some(HiveReplicaRole::Owner)
+    } else if role == MemberRole::Primary.as_str() {
+        Some(HiveReplicaRole::Primary)
     } else {
         None
     }
@@ -55,22 +61,26 @@ pub(crate) fn replicated(s: &AgentSession) -> bool {
     })
 }
 
-/// The joins of `s` still to send: its members other than the primary that
-/// have not answered, each with its role.
+/// The joins of `s` still to send: its members that have not answered, each
+/// with its role. The primary is among them only once it is owed one (P2c-4:
+/// `pending`, while the session has a member besides it).
 fn pending(s: &AgentSession) -> Vec<(ObjectId, HiveReplicaRole)> {
     let Some(r) = &s.replicaset else {
         return Vec::new();
     };
+    let has_members = replicated(s);
     r.members
         .iter()
         .filter(|m| m.state == MemberState::Pending)
+        .filter(|m| has_members || m.role != MemberRole::Primary.as_str())
         .filter_map(|m| Some((m.device_id, wire_role(&m.role)?)))
         .collect()
 }
 
 /// Push one join. `false` = it did not leave: the device is not connected
-/// here, or this connection does not hold copies. It stays pending either
-/// way, and goes when a connection that holds copies asks.
+/// here, or this connection does not take it (a member's that holds no
+/// copies, a primary's that runs no Hive). It stays owed either way, and goes
+/// when a connection that takes it asks.
 pub(crate) fn push_join(
     state: &HiveState,
     tenant_id: ObjectId,
@@ -84,11 +94,13 @@ pub(crate) fn push_join(
         fence,
         role: Some(role),
     };
-    match state
-        .fleet
-        .rc_hub
-        .push_hive_replica(device_id, tenant_id, msg)
-    {
+    let hub = &state.fleet.rc_hub;
+    let pushed = if role == HiveReplicaRole::Primary {
+        hub.push_hive(device_id, tenant_id, msg)
+    } else {
+        hub.push_hive_replica(device_id, tenant_id, msg)
+    };
+    match pushed {
         Ok(()) => {
             info!(
                 session = %session_id, device = %device_id, role = role.as_str(),
@@ -121,22 +133,44 @@ pub(crate) async fn send_joins(state: &HiveState, session_id: ObjectId) {
     }
 }
 
-/// A device connected: send it every join it has still to answer, if THIS
-/// connection holds copies. `conn` is the connection's sender in the hub,
-/// read as `reconcile_on_connect` reads it: a connection a newer one
-/// displaced decides nothing.
+/// A device connected: send it every join it has still to answer — as the
+/// primary of a session it runs, if THIS connection runs Hive (P2c-4), and
+/// as a member, if THIS connection holds copies. `conn` is the connection's
+/// sender in the hub, read as `reconcile_on_connect` reads it: a connection a
+/// newer one displaced decides nothing.
 pub(crate) async fn reconcile_joins(
     state: &HiveState,
     tenant_id: ObjectId,
     device_id: ObjectId,
     conn: &mpsc::Sender<ServerMsg>,
 ) {
-    if state
-        .fleet
-        .rc_hub
-        .agent_supports_hive_replica_on(device_id, conn)
-        != Some(true)
-    {
+    let hub = &state.fleet.rc_hub;
+    if hub.agent_supports_hive_on(device_id, conn) == Some(true) {
+        match state
+            .sessions
+            .primary_joins_owed(tenant_id, device_id)
+            .await
+        {
+            Ok(sessions) => {
+                for s in sessions {
+                    let Some(sid) = s.id else { continue };
+                    let fence = u64::try_from(s.fence).unwrap_or_default();
+                    push_join(
+                        state,
+                        tenant_id,
+                        device_id,
+                        sid,
+                        fence,
+                        HiveReplicaRole::Primary,
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(device = %device_id, %e, "hive: the primary's joins were not read");
+            }
+        }
+    }
+    if hub.agent_supports_hive_replica_on(device_id, conn) != Some(true) {
         return;
     }
     let sessions = match state.sessions.pending_joins(tenant_id, device_id).await {
@@ -325,10 +359,11 @@ mod tests {
         assert!(replicated(&two));
     }
 
-    /// Only members still pending get a join, each in its own role; the
-    /// primary never does, nor a member that answered.
+    /// Only members still pending get a join, each in its own role, never
+    /// one that answered. The primary gets one only while it is owed one
+    /// (P2c-4): pending, with a member besides it.
     #[test]
-    fn only_pending_members_other_than_the_primary_are_joined() {
+    fn pending_members_are_joined_and_the_primary_only_when_owed_one() {
         let s = session(vec![
             member(MemberRole::Primary, MemberState::Pending),
             member(MemberRole::Archive, MemberState::Pending),
@@ -340,9 +375,26 @@ mod tests {
         assert_eq!(
             pending(&s),
             [
+                (m[0].device_id, HiveReplicaRole::Primary),
                 (m[1].device_id, HiveReplicaRole::Archive),
                 (m[4].device_id, HiveReplicaRole::Owner),
             ]
         );
+
+        let told = session(vec![
+            member(MemberRole::Primary, MemberState::Joined),
+            member(MemberRole::Owner, MemberState::Pending),
+        ]);
+        let m = &told.replicaset.as_ref().unwrap().members;
+        assert_eq!(
+            pending(&told),
+            [(m[1].device_id, HiveReplicaRole::Owner)],
+            "a primary the start told is owed nothing"
+        );
+
+        // A primary with no member besides it holds nothing to tell: one
+        // placed before P2c-3 has no state, and reads as pending.
+        let alone = session(vec![member(MemberRole::Primary, MemberState::Pending)]);
+        assert!(pending(&alone).is_empty());
     }
 }
