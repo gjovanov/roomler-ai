@@ -339,6 +339,33 @@ impl Store {
         self.extend(env)
     }
 
+    /// FR-90 P2d-3 — [`Self::apply`], or nothing at all for an event this
+    /// store holds already: the same `seq`, hashed the same. Two streams of
+    /// one session reach a member at once while a renewal comes up beside
+    /// the stream it replaces (make-before-break), and the later of the two
+    /// to carry an event finds it applied. Any other event at a `seq` held
+    /// is refused as `apply` refuses it, and so is any event of a purged
+    /// session, which holds none. `true` when it was applied here.
+    ///
+    /// The look and the apply are one call on `&mut self`: nothing else
+    /// writes this store between them.
+    pub fn apply_unless_held(&mut self, env: &EventEnvelope) -> Result<bool, StoreError> {
+        if Self::tip_in(&self.conn, &env.session)?.is_some_and(|t| env.seq <= t.seq) {
+            let held: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT hash FROM events WHERE session = ?1 AND seq = ?2",
+                    params![env.session, env.seq as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if held.as_deref() == Some(env.hash().as_slice()) {
+                return Ok(false);
+            }
+        }
+        self.extend(env).map(|_| true)
+    }
+
     fn extend(&mut self, env: &EventEnvelope) -> Result<ChainTip, StoreError> {
         let tx = self.conn.transaction()?;
         if Self::purged_in(&tx, &env.session)? {
@@ -678,6 +705,20 @@ impl Store {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<EventEnvelope>, StoreError> {
+        self.page_within(session, after_seq, limit, usize::MAX)
+    }
+
+    /// FR-90 P2d-3 — [`Self::page`], cut before the events' JSON would pass
+    /// `max_bytes`, and never empty while an event follows `after_seq`: one
+    /// `events` frame of the replica stream, read without holding more than
+    /// it. An event larger than `max_bytes` comes alone.
+    pub fn page_within(
+        &self,
+        session: &str,
+        after_seq: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<EventEnvelope>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, fence, ts_ms, prev_hash, event_json FROM events
              WHERE session = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
@@ -692,8 +733,13 @@ impl Store {
             ))
         })?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for row in rows {
             let (seq, fence, ts_ms, prev, event_json) = row?;
+            bytes = bytes.saturating_add(event_json.len());
+            if !out.is_empty() && bytes > max_bytes {
+                break;
+            }
             out.push(EventEnvelope {
                 session: session.to_string(),
                 seq: seq as u64,
@@ -949,6 +995,80 @@ mod tests {
         assert_eq!(page[2].hash(), tip.hash);
         assert_eq!(s.page("s1", 2, 10).unwrap().len(), 1);
         assert_eq!(s.page("s1", 0, 2).unwrap().len(), 2);
+    }
+
+    /// FR-90 P2d-3 — a page within a byte budget is cut before the events'
+    /// JSON passes it, never empty while an event follows: one larger than
+    /// the budget comes alone. The limit still holds, and a budget nothing
+    /// passes is the page itself.
+    #[test]
+    fn a_page_within_a_budget_is_cut_but_never_empty() {
+        let mut s = Store::open_in_memory().unwrap();
+        let big = "x".repeat(300);
+        append_all(&mut s, "s1", 1, &["a", "b", &big, "c", "d"]);
+        let len = |seq: u64| s.event_at("s1", seq).unwrap().unwrap().event_json.len();
+        let two = len(1) + len(2);
+        let seqs = |p: Vec<EventEnvelope>| p.iter().map(|e| e.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(s.page_within("s1", 0, 10, two).unwrap()), [1, 2]);
+        assert_eq!(seqs(s.page_within("s1", 0, 10, two - 1).unwrap()), [1]);
+        assert_eq!(
+            seqs(s.page_within("s1", 2, 10, 10).unwrap()),
+            [3],
+            "an event past the budget comes alone"
+        );
+        assert_eq!(seqs(s.page_within("s1", 0, 2, usize::MAX).unwrap()), [1, 2]);
+        assert_eq!(
+            s.page_within("s1", 0, 10, usize::MAX).unwrap(),
+            s.page("s1", 0, 10).unwrap()
+        );
+        assert!(s.page_within("s1", 5, 10, 1).unwrap().is_empty());
+    }
+
+    /// FR-90 P2d-3 — an event held already, the same `seq` hashed the same,
+    /// is taken as held and nothing is written; any other at a `seq` held is
+    /// refused as `apply` refuses it, and the next one is applied.
+    #[test]
+    fn an_event_held_already_is_not_applied_twice() {
+        let mut primary = Store::open_in_memory().unwrap();
+        append_all(&mut primary, "s1", 1, &["one", "two", "three"]);
+        let envs = primary.page("s1", 0, 10).unwrap();
+        let mut m = Store::open_in_memory().unwrap();
+        for env in &envs[..2] {
+            assert!(
+                m.apply_unless_held(env).unwrap(),
+                "applied: seq {}",
+                env.seq
+            );
+        }
+        for env in &envs[..2] {
+            assert!(!m.apply_unless_held(env).unwrap(), "held: seq {}", env.seq);
+        }
+        assert_eq!(
+            m.page("s1", 0, 10).unwrap(),
+            envs[..2],
+            "nothing written twice"
+        );
+        let other = EventEnvelope {
+            event_json: ev("not the primary's").to_json(),
+            ..envs[1].clone()
+        };
+        assert!(
+            matches!(
+                m.apply_unless_held(&other),
+                Err(StoreError::Chain(ChainError::Gap { .. }))
+            ),
+            "another event at a seq held"
+        );
+        assert!(m.apply_unless_held(&envs[2]).unwrap(), "the next one");
+        assert_eq!(m.tip("s1").unwrap().unwrap().hash, envs[2].hash());
+        m.purge("s1").unwrap();
+        assert!(
+            matches!(
+                m.apply_unless_held(&envs[0]),
+                Err(StoreError::Purged { .. })
+            ),
+            "a purged session holds nothing, and takes nothing back"
+        );
     }
 
     /// FR-90 P2b-3b — the newest event of a kind, by session: none before one
