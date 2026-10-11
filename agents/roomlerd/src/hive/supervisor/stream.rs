@@ -508,7 +508,7 @@ impl Supervisor {
     }
 
     /// The source's answer to this member's hello on `grant_id`, once heard.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn stream_answer(&self, grant_id: ObjectId) -> Option<SourceMsg> {
         self.streams
             .lock()
@@ -518,7 +518,7 @@ impl Supervisor {
     }
 
     /// Whether this device is a side of `grant_id` now.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn holds_stream(&self, grant_id: ObjectId) -> bool {
         self.streams
             .lock()
