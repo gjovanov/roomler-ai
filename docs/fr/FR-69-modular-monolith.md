@@ -66,7 +66,7 @@ Two more measurements shaped the design rather than motivating it:
   consent and cluster metrics. It is the device control-plane multiplexer, not a remote-desktop
   object — which is why device management becomes a module of its own (D3).
 - **The wire already groups by pillar.** `ClientMsg`/`ServerMsg`
-  (`crates/remote_control/src/signaling.rs:248`, `:1221`) carry ~134 variants; the `rc:` names
+  (`crates/remote_control/src/signaling.rs:248`, `:1279`) carry ~134 variants; the `rc:` names
   group as tunnel 35 · overlay 18 · agent 8 · rpc 5 · ssh 4 · sdp 4 · relay 4 · session 3 ·
   consent 3. The namespaces map onto modules without touching a byte (D7).
 

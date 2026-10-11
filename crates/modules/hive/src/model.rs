@@ -200,6 +200,64 @@ pub struct ReplicaMember {
     /// [`crate::placement::MemberRole::as_str`]: `primary` | `archive` |
     /// `owner`.
     pub role: String,
+    /// P2c-3 — whether it took its copy. The primary is `joined` from its
+    /// placement: it runs the session. Absent on a record placed before
+    /// P2c-3, and read as `pending`: its join is still to send.
+    #[serde(default)]
+    pub state: MemberState,
+    /// The device's word, when it refused the join
+    /// ([`roomler_ai_remote_control::hive::HiveJoinRefusal::as_str`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// When the device answered its join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime>,
+    /// P2c-3 — where its copy ends, from its last report: the device's
+    /// claim, numbers and hashes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<MemberTip>,
+}
+
+/// FR-90 P2c-3 — whether a member took its copy.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberState {
+    /// Its join is still to send, or sent and unanswered: it is re-sent on
+    /// every connection of the device that holds copies.
+    #[default]
+    Pending,
+    /// The device holds the session: its floor is at the session's fence.
+    Joined,
+    /// The device refused; `refusal` says which of its gates.
+    Refused,
+}
+
+impl MemberState {
+    /// The spelling in the database and the API. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Joined => "joined",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// FR-90 P2c-3 — where a member's copy of a session ends, as it last said.
+/// BSON has no unsigned integer, so the numbers are stored signed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MemberTip {
+    /// The fence of the event at `seq`.
+    pub fence: i64,
+    pub seq: i64,
+    /// That event's hash.
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_hash: Option<String>,
+    /// When the server heard it.
+    pub at: DateTime,
 }
 
 /// FR-90 P1j — how a session came to be.
@@ -332,6 +390,27 @@ pub struct ReplicasetView {
 pub struct ReplicaMemberView {
     pub device_id: String,
     pub role: String,
+    /// P2c-3 — `pending` | `joined` | `refused`.
+    pub state: MemberState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip: Option<MemberTipView>,
+}
+
+/// [`MemberTip`] as the API answers it.
+#[derive(Serialize, Debug, Clone)]
+pub struct MemberTipView {
+    pub fence: i64,
+    pub seq: i64,
+    pub hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_hash: Option<String>,
+    pub at: String,
 }
 
 impl From<&Replicaset> for ReplicasetView {
@@ -347,6 +426,17 @@ impl From<&Replicaset> for ReplicasetView {
                 .map(|m| ReplicaMemberView {
                     device_id: m.device_id.to_hex(),
                     role: m.role.clone(),
+                    state: m.state,
+                    refusal: m.refusal.clone(),
+                    answered_at: m.answered_at.map(rfc3339),
+                    tip: m.tip.as_ref().map(|t| MemberTipView {
+                        fence: t.fence,
+                        seq: t.seq,
+                        hash: t.hash.clone(),
+                        checkpoint_seq: t.checkpoint_seq,
+                        checkpoint_hash: t.checkpoint_hash.clone(),
+                        at: rfc3339(t.at),
+                    }),
                 })
                 .collect(),
             short: r.short.clone(),
@@ -644,5 +734,34 @@ mod tests {
             SessionOrigin::Adopted,
             "and the UI is told"
         );
+    }
+
+    /// FR-90 P2c-3 — the member words are locked, and a member placed before
+    /// P2c-3, with no state, reads as `pending`: its join is still to send.
+    #[test]
+    fn a_member_placed_before_p2c3_is_pending() {
+        assert_eq!(
+            [
+                MemberState::Pending,
+                MemberState::Joined,
+                MemberState::Refused
+            ]
+            .map(MemberState::as_str),
+            ["pending", "joined", "refused"]
+        );
+        for s in [
+            MemberState::Pending,
+            MemberState::Joined,
+            MemberState::Refused,
+        ] {
+            assert_eq!(
+                bson::to_bson(&s).unwrap(),
+                bson::Bson::String(s.as_str().into())
+            );
+        }
+        let old = bson::doc! { "device_id": ObjectId::new(), "role": "owner" };
+        let m: ReplicaMember = bson::from_document(old).expect("a P2c-2b member reads");
+        assert_eq!(m.state, MemberState::Pending);
+        assert_eq!((m.refusal, m.answered_at, m.tip), (None, None, None));
     }
 }

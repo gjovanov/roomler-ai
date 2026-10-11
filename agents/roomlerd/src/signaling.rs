@@ -4224,6 +4224,7 @@ async fn handle_server_msg(
             user_email,
             caller,
             resume,
+            replicated,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_start(
@@ -4237,9 +4238,9 @@ async fn handle_server_msg(
                     user_email,
                     caller,
                     resume,
-                    // FR-90 P2c sets it from the wire, for a session the
-                    // server joined as replicated.
-                    replicated: false,
+                    // P2c-3 — the server placed members besides this device:
+                    // checkpoint each turn's end (P2b-3b).
+                    replicated,
                 },
                 ctx.is_primary,
                 outbound_tx.clone(),
@@ -4256,6 +4257,7 @@ async fn handle_server_msg(
                     user_id,
                     &user_email,
                     resume,
+                    replicated,
                 );
                 warn!(
                     session = %session_id, %caller,
@@ -4412,6 +4414,19 @@ async fn handle_server_msg(
                 let _ = &reason;
                 debug!(grant = %grant_id, "rc:hive.view.close ignored");
             }
+        }
+        // FR-90 P2c-3 — hold a copy of a session. This build does not
+        // advertise `hive-replica`, so no server sends it one; the device's
+        // gates on a join, and its answer, come with the build that does.
+        ServerMsg::HiveReplicaJoin {
+            session_id,
+            fence,
+            role,
+        } => {
+            debug!(
+                session = %session_id, fence, ?role,
+                "rc:hive.replica.join ignored — this build holds no copies"
+            );
         }
 
         // Roomler SSH — the answer to a session THIS device asked for

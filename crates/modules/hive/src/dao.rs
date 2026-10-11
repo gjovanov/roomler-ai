@@ -16,7 +16,10 @@ use roomler_ai_services::dao::base::{
     BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams,
 };
 
-use crate::model::{AgentApproval, AgentSession, HiveAuditEvent, SessionStatus};
+use crate::model::{
+    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, SessionStatus,
+};
+use crate::placement::MemberRole;
 
 fn statuses(set: &[SessionStatus]) -> Bson {
     let words: Vec<Bson> = set.iter().map(|s| Bson::from(s.as_str())).collect();
@@ -465,6 +468,107 @@ impl AgentSessionDao {
                         { "status": SessionStatus::Stopping.as_str() },
                         { "status": SessionStatus::Starting.as_str(), "accepted_at": Bson::Null },
                     ],
+                },
+                Some(doc! { "created_at": 1 }),
+            )
+            .await
+    }
+
+    /// FR-90 P2c-3 — a member's answer to its join: `joined`, or `refused`
+    /// with the device's word. Only for a member the replicaset names as
+    /// THIS device, never the primary (whose copy is its run), and only at
+    /// the session's fence: an answer to an older join changes nothing.
+    pub async fn member_answer(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        fence: u64,
+        refused: Option<&str>,
+    ) -> DaoResult<bool> {
+        let Some(fence) = stored_fence(fence) else {
+            return Ok(false);
+        };
+        let now = DateTime::now();
+        let update = match refused {
+            None => doc! {
+                "$set": {
+                    "replicaset.members.$.state": MemberState::Joined.as_str(),
+                    "replicaset.members.$.answered_at": now,
+                },
+                "$unset": { "replicaset.members.$.refusal": "" },
+            },
+            Some(word) => doc! {
+                "$set": {
+                    "replicaset.members.$.state": MemberState::Refused.as_str(),
+                    "replicaset.members.$.refusal": word,
+                    "replicaset.members.$.answered_at": now,
+                },
+            },
+        };
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "fence": fence,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                    } },
+                },
+                update,
+            )
+            .await
+    }
+
+    /// FR-90 P2c-3 — where a member's copy of a session ends, as the member
+    /// says: any member the replicaset names as THIS device, the primary
+    /// included, but not one that refused its join — by its own word it holds
+    /// nothing.
+    pub async fn member_tip(
+        &self,
+        id: ObjectId,
+        device_id: ObjectId,
+        tip: &MemberTip,
+    ) -> DaoResult<bool> {
+        let tip = bson::to_bson(tip)?;
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "state": { "$ne": MemberState::Refused.as_str() },
+                    } },
+                },
+                doc! { "$set": { "replicaset.members.$.tip": tip } },
+            )
+            .await
+    }
+
+    /// FR-90 P2c-3 — the sessions whose joins this device has still to
+    /// answer: it is a member other than the primary, still `pending`, of a
+    /// session its primary launched and nobody is stopping. What a device
+    /// that holds copies is sent when it connects. A member placed before
+    /// P2c-3 has no `state`, and is pending.
+    pub async fn pending_joins(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "$or": [
+                        { "accepted_at": { "$type": "date" } },
+                        { "status": statuses(&SessionStatus::LAUNCHED) },
+                    ],
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": { "$in": [MemberState::Pending.as_str(), Bson::Null] },
+                    } },
                 },
                 Some(doc! { "created_at": 1 }),
             )

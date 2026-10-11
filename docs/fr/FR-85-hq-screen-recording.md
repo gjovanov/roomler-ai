@@ -22,7 +22,7 @@ what it costs in installer size and ships with integration and e2e tests.
   §11.3 (`:679`) promises a banner that cannot be dismissed and a red tray dot while recording; neither exists.
 - ⚠️ **Any tab can already request RECORD.** `resolve_session_authz` (`crates/modules/remote/src/controller.rs:375`)
   never reads the requested permissions, and `Hub::create_session` narrows only INPUT
-  (`crates/modules/fleet/src/hub.rs:811-834`). Harmless today because no agent honours the bit. It stops being harmless
+  (`crates/modules/fleet/src/hub.rs:819-834`). Harmless today because no agent honours the bit. It stops being harmless
   the day one does, so the strip ships before the agent learns the bit (P3).
 - **Recording what the viewer receives would not be HQ.** The live stream is rate-controlled to the network
   (FR-62/63/79) and its capture is capped by the live plan (`agents/roomlerd/src/peer.rs` `set_output_cap`), so the

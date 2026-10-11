@@ -4028,3 +4028,321 @@ async fn placement_takes_the_archive_then_the_owners_offering_devices() {
         ]
     );
 }
+
+// ─── P2c-3a — the join, and what a member says back ─────────────────────────
+
+/// What a device that holds copies advertises (`hive-replica`).
+const HOLDS_COPIES: &[&str] = &["exec", "hive", "hive-replica"];
+
+/// The free plan's three devices are not enough for a replicaset test.
+async fn on_pro(app: &TestApp, seeded: &SeededTenant) {
+    app.db
+        .collection::<Document>("tenants")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&seeded.tenant_id).unwrap() },
+            doc! { "$set": { "plan": "pro" } },
+        )
+        .await
+        .unwrap();
+}
+
+/// The member of `sid` that is `device`, as the session view reads it.
+async fn member_of(app: &TestApp, tid: &str, token: &str, sid: &str, device: &str) -> Value {
+    let (code, s) = get_session(app, tid, token, sid).await;
+    assert_eq!(code, 200, "{s}");
+    s["replicaset"]["members"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| m["device_id"] == device).cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// Poll until the member `device` of `sid` satisfies `pred`.
+async fn wait_member(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    device: &str,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let m = member_of(app, tid, token, sid, device).await;
+        if pred(&m) {
+            return m;
+        }
+        assert!(Instant::now() < deadline, "{what}: {m}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether a frame `want` arrives within `within`.
+async fn arrives(ws: &mut AgentWs, want: &str, within: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v["t"] == want
+                {
+                    return Some(v);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => return None,
+        }
+    }
+    None
+}
+
+/// A well-formed hash, every character `fill`.
+fn hash(fill: &str) -> String {
+    fill.repeat(64 / fill.len())
+}
+
+/// A member that holds copies is sent its join once the primary accepts,
+/// and the primary's start says the session is replicated. The member's
+/// answer and its tips land on its entry; the primary's tips on the
+/// primary's. A device the session does not hold as a member changes
+/// nothing, and a malformed hash is dropped.
+#[tokio::test]
+async fn a_member_is_joined_once_the_primary_accepts_and_its_tips_are_kept() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivejoin").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-join-primary", RUNS_HIVE).await;
+    let mut member = device(&app, &seeded, "mach-join-member", HOLDS_COPIES).await;
+    let mut stranger = device(&app, &seeded, "mach-join-stranger", RUNS_HIVE).await;
+    let other = app.seed_tenant("hivejoinother").await;
+    // Someone else's device: never the admin's own, so never placed.
+    let mut theirs = device(&app, &other, "mach-join-theirs", HOLDS_COPIES).await;
+
+    let caller = start(&app, &tid, &admin, &primary.agent_id, "/srv/join");
+    let target = async {
+        let frame = read_until(&mut primary.ws, "rc:hive.start")
+            .await
+            .expect("the primary receives rc:hive.start");
+        assert_eq!(frame["replicated"], true, "a member was placed: {frame}");
+        send(
+            &mut primary.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    let join = read_until(&mut member.ws, "rc:hive.replica.join")
+        .await
+        .expect("the member receives its join");
+    assert_eq!(join["session_id"], sid.as_str());
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(1), Some("owner"))
+    );
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &member.agent_id).await["state"],
+        "pending",
+        "sent, not yet answered"
+    );
+    assert!(
+        arrives(
+            &mut theirs.ws,
+            "rc:hive.replica.join",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "another organization's device is never joined"
+    );
+
+    // A stranger's answer and tip change nothing, nor an answer to another
+    // fence.
+    send(
+        &mut stranger.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    send(
+        &mut stranger.ws,
+        json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": 9,
+               "hash": hash("ee")}),
+    )
+    .await;
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 7}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &member.agent_id).await["state"],
+        "pending",
+        "neither the stranger's answer nor one to fence 7 counted"
+    );
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    let m = wait_member(&app, &tid, &admin, &sid, &member.agent_id, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+    assert!(m["answered_at"].is_string(), "{m}");
+    assert!(m.get("refusal").is_none(), "{m}");
+
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": 3,
+               "hash": hash("ab"), "checkpoint": {"seq": 2, "hash": hash("cd")}}),
+    )
+    .await;
+    let m = wait_member(&app, &tid, &admin, &sid, &member.agent_id, "its tip", |m| {
+        m["tip"]["seq"] == 3
+    })
+    .await;
+    assert_eq!(
+        (
+            m["tip"]["fence"].as_i64(),
+            m["tip"]["hash"].as_str(),
+            m["tip"]["checkpoint_seq"].as_i64(),
+            m["tip"]["checkpoint_hash"].as_str()
+        ),
+        (
+            Some(1),
+            Some(hash("ab").as_str()),
+            Some(2),
+            Some(hash("cd").as_str())
+        )
+    );
+    // Malformed: dropped, and the last good tip stays. Then the primary's
+    // own tip, through its manifest, which lands after it.
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": 5,
+               "hash": "AB".repeat(32)}),
+    )
+    .await;
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.manifest", "sessions": [
+            {"session_id": sid, "fence": 1, "seq": 4, "hash": hash("01")}
+        ]}),
+    )
+    .await;
+    wait_member(
+        &app,
+        &tid,
+        &admin,
+        &sid,
+        &primary.agent_id,
+        "the primary's tip",
+        |m| m["tip"]["seq"] == 4,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &member.agent_id).await["tip"]["seq"],
+        3,
+        "the malformed tip was dropped"
+    );
+    let s = stored(&app, &sid).await;
+    let members = s
+        .get_document("replicaset")
+        .unwrap()
+        .get_array("members")
+        .unwrap();
+    assert_eq!(members.len(), 2, "nobody else was added: {members:?}");
+    let stranger_got_tip = members.iter().any(|m| {
+        m.as_document()
+            .and_then(|d| d.get_document("tip").ok())
+            .is_some_and(|t| t.get_i64("seq").ok() == Some(9))
+    });
+    assert!(!stranger_got_tip, "the stranger's tip landed nowhere");
+}
+
+/// A member offline at the start keeps its join pending; a connection that
+/// does not hold copies gets nothing; the one that does gets the join, and
+/// its refusal lands with the device's word. A member that refused holds
+/// nothing, so its tips are not kept.
+#[tokio::test]
+async fn a_pending_join_waits_for_a_connection_that_holds_copies() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivejoinlater").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-later-primary", RUNS_HIVE).await;
+    let (member_id, member_token) =
+        enroll_agent(&app, &seeded, "mach-later-member", "mach-later-member").await;
+    set_device(
+        &app,
+        &member_id,
+        doc! { "capabilities.rpc": ["hive-replica"] },
+    )
+    .await;
+
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/later").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        members(&s),
+        [
+            (primary.agent_id.clone(), "primary".to_string()),
+            (member_id.clone(), "owner".to_string()),
+        ]
+    );
+
+    // Connected, but not holding copies: nothing is sent.
+    let mut ws = connect(&app, &member_token, "mach-later-member", RUNS_HIVE).await;
+    wait_agent_online(&app, &seeded, &member_id).await;
+    assert!(
+        arrives(&mut ws, "rc:hive.replica.join", Duration::from_millis(800))
+            .await
+            .is_none(),
+        "no join to a connection without hive-replica"
+    );
+    ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &member_id).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &member_id).await["state"],
+        "pending"
+    );
+
+    // The connection that holds copies gets it, and refuses.
+    let mut ws = connect(&app, &member_token, "mach-later-member", HOLDS_COPIES).await;
+    let join = read_until(&mut ws, "rc:hive.replica.join")
+        .await
+        .expect("the join, on the connection that holds copies");
+    assert_eq!(join["session_id"], sid.as_str());
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1,
+               "refused": "replica_disabled", "detail": "hive_replica is off"}),
+    )
+    .await;
+    let m = wait_member(&app, &tid, &admin, &sid, &member_id, "refused", |m| {
+        m["state"] == "refused"
+    })
+    .await;
+    assert_eq!(m["refusal"], "replica_disabled");
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": 2,
+               "hash": hash("ab")}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        member_of(&app, &tid, &admin, &sid, &member_id)
+            .await
+            .get("tip")
+            .is_none(),
+        "a member that refused holds nothing"
+    );
+}

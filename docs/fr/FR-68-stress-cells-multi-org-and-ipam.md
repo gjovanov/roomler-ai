@@ -43,7 +43,7 @@ Turn two overlay properties from **promises into properties**:
 
 - **The decoder pin.** No test feeds a P5d netmap *containing* `cidrs` into a pre-P5d
   decoder. `a_pre_p5d_netmap_still_decodes_and_carries_no_block_list`
-  (`crates/remote_control/src/signaling.rs:4099`) only tests old-server → new-decoder.
+  (`crates/remote_control/src/signaling.rs:4357`) only tests old-server → new-decoder.
   Copy `agent-v0.4.42`'s `OverlayNetworkInfo` verbatim as a local struct and decode a real
   grown-org netmap into it.
 - **Cross-tenant carve racing a grow.** `allocate`'s `DuplicateKey` arm

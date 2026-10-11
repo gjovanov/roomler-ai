@@ -508,6 +508,7 @@ pub async fn start(
         user_email: user.email,
         caller: user.display_name,
         resume: false,
+        replicated: crate::replica::replicated(&session),
     };
     if let Err(e) = state.fleet.rc_hub.push_hive(device_id, tid, msg) {
         // The device left — or reconnected as a build without Hive — between

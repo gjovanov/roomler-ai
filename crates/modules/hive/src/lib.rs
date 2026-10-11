@@ -58,6 +58,7 @@ pub mod model;
 pub mod participants;
 pub mod placement;
 pub mod policy;
+pub mod replica;
 pub mod room;
 pub mod routes;
 pub mod scope;

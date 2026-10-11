@@ -819,6 +819,64 @@ pub enum ClientMsg {
         folder: String,
     },
 
+    /// FR-90 P2c-3 — the device's answer to [`ServerMsg::HiveReplicaJoin`]:
+    /// whether it holds a copy of the session now. Sent on EVERY outcome,
+    /// refusals included: each names a different gate with a different fix.
+    ///
+    /// ⚠️ The server applies it only to a member the session's replicaset
+    /// names as the sending device, at the session's fence; session ids are
+    /// ObjectIds, structured, not secret.
+    #[serde(rename = "rc:hive.replica.join_ack")]
+    HiveReplicaJoinAck {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Echo of the join's `fence`.
+        fence: u64,
+        /// Absent = joined. Present = refused, decoded leniently — see
+        /// [`crate::hive::HiveJoinRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::join_refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveJoinRefusal>,
+        /// A few words for the owner. Capped by the device, re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// FR-90 P2c-3 — where this device's copy of a session ends, from a
+    /// member or the primary, at most every
+    /// [`crate::hive::replica_limits::TIP_INTERVAL_SECS`] and at each
+    /// checkpoint. What the server learns a copy's freshness from, without
+    /// seeing any of it.
+    ///
+    /// ⚠️ NUMBERS AND HASHES ONLY, and the field set is LOCKED by test.
+    #[serde(rename = "rc:hive.replica.tip")]
+    HiveReplicaTip {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence of the event at `seq`.
+        fence: u64,
+        seq: u64,
+        /// That event's hash, as [`crate::hive::is_hash_hex`] reads it.
+        hash: String,
+        /// The newest checkpoint the copy holds, when it holds one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<crate::hive::HiveCheckpointMark>,
+    },
+
+    /// FR-90 P2c-3 — every session this device holds a copy of, its own
+    /// replicated ones included, each with its tip; sent on every connection
+    /// of its primary enrollment. How a member's freshness reaches the server
+    /// when it reconnects, primary or not.
+    #[serde(rename = "rc:hive.replica.manifest")]
+    HiveReplicaManifest {
+        #[serde(default)]
+        sessions: Vec<crate::hive::HiveReplicaManifestEntry>,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1597,6 +1655,9 @@ impl ClientMsg {
             ClientMsg::HiveApproval { .. } => "rc:hive.approval",
             ClientMsg::HiveManifest { .. } => "rc:hive.manifest",
             ClientMsg::HiveAdopt { .. } => "rc:hive.adopt",
+            ClientMsg::HiveReplicaJoinAck { .. } => "rc:hive.replica.join_ack",
+            ClientMsg::HiveReplicaTip { .. } => "rc:hive.replica.tip",
+            ClientMsg::HiveReplicaManifest { .. } => "rc:hive.replica.manifest",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1694,6 +1755,9 @@ impl ClientMsg {
             | ClientMsg::HiveApproval { .. }
             | ClientMsg::HiveManifest { .. }
             | ClientMsg::HiveAdopt { .. }
+            | ClientMsg::HiveReplicaJoinAck { .. }
+            | ClientMsg::HiveReplicaTip { .. }
+            | ClientMsg::HiveReplicaManifest { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1727,6 +1791,9 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.approval", Owner::Hive),
     ("rc:hive.manifest", Owner::Hive),
     ("rc:hive.adopt", Owner::Hive),
+    ("rc:hive.replica.join_ack", Owner::Hive),
+    ("rc:hive.replica.tip", Owner::Hive),
+    ("rc:hive.replica.manifest", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -2871,6 +2938,33 @@ pub enum ServerMsg {
         /// `true` = resume the harness session (`--resume`); `false` = a
         /// first start (`--session-id`).
         resume: bool,
+        /// FR-90 P2c-3 — the session has members besides this device: take
+        /// a checkpoint at each turn's end (P2b-3b), so a member can hold a
+        /// copy it could resume. Absent, as from every server before it: no
+        /// member, no checkpoint. A device that predates it ignores it, and
+        /// its members then hold no checkpoint.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replicated: bool,
+    },
+
+    /// FR-90 P2c-3 — hold a copy of a session: placement chose this device
+    /// as a member. Answered by [`ClientMsg::HiveReplicaJoinAck`]. Pushed only
+    /// to a connection advertising `hive-replica`, and re-sent on every
+    /// connection until it is answered.
+    ///
+    /// ⚠️ It carries no content and opens nothing: the copy arrives over the
+    /// carrier (P2d), from a source the server grants then.
+    #[serde(rename = "rc:hive.replica.join")]
+    HiveReplicaJoin {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The session's fence: the device's floor for it rises to this
+        /// before it holds anything of it.
+        fence: u64,
+        /// Why it holds a copy. `None` on the device = a role this build
+        /// cannot name, decoded leniently: it refuses (`other`).
+        #[serde(default, deserialize_with = "crate::hive::replica_role_lenient")]
+        role: Option<crate::hive::HiveReplicaRole>,
     },
 
     /// Stop a session: interrupt any running turn, let the harness exit, and
@@ -3762,6 +3856,7 @@ mod tests {
             user_email: "dev@example.com".into(),
             caller: "Dev".into(),
             resume: false,
+            replicated: false,
         };
         let v = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -3779,17 +3874,180 @@ mod tests {
                 "t",
                 "user_email",
                 "user_id",
-            ]
+            ],
+            "an unreplicated start is the frame every earlier server sent"
         );
         assert_eq!(v["t"], "rc:hive.start");
         assert_eq!(v["session_id"], sid.to_hex(), "ObjectIds are raw hex");
         assert_eq!(v["user_id"], uid.to_hex());
         match serde_json::from_value::<ServerMsg>(v).unwrap() {
             ServerMsg::HiveStart {
-                session_id, fence, ..
-            } => assert_eq!((session_id, fence), (sid, 1)),
+                session_id,
+                fence,
+                replicated,
+                ..
+            } => assert_eq!((session_id, fence, replicated), (sid, 1, false)),
             other => panic!("wrong variant: {other:?}"),
         }
+        // P2c-3 — a replicated start says so, and only then.
+        let mut replicated = serde_json::to_value(&m).unwrap();
+        replicated["replicated"] = serde_json::json!(true);
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(replicated).unwrap(),
+            ServerMsg::HiveStart {
+                replicated: true,
+                ..
+            }
+        ));
+    }
+
+    /// FR-90 P2c-3 — the join's field set is locked: which session, at which
+    /// fence, in which role. It carries no content and no source; and a role
+    /// this build cannot name still decodes, as `None`, so the device refuses
+    /// it instead of dropping it unanswered.
+    #[test]
+    fn hive_replica_join_wire_shape_is_locked() {
+        use crate::hive::HiveReplicaRole;
+
+        let sid = ObjectId::new();
+        let m = ServerMsg::HiveReplicaJoin {
+            session_id: sid,
+            fence: 2,
+            role: Some(HiveReplicaRole::Archive),
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.join", "session_id": sid.to_hex(), "fence": 2,
+                "role": "archive"
+            })
+        );
+        let unknown = serde_json::json!({
+            "t": "rc:hive.replica.join", "session_id": sid.to_hex(), "fence": 2, "role": "witness"
+        });
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(unknown).unwrap(),
+            ServerMsg::HiveReplicaJoin {
+                fence: 2,
+                role: None,
+                ..
+            }
+        ));
+    }
+
+    /// FR-90 P2c-3 — "joined" is the ABSENCE of `refused`, as for the start
+    /// ack; an unknown refusal is still a refusal and never a copy counted.
+    #[test]
+    fn hive_replica_join_ack_wire_shape_and_lenient_refusal() {
+        use crate::hive::HiveJoinRefusal;
+
+        let sid = ObjectId::new();
+        let joined = ClientMsg::HiveReplicaJoinAck {
+            session_id: sid,
+            fence: 2,
+            refused: None,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&joined).unwrap(),
+            serde_json::json!({"t": "rc:hive.replica.join_ack", "session_id": sid.to_hex(), "fence": 2})
+        );
+        assert_eq!(joined.namespace(), Owner::Hive);
+        let parse = |refused: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "t": "rc:hive.replica.join_ack", "session_id": sid.to_hex(), "fence": 2
+            });
+            v["refused"] = refused;
+            match serde_json::from_value::<ClientMsg>(v).expect("the frame must still parse") {
+                ClientMsg::HiveReplicaJoinAck { refused, .. } => refused,
+                other => panic!("wrong variant: {other:?}"),
+            }
+        };
+        assert_eq!(
+            parse(serde_json::json!("replica_disabled")),
+            Some(HiveJoinRefusal::ReplicaDisabled)
+        );
+        assert_eq!(
+            parse(serde_json::json!("a_word_from_2027")),
+            Some(HiveJoinRefusal::Other)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"x": 1})),
+            Some(HiveJoinRefusal::Other)
+        );
+        assert_eq!(parse(serde_json::Value::Null), None);
+    }
+
+    /// FR-90 P2c-3 — a tip and a manifest are numbers and hashes. Their field
+    /// sets are spelled out so a `summary`, an `event` or a `title` riding
+    /// along is a deliberate edit to this test: the server learns how fresh a
+    /// copy is, never what is in it.
+    #[test]
+    fn hive_replica_tip_and_manifest_are_numbers_and_hashes_only() {
+        use crate::hive::{HiveCheckpointMark, HiveReplicaManifestEntry};
+
+        let sid = ObjectId::new();
+        let hash = "ab".repeat(32);
+        let tip = ClientMsg::HiveReplicaTip {
+            session_id: sid,
+            fence: 1,
+            seq: 42,
+            hash: hash.clone(),
+            checkpoint: Some(HiveCheckpointMark {
+                seq: 40,
+                hash: "cd".repeat(32),
+            }),
+        };
+        let v = serde_json::to_value(&tip).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["checkpoint", "fence", "hash", "seq", "session_id", "t"]
+        );
+        let mut mark: Vec<&str> = v["checkpoint"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        mark.sort_unstable();
+        assert_eq!(mark, ["hash", "seq"]);
+        assert_eq!(v["t"], "rc:hive.replica.tip");
+        assert_eq!(tip.namespace(), Owner::Hive);
+
+        let manifest = ClientMsg::HiveReplicaManifest {
+            sessions: vec![HiveReplicaManifestEntry {
+                session_id: sid,
+                fence: 1,
+                seq: 42,
+                hash,
+                checkpoint: None,
+            }],
+        };
+        let v = serde_json::to_value(&manifest).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["sessions", "t"]);
+        let mut entry: Vec<&str> = v["sessions"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        entry.sort_unstable();
+        assert_eq!(
+            entry,
+            ["fence", "hash", "seq", "session_id"],
+            "no checkpoint is absent, not null"
+        );
+        assert_eq!(v["sessions"][0]["session_id"], sid.to_hex());
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(serde_json::json!({"t": "rc:hive.replica.manifest"}))
+                .unwrap(),
+            ClientMsg::HiveReplicaManifest { ref sessions } if sessions.is_empty()
+        ));
+        assert_eq!(manifest.namespace(), Owner::Hive);
     }
 
     /// FR-90 P1e — the core-memory frame's field set is locked: who, which
