@@ -104,6 +104,16 @@ install, **root** under systemd. That is required for the diagnostics that
 matter (`Get-NetFirewallRule`, `netsh`, route tables, service state), and the
 admin UI says so in those words on both the console and the policy dialog.
 
+> ⚠️ **Measured otherwise on Windows (0.4.129, #2021).** Fleet RPC runs in the
+> process that holds the agent socket. On a perMachine install that process is
+> the **worker in the console session**, not the session-0 service. With someone
+> signed in and no controller connected, a command ran as that user (their
+> elevated token, High integrity) in session 1. By the supervisor's
+> `decide_spawn` it runs as SYSTEM in that session while a controller is
+> connected. A standard-user host, an open RC session and an empty console are
+> not measured yet. Until #2021 decides which identity is intended, read the
+> paragraph above as the intent, not the behaviour.
+
 There is no command blocklist. A blocklist on a root shell is false security
 and trivially bypassed; the real mitigations are the four gates, the audit
 trail, and the existing watchdog + SCM auto-restart if someone stops the

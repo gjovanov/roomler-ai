@@ -696,8 +696,11 @@ control WS**, deliberately not the overlay: the diagnostics this exists for are 
 needed when the mesh is broken. Four independent default-deny gates, the last of
 which (`exec_enabled` on the device) is the only refusal that survives a compromised
 server.
-⚠️ Commands inherit the daemon's identity — **SYSTEM on Windows, root under
-systemd**.
+⚠️ Commands inherit the identity of whatever process holds the agent socket: **root
+under systemd**. On Windows that process is the **worker in the console session**,
+not the session-0 service: measured on 0.4.129, the signed-in user's elevated
+token, and by `decide_spawn` SYSTEM in that session while a controller is
+connected. The docs and UI still say SYSTEM (#2021).
 ⚠️ A caller **awaits** this frame, so unlike `Goodbye`/`UpdateNow` it must gate on
 `AgentCaps.rpc` containing `exec` (412 otherwise) — pushing to a pre-feature agent
 would hang the caller until its deadline.

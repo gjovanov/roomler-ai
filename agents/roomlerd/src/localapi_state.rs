@@ -1254,8 +1254,9 @@ impl LocalApiState for DaemonState {
     }
 
     /// FR-92 P10 — the person at the console turns keep busy on. The
-    /// dispatcher has already refused everyone else (root, services,
-    /// `roomler exec`).
+    /// dispatcher has already refused root, services and other sessions —
+    /// but not a `roomler exec` on Windows, which runs in the console session
+    /// (FR-92 §3g).
     ///
     /// ⚠️ Never relayed to a supervised Mac's GUI worker: the person's own
     /// clients reach the worker's socket directly, and nothing that can only
