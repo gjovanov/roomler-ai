@@ -6,23 +6,49 @@
 //! part with no I/O: the messages, their framing, and each side's half of
 //! the opening exchange, read from a store.
 //!
+//! On the member's stream (both ways):
+//!
 //! | Message | From | Says |
 //! |---|---|---|
 //! | `hello {v, session, fence, tip, floor, checkpoints}` | member | where its copy ends, and the `(seq, hash)` of its newest checkpoints |
 //! | `hello {v, tip}` | source | the member's copy is a prefix of its chain; the stream goes on from the member's tip |
-//! | `diverged {at}` | source | the member's tip is not in its chain: the newest checkpoint both hold |
+//! | `diverged {at}` | source | the member's tip is not in its chain: the newest checkpoint both hold, past which the member sets its copy aside |
 //! | `refused {reason}` | source | it cannot serve: a version it does not speak, a session it does not hold |
+//! | `events {events: [{seq, fence, ts_ms, prev_hash, len}]}`, then each event's JSON, `len` bytes | source | envelopes in `seq` order (P2d-3): from where the opening exchange left the member, then the live tail as it is appended |
+//! | `need {blobs}` | member | the blobs the next event names that it does not hold, by hash |
+//! | `ack {seq, hash}` | member | applied and on disk: the events up to `seq`, and every blob they name |
 //!
-//! The events, blobs and acks that follow the opening exchange are P2d-3.
+//! On a stream of its own, one per blob the member asked for:
+//!
+//! | Message | From | Says |
+//! |---|---|---|
+//! | `blob {hash, len}`, then its bytes | source | one blob of the `need` |
+//!
+//! ⚠️ **A member asks for a blob; it is never pushed one.** A blob pushed
+//! ahead of the event that names it would reach the member before it could
+//! know the name, so a source could fill its disk with bytes nothing names;
+//! and a member that could not read a pushed blob at once (its memory budget
+//! spent) would leave it filling the connection's flow-control window, under
+//! the data that would free the budget. A member asks only for what it lacks,
+//! and only once it has the memory for it, so a reconnect sends nothing it
+//! holds already: a checkpoint larger than one grant can carry still lands,
+//! a grant at a time.
+//!
+//! ⚠️ An event's JSON follows its frame byte for byte, never as a JSON string
+//! inside it: its hash is over those bytes, and a string would be escaped
+//! (up to twice the size) and read back through another parser.
 //!
 //! ⚠️ A frame announces its length before its body, and a reader refuses a
-//! length past [`MAX_FRAME`] before it allocates: the other side is a device
-//! of the org, not a trusted one.
+//! length past [`MAX_FRAME`] before it allocates; an event past
+//! [`MAX_EVENT_BYTES`] or a blob past [`MAX_STREAM_BLOB`] likewise: the other
+//! side is a device of the org, not a trusted one.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::chain::GENESIS;
+use crate::chain::{EventEnvelope, GENESIS};
+use crate::checkpoint::{CHUNK_MAX, Digest};
+use crate::event::TranscriptEvent;
 use crate::store::{Store, StoreError, hex};
 
 /// The stream's version. A source refuses a hello of any other.
@@ -32,6 +58,23 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 /// How many of its newest checkpoints a member names in its hello: enough
 /// to find one both sides hold after a divergence a promotion left behind.
 pub const MAX_CHECKPOINTS: usize = 8;
+/// P2d-3 — the most events one `events` frame lists, as a viewer's page does
+/// (`agents/roomlerd/src/hive/view.rs` `PAGE_MAX`).
+pub const MAX_BATCH: usize = 500;
+/// P2d-3 — the event bytes one `events` frame carries before its batch is
+/// cut; an event larger than this comes alone.
+pub const BATCH_BYTES: usize = 1024 * 1024;
+/// P2d-3 — the largest event the stream carries, refused before it is read.
+/// Twice the largest a device records: a checkpoint, whose manifest the
+/// daemon reads up to 16 MiB (`agents/roomlerd/src/hive/checkpointer.rs`
+/// `MAX_HEADER`), and a stream-json line, read up to 8 MiB. A source holding
+/// a larger one cannot stream past it, and says so.
+pub const MAX_EVENT_BYTES: usize = 32 * 1024 * 1024;
+/// P2d-3 — the largest blob the stream carries: a chunk. A producer chunks
+/// anything larger ([`crate::checkpoint::chunk_bytes`]).
+pub const MAX_STREAM_BLOB: usize = CHUNK_MAX;
+/// P2d-3 — the most blobs one `need` asks for.
+pub const MAX_NEED: usize = 64;
 
 /// A point in a session's chain: an event's `seq`, and its hash as
 /// lowercase hex. Seq 0 is before the first event, at [`GENESIS`].
@@ -72,6 +115,12 @@ pub enum MemberMsg {
         /// Newest first, at most [`MAX_CHECKPOINTS`].
         checkpoints: Vec<Mark>,
     },
+    /// P2d-3 — the blobs the next event names that the member lacks, at
+    /// most [`MAX_NEED`]: each comes back on a stream of its own.
+    Need { blobs: Vec<Digest> },
+    /// P2d-3 — applied and on disk: the events up to `seq`, whose hash is
+    /// `hash`, and every blob they name.
+    Ack { seq: u64, hash: String },
 }
 
 /// What the source sends.
@@ -82,11 +131,76 @@ pub enum SourceMsg {
     /// `tip`.
     Hello { v: u32, tip: Mark },
     /// The member's tip is not in the source's chain: `at` is the newest
-    /// checkpoint both hold (genesis, if none), past which the member takes
-    /// the source's events (P2d-3).
+    /// checkpoint both hold (genesis, if none), past which the member sets
+    /// its copy aside and takes the source's events.
     Diverged { at: Mark },
     /// The source cannot serve this stream.
     Refused { reason: String },
+    /// P2d-3 — the next events, in `seq` order; each one's JSON follows the
+    /// frame, `len` bytes, in the order listed.
+    Events { events: Vec<EventMeta> },
+}
+
+/// P2d-3 — one event as an `events` frame lists it: its envelope but the
+/// session, which is the stream's, and the JSON, which follows the frame.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EventMeta {
+    pub seq: u64,
+    pub fence: u64,
+    pub ts_ms: i64,
+    #[serde(with = "crate::chain::hex32")]
+    pub prev_hash: [u8; 32],
+    /// The length of the event's JSON, in bytes.
+    pub len: u64,
+}
+
+impl EventMeta {
+    /// How `env` is listed.
+    pub fn of(env: &EventEnvelope) -> Self {
+        Self {
+            seq: env.seq,
+            fence: env.fence,
+            ts_ms: env.ts_ms,
+            prev_hash: env.prev_hash,
+            len: env.event_json.len() as u64,
+        }
+    }
+
+    /// The envelope this listing and the JSON that followed it make, in the
+    /// stream's `session`: the very one the source holds, whose hash is
+    /// over these bytes.
+    pub fn envelope(&self, session: &str, event_json: String) -> EventEnvelope {
+        EventEnvelope {
+            session: session.to_string(),
+            seq: self.seq,
+            fence: self.fence,
+            ts_ms: self.ts_ms,
+            prev_hash: self.prev_hash,
+            event_json,
+        }
+    }
+}
+
+/// P2d-3 — the first frame of a blob's own stream, which the source opens
+/// for each blob a member asked for: its name and length. Its bytes follow.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum BlobMsg {
+    Blob { hash: Digest, len: u64 },
+}
+
+/// P2d-3 — the blobs `env` names, each once, with its length: a
+/// checkpoint's ([`crate::checkpoint::Checkpoint::blobs`]). Every other kind
+/// names none, and so does a kind this build does not know.
+///
+/// ⚠️ A new kind that names blobs bumps [`STREAM_V`]. A member that cannot
+/// read the kind would apply it, and ack it, without them: a copy that says
+/// it is whole and is not.
+pub fn blobs_named(env: &EventEnvelope) -> Vec<(Digest, u64)> {
+    match env.event() {
+        Some(TranscriptEvent::Checkpoint(cp)) => cp.blobs(),
+        _ => Vec::new(),
+    }
 }
 
 /// Why a frame could not be read.
@@ -98,6 +212,57 @@ pub enum FrameError {
     Empty,
     #[error("a frame that is not one: {0}")]
     Malformed(String),
+    /// P2d-3 — an `events` frame listing none, or more than [`MAX_BATCH`].
+    #[error("an events frame of {0} events: one at least, {MAX_BATCH} at most")]
+    Batch(usize),
+    /// P2d-3 — an event announced past [`MAX_EVENT_BYTES`].
+    #[error("an event of {0} bytes is past the {MAX_EVENT_BYTES}-byte limit")]
+    EventTooLong(u64),
+    /// P2d-3 — a blob announced past [`MAX_STREAM_BLOB`].
+    #[error("a blob of {0} bytes is past the {MAX_STREAM_BLOB}-byte limit")]
+    BlobTooLong(u64),
+    /// P2d-3 — a `need` asking for none, or more than [`MAX_NEED`].
+    #[error("a need of {0} blobs: one at least, {MAX_NEED} at most")]
+    Need(usize),
+}
+
+/// P2d-3 — an `events` frame's listing, checked before any of its JSON is
+/// read: one event at least, [`MAX_BATCH`] at most, none past
+/// [`MAX_EVENT_BYTES`]. Their order and their chain are the store's to
+/// check, as it applies each.
+pub fn check_events(events: &[EventMeta]) -> Result<(), FrameError> {
+    if events.is_empty() || events.len() > MAX_BATCH {
+        return Err(FrameError::Batch(events.len()));
+    }
+    match events.iter().find(|e| e.len > MAX_EVENT_BYTES as u64) {
+        Some(e) => Err(FrameError::EventTooLong(e.len)),
+        None => Ok(()),
+    }
+}
+
+/// P2d-3 — a blob's announced length, refused before it is read when past
+/// [`MAX_STREAM_BLOB`].
+pub fn check_blob_len(len: u64) -> Result<usize, FrameError> {
+    if len > MAX_STREAM_BLOB as u64 {
+        return Err(FrameError::BlobTooLong(len));
+    }
+    Ok(len as usize)
+}
+
+/// P2d-3 — a `need`'s size: one blob at least, [`MAX_NEED`] at most.
+pub fn check_need(blobs: &[Digest]) -> Result<(), FrameError> {
+    if blobs.is_empty() || blobs.len() > MAX_NEED {
+        return Err(FrameError::Need(blobs.len()));
+    }
+    Ok(())
+}
+
+/// P2d-3 — the member's ack once it has applied up to `tip`.
+pub fn ack_of(tip: &crate::chain::ChainTip) -> MemberMsg {
+    MemberMsg::Ack {
+        seq: tip.seq,
+        hash: hex(&tip.hash),
+    }
 }
 
 /// One frame: a little-endian `u32` length, then that many bytes of JSON.
@@ -146,7 +311,8 @@ pub fn member_hello(store: &Store, session: &str, fence: u64) -> Result<MemberMs
     })
 }
 
-/// The source's answer to a member's hello, from its own store.
+/// The source's answer to a member's hello, from its own store. A first
+/// frame that is not a hello is refused (`not_a_hello`).
 pub fn answer_hello(store: &Store, hello: &MemberMsg) -> Result<SourceMsg, StoreError> {
     let MemberMsg::Hello {
         v,
@@ -154,7 +320,12 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg) -> Result<SourceMsg, Store
         tip,
         checkpoints,
         ..
-    } = hello;
+    } = hello
+    else {
+        return Ok(SourceMsg::Refused {
+            reason: "not_a_hello".into(),
+        });
+    };
     if *v != STREAM_V {
         return Ok(SourceMsg::Refused {
             reason: "version".into(),
@@ -196,7 +367,6 @@ fn holds(store: &Store, session: &str, mark: &Mark) -> Result<bool, StoreError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EventEnvelope, TranscriptEvent};
 
     /// Append `n` notes to `session` at `fence`, each chained on the last.
     fn grow(store: &mut Store, session: &str, fence: u64, n: usize) {
@@ -355,7 +525,10 @@ mod tests {
             floor,
             checkpoints,
             ..
-        } = hello(Mark::genesis(), vec![]);
+        } = hello(Mark::genesis(), vec![])
+        else {
+            unreachable!("a hello")
+        };
         let older = MemberMsg::Hello {
             v: STREAM_V + 1,
             session: session.clone(),
@@ -404,7 +577,159 @@ mod tests {
             }
         );
         grow(&mut store, "s", 2, 2);
-        let MemberMsg::Hello { tip, .. } = member_hello(&store, "s", 2).unwrap();
+        let MemberMsg::Hello { tip, .. } = member_hello(&store, "s", 2).unwrap() else {
+            unreachable!("a hello")
+        };
         assert_eq!(tip, mark_at(&store, 2));
+    }
+
+    /// A first frame that is not a hello is refused in words, never taken
+    /// for one.
+    #[test]
+    fn a_first_frame_that_is_not_a_hello_is_refused() {
+        let mut store = Store::open_in_memory().unwrap();
+        grow(&mut store, "s", 1, 1);
+        let ack = ack_of(&store.tip("s").unwrap().unwrap());
+        assert_eq!(
+            answer_hello(&store, &ack).unwrap(),
+            SourceMsg::Refused {
+                reason: "not_a_hello".into()
+            }
+        );
+    }
+
+    /// P2d-3 — what follows the opening exchange is locked too.
+    #[test]
+    fn the_messages_after_the_opening_exchange_are_locked() {
+        let mut store = Store::open_in_memory().unwrap();
+        grow(&mut store, "s", 3, 1);
+        let env = store.event_at("s", 1).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(SourceMsg::Events {
+                events: vec![EventMeta::of(&env)]
+            })
+            .unwrap(),
+            serde_json::json!({"t": "events", "events": [{
+                "seq": 1, "fence": 3, "ts_ms": 0, "prev_hash": "0".repeat(64),
+                "len": env.event_json.len()
+            }]})
+        );
+        let d = Digest::of(b"x");
+        assert_eq!(
+            serde_json::to_value(MemberMsg::Need { blobs: vec![d] }).unwrap(),
+            serde_json::json!({"t": "need", "blobs": [d.to_string()]})
+        );
+        assert_eq!(
+            serde_json::to_value(ack_of(&env.tip())).unwrap(),
+            serde_json::json!({"t": "ack", "seq": 1, "hash": hex(&env.hash())})
+        );
+        assert_eq!(
+            serde_json::to_value(BlobMsg::Blob { hash: d, len: 1 }).unwrap(),
+            serde_json::json!({"t": "blob", "hash": d.to_string(), "len": 1})
+        );
+    }
+
+    /// P2d-3 — an event crosses the stream as its listing and its JSON, and
+    /// comes out the very envelope, hash and all.
+    #[test]
+    fn an_event_crosses_as_the_very_envelope() {
+        let mut store = Store::open_in_memory().unwrap();
+        grow(&mut store, "s", 2, 3);
+        for env in store.page("s", 0, 10).unwrap() {
+            let meta: EventMeta =
+                serde_json::from_value(serde_json::to_value(EventMeta::of(&env)).unwrap()).unwrap();
+            assert_eq!(meta.len, env.event_json.len() as u64);
+            let back = meta.envelope("s", env.event_json.clone());
+            assert_eq!(back, env);
+            assert_eq!(back.hash(), env.hash());
+        }
+    }
+
+    /// P2d-3 — a listing, a blob's length and a need are each checked before
+    /// anything they announce is read.
+    #[test]
+    fn what_a_frame_announces_is_checked_before_it_is_read() {
+        let meta = |len: u64| EventMeta {
+            seq: 1,
+            fence: 1,
+            ts_ms: 0,
+            prev_hash: GENESIS,
+            len,
+        };
+        assert_eq!(check_events(&[]), Err(FrameError::Batch(0)));
+        assert_eq!(
+            check_events(&vec![meta(2); MAX_BATCH + 1]),
+            Err(FrameError::Batch(MAX_BATCH + 1))
+        );
+        assert_eq!(check_events(&vec![meta(2); MAX_BATCH]), Ok(()));
+        let past = MAX_EVENT_BYTES as u64 + 1;
+        assert_eq!(
+            check_events(&[meta(2), meta(past)]),
+            Err(FrameError::EventTooLong(past))
+        );
+        assert_eq!(check_events(&[meta(MAX_EVENT_BYTES as u64)]), Ok(()));
+        assert_eq!(check_blob_len(0), Ok(0), "an empty file's blob");
+        assert_eq!(check_blob_len(MAX_STREAM_BLOB as u64), Ok(MAX_STREAM_BLOB));
+        let past = MAX_STREAM_BLOB as u64 + 1;
+        assert_eq!(check_blob_len(past), Err(FrameError::BlobTooLong(past)));
+        let d = Digest::of(b"x");
+        assert_eq!(check_need(&[]), Err(FrameError::Need(0)));
+        assert_eq!(check_need(&vec![d; MAX_NEED]), Ok(()));
+        assert_eq!(
+            check_need(&vec![d; MAX_NEED + 1]),
+            Err(FrameError::Need(MAX_NEED + 1))
+        );
+    }
+
+    /// P2d-3 — a checkpoint names each blob it adds once, with its length:
+    /// its files' chunks, then its pack's. Any other kind names none, and so
+    /// does a kind this build cannot read.
+    #[test]
+    fn a_checkpoint_names_each_blob_it_adds_once() {
+        use crate::checkpoint::{
+            Checkpoint, RepoKind, WorkspaceSnap, chunk_bytes, snapshot_append, snapshot_whole,
+        };
+        let (history, _) = snapshot_append("h.jsonl", 0o600, b"one\ntwo\n", None);
+        let (same, _) = snapshot_whole("copy.jsonl", 0o600, b"one\ntwo\n", None);
+        let (empty, _) = snapshot_whole("CLAUDE.md", 0o600, b"", None);
+        let (pack, _) = chunk_bytes(b"PACK");
+        let cp = Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![history.clone(), same, empty.clone()],
+            skipped: vec![],
+            workspace: Some(WorkspaceSnap {
+                repo: RepoKind::Shadow,
+                prefix: String::new(),
+                tree: "t".into(),
+                commit: "c".into(),
+                base: None,
+                head: None,
+                pack: pack.clone(),
+            }),
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        let env = EventEnvelope::next("s", None, 1, 0, &TranscriptEvent::Checkpoint(cp));
+        store.append(&env).unwrap();
+        assert_eq!(
+            blobs_named(&env),
+            vec![
+                (history.chunks[0].hash, history.chunks[0].len),
+                (empty.chunks[0].hash, 0),
+                (pack[0].hash, 4),
+            ],
+            "the second copy of the history's bytes is named once"
+        );
+        grow(&mut store, "s", 1, 1);
+        let note = store.event_at("s", 2).unwrap().unwrap();
+        assert!(blobs_named(&note).is_empty(), "a note names no blob");
+        let unknown = EventEnvelope {
+            event_json: r#"{"kind":"from_the_future","blobs":["ab"]}"#.into(),
+            ..note
+        };
+        assert!(
+            blobs_named(&unknown).is_empty(),
+            "a kind this build cannot read"
+        );
     }
 }
