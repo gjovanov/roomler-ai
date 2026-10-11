@@ -11326,9 +11326,20 @@ mod codec_cap_tests {
             (CaptureUnavailableCode::NoDisplay, "no_display"),
             (CaptureUnavailableCode::NotBuilt, "not_built"),
             (CaptureUnavailableCode::BackendError, "backend_error"),
+            (
+                CaptureUnavailableCode::WaylandNotEnabled,
+                "wayland_not_enabled",
+            ),
         ] {
             assert_eq!(code.wire(), wire);
             assert!(!code.hint().is_empty(), "{wire} has no operator sentence");
+            // The hint is spliced into the payload unescaped, so every code's
+            // sentence must leave it parseable and arrive as written.
+            let payload = super::capture_unavailable_payload(&CaptureUnavailable::new(code, "d"));
+            let parsed: serde_json::Value = serde_json::from_str(&payload)
+                .unwrap_or_else(|e| panic!("{wire}: payload is not JSON ({e}): {payload}"));
+            assert_eq!(parsed["code"], wire);
+            assert_eq!(parsed["hint"], code.hint(), "{wire}");
         }
     }
 

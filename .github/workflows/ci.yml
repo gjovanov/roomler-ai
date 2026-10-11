@@ -819,12 +819,21 @@ jobs:
         # every test here shares ONE display, and to keep busy another test's
         # pointer move IS a person (measured: in parallel it paused, correctly,
         # 0.3 s in).
+        #
+        # FR-93 P1 — the Xwayland guard, against the same Xvfb: a server that
+        # is NOT Xwayland must never be refused, or every X11 host and the
+        # virtual desktop would lose capture; and an Xwayland older than 23.1
+        # (no XWAYLAND extension) is still known by its monitors — shown with
+        # a client-defined XWAYLAND0 monitor, since only the fallback can see
+        # it. Both `x11-real:` lines are grepped.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
-          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input --lib -- capture::pointer keep_busy::host_x11 --nocapture --test-threads=1 | tee /tmp/x11-tests.log
+          xvfb-run -a env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input --lib -- capture::pointer keep_busy::host_x11 capture::xwayland_probe_tests --nocapture --test-threads=1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
+          grep -q "x11-real: Xvfb does not advertise XWAYLAND" /tmp/x11-tests.log
+          grep -q "x11-real: an XWAYLAND monitor reads as Xwayland" /tmp/x11-tests.log
 
   rust:
     # The name the five lanes above shared when they were one job. It builds

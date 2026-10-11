@@ -21,7 +21,7 @@ fixed order and every non-default arm is **opt-in**.
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:682`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:943`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -32,24 +32,27 @@ flowchart TD
     SY -- no --> D{"ROOMLERD_DRM_CAPTURE=1<br/>and a CRTC with live scanout?"}
     D -- "yes: backend=drm" --> DRM["DRM/KMS — the scanout plane,<br/>read below the compositor (FR-36)"]
     D -- "no: flag off, no /dev/dri, tiled buffer…" --> P{"ROOMLERD_PORTAL_CAPTURE=1?"}
-    P -- no --> X
+    P -- no --> XW
     P -- yes --> PS{"ROOMLERD_MUTTER_CAPTURE=1?"}
     PS -- no --> PORT["portal-helper → xdg-desktop-portal ScreenCast<br/>ATTENDED: a logged-in user and a consent dialog"]
     PS -- yes --> MUT["portal-helper → org.gnome.Mutter.ScreenCast<br/>UNATTENDED: no dialog; GNOME only"]
     PORT -- "backend=portal" --> OK([frames])
     MUT -- "backend=portal" --> OK
-    PORT -- "could not open: nobody at the screen,<br/>dialog unanswered, no PipeWire…" --> X
-    MUT -- "could not open: no graphical logind session,<br/>no mutter on the user bus…" --> X
+    PORT -- "could not open: nobody at the screen,<br/>dialog unanswered, no PipeWire…" --> XW
+    MUT -- "could not open: no graphical logind session,<br/>no mutter on the user bus…" --> XW
+    XW{"DISPLAY set, and the server<br/>says it is Xwayland? (FR-93, §1.1)"}
+    XW -- "yes: its root is EMPTY" --> W["NoopCapture: wayland_not_enabled,<br/>or the failed arm's own error"]
+    XW -- "no: Xorg, the daemon's own Xvfb,<br/>or no DISPLAY" --> X
     X["scrap — X11 XShm + XDamage (FR-29)<br/>DISPLAY from the session, or the daemon's own Xvfb<br/>(ROOMLERD_VIRTUAL_DESKTOP=1)"] -- "backend=scrap" --> OK
-    X -- "no X display at all" --> N["NoopCapture carrying the reason —<br/>the viewer shows rc:media-unavailable (FR-80)"]
+    X -- "no X display at all" --> N["NoopCapture carrying the reason (FR-80) —<br/>wayland_not_enabled if the SEAT shows a<br/>Wayland session, else no_display"]
 ```
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:810`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off** | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:846`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:1078`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off** | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:1117`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off** | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:66`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (XWayland's root has no readable framebuffer) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:877`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:1186`), after the Xwayland guard (`mod.rs:1159`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -66,8 +69,90 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:826`, `mod.rs:863`), because
+  asked for them and they fell through (`mod.rs:1094`, `mod.rs:1134`), because
   silently serving X11 instead would look like the feature simply not working.
+  Since FR-93 that error also travels: it becomes the session's `detail`
+  (§1.1).
+
+### 1.1 A Wayland desktop with nothing switched on (FR-93 P1)
+
+Every Wayland arm above is opt-in, so a stock install on a Wayland desktop
+reaches the bottom of the cascade. Before FR-93 it said something false there,
+and a different false thing per install type. Measured on the FR-93 lab
+(GNOME 50.1 on Ubuntu 26.04, the released 0.4.125):
+
+| Install | What the viewer got | Why |
+|---|---|---|
+| per-user (`install.sh`'s default) | a **live black picture**: `backend=scrap`, content `lit=0.0 %`, no reason anywhere | the user unit's `DISPLAY` is Xwayland; XShm on it *opens*, and Xwayland's root window is empty |
+| system (root) | *"This host has no display to capture (headless…)"*, `no_display`, while the guest's own screen showed GNOME and the companion banner | a systemd unit has none of the session's variables, and the classifier read the **daemon's** environment as if it described the **host** |
+
+Two changes stop both:
+
+- 🔑 **The Xwayland guard** (`mod.rs:1159`). Before scrap opens, the daemon
+  asks the X server named by its `DISPLAY` whether it is Xwayland
+  (`x_server_is_xwayland`, `mod.rs:650`). There are two signals, the same two
+  keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
+  since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
+  it is Xwayland, scrap is refused, and the session gets a reason instead of
+  black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
+  real Xorg and the daemon's own Xvfb are captured exactly as before.
+- 🔑 **The seat, not the daemon's environment, decides "headless"**
+  (`linux_no_pixels_code`, `mod.rs:567`). When every arm has failed and the
+  daemon has no display variables, logind is asked whether a graphical session
+  is showing (`seat_shows_wayland`, `mod.rs:634`, through
+  `companion::graphical_session`). A Wayland session there means
+  `wayland_not_enabled`. No session at all means `no_display`, and that is now
+  true.
+
+| The daemon sees | An arm the operator switched on failed? | → `code` | `detail` |
+|---|---|---|---|
+| `DISPLAY` is Xwayland | no | `wayland_not_enabled` | which display, and why XShm would be black |
+| `DISPLAY` is Xwayland | yes | `backend_error` | that arm's own error (`drm_capture is on, but DRM capture could not open: …`) |
+| no display variables; the seat shows Wayland | no | `wayland_not_enabled` | what was found (logind, or `WAYLAND_DISPLAY`), then X11's own words: on their own, "connection refused" reads like a network fault |
+| no display variables; the seat shows Wayland | yes | `backend_error` | that arm's own error |
+| no display variables; no graphical session | — | `no_display` | scrap's own error |
+| a `DISPLAY` that is not Xwayland, which scrap could not open | — | `backend_error` | scrap's own error |
+
+The `wayland_not_enabled` hint names the keys **this install** can use,
+because only root can read the scanout or create a uinput device:
+
+- a system daemon is told `drm_capture` + `uinput`;
+- a per-user one is told `portal_capture`, plus `mutter_capture` on GNOME.
+
+A failed arm is never told to "switch it on". It is already on, and its own
+error is the useful sentence.
+
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:705`).
+`x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
+missing. Under WSL2's mirrored networking a localhost connect to a closed port
+hangs instead of being refused, and systemd's `/tmp` handling there had hidden
+WSLg's `X0` socket. Together, the first draft of this probe stalled **for over
+a minute**, measured, in front of every capture open. Xwayland is a local
+server, so a display reached over TCP is not probed at all. Locked by
+`a_tcp_display_is_never_dialled`.
+
+⚠️ **A rootful Xwayland is refused too**: one that draws a whole X desktop
+inside a Wayland window (a nested session, `Xwayland -rootful`). The probe does
+not tell the two modes apart, and the trade is deliberate. The rootless case is
+every stock GNOME and KDE desktop; the rootful one is rare, and it gets a
+sentence rather than a black stream. `wayland_aware = false` restores XShm
+there.
+
+**Kill switch**: `wayland_aware` / `ROOMLERD_WAYLAND_AWARE=0` (default on)
+gives back the behaviour before FR-93 unchanged. The X server is not even
+asked.
+
+CI proves the half it can run, against Xvfb in the X11 lane (`ci.yml`, the
+"against a real X server" step):
+
+- A server that is not Xwayland is captured. A control checks that the
+  Unix-only path really reads the server's extensions (`XFIXES`), so a probe
+  that never connected cannot pass by answering "no".
+- An `XWAYLAND0` monitor that the test defines reads as Xwayland. This is the
+  only place the pre-23.1 fallback runs at all, because the lab's GNOME 50
+  carries the extension.
+
+The Xwayland half itself is proven on the lab's GNOME guests (§6).
 
 ## 2. The X11 arm, and the virtual desktop
 
@@ -80,8 +165,8 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2319`,
-`virtual_desktop.rs:76`) starts Xvfb at `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION`
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2598`,
+`virtual_desktop.rs:528`) starts Xvfb at `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION`
 (default `1920x1080`) with the window manager named by
 `ROOMLERD_VIRTUAL_DESKTOP_WM` (default `openbox`) and the comma-separated
 `ROOMLERD_VIRTUAL_DESKTOP_STARTUP` apps, points `DISPLAY` at it before the caps
@@ -410,8 +495,9 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 ## 7. Configuration
 
-Every key below is `restart required`; env wins over the config file
-(`crates/agent-core/src/config_surface.rs:972-995`, `:1470`).
+Every key below is `restart required`; env wins over the config file. The
+keys are `crates/agent-core/src/config_surface.rs:1131-1194`, and they reach
+the daemon through the env bridge (`crates/agent-core/src/config.rs:2549`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -421,6 +507,7 @@ Every key below is `restart required`; env wins over the config file
 | `portal_input` | `ROOMLERD_PORTAL_INPUT` | off | input through the portal's RemoteDesktop, on the same session. Inert without `portal_capture`; and on GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped |
 | `mutter_capture` | `ROOMLERD_MUTTER_CAPTURE` | off | the mutter arm (§5), **inside** `portal_capture`. **Unattended, GNOME-only, no input** |
 | `window_capture` | `ROOMLERD_WINDOW_CAPTURE` | off | FR-56 P4: one application window instead of the monitor. Attended **by construction** — the portal answers with a window picker, and nothing agent-side can name a window (GNOME refuses `Introspect.GetWindows`) |
+| `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged |
 | — | `ROOMLERD_VIRTUAL_DESKTOP` (+ `_RESOLUTION`, `_WM`, `_STARTUP`) | off | the daemon's own Xvfb (§2). Turn it **off** when testing the portal arms on a host that has it, or the X11 fallback quietly serves the session in the portal's place |
 | `virtual_desktop_apps` | — | — | the FR-56 launch allowlist — for a virtual desktop **or** a logged-in X11/Xwayland session; [`remote-apps.md`](remote-apps.md) §7 |
 
@@ -466,16 +553,16 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:682`) and the cascade; the FR-80 failure classifier (`:594`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:943`) and the cascade; the FR-80 failure classifier (`:830`); FR-93's verdicts: `linux_no_pixels_code` (`:567`), `xwayland_verdict` (`:616`), the Xwayland guard (`:1159`) and its socket-only probe (`x_server_query` `:705`), the hints (`wayland_hint` `:519`, `wayland_not_enabled_detail` `:601`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:107`, `primary` `:243`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:158`, `detect_in_session` `:245`); `pub mod helper` (`:264`): the `portal-helper` subcommand, `spawn_streaming` (`:640`), `spawn_child` (`:764`) |
-| `agents/roomlerd/src/companion.rs` | `graphical_session()` (`:457`) — the logind lookup both the consent companion and the helper share |
+| `agents/roomlerd/src/companion.rs` | `graphical_session()` (`:615`) — the logind lookup the consent companion, the helper and FR-93's "is a Wayland desktop showing" all share |
 | `agents/roomlerd/src/capture/portal/screencast.rs` | the portal handshake (`open` `:256`), `SessionKind`, the `TokenStore` (`:524`) |
 | `agents/roomlerd/src/capture/portal/mutter.rs` | the mutter broker (`open` `:152`, `RecordMonitor` `:202`, `PipeWireStreamAdded` `:224`) |
 | `agents/roomlerd/src/capture/portal/pipewire.rs` · `pod.rs` | `dlopen` (`:307`), `negotiate` (`:1015`), `stream` (`:1156`); the hand-written SPA PODs |
 | `agents/roomlerd/src/capture/portal/wire.rs` · `backend.rs` | the `RPWF` frame wire; `PortalCapture` (`open` `:48`, `HANDSHAKE_DEADLINE` `:294`) |
 | `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | P4: the helper's `Notify*` mapping; the arbiter-side per-event route (`try_route` `:93`) |
-| `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:948-995`) |
-| `agents/roomlerd/src/main.rs` | `capture-smoke` (`:4647`, the portal line `:4751`); the virtual desktop (`:2311`) |
+| `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1194`) |
+| `agents/roomlerd/src/main.rs` | `capture-smoke` (`:5455`, the portal line `:5482`); the virtual desktop (`:2598`) |
