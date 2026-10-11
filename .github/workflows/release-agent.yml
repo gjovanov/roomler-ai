@@ -3645,6 +3645,6 @@ jobs:
 
           gh workflow run release-setup.yml --ref "${setup_tag}" \
             -f version="${VERSION}" -f publish_release=true
-          echo "dispatched release-setup.yml on ${setup_tag}: it builds all three platforms, publishes the release pinned to ${commit}, refreshes the roomler.ai cache, and opens an issue if it fails"
-          echo "verify: gh release view ${setup_tag} --json assets,targetCommitish ; curl -sI https://roomler.ai/api/setup/windows | grep -i content-disposition"
+          echo "dispatched release-setup.yml on ${setup_tag}: it builds all three platforms, publishes the release on the tag (which pins ${commit}), refreshes the roomler.ai cache, and opens an issue if it fails"
+          echo "verify: git ls-remote origin 'refs/tags/${setup_tag}^{}' (must be ${commit}) ; gh release view ${setup_tag} --json assets ; curl -sI https://roomler.ai/api/setup/windows | grep -i content-disposition"
 # RETIRED-NAME-ANCHOR-END

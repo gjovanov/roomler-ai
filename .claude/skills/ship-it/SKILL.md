@@ -190,13 +190,25 @@ so it can never block the agent) tags `setup-v<V>` at the built commit and
 dispatches `release-setup.yml --ref setup-v<V>`. Two GitHub rules shape it: a
 tag pushed with `GITHUB_TOKEN` triggers **no** workflow, and `workflow_dispatch`
 is the documented exception — hence the explicit dispatch. The wizard lane
-builds all three platforms (macOS is no longer skippable), pins the release's
-`target_commitish` to the built commit, and opens/closes a
-"roomler-setup release failed" issue like the agent lane's seed alert.
+builds all three platforms (macOS is no longer skippable), publishes the
+release on that tag, and opens/closes a "roomler-setup release failed" issue
+like the agent lane's seed alert.
+
+⚠️ **#2013 — never send `target_commitish` for a tag that already exists.**
+GitHub refuses a release (create *or* update) whose `target_commitish` adds or
+changes anything under `.github/workflows` relative to master, because that
+needs a `workflows` permission `GITHUB_TOKEN` cannot hold. The 403 reads
+"Resource not accessible by integration" although the job has
+`contents: write`. `setup-v0.4.128` never published for this reason: master
+changed one line of `ci.yml` 13 minutes after its commit. The lane now sends it
+only when the release must create the tag. A run on a tag executes the workflow
+**as it stood at that tag**, so a pre-fix tag cannot be re-published: release
+the next version.
 
 ```bash
 # Verify a lockstep roll — both must hold
-gh release view setup-v<V> --json assets,targetCommitish   # 3 platforms + sidecars; commitish = the agent-v<V> commit
+git ls-remote origin 'refs/tags/setup-v<V>^{}' 'refs/tags/agent-v<V>^{}'   # the SAME commit (the release's targetCommitish now reads `master`)
+gh release view setup-v<V> --json assets   # 3 platforms + sidecars
 for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>
 
 # Re-run after a failure (the tag already exists at the agent commit; idempotent)
