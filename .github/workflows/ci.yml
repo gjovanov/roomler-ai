@@ -730,11 +730,12 @@ jobs:
           # What `roomlerd enroll` leaves behind, and an XDG Videos folder.
           mkdir -p "$H/.config/roomler" "$H/.local/share/roomler" "$H/Videos"
           printf 'XDG_VIDEOS_DIR="$HOME/Videos"\n' > "$H/.config/user-dirs.dirs"
-          # Every path the unit lists as optional (`-`), ~/Videos aside, must
-          # be MISSING, as on any host installed after the rename, or the
-          # cell proves nothing about a missing path.
+          # Every path the unit lists as optional (`-`), the XDG user folders
+          # (~/Videos, ~/Downloads) aside, must be MISSING, as on any host
+          # installed after the rename, or the cell proves nothing about a
+          # missing path.
           for p in $(grep -E '^ReadWritePaths=' agents/roomlerd/packaging/linux/roomler.service | sed 's/^ReadWritePaths=//' | tr ' ' '\n' | grep '^-' | sed "s|^-||; s|%h|$H|g"); do
-            if [ "$p" != "$H/Videos" ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
+            if [ "$p" != "$H/Videos" ] && [ "$p" != "$H/Downloads" ] && [ -e "$p" ]; then echo "::error::$p exists on the runner; the cell proves nothing"; exit 1; fi
           done
           OUT=/tmp/p2c-where.out
           {
@@ -754,6 +755,68 @@ jobs:
           cat "$OUT"
           grep -q "$H/Videos/Roomler" "$OUT" || { echo "::error::under the sandbox the recorder did not choose ~/Videos/Roomler"; exit 1; }
           grep -q HOME_READ_ONLY "$OUT" || { echo "::error::the sandbox left the rest of home writable"; exit 1; }
+
+      - name: The Linux user unit runs where its user manager sandboxes it — Fedora's configuration (#1997)
+        # #1997. The cell above copies the unit's sandbox into a SYSTEM unit,
+        # where `%t` means /run, and its oneshot never takes the lock. So it
+        # could not see the per-user daemon failing to start on Fedora, every
+        # 5 s, forever: "opening /run/user/$UID/roomler-agent-<id>.lock:
+        # Read-only file system". This cell starts the SHIPPED unit under the
+        # runner's own user manager, as an install does. Ubuntu's AppArmor
+        # stops a user manager from mounting inside an unprivileged user
+        # namespace, and the unit then runs with NO sandbox, as on every
+        # Ubuntu desktop. Lifting that is Fedora's configuration, where the
+        # sandbox applies. The cell fails unless the daemon really ran in its
+        # own mount namespace, so it cannot pass by not sandboxing. Measured
+        # before it landed, under a user manager that applies the sandbox:
+        # master's unit fails here (the lock, EROFS), the fixed one passes.
+        run: |
+          set -eu
+          cargo build -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --message-format=json > /tmp/uu-build.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "roomlerd" and .executable != null) | .executable' /tmp/uu-build.json | tail -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd binary in the build output"; exit 1; fi
+          ME=$(id -un)
+          MYUID=$(id -u)
+          H=$(getent passwd "$ME" | cut -d: -f6)
+          RUN=/run/user/$MYUID
+          export XDG_RUNTIME_DIR=$RUN
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo loginctl enable-linger "$ME"
+          for _ in $(seq 1 30); do [ -S "$RUN/systemd/private" ] && break; sleep 1; done
+          [ -S "$RUN/systemd/private" ] || { echo "::error::no user manager for $ME"; exit 1; }
+          # What `roomlerd enroll` leaves behind, for a server nobody answers:
+          # the daemon takes its lock and binds LocalAPI before it needs one.
+          mkdir -p "$H/.config/roomler" "$H/.local/share/roomler" "$H/.config/systemd/user"
+          printf '%s\n' 'server_url = "http://127.0.0.1:9"' 'agent_token = "ci"' \
+            'agent_id = "000000000000000000000000"' 'tenant_id = "000000000000000000000000"' \
+            'machine_id = "ci"' 'machine_name = "ci"' > "$H/.config/roomler/config.toml"
+          sed "s|^ExecStart=.*|ExecStart=$BIN run|" agents/roomlerd/packaging/linux/roomler.service > "$H/.config/systemd/user/roomler.service"
+          systemctl --user daemon-reload
+          systemctl --user start roomler.service
+          sock=""
+          for _ in $(seq 1 45); do [ -S "$RUN/roomler.sock" ] && { sock=1; break; }; sleep 1; done
+          show_log() { sudo journalctl "_UID=$MYUID" _SYSTEMD_USER_UNIT=roomler.service --no-pager -n 25 || true; }
+          PID=$(systemctl --user show -p MainPID --value roomler.service)
+          case "$PID" in ''|0) show_log; echo "::error::the unit has no running daemon"; exit 1 ;; esac
+          [ "$(sudo readlink "/proc/$PID/ns/mnt")" != "$(sudo readlink /proc/1/ns/mnt)" ] \
+            || { echo "::error::the unit ran in the host's mount namespace: its sandbox did not apply, and this cell proves nothing"; exit 1; }
+          [ -n "$sock" ] || { show_log; echo "::error::no LocalAPI socket at $RUN/roomler.sock within 45 s"; exit 1; }
+          opts() { sudo awk -v p="$1" '$5 == p { o = $6 } END { print o }' "/proc/$PID/mountinfo"; }
+          # The mount that governs a path: the longest mount point containing
+          # it. /home is often not a mount of its own, and then ProtectSystem's
+          # read-only / is the one.
+          governing() {
+            sudo awk -v p="$1" '{ m = $5; ok = (m == "/" || p == m || index(p, m "/") == 1) } ok && length(m) >= best { best = length(m); o = $6 } END { print o }' "/proc/$PID/mountinfo"
+          }
+          for p in "$RUN" "$H/.local/state/roomler" "$H/.config/roomler" "$H/.local/share/roomler"; do
+            case "$(opts "$p")" in
+              rw*) ;;
+              *) echo "::error::$p is not writable inside the unit (mount options '$(opts "$p")')"; sudo awk '{ print $5, $6 }' "/proc/$PID/mountinfo" | grep -E "^($H|/run/user)"; exit 1 ;;
+            esac
+          done
+          case "$(governing "$H")" in ro*) ;; *) echo "::error::$H is writable inside the unit ('$(governing "$H")')"; exit 1 ;; esac
+          echo "the user unit: sandboxed, LocalAPI bound, the runtime, state, config and data folders writable, the rest of home read-only"
+          systemctl --user stop roomler.service
 
   rust-recorder-audio:
     name: Recorder tests with audio + X11 pointer (FR-85)

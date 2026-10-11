@@ -159,14 +159,31 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   enrolls, and enables a **systemd user unit** (`roomler.service` →
   `systemctl --user enable --now`).
 - ⚠️ The user unit is **sandboxed** (`ProtectSystem=strict`,
-  `ProtectHome=read-only`): the daemon can write only its own config and data
-  folders and `~/Videos` (screen recordings, FR-85 P2c). Every
-  `ReadWritePaths=` entry that may be missing carries systemd's `-` prefix.
-  Without it a missing path fails the whole unit with `226/NAMESPACE`, and
-  until P2c the pre-rename folders listed there without it kept the unit from
-  starting on any host that never ran the pre-rename agent, wherever the
-  sandbox applies. CI starts a unit with these sandbox lines on a fresh
-  runner (`ci.yml`, "The Linux user unit's sandbox").
+  `ProtectHome=read-only`). The daemon can write only these:
+  - its own config and data folders;
+  - the runtime dir (`%t`), which holds the single-instance lock and the
+    LocalAPI socket;
+  - `~/.local/state/roomler`, the portal's restore token, created 0700 by an
+    unsandboxed `ExecStartPre=+`;
+  - `~/Downloads` (incoming files) and `~/Videos` (screen recordings, FR-85 P2c).
+
+  Every `ReadWritePaths=` entry that may be missing carries systemd's `-`
+  prefix. Without it a missing path fails the whole unit with `226/NAMESPACE`,
+  and until P2c the pre-rename folders listed there without it kept the unit
+  from starting on any host that never ran the pre-rename agent, wherever the
+  sandbox applies. CI starts a unit with these sandbox lines on a fresh runner
+  (`ci.yml`, "The Linux user unit's sandbox").
+- ⚠️ **Until #1997 the per-user daemon could not start wherever the sandbox
+  applies**, Fedora among them: it restarted every 5 s with `opening
+  /run/user/$UID/roomler-agent-<id>.lock: Read-only file system`, because `%t`
+  was not writable. The P2c cell could not see it: a system unit's `%t` is
+  `/run`, and its oneshot never takes the lock. A second cell ("…where its
+  user manager sandboxes it") starts the shipped unit under the runner's own
+  user manager, with AppArmor's user-namespace restriction lifted (Fedora's
+  configuration). It fails unless the daemon ran in its own mount namespace,
+  then waits for the LocalAPI socket. ⚠️ Not `StateDirectory=`: on systemd 255
+  it took the existing `~/.config/roomler` for its own pre-XDG-state location
+  and symlinked `~/.local/state/roomler` to it.
 - ⚠️ **The sandbox is best-effort for a user unit.** A user manager applies
   it only inside an unprivileged user namespace in which it may mount, and
   otherwise runs the unit with **no sandbox at all** (home fully writable,
