@@ -1635,6 +1635,19 @@ fn rpc_caps() -> Vec<String> {
     if crate::hive::adopt_enabled() {
         caps.push(RpcCap::HiveAdopt);
     }
+    // FR-90 P2c-3 — and holds copies of its owner's sessions run elsewhere:
+    // answers `rc:hive.replica.join`. Not a property of the build alone:
+    // only while the owner's `hive_replica` is on and the store is open, and
+    // on the primary enrollment's connection only (the hello strips both
+    // words from any other). `hive-archive` only ever with it.
+    #[cfg(hive_host)]
+    if crate::hive::replica_enabled() {
+        caps.push(RpcCap::HiveReplica);
+    }
+    #[cfg(hive_host)]
+    if crate::hive::archive_enabled() {
+        caps.push(RpcCap::HiveArchive);
+    }
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

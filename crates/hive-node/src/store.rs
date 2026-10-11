@@ -108,6 +108,28 @@ const P2A_TABLES: &str = "CREATE TABLE IF NOT EXISTS floors (
                  purged_ms INTEGER NOT NULL
              ) WITHOUT ROWID;";
 
+/// FR-90 P2c-3: the sessions this device holds a copy of as a member, as the
+/// server joined it: the role it was placed in and the join's fence. New and
+/// made only when missing, like P2a's tables, so `user_version` stays 1.
+const P2C_TABLES: &str = "CREATE TABLE IF NOT EXISTS memberships (
+                 session   TEXT    PRIMARY KEY,
+                 role      TEXT    NOT NULL,
+                 fence     INTEGER NOT NULL,
+                 joined_ms INTEGER NOT NULL
+             ) WITHOUT ROWID;";
+
+/// FR-90 P2c-3 — one session this device holds a copy of as a member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Membership {
+    pub session: String,
+    /// The role it was placed in: `archive` or `owner`.
+    pub role: String,
+    /// The fence of the newest join.
+    pub fence: u64,
+    /// When it first joined.
+    pub joined_ms: i64,
+}
+
 /// At most this many sessions per search filter — a view grant names sessions
 /// explicitly, and a filter larger than this is a caller bug.
 pub const MAX_SEARCH_SESSIONS: usize = 500;
@@ -158,6 +180,13 @@ pub enum StoreError {
     CorruptBlob { hash: String },
     #[error("a blob holds at most {MAX_BLOB_BYTES} bytes, not {0}")]
     BlobTooLarge(usize),
+    /// P2c-3: a join at a fence older than the floor this device holds.
+    #[error("session {session}'s floor is fence {floor}: a join at fence {fence} is older")]
+    StaleJoin {
+        session: String,
+        floor: u64,
+        fence: u64,
+    },
 }
 
 /// One full-text match.
@@ -204,8 +233,70 @@ impl Store {
         }
         conn.execute_batch(P0A_TABLES)?;
         conn.execute_batch(P2A_TABLES)?;
+        conn.execute_batch(P2C_TABLES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
+    }
+
+    /// FR-90 P2c-3: hold `session` as a member, placed in `role`, at `fence`.
+    /// The floor rises to `fence` in the same transaction, so from the join on
+    /// an event of an older fence is refused here, whoever sends it. A join
+    /// below the floor is refused ([`StoreError::StaleJoin`]), as is one for
+    /// a purged session. A later join moves the role and fence, and keeps
+    /// when the first was made. Returns the floor.
+    pub fn join(&mut self, session: &str, role: &str, fence: u64) -> Result<u64, StoreError> {
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        if let Some(floor) = Self::floor_in(&tx, session)?
+            && floor > fence
+        {
+            return Err(StoreError::StaleJoin {
+                session: session.to_string(),
+                floor,
+                fence,
+            });
+        }
+        tx.execute(
+            "INSERT INTO floors (session, fence) VALUES (?1, ?2)
+             ON CONFLICT(session) DO UPDATE SET fence = ?2",
+            params![session, fence as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO memberships (session, role, fence, joined_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session) DO UPDATE SET role = ?2, fence = ?3",
+            params![session, role, fence as i64, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(fence)
+    }
+
+    /// FR-90 P2c-3: every session this device holds as a member, by id.
+    pub fn memberships(&self) -> Result<Vec<Membership>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session, role, fence, joined_ms FROM memberships ORDER BY session")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Membership {
+                session: r.get(0)?,
+                role: r.get(1)?,
+                fence: r.get::<_, i64>(2)? as u64,
+                joined_ms: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// FR-90 P2c-3: the store's size, as SQLite counts its pages: what
+    /// `hive_store_quota_mib` is held to. The write-ahead log is not counted;
+    /// it is folded back at each checkpoint.
+    pub fn size_bytes(&self) -> Result<u64, StoreError> {
+        let pages: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(pages.max(0) as u64 * page.max(0) as u64)
     }
 
     /// The newest event this store holds for `session`.
@@ -685,6 +776,10 @@ impl Store {
         )?;
         tx.execute("DELETE FROM tips WHERE session = ?1", params![session])?;
         tx.execute("DELETE FROM floors WHERE session = ?1", params![session])?;
+        tx.execute(
+            "DELETE FROM memberships WHERE session = ?1",
+            params![session],
+        )?;
         tx.execute(
             "DELETE FROM blobs WHERE hash IN (SELECT hash FROM blob_refs WHERE session = ?1)
                AND hash NOT IN (SELECT hash FROM blob_refs WHERE session <> ?1)",
@@ -1545,6 +1640,8 @@ mod tests {
             blob = s.put_blob("s1", b"a history chunk").unwrap();
             append_all(&mut s, "s2", 1, &["purgeword"]);
             s.purge("s2").unwrap();
+            // P2c-3 — and a membership.
+            s.join("s3", "owner", 1).unwrap();
         }
 
         // The rolled-back daemon.
@@ -1586,6 +1683,15 @@ mod tests {
             Some(b"a history chunk".to_vec())
         );
         assert!(s.is_purged("s2").unwrap());
+        assert_eq!(
+            s.memberships()
+                .unwrap()
+                .iter()
+                .map(|m| m.session.as_str())
+                .collect::<Vec<_>>(),
+            ["s3"],
+            "the membership survives the rolled-back daemon"
+        );
         let replay = sent("s2", None, 1, &["purgeword"]).remove(0);
         assert!(matches!(s.apply(&replay), Err(StoreError::Purged { .. })));
         let user_version: i64 = s
@@ -1615,7 +1721,14 @@ mod tests {
         assert_eq!(s.tip("s1").unwrap(), tip);
         assert_eq!(s.page("s1", 0, 10).unwrap().len(), 2);
         assert_eq!(s.search("oldtwo", None, 10).unwrap().len(), 1);
-        for table in ["floors", "divergent", "blobs", "blob_refs", "purged"] {
+        for table in [
+            "floors",
+            "divergent",
+            "blobs",
+            "blob_refs",
+            "purged",
+            "memberships",
+        ] {
             assert_eq!(
                 count(
                     &s,
@@ -1628,5 +1741,59 @@ mod tests {
             );
         }
         assert_eq!(append_all(&mut s, "s1", 1, &["newthree"]).seq, 3);
+    }
+
+    /// FR-90 P2c-3 — a join raises the floor and records the membership; a
+    /// later one moves the role and the fence, and keeps when the first was
+    /// made.
+    #[test]
+    fn a_join_raises_the_floor_and_records_the_membership() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(s.join("s1", "owner", 2).unwrap(), 2);
+        assert_eq!(s.floor("s1").unwrap(), Some(2));
+        let first = s.memberships().unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|m| (m.session.as_str(), m.role.as_str(), m.fence))
+                .collect::<Vec<_>>(),
+            [("s1", "owner", 2)]
+        );
+        // From the join on, an event of an older fence is refused here.
+        let old = EventEnvelope::next("s1", None, 1, 0, &ev("from fence one"));
+        assert!(s.apply(&old).is_err(), "fence 1 is below the floor");
+        assert_eq!(s.join("s1", "archive", 3).unwrap(), 3);
+        let again = s.memberships().unwrap();
+        assert_eq!(
+            (again[0].role.as_str(), again[0].fence, again[0].joined_ms),
+            ("archive", 3, first[0].joined_ms)
+        );
+        assert_eq!(s.floor("s1").unwrap(), Some(3));
+    }
+
+    /// A join older than the floor is refused and changes nothing; a purged
+    /// session is never joined, and a purge ends a membership.
+    #[test]
+    fn a_stale_or_purged_join_is_refused_and_a_purge_ends_a_membership() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.raise_floor("s1", 4).unwrap();
+        assert!(matches!(
+            s.join("s1", "owner", 3),
+            Err(StoreError::StaleJoin {
+                floor: 4,
+                fence: 3,
+                ..
+            })
+        ));
+        assert!(s.memberships().unwrap().is_empty());
+        assert_eq!(s.floor("s1").unwrap(), Some(4), "the floor never falls");
+        s.join("s2", "owner", 1).unwrap();
+        s.purge("s2").unwrap();
+        assert!(s.memberships().unwrap().is_empty(), "a purge ends it");
+        assert!(matches!(
+            s.join("s2", "owner", 2),
+            Err(StoreError::Purged { .. })
+        ));
+        assert!(s.size_bytes().unwrap() > 0);
     }
 }

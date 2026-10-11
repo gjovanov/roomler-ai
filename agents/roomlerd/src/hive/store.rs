@@ -18,14 +18,16 @@
 //! fence's tail, blobs, purge, and search. Each goes through this same thread
 //! and is answered on its oneshot with the store's own word, so a caller can
 //! tell `purged` from a stale fence. An applied envelope is published like an
-//! appended one. Nothing sends a member command yet: the join (P2c), the
-//! stream (P2d), the purge (P2g) and an archive replica's search (P2i) will.
+//! appended one. The join (P2c-3) is the first to send one: it keeps the
+//! membership and raises the floor in one transaction, and the tips read the
+//! chain's end. The stream (P2d), the purge (P2g) and an archive replica's
+//! search (P2i) come next.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use roomler_hive_node::store::{SearchHit, Store, StoreError};
+use roomler_hive_node::store::{Membership, SearchHit, Store, StoreError};
 use roomler_hive_node::{ChainTip, EventEnvelope, TranscriptEvent};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
@@ -123,6 +125,26 @@ enum Member {
         sessions: Vec<String>,
         limit: usize,
         reply: Reply<Vec<SearchHit>>,
+    },
+    /// P2c-3 — hold a session as a member, at a fence.
+    Join {
+        session: String,
+        role: &'static str,
+        fence: u64,
+        reply: Reply<u64>,
+    },
+    /// P2c-3 — every session held as a member.
+    Memberships {
+        reply: Reply<Vec<Membership>>,
+    },
+    /// P2c-3 — a session's tip, whole: `seq`, hash and fence.
+    TipOf {
+        session: String,
+        reply: Reply<Option<ChainTip>>,
+    },
+    /// P2c-3 — the store's size, for the quota.
+    SizeBytes {
+        reply: Reply<u64>,
     },
 }
 
@@ -399,6 +421,41 @@ impl StoreHandle {
         })
         .await
     }
+
+    /// FR-90 P2c-3 — hold `session` as a member placed in `role`, at
+    /// `fence`: the floor rises to it in the same transaction
+    /// (`Store::join`). Refused for a purged session, and below the floor.
+    pub(crate) async fn join(
+        &self,
+        session: &str,
+        role: &'static str,
+        fence: u64,
+    ) -> Result<u64, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::Join {
+            session,
+            role,
+            fence,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2c-3 — every session this device holds as a member.
+    pub(crate) async fn memberships(&self) -> Result<Vec<Membership>, WriterError> {
+        self.ask(|reply| Member::Memberships { reply }).await
+    }
+
+    /// FR-90 P2c-3 — `session`'s tip, whole: what a tip report carries.
+    pub(crate) async fn chain_tip(&self, session: &str) -> Result<Option<ChainTip>, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::TipOf { session, reply }).await
+    }
+
+    /// FR-90 P2c-3 — the store's size, as `hive_store_quota_mib` reads it.
+    pub(crate) async fn size_bytes(&self) -> Result<u64, WriterError> {
+        self.ask(|reply| Member::SizeBytes { reply }).await
+    }
 }
 
 fn now_ms() -> i64 {
@@ -542,6 +599,23 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
             reply,
         } => {
             let _ = reply.send(store.search(&query, Some(&sessions), limit));
+        }
+        Member::Join {
+            session,
+            role,
+            fence,
+            reply,
+        } => {
+            let _ = reply.send(store.join(&session, role, fence));
+        }
+        Member::Memberships { reply } => {
+            let _ = reply.send(store.memberships());
+        }
+        Member::TipOf { session, reply } => {
+            let _ = reply.send(store.tip(&session));
+        }
+        Member::SizeBytes { reply } => {
+            let _ = reply.send(store.size_bytes());
         }
     }
 }
@@ -756,5 +830,41 @@ mod tests {
                 .is_empty(),
             "an empty list is nothing, never everything"
         );
+    }
+
+    /// FR-90 P2c-3 — a join on the writer: the membership kept, the floor
+    /// raised, a stale or purged join refused in the store's own word; the
+    /// tip whole, and the size the quota reads.
+    #[tokio::test]
+    async fn the_writer_joins_and_answers_in_the_stores_word() {
+        let store = StoreHandle::spawn(None).unwrap();
+        assert_eq!(store.join("s1", "owner", 2).await.unwrap(), 2);
+        assert_eq!(store.floor("s1").await.unwrap(), Some(2));
+        let held = store.memberships().await.unwrap();
+        assert_eq!(
+            held.iter()
+                .map(|m| (m.session.as_str(), m.role.as_str(), m.fence))
+                .collect::<Vec<_>>(),
+            [("s1", "owner", 2)]
+        );
+        assert!(matches!(
+            store.join("s1", "owner", 1).await,
+            Err(WriterError::Store(StoreError::StaleJoin { .. }))
+        ));
+        assert_eq!(
+            store.chain_tip("s1").await.unwrap(),
+            None,
+            "nothing held yet"
+        );
+        let env = sent("s1", None, 2, &["one"]).remove(0);
+        let tip = store.apply(env).await.unwrap();
+        assert_eq!(store.chain_tip("s1").await.unwrap(), Some(tip));
+        store.purge("s1").await.unwrap();
+        assert!(store.memberships().await.unwrap().is_empty());
+        assert!(matches!(
+            store.join("s1", "owner", 3).await,
+            Err(WriterError::Store(StoreError::Purged { .. }))
+        ));
+        assert!(store.size_bytes().await.unwrap() > 0);
     }
 }

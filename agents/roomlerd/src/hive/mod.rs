@@ -100,9 +100,10 @@ pub use materializer::{MATERIALIZE_SUBCOMMAND, materialize_args, materialize_mai
 #[cfg(all(unix, feature = "hive-test-launcher"))]
 pub use supervisor::init_as_daemon;
 pub use supervisor::{
-    Author, CoreMemory, StartOrder, Supervisor, adopt_enabled, begin_shutdown, begin_update,
-    end_update, global, handle_adopt_ack, handle_memory, handle_start, handle_stop, init,
-    on_connected, turns_running, update_wait, wind_down,
+    Author, CoreMemory, StartOrder, Supervisor, adopt_enabled, archive_enabled, begin_shutdown,
+    begin_update, end_update, global, handle_adopt_ack, handle_memory, handle_replica_join,
+    handle_start, handle_stop, init, on_connected, replica_enabled, turns_running, update_wait,
+    wind_down,
 };
 pub use toolbelt::{relay, relay_args};
 pub use view::{
