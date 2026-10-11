@@ -36,6 +36,10 @@ pub mod disco;
 pub mod dns;
 pub mod hosts;
 pub mod ingress;
+/// A LAN interface's own prefix route made unusable underneath it (a next
+/// hop that is not on its LAN, a VPN's stale gateway): detected and repaired
+/// with the prefix's two on-link halves. Never routes around a capture.
+pub mod lan_repair;
 pub(crate) mod lifecycle;
 pub mod nat;
 pub mod netcheck;
