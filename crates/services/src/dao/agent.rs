@@ -6,7 +6,7 @@ use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    PeerRelayPolicy, SshPolicy,
+    PeerRelayPolicy, RpcCap, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -230,6 +230,34 @@ impl AgentDao {
     pub async fn list_all_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
         self.base
             .find_many(doc! { "tenant_id": tenant_id, "deleted_at": null }, None)
+            .await
+    }
+
+    /// FR-90 P2c-2b — the live devices of `tenant_id` that could hold a copy
+    /// of a session `owner` runs: those whose last hello advertised
+    /// `hive-replica` and that are the owner's own (`owner_user_id` AND
+    /// `enrolled_by`) or among `archives`. A prefilter only: placement checks
+    /// every rule again on what this returns. The array match is equality,
+    /// so `hive-replicas` would not match — the `RpcCap` rule.
+    pub async fn list_replica_candidates(
+        &self,
+        tenant_id: ObjectId,
+        owner: ObjectId,
+        archives: &[ObjectId],
+    ) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "capabilities.rpc": RpcCap::HiveReplica.wire(),
+                    "$or": [
+                        { "owner_user_id": owner, "enrolled_by": owner },
+                        { "_id": { "$in": archives } },
+                    ],
+                },
+                None,
+            )
             .await
     }
 
