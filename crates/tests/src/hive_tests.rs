@@ -3812,3 +3812,219 @@ async fn an_administrator_sets_the_replica_policy_from_the_revision_they_read() 
     .map(|(o, r)| (o.to_string(), r.to_string()));
     assert_eq!(seen, want);
 }
+
+// ─── P2c-2b — placement (`hive.replicaset`) ────────────────────────────────
+
+/// Set fields on a device's stored row, as its hello or an admin would.
+async fn set_device(app: &TestApp, id: &str, set: Document) {
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(id).unwrap() },
+            doc! { "$set": set },
+        )
+        .await
+        .unwrap();
+}
+
+/// A device of the admin's that never connected, whose stored capabilities
+/// are `rpc`: placement reads the last hello, so an offline device is placed
+/// too.
+async fn stored_device(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine: &str,
+    rpc: &[&str],
+) -> String {
+    let (id, _) = enroll_agent(app, seeded, machine, machine).await;
+    let rpc: Vec<String> = rpc.iter().map(|s| s.to_string()).collect();
+    set_device(app, &id, doc! { "capabilities.rpc": rpc }).await;
+    id
+}
+
+/// Start a session on `dev` as `token`, answered as the device would.
+async fn started(app: &TestApp, tid: &str, token: &str, dev: &mut Device, folder: &str) -> Value {
+    let caller = start(app, tid, token, &dev.agent_id, folder);
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives rc:hive.start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    body["session"].clone()
+}
+
+fn members(s: &Value) -> Vec<(String, String)> {
+    s["replicaset"]["members"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|m| {
+            (
+                m["device_id"].as_str().unwrap_or("").to_string(),
+                m["role"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// With the replicaset's switch off, a session is placed nowhere: the
+/// record carries no replicaset and nothing is audited.
+#[tokio::test]
+async fn a_session_started_with_the_switch_off_is_placed_nowhere() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hiveplaceoff").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-placeoff-p", RUNS_HIVE).await;
+    stored_device(&app, &seeded, "mach-placeoff-r", &["hive-replica"]).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/off").await;
+    assert!(s.get("replicaset").is_none(), "{s}");
+    let sid = s["id"].as_str().unwrap();
+    assert!(stored(&app, sid).await.get("replicaset").is_none());
+    let places = app
+        .db
+        .collection::<Document>("hive_audit")
+        .count_documents(doc! { "action": "place" })
+        .await
+        .unwrap();
+    assert_eq!(places, 0);
+}
+
+/// Placement at a start, from the devices' stored rows: the designated
+/// archive that offers itself, then the owner's own devices that offer,
+/// last seen first, until `min`. Never a device that does not offer, an
+/// ephemeral one, one handed to someone else, or a removed one; and with a
+/// restricted primary, only devices carrying its tag, in any case.
+#[tokio::test]
+async fn placement_takes_the_archive_then_the_owners_offering_devices() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hiveplace").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    // Eight devices: past the free plan's three.
+    app.db
+        .collection::<Document>("tenants")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&tid).unwrap() },
+            doc! { "$set": { "plan": "pro" } },
+        )
+        .await
+        .unwrap();
+    let mut primary = device(&app, &seeded, "mach-place-primary", RUNS_HIVE).await;
+    // Online, and its hello offers copies.
+    let laptop = device(
+        &app,
+        &seeded,
+        "mach-place-laptop",
+        &["exec", "hive", "hive-replica"],
+    )
+    .await;
+    let old = stored_device(&app, &seeded, "mach-place-old", &["hive-replica"]).await;
+    let day_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+    set_device(&app, &old, doc! { "last_seen_at": day_ago }).await;
+    let nas = stored_device(
+        &app,
+        &seeded,
+        "mach-place-nas",
+        &["hive-replica", "hive-archive"],
+    )
+    .await;
+    let silent = stored_device(&app, &seeded, "mach-place-silent", &["exec"]).await;
+    let eph = stored_device(&app, &seeded, "mach-place-eph", &["hive-replica"]).await;
+    set_device(&app, &eph, doc! { "ephemeral": true }).await;
+    let handed = stored_device(&app, &seeded, "mach-place-handed", &["hive-replica"]).await;
+    let member_id = ObjectId::parse_str(&seeded.member.id).unwrap();
+    set_device(&app, &handed, doc! { "owner_user_id": member_id }).await;
+    let removed = stored_device(&app, &seeded, "mach-place-removed", &["hive-replica"]).await;
+    set_device(&app, &removed, doc! { "deleted_at": bson::DateTime::now() }).await;
+
+    let mut policy = a_policy(0);
+    policy["replicaset"] = json!({
+        "min": 3, "max": 4, "archive": true,
+        "prefer": ["owner_devices"], "restricted_tags": ["prod"],
+    });
+    policy["archive_devices"] = json!([nas]);
+    let (code, p) = put_policy(&app, &tid, &admin, &policy).await;
+    assert_eq!(code, 200, "{p}");
+
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/place").await;
+    let r = &s["replicaset"];
+    assert_eq!(
+        (
+            r["policy_revision"].as_i64(),
+            r["min"].as_u64(),
+            r["max"].as_u64()
+        ),
+        (Some(1), Some(3), Some(4)),
+        "{s}"
+    );
+    let want = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(d, r)| (d.to_string(), r.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        members(&s),
+        want(&[
+            (&primary.agent_id, "primary"),
+            (&nas, "archive"),
+            (&laptop.agent_id, "owner"),
+        ]),
+        "{r}"
+    );
+    assert!(r.get("short").is_none(), "{r}");
+    assert_eq!(r["restricted_tags"], json!([]));
+    let sid = s["id"].as_str().unwrap().to_string();
+    let (_, read) = get_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(read["replicaset"], s["replicaset"], "kept on the record");
+    for never in [&silent, &eph, &handed, &removed, &old] {
+        assert!(!members(&s).iter().any(|(d, _)| d == never), "{never}: {r}");
+    }
+
+    // A primary tagged `Prod` is restricted by the policy's `prod`; only the
+    // device tagged `PROD` may hold a copy, and the session is short.
+    set_device(&app, &primary.agent_id, doc! { "tags": ["Prod"] }).await;
+    set_device(&app, &old, doc! { "tags": ["PROD"] }).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/prod").await;
+    let r = &s["replicaset"];
+    assert_eq!(r["restricted_tags"], json!(["prod"]), "{r}");
+    assert_eq!(
+        members(&s),
+        want(&[(&primary.agent_id, "primary"), (&old, "owner")]),
+        "{r}"
+    );
+    assert_eq!(r["short"], "restricted");
+
+    let tid_oid = ObjectId::parse_str(&tid).unwrap();
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "tenant_id": tid_oid, "action": "place" })
+        .await
+        .unwrap();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        seen.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+        ));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("placed".to_string(), String::new()),
+            ("short".to_string(), "restricted".to_string()),
+        ]
+    );
+}
