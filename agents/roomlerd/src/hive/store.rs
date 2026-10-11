@@ -20,8 +20,10 @@
 //! tell `purged` from a stale fence. An applied envelope is published like an
 //! appended one. The join (P2c-3) is the first to send one: it keeps the
 //! membership and raises the floor in one transaction, and the tips read the
-//! chain's end. The stream (P2d), the purge (P2g) and an archive replica's
-//! search (P2i) come next.
+//! chain's end. The stream (P2d-3) applies what a source sends, an event
+//! held already taken as held (`apply_unless_held`), and keeps the blobs a
+//! member asks for. The purge (P2g) and an archive replica's search (P2i)
+//! come next.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -47,6 +49,8 @@ enum Cmd {
         session: String,
         after: u64,
         limit: usize,
+        /// P2d-3 — the page cut before its events' JSON passes this.
+        max_bytes: usize,
         reply: oneshot::Sender<Result<Vec<EventEnvelope>, String>>,
     },
     Tip {
@@ -80,6 +84,11 @@ enum Member {
     Apply {
         env: EventEnvelope,
         reply: Reply<ChainTip>,
+    },
+    /// P2d-3 — apply, or nothing for an event held already.
+    ApplyUnlessHeld {
+        env: EventEnvelope,
+        reply: Reply<bool>,
     },
     RaiseFloor {
         session: String,
@@ -216,12 +225,26 @@ impl StoreHandle {
         after: u64,
         limit: usize,
     ) -> Result<Vec<EventEnvelope>, String> {
+        self.page_within(session, after, limit, usize::MAX).await
+    }
+
+    /// FR-90 P2d-3 — [`Self::page`], cut before its events' JSON passes
+    /// `max_bytes`, and never empty while an event follows `after`
+    /// (`Store::page_within`): one replica stream frame.
+    pub(crate) async fn page_within(
+        &self,
+        session: &str,
+        after: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<EventEnvelope>, String> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Page {
                 session: session.to_string(),
                 after,
                 limit,
+                max_bytes,
                 reply,
             })
             .map_err(|_| "the replica store is closed".to_string())?;
@@ -303,6 +326,15 @@ impl StoreHandle {
     /// its stream carries before it gets here.
     pub(crate) async fn apply(&self, env: EventEnvelope) -> Result<ChainTip, WriterError> {
         self.ask(|reply| Member::Apply { env, reply }).await
+    }
+
+    /// FR-90 P2d-3 — [`Self::apply`], or nothing for an event this store
+    /// holds already, the same `seq` hashed the same, which another stream
+    /// of the session applied first (`Store::apply_unless_held`). Published
+    /// to the live feed only when it was applied here. `true` when it was.
+    pub(crate) async fn apply_unless_held(&self, env: EventEnvelope) -> Result<bool, WriterError> {
+        self.ask(|reply| Member::ApplyUnlessHeld { env, reply })
+            .await
     }
 
     /// Raise `session`'s fence floor to `fence`; the floor after it is
@@ -532,10 +564,11 @@ fn writer(
                 session,
                 after,
                 limit,
+                max_bytes,
                 reply,
             } => {
                 let page = store
-                    .page(&session, after, limit)
+                    .page_within(&session, after, limit, max_bytes)
                     .map_err(|e| format!("reading the replica store: {e}"));
                 let _ = reply.send(page);
             }
@@ -574,6 +607,14 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
             // Published before the answer, so whoever the answer reaches can
             // already find it on the feed.
             if landed.is_ok() {
+                let _ = publish.send(Arc::new(env));
+            }
+            let _ = reply.send(landed);
+        }
+        Member::ApplyUnlessHeld { env, reply } => {
+            let landed = store.apply_unless_held(&env);
+            // Held already: on the feed since it first landed.
+            if matches!(landed, Ok(true)) {
                 let _ = publish.send(Arc::new(env));
             }
             let _ = reply.send(landed);
