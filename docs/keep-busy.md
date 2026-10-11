@@ -4,9 +4,10 @@
 > [spec](fr/FR-92-keep-busy.md)).
 >
 > **Status: released (0.4.125; GNOME Wayland in 0.4.126) and field-verified on
-> Windows 11, GNOME on Xorg and GNOME Wayland**, a self-update included
-> ([spec §9](fr/FR-92-keep-busy.md#9-field-verification-log)). macOS is still
-> owed.
+> Windows 11, GNOME on Xorg, GNOME Wayland and macOS** (a supervised MacBook), a
+> self-update included ([spec §9](fr/FR-92-keep-busy.md#9-field-verification-log)).
+> The macOS cell found two faults, fixed in #1991 (§9, and the macOS notes in
+> §10).
 >
 > | Part | What |
 > |---|---|
@@ -433,7 +434,7 @@ sequenceDiagram
 | Windows, user-context and SystemContext workers | ✅ (field: Win11, 0.4.125) | `GetLastInputInfo` · `OpenInputDesktop` · `GetMonitorInfoW.rcWork` |
 | Linux X11 (a user-session daemon, or root with the display's auth) | ✅ (Xvfb in CI; field: GNOME on Xorg, 0.4.125) | `MIT-SCREEN-SAVER` · logind `LockedHint` (`logind.rs` L144) · RandR 1.5 ∩ `_NET_WORKAREA` |
 | **GNOME on Wayland**, or GNOME on Xorg, under a **root** daemon with uinput on (P9) | ✅ blind ([§2](#a-blind-host-gnome-through-uinput)) | Mutter IdleMonitor through the session helper · logind `LockedHint` · Mutter `DisplayConfig` |
-| macOS, GUI worker or LaunchAgent | ✅ (compiled; field owed) | `CGEventSourceSecondsSinceLastEventType` · `CGSessionCopyCurrentDictionary` (`host_mac.rs` `console`, L182) · `CGDisplayBounds` + 96 pt |
+| macOS, GUI worker or LaunchAgent | ✅ (field: a supervised MacBook, macOS 27, 0.4.126) | `CGEventSourceSecondsSinceLastEventType` · `CGSessionCopyCurrentDictionary` (`host_mac.rs` `console`, L182) · `CGDisplayBounds` + 96 pt |
 | Wayland without the uinput path: a per-user daemon, or uinput off | ✖ reported (`wayland`) | — |
 | KDE Plasma or wlroots on Wayland, uinput on | ✖ reported (`no_idle_clock`): no idle clock a helper can read | — |
 
@@ -459,6 +460,33 @@ sequenceDiagram
 > never saw GNOME's lock and kept moving the pointer behind the lock screen
 > (field, GNOME 46 on Ubuntu 24.04). P9's `logind::pick` falls back to the
 > active X11 session that names no display.
+
+> [!NOTE]
+> **macOS has two idle clocks, and posted input refreshes them differently.**
+> The session's event-source clock, the one keep busy reads and apps such as
+> Teams read, follows every move: on the MacBook it stayed under 1 s for 83
+> minutes (the only longer gaps are wander's 250–900 ms rests).
+> `IOHIDSystem`'s `HIDIdleTime`, the one the screensaver and display sleep read,
+> is refreshed by **posted** input only once per ~5 s: a 5.0–5.1 s sawtooth,
+> maximum 5.8 s, and identical for a remote controller's input. Both stay far
+> below any lock or Away delay, so this is a measurement note, not a fault.
+> Measure macOS by the session clock (`osascript -l JavaScript` with
+> `CGEventSourceSecondsSinceLastEventType(0, ~0)`). `HIDIdleTime` alone reads
+> as a 5 s idle that is not there.
+>
+> **The Accessibility grant.** macOS 27 lists it under Privacy & Security →
+> **Device Control & Data Access**, with two entries: "Roomler" (the companion)
+> and "roomlerd" (the agent). Only `roomlerd`'s gates input, and the agent
+> reads it at start.
+> - A worker that **loses** the grant while running keeps its start-time view,
+>   but its moves stop landing. Keep busy then says `calibration_failed` and
+>   retries every 30 s; it never claims to run.
+> - A worker that **starts** without the grant cannot build an injector at all:
+>   the enigo we ship refuses ("the application does not have the permission to
+>   simulate input"). Keep busy asks the OS (`arbiter.rs`
+>   `classify_unpermitted`) and says `no_permission`, the reason that names the
+>   fix. Before #1991 it said `unsupported`, "Unavailable on this computer."
+>   (field, 0.4.126).
 
 ## 11. History (P7)
 
@@ -656,7 +684,7 @@ Run this on a release candidate, never on a machine someone is using. Record
 the negative control **first**. The runs so far, with their numbers, are in the
 [spec's log](fr/FR-92-keep-busy.md#9-field-verification-log): Windows 11 and
 GNOME on Xorg on 0.4.125 (cells 1–5, 7 in part); GNOME on Wayland on the P9
-build (cell 8). macOS (cell 6) is owed.
+build (cell 8); macOS on 0.4.126 (cells 1–3 and 6, spec rows 30–37).
 
 > [!TIP]
 > On a throwaway VM, **real local input** comes from the hypervisor:
@@ -673,7 +701,10 @@ build (cell 8). macOS (cell 6) is owed.
 1. **Negative control.** A host with a 1-minute lock and Teams open, keep busy
    OFF: it locks, and Teams goes Away. Measure idle with `roomler exec`:
    - Windows: a `GetLastInputInfo` one-liner;
-   - macOS: `ioreg -c IOHIDSystem` `HIDIdleTime`;
+   - macOS: the session clock, `osascript -l JavaScript -e
+     'ObjC.import("CoreGraphics"); $.CGEventSourceSecondsSinceLastEventType(0, 4294967295)'`.
+     `ioreg -c IOHIDSystem` `HIDIdleTime` shows a ~5 s sawtooth under posted
+     input (§10), so on its own it overstates idle;
    - X11: `xprintidle`.
 2. **ON:** no lock for 15 min, Teams stays Available, idle stays under 2 s.
 3. **Pause and resume:** a local touch, local typing and controller typing each
@@ -683,13 +714,17 @@ build (cell 8). macOS (cell 6) is owed.
 5. **Org deny:** the PUT makes every online device log
    `keep-busy: org policy received` and stop within 5 s.
 6. **macOS:**
-   - with a lock hot corner set, it never fires in 30 min at size l;
-   - with Accessibility denied, it reports `no_permission`.
+   - with a lock hot corner set, it never fires in 30 min at size l. Prove the
+     corner is live first: a viewer move to the exact corner must lock the Mac;
+   - with Accessibility denied, it reports `no_permission`. Switch off
+     **roomlerd** (not "Roomler", the companion), then restart the GUI worker:
+     the grant is read at start (§10).
    - On a **supervised** Mac, `roomler keep-busy status` and the tray reach
      the **GUI worker**, which runs keep busy, and not the root daemon. The
      worker serves the per-user LocalAPI socket that clients try first. `sudo`
-     drops `TMPDIR`, but `temp_dir()` falls back to the same per-user folder.
-     This is expected, not yet proven.
+     drops `TMPDIR`, but `temp_dir()` falls back to the same per-user folder:
+     proven on 0.4.126 (spec row 36). A **root** client lands on the daemon,
+     which asks the worker since #1991 (§9).
 7. **Worker types:** both the SystemContext and the user-context Windows
    workers. The SystemContext worker's store is **owned by the user**.
 8. **GNOME on Wayland**, a system install with `uinput = true`: OFF ⇒ GNOME

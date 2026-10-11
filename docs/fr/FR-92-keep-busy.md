@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11) and field-verified (§9); owed: macOS, the tray, 24 h of EDR
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11) and field-verified (§9), macOS included; owed: 24 h of EDR (10-12 07:00Z) and the two macOS fixes of #1991 on a release
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -416,7 +416,36 @@ Mutter's `GetIdletime` over the person's bus.
 | 28 | **AC4: a daemon self-update** | Win11 system install on **0.4.125**, keep busy running, no viewer | the agent's own updater: "installer signature verified … signer=G ROX LTD", "spawning installer and exiting current=0.4.125 latest=agent-v0.4.126"; 5 s later 0.4.126 started and **"keep-busy: restored from the per-person store"** (circle, `vmtest admin`) — running again with no viewer: 60 s of session idle, max 47 ms. (A server-pushed update is DROPPED while the device's `auto_update = false`, by design: "update trigger dropped — auto-update is off on this device".) |
 | 29 | **AC9 + AC13 on the release** | a fresh Ubuntu 24.04 GNOME Wayland system install of **0.4.126** (uinput on) | OFF: a real key, then GNOME locked at 60.35 s. ON from the viewer: running in 229 ms; the GNOME host came up 24 ms after "no X display to drive"; **2 min: Mutter idle max 39 ms, no lock**; a real local key paused it at once (`paused_by: local`) and it resumed 10.3 s later |
 
+**macOS, 2026-10-11, on the released 0.4.126** — the operator's MacBook, at the operator's request
+and with the operator at the machine for the hands-on cells: macOS 27.0.1, a **supervised** install
+(root daemon + GUI worker), display sleep set to never. Idle is read on the Mac by a 1 Hz sampler
+(later 4 Hz): `HIDIdleTime` from `ioreg -c IOHIDSystem`, the screen lock from
+`CGSSessionScreenIsLocked`, and the session's event-source clock
+(`CGEventSourceSecondsSinceLastEventType`) through `osascript -l JavaScript`. The viewer is the
+production SPA in the operator's Chrome, its control channel tapped as on the VMs.
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 30 | **AC2 on macOS**: the negative control, then ON | the MacBook | OFF: `HIDIdleTime` 803 → 826 s and climbing, unlocked. ON from the viewer (`wander`, size `l`, resume after 10 s): `running` 157 ms after the click. Over **83.5 min**, the session clock stayed at **max 1.005 s** (3,801 samples; one at or over 1 s, at one of wander's 250–900 ms rests). `HIDIdleTime` stayed at **max 5.82 s** (4,376 samples), never locked. It then ran on for **2.5 h**, never paused, until a person came back |
+| 31 | **macOS idle clocks** (a finding, not a fault) | the MacBook | `HIDIdleTime` — what the screensaver and display sleep read — is refreshed by **posted** input only once per **5.0–5.1 s**: a sawtooth while keep busy posts about 30 moves a second. A remote controller's input showed the identical 5 s sawtooth. The session clock follows every move. Both stay far below any screensaver, lock or Away delay |
+| 32 | **Hot corners** (cell 6) | the MacBook | All four corners set to **Lock Screen**; size `l`, anchored near the top-right: **none fired in 2.5 h**. Positive control: a viewer move to the exact corner (0, 0) locked the Mac. Keep busy said **`locked` 259 ms after that move**, and posted nothing while locked (`HIDIdleTime` climbed to 19.9 s). After the unlock: `paused` (`local`), then `running` 10.1 s after the last input. The corners were restored afterwards |
+| 33 | **AC3 on macOS** | the MacBook | **Local**: a trackpad touch at 17:49:26.791 (a `HIDIdleTime` reset off the 5 s grid) gave `paused` (`local`) at 17:49:26.842, **51 ms**. A Shift tap gave `paused` 0.49 s **before** its key-up, which the 10 s resume dates exactly. **Remote**: a viewer's move gave `paused` (`remote`) in **109–126 ms**. Each resumed 10 s after the last input |
+| 34 | **AC4 on macOS**: disconnect, then a worker restart | the MacBook | Viewer closed at 14:52:25: keep busy ran 2.5 h with no viewer. A reconnecting viewer read `running` and re-asserted nothing. A restarted GUI worker logged **"keep-busy: restored from the per-person store"**. The worker's store is in the person's `~/Library/Application Support/live.roomler.roomler/` and owned by them; the root daemon keeps its own under `/var/root` |
+| 35 | **AC1, two viewers** | the MacBook | Two Chrome instances on one session ("shared ×2"). A move from viewer 2: both showed `paused` (`remote`) **33 ms apart** and `running` 38 ms apart, identical states. (The second instance was not Edge: Edge was not connected to the extension) |
+| 36 | **AC7 on macOS**: the tray, and the CLI on a supervised Mac | the MacBook | **Tray**: the companion's "Stop keep busy (Wander · …)" reached the **worker**: `turned off reason="stopped_locally"` and `localapi: keep busy stopped at this computer`; every viewer showed `off`. The companion's own log reads the worker (`tray: keep busy is on pattern=wander`). **CLI as the person** (`sudo -u <person> roomler keep-busy status`, so `TMPDIR` dropped) reached the worker: `running`. **CLI as root**, what `roomler exec` runs, ❌: it reached the root daemon's own idle engine. `status` said `off`, and `off` stopped nothing — 6 s later the worker still said `running` and the session clock read 6–505 ms. Fixed in #1991 (the daemon asks the worker over the delegation channel); field confirmation rides the next release |
+| 37 | **Accessibility denied** (cell 6) | the MacBook | macOS 27 lists the grant under Privacy & Security → **Device Control & Data Access**, with two entries: "Roomler" (the companion) and "roomlerd" (the agent). Only `roomlerd`'s counts: switching off the companion's changed nothing. With `roomlerd`'s off, a **running** worker kept its start-time grant, but its moves stopped landing: `unavailable` (`calibration_failed`) on every 30 s retry, never a false `running`. A **restarted** worker could not inject (it announced `permissions: ["screen-capture"]`, no `input`); the pointer stayed still. But it reported `unsupported`, "Unavailable on this computer." ❌, instead of `no_permission`: the enigo we ship refuses to construct without the grant, and a Noop read as "no backend". Fixed in #1991 (`classify_unpermitted` asks the OS first). Re-granted, a worker restart brought input back (`["screen-capture", "input"]`) |
+
 Wrong turns, recorded so nobody repeats them:
+- **On macOS, two Accessibility entries.** Switch off **roomlerd**, not "Roomler": the companion's
+  entry does not gate the agent's input. And a grant change reaches the agent only at its next
+  start, so restart the GUI worker after flipping it.
+- **The viewer's menu was not clickable from the extension.** In a tab that is not focused, the
+  menu's enter transition never finished. Vuetify left `pointer-events: none` on it, so two "switch"
+  clicks fell through to the remote picture and landed on the Mac's menu bar as a controller's
+  clicks. Check `document.elementFromPoint` before clicking near a menu, and toggle the switch with
+  a DOM `click()` (the same handler) instead.
+- **A viewer's corner move must target the letterboxed picture, not the canvas.** In adaptive
+  scale the picture is narrower than its element; points in the side bars are dropped.
 - **An ephemeral (vmtest) device unenrolls on a clean OS restart.** Windows' servicing
   (TrustedInstaller, "Operating System: Upgrade") restarted the guest once after a hard reset, and
   the device removed itself, by design (FR-51). The reboot cell needs a standard enrollment.
@@ -429,9 +458,18 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), and 24 h of EDR on
-the corporate laptop (AC8). AC11 and AC12 are proven on prod (rows 25–26); AC4's self-update and
-AC9/AC13 on the released 0.4.126 (rows 28–29).
+Still owed:
+- **24 h of EDR on the corporate laptop (AC8).** Microsoft Defender Antivirus plus Defender for
+  Endpoint (`Sense`). The window opened at 07:00Z on 10-11 with 0.4.125; the laptop self-updated
+  to 0.4.126 at 14:30Z. At 14:39Z there were 0 detections and 0 Defender events since 07:00Z. The
+  window closes at 07:00Z on 10-12.
+- **The two macOS fixes from rows 36 and 37 (#1991), field-confirmed on a release that carries
+  them.**
+
+Proven so far:
+- macOS: rows 30–37.
+- AC11 and AC12, on prod: rows 25–26.
+- AC4's self-update, and AC9/AC13 on the released 0.4.126: rows 28–29.
 
 AC3 and AC5 were reworded on the operator's go (2026-10-11, "proceed per your recommendation"):
 - **AC3** keeps "within 1 s" for moves, clicks, scrolls and typing, and states the accepted limit: on
