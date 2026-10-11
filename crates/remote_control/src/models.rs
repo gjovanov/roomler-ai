@@ -671,6 +671,16 @@ pub enum RpcCap {
     /// no archive holds its owner's own sessions only. Equality-matched,
     /// locked by test.
     HiveArchive,
+    /// FR-90 P2d — the agent carries replica streams: it serves a session it
+    /// holds to a member over QUIC (`rc:hive.replica.grant`), and, as a
+    /// member, asks for and dials one (`rc:hive.replica.want`). A build
+    /// capability, advertised while its store is open: a primary serves the
+    /// sessions it runs whether or not its owner lets it hold copies of
+    /// others' (`hive-replica`).
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2d
+    /// drops every stream frame. Equality-matched, locked by test.
+    HiveStream,
 }
 
 impl RpcCap {
@@ -697,11 +707,12 @@ impl RpcCap {
             Self::HiveAdopt => "hive-adopt",
             Self::HiveReplica => "hive-replica",
             Self::HiveArchive => "hive-archive",
+            Self::HiveStream => "hive-stream",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 15] = [
+    pub const ALL: [RpcCap; 16] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -717,6 +728,7 @@ impl RpcCap {
         Self::HiveAdopt,
         Self::HiveReplica,
         Self::HiveArchive,
+        Self::HiveStream,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4691,6 +4703,7 @@ mod tests {
         assert_eq!(RpcCap::HiveAdopt.wire(), "hive-adopt");
         assert_eq!(RpcCap::HiveReplica.wire(), "hive-replica");
         assert_eq!(RpcCap::HiveArchive.wire(), "hive-archive");
+        assert_eq!(RpcCap::HiveStream.wire(), "hive-stream");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4708,7 +4721,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 8] = [
+        const KNOWN: [(RpcCap, RpcCap); 9] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4729,6 +4742,9 @@ mod tests {
             // `hive_replica_and_hive_archive_are_promises_of_their_own`.
             (RpcCap::Hive, RpcCap::HiveReplica),
             (RpcCap::Hive, RpcCap::HiveArchive),
+            // FR-90 P2d — nor "carries replica streams". Locked by
+            // `hive_stream_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveStream),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5036,6 +5052,31 @@ mod tests {
         assert_eq!(RpcCap::from_wire("hive-archive"), Some(RpcCap::HiveArchive));
         assert!(RpcCap::from_wire("hive-replicas").is_none());
         assert!(RpcCap::from_wire("hive-archives").is_none());
+    }
+
+    /// FR-90 P2d — carrying replica streams is a promise of its own: a build
+    /// that runs sessions or holds copies but predates P2d drops every stream
+    /// frame, so a grant pushed to it would wait out its whole timeout. Nor
+    /// does carrying streams imply holding copies: a primary serves its own
+    /// sessions whatever its owner said of others'.
+    #[test]
+    fn hive_stream_is_a_promise_of_its_own() {
+        let older = AgentCaps {
+            rpc: vec!["hive".into(), "hive-replica".into(), "hive-archive".into()],
+            ..Default::default()
+        };
+        assert!(!older.has_rpc(RpcCap::HiveStream));
+        let streams = AgentCaps {
+            rpc: vec!["hive".into(), "hive-stream".into()],
+            ..Default::default()
+        };
+        assert!(streams.has_rpc(RpcCap::HiveStream));
+        assert!(
+            !streams.has_rpc(RpcCap::HiveReplica),
+            "serving its own sessions is not holding others'"
+        );
+        assert_eq!(RpcCap::from_wire("hive-stream"), Some(RpcCap::HiveStream));
+        assert!(RpcCap::from_wire("hive-streams").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

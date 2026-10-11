@@ -117,6 +117,9 @@ enum Report {
     /// P2c-3 — every session the device holds a copy of
     /// (`rc:hive.replica.manifest`).
     ReplicaManifest(Vec<HiveReplicaManifestEntry>),
+    /// P2d — a stream frame (`rc:hive.replica.want` · `ready` ·
+    /// `candidate` · `close`), from a connection advertising `hive-stream`.
+    Stream(ClientMsg),
     /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
     /// the device's answer must reach the browser before its candidates.
     View(ClientMsg),
@@ -254,6 +257,25 @@ impl AgentMsgHandler for HiveAgentSocket {
                 checkpoint,
             }),
             ClientMsg::HiveReplicaManifest { sessions } => Report::ReplicaManifest(sessions),
+            // P2d — read only from a connection that advertises
+            // `hive-stream`: a build that does not carry streams has nothing
+            // to say about one. Checked here, against THIS connection.
+            stream @ (ClientMsg::HiveReplicaWant { .. }
+            | ClientMsg::HiveReplicaReady { .. }
+            | ClientMsg::HiveReplicaCandidate { .. }
+            | ClientMsg::HiveReplicaClose { .. }) => {
+                if self
+                    .state
+                    .fleet
+                    .rc_hub
+                    .agent_supports_hive_stream_on(ctx.agent_id, &ctx.tx)
+                    != Some(true)
+                {
+                    debug!(agent_id = %ctx.agent_id, "hive: a stream frame from a connection without hive-stream — dropped");
+                    return None;
+                }
+                Report::Stream(stream)
+            }
             view @ (ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -528,6 +550,9 @@ async fn apply_reports(
             }
             Report::Adopt(offer) => crate::adopt::offer(state, tenant_id, device_id, offer).await,
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
+            Report::Stream(msg) => {
+                crate::stream::on_device_frame(state, tenant_id, device_id, msg).await
+            }
         }
     }
 }

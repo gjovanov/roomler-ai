@@ -62,6 +62,7 @@ pub mod replica;
 pub mod room;
 pub mod routes;
 pub mod scope;
+pub mod stream;
 pub mod view;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -95,6 +96,10 @@ pub struct HiveState {
     pub scope: Arc<scope::TenantScope>,
     /// P2c-2a — the organizations' replica policies.
     pub policies: Arc<policy::PolicyDao>,
+    /// P2d — the replica stream grants this pod minted (pod-local).
+    pub stream_grants: Arc<stream::StreamGrants>,
+    /// The per-(member, session) want ceiling.
+    pub stream_limiter: Arc<RateLimiter>,
     /// P2c — the replicaset's server switch (`hive.replicaset`, default off).
     pub replicaset: bool,
 }
@@ -137,6 +142,8 @@ impl Module for HiveState {
             brain: Arc::new(brain::BrainDao::new(db)),
             scope: Arc::new(scope),
             policies: Arc::new(policy::PolicyDao::new(db)),
+            stream_grants: Arc::new(stream::StreamGrants::new()),
+            stream_limiter: Arc::new(RateLimiter::new()),
             replicaset: settings.hive.replicaset,
             chat: BoundChat::new(&core),
             fleet,

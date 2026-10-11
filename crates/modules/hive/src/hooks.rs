@@ -92,6 +92,9 @@ impl FleetLifecycle for HiveHooks {
             false,
         )
         .await;
+        // P2d — every stream it is a side of ends, as member or source; the
+        // other side is told.
+        crate::stream::end_for_device(&self.state, agent_id, "device_removed");
         // P2c-4 — where it held copies, it leaves, and another device may
         // take its place. Its row is still there while this runs, so it is
         // named as gone.
