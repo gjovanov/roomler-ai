@@ -17,7 +17,9 @@ compositor — but only inside a logged-in session, and only after a human says
 yes. Mutter's own screencast API works where the portal cannot even start — but
 asks nobody, and only exists on GNOME. Each arm sees something the others
 cannot and pays for it in a different currency, so the cascade tries them in a
-fixed order and every non-default arm is **opt-in**.
+fixed order and every non-default arm is **opt-in**, with one exception from
+FR-93 P2: a per-user daemon in its own Wayland session, with no capture key
+set, switches mutter or the portal on by itself (§1.2).
 
 ## 1. The cascade
 
@@ -153,6 +155,67 @@ CI proves the half it can run, against Xvfb in the X11 lane (`ci.yml`, the
   carries the extension.
 
 The Xwayland half itself is proven on the lab's GNOME guests (§6).
+
+### 1.2 A per-user Wayland session switches itself on (FR-93 P2, decision D1)
+
+From P2, one case is no longer opt-in. A **per-user** daemon whose own user is
+signed in to an active **Wayland** session, with **no capture key set**,
+switches its arms on by itself before the cascade above runs. It tries two:
+
+- **mutter** first (§5). It is GNOME's own screencast, it asks nobody, and it
+  is the unattended peer of DRM.
+- **the portal** next (§4). It asks the person at the screen once, and KDE
+  renews that grant every session.
+
+`capture::wayland_plan` (`capture/mod.rs`) decides, as a pure function:
+
+```mermaid
+flowchart TD
+    O([open_default]) --> K{"wayland_aware and wayland_auto on,<br/>not root, no capture key,<br/>no virtual desktop?"}
+    K -- no --> C["the cascade of §1, exactly as before P2"]
+    K -- yes --> S{"logind: this user's session<br/>active, class user, type wayland?"}
+    S -- no --> C
+    S -- yes --> M{"org.gnome.Mutter.ScreenCast<br/>answers on the session bus?"}
+    M -- yes --> MO{"its screencast opens?"}
+    MO -- yes --> MU["mutter, AUTOMATIC<br/>(logged as a warning: it asks nobody)"]
+    MO -- no --> L
+    M -- no --> L{"session locked?"}
+    L -- no --> P["the portal, AUTOMATIC + ATTENDED"]
+    L -- yes --> F["backend_error, each arm's reason<br/>(the portal is never asked behind a lock)"]
+    P -- "failed or unanswered" --> F
+```
+
+| | auto? | why |
+|---|---|---|
+| a per-user daemon in its own Wayland session, no capture key | **yes** | D1's per-user half |
+| a root (system) daemon | no | D1's system half: DRM and uinput stay opt-in until a desktop companion ships for non-Debian hosts, because without one a system install there has no "being viewed" banner and no Disconnect |
+| any of `drm_capture`, `portal_capture`, `mutter_capture`, `window_capture` set, **to anything** | no | an explicit key always wins. `portal_capture = false` keeps the portal off, as before |
+| `ROOMLERD_VIRTUAL_DESKTOP=1` | no | the daemon's own Xvfb is what it captures |
+| X11, a tty only, nobody signed in, no logind | no | auto applies only where logind says Wayland, so an X11 host keeps FR-29's idle numbers byte for byte |
+| `wayland_auto = false` or `wayland_aware = false` | no | the kill switches |
+
+⚠️ **A failed automatic arm reports `backend_error`, never `wayland_not_enabled`.**
+The arms were switched on, by policy, so "switch it on" would be the wrong
+sentence. The detail names each arm's own reason, for example *"mutter: … is not
+on this session's bus, so this is not a GNOME session; the portal: … a consent
+dialog left unanswered"*. This is the same rule §1.1 gives an arm the operator
+switched on.
+
+⚠️ **The portal is never asked behind a locked screen.** Nobody could answer
+it, and its open waits two minutes for an answer (`HANDSHAKE_DEADLINE`).
+mutter still is: a locked GNOME session keeps its screencast API.
+
+⚠️ **Input does not follow.** Portal input stays opt-in (`portal_input`): it is a
+separate grant, and it is not yet proven to land. Mutter's RemoteDesktop input
+is P4. A per-user GNOME session therefore shows its picture from P2 and still
+names its input reach (P1d) until P4.
+
+The arm is on the wire: `rc:video-info` carries `capture_arm` (`drm`, `mutter`,
+`portal` or `x11`) and `attended` (`true` only for the portal). Both are absent
+from Windows, macOS and older agents.
+
+**Kill switch**: `wayland_auto` / `ROOMLERD_WAYLAND_AUTO=0` (default on) gives
+back the behaviour before P2.
 
 ## 2. The X11 arm, and the virtual desktop
 
@@ -508,6 +571,7 @@ the daemon through the env bridge (`crates/agent-core/src/config.rs:2549`).
 | `mutter_capture` | `ROOMLERD_MUTTER_CAPTURE` | off | the mutter arm (§5), **inside** `portal_capture`. **Unattended, GNOME-only, no input** |
 | `window_capture` | `ROOMLERD_WINDOW_CAPTURE` | off | FR-56 P4: one application window instead of the monitor. Attended **by construction** — the portal answers with a window picker, and nothing agent-side can name a window (GNOME refuses `Introspect.GetWindows`) |
 | `wayland_aware` | `ROOMLERD_WAYLAND_AWARE` | **on** | FR-93 P1 (§1.1): a Wayland desktop that no arm may capture reports `wayland_not_enabled`, never black and never "headless". Switches no capture on. Off = the behaviour before FR-93, unchanged |
+| `wayland_auto` | `ROOMLERD_WAYLAND_AUTO` | **on** | FR-93 P2 (§1.2): a **per-user** daemon in its own Wayland session, with no capture key set, switches on mutter (asks nobody) and else the portal (asks once). Never on a root daemon. Off = the behaviour before P2 |
 | — | `ROOMLERD_VIRTUAL_DESKTOP` (+ `_RESOLUTION`, `_WM`, `_STARTUP`) | off | the daemon's own Xvfb (§2). Turn it **off** when testing the portal arms on a host that has it, or the X11 fallback quietly serves the session in the portal's place |
 | `virtual_desktop_apps` | — | — | the FR-56 launch allowlist — for a virtual desktop **or** a logged-in X11/Xwayland session; [`remote-apps.md`](remote-apps.md) §7 |
 

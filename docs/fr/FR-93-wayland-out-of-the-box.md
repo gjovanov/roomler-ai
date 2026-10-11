@@ -349,6 +349,20 @@ byte-for-byte; an explicit key always wins (`drm_capture = false` removes the ar
 switch `ROOMLERD_WAYLAND_AUTO=0`; the choice is logged once per session and put on the wire
 (`capture_arm`, `attended`) — FR-45 AC8 option (b).
 
+**As built (P2a, D1).** Only the per-user half switches itself on: a root daemon never does
+(`capture::wayland_plan`; mechanics in [`linux-capture.md`](../linux-capture.md) §1.2). Three choices the
+flowchart above leaves open:
+
+- *"A person who can answer"* is read as **the session is not locked**. Nobody can answer the portal behind a
+  lock, and its open waits two minutes for an answer. mutter is tried locked or not.
+- **"Any capture key" means set to anything.** `drm_capture`, `portal_capture`, `mutter_capture` and
+  `window_capture` count, so `portal_capture = false` keeps the portal off as before. A virtual desktop also
+  keeps the cascade as configured.
+- The last node is **`backend_error` with each arm's reason**, not `wayland_not_enabled`, whenever an automatic
+  arm was tried and failed. The arms were switched on, so "switch it on" would be the wrong sentence. This is
+  the rule P1c gives an arm the operator switched on. `wayland_not_enabled` stays the answer when nothing may
+  capture: a kill switch, an explicit `false`, a root daemon.
+
 ⚠️ **The policy coupling is the decision, not a detail.** DRM and mutter capture without asking anyone.
 FR-36 made it a precondition that the viewer indicator is reachable on those surfaces before DRM leaves
 opt-in (`FR-36-wayland-capture.md:308-313`). Today: x86_64 system installs have the companion banner (P11);
@@ -431,6 +445,9 @@ bridge for text and images in the lab before deciding.
 | **P0** | the lab (§3.2), #1719 finished, the 0.4.124 baseline recorded red | — | lab, vmtest, Asahi | M |
 | **P1** | honest failure (§4.2), #1945, the GEM-handle fix (§4.4a), `capture-smoke` reads config | `ROOMLERD_WAYLAND_AWARE=0` | lab, vmtest `default` cells | S–M |
 | **P2** | the auto-cascade (§4.3) + the wire (§4.9) | `ROOMLERD_WAYLAND_AUTO=0`; explicit keys | lab ×2, vmtest, Asahi | M |
+| ↳ P2a | the per-user automatic arms (D1), and `rc:video-info` `capture_arm` + `attended` | `wayland_auto`; any capture key | lab: GNOME + KDE per-user, GNOME system unchanged | S |
+| ↳ P2b | the hello's `desktop` object, and the server's count of Wayland hosts and the arm serving each (AC13) | additive wire | lab, then the fleet | S |
+| ↳ P2c | the viewer names the arm and whether it asked (FR-45 AC8 option b) | — | lab, after a promote | S |
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
@@ -491,6 +508,11 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - [ ] **AC1** — a default **per-user** install on GNOME 50 Wayland, no keys: the viewer shows the real desktop
   (canvas ≈ `virsh screenshot`, the probe counter fresh within 2 s). Red on 0.4.124 first.
 - [ ] **AC2** — the same for a default **system** install. Red on 0.4.124 first ("headless").
+  ⚠️ **Unreachable as written while D1's system half holds.** A default system install switches nothing on
+  until a desktop companion ships for non-Debian hosts, so it answers `wayland_not_enabled` with the root
+  hint (P1c), and a picture needs `drm_capture` + `uinput`. The operator decides whether AC2 waits for that
+  companion or is re-worded to "the root hint, and a picture once the keys are set". This spec does not
+  change it.
 - [ ] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,

@@ -142,6 +142,48 @@ pub struct MutterSession {
     _conn: zbus::blocking::Connection,
 }
 
+/// How long [`available`] waits. One property read; a wedged bus otherwise
+/// holds it for D-Bus's own 25 s method timeout.
+const AVAILABLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// FR-93 P2 — is mutter's ScreenCast answering on this process's session bus?
+/// The automatic cascade asks before it spawns the helper, so a KDE or wlroots
+/// session costs one D-Bus round trip rather than a helper process. The proof
+/// is the one [`open`] uses: a property read, because a proxy builds happily
+/// for a name nobody owns.
+///
+/// On its own thread for the reason [`open`] gives: `zbus`'s blocking API
+/// panics inside a tokio runtime, and the cascade runs on one.
+pub fn available() -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = (|| {
+            let conn = zbus::blocking::Connection::session()
+                .map_err(|e| format!("no session bus: {e}"))?;
+            let proxy = zbus::blocking::Proxy::new(&conn, MUTTER_BUS, MUTTER_PATH, MUTTER_IFACE)
+                .map_err(|e| format!("{MUTTER_BUS}: {e}"))?;
+            proxy.get_property::<i32>("Version").map(|_| ()).map_err(|_| {
+                format!(
+                    "{MUTTER_BUS} does not answer on this session's bus, so this is not a GNOME \
+                     session"
+                )
+            })
+        })();
+        // The receiver may already have timed out; nothing to do about that.
+        let _ = tx.send(answer);
+    });
+    match rx.recv_timeout(AVAILABLE_TIMEOUT) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{MUTTER_BUS} did not answer within {}s",
+            AVAILABLE_TIMEOUT.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the mutter probe thread panicked".to_string())
+        }
+    }
+}
+
 /// Open a screencast on the first recordable monitor.
 ///
 /// ⚠️ **Runs on its own thread, and that is not optional** — `zbus`'s blocking

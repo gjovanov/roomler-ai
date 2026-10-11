@@ -1006,6 +1006,19 @@ pub struct AgentConfig {
     /// behaviour before FR-93, unchanged. Restart required.
     #[serde(default)]
     pub wayland_aware: Option<bool>,
+    /// FR-93 P2 (decision D1) — a per-user install in a Wayland session,
+    /// with no capture key set, switches its capture on by itself
+    /// (`ROOMLERD_WAYLAND_AUTO`). Built-in default: **ON**.
+    ///
+    /// It tries mutter's own screencast first, which asks nobody (GNOME), then
+    /// the portal, which asks the person at the screen once (KDE renews the
+    /// grant every session). A root (system) install never switches an arm on
+    /// by itself: D1 keeps DRM and uinput opt-in there until a desktop
+    /// companion ships for non-Debian hosts. Any capture key set, to anything,
+    /// takes the choice back. `false` is the kill switch: the behaviour before
+    /// P2, unchanged. Restart required.
+    #[serde(default)]
+    pub wayland_auto: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -2384,6 +2397,7 @@ pub fn test_fixture() -> AgentConfig {
         mutter_capture: None,
         window_capture: None,
         wayland_aware: None,
+        wayland_auto: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -2546,7 +2560,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 85] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 86] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2582,6 +2596,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 85]
         ("MUTTER_CAPTURE", cfg.mutter_capture),
         ("WINDOW_CAPTURE", cfg.window_capture),
         ("WAYLAND_AWARE", cfg.wayland_aware),
+        ("WAYLAND_AUTO", cfg.wayland_auto),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
