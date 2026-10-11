@@ -552,7 +552,8 @@ pub fn handle_replica_join(
 
 /// FR-90 P2d — `rc:hive.replica.grant`: serve a stream of a session this
 /// device holds to one of its members, answered with `rc:hive.replica.ready`
-/// on the connection it came on ([`stream`]).
+/// on the connection it came on ([`stream`]). The grant is registered before
+/// its endpoint is stood up, so the server's close ends a setup in flight.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_replica_grant(
     grant_id: ObjectId,
@@ -576,20 +577,23 @@ pub fn handle_replica_grant(
         ice_servers,
         ttl_secs,
     };
-    tokio::spawn(async move {
-        let ready = match global() {
-            Some(sup) => sup.serve_grant(g, is_primary).await,
-            None => ClientMsg::HiveReplicaReady {
-                grant_id,
-                refused: Some(roomler_ai_remote_control::hive::HiveStreamRefusal::NotHeld),
-                detail: Some("agent sessions are not set up on this device".into()),
-                cert_fingerprint: None,
-                addrs: Vec::new(),
-                derp_pubkey: None,
-            },
-        };
-        let _ = tx.send(ready).await;
-    });
+    match global() {
+        Some(sup) => sup.take_grant(g, is_primary, tx),
+        None => {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(ClientMsg::HiveReplicaReady {
+                        grant_id,
+                        refused: Some(roomler_ai_remote_control::hive::HiveStreamRefusal::NotHeld),
+                        detail: Some("agent sessions are not set up on this device".into()),
+                        cert_fingerprint: None,
+                        addrs: Vec::new(),
+                        derp_pubkey: None,
+                    })
+                    .await;
+            });
+        }
+    }
 }
 
 /// FR-90 P2d — `rc:hive.replica.dial`: the source this device asked for is
@@ -604,6 +608,7 @@ pub fn handle_replica_dial(
     token: String,
     cert_fingerprint: String,
     addrs: Vec<String>,
+    ice_servers: Vec<roomler_ai_remote_control::signaling::IceServer>,
     ttl_secs: u32,
     is_primary: bool,
 ) {
@@ -618,10 +623,20 @@ pub fn handle_replica_dial(
                 token,
                 cert_fingerprint,
                 addrs,
+                ice_servers,
                 ttl_secs,
             },
             is_primary,
         );
+    }
+}
+
+/// FR-90 P2d-2b — `rc:hive.replica.candidate`: a member's relayed address,
+/// for the TURN permission of a relay stream this device serves
+/// ([`stream`]).
+pub fn handle_replica_candidate(grant_id: ObjectId, addr: String, is_primary: bool) {
+    if let Some(sup) = global() {
+        sup.take_candidate(grant_id, &addr, is_primary);
     }
 }
 

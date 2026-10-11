@@ -698,6 +698,22 @@ pub fn is_pubkey_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Whether `addr` is one a device could be reached at over a stream: never
+/// the unspecified address, port 0, multicast or broadcast. Read by both
+/// ends: the server, of each address a `ready` offers and each `candidate`
+/// it relays, and the device, of each address it dials or permits. The
+/// addresses travel between two devices through the server, and a device
+/// dials as SYSTEM or root, so a multicast address relayed to every member
+/// of a tenant would have each of them spray its own network; the device's
+/// check is the one that holds against a compromised server or source.
+pub fn is_dialable(addr: &std::net::SocketAddr) -> bool {
+    let ip = addr.ip();
+    addr.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
+}
+
 /// FR-90 P2d — the rung of the ladder a replica stream tries (spec §3b, "The
 /// carrier"). The member names one in each `rc:hive.replica.want`, from the
 /// top, and climbs down a rung when one does not carry. Every renewal starts
@@ -1189,6 +1205,31 @@ mod tests {
         assert!(!is_pubkey_hex(&good.to_uppercase()));
         assert!(!is_pubkey_hex(&good[..63]));
         assert!(!is_pubkey_hex(&"z".repeat(64)));
+    }
+
+    /// Only an address a device could be reached at is dialable: never the
+    /// unspecified address, port 0, multicast or broadcast.
+    #[test]
+    fn only_an_address_a_device_could_be_reached_at_is_dialable() {
+        for a in [
+            "192.168.1.20:41000",
+            "203.0.113.7:41000",
+            "127.0.0.1:41000",
+            "[2001:db8::1]:41000",
+        ] {
+            assert!(is_dialable(&a.parse().unwrap()), "{a} is dialable");
+        }
+        for a in [
+            "0.0.0.0:41000",
+            "192.168.1.20:0",
+            "224.0.0.251:5353",
+            "239.255.255.250:1900",
+            "255.255.255.255:41000",
+            "[ff02::1]:41000",
+            "[::]:41000",
+        ] {
+            assert!(!is_dialable(&a.parse().unwrap()), "{a} is never dialable");
+        }
     }
 
     /// A hash is 64 lowercase hex characters, and nothing else is one.

@@ -4514,8 +4514,8 @@ async fn handle_server_msg(
         } => {
             #[cfg(hive_host)]
             {
-                // The `relay` and `derp` rungs read these from P2d-2b/2c.
-                let _ = (derp_pubkey, ice_servers);
+                // The `derp` rung reads its key from P2d-2c.
+                let _ = derp_pubkey;
                 crate::hive::handle_replica_dial(
                     grant_id,
                     session_id,
@@ -4525,6 +4525,7 @@ async fn handle_server_msg(
                     token,
                     cert_fingerprint,
                     addrs,
+                    ice_servers,
                     ttl_secs,
                     ctx.is_primary,
                 );
@@ -4547,11 +4548,14 @@ async fn handle_server_msg(
             }
         }
 
-        // FR-90 P2d — the member's relayed address, for the `relay` rung's
-        // TURN permission (P2d-2b); and a want the server refused (the
-        // ladder that acts on it comes with the follow, P2d-3).
+        // FR-90 P2d-2b — the member's relayed address, for the `relay` rung's
+        // TURN permission on this source's allocation; and a want the server
+        // refused (the ladder that acts on it comes with the follow, P2d-3).
         ServerMsg::HiveReplicaCandidate { grant_id, addr } => {
-            debug!(grant = %grant_id, %addr, "rc:hive.replica.candidate — the relay rung is not served yet");
+            #[cfg(hive_host)]
+            crate::hive::handle_replica_candidate(grant_id, addr, ctx.is_primary);
+            #[cfg(not(hive_host))]
+            debug!(grant = %grant_id, %addr, "rc:hive.replica.candidate ignored — this build carries no streams");
         }
         ServerMsg::HiveReplicaRefused {
             session_id,
