@@ -30,12 +30,37 @@ pub mod wire;
 
 #[cfg(feature = "enigo-input")]
 mod arbiter_io;
+// FR-92 P9 — the pure half of the GNOME host: built everywhere so its rules
+// are tests on every platform; used only where the host is.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "enigo-input",
+        feature = "uinput-input",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+mod gnome;
+#[cfg(all(
+    target_os = "linux",
+    feature = "enigo-input",
+    feature = "uinput-input",
+    feature = "portal-capture"
+))]
+mod host_gnome;
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+mod host_linux;
 #[cfg(all(target_os = "macos", feature = "enigo-input"))]
 mod host_mac;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 mod host_win;
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 mod host_x11;
+/// FR-92 P9 — the child the daemon runs inside a person's GNOME session
+/// (`roomlerd portal-helper --keep-busy`), and the daemon's link to it.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+pub mod session_helper;
 
 pub use wire::SetRequest;
 
@@ -64,9 +89,10 @@ pub fn remote_input_epoch() -> u64 {
 }
 
 /// Is keep-busy built for this host at all? Windows (FR-92 P1), Linux X11
-/// (P3a) and macOS (P3b). A Wayland desktop is detected at run time and
-/// reported `unavailable` with its reason — the cap word stays, so the
-/// viewer can say why. On a supervised Mac BOTH processes run an engine: the
+/// (P3a), macOS (P3b), and a GNOME session reached through uinput — Wayland,
+/// or Xorg under a root daemon (P9). Any other Wayland desktop is detected
+/// at run time and reported `unavailable` with its reason — the cap word
+/// stays, so the viewer can say why. On a supervised Mac BOTH processes run an engine: the
 /// GUI worker's is the one that moves (sessions are delegated to it), and
 /// the root daemon's waits as "nobody signed in" — it has no GUI session —
 /// while handing the worker the orgs' policy. The cap word also needs the
@@ -367,11 +393,13 @@ fn run(
     }
     #[cfg(all(target_os = "linux", feature = "enigo-input"))]
     {
+        // X11 where this process holds a real X display; otherwise (a root
+        // daemon, Xwayland) a GNOME session through uinput — FR-92 P9.
         run_with(
             engine,
             rx,
             out,
-            host_x11::X11Host::new(),
+            host_linux::LinuxHost::new(),
             host_x11::warnings,
             &enrolled_tenants,
         );
@@ -767,7 +795,7 @@ mod tests {
     /// (once per resume); the keyboard's never.
     #[test]
     fn no_keylogger_shaped_api_anywhere_in_keep_busy() {
-        let sources: [(&str, &str); 11] = [
+        let sources: [(&str, &str); 16] = [
             ("mod.rs", include_str!("mod.rs")),
             ("engine.rs", include_str!("engine.rs")),
             ("patterns.rs", include_str!("patterns.rs")),
@@ -778,6 +806,15 @@ mod tests {
             ("host_win.rs", include_str!("host_win.rs")),
             ("host_x11.rs", include_str!("host_x11.rs")),
             ("host_mac.rs", include_str!("host_mac.rs")),
+            // FR-92 P9: the GNOME host, its helper, and uinput's move.
+            ("gnome.rs", include_str!("gnome.rs")),
+            ("host_gnome.rs", include_str!("host_gnome.rs")),
+            ("host_linux.rs", include_str!("host_linux.rs")),
+            ("session_helper.rs", include_str!("session_helper.rs")),
+            (
+                "input/uinput_backend.rs",
+                include_str!("../input/uinput_backend.rs"),
+            ),
             (
                 "input/enigo_backend.rs",
                 include_str!("../input/enigo_backend.rs"),
@@ -806,6 +843,16 @@ mod tests {
         .map(|p| p.concat())
         .collect();
         let key_state = ["GetAsync", "KeyState"].concat();
+        // Every file of this module is in the list: a new host must not slip
+        // past the scan because nobody remembered to add it here.
+        let listed: Vec<&str> = sources.iter().map(|(n, _)| *n).collect();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/keep_busy");
+        for entry in std::fs::read_dir(&dir).expect("the keep_busy sources") {
+            let file = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if file.ends_with(".rs") {
+                assert!(listed.contains(&file.as_str()), "{file} is not scanned");
+            }
+        }
         for (name, src) in sources {
             let lines: Vec<&str> = src.lines().map(code_of).collect();
             for (i, code) in lines.iter().enumerate() {

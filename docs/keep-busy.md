@@ -3,7 +3,9 @@
 > **FR-92** ([#1942](https://github.com/gjovanov/roomler-ai/issues/1942),
 > [spec](fr/FR-92-keep-busy.md)).
 >
-> **Status: built, not yet released or field-verified.**
+> **Status: released in 0.4.125 and field-verified on Windows 11 and GNOME on
+> Xorg** ([spec §9](fr/FR-92-keep-busy.md#9-field-verification-log)). macOS is
+> still owed.
 >
 > | Part | What |
 > |---|---|
@@ -14,8 +16,9 @@
 > | P4 | the person at the device sees it and stops it: tray, `roomler keep-busy`, LocalAPI |
 > | P5 | the org deny |
 > | P5b | the device list shows where it runs and who turned it on |
+> | P9 | **GNOME on Wayland**, and GNOME on Xorg under a root daemon, through uinput ([§2](#a-blind-host-gnome-through-uinput)) |
 >
-> Wayland is detected and reported unavailable.
+> Any other Wayland desktop is detected and reported unavailable, with its reason.
 >
 > Every enable comes from a remote-desktop session that holds input. There is no
 > local "on" and no server "on".
@@ -63,6 +66,7 @@ created lazily and cached for the life of the process
 | A move is **refused while any session holds a mouse button**, so a controller's drag never has a move spliced into it | `input/arbiter.rs` `any_button_held`, L513 |
 | Every injected controller event bumps a counter the engine reads, so remote activity is known exactly. A heartbeat or a denied event is not counted | `input/arbiter.rs` L805, `keep_busy::note_remote_input` |
 | Only a session holding **INPUT** may set it, and in exclusive mode only the floor holder | `input/arbiter.rs` `keep_busy_may_set`, L523 |
+| An injector with **no pixel space** (uinput, below the compositor) is moved by a **fraction of the desktop** instead (`KbOp::MoveNorm`), under the same held-button rule | `input/arbiter.rs` `keep_busy_op`; `uinput_backend.rs` `move_norm` |
 
 The state machine (`keep_busy/engine.rs`) is pure. A `Host` trait (L308)
 carries every OS fact, and the tests drive the engine with a scripted fake host
@@ -95,6 +99,7 @@ Each running tick (`engine.rs` `detect`, L877) pauses on the first of these:
 | Windows | `GetLastInputInfo` (`host_win.rs` L45) | an exact tick, on the system timer (10–16 ms) |
 | X11 | `MIT-SCREEN-SAVER` `ms_since_user_input` (`host_x11.rs` L55) | an **interval** |
 | macOS | `CGEventSourceSecondsSinceLastEventType`, the session's combined state | an **interval** |
+| GNOME through uinput (P9) | Mutter's `org.gnome.Mutter.IdleMonitor.GetIdletime`, asked by a helper inside the person's session (`session_helper.rs`) | an **interval**, round trip included |
 
 A "time since" reading cannot say exactly when the clock was read: only that it
 was read somewhere between asking and hearing back. So the last input lies in
@@ -121,6 +126,50 @@ On every enable and resume, the engine moves the pointer **3 px out and back**
   only the out leg catches it.
 - A failed round trip is `calibration_failed`. A move the clock never sees is
   `not_landing` (UIPI, another desktop).
+
+### A blind host: GNOME through uinput
+
+On Wayland nothing tells an unprivileged process where the pointer is, and XTest
+moves only Xwayland's private pointer. A **root** daemon can still drive the
+real one: the uinput device the arbiter already owns for remote control
+(`ROOMLERD_UINPUT=1`, FR-36), below the compositor. What it cannot do is read
+the pointer back. So the GNOME host (`keep_busy/host_gnome.rs`) is **blind**:
+
+```mermaid
+flowchart LR
+  E[keep-busy engine] -- "MoveNorm (a fraction of the desktop)" --> A[input arbiter]
+  A -- "EV_ABS, the ONE uinput device" --> K[(kernel → libinput → Mutter)]
+  E -- "idle · geom (one line each)" --> H["roomlerd portal-helper --keep-busy<br/>AS the person, in their session"]
+  H -- "IdleMonitor.GetIdletime" --> M[Mutter]
+  H -- "DisplayConfig.GetCurrentState" --> M
+  E -- "LockedHint" --> L[logind]
+```
+
+| Question | Answer on GNOME |
+|---|---|
+| Where is the pointer? | **where the engine last put it** (`Host::blind`); the first move starts at the primary monitor's middle |
+| Did a person act? | **the idle clock alone**: every key, click, scroll and move a person makes reaches Mutter's IdleMonitor. `detector` reads `clock` |
+| Where may it draw? | the logical monitors from `DisplayConfig`, scale and rotation applied (`gnome.rs` `layout`), each inset 48 px |
+| Is it locked? | logind's `LockedHint`, which GNOME sets |
+
+What blindness costs, said once here and in the spec:
+
+- **After a pause it resumes where it stopped, not where the person left the
+  pointer: the pointer jumps back.** It never jumps into a hot corner: the
+  destination is inside the safe box, and an absolute move crosses no edge
+  barrier.
+- **Mouse buttons are not observable.** A button held perfectly still for
+  longer than `resume_after` is not seen; any movement while it is held is.
+- **Something moving the pointer without input** (there is no such thing for a
+  Wayland client) cannot be seen as `cursor_contended`.
+
+The helper is the FR-45 `portal-helper` subcommand with `--keep-busy`, started
+through the same session lookup and privilege drop (`capture/portal/mod.rs`
+`spawn_child`): the person's session bus checks `SO_PEERCRED`, so root cannot
+ask Mutter itself. It reads no input and sends none, and it exits after a
+minute nobody asks it anything. Another desktop's helper says so in its hello:
+KDE and wlroots have no idle clock to offer here, and keep busy reports
+`no_idle_clock`.
 
 ## 3. States
 
@@ -161,10 +210,10 @@ show that one sentence.
 |---|---|
 | **Moves only.** Never a click, a key or a scroll | — |
 | **The safe box**: the monitor's work area ∩ a 48 px inset from every monitor edge (`patterns.rs` `safe_box`, L233). macOS uses 96 pt (`host_mac.rs` `mac_safe_box`, L235): the release build has no AppKit, so no `visibleFrame`, and the margin keeps the menu bar and a Dock on any edge clear | The pointer never reaches a hot corner or edge: GNOME Activities, a macOS hot corner that can start the screensaver **or lock the screen**, an auto-hidden taskbar or Dock, Windows Peek |
-| **No jumps.** Each loop starts at the pointer, and a changing pattern (Shuffle, Wander, Lissajous) continues from where the last loop ended | — |
+| **No jumps.** Each loop starts at the pointer, and a changing pattern (Shuffle, Wander, Lissajous) continues from where the last loop ended. The one exception is a blind host (GNOME through uinput), which resumes where it stopped | — |
 | **Never the first to create the injector before a display exists.** A boot-time restore waits for an unlocked session, and an injector the OS has not granted is answered for and not cached | The arbiter caches the injector, Noop included. Creating it too early would break remote control's input until a restart |
 | **The viewer never re-asserts keep busy on connect**, unlike display-match | A reconnecting tab must not undo the person's Stop |
-| **Wayland is refused from the display itself** (`host_x11.rs` `session`, L389): the `XWAYLAND` extension, or monitors named `XWAYLAND*` | XTest there moves only Xwayland's own pointer, so a calibration could pass while nothing real moves |
+| **Wayland is refused from the display itself** (`host_x11.rs` `session`, L389): the `XWAYLAND` extension, or monitors named `XWAYLAND*`. The GNOME host is asked instead (`host_linux.rs`) | XTest there moves only Xwayland's own pointer, so a calibration could pass while nothing real moves |
 
 ## 5. Patterns
 
@@ -289,7 +338,7 @@ who and why.
 | Windows, user worker | `%LOCALAPPDATA%\roomler\roomler\data\keep-busy.json` | the user |
 | Windows, SystemContext worker | the **console user's** file, resolved through `session_user_profile_dir` | **the user**, impersonated (`win_identity.rs` `as_session_user`, L137; `state.rs` `as_owner`, L132) |
 | Linux, per-user daemon | `~/.local/share/roomler/keep-busy.json` | the user |
-| Linux, root daemon | **root's own** data dir: `/root/.local/share/roomler/keep-busy-<uid>.json`, for the person on our display (`state.rs` `default_path`, L209) | root, in a directory only root can write |
+| Linux, root daemon | **root's own** data dir: `/root/.local/share/roomler/keep-busy-<uid>.json`, for the person on our display, else in the active graphical session (`state.rs` `default_path`, L209; `logind.rs` `pick`) | root, in a directory only root can write |
 | macOS GUI worker / LaunchAgent | `~/Library/Application Support/live.roomler.roomler/keep-busy.json` | the user |
 
 On a host installed before the rename, the directory keeps its pre-rename name
@@ -342,10 +391,12 @@ does not spawn `loginctl` forever.
 
 | Host | Status | Idle clock · lock · geometry |
 |---|---|---|
-| Windows, user-context and SystemContext workers | ✅ | `GetLastInputInfo` · `OpenInputDesktop` · `GetMonitorInfoW.rcWork` |
-| Linux X11 (a user-session daemon, or root with the display's auth) | ✅ (Xvfb-proven) | `MIT-SCREEN-SAVER` · logind `LockedHint` (`logind.rs` L144) · RandR 1.5 ∩ `_NET_WORKAREA` |
+| Windows, user-context and SystemContext workers | ✅ (field: Win11, 0.4.125) | `GetLastInputInfo` · `OpenInputDesktop` · `GetMonitorInfoW.rcWork` |
+| Linux X11 (a user-session daemon, or root with the display's auth) | ✅ (Xvfb in CI; field: GNOME on Xorg, 0.4.125) | `MIT-SCREEN-SAVER` · logind `LockedHint` (`logind.rs` L144) · RandR 1.5 ∩ `_NET_WORKAREA` |
+| **GNOME on Wayland**, or GNOME on Xorg, under a **root** daemon with uinput on (P9) | ✅ blind ([§2](#a-blind-host-gnome-through-uinput)) | Mutter IdleMonitor through the session helper · logind `LockedHint` · Mutter `DisplayConfig` |
 | macOS, GUI worker or LaunchAgent | ✅ (compiled; field owed) | `CGEventSourceSecondsSinceLastEventType` · `CGSessionCopyCurrentDictionary` (`host_mac.rs` `console`, L182) · `CGDisplayBounds` + 96 pt |
-| Wayland, portal-only input | ✖ reported (`wayland`) | — |
+| Wayland without the uinput path: a per-user daemon, or uinput off | ✖ reported (`wayland`) | — |
+| KDE Plasma or wlroots on Wayland, uinput on | ✖ reported (`no_idle_clock`): no idle clock a helper can read | — |
 
 > [!NOTE]
 > **Lockers that never report `LockedHint`** (xscreensaver, i3lock) are not seen
@@ -356,6 +407,19 @@ does not spawn `loginctl` forever.
 > **A single isolated key tap can slip through on X11 or macOS** if it lands
 > within a few milliseconds of the engine's own move. A person typing, scrolling
 > or moving the mouse is caught at once, because the pointer moves too.
+>
+> **On Windows the window is a whole system-timer tick** (15.6 ms):
+> `GetLastInputInfo` stamps an event with the tick it arrived in, so a lone key
+> in the same tick as one of the engine's moves reads as that move. Measured
+> on Win11 with 0.4.125: **one of nine isolated taps** slipped through; four
+> of four short typing bursts, every mouse move and a held button were caught
+> within a second.
+>
+> **GNOME's Xorg session names no display to logind** (`Display=` empty, while
+> its Xorg serves `:0`). 0.4.125 matched the session by display alone, so it
+> never saw GNOME's lock and kept moving the pointer behind the lock screen
+> (field, GNOME 46 on Ubuntu 24.04). P9's `logind::pick` falls back to the
+> active X11 session that names no display.
 
 ## 11. Tests
 
@@ -390,10 +454,22 @@ The step runs with `--test-threads=1`: in parallel, another test's pointer move
 - `keep_busy/mod.rs`, `logind.rs`, `state.rs`, `host_mac.rs`:
   - the person switch;
   - the strictest org and leaving an org;
-  - logind parsing;
+  - logind parsing, and **GDM's Xorg session that names no display** (P9);
   - the per-person root store;
   - the macOS console flags and safe box.
-- `input/arbiter.rs`: the INPUT and floor rule, and a held button blocking moves.
+- `keep_busy/gnome.rs` (P9, pure, every platform): the monitor layout from
+  `DisplayConfig` (scale, rotation, a dark connector), the desktop-fraction
+  mapping with negative origins and clamping, the helper's line protocol
+  (noise and unknown verbs ignored), and when the GNOME host may run.
+- `keep_busy/host_linux.rs`: only what X11 cannot reach goes to GNOME, and the
+  better reason shows.
+- `keep_busy/engine.rs`, a **blind** fake host: calibration on the clock alone
+  (`detector` = `clock`), a warp is not a person, a person is, and a resume
+  starts where it stopped.
+- `input/arbiter.rs`: the INPUT and floor rule, a held button blocking moves,
+  and the normalised move under the same rule (P9).
+- The AC8 scan covers every file of `keep_busy/` (a new one fails it until it
+  is listed) and uinput's move.
 - `win_identity.rs`: no token for the person means the store is not touched at all.
 - `delegate.rs`: the worker gets the strictest policy on attach and on change.
 - `crates/tests/src/keep_busy_tests.rs`:
@@ -404,10 +480,25 @@ The step runs with `--test-threads=1`: in parallel, another test's pointer move
   - `keepBusy.spec.ts`: the parser, the message, the status line, the previews.
   - `KeepBusyMenu.spec.ts`: chip vs button, the countdown, asking, view-only.
 
-## 12. Field verification (owed)
+## 12. Field verification
 
 Run this on a release candidate, never on a machine someone is using. Record
-the negative control **first**.
+the negative control **first**. The runs so far, with their numbers, are in the
+[spec's log](fr/FR-92-keep-busy.md#9-field-verification-log): Windows 11 and
+GNOME on Xorg on 0.4.125 (cells 1–5, 7 in part); GNOME on Wayland on the P9
+build (cell 8). macOS (cell 6) is owed.
+
+> [!TIP]
+> On a throwaway VM, **real local input** comes from the hypervisor:
+> `virsh send-key <dom> KEY_LEFTSHIFT` is a key on the guest's keyboard, and
+> QEMU's `mouse_move` / `mouse_button 1` move and hold its mouse. Neither is
+> synthetic input inside the guest.
+>
+> ⚠️ HMP `mouse_move` is **relative**: where the guest's active mouse is the
+> absolute USB tablet (the vmtest Ubuntu image; `info mice` says which), it
+> reaches nothing, and a "missed" local mouse is the test's fault. Move the
+> tablet itself with QMP:
+> `input-send-event {"events":[{"type":"abs","data":{"axis":"x","value":9000}}, …]}`.
 
 1. **Negative control.** A host with a 1-minute lock and Teams open, keep busy
    OFF: it locks, and Teams goes Away. Measure idle with `roomler exec`:
@@ -431,4 +522,7 @@ the negative control **first**.
      This is expected, not yet proven.
 7. **Worker types:** both the SystemContext and the user-context Windows
    workers. The SystemContext worker's store is **owned by the user**.
-8. **Wayland VM:** `unavailable: wayland`.
+8. **GNOME on Wayland**, a system install with `uinput = true`: OFF ⇒ GNOME
+   locks at its idle delay (Mutter's `GetIdletime` via `gdbus`); ON ⇒ no lock,
+   `detector` `clock`; a local key pauses it. With uinput off, or as a
+   per-user install: `unavailable: wayland`.

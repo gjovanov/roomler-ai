@@ -195,7 +195,7 @@ impl Reason {
                 "Unavailable: on this desktop the pointer is driven through a screen-sharing portal, which keep busy does not use yet."
             }
             Reason::Wayland => {
-                "Unavailable on a Wayland desktop: the agent can move the real pointer only in an X11 session."
+                "Unavailable on this Wayland desktop: here keep busy needs the system service with uinput input turned on, on GNOME."
             }
             Reason::NoIdleClock => {
                 "Unavailable: this desktop does not report when it was last used, so a person could not take over."
@@ -327,6 +327,13 @@ pub trait Host {
     /// Block the engine's thread for `d` (the real host sleeps; the fake
     /// advances its clock). Only for [`MIN_MOVE_GAP`].
     fn wait(&mut self, d: Duration);
+    /// FR-92 P9 — this host cannot read the pointer back (Wayland through
+    /// uinput): `cursor` is where the engine last PUT it. A person is then
+    /// seen by the idle clock alone (`detector` = `clock`), and a resume
+    /// starts where keep busy stopped — the pointer jumps back.
+    fn blind(&self) -> bool {
+        false
+    }
 }
 
 /// What someone asked for, and who.
@@ -760,7 +767,11 @@ impl Engine {
             self.detector = "cursor";
             return self.unavailable(Reason::NoIdleClock, now);
         };
-        self.detector = "clock+cursor";
+        self.detector = if host.blind() {
+            "clock"
+        } else {
+            "clock+cursor"
+        };
         // A short there-and-back, each leg VERIFIED. A move to the same point
         // may not count as input anywhere, and a pointer stuck (or confined)
         // at the anchor would pass a check that only looked at the return —
@@ -1157,6 +1168,10 @@ mod tests {
         /// one tick read as one. `None`: a counter every event moves.
         tick_ms: Option<u64>,
         started: Instant,
+        /// FR-92 P9 — a host that cannot read the pointer back: `cursor`
+        /// answers where the engine last put it (`placed`), or the middle.
+        blind: bool,
+        placed: Option<(i32, i32)>,
     }
 
     impl Fake {
@@ -1178,6 +1193,8 @@ mod tests {
                 reads_while_absent: 0,
                 tick_ms: None,
                 started: now,
+                blind: false,
+                placed: None,
             }
         }
         fn advance(&mut self, d: Duration) {
@@ -1230,6 +1247,9 @@ mod tests {
             if self.session != SessionState::Present {
                 self.reads_while_absent += 1;
             }
+            if self.blind {
+                return Ok(self.placed.unwrap_or((640, 400)));
+            }
             Ok(self.cursor)
         }
         fn move_to(&mut self, p: (i32, i32)) -> Result<(), HostError> {
@@ -1240,6 +1260,7 @@ mod tests {
                 return Err(e);
             }
             self.moves.push(p);
+            self.placed = Some(p);
             self.cursor = self.warp.map(|w| w(p)).unwrap_or(p);
             if self.clock_registers {
                 self.register();
@@ -1264,6 +1285,9 @@ mod tests {
         }
         fn wait(&mut self, d: Duration) {
             self.advance(d);
+        }
+        fn blind(&self) -> bool {
+            self.blind
         }
     }
 
@@ -1460,6 +1484,52 @@ mod tests {
         assert!(
             (first_draw.0 - 300).abs() <= 3 && (first_draw.1 - 300).abs() <= 3,
             "resumed with a jump to {first_draw:?}"
+        );
+    }
+
+    /// FR-92 P9 — a host that cannot read the pointer back (Wayland through
+    /// uinput). Calibration rests on the clock alone and says so; something
+    /// moving the pointer WITHOUT input is invisible to it (no "contended");
+    /// a person is seen by the clock; and a resume starts where keep busy
+    /// STOPPED — the jump the docs promise — never where the person left it.
+    #[test]
+    fn a_blind_host_runs_on_the_clock_alone_and_resumes_where_it_stopped() {
+        let mut f = Fake::new();
+        f.blind = true;
+        let mut e = Engine::new(1);
+        on(&mut e, &mut f, Pattern::Circle);
+        let s = e.snapshot(f.now);
+        assert_eq!(s.phase, Phase::Running);
+        assert_eq!(s.detector, "clock");
+        // Calibrated around the host's starting point, not the real pointer.
+        assert_eq!(f.moves[0], (640 - CALIBRATION_NUDGE_PX, 400));
+        assert_eq!(f.moves[1], (640, 400));
+        run_for(&mut e, &mut f, Duration::from_secs(1));
+        f.app_warp((10, 10));
+        run_for(&mut e, &mut f, Duration::from_millis(300));
+        assert_eq!(
+            e.snapshot(f.now).phase,
+            Phase::Running,
+            "no input, no person"
+        );
+        f.human_move((1500, 900));
+        e.tick(&mut f);
+        let s = e.snapshot(f.now);
+        assert_eq!(s.reason, Some(Reason::UserActive));
+        assert_eq!(s.paused_by, Some(Source::Local));
+        let stopped = *f.moves.last().unwrap();
+        let n = f.moves.len();
+        run_for(&mut e, &mut f, Duration::from_secs(31));
+        assert_eq!(e.snapshot(f.now).phase, Phase::Running);
+        let resumed = f.moves[n];
+        let near = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() <= 4 && (a.1 - b.1).abs() <= 4;
+        assert!(
+            near(resumed, stopped),
+            "resumed at {resumed:?}, stopped at {stopped:?}"
+        );
+        assert!(
+            !near(resumed, (1500, 900)),
+            "it cannot know where the person left it"
         );
     }
 

@@ -228,6 +228,11 @@ enum Command {
         /// window PICKER; nothing here chooses the window.
         #[arg(long)]
         window: bool,
+        /// FR-92 P9 — answer keep busy's questions about this GNOME session
+        /// (Mutter's idle clock and monitor layout), one line per question on
+        /// stdin, until the daemon closes it. Reads no input, sends none.
+        #[arg(long)]
+        keep_busy: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1413,10 +1418,17 @@ async fn daemon_main() -> Result<()> {
             input,
             mutter,
             window,
+            keep_busy,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run(screencast, stream, input, mutter, window);
+                if keep_busy {
+                    roomlerd::keep_busy::session_helper::serve();
+                } else {
+                    roomlerd::capture::portal::helper::run(
+                        screencast, stream, input, mutter, window,
+                    );
+                }
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1425,7 +1437,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream, input, mutter, window);
+                let _ = (screencast, stream, input, mutter, window, keep_busy);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"

@@ -760,8 +760,9 @@ pub mod helper {
     /// collect-and-wait path and the streaming one, so the session lookup, the
     /// session environment and the privilege drop exist exactly once — the
     /// three things that must not drift between two ways of running the same
-    /// child.
-    fn spawn_child(
+    /// child. FR-92 P9's keep-busy helper (`--keep-busy`) is the third way,
+    /// and reuses it for exactly that reason.
+    pub(crate) fn spawn_child(
         extra_args: &[&str],
         piped_stdin: bool,
     ) -> Result<std::process::Child, SpawnError> {

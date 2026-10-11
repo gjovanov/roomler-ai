@@ -88,18 +88,31 @@ pub fn same_display(a: &str, b: &str) -> bool {
 /// Of `sessions`, the one that owns `display`; else, with no display to go
 /// by, the active graphical one. A greeter is returned like any other — the
 /// caller decides that a greeter means "nobody signed in".
+///
+/// ⚠️ **GDM's Xorg user session names no display to logind** (FR-92 P9,
+/// measured on Ubuntu 24.04: `Type=x11 Display=` while its Xorg serves `:0`).
+/// When NO session claims `display`, the active X11 session that names no
+/// display either is the one on it. Without this, the lock was never seen:
+/// keep busy kept moving the pointer behind GNOME's lock screen (0.4.125, in
+/// the field), and nobody was "signed in" to own the store. A display that
+/// some OTHER session names still matches nothing.
 pub fn pick<'a>(sessions: &'a [Session], display: Option<&str>) -> Option<&'a Session> {
     if let Some(d) = display {
         let on_display: Vec<&Session> = sessions
             .iter()
             .filter(|s| s.display.as_deref().is_some_and(|sd| same_display(sd, d)))
             .collect();
-        // Several sessions can name one display over time; the live one wins.
-        return on_display
+        if !on_display.is_empty() {
+            // Several sessions can name one display over time; the live one wins.
+            return on_display
+                .iter()
+                .find(|s| s.active)
+                .or(on_display.first())
+                .copied();
+        }
+        return sessions
             .iter()
-            .find(|s| s.active)
-            .or(on_display.first())
-            .copied();
+            .find(|s| s.active && s.kind == "x11" && s.display.is_none());
     }
     sessions
         .iter()
@@ -232,5 +245,41 @@ mod tests {
         };
         let all = vec![gone, live.clone()];
         assert_eq!(pick(&all, Some(":0")), Some(&live));
+    }
+
+    /// FR-92 P9, measured on Ubuntu 24.04 GNOME on Xorg under GDM: the user
+    /// session says `Type=x11` and NO display while its Xorg serves `:0`, and
+    /// an ssh login sits beside it. Matching only by the display found
+    /// nothing, so 0.4.125 never saw GNOME's lock and moved the pointer
+    /// behind it.
+    #[test]
+    fn gdms_xorg_session_names_no_display_and_is_still_found() {
+        let gdm_x11 = parse_show(
+            "Id=26\nUser=1000\nClass=user\nActive=yes\nLockedHint=yes\nDisplay=\nType=x11\n",
+        )
+        .unwrap();
+        let ssh = parse_show(
+            "Id=29\nUser=1000\nClass=user\nActive=yes\nLockedHint=no\nDisplay=\nType=tty\n",
+        )
+        .unwrap();
+        let all = vec![ssh.clone(), gdm_x11.clone()];
+        let found = pick(&all, Some(":0")).unwrap();
+        assert_eq!(found, &gdm_x11);
+        assert!(found.locked, "the lock is what this was missing");
+        // A display another session NAMES is that session's, not ours.
+        let xrdp = Session {
+            id: "31".into(),
+            display: Some(":10".into()),
+            ..gdm_x11.clone()
+        };
+        let both = vec![xrdp.clone(), gdm_x11.clone()];
+        assert_eq!(pick(&both, Some(":10")), Some(&xrdp));
+        assert_eq!(pick(&both, Some(":0")), Some(&gdm_x11));
+        // An inactive one, or a tty, is never the fallback.
+        let idle = Session {
+            active: false,
+            ..gdm_x11.clone()
+        };
+        assert_eq!(pick(&[ssh, idle], Some(":0")), None);
     }
 }
