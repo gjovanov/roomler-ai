@@ -220,9 +220,11 @@ pub fn submit_from_session(session: ObjectId, name: String, req: SetRequest) -> 
 }
 
 /// FR-92 P10 — who a local start names: the person at the console. The
-/// LocalAPI has already checked it IS that person (never root, never a
-/// service, never `roomler exec`); their account name is not ours to report
-/// to every viewer and the org's history.
+/// LocalAPI has already checked the peer stands where that person does (never
+/// root, never a service, never another session); their account name is not
+/// ours to report to every viewer and the org's history. ⚠️ On Windows a
+/// `roomler exec` runs in the console session, passes that check and is named
+/// this too (FR-92 §3g).
 pub const LOCAL_SET_BY: &str = "the person at this computer";
 
 /// FR-92 P10 — the person at the machine turns it ON (tray, CLI). `opts`

@@ -26,8 +26,9 @@
 > Any other Wayland desktop is detected and reported unavailable, with its reason.
 >
 > It is turned on from a remote-desktop session that holds input, or (P10) by
-> the person at the computer. There is no server "on", and `roomler exec` cannot
-> turn it on.
+> the person at the computer. There is no server "on". ⚠️ `roomler exec` is not
+> kept out everywhere: on Windows it runs in the person's session, and its
+> `roomler keep-busy on` passes the local gate (§9).
 
 Keep busy moves a device's pointer in a pattern so the computer stays
 **active**: no screensaver, no idle lock, no "Away" in Teams or Slack.
@@ -390,20 +391,20 @@ does not spawn `loginctl` forever.
 |---|---|
 | **Tray** (`roomler-desktop`, `tray.rs` L47) | A toggle, polled every 3 s: "Stop keep busy (Heart · paused)" while it is on, whoever turned it on; **"Start keep busy"** while it is off and can run here (P10, the product default pattern); "Keep busy: unavailable", disabled, where it cannot. The click reads the state at that moment |
 | **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`, and (P10) `roomler keep-busy on [--pattern P] [--size s\|m\|l] [--speed slow\|normal\|fast] [--resume-after SECONDS] [--auto-off MINUTES]` |
-| **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` as SYSTEM or root included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
+| **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
 
-**Who may turn it ON here (P10).** The person at the computer, and nobody
-standing in for them. `ClientPeer::may_start_keep_busy` (`crates/localapi`)
-answers per endpoint:
+**Who may turn it ON here (P10).** Whoever stands where the person does: the
+console session on Windows, the person's own uid elsewhere, and never root.
+`ClientPeer::may_start_keep_busy` (`crates/localapi`) answers per endpoint:
 
 ```mermaid
 flowchart TD
   P[a LocalAPI keep_busy_on] --> R{peer is root?}
-  R -- yes --> X[refused: roomler exec arrives as root]
+  R -- yes --> X[refused: sudo, and roomler exec on Unix]
   R -- no --> W{Windows peer?}
   W -- yes --> S{the active console session, and not session 0?}
   S -- yes --> OK[the engine starts it: set_by = the person at this computer]
-  S -- no --> X2[refused: an RDP guest, a service, exec as SYSTEM]
+  S -- no --> X2[refused: an RDP guest, a service in session 0]
   W -- no --> E{which endpoint?}
   E -- a per-user daemon's socket --> O{the socket's owner?}
   O -- yes --> OK
@@ -411,9 +412,24 @@ flowchart TD
   E -- the person socket of a system install --> OK
 ```
 
+- ⚠️ **Not a wall against `roomler exec`** (measured on 0.4.129, FR-92 §9
+  row 43). On Windows, exec runs in the worker that holds the agent socket,
+  and that worker lives in the console session: as the signed-in user (their
+  elevated token) while no controller is connected, and as SYSTEM in that
+  session while one is (`decide_spawn`, `win_service/supervisor.rs` L743). So
+  `roomler exec <win> -- roomler keep-busy on` passes the session test, and
+  the start is named "the person at this computer". On Unix exec arrives as
+  root and is refused, but root can `sudo -u` the person. No local gate can
+  tell them apart: an exec caller could as well write the person's
+  `keep-busy.json`, or run an input loop of its own. A device that allows exec
+  has given its exec callers more than keep busy. Its boundary against them is
+  the owner's `exec_enabled` ([fleet-rpc.md](fleet-rpc.md)), and the open
+  question is only how an exec-started On is named (FR-92 §6). Exec's
+  identity on Windows is #2021.
 - **Not the recording verbs' gate**: on Unix that one lets root through, and
-  root is how `roomler exec` arrives. With it, the server could start
-  synthetic input on any exec-enabled device (FR-92 §7, §8).
+  root is how `roomler exec` arrives there. With it, a plain
+  `roomler exec <host> -- roomler keep-busy on` would start keep busy under the
+  person's name (FR-92 §8).
 - **Never relayed**: a supervised Mac's root daemon refuses a local On rather
   than pass it to the worker. The person's own clients reach the worker
   directly.
