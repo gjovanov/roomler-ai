@@ -64,6 +64,10 @@ pub fn parse_virtual_screen_flag(value: Option<&str>) -> bool {
 // Compiles on every build (injection degrades to NoopInjector).
 pub mod arbiter;
 
+// FR-93 P1 — what a session's input can reach, told to the controller
+// (`rc:input-reach`) instead of injecting into nothing in silence.
+pub mod reach;
+
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 

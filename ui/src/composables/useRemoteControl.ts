@@ -683,6 +683,20 @@ export interface RcMediaUnavailable {
   hint: string
 }
 
+/** FR-93 P1 — `rc:input-reach`: this session's mouse and keyboard will NOT
+ *  reach the whole desktop. Sent once, and only then; a session that reaches
+ *  everything sends nothing. An injector that reaches nothing does not fail
+ *  (XTest into Xwayland succeeds and moves nobody's pointer), so before this
+ *  a session on a GNOME Wayland host looked interactive and did nothing.
+ *
+ *  `reach` is `none` or `xwayland_only` today, typed as a string on purpose:
+ *  a newer agent's value still carries a `reason` worth showing. */
+export interface RcInputReach {
+  reach: string
+  /** The agent's own words: what it found, and the key that would fix it. */
+  reason: string
+}
+
 export interface RcVideoInfo {
   codec: string
   encoder: string
@@ -982,6 +996,7 @@ export type RcControlInbound =
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
+  | { kind: 'input_reach'; reach: RcInputReach }
   | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
@@ -1069,6 +1084,17 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         code: obj.code,
         detail: typeof obj.detail === 'string' ? obj.detail : '',
         hint: typeof obj.hint === 'string' ? obj.hint : '',
+      },
+    }
+  }
+  // FR-93 P1 — the session's input will not reach the whole desktop. An
+  // unknown `reach` is kept, like an unknown FR-80 code: its reason still reads.
+  if (obj.t === 'rc:input-reach' && typeof obj.reach === 'string') {
+    return {
+      kind: 'input_reach',
+      reach: {
+        reach: obj.reach,
+        reason: typeof obj.reason === 'string' ? obj.reason : '',
       },
     }
   }
@@ -4180,6 +4206,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** FR-80 — set when the agent tells us it cannot capture; cleared on every
    *  new connect so a fixed host stops showing yesterday's reason. */
   const mediaUnavailable = ref<RcMediaUnavailable | null>(null)
+  /** FR-93 P1 — set when the agent says this session's input will not reach
+   *  the whole desktop; cleared on every new connect, like `mediaUnavailable`. */
+  const inputReach = ref<RcInputReach | null>(null)
   /** FR-80 — the WebCodecs config string the active DataChannel decoder was
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
@@ -7526,6 +7555,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // yesterday's reason, and the pill must not carry the last session's
     // codec into one that has not named its own yet.
     mediaUnavailable.value = null
+    inputReach.value = null
     dcDecoderCodec.value = null
     remoteLayout.value = null
     localClipboardBridge.value = null
@@ -8633,6 +8663,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
         notice.value = null
+      } else if (parsed?.kind === 'input_reach') {
+        // FR-93 P1 — the mouse and keyboard will not reach the whole desktop.
+        // Said on screen, because the alternative was input that went nowhere
+        // with nothing anywhere saying so.
+        inputReach.value = parsed.reach
+        console.warn(`[rc] input reaches ${parsed.reach.reach} of this desktop — ${parsed.reach.reason}`)
       } else if (parsed?.kind === 'control_state') {
         // P6 - arbiter state: participants rail + exclusive floor. Prune
         // ghost cursors of sessions that left.
@@ -11131,6 +11167,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  badge falls back to a selection-derived label then. */
     videoInfo,
     mediaUnavailable,
+    inputReach,
     dcDecoderCodec,
     // P6 — multi-user: arbiter state, ghost cursors, floor control.
     controlState,

@@ -82,6 +82,13 @@ pub fn unregister(generation: u64) {
     routes.retain(|r| r.generation != generation);
 }
 
+/// FR-93 — is a portal input route live right now? Asked once per session by
+/// `input::reach`: while one is, the portal session owns injection (see
+/// [`try_route`]), so the OS injector's reach no longer decides anything.
+pub fn is_active() -> bool {
+    !ROUTES.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 /// Offer one event to the portal route.
 ///
 /// `true` means the portal OWNS this event — including when the target channel
