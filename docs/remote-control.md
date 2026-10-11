@@ -372,6 +372,15 @@ Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which r
 
 As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
 
+### 6.1a Keep busy — a second input source (FR-92)
+
+A controller with input can leave the host's pointer moving in a pattern so the
+host stays active (`rc:keep-busy.*` on the control DC). It is **another input
+source behind the same arbiter**, never a second injector: the arbiter refuses
+its moves while any session holds a mouse button, and tells it about every
+controller event it injects, so a remote person pauses it exactly as a local
+one does. See [`keep-busy.md`](keep-busy.md).
+
 ### 6.2 Remote cursor
 
 The agent does **not** render the cursor into the captured frame (it tells the OS "I'm capturing, hide the cursor"). Instead, it sends cursor shape + position over the `control` DC. The controller renders the cursor as a CSS overlay on top of the video. This eliminates the "delayed mouse" feeling that plagues lower-end remote desktop tools — the local cursor moves at native refresh, the video catches up.
