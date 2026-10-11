@@ -4,7 +4,7 @@
  * FR-88 (#1790) P2 — the link hub, written to `dist/links/index.html` and
  * served at `/links/`. It is where a link goes that cannot carry a campaign
  * itself: a profile bio, a URL said out loud in a video. Each channel's short
- * path (`/yt`, `/tt`, `/ig`, `/fb`) is a 302 to here WITH one
+ * path (`/yt`, `/tt`, `/x`, `/fb`) is a 302 to here WITH one
  * (`shortPathLocation` in `site.ts`), and `attribution.js` carries it on to
  * sign-up and the install pages, as on every other static page.
  *
@@ -30,7 +30,7 @@ import { graph, organization } from './structured.ts'
 export const LINKS_URL = '/links/'
 export const LINKS_TITLE = 'Roomler: start here'
 export const LINKS_DESCRIPTION =
-  'Start free, install the agent, read the docs, or follow Roomler on YouTube, TikTok, Instagram and Facebook.'
+  'Start free, install the agent, read the docs, or follow Roomler on YouTube, TikTok, X and Facebook.'
 
 export interface LinksCtx {
   assets: SiteAssets
