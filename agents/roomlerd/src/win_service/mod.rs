@@ -51,7 +51,7 @@ pub mod system_context_probe;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -59,7 +59,9 @@ use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -340,23 +342,29 @@ fn service_main_inner() -> Result<()> {
     let (sup_tx, sup_rx) = mpsc::channel::<supervisor::SupervisorEvent>();
     let sup_tx_for_handler = sup_tx.clone();
 
+    // #2010 — the handler reports STOP_PENDING itself, through a status handle
+    // that `register` only returns once the handler is installed. It is stored
+    // before `Running` is reported, and the SCM sends no Stop before that.
+    let status_cell: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
+    let status_for_handler = Arc::clone(&status_cell);
+
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Stop | ServiceControl::Preshutdown => {
-                tracing::info!(?control_event, "service stop requested");
-                let _ = sup_tx_for_handler.send(supervisor::SupervisorEvent::Shutdown);
-                ServiceControlHandlerResult::NoError
+        let mut report = |status: ServiceStatus| match status_for_handler.get() {
+            Some(handle) => {
+                if let Err(e) = handle.set_service_status(status) {
+                    tracing::warn!(error = %e, "control handler: set_service_status failed");
+                }
             }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            ServiceControl::SessionChange(_) => {
-                let _ = sup_tx_for_handler.send(supervisor::SupervisorEvent::SessionChanged);
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        }
+            None => tracing::warn!("control handler: no status handle yet; status not reported"),
+        };
+        let mut notify = |event| {
+            let _ = sup_tx_for_handler.send(event);
+        };
+        on_control(control_event, &mut report, &mut notify)
     };
     let status_handle = service_control_handler::register(NEW_SERVICE_NAME, event_handler)
         .context("register control handler")?;
+    let _ = status_cell.set(status_handle);
 
     status_handle
         .set_service_status(running_status())
@@ -534,6 +542,59 @@ fn stopped_status() -> ServiceStatus {
     }
 }
 
+/// #2010 — what the host does with one SCM control. A seam so the ORDER can be
+/// asserted with recorders: on Stop/Preshutdown, `STOP_PENDING` is reported
+/// BEFORE the supervisor hears of it. The other order lets a fast supervisor
+/// report `STOPPED` first and have this overwrite it with a pending state for
+/// a process that is already gone.
+fn on_control(
+    control_event: ServiceControl,
+    report: &mut dyn FnMut(ServiceStatus),
+    notify: &mut dyn FnMut(supervisor::SupervisorEvent),
+) -> ServiceControlHandlerResult {
+    match control_event {
+        ServiceControl::Stop | ServiceControl::Preshutdown => {
+            tracing::info!(?control_event, "service stop requested");
+            report(stop_pending_status());
+            notify(supervisor::SupervisorEvent::Shutdown);
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        ServiceControl::SessionChange(_) => {
+            notify(supervisor::SupervisorEvent::SessionChanged);
+            ServiceControlHandlerResult::NoError
+        }
+        _ => ServiceControlHandlerResult::NotImplemented,
+    }
+}
+
+/// #2010 — the wait hint `STOP_PENDING` carries: the supervisor's whole
+/// shutdown bound plus slack for netd's teardown on a loaded box. A stop that
+/// outlives its own hint reads as hung to services.msc.
+const STOP_PENDING_WAIT_HINT: Duration =
+    supervisor::SHUTDOWN_BOUND.saturating_add(Duration::from_secs(10));
+
+/// #2010 — reported the moment the host accepts Stop or Preshutdown.
+///
+/// PowerShell's `Stop-Service`/`Restart-Service` wait for `Stopped` in 2 s
+/// slices and give up on a service that is still `RUNNING` after one
+/// (`DoWaitForStatus` accepts only the pending state) — and `Restart-Service`
+/// then never starts it. Before this the host stayed `RUNNING` through the whole
+/// graceful stop (#1683, up to [`supervisor::SHUTDOWN_BOUND`]), so a 2.3 s stop
+/// left a device stopped, and offline, for over ten minutes. No controls are
+/// accepted while stopping.
+fn stop_pending_status() -> ServiceStatus {
+    ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: STOP_PENDING_WAIT_HINT,
+        process_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +717,65 @@ mod tests {
             "SESSION_CHANGE must be accepted for M2 to receive logon notifications"
         );
         assert_eq!(s.current_state, ServiceState::Running);
+    }
+
+    /// #2010 — Stop and Preshutdown are answered with `STOP_PENDING`, and it is
+    /// reported BEFORE the supervisor is told. Without it `Restart-Service`
+    /// took a 2.3 s stop for a failure and never started the service again.
+    #[test]
+    fn stop_reports_stop_pending_before_the_supervisor_hears_of_it() {
+        for control in [ServiceControl::Stop, ServiceControl::Preshutdown] {
+            let calls = std::cell::RefCell::new(Vec::<String>::new());
+            let result = on_control(
+                control,
+                &mut |s| {
+                    calls
+                        .borrow_mut()
+                        .push(format!("report {:?}", s.current_state))
+                },
+                &mut |e| calls.borrow_mut().push(format!("notify {e:?}")),
+            );
+            assert!(matches!(result, ServiceControlHandlerResult::NoError));
+            assert_eq!(
+                *calls.borrow(),
+                ["report StopPending", "notify Shutdown"],
+                "{control:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrogate_reports_nothing_and_tells_the_supervisor_nothing() {
+        let calls = std::cell::RefCell::new(0u32);
+        let result = on_control(
+            ServiceControl::Interrogate,
+            &mut |_| *calls.borrow_mut() += 1,
+            &mut |_| *calls.borrow_mut() += 1,
+        );
+        assert!(matches!(result, ServiceControlHandlerResult::NoError));
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    /// The pending status takes no further controls and carries a hint that
+    /// covers the supervisor's whole shutdown — derived from it, so raising
+    /// the graceful budget raises the hint.
+    #[test]
+    fn stop_pending_status_covers_the_supervisors_whole_shutdown() {
+        let s = stop_pending_status();
+        assert_eq!(s.current_state, ServiceState::StopPending);
+        assert!(s.controls_accepted.is_empty());
+        assert_eq!(s.checkpoint, 1);
+        assert_eq!(s.exit_code, ServiceExitCode::Win32(0));
+        assert!(
+            supervisor::SHUTDOWN_BOUND > supervisor::WORKER_GRACEFUL_STOP_BUDGET,
+            "the bound includes the graceful budget"
+        );
+        assert!(
+            s.wait_hint > supervisor::SHUTDOWN_BOUND,
+            "hint {:?} must outlast the shutdown bound {:?}",
+            s.wait_hint,
+            supervisor::SHUTDOWN_BOUND
+        );
     }
 }
 // RETIRED-NAME-ANCHOR-END

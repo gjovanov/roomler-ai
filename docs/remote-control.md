@@ -2192,7 +2192,8 @@ mod.rs`):
   - `status()` returns `InstalledStatus` enum.
   - `run_in_dispatcher()` is the SCM entry point. Hands the OS thread
     to `windows_service::service_dispatcher::start`.
-  - SCM control handler accepts STOP + PRESHUTDOWN + SESSION_CHANGE.
+  - SCM control handler accepts STOP + PRESHUTDOWN + SESSION_CHANGE, and
+    answers STOP / PRESHUTDOWN with `STOP_PENDING` (§19.8.7, #2010).
 
 CLI: `service install --as-service` / `service uninstall --as-service`
 / `service status --as-service`. Hidden top-level `service-run`
@@ -2301,5 +2302,53 @@ The fix is a per-worker **named stop event**
   `TerminateProcess`. Only the whole-service shutdown signals the event — a
   session-change swap or crash-respawn still hard-kills, because the device is
   not leaving.
+
+#### 19.8.7 The host says it is stopping (#2010)
+
+§19.8.6 made an SCM stop last as long as the worker's graceful exit, which is
+1.5–2.3 s in the field. Throughout that time the host kept reporting `RUNNING`.
+PowerShell does not tolerate that. `Stop-Service` and `Restart-Service` wait for
+`Stopped` in 2-second slices, and after each slice they accept only the pending
+state. A service still `RUNNING` is a `StopServiceFailed`, and `Restart-Service`
+then **never calls start**:
+
+```mermaid
+sequenceDiagram
+    participant PS as Restart-Service
+    participant SCM
+    participant H as SCM host (service-run)
+    participant W as worker
+    PS->>SCM: ControlService(STOP)
+    SCM->>H: Stop
+    H->>SCM: STOP_PENDING (wait hint 20 s)
+    H->>W: signal the stop event
+    Note over PS: 2 s slice ends: STOP_PENDING,<br/>so keep waiting
+    W-->>H: exits (graceful, bounded at 8 s)
+    H->>SCM: STOPPED
+    PS->>SCM: StartService
+```
+
+| The host reports while stopping | `Restart-Service` when the stop takes > 2 s |
+|---|---|
+| `RUNNING` (0.4.105 → #2010) | `StopServiceFailed`. The service stays **stopped**, and the device stays offline: the service has no SCM recovery actions |
+| `STOP_PENDING` | warns "Waiting for service … to stop", waits, then starts it |
+
+- `on_control` (`agents/roomlerd/src/win_service/mod.rs`) reports
+  `stop_pending_status()` **before** it posts `Shutdown` to the supervisor. In
+  the other order, a fast supervisor could report `STOPPED` first and then have
+  it overwritten with a pending state for a process that is already gone. A
+  recorder test pins the order.
+- The wait hint is `supervisor::SHUTDOWN_BOUND` plus 10 s. The bound is one poll
+  interval, plus the graceful budget, plus the terminate wait, so raising any of
+  those raises the hint with it.
+- ⚠️ Field case, CORPLAP-3 on 0.4.126: a stop took 2.31 s, and the SYSTEM task
+  running `Restart-Service Roomler -Force` exited 1 that same second. The device
+  was offline for 10 min 24 s. The same restart earlier that day took 1.74 s and
+  came back 162 ms later. Because the failure depends on which side of 2 s a stop
+  lands, it is intermittent.
+- `roomler restart` never had this problem. Under the SCM the worker exits 0 and
+  the supervisor respawns it in-process, so the service itself never leaves
+  `RUNNING`. Prefer it remotely too: `roomler exec <host> -- roomler restart
+  --no-wait`.
 
 <!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->

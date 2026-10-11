@@ -635,7 +635,21 @@ const TERMINATE_WAIT: Duration = Duration::from_millis(1500);
 /// and the server-side reaper is the backstop for any exit that never reaches
 /// self-unenroll. The observed field case (#1683) was `virsh shutdown`, i.e. an
 /// OS shutdown, which is exactly the PRESHUTDOWN path.
+///
+/// ⚠️ #2010 — PowerShell does NOT poll that long unless the service says it is
+/// stopping: `Stop-Service`/`Restart-Service` give up on a service still
+/// `RUNNING` after 2 s, and `Restart-Service` then never starts it. The host
+/// reports `STOP_PENDING` (hint: [`SHUTDOWN_BOUND`]) the moment Stop lands.
 pub(super) const WORKER_GRACEFUL_STOP_BUDGET: Duration = Duration::from_secs(8);
+
+/// #2010 — the longest this supervisor's shutdown takes from the moment Stop or
+/// Preshutdown is posted: up to one [`POLL_INTERVAL`] before the loop sees it,
+/// the graceful budget, then `TerminateProcess` and its reap wait. The host's
+/// `STOP_PENDING` wait hint is built from this, so raising a budget here raises
+/// the hint with it.
+pub(super) const SHUTDOWN_BOUND: Duration = POLL_INTERVAL
+    .saturating_add(WORKER_GRACEFUL_STOP_BUDGET)
+    .saturating_add(TERMINATE_WAIT);
 
 /// #1683 — mint the per-spawn stop event and the `--stop-event <name>` argv to
 /// hand the worker. On failure it logs and returns `(None, empty)` so a spawn is
