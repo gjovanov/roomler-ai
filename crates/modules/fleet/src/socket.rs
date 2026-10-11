@@ -154,6 +154,9 @@ pub async fn handle_agent_socket(
     // FR-90 P2c-3 — and holds copies of the org's sessions: it answers a
     // join, and its owner's `hive_replica` is on. `hive` is its prefix too.
     let holds_hive_copies = caps.has_rpc(RpcCap::HiveReplica);
+    // FR-90 P2d — and carries replica streams: it serves a session it holds
+    // to a member, and dials one as a member. `hive` is its prefix too.
+    let carries_hive_streams = caps.has_rpc(RpcCap::HiveStream);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -186,6 +189,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_replica_support(agent_id, holds_hive_copies);
+    state
+        .rc_hub
+        .set_agent_hive_stream_support(agent_id, carries_hive_streams);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

@@ -878,6 +878,79 @@ pub enum ClientMsg {
         sessions: Vec<crate::hive::HiveReplicaManifestEntry>,
     },
 
+    /// FR-90 P2d — a member asks for a stream of a session it holds a copy
+    /// of, on one rung of the ladder. Answered by [`ServerMsg::HiveReplicaDial`]
+    /// once the source is ready, or by [`ServerMsg::HiveReplicaRefused`]. Read
+    /// only from a connection advertising `hive-stream`.
+    #[serde(rename = "rc:hive.replica.want")]
+    HiveReplicaWant {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence the member holds the session at.
+        fence: u64,
+        /// Where its copy ends: what the source streams from.
+        seq: u64,
+        hash: String,
+        /// The rung to try. `None` on the server = a rung this build cannot
+        /// name: refused `path_unavailable`.
+        #[serde(default, deserialize_with = "crate::hive::stream_path_lenient")]
+        path: Option<crate::hive::HiveStreamPath>,
+        /// The member's WireGuard key, which the `derp` rung addresses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
+    },
+
+    /// FR-90 P2d — the source's answer to [`ServerMsg::HiveReplicaGrant`]:
+    /// ready, with what the member pins and dials; or refused, and why. The
+    /// member is told to dial only after an answer without `refused` (FR-83).
+    #[serde(rename = "rc:hive.replica.ready")]
+    HiveReplicaReady {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        /// Absent = ready. Present = refused, decoded leniently — see
+        /// [`crate::hive::HiveStreamRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::stream_refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveStreamRefusal>,
+        /// A few words for the owner. Capped by the device, re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// The SHA-256 of the source's ephemeral certificate, as lowercase
+        /// hex: the member pins it. Required when ready.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert_fingerprint: Option<String>,
+        /// Where the member dials: host and server-reflexive candidates on
+        /// `direct`, the relayed address on `relay`; none on `derp`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addrs: Vec<String>,
+        /// The source's WireGuard key, on the `derp` rung.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
+    },
+
+    /// FR-90 P2d — the member's relayed address, for the source to permit on
+    /// the `relay` rung: a TURN allocation lets in only what a permission
+    /// names. Relayed only for a grant the source confirmed.
+    #[serde(rename = "rc:hive.replica.candidate")]
+    HiveReplicaCandidate {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        addr: String,
+    },
+
+    /// FR-90 P2d — the device ended a stream, as its member or its source:
+    /// the server forgets the grant and tells the other side.
+    #[serde(rename = "rc:hive.replica.close")]
+    HiveReplicaClose {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        reason: String,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1659,6 +1732,10 @@ impl ClientMsg {
             ClientMsg::HiveReplicaJoinAck { .. } => "rc:hive.replica.join_ack",
             ClientMsg::HiveReplicaTip { .. } => "rc:hive.replica.tip",
             ClientMsg::HiveReplicaManifest { .. } => "rc:hive.replica.manifest",
+            ClientMsg::HiveReplicaWant { .. } => "rc:hive.replica.want",
+            ClientMsg::HiveReplicaReady { .. } => "rc:hive.replica.ready",
+            ClientMsg::HiveReplicaCandidate { .. } => "rc:hive.replica.candidate",
+            ClientMsg::HiveReplicaClose { .. } => "rc:hive.replica.close",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1759,6 +1836,10 @@ impl ClientMsg {
             | ClientMsg::HiveReplicaJoinAck { .. }
             | ClientMsg::HiveReplicaTip { .. }
             | ClientMsg::HiveReplicaManifest { .. }
+            | ClientMsg::HiveReplicaWant { .. }
+            | ClientMsg::HiveReplicaReady { .. }
+            | ClientMsg::HiveReplicaCandidate { .. }
+            | ClientMsg::HiveReplicaClose { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1795,6 +1876,10 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.replica.join_ack", Owner::Hive),
     ("rc:hive.replica.tip", Owner::Hive),
     ("rc:hive.replica.manifest", Owner::Hive),
+    ("rc:hive.replica.want", Owner::Hive),
+    ("rc:hive.replica.ready", Owner::Hive),
+    ("rc:hive.replica.candidate", Owner::Hive),
+    ("rc:hive.replica.close", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -2973,6 +3058,104 @@ pub enum ServerMsg {
         role: Option<crate::hive::HiveReplicaRole>,
     },
 
+    /// FR-90 P2d — serve a stream of a session this device holds to one of
+    /// its members: stand up a QUIC endpoint on `path`, authorize only the
+    /// member presenting `token`, and answer [`ClientMsg::HiveReplicaReady`].
+    /// Pushed only to a connection advertising `hive-stream`.
+    ///
+    /// ⚠️ It opens nothing by itself: the member dials only once the source
+    /// said ready (FR-83), and the endpoint serves the one member the token
+    /// names, for `ttl_secs`.
+    #[serde(rename = "rc:hive.replica.grant")]
+    HiveReplicaGrant {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The member the stream is for.
+        #[serde(with = "oid_hex")]
+        member_id: ObjectId,
+        /// The rung. `None` on the device = a rung this build cannot name:
+        /// it refuses (`path_unavailable`).
+        #[serde(default, deserialize_with = "crate::hive::stream_path_lenient")]
+        path: Option<crate::hive::HiveStreamPath>,
+        /// What the member presents once connected: minted per grant,
+        /// unguessable.
+        token: String,
+        /// STUN, and on `relay` TURN, credentials minted for this grant.
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
+        /// The grant's life from receipt.
+        ttl_secs: u32,
+        /// The member's WireGuard key, on the `derp` rung.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member_derp_pubkey: Option<String>,
+    },
+
+    /// FR-90 P2d — the source is ready: dial it on `path`, pinning
+    /// `cert_fingerprint`, and present `token`. Sent only after the source's
+    /// `ready` (FR-83).
+    #[serde(rename = "rc:hive.replica.dial")]
+    HiveReplicaDial {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The device that serves the stream.
+        #[serde(with = "oid_hex")]
+        source_id: ObjectId,
+        #[serde(default, deserialize_with = "crate::hive::stream_path_lenient")]
+        path: Option<crate::hive::HiveStreamPath>,
+        token: String,
+        /// The SHA-256 the source's certificate must have.
+        cert_fingerprint: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addrs: Vec<String>,
+        /// The source's WireGuard key, on the `derp` rung.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
+        ttl_secs: u32,
+    },
+
+    /// FR-90 P2d — the member's relayed address, relayed to the source to
+    /// permit (mirror of [`ClientMsg::HiveReplicaCandidate`]).
+    #[serde(rename = "rc:hive.replica.candidate")]
+    HiveReplicaCandidate {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        addr: String,
+    },
+
+    /// FR-90 P2d — no stream this time: the server's word, or the source's.
+    /// The member asks again later, or on the next rung.
+    #[serde(rename = "rc:hive.replica.refused")]
+    HiveReplicaRefused {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The rung that was asked for, as named in the want.
+        #[serde(default, deserialize_with = "crate::hive::stream_path_lenient")]
+        path: Option<crate::hive::HiveStreamPath>,
+        /// Decoded leniently: an unknown word is still a refusal.
+        #[serde(default, deserialize_with = "crate::hive::stream_refusal_lenient")]
+        reason: Option<crate::hive::HiveStreamRefusal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// FR-90 P2d — a stream is over: the grant was revoked (a member that
+    /// left, a device removed), or the other side closed it.
+    #[serde(rename = "rc:hive.replica.close")]
+    HiveReplicaClose {
+        #[serde(with = "oid_hex")]
+        grant_id: ObjectId,
+        reason: String,
+    },
+
     /// Stop a session: interrupt any running turn, let the harness exit, and
     /// report `ended` through [`ClientMsg::HiveState`]. Idempotent — a stop
     /// for a session the device does not run is answered `ended` too.
@@ -3982,6 +4165,165 @@ mod tests {
             Some(HiveJoinRefusal::Other)
         );
         assert_eq!(parse(serde_json::Value::Null), None);
+    }
+
+    /// FR-90 P2d — the stream's handshake, both directions, field sets locked:
+    /// numbers, hashes, keys, addresses and a token, never content. A rung
+    /// this build cannot name still decodes, as `None`, and is refused in
+    /// words; an unknown refusal is still a refusal.
+    #[test]
+    fn hive_replica_stream_wire_shapes_are_locked() {
+        use crate::hive::{HiveStreamPath, HiveStreamRefusal};
+
+        let (sid, gid, dev) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let hash = "ab".repeat(32);
+        let key = "cd".repeat(32);
+        let want = ClientMsg::HiveReplicaWant {
+            session_id: sid,
+            fence: 2,
+            seq: 7,
+            hash: hash.clone(),
+            path: Some(HiveStreamPath::Direct),
+            derp_pubkey: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&want).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.want", "session_id": sid.to_hex(), "fence": 2,
+                "seq": 7, "hash": hash, "path": "direct"
+            })
+        );
+        let unnamed = serde_json::json!({
+            "t": "rc:hive.replica.want", "session_id": sid.to_hex(), "fence": 2,
+            "seq": 7, "hash": hash, "path": "smoke_signals"
+        });
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(unnamed).unwrap(),
+            ClientMsg::HiveReplicaWant { path: None, .. }
+        ));
+
+        let ready = ClientMsg::HiveReplicaReady {
+            grant_id: gid,
+            refused: None,
+            detail: None,
+            cert_fingerprint: Some(hash.clone()),
+            addrs: vec!["192.0.2.7:41641".into()],
+            derp_pubkey: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&ready).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.ready", "grant_id": gid.to_hex(),
+                "cert_fingerprint": hash, "addrs": ["192.0.2.7:41641"]
+            })
+        );
+        let refused = serde_json::json!({
+            "t": "rc:hive.replica.ready", "grant_id": gid.to_hex(), "refused": "a_word_from_2027"
+        });
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(refused).unwrap(),
+            ClientMsg::HiveReplicaReady {
+                refused: Some(HiveStreamRefusal::Other),
+                ..
+            }
+        ));
+        let candidate = ClientMsg::HiveReplicaCandidate {
+            grant_id: gid,
+            addr: "198.51.100.4:3478".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&candidate).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.candidate", "grant_id": gid.to_hex(),
+                "addr": "198.51.100.4:3478"
+            })
+        );
+        let close = ClientMsg::HiveReplicaClose {
+            grant_id: gid,
+            reason: "replaced".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&close).unwrap(),
+            serde_json::json!({"t": "rc:hive.replica.close", "grant_id": gid.to_hex(), "reason": "replaced"})
+        );
+        for m in [&want, &ready, &candidate, &close] {
+            assert_eq!(m.namespace(), Owner::Hive);
+        }
+
+        let grant = ServerMsg::HiveReplicaGrant {
+            grant_id: gid,
+            session_id: sid,
+            fence: 2,
+            member_id: dev,
+            path: Some(HiveStreamPath::Derp),
+            token: "t0k".into(),
+            ice_servers: Vec::new(),
+            ttl_secs: 600,
+            member_derp_pubkey: Some(key.clone()),
+        };
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.grant", "grant_id": gid.to_hex(), "session_id": sid.to_hex(),
+                "fence": 2, "member_id": dev.to_hex(), "path": "derp", "token": "t0k",
+                "ice_servers": [], "ttl_secs": 600, "member_derp_pubkey": key
+            })
+        );
+        let dial = ServerMsg::HiveReplicaDial {
+            grant_id: gid,
+            session_id: sid,
+            fence: 2,
+            source_id: dev,
+            path: Some(HiveStreamPath::Relay),
+            token: "t0k".into(),
+            cert_fingerprint: hash.clone(),
+            addrs: vec!["203.0.113.9:49152".into()],
+            derp_pubkey: None,
+            ice_servers: Vec::new(),
+            ttl_secs: 600,
+        };
+        assert_eq!(
+            serde_json::to_value(&dial).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.dial", "grant_id": gid.to_hex(), "session_id": sid.to_hex(),
+                "fence": 2, "source_id": dev.to_hex(), "path": "relay", "token": "t0k",
+                "cert_fingerprint": hash, "addrs": ["203.0.113.9:49152"],
+                "ice_servers": [], "ttl_secs": 600
+            })
+        );
+        let no = ServerMsg::HiveReplicaRefused {
+            session_id: sid,
+            fence: 2,
+            path: Some(HiveStreamPath::Direct),
+            reason: Some(HiveStreamRefusal::SourceOffline),
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&no).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.refused", "session_id": sid.to_hex(), "fence": 2,
+                "path": "direct", "reason": "source_offline"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::HiveReplicaCandidate {
+                grant_id: gid,
+                addr: "198.51.100.4:3478".into()
+            })
+            .unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.candidate", "grant_id": gid.to_hex(),
+                "addr": "198.51.100.4:3478"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::HiveReplicaClose {
+                grant_id: gid,
+                reason: "member_left".into()
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:hive.replica.close", "grant_id": gid.to_hex(), "reason": "member_left"})
+        );
     }
 
     /// FR-90 P2c-3 — a tip and a manifest are numbers and hashes. Their field

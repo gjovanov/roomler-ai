@@ -662,6 +662,179 @@ pub struct HiveReplicaManifestEntry {
     pub checkpoint: Option<HiveCheckpointMark>,
 }
 
+/// FR-90 P2d — bounds on the replica stream's frames
+/// (`rc:hive.replica.want` · `grant` · `ready` · `dial` · `candidate` ·
+/// `refused` · `close`), read by both ends.
+pub mod stream_limits {
+    /// A stream grant's life, sent as a RELATIVE `ttl_secs`, so a device
+    /// whose clock is off neither refuses every grant nor keeps one past its
+    /// time. A member renews at half-life while it follows, from the top of
+    /// the ladder again (P2d-4).
+    pub const GRANT_TTL_SECS: u32 = 10 * 60;
+    /// How long the server waits for the source's `ready` before it tells
+    /// the member no. A relay's allocation alone can take ~20 s on a
+    /// UDP-hostile network (#1761), so this is above the view's 10 s.
+    pub const GRANT_ACK_TIMEOUT_SECS: u64 = 30;
+    /// Grants one member holds for one session at once: the one it follows,
+    /// and the renewal that replaces it once it carries (make-before-break).
+    pub const MAX_PER_MEMBER_SESSION: usize = 2;
+    /// Streams one source serves at once.
+    pub const MAX_PER_SOURCE: usize = 32;
+    /// Wants per (member, session) per minute, after the identity gates:
+    /// three rungs and a renewal, with room to spare.
+    pub const WANT_RATE_PER_MINUTE: u32 = 12;
+    /// Addresses one `ready` may offer, and the longest of them.
+    pub const MAX_ADDRS: usize = 8;
+    pub const MAX_ADDR_LEN: usize = 64;
+    /// A WireGuard key, which addresses a device on DERP: lowercase hex.
+    pub const PUBKEY_HEX_LEN: usize = 64;
+}
+
+/// Whether `s` is a WireGuard key as the stream frames carry it: exactly
+/// [`stream_limits::PUBKEY_HEX_LEN`] lowercase hex characters.
+pub fn is_pubkey_hex(s: &str) -> bool {
+    s.len() == stream_limits::PUBKEY_HEX_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// FR-90 P2d — the rung of the ladder a replica stream tries (spec §3b, "The
+/// carrier"). The member names one in each `rc:hive.replica.want`, from the
+/// top, and climbs down a rung when one does not carry. Every renewal starts
+/// from the top again, so a member that fell to a relay is back on a direct
+/// path at the first renewal that finds one: never ratchet.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveStreamPath {
+    /// QUIC between the two devices' own sockets: host and server-reflexive
+    /// candidates, hole-punched. There is no relay to see anything.
+    Direct,
+    /// QUIC through a TURN relay, over UDP or TURNS on TCP 443, with the
+    /// grant's credentials. The relay sees QUIC packets: ciphertext.
+    Relay,
+    /// `quic-derp-v1`: QUIC framed over each device's established `/derp`
+    /// WebSocket, addressed by WireGuard key. Both must be overlay nodes.
+    Derp,
+}
+
+impl HiveStreamPath {
+    /// The spelling on the wire. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Derp => "derp",
+        }
+    }
+
+    /// Every rung this build knows, from the top.
+    pub const ALL: [HiveStreamPath; 3] = [Self::Direct, Self::Relay, Self::Derp];
+}
+
+/// Lenient decoder for a stream frame's `path`: a rung this build cannot
+/// name is `None`, so the frame still decodes and is refused in words,
+/// never dropped unanswered.
+pub(crate) fn stream_path_lenient<'de, D>(de: D) -> Result<Option<HiveStreamPath>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(None);
+    };
+    Ok(HiveStreamPath::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .ok())
+}
+
+/// FR-90 P2d — why a member gets no stream this time: the server's word in
+/// `rc:hive.replica.refused`, or the source's, in `rc:hive.replica.ready`
+/// and relayed. Each names a different gate with a different fix.
+///
+/// ⚠️ Decoded LENIENTLY ([`stream_refusal_lenient`]): an unknown word is
+/// [`Self::Other`], still a refusal. It must never land on "ready": the
+/// member would dial a source that has just said no.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveStreamRefusal {
+    /// The asking device is not a joined member of the session.
+    NotAMember,
+    /// The want named another fence than the session's.
+    StaleFence,
+    /// The source is not connected here.
+    SourceOffline,
+    /// The source's build carries no replica stream (`hive-stream`).
+    SourceUnsupported,
+    /// The rung cannot be had: a relay where no TURN server is configured,
+    /// DERP without both devices' keys, or a rung this build cannot name.
+    PathUnavailable,
+    /// Too many wants from this member for this session.
+    RateLimited,
+    /// The source serves as many streams as it may.
+    Busy,
+    /// The source does not hold the session it was asked to serve.
+    NotHeld,
+    /// The source did not answer in time.
+    NoAnswer,
+    /// A word this build does not know.
+    Other,
+}
+
+impl HiveStreamRefusal {
+    /// The spelling on the wire and in the audit. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAMember => "not_a_member",
+            Self::StaleFence => "stale_fence",
+            Self::SourceOffline => "source_offline",
+            Self::SourceUnsupported => "source_unsupported",
+            Self::PathUnavailable => "path_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::Busy => "busy",
+            Self::NotHeld => "not_held",
+            Self::NoAnswer => "no_answer",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveStreamRefusal; 10] = [
+        Self::NotAMember,
+        Self::StaleFence,
+        Self::SourceOffline,
+        Self::SourceUnsupported,
+        Self::PathUnavailable,
+        Self::RateLimited,
+        Self::Busy,
+        Self::NotHeld,
+        Self::NoAnswer,
+        Self::Other,
+    ];
+}
+
+/// Lenient decoder for a stream refusal: present and not a known word is
+/// [`HiveStreamRefusal::Other`], never "ready"; absent or `null` is `None`.
+pub(crate) fn stream_refusal_lenient<'de, D>(de: D) -> Result<Option<HiveStreamRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveStreamRefusal::Other));
+    };
+    Ok(Some(
+        HiveStreamRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveStreamRefusal::Other),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1113,82 @@ mod tests {
         assert_eq!(r(r#"{"role":"witness"}"#), None);
         assert_eq!(r(r#"{"role":2}"#), None);
         assert_eq!(r("{}"), None);
+    }
+
+    /// FR-90 P2d — the rungs are locked, top first, and one this build cannot
+    /// name is `None`: the want still decodes, and is refused in words.
+    #[test]
+    fn stream_paths_are_locked_top_first_and_an_unknown_one_is_unnamed() {
+        let words: Vec<&str> = HiveStreamPath::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(words, ["direct", "relay", "derp"]);
+        for p in HiveStreamPath::ALL {
+            assert_eq!(
+                serde_json::to_value(p).unwrap(),
+                serde_json::json!(p.as_str())
+            );
+        }
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default, deserialize_with = "stream_path_lenient")]
+            path: Option<HiveStreamPath>,
+        }
+        let p = |s: &str| serde_json::from_str::<P>(s).unwrap().path;
+        assert_eq!(p(r#"{"path":"derp"}"#), Some(HiveStreamPath::Derp));
+        assert_eq!(p(r#"{"path":"carrier-pigeon"}"#), None);
+        assert_eq!(p(r#"{"path":3}"#), None);
+        assert_eq!(p("{}"), None);
+    }
+
+    /// FR-90 P2d — the refusal words are locked, and anything present that
+    /// is not one is still a refusal (`other`), never "ready".
+    #[test]
+    fn stream_refusals_are_locked_and_never_read_as_ready() {
+        let words: Vec<&str> = HiveStreamRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "not_a_member",
+                "stale_fence",
+                "source_offline",
+                "source_unsupported",
+                "path_unavailable",
+                "rate_limited",
+                "busy",
+                "not_held",
+                "no_answer",
+                "other",
+            ]
+        );
+        for r in HiveStreamRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::json!(r.as_str())
+            );
+        }
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default, deserialize_with = "stream_refusal_lenient")]
+            refused: Option<HiveStreamRefusal>,
+        }
+        let r = |s: &str| serde_json::from_str::<R>(s).unwrap().refused;
+        assert_eq!(r(r#"{"refused":"busy"}"#), Some(HiveStreamRefusal::Busy));
+        assert_eq!(
+            r(r#"{"refused":"moon_in_wrong_phase"}"#),
+            Some(HiveStreamRefusal::Other)
+        );
+        assert_eq!(r(r#"{"refused":7}"#), Some(HiveStreamRefusal::Other));
+        assert_eq!(r(r#"{"refused":null}"#), None);
+        assert_eq!(r("{}"), None);
+    }
+
+    /// A WireGuard key is 64 lowercase hex characters, and nothing else is.
+    #[test]
+    fn a_pubkey_is_64_lowercase_hex_characters() {
+        let good = "89abcdef".repeat(8);
+        assert!(is_pubkey_hex(&good));
+        assert!(!is_pubkey_hex(&good.to_uppercase()));
+        assert!(!is_pubkey_hex(&good[..63]));
+        assert!(!is_pubkey_hex(&"z".repeat(64)));
     }
 
     /// A hash is 64 lowercase hex characters, and nothing else is one.

@@ -156,6 +156,11 @@ pub struct ConnectedAgent {
     /// (`hive_replica`). Per connection, for the same reason; `hive` does NOT
     /// imply it.
     pub supports_hive_replica: bool,
+    /// FR-90 P2d — the agent advertises `hive-stream`: it serves a session it
+    /// holds to a member over QUIC, and asks for and dials one as a member.
+    /// A grant goes only to a connection with it. Per connection, for the same
+    /// reason; neither `hive` nor `hive-replica` implies it.
+    pub supports_hive_stream: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -446,6 +451,9 @@ impl Hub {
             // FR-90 P2c-3 — set by `set_agent_hive_replica_support`; `false` = no
             // join is ever pushed to this connection.
             supports_hive_replica: false,
+            // FR-90 P2d — set by `set_agent_hive_stream_support`; `false` = no
+            // stream grant is ever pushed to this connection.
+            supports_hive_stream: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1850,6 +1858,67 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !entry.supports_hive_replica {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2d — record whether this connection carries replica streams
+    /// (`hive-stream`), right after registration.
+    pub fn set_agent_hive_stream_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_stream = supports;
+        }
+    }
+
+    /// FR-90 P2d — whether THIS connection advertises `hive-stream`, as
+    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or a
+    /// newer connection holds the slot.
+    pub fn agent_supports_hive_stream_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| ptr_eq(&a.tx, tx))
+            .map(|a| a.supports_hive_stream)
+    }
+
+    /// FR-90 P2d — whether the device's CURRENT connection on this pod
+    /// advertises `hive-stream`: `None` = not online here, or another
+    /// tenant's (answered alike, as [`Self::push_hive`] answers).
+    pub fn agent_supports_hive_stream(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .map(|a| a.supports_hive_stream)
+    }
+
+    /// FR-90 P2d — push a stream frame (`rc:hive.replica.grant`, `dial`,
+    /// `candidate`, `refused`, `close`), checked in the lookup that sends it,
+    /// as [`Self::push_hive`]: offline or another tenant's is
+    /// [`Error::AgentOffline`]; a connection without `hive-stream` is
+    /// [`Error::ExecUnsupported`] and receives nothing.
+    pub fn push_hive_stream(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive_stream {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }

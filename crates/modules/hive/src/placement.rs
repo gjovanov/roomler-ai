@@ -463,6 +463,10 @@ async fn replace_one(
             && state.sessions.mark_leaving(sid, m.device_id).await?
         {
             moved = true;
+            // P2d — and its streams of the session end now, not at their
+            // grant's end: a member let go for a tag taken off must stop
+            // following at once. What it holds goes with the purge (P2g).
+            crate::stream::end_for_member(state, sid, m.device_id, "member_left");
         }
     }
     let short = p.short.map(Short::as_str);
