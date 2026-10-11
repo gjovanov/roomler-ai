@@ -636,7 +636,7 @@ pub async fn handle_agent_socket(
                                         .await;
                                     }
                                 }
-                                if let Err(e) = state
+                                match state
                                     .agents
                                     .touch_heartbeat(
                                         agent_id,
@@ -646,7 +646,31 @@ pub async fn handle_agent_socket(
                                     )
                                     .await
                                 {
-                                    warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                                    // FR-92 P7 — the row as it was BEFORE this
+                                    // beat came back with the write: an edge
+                                    // between its brief and this one is a
+                                    // history row (the device's claim). Inline,
+                                    // not spawned: edges are rare, and two
+                                    // beats' edges must land in order.
+                                    //
+                                    // ⚠️ `tenant_id` / `agent_id` are the
+                                    // authenticated socket's, never the frame's.
+                                    Ok(Some(before)) => {
+                                        crate::keep_busy::record_device_edge(
+                                            &state,
+                                            tenant_id,
+                                            agent_id,
+                                            &before,
+                                            keep_busy.as_ref(),
+                                        )
+                                        .await;
+                                    }
+                                    Ok(None) => {
+                                        debug!(%agent_id, "heartbeat for a device row that is gone");
+                                    }
+                                    Err(e) => {
+                                        warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                                    }
                                 }
                                 // C4 stage 2 (PR-B) — the warm leg mirrored onto
                                 // the overlay-node row is `network`'s write

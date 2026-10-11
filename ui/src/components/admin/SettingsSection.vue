@@ -139,9 +139,35 @@
           immediately for devices that are online and at the next connect for the rest. A
           device's owner can also turn it off on that device (<code>keep_busy_enabled</code>).
         </div>
+
+        <!-- FR-92 P8 — the org's default pattern. A preference, never a
+             policy: it never reaches a device, and a person's own last
+             choice for a device wins over it in the viewer. -->
+        <v-select
+          :model-value="agentStore.orgKeepBusyDefaultPattern ?? 'circle'"
+          :items="patternItems"
+          :label="t('keepBusy.defaultPattern.label')"
+          :loading="savingKeepBusyPattern"
+          :disabled="savingKeepBusyPattern || agentStore.orgKeepBusyDenied === null"
+          density="compact"
+          hide-details
+          class="mt-4"
+          style="max-width: 320px"
+          data-testid="org-keep-busy-default-pattern"
+          @update:model-value="onDefaultPattern"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          {{ t('keepBusy.defaultPattern.hint') }}
+        </div>
+
         <v-alert v-if="keepBusyError" type="error" variant="tonal" density="compact" class="mt-3">
           {{ keepBusyError }}
         </v-alert>
+
+        <v-divider class="my-4" />
+        <!-- FR-92 P7 — the permanent history. MANAGE_AGENTS server-side; a
+             refusal shows inside the list and ends nothing. -->
+        <KeepBusyHistorySection :tenant-id="tenantId" />
       </v-card-text>
     </v-card>
 
@@ -197,10 +223,14 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useTenantStore } from '@/stores/tenant'
 import { useAgentStore } from '@/stores/agents'
+import { KEEP_BUSY_PATTERNS } from '@/composables/keepBusy'
+import KeepBusyHistorySection from '@/components/admin/KeepBusyHistorySection.vue'
 
 const props = defineProps<{ tenantId: string }>()
+const { t } = useI18n()
 const tenantStore = useTenantStore()
 const agentStore = useAgentStore()
 
@@ -250,6 +280,24 @@ async function onToggleKeepBusy(allow: boolean | null) {
     keepBusyError.value = (e as Error).message
   } finally {
     savingKeepBusy.value = false
+  }
+}
+
+// FR-92 P8 — the default pattern, its own saving flag so a failed pattern
+// change never greys out the switch. The labels are the viewer's own.
+const patternItems = KEEP_BUSY_PATTERNS.map((p) => ({ title: p.label, value: p.id }))
+const savingKeepBusyPattern = ref(false)
+
+async function onDefaultPattern(pattern: string | null) {
+  if (!pattern) return
+  savingKeepBusyPattern.value = true
+  keepBusyError.value = null
+  try {
+    await agentStore.setOrgKeepBusyDefaultPattern(props.tenantId, pattern)
+  } catch (e) {
+    keepBusyError.value = (e as Error).message
+  } finally {
+    savingKeepBusyPattern.value = false
   }
 }
 

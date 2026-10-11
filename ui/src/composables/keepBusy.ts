@@ -88,6 +88,12 @@ export const KEEP_BUSY_RESUME_CHOICES = [10, 30, 60, 120, 300] as const
 export const KEEP_BUSY_AUTO_OFF_CHOICES = [0, 30, 60, 120, 240, 480] as const
 
 const PATTERN_IDS = new Set<string>(KEEP_BUSY_PATTERNS.map((p) => p.id))
+
+/** Is `v` a pattern this viewer knows, by exact id? (FR-92 P8: the org's
+ *  default comes from the server as a word; an unknown one means circle.) */
+export function isKeepBusyPattern(v: unknown): v is KeepBusyPattern {
+  return typeof v === 'string' && PATTERN_IDS.has(v)
+}
 const PHASES = new Set<string>(['off', 'calibrating', 'running', 'paused', 'locked', 'unavailable'])
 
 function str(v: unknown): string | null {

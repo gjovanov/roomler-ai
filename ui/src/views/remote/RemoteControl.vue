@@ -359,6 +359,7 @@
         :state="rc.keepBusy.value"
         :can-control="rc.inputGranted.value"
         :agent-id="agentId"
+        :default-pattern="orgKeepBusyDefault"
         @set="rc.setKeepBusy"
       />
       <v-menu
@@ -1919,6 +1920,7 @@ import {
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
+import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 
 const route = useRoute()
@@ -2776,6 +2778,10 @@ const agentLayoutCaps = computed<string[]>(() => agent.value?.capabilities?.layo
 const agentSupportsKeepBusy = computed<boolean>(
   () => agent.value?.capabilities?.input?.includes('keep-busy') ?? false,
 )
+// FR-92 P8 — the org's default pattern, for a device this person has no
+// remembered choice on. Read once per viewer open; any member may read it,
+// and a failure means circle (the store never throws here).
+const orgKeepBusyDefault = ref<KeepBusyPattern | null>(null)
 /** Pretty layout label via Intl.DisplayNames ("bg-BG" → "Bulgarian
  *  (Bulgaria)" in the viewer's language); raw tag on failure (the
  *  agent falls back to a hex LANGID for layouts the OS can't name). */
@@ -4177,6 +4183,9 @@ watch(
 
 onMounted(() => {
   void loadAgent()
+  void agentStore.fetchKeepBusyDefaultPattern(tenantId.value).then((p) => {
+    orgKeepBusyDefault.value = p
+  })
   agentStatusTimer = setInterval(() => void refreshAgentStatus(), AGENT_STATUS_POLL_MS)
   // P6 — ghost-cursor staleness ticker (cheap; drives the 5 s fade).
   ghostTicker = setInterval(() => { ghostNow.value = Date.now() }, 1000)

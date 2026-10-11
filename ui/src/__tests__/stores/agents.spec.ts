@@ -444,6 +444,60 @@ describe('useAgentStore', () => {
     expect(s.orgKeepBusyDenied).toBe(true)
   })
 
+  it('FR-92 P8: the admin read carries the default pattern, and a pattern-only PUT touches nothing else', async () => {
+    mockApi.get.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: 'heart' })
+    asOwner()
+    const s = useAgentStore()
+    await s.fetchOrgKeepBusyDenied(TENANT_ID)
+    expect(s.orgKeepBusyDenied).toBe(false)
+    expect(s.orgKeepBusyDefaultPattern).toBe('heart')
+
+    mockApi.put.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: 'wave' })
+    await s.setOrgKeepBusyDefaultPattern(TENANT_ID, 'wave')
+    expect(mockApi.put.mock.calls.at(-1)).toEqual([
+      `/tenant/${TENANT_ID}/keep-busy-settings`,
+      { keep_busy_default_pattern: 'wave' },
+    ])
+    expect(s.orgKeepBusyDefaultPattern).toBe('wave')
+    expect(s.orgKeepBusyDenied).toBe(false)
+
+    // `null` clears it to the product default, and that is what is sent.
+    mockApi.put.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: null })
+    await s.setOrgKeepBusyDefaultPattern(TENANT_ID, null)
+    expect(mockApi.put.mock.calls.at(-1)![1]).toEqual({ keep_busy_default_pattern: null })
+    expect(s.orgKeepBusyDefaultPattern).toBeNull()
+  })
+
+  it("FR-92 P8: a viewer's read of the default is ungated and never throws — circle for anything but a known word", async () => {
+    // A plain member: the route is readable by any member, so no gate.
+    asMemberWithoutManageTenant()
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: 'subtle' })
+    expect(await s.fetchKeepBusyDefaultPattern(TENANT_ID)).toBe('subtle')
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/keep-busy-settings`)
+    // Unset = the product default.
+    mockApi.get.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: null })
+    expect(await s.fetchKeepBusyDefaultPattern(TENANT_ID)).toBe('circle')
+    // A word this viewer cannot draw (a newer server) = circle, never a crash.
+    mockApi.get.mockResolvedValueOnce({ keep_busy_denied: false, keep_busy_default_pattern: 'hexagon' })
+    expect(await s.fetchKeepBusyDefaultPattern(TENANT_ID)).toBe('circle')
+    // A refusal or a network failure = circle; nothing thrown, nothing logged out.
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    expect(await s.fetchKeepBusyDefaultPattern(TENANT_ID)).toBe('circle')
+  })
+
+  it('FR-92 P7: the history is asked for newest first — by device, and by the cursor', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce([])
+    await s.fetchKeepBusyHistory(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/keep-busy-history?limit=50`)
+    mockApi.get.mockResolvedValueOnce([])
+    await s.fetchKeepBusyHistory(TENANT_ID, { agentId: 'a1', before: '2026-10-11T12:00:00Z', limit: 20 })
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(
+      `/tenant/${TENANT_ID}/keep-busy-history?agent_id=a1&before=2026-10-11T12%3A00%3A00Z&limit=20`,
+    )
+  })
+
   it('a 403 on the ssh org switch leaves it UNKNOWN, not "off"', async () => {
     mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
     asOwner()
