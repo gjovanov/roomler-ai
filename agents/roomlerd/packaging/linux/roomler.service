@@ -68,6 +68,31 @@ ReadWritePaths=%h/.config/roomler %h/.local/share/roomler -%h/.config/roomler-ag
 # localized Videos folder (XDG_VIDEOS_DIR=~/Vidéos, …) is not covered and
 # falls back the same way.
 ReadWritePaths=-%h/Videos
+# #1997 — three more paths the daemon writes, each one denied wherever the
+# sandbox applies. Measured on Fedora 44, whose user manager DOES apply it: the
+# daemon could not start at all, and restarted every 5 s forever with
+# "acquiring single-instance lock … Read-only file system (os error 30)".
+#   * `%t`, the runtime dir: ProtectSystem=strict leaves /run read-only, and
+#     /run/user/$UID with it. The single-instance lock (instance_lock.rs) and
+#     the LocalAPI socket ($XDG_RUNTIME_DIR/roomler.sock) both live there.
+#   * the state folder: the portal's restore token (~/.local/state/roomler,
+#     capture/portal/screencast.rs TokenStore). Read-only, the token cannot be
+#     renewed, so the person at the screen is asked again every session. A
+#     ReadWritePaths entry binds only a folder that EXISTS when the sandbox is
+#     built, so the `+` line (run outside the sandbox) creates it first, 0700
+#     as TokenStore::save sets it. Its `-` matters as much: a folder that
+#     cannot be made costs one prompt per session, never the daemon's start.
+#     ⚠️ Not StateDirectory=: measured on systemd 255, it found
+#     ~/.config/roomler, took that for its own pre-XDG-state location, and
+#     symlinked ~/.local/state/roomler to it. Every enrolled host has that
+#     folder, so the token would have moved into the config folder.
+#     A custom XDG_STATE_HOME is not covered and costs that prompt per session.
+#   * ~/Downloads, where incoming files land (files.rs default_download_dir).
+#     `-` and the localized-name caveat as for ~/Videos.
+ReadWritePaths=%t
+ExecStartPre=-+/bin/mkdir -p -m 0700 %h/.local/state/roomler
+ReadWritePaths=-%h/.local/state/roomler
+ReadWritePaths=-%h/Downloads
 
 [Install]
 WantedBy=default.target
