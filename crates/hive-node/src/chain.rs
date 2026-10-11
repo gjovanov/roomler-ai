@@ -195,8 +195,9 @@ pub fn check_next_with_floor(
     check_next(tip, next)
 }
 
-/// `[u8; 32]` as lowercase hex in JSON.
-mod hex32 {
+/// `[u8; 32]` as lowercase hex in JSON: an envelope's `prev_hash`, and an
+/// `events` frame's (P2d-3).
+pub(crate) mod hex32 {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

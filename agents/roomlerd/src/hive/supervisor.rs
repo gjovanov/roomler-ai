@@ -355,6 +355,11 @@ pub struct Supervisor {
     /// P2d — the replica streams this device is a side of, by grant: the
     /// ones it serves as a source and the ones it follows as a member.
     streams: Mutex<HashMap<ObjectId, stream::Stream>>,
+    /// P2d-3 — what the streams this device follows hold in memory, across
+    /// all of them: event bytes, and blob bytes, each taken before it is
+    /// read ([`stream::EVENT_BUDGET`], [`stream::BLOB_BUDGET`]).
+    replica_events: tokio::sync::Semaphore,
+    replica_blobs: tokio::sync::Semaphore,
     /// P2d-2c — a test's own DERP mux in place of the primary org's (`Some`),
     /// so one test stands a source and a member on two muxes wired to each
     /// other; `Some(None)` for none at all, whatever another test registered.
@@ -873,6 +878,8 @@ impl Supervisor {
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            replica_events: tokio::sync::Semaphore::new(stream::EVENT_BUDGET),
+            replica_blobs: tokio::sync::Semaphore::new(stream::BLOB_BUDGET),
             #[cfg(test)]
             derp_for_tests: Mutex::new(None),
             #[cfg(test)]

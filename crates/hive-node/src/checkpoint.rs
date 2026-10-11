@@ -249,6 +249,24 @@ pub struct Checkpoint {
     pub workspace: Option<WorkspaceSnap>,
 }
 
+impl Checkpoint {
+    /// FR-90 P2d-3 — every blob this checkpoint adds, each once, with its
+    /// length: each file's chunks in path order, then the pack's. A member
+    /// holds them all before it applies the checkpoint
+    /// ([`crate::stream::blobs_named`]), so a copy whose tip is past a
+    /// checkpoint holds its files too.
+    pub fn blobs(&self) -> Vec<(Digest, u64)> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.files
+            .iter()
+            .flat_map(|f| f.chunks.iter())
+            .chain(self.workspace.iter().flat_map(|w| w.pack.iter()))
+            .filter(|c| seen.insert(c.hash))
+            .map(|c| (c.hash, c.len))
+            .collect()
+    }
+}
+
 /// `bytes` as chunks of at most [`CHUNK_MAX`] from offset 0, and their blobs:
 /// how a whole thing, a pack among them, is carried.
 pub fn chunk_bytes(bytes: &[u8]) -> (Vec<Chunk>, Vec<Vec<u8>>) {

@@ -43,7 +43,7 @@ pub const CHECKPOINT_SUBCOMMAND: &str = "hive-checkpoint";
 const MAGIC: &[u8; 8] = b"HIVECP1\n";
 
 /// The most header bytes read: a manifest of [`MAX_FILES`] files.
-const MAX_HEADER: usize = 16 * 1024 * 1024;
+pub(super) const MAX_HEADER: usize = 16 * 1024 * 1024;
 
 /// The most blobs one checkpoint names: every file in at most two chunks,
 /// and a pack of [`workspace::MAX_PACK`].
