@@ -151,6 +151,11 @@ pub struct ConnectedAgent {
     /// An `rc:hive.adopt` from a connection without it is refused unread. Per
     /// connection, for the same reason; `hive` does NOT imply it.
     pub supports_hive_adopt: bool,
+    /// FR-90 P2c-3 — the agent advertises `hive-replica`: it answers
+    /// `rc:hive.replica.join`, and its owner lets it hold copies
+    /// (`hive_replica`). Per connection, for the same reason; `hive` does NOT
+    /// imply it.
+    pub supports_hive_replica: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -438,6 +443,9 @@ impl Hub {
             // FR-90 P1j — set by `set_agent_hive_adopt_support`; `false` = an
             // adopt offer from this connection is never honoured.
             supports_hive_adopt: false,
+            // FR-90 P2c-3 — set by `set_agent_hive_replica_support`; `false` = no
+            // join is ever pushed to this connection.
+            supports_hive_replica: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1792,6 +1800,56 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !entry.supports_hive_adopt {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2c-3 — record whether this connection holds copies
+    /// (`hive-replica`), right after registration.
+    pub fn set_agent_hive_replica_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_replica = supports;
+        }
+    }
+
+    /// FR-90 P2c-3 — whether THIS connection advertises `hive-replica`, as
+    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or a
+    /// newer connection holds the slot.
+    pub fn agent_supports_hive_replica_on(
+        &self,
+        agent_id: ObjectId,
+        tx: &ClientTx,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| ptr_eq(&a.tx, tx))
+            .map(|a| a.supports_hive_replica)
+    }
+
+    /// FR-90 P2c-3 — push a join (`rc:hive.replica.join`), checked in the
+    /// lookup that sends it, as [`Self::push_hive`]: offline or another
+    /// tenant's is [`Error::AgentOffline`]; a connection without
+    /// `hive-replica` is [`Error::ExecUnsupported`] and receives nothing — the
+    /// join stays pending until a connection that holds copies asks.
+    pub fn push_hive_replica(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive_replica {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }

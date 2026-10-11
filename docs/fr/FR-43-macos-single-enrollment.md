@@ -98,7 +98,7 @@ the session has to reach the worker some other way.
 ### Why not "let the worker open its own WS for the session"
 
 Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
-(`crates/modules/fleet/src/hub.rs:280`) is keyed on `agent_id`, and a second connection
+(`crates/modules/fleet/src/hub.rs:285`) is keyed on `agent_id`, and a second connection
 **displaces** the first — the displaced socket is cancelled within milliseconds by design
 (`hub.rs:91-96`). A worker dialling in as the same device would knock the daemon's control
 WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
