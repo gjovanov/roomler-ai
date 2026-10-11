@@ -249,7 +249,11 @@ From P11 the daemon also gives the person at the seat a **person socket** in the
 runtime dir: `/run/user/<uid>/roomler.sock`, 0600 and theirs. Their companion uses
 it, which is how a system install gets its "Being viewed by …" banner, its
 Disconnect and its consent prompt. As that user:
-- `roomler status` answers;
+- `roomler status` answers. Its `mode` line names the account the daemon runs as:
+  `service (root)` here, `service (per-user)` for a per-user install
+  (`service (SYSTEM)` on Windows). `status --json` carries the same fact as
+  `"privileged"`. An older daemon reports no account: a new CLI then prints a
+  bare `service`, an older one `service (SYSTEM)` for every install;
 - anything administrative (`peers`, routes, `config`, …) is refused with a pointer
   to `sudo roomler …`.
 

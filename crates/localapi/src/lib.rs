@@ -49,7 +49,9 @@ pub enum ConnectionType {
     Offline,
 }
 
-/// Which privilege mode the daemon is running in.
+/// What kind of node the daemon is. It says nothing about the account the
+/// process runs as: a per-user `roomlerd` is a full node and reports
+/// `Service`. That account is [`NodeStatus::privileged`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonMode {
@@ -103,6 +105,13 @@ pub struct NodeStatus {
     pub name: String,
     pub version: String,
     pub mode: DaemonMode,
+    /// The account the daemon process runs as: `Some(true)` = root or
+    /// LocalSystem (a system install), `Some(false)` = the signed-in user (a
+    /// per-user install). Before this field, `status` printed "SYSTEM" for
+    /// every `Service` daemon, per-user ones included. Additive: `None` from
+    /// an older daemon, and an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4476,6 +4485,7 @@ mod tests {
                 name: "devbox".into(),
                 version: "0.3.0-rc.154".into(),
                 mode: DaemonMode::Service,
+                privileged: None,
                 tenant_id: Some("t1".into()),
                 overlay_ip: Some("100.64.0.2".into()),
                 overlay_ip6: None,
@@ -5829,6 +5839,30 @@ mod tests {
         assert_eq!(serde_json::from_str::<NodeStatus>(&s).unwrap(), with);
         // Empty orgs is omitted entirely (old-CLI-identical wire).
         assert!(!serde_json::to_string(&st).unwrap().contains("orgs"));
+    }
+
+    /// `privileged` is additive both ways, and independent of `mode`. An older
+    /// daemon sends no such key, which parses as `None`: a new CLI then names
+    /// no account rather than guessing one. `None` is never written. Both
+    /// values round-trip with `mode` untouched, because a per-user daemon is
+    /// still a `Service` node.
+    #[test]
+    fn privileged_is_additive_and_independent_of_mode() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.privileged, None);
+        assert!(!serde_json::to_string(&st).unwrap().contains("privileged"));
+        for p in [true, false] {
+            let with = NodeStatus {
+                privileged: Some(p),
+                ..st.clone()
+            };
+            let wire = serde_json::to_string(&with).unwrap();
+            assert!(wire.contains(&format!(r#""privileged":{p}"#)), "{wire}");
+            let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back.privileged, Some(p));
+            assert_eq!(back.mode, DaemonMode::Service);
+        }
     }
 
     /// FR-49 — an OLDER daemon reports no `overlay_mode`, and that must parse

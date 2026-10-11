@@ -2154,11 +2154,22 @@ fn fmt_flow_row(f: &FlowInfo) -> String {
     )
 }
 
+/// The `mode` line. `mode` names the kind of node; `privileged` names the
+/// account it runs as. Before the daemon reported the account, this line read
+/// "service (SYSTEM)" for every full node, per-user ones included. An older
+/// daemon reports no account, so the line names none.
+fn mode_label(mode: DaemonMode, privileged: Option<bool>) -> &'static str {
+    match (mode, privileged) {
+        (DaemonMode::Service, Some(true)) if cfg!(windows) => "service (SYSTEM)",
+        (DaemonMode::Service, Some(true)) => "service (root)",
+        (DaemonMode::Service, Some(false)) => "service (per-user)",
+        (DaemonMode::Service, None) => "service",
+        (DaemonMode::User, _) => "user",
+    }
+}
+
 fn print_status(s: &NodeStatus) {
-    let mode = match s.mode {
-        DaemonMode::Service => "service (SYSTEM)",
-        DaemonMode::User => "user",
-    };
+    let mode = mode_label(s.mode, s.privileged);
     println!("{} {}", up_glyph(s.connected), s.name);
     println!("  node id     {}", short_id(&s.node_id));
     println!("  version     {}", s.version);
@@ -2887,6 +2898,25 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-93's lab saw a per-user Fedora daemon print "service (SYSTEM)". The
+    /// label follows the account the daemon reports, and an older daemon,
+    /// which reports none, gets no guess.
+    #[test]
+    fn the_mode_line_names_the_account_the_daemon_reported() {
+        assert_eq!(
+            mode_label(DaemonMode::Service, Some(false)),
+            "service (per-user)"
+        );
+        assert_eq!(mode_label(DaemonMode::Service, None), "service");
+        let privileged = if cfg!(windows) {
+            "service (SYSTEM)"
+        } else {
+            "service (root)"
+        };
+        assert_eq!(mode_label(DaemonMode::Service, Some(true)), privileged);
+        assert_eq!(mode_label(DaemonMode::User, Some(false)), "user");
+    }
 
     /// FR-92 — the line uses the agent's own sentence and never a paraphrase;
     /// a plain stop from the viewer reads as a plain "off".

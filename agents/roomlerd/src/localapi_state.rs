@@ -136,6 +136,10 @@ pub struct DaemonState {
     name: Mutex<String>,
     version: String,
     mode: DaemonMode,
+    /// Root or LocalSystem, read once at construction (a daemon never changes
+    /// account). `status` reports it beside `mode`, which names the kind of
+    /// node, not the account.
+    privileged: bool,
     tenant_id: Option<String>,
     /// Set while a signaling WS connection is live (updated by the signaling
     /// loop's per-connection guard). `peers()` reports none when this is false,
@@ -310,6 +314,22 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Does this process run as root (unix) or LocalSystem (Windows)? This is what
+/// `roomler status` names beside the mode. Without it, the CLI printed
+/// "service (SYSTEM)" for a per-user daemon too, because `mode` reads
+/// `Service` for every full node, whatever account it runs as.
+fn process_is_privileged() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        crate::win_identity::process_is_local_system()
+    }
+}
+
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
 /// read by `status()`. The `connected` flag is the SAME per-connection
 /// `AtomicBool` the org's signaling guard flips; `terminal_error` is written
@@ -346,9 +366,10 @@ pub type OrgViewRegistry = Arc<Mutex<Vec<(String, watch::Receiver<OverlayView>)>
 
 impl DaemonState {
     /// Build from the enrolled config identity + the live handles. `mode` is the
-    /// privilege the daemon runs at (today's agent is always the full "be
-    /// accessed" service node → [`DaemonMode::Service`]; the unprivileged
-    /// user-mode daemon arrives with the binary unification at P3).
+    /// kind of node (today's agent is always the full "be accessed" node →
+    /// [`DaemonMode::Service`]; the reach-only user-mode daemon arrives with the
+    /// binary unification at P3). The account it runs as is read here, not
+    /// passed in: see [`process_is_privileged`].
     #[allow(clippy::too_many_arguments)] // a daemon-state constructor; grouping would obscure
     pub fn new(
         node_id: String,
@@ -367,6 +388,7 @@ impl DaemonState {
             name: Mutex::new(name),
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode,
+            privileged: process_is_privileged(),
             tenant_id,
             connected,
             overlay,
@@ -552,6 +574,7 @@ impl LocalApiState for DaemonState {
             name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
             version: self.version.clone(),
             mode: self.mode,
+            privileged: Some(self.privileged),
             tenant_id: self.tenant_id.clone(),
             // The overlay IP the runtime last assigned us — a stable identity,
             // so it's kept even across a brief disconnect.
@@ -1880,6 +1903,37 @@ mod tests {
 
     fn empty_rtt_cache() -> RttCache {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// `status` always names the account, and names the real one. Before
+    /// this, `roomler status` printed "service (SYSTEM)" for every daemon: a
+    /// per-user Fedora install read as a system one (FR-93's lab, 0.4.128).
+    /// The test process is the daemon's stand-in: unprivileged in CI's lib
+    /// lane, root under its sudo step.
+    #[tokio::test]
+    async fn status_names_the_account_the_daemon_runs_as() {
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("privileged"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        let s = st.status();
+        #[cfg(unix)]
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let expected = unsafe { libc::geteuid() == 0 };
+        #[cfg(windows)]
+        let expected = crate::win_identity::process_is_local_system();
+        assert_eq!(s.privileged, Some(expected));
+        // The kind of node does not follow the account.
+        assert_eq!(s.mode, DaemonMode::Service);
     }
 
     #[tokio::test]
