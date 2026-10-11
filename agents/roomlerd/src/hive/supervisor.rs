@@ -293,6 +293,7 @@ enum Launcher {
 
 /// P1j — terminal sessions adopted on this device.
 mod adopt;
+mod follow;
 mod replica;
 mod stream;
 
@@ -360,6 +361,9 @@ pub struct Supervisor {
     /// read ([`stream::EVENT_BUDGET`], [`stream::BLOB_BUDGET`]).
     replica_events: tokio::sync::Semaphore,
     replica_blobs: tokio::sync::Semaphore,
+    /// P2d-3b — what this device does about each session it holds a copy of
+    /// as a member: the ask in flight, the stream followed, the wait.
+    follows: Mutex<follow::Follows>,
     /// P2d-2c — a test's own DERP mux in place of the primary org's (`Some`),
     /// so one test stands a source and a member on two muxes wired to each
     /// other; `Some(None)` for none at all, whatever another test registered.
@@ -370,6 +374,11 @@ pub struct Supervisor {
     /// the account.
     #[cfg(test)]
     checkpoint_runner: Option<super::checkpointer::Runner>,
+    /// P2d-3b — whether a connection starts following every copy held, as
+    /// a device's does; a test that drives the follow itself turns it off,
+    /// so the connection's own asks do not race its own.
+    #[cfg(test)]
+    follow_at_connect: bool,
 }
 
 static SUPERVISOR: OnceLock<Arc<Supervisor>> = OnceLock::new();
@@ -531,6 +540,14 @@ pub fn archive_enabled() -> bool {
     global().is_some_and(|s| s.cfg.archive && s.store.is_ok())
 }
 
+/// FR-90 P2d-3b — whether this device carries the replica stream:
+/// `hive-stream`. While its store is open, whatever its owner says of
+/// holding copies: a primary serves its own sessions' members, and P2c-4
+/// tells it it is replicated whether its owner holds others' copies or not.
+pub fn stream_enabled() -> bool {
+    global().is_some_and(|s| s.store.is_ok())
+}
+
 /// FR-90 P2c-3 — `rc:hive.replica.join`: answered with
 /// `rc:hive.replica.join_ack` on the connection it came on, after the
 /// device's own gates ([`replica`]).
@@ -543,7 +560,17 @@ pub fn handle_replica_join(
 ) {
     tokio::spawn(async move {
         let (refused, detail) = match global() {
-            Some(sup) => sup.answer_join(is_primary, session_id, fence, role).await,
+            Some(sup) => {
+                let answer = sup.answer_join(is_primary, session_id, fence, role).await;
+                // P2d-3b — a copy now held asks for its stream.
+                let member = role.is_some_and(|r| {
+                    r != roomler_ai_remote_control::hive::HiveReplicaRole::Primary
+                });
+                if answer.0.is_none() && member {
+                    sup.follow_joined(session_id, fence);
+                }
+                answer
+            }
             None => (
                 Some(roomler_ai_remote_control::hive::HiveJoinRefusal::ReplicaDisabled),
                 Some("agent sessions are not set up on this device".to_string()),
@@ -659,6 +686,24 @@ pub fn handle_replica_candidate(grant_id: ObjectId, addr: String, is_primary: bo
 pub fn handle_replica_close(grant_id: ObjectId, reason: String) {
     if let Some(sup) = global() {
         sup.close_stream(grant_id, &reason);
+    }
+}
+
+/// FR-90 P2d-3b — `rc:hive.replica.refused`: no stream this time, for an ask
+/// this device made ([`follow`]). The primary enrollment's only, like every
+/// Hive frame.
+pub fn handle_replica_refused(
+    session_id: ObjectId,
+    fence: u64,
+    path: Option<roomler_ai_remote_control::hive::HiveStreamPath>,
+    reason: Option<roomler_ai_remote_control::hive::HiveStreamRefusal>,
+    is_primary: bool,
+) {
+    if !is_primary {
+        return debug!(session = %session_id, "rc:hive.replica.refused on a secondary org's connection — ignored");
+    }
+    if let Some(sup) = global() {
+        sup.on_refused(session_id, fence, path, reason);
     }
 }
 
@@ -880,10 +925,13 @@ impl Supervisor {
             streams: Mutex::new(HashMap::new()),
             replica_events: tokio::sync::Semaphore::new(stream::EVENT_BUDGET),
             replica_blobs: tokio::sync::Semaphore::new(stream::BLOB_BUDGET),
+            follows: Mutex::new(follow::Follows::default()),
             #[cfg(test)]
             derp_for_tests: Mutex::new(None),
             #[cfg(test)]
             checkpoint_runner: None,
+            #[cfg(test)]
+            follow_at_connect: true,
         }
     }
 
@@ -1340,6 +1388,12 @@ impl Supervisor {
             if me.reports_copies() {
                 let sessions = me.replica_manifest().await;
                 let _ = tx.try_send(ClientMsg::HiveReplicaManifest { sessions });
+            }
+            // P2d-3b — then each copy it holds asks for its stream, once the
+            // server has heard where each one ends. Only while its owner lets
+            // it hold copies at all.
+            if me.cfg.replica && me.follows_at_connect() {
+                me.follow_all().await;
             }
         });
     }
@@ -1854,6 +1908,27 @@ impl Supervisor {
     pub(crate) fn with_approval_timing(mut self, timing: toolbelt::Timing) -> Self {
         self.approval_timing = timing;
         self
+    }
+
+    /// P2d-3b — a test's supervisor whose connections do not start following
+    /// (`follow_all`): the test drives the follow itself.
+    #[cfg(all(test, unix))]
+    pub(crate) fn without_follow_at_connect(mut self) -> Self {
+        self.follow_at_connect = false;
+        self
+    }
+
+    /// P2d-3b — whether a connection starts following every copy held: a
+    /// device's always does.
+    fn follows_at_connect(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.follow_at_connect
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     fn finish(&self, session: ObjectId, fence: u64, token: Option<&str>, detail: String) {

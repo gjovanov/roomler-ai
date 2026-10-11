@@ -4548,7 +4548,7 @@ async fn handle_server_msg(
 
         // FR-90 P2d-2b — the member's relayed address, for the `relay` rung's
         // TURN permission on this source's allocation; and a want the server
-        // refused (the ladder that acts on it comes with the follow, P2d-3).
+        // refused, which the member's ladder acts on (P2d-3b).
         ServerMsg::HiveReplicaCandidate { grant_id, addr } => {
             #[cfg(hive_host)]
             crate::hive::handle_replica_candidate(grant_id, addr, ctx.is_primary);
@@ -4566,6 +4566,10 @@ async fn handle_server_msg(
                 session = %session_id, fence, path = ?path, reason = ?reason, detail = ?detail,
                 "rc:hive.replica.refused"
             );
+            // FR-90 P2d-3b — the answer to this device's ask: the ladder acts
+            // on it.
+            #[cfg(hive_host)]
+            crate::hive::handle_replica_refused(session_id, fence, path, reason, ctx.is_primary);
         }
 
         // FR-90 P2d — the server ended a stream this device is a side of.
