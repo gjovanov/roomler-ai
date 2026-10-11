@@ -141,6 +141,16 @@ pub trait FleetLifecycle: Send + Sync {
         Ok(())
     }
 
+    /// FR-90 P2c-4 — something a holder decides from changed: the agent's
+    /// tags or its owner, now stored. `hive` decides again where the org's
+    /// sessions are copied: a tag taken off can make a device leave a
+    /// session's replicaset, an owner changed can take it out of another
+    /// person's. A failing holder is an error for the caller to report.
+    async fn agent_updated(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
+        let _ = (tenant_id, agent_id);
+        Ok(())
+    }
+
     /// Is the agent doing something a holder would lose if its socket were
     /// cycled? Fleet's owner-side rehome nudge asks this before cycling an
     /// idle-looking agent (P7b): `network` answers while tunnel sessions
@@ -282,6 +292,22 @@ impl HookRegistry {
             }
         }
         Ok(outcome)
+    }
+
+    /// FR-90 P2c-4 — run every `agent_updated` hook in order. A failing hook
+    /// stops the run and is the caller's to report: a tag taken off that did
+    /// not reach placement must not read as done.
+    pub async fn agent_updated(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.fleet_lifecycles() {
+            hook.agent_updated(tenant_id, agent_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: agent_updated: {e}"))?;
+        }
+        Ok(())
     }
 
     /// The first holder that would lose work if the agent's socket were

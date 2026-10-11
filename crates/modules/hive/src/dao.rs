@@ -17,7 +17,8 @@ use roomler_ai_services::dao::base::{
 };
 
 use crate::model::{
-    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, SessionStatus,
+    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, ReplicaMember,
+    SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -513,6 +514,9 @@ impl AgentSessionDao {
                     "replicaset.members": { "$elemMatch": {
                         "device_id": device_id,
                         "role": { "$ne": MemberRole::Primary.as_str() },
+                        // P2c-4 — an answer in flight when placement let the
+                        // member go does not take it back.
+                        "state": { "$ne": MemberState::Leaving.as_str() },
                     } },
                 },
                 update,
@@ -573,6 +577,108 @@ impl AgentSessionDao {
                 Some(doc! { "created_at": 1 }),
             )
             .await
+    }
+
+    /// FR-90 P2c-4 — the live sessions of `tenant_id` that were placed: what
+    /// placement decides again when something it reads changes. Not one being
+    /// stopped, and never an adopted one, which is placed nowhere until P2f.
+    pub async fn live_placed(&self, tenant_id: ObjectId) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "replicaset": { "$type": "object" },
+                    "origin": { "$ne": crate::model::SessionOrigin::Adopted.as_str() },
+                },
+                Some(doc! { "created_at": 1 }),
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — a member placement now chooses, added as it is given,
+    /// unless the replicaset already names the device. `false` = it did.
+    pub async fn add_member(&self, id: ObjectId, member: &ReplicaMember) -> DaoResult<bool> {
+        let m = bson::to_bson(member)?;
+        self.base
+            .update_one(
+                doc! { "_id": id, "replicaset.members.device_id": { "$ne": member.device_id } },
+                doc! { "$push": { "replicaset.members": m } },
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — a member placement no longer chooses: `leaving`, never
+    /// the primary. Its copy goes with the purge (P2g).
+    pub async fn mark_leaving(&self, id: ObjectId, device_id: ObjectId) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": { "$ne": MemberState::Leaving.as_str() },
+                    } },
+                },
+                doc! { "$set": { "replicaset.members.$.state": MemberState::Leaving.as_str() } },
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — a leaving member placement chooses again, in `role`:
+    /// `pending`, so its join goes again, and the device answers it as it
+    /// answered the first (its store holds the membership already).
+    pub async fn rejoin(&self, id: ObjectId, device_id: ObjectId, role: &str) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": device_id,
+                        "state": MemberState::Leaving.as_str(),
+                    } },
+                },
+                doc! {
+                    "$set": {
+                        "replicaset.members.$.state": MemberState::Pending.as_str(),
+                        "replicaset.members.$.role": role,
+                    },
+                    "$unset": {
+                        "replicaset.members.$.refusal": "",
+                        "replicaset.members.$.answered_at": "",
+                    },
+                },
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — what a placement decided besides its members: the
+    /// policy it read, its bounds, the restricted tags (only ever more), and
+    /// why it is short, when it is.
+    pub async fn set_placement(
+        &self,
+        id: ObjectId,
+        rules: &crate::policy::ReplicasetRules,
+        policy_revision: i64,
+        restricted_tags: &[String],
+        short: Option<&str>,
+    ) -> DaoResult<bool> {
+        let mut set = doc! {
+            "replicaset.policy_revision": policy_revision,
+            "replicaset.min": i64::from(rules.min),
+            "replicaset.max": i64::from(rules.max),
+            "replicaset.restricted_tags": bson::to_bson(restricted_tags)?,
+            "replicaset.placed_at": DateTime::now(),
+        };
+        let update = match short {
+            Some(s) => {
+                set.insert("replicaset.short", s);
+                doc! { "$set": set }
+            }
+            None => doc! { "$set": set, "$unset": { "replicaset.short": "" } },
+        };
+        self.base.update_one(doc! { "_id": id }, update).await
     }
 }
 
