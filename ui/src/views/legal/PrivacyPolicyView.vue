@@ -10,7 +10,7 @@
         </router-link>
 
         <h1 class="text-h3 font-weight-bold mb-2">Privacy Policy</h1>
-        <p class="text-body-2 legal-muted mb-8">Last updated: September 2026</p>
+        <p class="text-body-2 legal-muted mb-8">Last updated: October 2026</p>
 
         <section class="mb-8">
           <h2 class="text-h5 font-weight-bold mb-3">1. Introduction</h2>
@@ -193,6 +193,20 @@
           <p class="text-body-1 legal-muted mb-4">
             <strong>Nothing about this is stored on your device</strong>: no cookie, no local storage, no session
             storage. The tags travel only in the links you follow.
+          </p>
+
+          <h3 class="text-h6 font-weight-bold mb-2">2.17 YouTube</h3>
+          <p class="text-body-1 legal-muted mb-4">
+            Roomler uses YouTube API Services to publish Roomler's own videos to the Roomler YouTube channel and to
+            read that channel's statistics. This tool is used only by Roomler; it does not access, collect or store
+            data about other YouTube users or channels. Using it is subject to the
+            <a href="https://www.youtube.com/t/terms" class="text-primary" target="_blank" rel="noopener">YouTube Terms of Service</a>
+            and the
+            <a href="https://policies.google.com/privacy" class="text-primary" target="_blank" rel="noopener">Google Privacy Policy</a>.
+            We store only the statistics of our own videos. Access we granted can be revoked at any time through
+            <a href="https://myaccount.google.com/permissions" class="text-primary" target="_blank" rel="noopener">Google's security settings</a>,
+            and we delete the stored YouTube data within 30 days of a revocation or on request to
+            <a href="mailto:privacy@roomler.ai" class="text-primary">privacy@roomler.ai</a>.
           </p>
         </section>
 
