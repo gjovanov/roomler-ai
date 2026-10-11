@@ -968,8 +968,17 @@ pub struct AgentConfig {
     /// where `xdg-desktop-portal-gnome` exits without a GNOME session while
     /// mutter itself works. GNOME-only.
     ///
-    /// **UNATTENDED: this shows NO consent dialog.** Its peer is
-    /// `drm_capture`, not `portal_capture`. Restart required.
+    /// **UNATTENDED: this shows NO consent dialog.** Its peer in *behaviour*
+    /// is `drm_capture`, not `portal_capture`. Restart required.
+    ///
+    /// ⚠️ **Inert unless `portal_capture` is on as well.** It is a MODE of the
+    /// portal backend, read inside it (`capture/portal/backend.rs`), and the
+    /// capture cascade only enters that backend under `portal_capture`
+    /// (`capture/mod.rs`) — FR-45 field-verified P5 with both keys set. Set
+    /// alone it does nothing: the cascade falls through to X11, which on a
+    /// Wayland session is Xwayland's EMPTY root — a live stream of a black
+    /// picture, with nothing anywhere saying why. The vmtest Ubuntu lane ran
+    /// that way for weeks (#1719).
     #[serde(default)]
     pub mutter_capture: Option<bool>,
     /// FR-56 P4 - capture ONE application window instead of the whole monitor
