@@ -4465,8 +4465,6 @@ async fn handle_server_msg(
         } => {
             #[cfg(hive_host)]
             {
-                // The `derp` rung's key is read from P2d-2c.
-                let _ = member_derp_pubkey;
                 crate::hive::handle_replica_grant(
                     grant_id,
                     session_id,
@@ -4475,6 +4473,7 @@ async fn handle_server_msg(
                     path,
                     token,
                     ice_servers,
+                    member_derp_pubkey,
                     ttl_secs,
                     ctx.is_primary,
                     outbound_tx.clone(),
@@ -4514,8 +4513,6 @@ async fn handle_server_msg(
         } => {
             #[cfg(hive_host)]
             {
-                // The `derp` rung reads its key from P2d-2c.
-                let _ = derp_pubkey;
                 crate::hive::handle_replica_dial(
                     grant_id,
                     session_id,
@@ -4526,6 +4523,7 @@ async fn handle_server_msg(
                     cert_fingerprint,
                     addrs,
                     ice_servers,
+                    derp_pubkey,
                     ttl_secs,
                     ctx.is_primary,
                 );

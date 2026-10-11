@@ -2,22 +2,30 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P2d-2 — the replica stream on the device (spec §3b, "The carrier"
 //! and "The stream"): the source's endpoint for a grant, the member's dial,
-//! the token and the opening exchange, on the `direct` rung (P2d-2a) and the
-//! `relay` rung (P2d-2b).
+//! the token and the opening exchange, on the `direct` rung (P2d-2a), the
+//! `relay` rung (P2d-2b) and the `derp` rung (P2d-2c).
 //!
 //! | Side | On | Does |
 //! |---|---|---|
-//! | source | `rc:hive.replica.grant` | registers the grant at once, then stands its endpoint up: on `direct`, one UDP socket, STUN asked on that very socket, a QUIC server on it; on `relay`, a TURN allocation and a QUIC server over it. Answers `rc:hive.replica.ready` with its certificate and its addresses |
+//! | source | `rc:hive.replica.grant` | registers the grant at once, then stands its endpoint up: on `direct`, one UDP socket, STUN asked on that very socket, a QUIC server on it; on `relay`, a TURN allocation and a QUIC server over it; on `derp`, a QUIC server over its own `/derp` connection, on a route of the stream's own toward the member's key. Answers `rc:hive.replica.ready` with its certificate, and its addresses or its key |
 //! | source | `rc:hive.replica.candidate` | the member's relayed address: a TURN permission for it, held until the allocation lands |
 //! | source | the member's connection | serves ONE: the token first, then the member's hello, answered from its chain |
-//! | member | `rc:hive.replica.dial` | on `relay`, first its own allocation, on the source's TURN worker, and its relayed address sent for the source's permission; then the addresses dialed in order, the certificate pinned, the token presented, and where its copy ends said |
-//! | either | the server's `rc:hive.replica.close`, the connection's end, or the grant's | the endpoint, its socket and its allocation go, and the server is told why |
+//! | member | `rc:hive.replica.dial` | on `relay`, first its own allocation, on the source's TURN worker, and its relayed address sent for the source's permission; on `derp`, a route of the stream's own toward the source's key; then the source dialed, the certificate pinned, the token presented, and where its copy ends said |
+//! | either | the server's `rc:hive.replica.close`, the connection's end, or the grant's | the endpoint, its socket and its allocation or route go, and the server is told why |
 //!
-//! The events, blobs and acks after the opening exchange are P2d-3; the
-//! `derp` rung is P2d-2c, refused `path_unavailable` until then. This build
-//! does not advertise `hive-stream` yet: a source that answers the hello but
-//! streams no event would hold a member waiting for nothing, so the verb is
-//! advertised once events flow (P2d-3).
+//! The events, blobs and acks after the opening exchange are P2d-3. This
+//! build does not advertise `hive-stream` yet: a source that answers the
+//! hello but streams no event would hold a member waiting for nothing, so the
+//! verb is advertised once events flow (P2d-3).
+//!
+//! ⚠️ On `derp`, never the tunnel's route ([`DerpMux::tunnel_conn_for`]):
+//! that one is one per peer, last one wins, so a stream on it would take a
+//! `quic-derp-v1` tunnel's route between the same two devices, and two
+//! streams between one pair would take each other's. Each stream has its own
+//! ([`DerpMux::hive_conn_for`], by its grant's id).
+//!
+//! [`DerpMux::tunnel_conn_for`]: tunnel_core::transport::derp::DerpMux::tunnel_conn_for
+//! [`DerpMux::hive_conn_for`]: tunnel_core::transport::derp::DerpMux::hive_conn_for
 //!
 //! ⚠️ Every endpoint and every connection ends by the grant's `ttl_secs` at
 //! the latest, whatever the other side does: each holds a UDP socket (and on
@@ -48,6 +56,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+use tunnel_core::transport::derp::{DerpTunnelHandle, parse_pubkey_hex};
 use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer, RecvStream, SendStream};
 use tunnel_core::transport::relay::{self, RelayConn, RelayUdpSocket};
 
@@ -107,6 +116,8 @@ pub(crate) struct Grant {
     pub path: Option<HiveStreamPath>,
     pub token: String,
     pub ice_servers: Vec<IceServer>,
+    /// On `derp`, the member's WireGuard key: whom the stream's route faces.
+    pub member_derp_pubkey: Option<String>,
     pub ttl_secs: u32,
 }
 
@@ -121,6 +132,8 @@ pub(crate) struct Dial {
     pub cert_fingerprint: String,
     pub addrs: Vec<String>,
     pub ice_servers: Vec<IceServer>,
+    /// On `derp`, the source's WireGuard key: whom the stream's route faces.
+    pub derp_pubkey: Option<String>,
     pub ttl_secs: u32,
 }
 
@@ -131,6 +144,8 @@ struct Endpoint {
     addrs: Vec<String>,
     /// On the relay rung, the allocation the endpoint rides.
     relay: Option<Arc<dyn RelayConn>>,
+    /// On the derp rung, this device's own key, which the member dials.
+    derp_pubkey: Option<String>,
 }
 
 /// The STUN servers among `ice`, resolved: an IP literal as it is, a name
@@ -188,6 +203,30 @@ async fn direct_endpoint(ice: &[IceServer]) -> anyhow::Result<Endpoint> {
         fingerprint,
         addrs,
         relay: None,
+        derp_pubkey: None,
+    })
+}
+
+/// The source's endpoint on the `derp` rung: a QUIC server over this
+/// device's own `/derp` connection, on the stream's own route toward the
+/// member's key (by the grant's id), the MTU clamped under the relay's frame
+/// cap. The member dials this device's key, so `ready` names it and no
+/// address.
+fn derp_endpoint(handle: &DerpTunnelHandle, g: &Grant) -> anyhow::Result<Endpoint> {
+    let member = g
+        .member_derp_pubkey
+        .as_deref()
+        .and_then(parse_pubkey_hex)
+        .context("the grant names no member key")?;
+    let conn = handle.mux.hive_conn_for(member, g.grant_id.bytes());
+    let sock = Arc::new(RelayUdpSocket::new(Arc::new(conn))?);
+    let (peer, fingerprint) = QuicPeer::server_over_derp(sock)?;
+    Ok(Endpoint {
+        peer,
+        fingerprint,
+        addrs: Vec::new(),
+        relay: None,
+        derp_pubkey: Some(handle.self_pubkey_hex.clone()),
     })
 }
 
@@ -207,6 +246,7 @@ async fn relay_endpoint(ice: &[IceServer]) -> anyhow::Result<Endpoint> {
         fingerprint,
         addrs: vec![relayed.to_string()],
         relay: Some(relay),
+        derp_pubkey: None,
     })
 }
 
@@ -290,14 +330,14 @@ impl Supervisor {
             );
         }
         let path = match g.path {
-            Some(p @ (HiveStreamPath::Direct | HiveStreamPath::Relay)) => p,
-            _ => {
+            Some(p) => p,
+            None => {
                 return answer(
                     tx,
                     refusal(
                         grant_id,
                         HiveStreamRefusal::PathUnavailable,
-                        "this build serves the direct and relay rungs".into(),
+                        "a rung this build cannot name".into(),
                     ),
                 );
             }
@@ -379,7 +419,7 @@ impl Supervisor {
             detail: None,
             cert_fingerprint: Some(ep.fingerprint),
             addrs: ep.addrs,
-            derp_pubkey: None,
+            derp_pubkey: ep.derp_pubkey,
         };
         if tx.send(ready).await.is_err() {
             return self.stream_ended(g.grant_id, "disconnected");
@@ -422,6 +462,20 @@ impl Supervisor {
                     format!("no relay: {e:#}"),
                 )
             }),
+            Some(HiveStreamPath::Derp) => {
+                let Some(handle) = self.derp_handle() else {
+                    return Err((
+                        HiveStreamRefusal::PathUnavailable,
+                        "this device has no live DERP connection".into(),
+                    ));
+                };
+                derp_endpoint(&handle, g).map_err(|e| {
+                    (
+                        HiveStreamRefusal::PathUnavailable,
+                        format!("no DERP endpoint: {e:#}"),
+                    )
+                })
+            }
             _ => direct_endpoint(&g.ice_servers).await.map_err(|e| {
                 (
                     HiveStreamRefusal::Other,
@@ -429,6 +483,22 @@ impl Supervisor {
                 )
             }),
         }
+    }
+
+    /// This device's DERP mux, the primary org's: the one Hive streams ride,
+    /// as every Hive frame is the primary org's. `None` without the overlay
+    /// features, or while the overlay is down.
+    fn derp_handle(&self) -> Option<DerpTunnelHandle> {
+        #[cfg(test)]
+        if let Some(forced) = self
+            .derp_for_tests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return forced;
+        }
+        crate::tunnel::netwatch::primary_derp_tunnel_handle()
     }
 
     /// The endpoint is up: on the relay rung its allocation kept for the
@@ -563,8 +633,8 @@ impl Supervisor {
             return self.report_close(d.grant_id, "secondary_org");
         }
         let path = match d.path {
-            Some(p @ (HiveStreamPath::Direct | HiveStreamPath::Relay)) => p,
-            _ => return self.report_close(d.grant_id, "path_unavailable"),
+            Some(p) => p,
+            None => return self.report_close(d.grant_id, "path_unavailable"),
         };
         let grant_id = d.grant_id;
         let session_id = d.session_id;
@@ -618,26 +688,30 @@ impl Supervisor {
             .filter_map(|a| a.parse().ok())
             .filter(is_dialable)
             .collect();
-        if addrs.is_empty() {
+        // On `derp` the source is dialed by its key, never an address.
+        if addrs.is_empty() && d.path != Some(HiveStreamPath::Derp) {
             return "no_address".to_string();
         }
         let deadline = Instant::now() + Duration::from_secs(u64::from(d.ttl_secs));
         let followed = tokio::time::timeout_at(deadline, async {
-            let peer = if d.path == Some(HiveStreamPath::Relay) {
-                match self.member_relay(d, &addrs).await {
-                    Ok(peer) => peer,
+            let (peer, targets) = match d.path {
+                Some(HiveStreamPath::Relay) => match self.member_relay(d, &addrs).await {
+                    Ok(peer) => (peer, addrs.clone()),
                     Err(why) => return why,
-                }
-            } else {
-                match QuicPeer::client(
+                },
+                Some(HiveStreamPath::Derp) => match self.member_derp(d) {
+                    Ok((peer, at)) => (peer, vec![at]),
+                    Err(why) => return why,
+                },
+                _ => match QuicPeer::client(
                     "0.0.0.0:0".parse().expect("a bind address"),
                     &d.cert_fingerprint,
                 ) {
-                    Ok(peer) => peer,
+                    Ok(peer) => (peer, addrs.clone()),
                     Err(e) => return format!("the client could not be bound: {e}"),
-                }
+                },
             };
-            let Some(conn) = connect_first(&peer, &addrs).await else {
+            let Some(conn) = connect_first(&peer, &targets).await else {
                 return "unreachable".to_string();
             };
             if quic::client_authenticate(&conn, &d.token).await.is_err() {
@@ -681,6 +755,26 @@ impl Supervisor {
         })
         .await;
         followed.unwrap_or_else(|_| "expired".to_string())
+    }
+
+    /// The member's client on the derp rung: a QUIC client over this device's
+    /// own `/derp` connection, on the stream's own route toward the source's
+    /// key (by the grant's id), and the address that route answers to. The
+    /// reason, in the close's words, when it cannot.
+    fn member_derp(&self, d: &Dial) -> Result<(QuicPeer, SocketAddr), String> {
+        let Some(handle) = self.derp_handle() else {
+            return Err("no_derp".to_string());
+        };
+        let Some(source) = d.derp_pubkey.as_deref().and_then(parse_pubkey_hex) else {
+            return Err("no_derp_key".to_string());
+        };
+        let conn = handle.mux.hive_conn_for(source, d.grant_id.bytes());
+        let at = conn.synth_peer();
+        let sock =
+            RelayUdpSocket::new(Arc::new(conn)).map_err(|e| format!("no socket over DERP: {e}"))?;
+        let peer = QuicPeer::client_over_derp(Arc::new(sock), &d.cert_fingerprint)
+            .map_err(|e| format!("the client could not be built: {e}"))?;
+        Ok((peer, at))
     }
 
     /// The member's client on the relay rung: its own allocation, on the
@@ -829,6 +923,16 @@ impl Supervisor {
             .count()
     }
 
+    /// The DERP mux this device's streams ride in a test: `Some` a test's
+    /// own, `None` none at all.
+    #[cfg(all(test, unix))]
+    pub(super) fn use_derp_for_tests(&self, handle: Option<DerpTunnelHandle>) {
+        *self
+            .derp_for_tests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
     /// The member's addresses held for `grant_id`'s allocation.
     #[cfg(all(test, unix))]
     pub(super) fn held_candidates(&self, grant_id: ObjectId) -> usize {
@@ -911,6 +1015,7 @@ mod tests {
             path: Some(path),
             token: TOKEN.into(),
             ice_servers: Vec::new(),
+            member_derp_pubkey: None,
             ttl_secs: 30,
         }
     }
@@ -970,12 +1075,18 @@ mod tests {
             refused: None,
             cert_fingerprint: Some(fp),
             addrs,
+            derp_pubkey,
             ..
         } = ready
         else {
             panic!("not ready: {ready:?}");
         };
-        assert!(!addrs.is_empty(), "somewhere to dial");
+        if path == Some(HiveStreamPath::Derp) {
+            assert!(addrs.is_empty(), "no address on derp");
+            assert!(derp_pubkey.is_some(), "the source's key to dial");
+        } else {
+            assert!(!addrs.is_empty(), "somewhere to dial");
+        }
         mem.sup.follow_dial(
             Dial {
                 grant_id,
@@ -987,6 +1098,7 @@ mod tests {
                 cert_fingerprint: fp,
                 addrs,
                 ice_servers: ice,
+                derp_pubkey,
                 ttl_secs: 30,
             },
             true,
@@ -1248,6 +1360,191 @@ mod tests {
         }
     }
 
+    /// Two DERP muxes, a source's and a member's, wired back to back as the
+    /// server's `/derp` relay joins two devices: what one sends toward the
+    /// other's key arrives at the other stamped with the sender's.
+    fn derp_pair() -> (DerpTunnelHandle, DerpTunnelHandle) {
+        use tunnel_core::transport::derp::{DerpMux, DerpPubKey, OutboundFrame, pubkey_hex};
+        fn pump(mut out: mpsc::Receiver<OutboundFrame>, from: DerpPubKey, to: Arc<DerpMux>) {
+            tokio::spawn(async move {
+                while let Some((_, frame)) = out.recv().await {
+                    if frame.len() >= 32 && frame[..32] == to.self_pubkey() {
+                        let mut stamped = from.to_vec();
+                        stamped.extend_from_slice(&frame[32..]);
+                        to.deliver(&stamped);
+                    }
+                }
+            });
+        }
+        let (ka, kb) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let (a, a_out) = DerpMux::new(ka);
+        let (b, b_out) = DerpMux::new(kb);
+        pump(a_out, ka, Arc::clone(&b));
+        pump(b_out, kb, Arc::clone(&a));
+        (
+            DerpTunnelHandle {
+                mux: a,
+                self_pubkey_hex: pubkey_hex(&ka),
+            },
+            DerpTunnelHandle {
+                mux: b,
+                self_pubkey_hex: pubkey_hex(&kb),
+            },
+        )
+    }
+
+    /// The derp rung, end to end: the source serves over its own `/derp`
+    /// connection on the stream's own route toward the member's key, `ready`
+    /// names its key and no address, and the member dials that key.
+    #[tokio::test]
+    async fn a_member_follows_its_source_over_derp() {
+        let (on_src, on_mem) = derp_pair();
+        let src = rig(true, 4);
+        let mem = rig(true, 4);
+        src.sup.use_derp_for_tests(Some(on_src.clone()));
+        mem.sup.use_derp_for_tests(Some(on_mem.clone()));
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        let tip = src.store.chain_tip(&sid.to_hex()).await.unwrap().unwrap();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+
+        let mut g = grant(sid, HiveStreamPath::Derp);
+        g.member_derp_pubkey = Some(on_mem.self_pubkey_hex.clone());
+        let ids = (g.grant_id, g.session_id, g.path);
+        let ready = ready_of(&src, g, true).await;
+        let ClientMsg::HiveReplicaReady { derp_pubkey, .. } = &ready else {
+            panic!("not a ready: {ready:?}");
+        };
+        assert_eq!(
+            derp_pubkey.as_deref(),
+            Some(on_src.self_pubkey_hex.as_str()),
+            "the source's own key"
+        );
+        dial(&mem, ids, ready, TOKEN, Vec::new());
+        assert_eq!(
+            answer_of(&mem, ids.0).await,
+            SourceMsg::Hello {
+                v: wire::STREAM_V,
+                tip: Mark {
+                    seq: tip.seq,
+                    hash: hex::encode(tip.hash),
+                },
+            },
+            "over DERP"
+        );
+        mem.sup.close_stream(ids.0, "test");
+        src.sup.close_stream(ids.0, "test");
+    }
+
+    /// Streams between one pair carry at once on DERP, each on its own
+    /// route, and leave the pair's tunnel route alone: the tunnel's route is
+    /// one per peer, so a stream on it would have taken a `quic-derp-v1`
+    /// tunnel's, and the second stream the first's.
+    #[tokio::test]
+    async fn streams_between_one_pair_carry_at_once_beside_its_tunnel() {
+        let (on_src, on_mem) = derp_pair();
+        let src = rig(true, 4);
+        let mem = rig(true, 4);
+        src.sup.use_derp_for_tests(Some(on_src.clone()));
+        mem.sup.use_derp_for_tests(Some(on_mem.clone()));
+        // What a `quic-derp-v1` tunnel between the same two devices holds.
+        let tunnel_at_src = on_src.mux.tunnel_conn_for(on_mem.mux.self_pubkey());
+        let tunnel_at_mem = on_mem.mux.tunnel_conn_for(on_src.mux.self_pubkey());
+        let (s1, s2) = (ObjectId::new(), ObjectId::new());
+        note(&src, s1, &["one"]);
+        note(&src, s2, &["two"]);
+        mem.store.join(&s1.to_hex(), "owner", 1).await.unwrap();
+        mem.store.join(&s2.to_hex(), "owner", 1).await.unwrap();
+
+        let mut ids = Vec::new();
+        for sid in [s1, s2] {
+            let mut g = grant(sid, HiveStreamPath::Derp);
+            g.member_derp_pubkey = Some(on_mem.self_pubkey_hex.clone());
+            ids.push(served_on(&src, &mem, g, TOKEN).await);
+        }
+        for (n, grant_id) in ids.iter().enumerate() {
+            assert!(
+                matches!(answer_of(&mem, *grant_id).await, SourceMsg::Hello { .. }),
+                "stream {n} answered"
+            );
+        }
+        tunnel_at_src
+            .send_to(&[0xC3, 0, 0, 0, 1], tunnel_at_src.synth_peer())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), tunnel_at_mem.recv_from(&mut buf))
+                .await
+                .expect("the tunnel's packet arrives on its own route")
+                .unwrap();
+        assert_eq!(&buf[..n], &[0xC3, 0, 0, 0, 1]);
+        for grant_id in ids {
+            mem.sup.close_stream(grant_id, "test");
+            src.sup.close_stream(grant_id, "test");
+        }
+    }
+
+    /// A derp grant or dial this device cannot carry is refused in words: no
+    /// live DERP connection, a grant naming no member key, a dial naming no
+    /// source key.
+    #[tokio::test]
+    async fn a_derp_grant_or_dial_this_device_cannot_carry_is_refused() {
+        let src = rig(true, 4);
+        let mut mem = rig(true, 4);
+        src.sup.use_derp_for_tests(None);
+        mem.sup.use_derp_for_tests(None);
+        let sid = ObjectId::new();
+        note(&src, sid, &["one"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+
+        let mut g = grant(sid, HiveStreamPath::Derp);
+        g.member_derp_pubkey = Some("1f".repeat(32));
+        assert_eq!(
+            refusal_of(ready_of(&src, g, true).await),
+            Some(HiveStreamRefusal::PathUnavailable),
+            "no live DERP connection"
+        );
+        let (on_src, on_mem) = derp_pair();
+        src.sup.use_derp_for_tests(Some(on_src));
+        assert_eq!(
+            refusal_of(ready_of(&src, grant(sid, HiveStreamPath::Derp), true).await),
+            Some(HiveStreamRefusal::PathUnavailable),
+            "a grant that names no member key"
+        );
+
+        let derp_dial = |key: Option<String>| Dial {
+            grant_id: ObjectId::new(),
+            session_id: sid,
+            fence: 1,
+            source_id: ObjectId::new(),
+            path: Some(HiveStreamPath::Derp),
+            token: TOKEN.into(),
+            cert_fingerprint: "00".repeat(32),
+            addrs: Vec::new(),
+            ice_servers: Vec::new(),
+            derp_pubkey: key,
+            ttl_secs: 30,
+        };
+        let d = derp_dial(Some("2e".repeat(32)));
+        let grant_id = d.grant_id;
+        mem.sup.follow_dial(d, true);
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("no_derp"),
+            "no live DERP connection"
+        );
+        mem.sup.use_derp_for_tests(Some(on_mem));
+        let d = derp_dial(None);
+        let grant_id = d.grant_id;
+        mem.sup.follow_dial(d, true);
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("no_derp_key"),
+            "a dial that names no source key"
+        );
+    }
+
     /// A copy whose tip is off the source's chain hears where the two
     /// diverge: genesis, when they share no checkpoint.
     #[tokio::test]
@@ -1301,12 +1598,24 @@ mod tests {
     #[tokio::test]
     async fn a_grant_the_source_cannot_serve_is_refused_in_words() {
         let src = rig(true, 4);
+        src.sup.use_derp_for_tests(None);
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
+        let mut derp = grant(sid, HiveStreamPath::Derp);
+        derp.member_derp_pubkey = Some("1f".repeat(32));
         assert_eq!(
-            refusal_of(ready_of(&src, grant(sid, HiveStreamPath::Derp), true).await),
+            refusal_of(ready_of(&src, derp, true).await),
             Some(HiveStreamRefusal::PathUnavailable),
-            "derp is not served yet"
+            "a derp grant on a device with no DERP connection"
+        );
+        let unnamed = Grant {
+            path: None,
+            ..grant(sid, HiveStreamPath::Direct)
+        };
+        assert_eq!(
+            refusal_of(ready_of(&src, unnamed, true).await),
+            Some(HiveStreamRefusal::PathUnavailable),
+            "a rung this build cannot name"
         );
         assert_eq!(
             refusal_of(ready_of(&src, grant(sid, HiveStreamPath::Relay), true).await),
@@ -1420,6 +1729,7 @@ mod tests {
             cert_fingerprint: "00".repeat(32),
             addrs: vec![silent.local_addr().unwrap().to_string()],
             ice_servers: Vec::new(),
+            derp_pubkey: None,
             ttl_secs: 30,
         };
         let mut following = Vec::new();
@@ -1481,6 +1791,7 @@ mod tests {
                 cert_fingerprint: "00".repeat(32),
                 addrs: vec![silent.local_addr().unwrap().to_string()],
                 ice_servers: Vec::new(),
+                derp_pubkey: None,
                 ttl_secs: 1,
             },
             true,
@@ -1512,7 +1823,7 @@ mod tests {
 
     /// A dial this device does not follow is closed at once, in its own
     /// word, and nothing is dialed: one on a secondary org's connection,
-    /// and one on a rung this build does not climb yet.
+    /// and one on a rung this build cannot name.
     #[tokio::test]
     async fn a_dial_this_device_does_not_follow_is_closed_unasked() {
         let mut mem = rig(true, 4);
@@ -1523,16 +1834,17 @@ mod tests {
             session_id: sid,
             fence: 1,
             source_id: ObjectId::new(),
-            path: Some(path),
+            path,
             token: TOKEN.into(),
             cert_fingerprint: "00".repeat(32),
             addrs: vec!["127.0.0.1:9".into()],
             ice_servers: Vec::new(),
+            derp_pubkey: None,
             ttl_secs: 30,
         };
         for (d, primary, word) in [
-            (dial(HiveStreamPath::Direct), false, "secondary_org"),
-            (dial(HiveStreamPath::Derp), true, "path_unavailable"),
+            (dial(Some(HiveStreamPath::Direct)), false, "secondary_org"),
+            (dial(None), true, "path_unavailable"),
         ] {
             let grant_id = d.grant_id;
             mem.sup.follow_dial(d, primary);
@@ -1564,6 +1876,7 @@ mod tests {
                 cert_fingerprint: "00".repeat(32),
                 addrs: vec!["198.51.100.4:49152".into()],
                 ice_servers: Vec::new(),
+                derp_pubkey: None,
                 ttl_secs: 30,
             },
             true,
@@ -1596,6 +1909,7 @@ mod tests {
                 cert_fingerprint: "00".repeat(32),
                 addrs: vec!["0.0.0.0:41000".into(), "192.168.1.20:0".into()],
                 ice_servers: Vec::new(),
+                derp_pubkey: None,
                 ttl_secs: 30,
             },
             true,
