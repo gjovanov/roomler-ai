@@ -394,9 +394,14 @@ As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture;
 
 **Saying so (FR-93 P1).** An injector that reaches nothing does not fail. XTest
 into Xwayland *succeeds*, and moves only Xwayland's own pointer, which the
-compositor ignores. On GNOME 49 and later, Xwayland runs `-enable-ei-portal`,
-and XTest reaches no window at all: measured on GNOME 50, 0 events in a native
-window and 0 in an Xwayland one. So each session works out what its input will
+compositor ignores. Where Xwayland sends XTest through EI, it reaches no window
+at all. GNOME 49 and later start Xwayland with `-enable-ei-portal`: measured on
+GNOME 50, 0 events in a native window and 0 in an Xwayland one. KWin does it
+with nothing on the command line. It hands Xwayland an EI socket in its
+environment (`LIBEI_SOCKET=/proc/self/fd/N`) and gates XTest behind its own
+prompt. Measured on Plasma 6.7: `xdotool` moved nothing and clicked nothing, even
+in an X11 window, and the prompt helper failed to start. So each session works
+out what its input will
 reach (`input/reach.rs`), from the facts `input::open_default` decides from,
 after capture has opened (a portal capture registers its input route as it
 opens).
@@ -406,8 +411,32 @@ opens).
 | a live portal RemoteDesktop route, or uinput that is on and opens | `full` |
 | XTest on a real X server (Xorg, or the daemon's own Xvfb) | `full` |
 | XTest on Xwayland | `xwayland_only` |
-| XTest on an Xwayland with `-enable-ei-portal` (read from that process's own command line) | `none` |
+| XTest on an Xwayland that sends it through EI, read from that process: `-enable-ei-portal` on its command line (GNOME 49+), or a `LIBEI_SOCKET` in its environment (KWin) | `none` |
+| … through KWin, and the person allowed roomlerd in **Legacy X11 App Support** (kwinrc `[Xwayland] XwaylandEisNoPromptApps`, or the global `XwaylandEisNoPrompt`) | `full` |
 | no X display and no uinput · a build without an injector · a Mac without Accessibility | `none` |
+
+⚠️ **A sandboxed per-user daemon cannot read Xwayland's environment.** Wherever
+the user unit's sandbox applies (Fedora: always, #1997), the daemon runs in a
+user namespace of its own. The kernel then refuses another namespace's
+`/proc/<pid>/environ` (*Permission denied*), while `cmdline`, `comm` and `status`
+read fine. There, two readable facts stand in:
+- Xwayland's parent is `kwin_wayland`;
+- that KWin is 6.1 or later, read from its library's file name
+  (`libkwin.so.6.7.5`). 6.1 is the release that hands every Xwayland an EI
+  socket (Plasma 6.1's changelog), so Plasma 5.27 stays `xwayland_only`.
+
+KWin's grant is the per-user input path on Plasma, and the release binary
+already uses it. Measured on Plasma 6.7 with the viewer oracle's `points` plan:
+
+| kwinrc `[Xwayland]` | result |
+|---|---|
+| stock | 🔴 0 events: KWin's prompter could not start, so nothing got through |
+| `XwaylandEisNoPromptApps=roomlerd` | ✅ every pointer target within 1 px, the click, the wheel, `hello 123`; 🔴 only Shift+A lost |
+
+The name is the one Xwayland gives an X11 client's EI connection, the process
+name. KWin applies the grant only once it has reloaded its options (System
+Settings' Apply does that) **and** Xwayland has reconnected, which a new login
+does. Until then the agent already says `full`, because it reads the file.
 
 When `reach` is anything but `full`, the agent sends `rc:input-reach {reach,
 reason}` once over the control DC, with the same retry-until-open as FR-80's
