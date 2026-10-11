@@ -62,11 +62,12 @@ pub(crate) enum XServer {
     Real,
     /// Xwayland: XTest reaches its own clients only.
     Xwayland,
-    /// Xwayland sends XTest through EI: it reaches nothing.
+    /// Xwayland sends XTest through EI: it reaches nothing, unless KWin lets
+    /// this agent through.
     XwaylandEi(EiRoute),
 }
 
-/// How an Xwayland reaches EI, which decides only the words of the reason.
+/// How an Xwayland reaches EI.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "enigo-input")),
     allow(dead_code)
@@ -75,9 +76,12 @@ pub(crate) enum XServer {
 pub(crate) enum EiRoute {
     /// `-enable-ei-portal` on its command line: GNOME 49 and later.
     Portal,
-    /// A `LIBEI_SOCKET` in its environment, handed over by the compositor:
-    /// KWin, measured on Plasma 6.7.
-    Compositor,
+    /// An EI socket handed over by KWin (6.1 and later), which gates XTest
+    /// behind its own prompt. `granted`: the person let this agent through
+    /// without one, in Legacy X11 App Support. Measured on Plasma 6.7 with
+    /// `XwaylandEisNoPromptApps=roomlerd`: the viewer's pointer, click, wheel
+    /// and typing all reached a native Wayland window.
+    Compositor { granted: bool },
 }
 
 /// Allowed dead: each build constructs only its own platform.
@@ -106,6 +110,14 @@ pub(crate) struct Facts {
 const WAYLAND_FIX: &str = "On a system install switch on uinput; on a per-user one, \
      portal_capture with portal_input (the person at the screen allows Remote \
      Interaction once).";
+
+/// The fix where KWin gates XTest. The narrow grant, not the global switch:
+/// it names this agent and nothing else. KWin reads it when Xwayland starts,
+/// hence the new login.
+const KWIN_FIX: &str = "On Plasma, the person at the screen allows roomlerd once in \
+     System Settings, Legacy X11 App Support (kwinrc [Xwayland] \
+     XwaylandEisNoPromptApps=roomlerd), then logs in again; on a system install, \
+     switch on uinput.";
 
 /// The reach `input::open_default` would give a session with these facts.
 pub(crate) fn decide(f: &Facts) -> InputReach {
@@ -170,16 +182,30 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
                  Xwayland{uinput_note}. {WAYLAND_FIX}"
             ),
         ),
+        XServer::XwaylandEi(EiRoute::Compositor { granted: true }) => verdict(
+            Reach::Full,
+            "XTest through KWin's input-emulation gate, which lets this agent \
+             through without asking (Legacy X11 App Support)"
+                .into(),
+        ),
         XServer::XwaylandEi(route) => {
-            let via = match route {
-                EiRoute::Portal => "the EI portal (GNOME 49 and later)",
-                EiRoute::Compositor => "KWin's input-emulation gate (KDE Plasma 6)",
+            let (why, fix) = match route {
+                EiRoute::Portal => (
+                    "the EI portal (GNOME 49 and later), so it reaches no window at all",
+                    WAYLAND_FIX,
+                ),
+                EiRoute::Compositor { .. } => (
+                    "KWin's input-emulation gate (KDE Plasma 6.1 and later), which asks \
+                     the person at the screen first: unattended, it reaches no window at \
+                     all",
+                    KWIN_FIX,
+                ),
             };
             verdict(
                 Reach::None,
                 format!(
-                    "this is a Wayland desktop whose Xwayland sends XTest through {via}, \
-                     so it reaches no window at all{uinput_note}. {WAYLAND_FIX}"
+                    "this is a Wayland desktop whose Xwayland sends XTest through \
+                     {why}{uinput_note}. {fix}"
                 ),
             )
         }
@@ -253,11 +279,17 @@ fn x_server() -> XServer {
 }
 
 /// Does the Xwayland serving `display` send XTest through EI, and how? Read
-/// from that process: GNOME starts it as `Xwayland :0 -rootless …
-/// -enable-ei-portal`; KWin as `Xwayland :0 -auth … -rootless`, with a
-/// `LIBEI_SOCKET=/proc/self/fd/N` in its environment. No process found, or an
-/// environment this daemon may not read, means no EI: then the verdict claims
-/// XTest reaches X11 apps, the old wording, and not the honest "nothing".
+/// from that process. GNOME starts it as `Xwayland :0 -rootless …
+/// -enable-ei-portal`. KWin starts it as `Xwayland :0 -auth … -rootless`, with
+/// a `LIBEI_SOCKET=/proc/self/fd/N` in its environment.
+///
+/// ⚠️ A sandboxed per-user daemon may not read that environment. Its unit's
+/// sandbox puts it in a user namespace of its own, and the kernel refuses
+/// another namespace's `/proc/<pid>/environ` (measured on Fedora 44:
+/// *Permission denied*, while `cmdline` reads fine). Then two facts it CAN
+/// read stand in: Xwayland's parent is `kwin_wayland`, and that KWin is 6.1
+/// or later, the release that hands every Xwayland an EI socket. No process
+/// found means no EI.
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 fn xwayland_ei_route(display: &str) -> Option<EiRoute> {
     let number = display_number(display)?;
@@ -274,9 +306,70 @@ fn xwayland_ei_route(display: &str) -> Option<EiRoute> {
         if !cmdline_serves(&cmdline, number) {
             return None;
         }
-        let environ = std::fs::read(path.join("environ")).unwrap_or_default();
-        ei_route(&cmdline, &environ)
+        let compositor_ei = match std::fs::read(path.join("environ")) {
+            Ok(environ) => environ_has_libei_socket(&environ),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                parent_is_kwin(&path) && kwin_version().is_some_and(|v| v >= KWIN_EI_SINCE)
+            }
+            Err(_) => false,
+        };
+        ei_route(&cmdline, compositor_ei, kwin_granted)
     })
+}
+
+/// Is this Xwayland's parent KWin? From `/proc/<pid>/status`, world-readable,
+/// and the parent's `comm`, also world-readable even though KWin itself is
+/// not dumpable (it holds CAP_SYS_NICE).
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn parent_is_kwin(xwayland: &std::path::Path) -> bool {
+    std::fs::read_to_string(xwayland.join("status"))
+        .ok()
+        .and_then(|s| status_ppid(&s))
+        .and_then(|ppid| std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok())
+        .is_some_and(|comm| comm.trim().starts_with("kwin_wayland"))
+}
+
+/// The KWin release that started handing every Xwayland an EI socket: Plasma
+/// 6.1 ("xtest libei integration for Xwayland", the 6.1.0 changelog).
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+const KWIN_EI_SINCE: (u32, u32) = (6, 1);
+
+/// KWin's version, from its library's file name (`libkwin.so.6.7.5`): read
+/// without running anything. The highest one found, as (major, minor).
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn kwin_version() -> Option<(u32, u32)> {
+    [
+        "/usr/lib64",
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ]
+    .iter()
+    .filter_map(|d| std::fs::read_dir(d).ok())
+    .flat_map(|entries| entries.flatten())
+    .filter_map(|e| libkwin_version(&e.file_name().to_string_lossy()))
+    .max()
+}
+
+/// Has the person let this agent's XTest through KWin's gate without a
+/// prompt? KConfig reads the user's `kwinrc` over the system's
+/// (`/etc/xdg/kwinrc`), key by key, and so does this.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn kwin_granted() -> bool {
+    let user_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let user = user_dir.map(|d| read(d.join("kwinrc"))).unwrap_or_default();
+    let system = read(std::path::PathBuf::from("/etc/xdg/kwinrc"));
+    // Xwayland names an X11 client's EI connection after the process: the
+    // grant measured on the lab was `XwaylandEisNoPromptApps=roomlerd`.
+    let me = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    kwinrc_grants(&user, &system, me.trim())
 }
 
 /// `":0"` / `":0.0"` / `"unix:1"` → the display number. `None` for anything
@@ -305,23 +398,133 @@ fn cmdline_serves(cmdline: &[u8], number: &str) -> bool {
 }
 
 /// The pure half of [`xwayland_ei_route`]: from an Xwayland's NUL-separated
-/// command line and environment, how it reaches EI, if it does. An empty
-/// `LIBEI_SOCKET=` names no socket, so it does not count.
+/// command line, and whether a compositor handed it an EI socket, how its
+/// XTest reaches EI. `granted` is asked only on KWin's route.
 #[cfg_attr(
     not(all(target_os = "linux", feature = "enigo-input")),
     allow(dead_code)
 )]
-fn ei_route(cmdline: &[u8], environ: &[u8]) -> Option<EiRoute> {
+fn ei_route(
+    cmdline: &[u8],
+    compositor_ei: bool,
+    granted: impl FnOnce() -> bool,
+) -> Option<EiRoute> {
     if cmdline
         .split(|b| *b == 0)
         .any(|a| a == b"-enable-ei-portal")
     {
         return Some(EiRoute::Portal);
     }
+    compositor_ei.then(|| EiRoute::Compositor { granted: granted() })
+}
+
+/// A NUL-separated environment carrying a `LIBEI_SOCKET`. An empty one names
+/// no socket, so it does not count.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn environ_has_libei_socket(environ: &[u8]) -> bool {
     environ
         .split(|b| *b == 0)
         .any(|v| v.len() > b"LIBEI_SOCKET=".len() && v.starts_with(b"LIBEI_SOCKET="))
-        .then_some(EiRoute::Compositor)
+}
+
+/// `PPid:` from a `/proc/<pid>/status`.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn status_ppid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// `libkwin.so.6.7.5` → `(6, 7)`. KWin's own library, with its full version
+/// only: `libkwin.so.6` is the symlink, and says less.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn libkwin_version(file_name: &str) -> Option<(u32, u32)> {
+    let mut parts = file_name.strip_prefix("libkwin.so.")?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let _patch: u32 = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor))
+}
+
+/// KWin's grant, the user's kwinrc over the system's, key by key: the global
+/// `XwaylandEisNoPrompt`, or `me` named in `XwaylandEisNoPromptApps`.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn kwinrc_grants(user: &str, system: &str, me: &str) -> bool {
+    let (user_all, user_apps) = kwinrc_xwayland(user);
+    let (system_all, system_apps) = kwinrc_xwayland(system);
+    let all = user_all.or(system_all).unwrap_or(false);
+    let apps = user_apps.or(system_apps).unwrap_or_default();
+    all || (!me.is_empty() && apps.iter().any(|a| a == me))
+}
+
+/// `XwaylandEisNoPrompt` and `XwaylandEisNoPromptApps` from one kwinrc's
+/// `[Xwayland]` group, each `None` where the file does not set it. A
+/// `[$i]` (immutable) marker on the group or the key is KConfig's and is read
+/// through.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn kwinrc_xwayland(text: &str) -> (Option<bool>, Option<Vec<String>>) {
+    let (mut in_group, mut all, mut apps) = (false, None, None);
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') && !line.contains('=') {
+            in_group = line == "[Xwayland]" || line.starts_with("[Xwayland][$");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').filter(|_| in_group) else {
+            continue;
+        };
+        let key = key.split('[').next().unwrap_or(key).trim();
+        let value = value.trim();
+        match key {
+            "XwaylandEisNoPrompt" => {
+                all = Some(matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "on" | "yes"
+                ))
+            }
+            "XwaylandEisNoPromptApps" => apps = Some(kconfig_list(value)),
+            _ => {}
+        }
+    }
+    (all, apps)
+}
+
+/// A KConfig string list: comma-separated, a backslash escapes the next
+/// character.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "enigo-input")),
+    allow(dead_code)
+)]
+fn kconfig_list(value: &str) -> Vec<String> {
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => cur.extend(chars.next()),
+            ',' => out.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// The `rc:input-reach` control-channel message. Built with serde, because a
@@ -365,10 +568,29 @@ mod tests {
     /// X11 window, because KWin handed it an EI socket.
     #[test]
     fn kwins_xwayland_reaches_nothing() {
-        let r = decide(&linux(XServer::XwaylandEi(EiRoute::Compositor)));
+        let r = decide(&linux(XServer::XwaylandEi(EiRoute::Compositor {
+            granted: false,
+        })));
         assert_eq!(r.reach, Reach::None);
         assert!(r.reason.contains("KWin"), "{}", r.reason);
-        assert!(r.reason.contains("portal_input"), "{}", r.reason);
+        // The fix it names is the narrow grant, for this agent alone.
+        assert!(
+            r.reason.contains("XwaylandEisNoPromptApps=roomlerd"),
+            "{}",
+            r.reason
+        );
+    }
+
+    /// The same guest once the person allowed roomlerd in Legacy X11 App
+    /// Support: the viewer's pointer, click, wheel and typing reached a native
+    /// window (FR-93 lab, 2026-10-11).
+    #[test]
+    fn a_kwin_grant_reaches_everything() {
+        let r = decide(&linux(XServer::XwaylandEi(EiRoute::Compositor {
+            granted: true,
+        })));
+        assert_eq!(r.reach, Reach::Full);
+        assert!(r.reason.contains("KWin"), "{}", r.reason);
     }
 
     #[test]
@@ -394,7 +616,7 @@ mod tests {
         for x in [
             XServer::Absent,
             XServer::XwaylandEi(EiRoute::Portal),
-            XServer::XwaylandEi(EiRoute::Compositor),
+            XServer::XwaylandEi(EiRoute::Compositor { granted: false }),
             XServer::Xwayland,
         ] {
             let uinput = Facts {
@@ -482,10 +704,12 @@ mod tests {
         ]);
         assert!(cmdline_serves(&gnome, "0"));
         assert!(!cmdline_serves(&gnome, "1"), "another display's Xwayland");
-        assert_eq!(ei_route(&gnome, b""), Some(EiRoute::Portal));
+        // The portal route never asks for KWin's grant.
+        let never = || -> bool { panic!("asked for KWin's grant on GNOME") };
+        assert_eq!(ei_route(&gnome, false, never), Some(EiRoute::Portal));
         let older = cmdline(&["Xwayland", ":0", "-rootless", "-noreset", ""]);
         assert!(cmdline_serves(&older, "0"));
-        assert_eq!(ei_route(&older, b"PATH=/usr/bin\0"), None);
+        assert_eq!(ei_route(&older, false, || false), None);
     }
 
     /// Plasma 6.7's Xwayland, as the lab's KDE guest runs it: nothing about EI
@@ -516,11 +740,75 @@ mod tests {
             "WAYLAND_SOCKET=95",
             "",
         ]);
-        assert_eq!(ei_route(&kwin, &env), Some(EiRoute::Compositor));
+        assert!(environ_has_libei_socket(&env));
+        assert_eq!(
+            ei_route(&kwin, true, || false),
+            Some(EiRoute::Compositor { granted: false })
+        );
+        assert_eq!(
+            ei_route(&kwin, true, || true),
+            Some(EiRoute::Compositor { granted: true })
+        );
+        assert_eq!(ei_route(&kwin, false, || true), None);
         // No socket, an empty one, or a look-alike name: no EI.
-        assert_eq!(ei_route(&kwin, &nul(&["WAYLAND_SOCKET=95", ""])), None);
-        assert_eq!(ei_route(&kwin, &nul(&["LIBEI_SOCKET=", ""])), None);
-        assert_eq!(ei_route(&kwin, &nul(&["XLIBEI_SOCKET=/x", ""])), None);
+        assert!(!environ_has_libei_socket(&nul(&["WAYLAND_SOCKET=95", ""])));
+        assert!(!environ_has_libei_socket(&nul(&["LIBEI_SOCKET=", ""])));
+        assert!(!environ_has_libei_socket(&nul(&["XLIBEI_SOCKET=/x", ""])));
+    }
+
+    /// What a sandboxed daemon reads instead of Xwayland's environment.
+    #[test]
+    fn the_sandbox_stand_ins_are_parsed() {
+        let status = "Name:\tXwayland\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4269\nNgid:\t0\nPid:\t4269\nPPid:\t1586\nTracerPid:\t0\n";
+        assert_eq!(status_ppid(status), Some(1586));
+        assert_eq!(status_ppid("Name:\tx\n"), None);
+        assert_eq!(libkwin_version("libkwin.so.6.7.5"), Some((6, 7)));
+        assert_eq!(libkwin_version("libkwin.so.5.27.11"), Some((5, 27)));
+        assert_eq!(libkwin_version("libkwin.so.6"), None, "the symlink");
+        assert_eq!(libkwin_version("libkwin.so.6.7.5.debug"), None);
+        assert_eq!(libkwin_version("libkwineffects.so.6.7.5"), None);
+        // Plasma 6.1 is where KWin started handing Xwayland an EI socket.
+        // Kubuntu 24.04's Plasma 5.27 must stay below it: there XTest does
+        // reach X11 apps, and `xwayland_only` is the truth.
+        assert_eq!(KWIN_EI_SINCE, (6, 1));
+    }
+
+    #[test]
+    fn kwinrc_grants_are_read() {
+        let lab = "[Desktops]\nNumber=1\n\n[Xwayland]\nScale=1\nXwaylandEisNoPromptApps=roomlerd\n";
+        assert!(kwinrc_grants(lab, "", "roomlerd"));
+        assert!(
+            !kwinrc_grants(lab, "", "xdotool"),
+            "the grant names one app"
+        );
+        assert!(kwinrc_grants(
+            "[Xwayland]\nXwaylandEisNoPrompt=true\n",
+            "",
+            "roomlerd"
+        ));
+        assert!(kwinrc_grants(
+            "[Xwayland]\nXwaylandEisNoPromptApps=a,roomlerd ,b\\,c\n",
+            "",
+            "roomlerd"
+        ));
+        // Stock: no keys anywhere.
+        assert!(!kwinrc_grants("[Xwayland]\nScale=1\n", "", "roomlerd"));
+        // The same key in another group is not the grant.
+        assert!(!kwinrc_grants(
+            "[Wayland]\nXwaylandEisNoPrompt=true\n",
+            "",
+            "roomlerd"
+        ));
+        // The system file counts where the user's says nothing…
+        let system = "[Xwayland][$i]\nXwaylandEisNoPrompt[$i]=true\n";
+        assert!(kwinrc_grants("", system, "roomlerd"));
+        // …and the user's own value wins where it does.
+        assert!(!kwinrc_grants(
+            "[Xwayland]\nXwaylandEisNoPrompt=false\n",
+            system,
+            "roomlerd"
+        ));
+        assert!(!kwinrc_grants(lab, "", ""), "no name of our own, no grant");
     }
 
     #[test]
