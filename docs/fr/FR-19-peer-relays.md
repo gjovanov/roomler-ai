@@ -172,7 +172,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
 `is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2413`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
-`payload_is_wg_or_disco` (`crates/tunnel-core/src/transport/derp.rs:222`) classifies on the
+`payload_is_wg_or_disco` (`crates/tunnel-core/src/transport/derp.rs:257`) classifies on the
 first byte alone.
 
 So the rules are:
