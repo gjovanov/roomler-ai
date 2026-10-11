@@ -512,8 +512,9 @@ pub fn is_hash_hex(s: &str) -> bool {
 
 /// FR-90 P2c-3 — why a device is asked to hold a copy of a session, in
 /// `rc:hive.replica.join`: the role placement chose for it. The device checks
-/// its own gate for each: `hive_replica` for both, `hive_archive` as well for
-/// an archive.
+/// its own gate for each: `hive_replica` for a member, `hive_archive` as well
+/// for an archive, and for the primary that it runs the session at that
+/// fence.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HiveReplicaRole {
@@ -521,6 +522,11 @@ pub enum HiveReplicaRole {
     Archive,
     /// One of the session owner's own devices.
     Owner,
+    /// P2c-4 — the device that runs the session: it has members now, so it
+    /// takes a checkpoint at each turn's end from here on, as a start with
+    /// `replicated` would have had it do. Sent to a session that gained its
+    /// first member after it started, over the connection that runs it.
+    Primary,
 }
 
 impl HiveReplicaRole {
@@ -529,11 +535,12 @@ impl HiveReplicaRole {
         match self {
             Self::Archive => "archive",
             Self::Owner => "owner",
+            Self::Primary => "primary",
         }
     }
 
     /// Every role this build knows.
-    pub const ALL: [HiveReplicaRole; 2] = [Self::Archive, Self::Owner];
+    pub const ALL: [HiveReplicaRole; 3] = [Self::Archive, Self::Owner, Self::Primary];
 }
 
 /// Lenient decoder for `rc:hive.replica.join`'s `role`: a role this build
@@ -915,7 +922,7 @@ mod tests {
     #[test]
     fn replica_roles_are_locked_and_an_unknown_one_is_unnamed() {
         let words: Vec<&str> = HiveReplicaRole::ALL.iter().map(|r| r.as_str()).collect();
-        assert_eq!(words, ["archive", "owner"]);
+        assert_eq!(words, ["archive", "owner", "primary"]);
         for r in HiveReplicaRole::ALL {
             assert_eq!(
                 serde_json::to_value(r).unwrap(),
@@ -929,6 +936,7 @@ mod tests {
         }
         let r = |s: &str| serde_json::from_str::<R>(s).unwrap().role;
         assert_eq!(r(r#"{"role":"archive"}"#), Some(HiveReplicaRole::Archive));
+        assert_eq!(r(r#"{"role":"primary"}"#), Some(HiveReplicaRole::Primary));
         assert_eq!(r(r#"{"role":"witness"}"#), None);
         assert_eq!(r(r#"{"role":2}"#), None);
         assert_eq!(r("{}"), None);

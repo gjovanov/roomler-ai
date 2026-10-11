@@ -162,7 +162,8 @@ pub struct StartOrder {
     pub caller: String,
     pub resume: bool,
     /// P2b-3b — checkpoint each turn's end: a session the server joined as
-    /// replicated. Nothing sets it before P2c.
+    /// replicated (its start's `replicated`, or a resume of one). P2c-4: a
+    /// primary's join turns it on later, while the session runs.
     pub replicated: bool,
 }
 
@@ -238,8 +239,10 @@ struct Live {
     /// P1h — the harness's pid, which leads its process group.
     pid: Option<u32>,
     /// P2c-3 — the server placed members besides this device: it checkpoints,
-    /// and its tip is reported.
-    replicated: bool,
+    /// and its tip is reported. P2c-4: shared with the session's task, which
+    /// reads it at each turn's end, so a primary's join turns it on while the
+    /// session runs.
+    replicated: Arc<AtomicBool>,
 }
 
 /// What a launch hands the session task.
@@ -251,8 +254,8 @@ struct Spawned {
     toolbelt: Toolbelt,
     /// P1d-2 — launched with `--resume`: the harness has its history.
     history: bool,
-    /// P2b-3b — a replicated session's checkpoints; `None` for every other.
-    checkpoints: Option<super::checkpointer::Checkpoints>,
+    /// P2b-3b — the session's checkpoints, taken while it is replicated.
+    checkpoints: super::checkpointer::Checkpoints,
 }
 
 /// P1d-2 — where a session the device hosted stood when its last daemon
@@ -1322,10 +1325,20 @@ impl Supervisor {
         reap_leftover(&h).await;
         h.resumed_at = Some(now);
         h.quick_resumes = quick;
-        self.hosted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(h.clone());
+        {
+            let mut hosted = self.hosted.lock().unwrap_or_else(|e| e.into_inner());
+            // P2c-4 — `h` is the record as this daemon found it when it
+            // began. A primary's join may have turned the session replicated
+            // since (the server sends it at the very connection this resume
+            // runs for): what the join set is kept, never written over.
+            if hosted
+                .get(&h.session)
+                .is_some_and(|cur| cur.fence == h.fence && cur.replicated)
+            {
+                h.replicated = true;
+            }
+            hosted.put(h.clone());
+        }
         let order = StartOrder {
             session_id: session,
             harness: h.harness,
@@ -1857,6 +1870,7 @@ impl Supervisor {
         }
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
+        let replicated = Arc::new(AtomicBool::new(order.replicated));
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
             order.session_id,
             Live {
@@ -1867,13 +1881,19 @@ impl Supervisor {
                 waiting: Arc::clone(&waiting),
                 approvals: toolbelt.pending(),
                 pid,
-                replicated: order.replicated,
+                replicated: Arc::clone(&replicated),
             },
         );
         if prior.is_some() {
             self.hosted_update(order.session_id, |h| {
                 h.harness_pid = pid;
                 h.harness_started = started.clone();
+                // P2c-4 — a primary's join that came while this resumed:
+                // read AFTER the session is live, as `take_up_replication`
+                // writes the record before it looks for the live session.
+                if h.replicated {
+                    replicated.store(true, Ordering::SeqCst);
+                }
             });
         }
         let resumed = match prior {
@@ -1884,27 +1904,27 @@ impl Supervisor {
                 history,
             }),
             None => {
-                self.hosted
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .put(HostedSession {
-                        session: order.session_id.to_hex(),
-                        fence: order.fence,
-                        harness: order.harness.clone(),
-                        harness_session: order.harness_session.clone(),
-                        folder: order.folder.clone(),
-                        account: account.to_string(),
-                        starter: order.user_id.to_hex(),
-                        starter_email: order.user_email.clone(),
-                        turns: 0,
-                        running: None,
-                        approvals: Vec::new(),
-                        resumed_at: None,
-                        quick_resumes: 0,
-                        harness_pid: pid,
-                        harness_started: started.clone(),
-                        replicated: order.replicated,
-                    });
+                let mut hosted = self.hosted.lock().unwrap_or_else(|e| e.into_inner());
+                hosted.put(HostedSession {
+                    session: order.session_id.to_hex(),
+                    fence: order.fence,
+                    harness: order.harness.clone(),
+                    harness_session: order.harness_session.clone(),
+                    folder: order.folder.clone(),
+                    account: account.to_string(),
+                    starter: order.user_id.to_hex(),
+                    starter_email: order.user_email.clone(),
+                    turns: 0,
+                    running: None,
+                    approvals: Vec::new(),
+                    resumed_at: None,
+                    quick_resumes: 0,
+                    harness_pid: pid,
+                    harness_started: started.clone(),
+                    // P2c-4 — the live flag, read under the record's lock:
+                    // a primary's join that found no record yet set it.
+                    replicated: replicated.load(Ordering::SeqCst),
+                });
                 None
             }
         };
@@ -1925,6 +1945,7 @@ impl Supervisor {
                 approvals: approvals_rx,
                 toolbelt,
                 checkpoints,
+                replicated,
             };
             match run(&sup, session, fence, child, inputs, store, resumed).await {
                 Some(detail) => sup.finish(session, fence, token.as_deref(), detail),
@@ -2091,23 +2112,23 @@ impl Supervisor {
             // Its own process group, so a stop reaches the tools it started.
             .process_group(0);
         // P2b-3b — a replicated session checkpoints each turn's end, as its
-        // account, with the harness's own PATH so its `git` is found.
-        let checkpoints = order.replicated.then(|| {
-            super::checkpointer::Checkpoints::new(
-                self.checkpoint_runner(),
-                super::checkpointer::Place {
-                    runtime_dir: dir.clone(),
-                    account: matches!(self.launcher, Launcher::AsMappedAccount)
-                        .then(|| account.to_string()),
-                    owner,
-                    env: unix_base_env(&home, account, Some(&path)),
-                    harness_session: spec.session.clone(),
-                    config_dir: spec.config_dir(),
-                    folder: spec.folder.clone(),
-                    state_dir: spec.state_dir.clone(),
-                },
-            )
-        });
+        // account, with the harness's own PATH so its `git` is found. Built
+        // for every session: P2c-4's primary join can make one replicated
+        // while it runs.
+        let checkpoints = super::checkpointer::Checkpoints::new(
+            self.checkpoint_runner(),
+            super::checkpointer::Place {
+                runtime_dir: dir.clone(),
+                account: matches!(self.launcher, Launcher::AsMappedAccount)
+                    .then(|| account.to_string()),
+                owner,
+                env: unix_base_env(&home, account, Some(&path)),
+                harness_session: spec.session.clone(),
+                config_dir: spec.config_dir(),
+                folder: spec.folder.clone(),
+                state_dir: spec.state_dir.clone(),
+            },
+        );
         match &self.launcher {
             // The one privilege path exec, SSH and the PTY share (verified,
             // uid 0 refused), as an agent session runs (decision 13): none of
@@ -2256,22 +2277,21 @@ impl Supervisor {
         let started = unsafe { spawn_into_job(who, &line, Some(&spec.folder), &env, true, &job) };
         drop(console);
         // P2b-3b — a replicated session checkpoints each turn's end, as the
-        // console user, whom `account` names.
-        let checkpoints = order.replicated.then(|| {
-            super::checkpointer::Checkpoints::new(
-                self.checkpoint_runner(),
-                super::checkpointer::Place {
-                    runtime_dir: dir.clone(),
-                    account: Some(account.to_string()),
-                    owner: None,
-                    env: Vec::new(),
-                    harness_session: spec.session.clone(),
-                    config_dir: spec.config_dir(),
-                    folder: spec.folder.clone(),
-                    state_dir: spec.state_dir.clone(),
-                },
-            )
-        });
+        // console user, whom `account` names. Built for every session, as on
+        // Unix.
+        let checkpoints = super::checkpointer::Checkpoints::new(
+            self.checkpoint_runner(),
+            super::checkpointer::Place {
+                runtime_dir: dir.clone(),
+                account: Some(account.to_string()),
+                owner: None,
+                env: Vec::new(),
+                harness_session: spec.session.clone(),
+                config_dir: spec.config_dir(),
+                folder: spec.folder.clone(),
+                state_dir: spec.state_dir.clone(),
+            },
+        );
         match started {
             Ok(child) => Ok(Spawned {
                 child: hive_win::HarnessChild::new(child, job),
@@ -2578,8 +2598,10 @@ struct Task<'a> {
     /// P1a — the approvals open now, in the order the toolbelt reported
     /// them: the task's own view, so the run state follows the transcript.
     open_approvals: Vec<String>,
-    /// P2b-3b — the session's checkpoints, when it is replicated.
-    checkpoints: Option<super::checkpointer::Checkpoints>,
+    /// P2b-3b — the session's checkpoints, taken while it is replicated.
+    checkpoints: super::checkpointer::Checkpoints,
+    /// P2c-4 — whether it is replicated now ([`Live::replicated`]).
+    replicated: Arc<AtomicBool>,
     /// P2b-3b — a turn ended and its checkpoint is still to be taken: the
     /// run loop takes it ([`checkpoint_or_stop`]) before the next prompt
     /// begins.
@@ -2593,8 +2615,10 @@ struct Inputs {
     /// P1a — the toolbelt's approvals as they open and close.
     approvals: mpsc::Receiver<ApprovalEvent>,
     toolbelt: Toolbelt,
-    /// P2b-3b — the session's checkpoints, when it is replicated.
-    checkpoints: Option<super::checkpointer::Checkpoints>,
+    /// P2b-3b — the session's checkpoints, taken while it is replicated.
+    checkpoints: super::checkpointer::Checkpoints,
+    /// P2c-4 — whether it is replicated now ([`Live::replicated`]).
+    replicated: Arc<AtomicBool>,
 }
 
 impl Task<'_> {
@@ -2818,7 +2842,7 @@ impl Task<'_> {
             // before the next prompt begins, so it holds the files as the
             // turn left them. The run loop takes it, where a stop is still
             // heard.
-            if self.checkpoints.is_some() {
+            if self.replicated.load(Ordering::SeqCst) {
                 self.checkpoint_due = true;
             } else {
                 self.next_prompt().await;
@@ -2910,6 +2934,7 @@ async fn run(
         mut approvals,
         toolbelt,
         checkpoints,
+        replicated,
     } = inputs;
     let Some(stdout) = child.stdout.take() else {
         return Some("the harness has no stdout".into());
@@ -2940,6 +2965,7 @@ async fn run(
         },
         open_approvals: Vec::new(),
         checkpoints,
+        replicated,
         checkpoint_due: false,
     };
     let mut lines = LineReader::new(BufReader::new(stdout), MAX_LINE);
@@ -3084,7 +3110,7 @@ async fn checkpoint_or_stop(
         return None;
     }
     let taken = {
-        let c = task.checkpoints.as_mut()?;
+        let c = &mut task.checkpoints;
         let taking = c.after_turn(&task.store, &task.sid, task.fence, task.count);
         tokio::pin!(taking);
         loop {
@@ -3105,10 +3131,9 @@ async fn checkpoint_or_stop(
         // P2c-3 — kept: the server hears where the copy ends now.
         Ok(()) => task.sup.report_tip(task.session).await,
         Err(failed) => {
-            if !task.sup.went_down_with_daemon().await
-                && let Some(c) = task.checkpoints.as_mut()
-            {
-                c.say(&task.store, &task.sid, task.fence, failed);
+            if !task.sup.went_down_with_daemon().await {
+                task.checkpoints
+                    .say(&task.store, &task.sid, task.fence, failed);
             }
         }
     }
@@ -3983,6 +4008,211 @@ done
             "not replicated: no checkpoint"
         );
         r.sup.stop(plain, 1, "owner".into());
+    }
+
+    /// Every report up to `sid`'s next `idle`: what one turn says.
+    async fn until_idle(r: &mut Rig, sid: ObjectId) -> Vec<ClientMsg> {
+        let mut seen = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("idle within 10 s")
+                .expect("the reporter is open");
+            if let ClientMsg::HiveState {
+                session_id,
+                state: Some(HiveRunState::Idle),
+                ..
+            } = &msg
+                && *session_id == sid
+            {
+                return seen;
+            }
+            seen.push(msg);
+        }
+    }
+
+    /// Whether `sid` runs here replicated now.
+    fn runs_replicated(r: &Rig, sid: ObjectId) -> bool {
+        r.sup
+            .live
+            .lock()
+            .unwrap()
+            .get(&sid)
+            .is_some_and(|l| l.replicated.load(Ordering::SeqCst))
+    }
+
+    /// P2c-4 — a session that started alone takes no checkpoint until its
+    /// primary's join; from the next turn's end it does, and says where its
+    /// copy ends. Its record keeps it for a restart, and the copies the
+    /// device reports include it. The join is idempotent; at another fence,
+    /// for a session the device does not run, or on a secondary org's
+    /// connection, it is refused and turns nothing on.
+    #[tokio::test]
+    async fn a_primarys_join_turns_checkpoints_on_for_a_session_already_running() {
+        use super::super::checkpointer::Runner;
+        use roomler_ai_remote_control::hive::{HiveJoinRefusal, HiveReplicaRole};
+        let mut r = rig_with(
+            true,
+            4,
+            |_| {},
+            |mut s| {
+                s.checkpoint_runner = Some(Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s
+            },
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let checkpoints = |r: &Rig| {
+            r.store
+                .events(&sid.to_hex())
+                .iter()
+                .filter_map(|e| match e {
+                    TranscriptEvent::Checkpoint(c) => Some((c.n, c.turn)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        r.sup.prompt(sid, None, "alone".into()).unwrap();
+        until_idle(&mut r, sid).await;
+        assert!(checkpoints(&r).is_empty(), "alone: no checkpoint");
+        assert!(!r.sup.reports_copies());
+
+        let primary = Some(HiveReplicaRole::Primary);
+        assert_eq!(
+            r.sup.answer_join(false, sid, 1, primary).await.0,
+            Some(HiveJoinRefusal::SecondaryOrg)
+        );
+        assert_eq!(
+            r.sup.answer_join(true, ObjectId::new(), 1, primary).await.0,
+            Some(HiveJoinRefusal::Other),
+            "a session this device does not run"
+        );
+        assert_eq!(
+            r.sup.answer_join(true, sid, 2, primary).await.0,
+            Some(HiveJoinRefusal::Other),
+            "a fence past the one it runs"
+        );
+        assert_eq!(
+            r.sup.answer_join(true, sid, 0, primary).await.0,
+            Some(HiveJoinRefusal::StaleFence),
+            "a fence before the one it runs"
+        );
+        assert!(!runs_replicated(&r, sid), "a refused join turns nothing on");
+        assert!(!hosted_on_disk(&r)[0].replicated);
+
+        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary).await,
+            (None, None),
+            "idempotent"
+        );
+        assert!(runs_replicated(&r, sid));
+        assert!(r.sup.reports_copies());
+        assert!(hosted_on_disk(&r)[0].replicated, "kept for a restart");
+        assert!(
+            store_memberships(&r).await.is_empty(),
+            "the primary holds its run, never a membership"
+        );
+
+        r.sup.prompt(sid, None, "replicated".into()).unwrap();
+        let seen = until_idle(&mut r, sid).await;
+        assert_eq!(
+            checkpoints(&r),
+            [(1, 2)],
+            "the next turn's end, numbered from 1"
+        );
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveReplicaTip { session_id, seq, checkpoint: Some(_), .. }
+                    if *session_id == sid && *seq > 0)),
+            "and where its copy ends: {seen:?}"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// The memberships the rig's store keeps.
+    async fn store_memberships(r: &Rig) -> Vec<String> {
+        r.store
+            .memberships()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.session)
+            .collect()
+    }
+
+    /// P2c-4 — a primary's join holds across the restart after it: the next
+    /// daemon resumes the session replicated, from its record.
+    #[tokio::test]
+    async fn a_primarys_join_holds_across_a_restart() {
+        use roomler_ai_remote_control::hive::HiveReplicaRole;
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let primary = Some(HiveReplicaRole::Primary);
+        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        go_down(&r, sid).await;
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)], "resumed");
+        assert!(runs_replicated(&r, sid), "replicated, as its record says");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2c-4 — a primary's join that reaches the next daemon before its first
+    /// connection resumed the session (the server sends it at that very
+    /// connection) is kept in the record the resume launches from.
+    #[tokio::test]
+    async fn a_primarys_join_reaches_a_session_still_to_resume() {
+        use roomler_ai_remote_control::hive::HiveReplicaRole;
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |_| {});
+        next_daemon(&mut r, |_| {});
+        let primary = Some(HiveReplicaRole::Primary);
+        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert!(hosted_on_disk(&r)[0].replicated);
+        connect(&mut r);
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)], "resumed");
+        assert!(runs_replicated(&r, sid), "launched replicated");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2c-4 — a primary's join that lands while a resume launches, after
+    /// the resume read the record and before the session is live, is not
+    /// lost: the launch reads the record again once the session is live.
+    /// (The start below is the resume, read from the record before the join
+    /// changed it, as `a_start_the_server_re_sends_for_a_hosted_session_resumes_it`
+    /// launches one.)
+    #[tokio::test]
+    async fn a_primarys_join_that_lands_while_a_resume_launches_is_kept() {
+        use roomler_ai_remote_control::hive::HiveReplicaRole;
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        host(&r, sid, |_| {});
+        next_daemon(&mut r, |_| {});
+        assert!(!o.replicated, "the order as the resume read it");
+        let primary = Some(HiveReplicaRole::Primary);
+        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert!(!r.sup.holds_live(sid), "not live yet");
+        assert_eq!(r.sup.start(o, true).await, Answer::accepted("dev"));
+        assert!(runs_replicated(&r, sid), "the join is kept");
+        connect(&mut r);
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)]);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
     }
 
     /// A replicated session on `run`, started and idle.
