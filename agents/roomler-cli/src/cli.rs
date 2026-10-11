@@ -329,10 +329,10 @@ enum Command {
         #[command(subcommand)]
         action: RecordAction,
     },
-    /// Keep busy (FR-92): whether a remote controller left this computer's
-    /// pointer moving in a pattern to keep it active, and stop it. It pauses
-    /// by itself whenever someone uses the computer. There is no local "on":
-    /// only a remote-desktop session with input turns it on.
+    /// Keep busy (FR-92): moves this computer's pointer in a pattern to keep
+    /// it active (no screensaver, idle lock or "Away"), and pauses by itself
+    /// whenever someone uses the computer. Turn it on from a remote-desktop
+    /// session, or here as the person at this computer; anyone may stop it.
     #[command(name = "keep-busy")]
     KeepBusy {
         #[command(subcommand)]
@@ -635,6 +635,31 @@ enum KeepBusyAction {
     },
     /// Stop keep busy on this computer.
     Off {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Turn keep busy on, as the person at this computer (not as root or a
+    /// service: `sudo` and `roomler exec` are refused). It stays on until
+    /// someone turns it off, and resumes at your next login.
+    On {
+        /// The pattern: circle, triangle, square, star, figure8, heart,
+        /// spirograph, lissajous, rose, wave, wander (the most human),
+        /// subtle (an invisible nudge every ~45 s) or shuffle.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// The pattern's size: s, m or l.
+        #[arg(long)]
+        size: Option<String>,
+        /// slow, normal or fast.
+        #[arg(long)]
+        speed: Option<String>,
+        /// Seconds the computer must be left alone before it resumes after
+        /// someone used it (default 30).
+        #[arg(long = "resume-after", value_name = "SECONDS")]
+        resume_after: Option<u64>,
+        /// Turn itself off after this many minutes (default: never).
+        #[arg(long = "auto-off", value_name = "MINUTES")]
+        auto_off: Option<u64>,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -1010,6 +1035,26 @@ where
         Command::KeepBusy { action } => match action {
             KeepBusyAction::Status { fmt } => localclient::keep_busy_status(fmt.json).await,
             KeepBusyAction::Off { fmt } => localclient::keep_busy_off(fmt.json).await,
+            KeepBusyAction::On {
+                pattern,
+                size,
+                speed,
+                resume_after,
+                auto_off,
+                fmt,
+            } => {
+                localclient::keep_busy_on(
+                    localclient::KeepBusyStart {
+                        pattern,
+                        size,
+                        speed,
+                        resume_after_s: resume_after,
+                        auto_off_min: auto_off,
+                    },
+                    fmt.json,
+                )
+                .await
+            }
         },
         Command::Restart { reason, no_wait } => {
             localclient::restart(&reason, no_wait, daemon_exe(origin)).await
@@ -1481,7 +1526,7 @@ mod tests {
     /// FR-92 — `status` and `off`, and deliberately no `on`: only a
     /// remote-desktop session with input turns keep busy on.
     #[test]
-    fn parses_keep_busy_verbs_and_has_no_local_on() {
+    fn parses_keep_busy_verbs_including_a_local_on() {
         let cli = Cli::try_parse_from(["roomler", "keep-busy", "status", "--json"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -1496,7 +1541,55 @@ mod tests {
                 action: KeepBusyAction::Off { .. }
             }
         ));
-        assert!(Cli::try_parse_from(["roomler", "keep-busy", "on"]).is_err());
+        // FR-92 P10 — a bare `on` is the product default…
+        let cli = Cli::try_parse_from(["roomler", "keep-busy", "on"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::KeepBusy {
+                action: KeepBusyAction::On {
+                    pattern: None,
+                    resume_after: None,
+                    ..
+                }
+            }
+        ));
+        // …and every setting is a flag. The values are the agent's to check.
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "keep-busy",
+            "on",
+            "--pattern",
+            "wander",
+            "--size",
+            "l",
+            "--resume-after",
+            "10",
+            "--auto-off",
+            "60",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::KeepBusy {
+                action:
+                    KeepBusyAction::On {
+                        pattern,
+                        size,
+                        resume_after,
+                        auto_off,
+                        fmt,
+                        ..
+                    },
+            } => {
+                assert_eq!(pattern.as_deref(), Some("wander"));
+                assert_eq!(size.as_deref(), Some("l"));
+                assert_eq!(
+                    (resume_after, auto_off, fmt.json),
+                    (Some(10), Some(60), true)
+                );
+            }
+            other => panic!("expected keep-busy on, got {other:?}"),
+        }
     }
 
     #[test]

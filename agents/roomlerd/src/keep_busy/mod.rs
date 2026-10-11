@@ -219,6 +219,41 @@ pub fn submit_from_session(session: ObjectId, name: String, req: SetRequest) -> 
     true
 }
 
+/// FR-92 P10 — who a local start names: the person at the console. The
+/// LocalAPI has already checked it IS that person (never root, never a
+/// service, never `roomler exec`); their account name is not ours to report
+/// to every viewer and the org's history.
+pub const LOCAL_SET_BY: &str = "the person at this computer";
+
+/// FR-92 P10 — the person at the machine turns it ON (tray, CLI). `opts`
+/// carries the viewer's own wire names, read by the viewer's own parser
+/// ([`wire::parse_set`]): an unknown pattern is an error, never a circle.
+/// Waits (bounded) for the engine's answer, so the caller sees `on` — or the
+/// reason it refused (`org_denied`, `device_disabled`, …).
+pub async fn start_locally_and_wait(
+    opts: &tunnel_core::localapi::KeepBusyStartOpts,
+    timeout: Duration,
+) -> Result<Snapshot, String> {
+    let mut val = serde_json::to_value(opts).map_err(|e| e.to_string())?;
+    if let Some(m) = val.as_object_mut() {
+        m.insert("on".into(), serde_json::Value::Bool(true));
+    }
+    let req = wire::parse_set(&val, wall_ms()).map_err(|e| e.to_string())?;
+    let Some(mut rx) = subscribe() else {
+        return Ok(snapshot());
+    };
+    // Mark what is published now as seen, so the wait below ends at the
+    // engine's answer to THIS start: on, or a refusal it publishes too.
+    let _seen = rx.borrow_and_update().rev;
+    submit(Command::Set {
+        session: None,
+        set_by: LOCAL_SET_BY.into(),
+        settings: req.settings,
+    });
+    let _ = tokio::time::timeout(timeout, rx.changed()).await;
+    Ok(snapshot())
+}
+
 /// The person at the machine stops it (LocalAPI, tray, CLI).
 pub fn stop_locally() {
     submit(Command::Off {

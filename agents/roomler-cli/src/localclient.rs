@@ -1808,6 +1808,22 @@ pub async fn keep_busy_status(json: bool) -> Result<()> {
     print_keep_busy(&s, json)
 }
 
+/// FR-92 P10 — what `roomler keep-busy on` asks for (the LocalAPI's type).
+pub type KeepBusyStart = localapi::KeepBusyStartOpts;
+
+/// `roomler keep-busy on` — FR-92 P10. Only the person at this computer may:
+/// the daemon refuses root, services and `roomler exec`, and checks every
+/// value with the viewer's own parser.
+pub async fn keep_busy_on(opts: KeepBusyStart, json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let s = client.keep_busy_on(opts).await.map_err(daemon_err)?;
+    print_keep_busy(&s, json)?;
+    if !s.on && !json && s.reason.is_none() {
+        println!("(the start is being applied — `roomler keep-busy status` will show it)");
+    }
+    Ok(())
+}
+
 /// `roomler keep-busy off` — FR-92. Stopping is always allowed here.
 pub async fn keep_busy_off(json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
