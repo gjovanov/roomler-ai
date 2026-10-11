@@ -4856,3 +4856,630 @@ async fn with_the_switch_off_no_replica_frame_is_sent() {
         "no member join, at its connection or at Y's acceptance"
     );
 }
+
+// ─── P2d-1 — the replica stream's grants ───────────────────────────────────
+
+/// What a source advertises: it runs sessions and carries streams.
+const SERVES_STREAMS: &[&str] = &["exec", "hive", "hive-stream"];
+/// What a member that follows advertises: it holds copies and carries streams.
+const FOLLOWS: &[&str] = &["exec", "hive", "hive-replica", "hive-stream"];
+
+/// The replicaset on, a TURN server configured so the `relay` rung can be
+/// granted, and a limiter a polling test cannot trip.
+async fn stream_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+        s.turn.url = Some("turn:turn.example.com:3478".into());
+        s.turn.shared_secret = Some("stream-test-secret".into());
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// A session on `primary`, with `member` joined: it answered its join.
+async fn followed(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    primary: &mut Device,
+    member: &mut Device,
+    folder: &str,
+) -> String {
+    let s = started(app, tid, token, primary, folder).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    read_until(&mut member.ws, "rc:hive.replica.join")
+        .await
+        .expect("the member's join");
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    wait_member(app, tid, token, &sid, &member.agent_id, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+    sid
+}
+
+/// A member's want, from an empty copy, on `path`.
+fn want(sid: &str, path: &str) -> Value {
+    json!({
+        "t": "rc:hive.replica.want", "session_id": sid, "fence": 1,
+        "seq": 0, "hash": "0".repeat(64), "path": path,
+    })
+}
+
+/// The member's refusal, and why. `waited` names what the caller waited
+/// for, in the panic when none came: every call shares the panic's line.
+async fn refused_why(ws: &mut AgentWs, waited: &str) -> Value {
+    read_until(ws, "rc:hive.replica.refused")
+        .await
+        .unwrap_or_else(|| panic!("no refusal: {waited}"))
+}
+
+/// The member is told to dial only once the source said it is ready, with
+/// the token the source was granted and the certificate it reported. A
+/// candidate on the direct rung goes nowhere; a close reaches the other side.
+#[tokio::test]
+async fn a_member_is_told_to_dial_only_once_the_source_is_ready() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestream").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-st-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-st-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/st").await;
+
+    send(&mut member.ws, want(&sid, "direct")).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("the source's grant");
+    assert_eq!(grant["session_id"], sid.as_str());
+    assert_eq!(grant["member_id"], member.agent_id.as_str());
+    assert_eq!(
+        (grant["path"].as_str(), grant["ttl_secs"].as_u64()),
+        (Some("direct"), Some(600))
+    );
+    let token = grant["token"].as_str().unwrap().to_string();
+    assert!(token.len() >= 32, "unguessable: {token}");
+    assert!(
+        grant["ice_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s.get("username").is_none()),
+        "STUN only on the direct rung: {grant}"
+    );
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    // The member cannot answer for its source.
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ee"),
+               "addrs": ["192.0.2.66:1"]}),
+    )
+    .await;
+    assert!(
+        arrives(
+            &mut member.ws,
+            "rc:hive.replica.dial",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "no dial before the source is ready, nor on the member's own word"
+    );
+
+    let fp = hash("ab");
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": fp,
+               "addrs": ["192.0.2.7:41641"]}),
+    )
+    .await;
+    let dial = read_until(&mut member.ws, "rc:hive.replica.dial")
+        .await
+        .expect("the member's dial");
+    assert_eq!(
+        (
+            dial["grant_id"].as_str(),
+            dial["source_id"].as_str(),
+            dial["token"].as_str(),
+            dial["cert_fingerprint"].as_str(),
+        ),
+        (
+            Some(gid.as_str()),
+            Some(primary.agent_id.as_str()),
+            Some(token.as_str()),
+            Some(fp.as_str()),
+        )
+    );
+    assert_eq!(dial["addrs"], json!(["192.0.2.7:41641"]));
+
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.candidate", "grant_id": gid, "addr": "198.51.100.4:3478"}),
+    )
+    .await;
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.candidate",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "no candidate on the direct rung"
+    );
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.close", "grant_id": gid, "reason": "caught_up"}),
+    )
+    .await;
+    let close = read_until(&mut primary.ws, "rc:hive.replica.close")
+        .await
+        .expect("the source is told");
+    assert_eq!(
+        (close["grant_id"].as_str(), close["reason"].as_str()),
+        (Some(gid.as_str()), Some("caught_up"))
+    );
+    let tid_oid = ObjectId::parse_str(&tid).unwrap();
+    let rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .count_documents(doc! { "tenant_id": tid_oid, "action": "stream" })
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "sent, then ready");
+}
+
+/// The `relay` rung carries TURN credentials to both sides, minted for one
+/// worker, and relays the member's address to the source; the `derp` rung
+/// carries both devices' keys, and a ready without the source's is no ready.
+#[tokio::test]
+async fn the_relay_and_derp_rungs_carry_what_they_need() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestreamrungs").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-sr-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-sr-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/sr").await;
+
+    let turn = |ice: &Value| {
+        ice.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["username"].is_string() && s["credential"].is_string())
+    };
+    send(&mut member.ws, want(&sid, "relay")).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a relay grant");
+    assert!(turn(&grant["ice_servers"]), "the source's TURN credentials");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("cd"),
+               "addrs": ["203.0.113.9:49152"]}),
+    )
+    .await;
+    let dial = read_until(&mut member.ws, "rc:hive.replica.dial")
+        .await
+        .expect("a relay dial");
+    assert!(turn(&dial["ice_servers"]), "the member's TURN credentials");
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.candidate", "grant_id": gid, "addr": "198.51.100.4:3478"}),
+    )
+    .await;
+    let c = read_until(&mut primary.ws, "rc:hive.replica.candidate")
+        .await
+        .expect("the member's relay address, for the source to permit");
+    assert_eq!(c["addr"], "198.51.100.4:3478");
+    // Not an address, or not the member's grant: nothing.
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.candidate", "grant_id": gid, "addr": "relay.example:3478"}),
+    )
+    .await;
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.candidate", "grant_id": gid, "addr": "198.51.100.5:3478"}),
+    )
+    .await;
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.candidate",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none()
+    );
+
+    let member_key = "1f".repeat(32);
+    let mut w = want(&sid, "derp");
+    w["derp_pubkey"] = json!(member_key);
+    send(&mut member.ws, w.clone()).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a derp grant");
+    assert_eq!(grant["member_derp_pubkey"], member_key.as_str());
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ef")}),
+    )
+    .await;
+    let no = refused_why(&mut member.ws, "a derp ready without the source's key").await;
+    assert_eq!(
+        no["reason"], "other",
+        "a derp ready without the source's key: {no}"
+    );
+    let close = read_until(&mut primary.ws, "rc:hive.replica.close")
+        .await
+        .expect("the source's endpoint is told to go");
+    assert_eq!(close["reason"], "malformed");
+
+    send(&mut member.ws, w).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a second derp grant");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    let source_key = "2e".repeat(32);
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ef"),
+               "derp_pubkey": source_key}),
+    )
+    .await;
+    let dial = read_until(&mut member.ws, "rc:hive.replica.dial")
+        .await
+        .expect("a derp dial");
+    assert_eq!(dial["derp_pubkey"], source_key.as_str());
+    assert_eq!(dial["path"], "derp");
+}
+
+/// Each of the server's gates refuses in its own word: not a member, another
+/// fence, a rung that cannot be had, a source away or of an older build, and
+/// the rate. A connection that does not carry streams is not heard at all.
+#[tokio::test]
+async fn a_want_is_refused_by_the_gate_it_failed() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivestreamgates").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-sg-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-sg-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/sg").await;
+    // Enrolled after the session was placed: no member of it.
+    let mut outsider = device(&app, &seeded, "mach-sg-outsider", FOLLOWS).await;
+
+    send(&mut outsider.ws, want(&sid, "direct")).await;
+    assert_eq!(
+        refused_why(&mut outsider.ws, "the outsider's not_a_member").await["reason"],
+        "not_a_member"
+    );
+    let mut stale = want(&sid, "direct");
+    stale["fence"] = json!(2);
+    send(&mut member.ws, stale).await;
+    assert_eq!(
+        refused_why(&mut member.ws, "the stale fence").await["reason"],
+        "stale_fence"
+    );
+    for (path, why) in [
+        ("smoke_signals", "a rung this build cannot name"),
+        ("derp", "derp without the member's key"),
+        ("relay", "relay with no TURN server configured"),
+    ] {
+        send(&mut member.ws, want(&sid, path)).await;
+        let no = refused_why(&mut member.ws, why).await;
+        assert_eq!(no["reason"], "path_unavailable", "{why}: {no}");
+    }
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.grant",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "no gate let a grant through"
+    );
+
+    // A connection that does not carry streams is not heard, though the
+    // source is right there to be granted to.
+    member.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &member.agent_id).await;
+    let mut no_streams = connect(&app, &member.token, &member.machine, HOLDS_COPIES).await;
+    wait_agent_online(&app, &seeded, &member.agent_id).await;
+    send(&mut no_streams, want(&sid, "direct")).await;
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.grant",
+            Duration::from_millis(600)
+        )
+        .await
+        .is_none(),
+        "no grant from a connection without hive-stream"
+    );
+    drop(no_streams);
+    wait_offline(&app, &seeded, &member.agent_id).await;
+    let mut follower = connect(&app, &member.token, &member.machine, FOLLOWS).await;
+    wait_agent_online(&app, &seeded, &member.agent_id).await;
+
+    // A primary of an older build carries no stream; one away is offline.
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let older = connect(&app, &primary.token, &primary.machine, RUNS_HIVE).await;
+    wait_agent_online(&app, &seeded, &primary.agent_id).await;
+    send(&mut follower, want(&sid, "direct")).await;
+    assert_eq!(
+        refused_why(&mut follower, "an older source").await["reason"],
+        "source_unsupported"
+    );
+    drop(older);
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    send(&mut follower, want(&sid, "direct")).await;
+    assert_eq!(
+        refused_why(&mut follower, "a source away").await["reason"],
+        "source_offline"
+    );
+
+    // The rate, after the identity gates: two wants passed it above.
+    let mut reasons = Vec::new();
+    for _ in 0..12 {
+        send(&mut follower, want(&sid, "direct")).await;
+        reasons.push(refused_why(&mut follower, "the rate").await["reason"].clone());
+    }
+    assert_eq!(reasons.last().unwrap(), "rate_limited", "{reasons:?}");
+    assert_eq!(
+        reasons.iter().filter(|r| *r == "source_offline").count(),
+        10,
+        "twelve a minute: {reasons:?}"
+    );
+}
+
+/// A source's refusal reaches the member in the source's word, and a source
+/// that never answers is the member's `no_answer`, its grant dropped.
+#[tokio::test]
+async fn the_sources_refusal_or_silence_reaches_the_member() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestreamsource").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-ss-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-ss-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/ss").await;
+
+    send(&mut member.ws, want(&sid, "direct")).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a grant");
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": grant["grant_id"], "refused": "not_held",
+               "detail": "this device lost its store"}),
+    )
+    .await;
+    let no = refused_why(&mut member.ws, "the source's not_held").await;
+    assert_eq!(
+        (no["reason"].as_str(), no["detail"].as_str()),
+        (Some("not_held"), Some("this device lost its store"))
+    );
+
+    send(&mut member.ws, want(&sid, "direct")).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a second grant");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    let silent = Duration::from_secs(
+        roomler_ai_remote_control::hive::stream_limits::GRANT_ACK_TIMEOUT_SECS + 5,
+    );
+    let no = arrives(&mut member.ws, "rc:hive.replica.refused", silent)
+        .await
+        .expect("the member hears no_answer");
+    assert_eq!(no["reason"], "no_answer");
+    let close = read_until(&mut primary.ws, "rc:hive.replica.close")
+        .await
+        .expect("the source is told to drop it");
+    assert_eq!(
+        (close["grant_id"].as_str(), close["reason"].as_str()),
+        (Some(gid.as_str()), Some("no_answer"))
+    );
+    // Its answer after all changes nothing.
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ab"),
+               "addrs": ["192.0.2.7:41641"]}),
+    )
+    .await;
+    assert!(
+        arrives(
+            &mut member.ws,
+            "rc:hive.replica.dial",
+            Duration::from_millis(400)
+        )
+        .await
+        .is_none()
+    );
+}
+
+/// A renewal comes up beside the grant the member follows
+/// (make-before-break); a third want replaces the oldest, and both sides are
+/// told.
+#[tokio::test]
+async fn a_renewal_keeps_the_grant_it_follows_and_a_third_replaces_the_oldest() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestreamrenew").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-sn-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-sn-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/sn").await;
+
+    let mut grants = Vec::new();
+    for _ in 0..2 {
+        send(&mut member.ws, want(&sid, "direct")).await;
+        let g = read_until(&mut primary.ws, "rc:hive.replica.grant")
+            .await
+            .expect("a grant");
+        grants.push(g["grant_id"].as_str().unwrap().to_string());
+    }
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.close",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "the second comes up beside the first"
+    );
+    send(&mut member.ws, want(&sid, "direct")).await;
+    let frames = frames_within(&mut primary.ws, Duration::from_millis(1200)).await;
+    assert!(
+        frames.iter().any(|f| f["t"] == "rc:hive.replica.grant"),
+        "the third is granted: {frames:?}"
+    );
+    let closed: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["t"] == "rc:hive.replica.close")
+        .collect();
+    assert_eq!(closed.len(), 1, "one replaced: {frames:?}");
+    assert_eq!(
+        (closed[0]["grant_id"].as_str(), closed[0]["reason"].as_str()),
+        (Some(grants[0].as_str()), Some("replaced"))
+    );
+    let told = read_until(&mut member.ws, "rc:hive.replica.close")
+        .await
+        .expect("the member is told too");
+    assert_eq!(told["grant_id"], grants[0].as_str());
+}
+
+/// A member placement lets go stops following at once, and a removed
+/// device's streams end with it: the other side is told each time.
+#[tokio::test]
+async fn a_member_let_go_or_a_device_removed_ends_its_streams() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestreamend").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-se-primary", SERVES_STREAMS).await;
+    set_device(&app, &primary.agent_id, doc! { "tags": ["prod"] }).await;
+    let mut member = device(&app, &seeded, "mach-se-member", FOLLOWS).await;
+    set_device(&app, &member.agent_id, doc! { "tags": ["prod"] }).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/se").await;
+
+    let ready = |gid: &str| {
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ab"),
+               "addrs": ["192.0.2.7:41641"]})
+    };
+    send(&mut member.ws, want(&sid, "direct")).await;
+    let g = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a grant");
+    let gid = g["grant_id"].as_str().unwrap().to_string();
+    send(&mut primary.ws, ready(&gid)).await;
+    read_until(&mut member.ws, "rc:hive.replica.dial")
+        .await
+        .expect("a dial");
+
+    // The member's tag taken off: the restricted session lets it go.
+    tag(&app, &tid, &admin, &member.agent_id, &[]).await;
+    for (who, ws) in [("source", &mut primary.ws), ("member", &mut member.ws)] {
+        let c = read_until(ws, "rc:hive.replica.close")
+            .await
+            .unwrap_or_else(|| panic!("the {who} is told"));
+        assert_eq!(
+            (c["grant_id"].as_str(), c["reason"].as_str()),
+            (Some(gid.as_str()), Some("member_left")),
+            "{who}"
+        );
+    }
+
+    // A second session, followed by another device carrying the tag; then
+    // its source is removed.
+    let mut other = device(&app, &seeded, "mach-se-other", FOLLOWS).await;
+    set_device(&app, &other.agent_id, doc! { "tags": ["prod"] }).await;
+    let sid2 = followed(&app, &tid, &admin, &mut primary, &mut other, "/srv/se2").await;
+    send(&mut other.ws, want(&sid2, "direct")).await;
+    let g = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a grant for the second");
+    let gid = g["grant_id"].as_str().unwrap().to_string();
+    send(&mut primary.ws, ready(&gid)).await;
+    read_until(&mut other.ws, "rc:hive.replica.dial")
+        .await
+        .expect("a dial");
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{tid}/agent/{}", primary.agent_id),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "remove: {}", resp.status());
+    let c = read_until(&mut other.ws, "rc:hive.replica.close")
+        .await
+        .expect("the member is told its source is gone");
+    assert_eq!(
+        (c["grant_id"].as_str(), c["reason"].as_str()),
+        (Some(gid.as_str()), Some("device_removed"))
+    );
+}
+
+/// With the replicaset's switch off, a want is answered by nothing: no grant
+/// to the source, no refusal to the member.
+#[tokio::test]
+async fn with_the_switch_off_no_stream_is_granted() {
+    let on = stream_app().await;
+    let seeded = on.seed_tenant("hivestreamoff").await;
+    on_pro(&on, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&on, &seeded, "mach-so2-primary", SERVES_STREAMS).await;
+    let mut member = device(&on, &seeded, "mach-so2-member", FOLLOWS).await;
+    let sid = followed(&on, &tid, &admin, &mut primary, &mut member, "/srv/so2").await;
+
+    let off = switch_off(&on).await;
+    primary.ws.close(None).await.unwrap();
+    member.ws.close(None).await.unwrap();
+    wait_offline(&on, &seeded, &primary.agent_id).await;
+    wait_offline(&on, &seeded, &member.agent_id).await;
+    let mut source = connect(&off, &primary.token, &primary.machine, SERVES_STREAMS).await;
+    let mut follower = connect(&off, &member.token, &member.machine, FOLLOWS).await;
+    wait_agent_online(&off, &seeded, &member.agent_id).await;
+    send(&mut follower, want(&sid, "direct")).await;
+    assert!(
+        arrives(
+            &mut source,
+            "rc:hive.replica.grant",
+            Duration::from_millis(800)
+        )
+        .await
+        .is_none(),
+        "no grant"
+    );
+    assert!(
+        arrives(
+            &mut follower,
+            "rc:hive.replica.refused",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "no refusal either"
+    );
+}
