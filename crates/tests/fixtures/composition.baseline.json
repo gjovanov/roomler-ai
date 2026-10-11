@@ -417,6 +417,10 @@
       "methods": "DELETE,PUT"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/policy",
+      "methods": "GET,HEAD,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/session",
       "methods": "GET,HEAD,POST"
     },
@@ -1202,6 +1206,17 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "hive_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1
+            },
+            "unique": true
           }
         ]
       },
@@ -2744,6 +2759,17 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "hive_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1
+            },
+            "unique": true
           }
         ]
       },

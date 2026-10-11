@@ -3620,3 +3620,195 @@ async fn an_adopt_offer_passes_the_device_and_org_gates_first() {
         .unwrap();
     assert_eq!(none, 0, "no record for a refused or unanswered offer");
 }
+
+// ─── P2c-2a — the replica policy (`hive.replicaset`) ───────────────────────
+
+/// [`hive_app`] with the replicaset's server switch on.
+async fn replicaset_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+    })
+    .await
+}
+
+async fn get_policy(app: &TestApp, tid: &str, token: &str) -> (u16, Value) {
+    let resp = app
+        .auth_get(&format!("/api/tenant/{tid}/hive/policy"), token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+async fn put_policy(app: &TestApp, tid: &str, token: &str, body: &Value) -> (u16, Value) {
+    let resp = app
+        .auth_put(&format!("/api/tenant/{tid}/hive/policy"), token)
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+fn a_policy(revision: i64) -> Value {
+    json!({
+        "replicaset": {
+            "min": 3,
+            "max": 5,
+            "archive": false,
+            "prefer": ["owner_devices"],
+            "restricted_tags": [" pci ", "pci", ""],
+        },
+        "retention_days": 30,
+        "archive_devices": [],
+        "revision": revision,
+    })
+}
+
+/// With the replicaset's switch off, the policy is not there for anyone.
+#[tokio::test]
+async fn the_replica_policy_is_not_there_while_its_switch_is_off() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivepolicyoff").await;
+    let admin = &seeded.admin.access_token;
+    assert_eq!(get_policy(&app, &seeded.tenant_id, admin).await.0, 404);
+    assert_eq!(
+        put_policy(&app, &seeded.tenant_id, admin, &a_policy(0))
+            .await
+            .0,
+        404
+    );
+}
+
+/// An organization starts with decision 2's defaults. Any member reads the
+/// policy; only an administrator writes it, from the revision they read, an
+/// archive device must be a live device of this organization, and every
+/// attempt is audited.
+#[tokio::test]
+async fn an_administrator_sets_the_replica_policy_from_the_revision_they_read() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivepolicy").await;
+    let tid = seeded.tenant_id.as_str();
+    let admin = seeded.admin.access_token.as_str();
+    let member = seeded.member.access_token.as_str();
+
+    let (s, p) = get_policy(&app, tid, member).await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["is_default"], true);
+    assert_eq!(p["revision"], 0);
+    assert_eq!(
+        p["replicaset"],
+        json!({
+            "min": 2, "max": 4, "archive": true,
+            "prefer": ["owner_devices"], "restricted_tags": ["prod"],
+        })
+    );
+    assert_eq!(p["retention_days"], 90);
+
+    assert_eq!(put_policy(&app, tid, member, &a_policy(0)).await.0, 403);
+
+    let (s, p) = put_policy(&app, tid, admin, &a_policy(0)).await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["revision"], 1);
+    assert_eq!(p["is_default"], false);
+    assert_eq!(
+        p["replicaset"]["restricted_tags"],
+        json!(["pci"]),
+        "normalized"
+    );
+    assert_eq!(p["updated_by"], seeded.admin.id.as_str());
+    assert_eq!(get_policy(&app, tid, member).await.1["revision"], 1);
+
+    let (s, _) = put_policy(&app, tid, admin, &a_policy(0)).await;
+    assert_eq!(s, 409, "a write from the revision before is stale");
+
+    let mut next = a_policy(1);
+    next["replicaset"]["min"] = json!(1);
+    let (s, p) = put_policy(&app, tid, admin, &next).await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(
+        (p["revision"].as_i64(), p["replicaset"]["min"].as_i64()),
+        (Some(2), Some(1))
+    );
+    let (s, _) = put_policy(&app, tid, admin, &next).await;
+    assert_eq!(s, 409, "revision 1 is no longer the stored one");
+
+    let mut bad = a_policy(2);
+    bad["replicaset"]["max"] = json!(0);
+    assert_eq!(put_policy(&app, tid, admin, &bad).await.0, 400);
+
+    let other = app.seed_tenant("hivepolicyother").await;
+    let (foreign, _) = enroll_agent(&app, &other, "mach-policy-foreign", "foreign").await;
+    let mut archive = a_policy(2);
+    archive["archive_devices"] = json!([foreign]);
+    assert_eq!(
+        put_policy(&app, tid, admin, &archive).await.0,
+        400,
+        "another organization's device"
+    );
+    let agents = app.db.collection::<Document>("agents");
+    let (removed, _) = enroll_agent(&app, &seeded, "mach-policy-removed", "removed").await;
+    agents
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&removed).unwrap() },
+            doc! { "$set": { "deleted_at": bson::DateTime::now() } },
+        )
+        .await
+        .unwrap();
+    archive["archive_devices"] = json!([removed]);
+    assert_eq!(
+        put_policy(&app, tid, admin, &archive).await.0,
+        400,
+        "a removed device"
+    );
+    let (ephemeral, _) = enroll_agent(&app, &seeded, "mach-policy-eph", "eph").await;
+    agents
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&ephemeral).unwrap() },
+            doc! { "$set": { "ephemeral": true } },
+        )
+        .await
+        .unwrap();
+    archive["archive_devices"] = json!([ephemeral]);
+    let (s, p) = put_policy(&app, tid, admin, &archive).await;
+    assert_eq!(s, 400, "an ephemeral device: {p}");
+    let (own, _) = enroll_agent(&app, &seeded, "mach-policy-own", "own").await;
+    archive["archive_devices"] = json!([own, own]);
+    let (s, p) = put_policy(&app, tid, admin, &archive).await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["archive_devices"], json!([own]), "once");
+
+    let tid_oid = ObjectId::parse_str(tid).unwrap();
+    let mut audits = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "tenant_id": tid_oid, "action": "policy" })
+        .await
+        .unwrap();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    while let Some(d) = audits.next().await {
+        let d = d.unwrap();
+        seen.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+        ));
+    }
+    seen.sort();
+    let want = [
+        ("refused", "ephemeral"),
+        ("refused", "invalid"),
+        ("refused", "no_permission"),
+        ("refused", "not_a_device"),
+        ("refused", "not_a_device"),
+        ("refused", "stale"),
+        ("refused", "stale"),
+        ("set", ""),
+        ("set", ""),
+        ("set", ""),
+    ]
+    .map(|(o, r)| (o.to_string(), r.to_string()));
+    assert_eq!(seen, want);
+}
