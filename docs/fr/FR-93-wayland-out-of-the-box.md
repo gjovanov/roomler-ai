@@ -522,7 +522,9 @@ New cells run three times before they are trusted. An entry in `expected-failure
   session. Each refusal row shown red on 0.4.124 first.
 - [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
-- [ ] **AC9** — the GEM handle count stays flat over a 30-minute DRM session (red on 0.4.124).
+- [x] **AC9** — the GEM handle count stays flat over a 30-minute DRM session (red on 0.4.124).
+  ✅ 0.4.128, the GNOME system guest: `@create 51143 / @delete 51143` over 30 minutes, every minute with a
+  changing picture. 🔴 first on 0.4.125, the same code: `124 / 0` in one session. Step log 31 on #1972.
 - [ ] **AC10** — the person at the screen sees the indicator and the consent prompt on GNOME and KDE Wayland,
   system and per-user — proven with QMP and a screenshot.
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
