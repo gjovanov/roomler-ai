@@ -365,6 +365,10 @@ Two more shapes the registry carries:
   refuses the removal instead of leaving sessions running for someone a retry would find gone.
   A device that was away when its session ended is told on its next report of that session —
   the replay it sends on every connection — because nothing is left pending for reconcile.
+- **A change a holder decides from** (FR-90 P2c-4): fleet's update route runs
+  `core.hooks.agent_updated` once a device's tags or owner are stored, and hive decides again
+  where the org's sessions are copied. A failing holder is the route's 500: a tag taken off that
+  did not reach placement must not read as done, and a retry decides again from what is stored.
 
 ---
 

@@ -18,6 +18,7 @@
 //! | a restricted tag only ever takes a device out, and is compared without case | a guard that assumes a casing is no guard: a primary tagged `Prod` is restricted by `prod` |
 //! | the primary, then archive replicas in the policy's order, then the owner's devices last seen first until `min`; never more than `max` | decision 2 |
 //! | an adopted session is placed nowhere but where it was adopted | decision 11: only its owner sees it, and whoever runs an archive replica could read that disk |
+//! | P2c-4: deciding again keeps a member that still qualifies before it takes another, and a smaller `min` keeps the first | a copy that need not move does not: tagging an unrelated device must not move anyone's session |
 
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::models::{Agent, RpcCap};
@@ -72,6 +73,11 @@ pub struct SessionFacts<'a> {
     pub origin: SessionOrigin,
     /// The restricted tags it already carries, which a placement only adds to.
     pub restricted: &'a [String],
+    /// P2c-4 — the devices it holds copies on now, in the order they were
+    /// placed, the active before the leaving: a placement keeps one that still
+    /// qualifies before it takes another, so deciding again moves no copy that
+    /// need not move. Empty at a start.
+    pub current: &'a [ObjectId],
 }
 
 /// Why a member holds a copy.
@@ -175,7 +181,13 @@ pub fn place(
     let mut held_back = false;
 
     if rules.archive {
-        for id in archive_devices {
+        // Those it holds already first, so a full replicaset keeps them.
+        let held = |id: &&ObjectId| session.current.contains(id);
+        let order = archive_devices
+            .iter()
+            .filter(held)
+            .chain(archive_devices.iter().filter(|id| !held(id)));
+        for id in order {
             if members.len() >= max {
                 break;
             }
@@ -203,10 +215,17 @@ pub fn place(
                     && !placed(&members, d)
             })
             .collect();
-        owners.sort_by(|a, b| {
-            b.last_seen_at
+        // Those it holds already first, in their order; then the rest, last
+        // seen first.
+        let rank = |d: &DeviceFacts| session.current.iter().position(|c| *c == d.id);
+        owners.sort_by(|a, b| match (rank(a), rank(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b
+                .last_seen_at
                 .cmp(&a.last_seen_at)
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.id.cmp(&b.id)),
         });
         owners.dedup_by_key(|d| d.id);
         for d in owners {
@@ -263,6 +282,7 @@ pub async fn place_new(
             primary_tags: &primary.tags,
             origin: SessionOrigin::Started,
             restricted: &[],
+            current: &[],
         },
         &devices,
     );
@@ -293,6 +313,167 @@ pub async fn place_new(
         placed_at: DateTime::now(),
     };
     Ok((replicaset, p.short))
+}
+
+/// FR-90 P2c-4 — decide again where `tid`'s live placed sessions are copied,
+/// after something placement reads changed: the policy, a device's tags or
+/// owner, or a member removed (`gone`, which no longer counts, though its row
+/// is still there while the removal runs). Returns how many sessions'
+/// members changed.
+///
+/// A member placement now chooses is added `pending`, or a leaving one made
+/// `pending` again, and sent its join once the primary runs the session; one
+/// it no longer chooses is `leaving`, and its copy goes with the purge (P2g).
+/// Restricted tags only grow; a member that still qualifies is kept
+/// ([`place`]'s `current`).
+pub async fn replace_tenant(
+    state: &HiveState,
+    tid: ObjectId,
+    gone: Option<ObjectId>,
+) -> DaoResult<usize> {
+    let policy = state
+        .policies
+        .get(tid)
+        .await?
+        .unwrap_or_else(|| HivePolicy::defaults(tid));
+    let mut changed = 0;
+    for s in state.sessions.live_placed(tid).await? {
+        if replace_one(state, &policy, &s, gone).await? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// One session of [`replace_tenant`]. `true` = its members changed.
+async fn replace_one(
+    state: &HiveState,
+    policy: &HivePolicy,
+    s: &crate::model::AgentSession,
+    gone: Option<ObjectId>,
+) -> DaoResult<bool> {
+    let (Some(sid), Some(current)) = (s.id, s.replicaset.as_ref()) else {
+        return Ok(false);
+    };
+    // The primary's tags as they stand now. A removed primary's sessions end
+    // in its own cascade (`hooks`), so there is nothing to place.
+    let primary = match state
+        .fleet
+        .agents
+        .find_live_in_tenant(s.tenant_id, s.location.device_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let rows = state
+        .fleet
+        .agents
+        .list_replica_candidates(s.tenant_id, s.owner_id, &policy.archive_devices)
+        .await?;
+    let devices: Vec<DeviceFacts> = rows
+        .iter()
+        .filter_map(DeviceFacts::of)
+        .filter(|d| Some(d.id) != gone)
+        .collect();
+    let others = || {
+        current
+            .members
+            .iter()
+            .filter(|m| m.role != MemberRole::Primary.as_str())
+    };
+    // Active members first, then the leaving: one leaving still holds its
+    // copy, so taking it back moves less than taking a stranger.
+    let held: Vec<ObjectId> = others()
+        .filter(|m| m.state != MemberState::Leaving)
+        .chain(others().filter(|m| m.state == MemberState::Leaving))
+        .map(|m| m.device_id)
+        .collect();
+    let p = place(
+        &policy.replicaset,
+        &policy.archive_devices,
+        &SessionFacts {
+            owner: s.owner_id,
+            primary: s.location.device_id,
+            primary_tags: &primary.tags,
+            origin: s.origin,
+            restricted: &current.restricted_tags,
+            current: &held,
+        },
+        &devices,
+    );
+    let chosen: Vec<(ObjectId, MemberRole)> = p
+        .members
+        .iter()
+        .filter(|(_, r)| *r != MemberRole::Primary)
+        .copied()
+        .collect();
+    let fence = u64::try_from(s.fence).unwrap_or_default();
+    // Joins go once the primary runs it; before that, its acceptance sends
+    // them (`replica::send_joins`).
+    let runs = s.accepted_at.is_some() || crate::model::SessionStatus::LAUNCHED.contains(&s.status);
+    let mut moved = false;
+    for (device, role) in &chosen {
+        let added = match others().find(|m| m.device_id == *device) {
+            None => {
+                let m = ReplicaMember {
+                    device_id: *device,
+                    role: role.as_str().to_string(),
+                    state: MemberState::Pending,
+                    refusal: None,
+                    answered_at: None,
+                    tip: None,
+                };
+                state.sessions.add_member(sid, &m).await?
+            }
+            Some(m) if m.state == MemberState::Leaving => {
+                state.sessions.rejoin(sid, *device, role.as_str()).await?
+            }
+            Some(_) => false,
+        };
+        if added {
+            moved = true;
+            if runs && let Some(r) = crate::replica::wire_role(role.as_str()) {
+                crate::replica::push_join(state, s.tenant_id, *device, sid, fence, r);
+            }
+        }
+    }
+    for m in others().filter(|m| m.state != MemberState::Leaving) {
+        if !chosen.iter().any(|(d, _)| *d == m.device_id)
+            && state.sessions.mark_leaving(sid, m.device_id).await?
+        {
+            moved = true;
+        }
+    }
+    let short = p.short.map(Short::as_str);
+    state
+        .sessions
+        .set_placement(
+            sid,
+            &policy.replicaset,
+            policy.revision,
+            &p.restricted_tags,
+            short,
+        )
+        .await?;
+    if moved {
+        // The system decided this, not a person: the row names the session's
+        // owner, whose copies these are.
+        crate::routes::Audit {
+            tenant_id: s.tenant_id,
+            user_id: s.owner_id,
+            target_id: None,
+            device_id: s.location.device_id,
+            session_id: Some(sid),
+            action: "place",
+            outcome: "replaced",
+            reason: short,
+        }
+        .write(state)
+        .await;
+    }
+    Ok(moved)
 }
 
 #[cfg(test)]
@@ -351,6 +532,7 @@ mod tests {
                 primary_tags: &[],
                 origin: SessionOrigin::Started,
                 restricted: &[],
+                current: &[],
             }
         }
     }
@@ -573,5 +755,60 @@ mod tests {
         let first = a.min(b);
         let p = place(&rules(2, 4), &[], &f.session(), &f.devices);
         assert_eq!(ids(&p), [(f.primary, "primary"), (first, "owner")]);
+    }
+
+    /// P2c-4 — deciding again keeps a member that still qualifies, though a
+    /// device seen more recently qualifies too; replaces one that no longer
+    /// qualifies; and a smaller `min` keeps the first. A full set of archive
+    /// replicas keeps the ones it holds.
+    #[test]
+    fn a_placement_decided_again_keeps_what_still_qualifies() {
+        let mut f = Fleet::new();
+        let old = f.owners(3600);
+        let fresh = f.owners(1);
+        let held = vec![old];
+        let s = SessionFacts {
+            current: &held,
+            ..f.session()
+        };
+        assert_eq!(
+            ids(&place(&rules(2, 4), &[], &s, &f.devices)),
+            [(f.primary, "primary"), (old, "owner")],
+            "kept, though `fresh` was seen since"
+        );
+        f.device(old).replica = false;
+        assert_eq!(
+            ids(&place(&rules(2, 4), &[], &s, &f.devices)),
+            [(f.primary, "primary"), (fresh, "owner")],
+            "replaced once it no longer offers"
+        );
+        f.device(old).replica = true;
+        let both = vec![old, fresh];
+        let s = SessionFacts {
+            current: &both,
+            ..f.session()
+        };
+        assert_eq!(
+            ids(&place(&rules(2, 4), &[], &s, &f.devices)),
+            [(f.primary, "primary"), (old, "owner")],
+            "a smaller min keeps the first"
+        );
+
+        let a1 = f.owners(10);
+        let a2 = f.owners(20);
+        for a in [a1, a2] {
+            f.device(a).archive = true;
+        }
+        let archives = [a1, a2];
+        let holds_a2 = vec![a2];
+        let s = SessionFacts {
+            current: &holds_a2,
+            ..f.session()
+        };
+        assert_eq!(
+            ids(&place(&rules(2, 2), &archives, &s, &f.devices)),
+            [(f.primary, "primary"), (a2, "archive")],
+            "the archive it holds, before the one the policy lists first"
+        );
     }
 }

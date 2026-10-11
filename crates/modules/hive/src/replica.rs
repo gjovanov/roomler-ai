@@ -35,7 +35,7 @@ use crate::placement::MemberRole;
 
 /// The role a member was placed in, as the join names it. `None` for the
 /// primary, which is never sent one, and for a word this build cannot name.
-fn wire_role(role: &str) -> Option<HiveReplicaRole> {
+pub(crate) fn wire_role(role: &str) -> Option<HiveReplicaRole> {
     if role == MemberRole::Archive.as_str() {
         Some(HiveReplicaRole::Archive)
     } else if role == MemberRole::Owner.as_str() {
@@ -71,7 +71,7 @@ fn pending(s: &AgentSession) -> Vec<(ObjectId, HiveReplicaRole)> {
 /// Push one join. `false` = it did not leave: the device is not connected
 /// here, or this connection does not hold copies. It stays pending either
 /// way, and goes when a connection that holds copies asks.
-fn push_join(
+pub(crate) fn push_join(
     state: &HiveState,
     tenant_id: ObjectId,
     device_id: ObjectId,

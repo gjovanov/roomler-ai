@@ -92,7 +92,31 @@ impl FleetLifecycle for HiveHooks {
             false,
         )
         .await;
+        // P2c-4 — where it held copies, it leaves, and another device may
+        // take its place. Its row is still there while this runs, so it is
+        // named as gone.
+        if self.state.replicaset {
+            let moved =
+                crate::placement::replace_tenant(&self.state, tenant_id, Some(agent_id)).await?;
+            if moved > 0 {
+                info!(tenant = %tenant_id, device = %agent_id, moved, "hive: device removed — placement decided again");
+            }
+        }
         Ok(None)
+    }
+
+    /// P2c-4 — a device's tags or owner changed: where the org's sessions are
+    /// copied is decided again. A tag taken off can make a member leave; one
+    /// added can let a device join.
+    async fn agent_updated(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
+        if !self.state.replicaset {
+            return Ok(());
+        }
+        let moved = crate::placement::replace_tenant(&self.state, tenant_id, None).await?;
+        if moved > 0 {
+            info!(tenant = %tenant_id, device = %agent_id, moved, "hive: a device changed — placement decided again");
+        }
+        Ok(())
     }
 }
 
