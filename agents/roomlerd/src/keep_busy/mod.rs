@@ -244,6 +244,22 @@ pub async fn stop_locally_and_wait(timeout: Duration) -> Snapshot {
     snapshot()
 }
 
+/// How long a local `off` waits for the engine to say it stopped.
+pub const LOCAL_OFF_WAIT: Duration = Duration::from_millis(800);
+
+/// A LocalAPI keep-busy verb, answered by THIS process's engine: the status,
+/// or (`off`) a local stop and then the status. One body for the LocalAPI
+/// handlers and for a supervised Mac's GUI worker answering its daemon
+/// (`delegate::DelegateFrame::KeepBusyAsk`), so the two cannot drift.
+pub async fn answer_local(off: bool) -> tunnel_core::localapi::KeepBusyInfo {
+    let s = if off {
+        stop_locally_and_wait(LOCAL_OFF_WAIT).await
+    } else {
+        snapshot()
+    };
+    local_info(&s)
+}
+
 /// The LocalAPI's view of a snapshot (`roomler keep-busy status`, the tray).
 pub fn local_info(s: &Snapshot) -> tunnel_core::localapi::KeepBusyInfo {
     tunnel_core::localapi::KeepBusyInfo {

@@ -56,9 +56,14 @@ impl EnigoInjector {
 
         ready_rx.recv().context("input thread never responded")??;
 
-        // macOS: Enigo::new succeeds even when Accessibility is denied —
-        // the OS then swallows every CGEventPost with no error anywhere
-        // ("the mouse doesn't move and nothing logs"). Probe honestly.
+        // macOS: Enigo::new used to succeed even when Accessibility was
+        // denied — the OS then swallows every CGEventPost with no error
+        // anywhere ("the mouse doesn't move and nothing logs"). Probe
+        // honestly. ⚠️ The enigo we ship now refuses to construct instead
+        // ("the application does not have the permission to simulate
+        // input", field, macOS 27), so a denied Mac never gets here: it
+        // gets `open_default`'s Noop, and keep busy reads the grant from
+        // the OS itself (`arbiter::classify_unpermitted`).
         #[cfg(target_os = "macos")]
         let has_perm = {
             let trusted = crate::tcc::accessibility_trusted();

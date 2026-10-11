@@ -143,7 +143,30 @@ pub enum DelegateFrame {
     OverlayFootprint {
         v4_nets: Vec<(std::net::Ipv4Addr, u8)>,
     },
+    /// FR-92 — daemon → worker: a `roomler keep-busy status|off` that reached
+    /// the DAEMON's LocalAPI. A root caller — `roomler exec <mac> roomler
+    /// keep-busy off` — never sees the worker's per-user socket, while on a
+    /// supervised Mac it is the worker that runs keep busy. So the daemon
+    /// asks; `off` stops it first. The answer is
+    /// [`DelegateFrame::KeepBusyTold`] with the same `id`.
+    ///
+    /// ⚠️ Before this the daemon answered for its own engine, which never runs
+    /// there: a root `off` said "off" while the worker kept moving the pointer
+    /// (field, 0.4.126). An older worker skips the frame, and the daemon then
+    /// answers for itself as before, after [`KEEP_BUSY_ASK_WAIT`].
+    KeepBusyAsk { id: u64, off: bool },
+    /// FR-92 — worker → daemon: the worker's keep-busy state, answering the
+    /// [`DelegateFrame::KeepBusyAsk`] with this `id`.
+    KeepBusyTold {
+        id: u64,
+        info: Box<tunnel_core::localapi::KeepBusyInfo>,
+    },
 }
+
+/// FR-92 — how long the daemon waits for the worker's answer to a
+/// [`DelegateFrame::KeepBusyAsk`]: a local `off` waits up to
+/// [`crate::keep_busy::LOCAL_OFF_WAIT`] for the engine, plus the crossing.
+pub const KEEP_BUSY_ASK_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Everything the daemon resolved for a session while answering
 /// `rc:session.request`.
@@ -423,6 +446,17 @@ struct Inner {
     /// daemon to `tunnel_core::overlay_footprint::v4_nets`; unset (every test
     /// host) pushes nothing, so the frame-by-frame tests never meet the frame.
     footprint: Mutex<Option<FootprintSource>>,
+    /// FR-92 — the keep-busy questions put to the worker and not yet answered
+    /// ([`DelegateHost::ask_worker_keep_busy`]), by id. Emptied when the
+    /// channel closes, so a caller is never left waiting on a worker that has
+    /// gone.
+    keep_busy_asks: Mutex<
+        std::collections::HashMap<
+            u64,
+            tokio::sync::oneshot::Sender<tunnel_core::localapi::KeepBusyInfo>,
+        >,
+    >,
+    next_keep_busy_ask: std::sync::atomic::AtomicU64,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -619,6 +653,68 @@ impl DelegateHost {
                 denied = strictest,
                 "delegation: keep-busy policy handed to the GUI worker"
             );
+        }
+    }
+
+    /// FR-92 — ask the attached worker for its keep-busy state; with `off`,
+    /// have it stop first. `None` = nobody to ask: no worker attached, a full
+    /// queue, a worker that closed the channel, or no answer within `wait`
+    /// (an older worker skips the question). The caller then answers for its
+    /// own engine, as it did before the worker could be asked.
+    pub async fn ask_worker_keep_busy(
+        &self,
+        off: bool,
+        wait: std::time::Duration,
+    ) -> Option<tunnel_core::localapi::KeepBusyInfo> {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone()?;
+        let id = self
+            .inner
+            .next_keep_busy_ask
+            .fetch_add(1, Ordering::Relaxed);
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .insert(id, answer_tx);
+        let answer = if tx.try_send(DelegateFrame::KeepBusyAsk { id, off }).is_ok() {
+            match tokio::time::timeout(wait, answer_rx).await {
+                Ok(Ok(info)) => Some(info),
+                // No answer in time, or the channel closed under the question.
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Whatever happened, this question is over: a late answer to it finds
+        // no one waiting and is dropped.
+        self.inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .remove(&id);
+        answer
+    }
+
+    /// The worker's answer to [`Self::ask_worker_keep_busy`]. An `id` nobody
+    /// is waiting for (a late answer, or one never asked) is dropped.
+    fn keep_busy_told(&self, id: u64, info: tunnel_core::localapi::KeepBusyInfo) {
+        let waiting = self
+            .inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .remove(&id);
+        match waiting {
+            Some(tx) => {
+                let _ = tx.send(info);
+            }
+            None => tracing::debug!(id, "delegation: a keep-busy answer nobody is waiting for"),
         }
     }
 
@@ -854,6 +950,10 @@ impl DelegateHost {
                     tracing::warn!("delegation: worker sent an `attached` frame; ignoring");
                 }
                 Ok(DelegateFrame::FromWorker { msg }) => self.relay_upstream(*msg),
+                // FR-92 — the worker's keep-busy state, for a LocalAPI caller
+                // of this daemon. Data for that caller only; nothing here
+                // reaches the control WS.
+                Ok(DelegateFrame::KeepBusyTold { id, info }) => self.keep_busy_told(id, *info),
                 Ok(DelegateFrame::WorkerCaps { caps }) => {
                     tracing::info!(
                         permissions = ?caps.permissions,
@@ -865,7 +965,8 @@ impl DelegateHost {
                 Ok(
                     DelegateFrame::ToWorker { .. }
                     | DelegateFrame::SessionParams { .. }
-                    | DelegateFrame::OverlayFootprint { .. },
+                    | DelegateFrame::OverlayFootprint { .. }
+                    | DelegateFrame::KeepBusyAsk { .. },
                 ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
@@ -885,6 +986,13 @@ impl DelegateHost {
         // advertising a capture target that has gone, and the next session
         // would get the black screen P2b existed to fix.
         *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
+        // FR-92 — and the questions it will now never answer: dropping each
+        // sender ends its caller's wait at once instead of at the timeout.
+        self.inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .clear();
         Ok(())
     }
 
@@ -1172,6 +1280,212 @@ mod tests {
             host.keep_busy_replay(),
             Some(DelegateFrame::ToWorker { .. })
         ));
+    }
+
+    /// Attach a fake worker and wait until the daemon's frame loop is up (its
+    /// queue toward the worker exists only once it is): a ping answered.
+    async fn attached_worker(
+        host: &DelegateHost,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(4096);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        (task, lines, cwr)
+    }
+
+    async fn next_frame<R: tokio::io::AsyncBufRead + Unpin>(
+        lines: &mut tokio::io::Lines<R>,
+    ) -> DelegateFrame {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("a frame within 5 s")
+            .unwrap()
+            .expect("a frame, not EOF");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn worker_says(on: bool, phase: &str) -> tunnel_core::localapi::KeepBusyInfo {
+        tunnel_core::localapi::KeepBusyInfo {
+            available: true,
+            on,
+            phase: phase.into(),
+            pattern: "wander".into(),
+            ..Default::default()
+        }
+    }
+
+    /// FR-92 — `roomler exec <mac> roomler keep-busy off` reaches the ROOT
+    /// daemon, while on a supervised Mac keep busy runs in the WORKER. The
+    /// daemon asks the worker and answers with what it says. Field, 0.4.126:
+    /// it answered for its own engine — "off" — while the worker kept moving
+    /// the pointer.
+    #[tokio::test]
+    async fn a_keep_busy_question_is_answered_by_the_attached_worker() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+
+        let h = host.clone();
+        let asked = tokio::spawn(async move {
+            h.ask_worker_keep_busy(true, std::time::Duration::from_secs(5))
+                .await
+        });
+        let id = match next_frame(&mut lines).await {
+            DelegateFrame::KeepBusyAsk { id, off } => {
+                assert!(off, "an `off` crosses as an `off`");
+                id
+            }
+            other => panic!("expected the question, got {other:?}"),
+        };
+        let mut told = worker_says(false, "off");
+        told.reason = Some("stopped_locally".into());
+        write_frame(
+            &mut cwr,
+            &DelegateFrame::KeepBusyTold {
+                id,
+                info: Box::new(told),
+            },
+        )
+        .await
+        .unwrap();
+        let info = asked.await.unwrap().expect("the worker's answer");
+        assert_eq!(
+            (info.on, info.phase.as_str(), info.reason.as_deref()),
+            (false, "off", Some("stopped_locally"))
+        );
+        assert!(
+            host.inner.keep_busy_asks.lock().unwrap().is_empty(),
+            "nothing is left waiting"
+        );
+
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+    }
+
+    /// With no worker attached there is nobody to ask, and nothing to wait
+    /// for: the caller answers for its own engine at once.
+    #[tokio::test]
+    async fn with_no_worker_a_keep_busy_question_returns_at_once() {
+        let host = DelegateHost::new();
+        let t0 = std::time::Instant::now();
+        assert!(
+            host.ask_worker_keep_busy(true, std::time::Duration::from_secs(5))
+                .await
+                .is_none()
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A worker that never answers (an older one skips the frame) costs the
+    /// caller the bounded wait, no more. Its late answer finds nobody waiting
+    /// and is dropped, and the channel lives on.
+    #[tokio::test]
+    async fn a_silent_worker_times_out_and_a_late_answer_is_dropped() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+
+        let t0 = std::time::Instant::now();
+        assert!(
+            host.ask_worker_keep_busy(false, std::time::Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        let id = match next_frame(&mut lines).await {
+            DelegateFrame::KeepBusyAsk { id, off } => {
+                assert!(!off, "a status is not an off");
+                id
+            }
+            other => panic!("expected the question, got {other:?}"),
+        };
+        write_frame(
+            &mut cwr,
+            &DelegateFrame::KeepBusyTold {
+                id,
+                info: Box::new(worker_says(true, "running")),
+            },
+        )
+        .await
+        .unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.inner.keep_busy_asks.lock().unwrap().is_empty());
+
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+    }
+
+    /// A worker that goes away mid-question ends the caller's wait when the
+    /// channel closes, not at the timeout.
+    #[tokio::test]
+    async fn a_worker_that_leaves_ends_the_wait_at_once() {
+        let host = DelegateHost::new();
+        let (task, mut lines, cwr) = attached_worker(&host).await;
+
+        let h = host.clone();
+        let t0 = std::time::Instant::now();
+        let asked = tokio::spawn(async move {
+            h.ask_worker_keep_busy(true, std::time::Duration::from_secs(30))
+                .await
+        });
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::KeepBusyAsk { .. }
+        ));
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), asked)
+            .await
+            .expect("the wait ends with the channel")
+            .unwrap();
+        assert!(answer.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// The two frames' wire, which both halves of one install must agree on.
+    #[test]
+    fn the_keep_busy_frames_have_a_stable_wire() {
+        let ask = serde_json::to_value(DelegateFrame::KeepBusyAsk { id: 7, off: true }).unwrap();
+        assert_eq!(
+            ask,
+            serde_json::json!({"t": "keep_busy_ask", "d": {"id": 7, "off": true}})
+        );
+        let told = serde_json::to_string(&DelegateFrame::KeepBusyTold {
+            id: 7,
+            info: Box::new(worker_says(true, "running")),
+        })
+        .unwrap();
+        match serde_json::from_str::<DelegateFrame>(&told).unwrap() {
+            DelegateFrame::KeepBusyTold { id, info } => {
+                assert_eq!((id, info.on, info.phase.as_str()), (7, true, "running"));
+            }
+            other => panic!("expected a told frame, got {other:?}"),
+        }
     }
 
     /// An unknown frame must not close the channel: a NEWER worker may send one,
