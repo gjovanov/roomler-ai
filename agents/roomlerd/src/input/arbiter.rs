@@ -632,9 +632,17 @@ pub enum KbOp {
     Locate,
     /// A real-input absolute move to desktop pixel `(x, y)`.
     Move { x: i32, y: i32 },
+    /// FR-92 P9 — a real-input absolute move to `(x, y) / NORM_ONE` of the
+    /// whole desktop, for a backend with no pixel space of its own (uinput).
+    MoveNorm { x: u32, y: u32 },
     /// Is a physical mouse button held?
     Buttons,
 }
+
+/// [`KbOp::MoveNorm`]'s unit: `NORM_ONE` is the far edge of the desktop.
+/// 2¹⁶ steps is finer than a pixel on any screen uinput's own 0..=32767
+/// axis can address.
+pub const NORM_ONE: u32 = 1 << 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KbReply {
@@ -955,7 +963,7 @@ fn keep_busy_op(
     injector: &mut Option<Box<dyn super::InputInjector + Send>>,
     op: KbOp,
 ) -> KbReply {
-    if matches!(op, KbOp::Move { .. }) && state.any_button_held() {
+    if matches!(op, KbOp::Move { .. } | KbOp::MoveNorm { .. }) && state.any_button_held() {
         return KbReply::RemoteButtonHeld;
     }
     if injector.is_none() {
@@ -974,6 +982,10 @@ fn keep_busy_op(
     let result = match op {
         KbOp::Locate => inj.cursor_px().map(|(x, y)| KbReply::Located(x, y)),
         KbOp::Move { x, y } => inj.move_px(x, y).map(|()| KbReply::Moved),
+        KbOp::MoveNorm { x, y } => {
+            let f = |v: u32| f64::from(v.min(NORM_ONE)) / f64::from(NORM_ONE);
+            inj.move_norm(f(x), f(y)).map(|()| KbReply::Moved)
+        }
         KbOp::Buttons => inj.buttons_held().map(KbReply::Buttons),
     };
     result.unwrap_or_else(|e| {
@@ -1575,5 +1587,64 @@ mod tests {
         st.plan(a, &click(true), now);
         let _ = st.close(a);
         assert!(!st.any_button_held(), "a closed session holds nothing");
+    }
+
+    /// An injector that records keep busy's normalised moves — uinput's
+    /// shape: no pixel read, no pixel move.
+    struct NormOnly(std::sync::Arc<std::sync::Mutex<Vec<(f64, f64)>>>);
+
+    impl crate::input::InputInjector for NormOnly {
+        fn inject(&mut self, _event: crate::input::InputMsg) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn has_permission(&self) -> bool {
+            true
+        }
+        fn move_norm(&mut self, x: f64, y: f64) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push((x, y));
+            Ok(())
+        }
+    }
+
+    /// FR-92 P9 — the normalised move takes the same held-button rule as a
+    /// pixel move (a GNOME/Wayland drag is still a drag), reaches the
+    /// injector as a fraction of the desktop, clamps a value past the far
+    /// edge, and a backend without it says so instead of failing.
+    #[test]
+    fn a_normalised_move_is_blocked_by_a_held_button_and_reaches_the_injector() {
+        let moves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
+            Some(Box::new(NormOnly(moves.clone())));
+        let mut st = ArbiterState::default();
+        let a = sid();
+        let now = Instant::now();
+        st.open(a, "A".into(), true, None, now);
+        let half = KbOp::MoveNorm {
+            x: NORM_ONE / 2,
+            y: NORM_ONE / 4,
+        };
+        st.plan(a, &click(true), now);
+        assert_eq!(
+            keep_busy_op(&st, &mut injector, half),
+            KbReply::RemoteButtonHeld
+        );
+        assert!(moves.lock().unwrap().is_empty(), "nothing reached the OS");
+        st.plan(a, &click(false), now);
+        assert_eq!(keep_busy_op(&st, &mut injector, half), KbReply::Moved);
+        let past = KbOp::MoveNorm {
+            x: NORM_ONE * 3,
+            y: 0,
+        };
+        assert_eq!(keep_busy_op(&st, &mut injector, past), KbReply::Moved);
+        assert_eq!(*moves.lock().unwrap(), vec![(0.5, 0.25), (1.0, 0.0)]);
+        // The pixel ops are not this backend's: unsupported, never "failed".
+        assert_eq!(
+            keep_busy_op(&st, &mut injector, KbOp::Locate),
+            KbReply::Unsupported
+        );
+        assert_eq!(
+            keep_busy_op(&st, &mut injector, KbOp::Move { x: 1, y: 1 }),
+            KbReply::Unsupported
+        );
     }
 }

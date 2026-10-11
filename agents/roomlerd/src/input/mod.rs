@@ -226,6 +226,16 @@ pub trait InputInjector: Send {
     fn buttons_held(&mut self) -> Result<bool> {
         Err(anyhow::Error::new(PxUnsupported))
     }
+
+    /// FR-92 P9 — move the pointer with REAL input to `(x, y)`, each in
+    /// `0..=1` of the whole desktop the compositor maps an absolute pointing
+    /// device onto (every monitor's bounding box). For a backend below the
+    /// compositor — uinput, which has no pixel space and cannot read the
+    /// pointer back — this is the only move keep busy has. Default:
+    /// [`PxUnsupported`].
+    fn move_norm(&mut self, _x: f64, _y: f64) -> Result<()> {
+        Err(anyhow::Error::new(PxUnsupported))
+    }
 }
 
 /// FR-92 — the backend has no pixel-space read/move (Noop, uinput, a

@@ -35,6 +35,25 @@ pub fn move_to(p: (i32, i32)) -> Result<(), HostError> {
     }
 }
 
+/// FR-92 P9 — move to a fraction of the whole desktop, for an injector with no
+/// pixel space (uinput, below the compositor). Refused, like a pixel move,
+/// while a controller holds a mouse button.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "uinput-input",
+        feature = "portal-capture"
+    )),
+    allow(dead_code)
+)]
+pub fn move_norm(fx: f64, fy: f64) -> Result<(), HostError> {
+    let q = |f: f64| (f.clamp(0.0, 1.0) * f64::from(arbiter::NORM_ONE)).round() as u32;
+    match arbiter::global().keep_busy(KbOp::MoveNorm { x: q(fx), y: q(fy) }) {
+        KbReply::Moved => Ok(()),
+        other => Err(map_err(other)),
+    }
+}
+
 /// Is a physical mouse button held, as the injector's platform reads it?
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn buttons() -> Result<bool, HostError> {

@@ -477,6 +477,16 @@ impl InputInjector for UinputInjector {
     fn has_permission(&self) -> bool {
         true // constructing the device proved it
     }
+
+    /// FR-92 P9 — keep busy's move: the same absolute report a controller's
+    /// move makes, so it enters through libinput like a person's tablet and
+    /// resets the compositor's idle clock. ⚠️ The kernel drops an `EV_ABS`
+    /// that repeats the axis's current value, so a "move" to where the
+    /// device already is resets nothing — keep busy never sends one twice.
+    fn move_norm(&mut self, x: f64, y: f64) -> Result<()> {
+        self.move_abs(x as f32, y as f32)?;
+        self.sync()
+    }
 }
 
 // The HID usage → evdev keycode table lives in `super::hid_evdev` — FR-45 P4's

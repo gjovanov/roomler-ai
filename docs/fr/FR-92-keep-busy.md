@@ -284,6 +284,7 @@ stateDiagram-v2
 | P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | #1951, merged `51dfd2466` |
 | P5 | Org deny: tenant key, routes, admin UI; a standing `rc:agent.keep_busy_policy` on every connect and on every change, across pods. No per-session `Request` field (§3f). Forwarding to a supervised Mac's worker moves to P3. Deferred to P5b: the heartbeat brief, the device-list badge, the audit | the org switch (default allowed) | #1952, merged `19b1f9fc8`; P5b #1965, merged `fcccec0f5`: the brief + the device-list chip |
 | P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | docs PR open; the field log waits for a release candidate |
+| P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | P9 PR |
 
 ## 5. Acceptance criteria
 
@@ -303,7 +304,12 @@ stateDiagram-v2
 - [ ] **AC8:** no hook or raw-input API is used. A source-scan unit test passes (proven to fail on a
   planted line), the binary's import diff against the previous release is clean, and EDR stays quiet
   for 24 h on the corporate laptop.
-- [ ] **AC9:** Wayland and portal-only hosts report `unavailable` with a reason the viewer shows.
+- [ ] **AC9:** Wayland and portal-only hosts that keep busy cannot drive report `unavailable` with a
+  reason the viewer shows (`wayland` without the uinput path; `no_idle_clock` on a desktop with no idle
+  clock a helper can read).
+- [ ] **AC13 (P9):** on GNOME on Wayland, through a system install with uinput on, keep busy runs:
+  the negative control (OFF ⇒ GNOME locks at its idle delay) recorded first, then ON ⇒ no lock and
+  Mutter's idle clock under 2 s, and a local key pauses it within 1 s.
 - [ ] **AC10:** docs updated or created with mermaid diagrams (`docs/keep-busy.md`: the state machine,
   the sequence, the gates) and linked from `docs/README.md`; the configuration reference covers
   `keep_busy_enabled`.
@@ -314,7 +320,10 @@ stateDiagram-v2
   motion to connected viewers' cursor channel.
 - **Whether the arbiter should stop caching a `NoopInjector`.** That would harden RC input as well, but
   it changes RC behaviour and needs its own test and field check.
-- **When Wayland ships.** GNOME's Mutter IdleMonitor plus uinput is the likely first path.
+- ~~**When Wayland ships.**~~ **Resolved 2026-10-11 (operator: "do … wayland support"): P9**, GNOME's
+  Mutter IdleMonitor plus the arbiter's uinput device, blind (it cannot read the pointer back). KDE and
+  wlroots have no idle clock a session helper can read, and report `no_idle_clock`. Coordinated with
+  FR-93 (#1972), which owns making uinput the default on Wayland and the one desktop-session resolver.
 - **A durable audit of keep-busy transitions.** P5b shows the CURRENT state on the device list. A
   history (who turned it on where, and when) needs its own collection: an index-plan change, a
   composition re-baseline, and a retention to choose. Until then the agent's log records every
@@ -346,16 +355,52 @@ stateDiagram-v2
 
 ## 9. Field-verification log
 
-Nothing yet. The plan: on throwaway vmtest VMs and fleet hosts, never a machine someone is using.
-1. **Negative control first:** a 1-minute lock + Teams with keep-busy OFF ⇒ the host locks and Teams
-   goes Away.
-2. **ON:** no lock over 15 minutes. Host idle is measured with `roomler exec`: Windows
-   `GetLastInputInfo`, macOS `HIDIdleTime`, X11 `xprintidle`.
-3. **Pause and resume:** a local touch, local typing and controller typing each pause it within 1 s.
-4. **Locks and reboots:** Win+L ⇒ `locked`; a reboot and login ⇒ running with no viewer.
-5. **Org deny:** an org PUT ⇒ every online device stops within 5 s.
-6. **Hot corners:** a macOS lock hot corner never fires in 30 minutes at size `l`.
-7. **EDR:** quiet on the corporate laptop.
+**2026-10-11, prod** (server `hosted-20261011-967e5b6`, agents **0.4.125**), on throwaway vmtest VMs
+on zeus enrolled in the vmtest org, never a machine someone uses. The viewer is the production SPA
+driven by Playwright as the org's admin; every `rc:keep-busy.state` frame is logged on the same
+clock as the injected input. **Local input is real**: `virsh send-key` and QEMU's `mouse_move` /
+`mouse_button` reach the guest through its virtual keyboard and mouse. Idle is the host's own clock,
+read inside the session: `GetLastInputInfo` (an interactive scheduled task), `xprintidle`, and
+Mutter's `GetIdletime` over the person's bus.
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 1 | AC2 negative control | Win11, system install (SystemContext worker), machine inactivity limit 60 s | **OFF: idle grew 0 → 100 s and the session LOCKED at 66 s** (LogonUI) |
+| 2 | AC3: never while locked | same, locked | turned ON while locked: `locked` in 37 ms, and it stayed there |
+| 3 | AC4: reboot | same, hard reset | after autologon: `running (circle), turned on by vmtest admin`, no viewer connected |
+| 4 | AC2 ON | same, the 60 s lock armed | **15 min: 894 samples, idle max 47 ms (p99 32 ms), no lock** |
+| 5 | AC3: local and controller input | same, `resume_after` 10 s | local mouse 0.83 s · controller mouse 0.27 s · controller key 12 ms · each resumed after 10.1 s |
+| 6 | AC3: a single local key | same | **8 of 9 isolated Shift taps** paused it (0.5–1.1 s, including ~0.5 s of injection path); one slipped through inside a `GetLastInputInfo` tick shared with an own move (`docs/keep-busy.md` §10). Bursts of four taps: 4/4 in 0.40–0.50 s |
+| 7 | AC3: a held button | same, QEMU `mouse_button 1` for 25 s | paused 0.81 s after the press, `button_held` when `resume_after` ran out, resumed 10.1 s after the release |
+| 8 | AC2 negative control | Ubuntu 24.04, GNOME on Xorg, root daemon given the display (`/etc/default/roomlerd`), uinput off | **OFF: X idle 123 s, GNOME locked** (`LockedHint=yes`) |
+| 9 | **a bug** | same, locked | turned ON while locked: **`running` behind GNOME's lock screen** (X idle 5 ms). GDM's Xorg session names no display to logind, so `logind::pick` matched nothing and the lock was never read. **Fixed in P9** |
+| 10 | AC2 ON | same, unlocked, GNOME's 60 s lock armed | **5 min: 301 samples, X idle max 33 ms, no lock** |
+| 11 | AC9 | Ubuntu 24.04 GNOME **Wayland**, system install, uinput on | `unavailable`, reason **`unsupported`** ("Unavailable on this computer."), not `wayland`: a root daemon has no `DISPLAY`, so the X11 host never even saw Xwayland. P9 makes this host run |
+| 12 | AC13 negative control | same, keep busy unavailable | **OFF: Mutter idle reached 60 s and GNOME locked** |
+| 13 | AC6: org deny, **across pods** | all three VMs' sockets on pod A; the PUT sent straight to pod B | every device logged `org policy received denied=true` and turned off, 17–38 ms after the PUT |
+| 14 | AC6: refuses new enables | Win11, denied | the viewer greys the switch ("Disabled by your organization."); a raw `rc:keep-busy.set on` sent past it, straight down the control channel, came back `on=false org_denied` in 10 ms |
+| 15 | AC6: a device that reconnects | Ubuntu (X11), denied, `roomler restart` | the policy arrived 5 ms after the new hello, and it stayed off. The re-allow (via pod B again) reached all three in ~20 ms and turned nothing back on |
+| 16 | AC7: the CLI | Win11, over the guest's own shell | `roomler keep-busy status` (and `--json`) read the live state; `roomler keep-busy off` turned it off, "Turned off at this computer." |
+| 17 | AC8: imports | the release MSIs, `roomlerd.exe` 0.4.124 → 0.4.125 | **exactly two new imports**, `user32!GetLastInputInfo` and `user32!SystemParametersInfoW`; no hook, raw-input or keyboard-state API added (`GetAsyncKeyState`/`GetKeyState` predate keep busy) |
+| 18 | AC13 ON (**P9 build**) | Ubuntu 24.04 GNOME **Wayland**, system install, uinput on, GNOME's 60 s lock armed | the GNOME host came up 44 ms after the turn-on (`idle_clock=true geometry=true`), `detector` `clock`; **~5 min: 284 samples, Mutter idle max 46 ms (p99 33 ms), no lock** |
+| 19 | AC13: local input, lock (P9) | same | a key paused it in 0.64 s, a move of the VM's USB tablet in 0.54 s; each resumed after ~10 s. `loginctl lock-session` ⇒ `locked`; the unlock ⇒ paused for whoever unlocked, then running |
+| 20 | **the fix** (P9) | the Xorg host of cell 9, P9 installed | turned ON while locked: **`locked` in 229 ms, X idle growing** — the same cell 0.4.125 failed |
+
+Wrong turns, recorded so nobody repeats them:
+- **An ephemeral (vmtest) device unenrolls on a clean OS restart.** Windows' servicing
+  (TrustedInstaller, "Operating System: Upgrade") restarted the guest once after a hard reset, and
+  the device removed itself, by design (FR-51). The reboot cell needs a standard enrollment.
+- The machine inactivity limit does not arm until the next boot; a key after setting it is not
+  enough.
+- **A "missed" local mouse on the Ubuntu VM was the test's.** HMP `mouse_move` is relative, and that
+  guest's active mouse is QEMU's absolute USB tablet (its PS/2 mouse is vmmouse, absolute too), so
+  nothing reached GNOME. A QMP `input-send-event` move of the tablet paused it in 0.54 s.
+- The P9 test binary was built locally with `RUSTFLAGS=-A dead_code`: without `ffmpeg-encoder` a
+  release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
+  `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
+
+Still owed: macOS (cells 6 of `docs/keep-busy.md` §12), the tray's Stop (AC7), a user-context
+Windows worker, a self-update (AC4, the next release), and 24 h of EDR on the corporate laptop (AC8).
 
 ## 10. Related
 
