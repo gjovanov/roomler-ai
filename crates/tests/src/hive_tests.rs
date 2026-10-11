@@ -3628,6 +3628,11 @@ async fn replicaset_app() -> TestApp {
     TestApp::spawn_with_settings(|s| {
         s.modules.hive = true;
         s.hive.replicaset = true;
+        // Polls, like `hive_app_polling`: the default limiter answers a poll
+        // loop 429 before the condition it waits for, so a wait that runs to
+        // its deadline would fail on the 429, not on what it waited for.
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
     })
     .await
 }
@@ -4564,4 +4569,290 @@ async fn a_removed_member_leaves_and_another_takes_its_place() {
     read_until(&mut b.ws, "rc:hive.replica.join")
         .await
         .expect("B's join, in A's place");
+}
+
+// ─── P2c-4b — the primary told, and sessions from before placement ─────────
+
+/// A session that started alone gains its first member: its primary is owed
+/// its join, `role: primary`, and checkpoints once it answers. A primary that
+/// refused (a build that cannot name the role) is asked again at its next
+/// connection; one that answered `joined` is owed nothing more, and an answer
+/// it was not owed changes nothing.
+#[tokio::test]
+async fn a_session_that_gains_its_first_member_tells_its_primary() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hiveprimaryjoin").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut primary = device(&app, &seeded, "mach-pj-primary", RUNS_HIVE).await;
+    let mut b = device(&app, &seeded, "mach-pj-b", HOLDS_COPIES).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/pj").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(members(&s).len(), 1, "min 1: the primary alone");
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &primary.agent_id).await["state"],
+        "joined",
+        "its start told it all there was"
+    );
+
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{p}");
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &primary.agent_id).await["state"],
+        "pending",
+        "owed its join"
+    );
+    let join = read_until(&mut primary.ws, "rc:hive.replica.join")
+        .await
+        .expect("the primary's join");
+    assert_eq!(
+        (
+            join["session_id"].as_str(),
+            join["fence"].as_u64(),
+            join["role"].as_str()
+        ),
+        (Some(sid.as_str()), Some(1), Some("primary"))
+    );
+    read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join");
+
+    // A build that cannot name the role refuses it, in its own word.
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1,
+               "refused": "other", "detail": "a role this build cannot name"}),
+    )
+    .await;
+    let m = wait_member(
+        &app,
+        &tid,
+        &admin,
+        &sid,
+        &primary.agent_id,
+        "refused",
+        |m| m["state"] == "refused",
+    )
+    .await;
+    assert_eq!(m["refusal"], "other");
+
+    // Asked again at its next connection, and this time it takes it.
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let mut ws = connect(&app, &primary.token, &primary.machine, RUNS_HIVE).await;
+    let again = read_until(&mut ws, "rc:hive.replica.join")
+        .await
+        .expect("asked again at its next connection");
+    assert_eq!(again["role"], "primary");
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    wait_member(&app, &tid, &admin, &sid, &primary.agent_id, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+
+    // An answer it was not owed changes nothing; nor is it asked again.
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1,
+               "refused": "other"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &primary.agent_id).await["state"],
+        "joined"
+    );
+    ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let mut ws = connect(&app, &primary.token, &primary.machine, RUNS_HIVE).await;
+    assert!(
+        arrives(&mut ws, "rc:hive.replica.join", Duration::from_millis(800))
+            .await
+            .is_none(),
+        "joined: owed nothing"
+    );
+}
+
+/// A session placed nowhere (one from before P2, or started while the switch
+/// was off) is placed the first time its primary connects with the switch
+/// on, as at a start: its primary, which runs it without `replicated`, is
+/// owed its join, and its member is sent its own. A second connection places
+/// nothing more.
+#[tokio::test]
+async fn a_session_from_before_placement_is_placed_when_its_primary_connects() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hiveunplaced").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-up-primary", RUNS_HIVE).await;
+    let mut b = device(&app, &seeded, "mach-up-b", HOLDS_COPIES).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/up").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join at the start");
+    // As a record from before P2 has it: no replicaset at all.
+    let oid = ObjectId::parse_str(&sid).unwrap();
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(doc! { "_id": oid }, doc! { "$unset": { "replicaset": "" } })
+        .await
+        .unwrap();
+    let places = || async {
+        app.db
+            .collection::<Document>("hive_audit")
+            .count_documents(doc! { "session_id": oid, "action": "place" })
+            .await
+            .unwrap()
+    };
+    assert_eq!(places().await, 1, "the start's");
+
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let mut ws = connect(&app, &primary.token, &primary.machine, RUNS_HIVE).await;
+    let join = read_until(&mut ws, "rc:hive.replica.join")
+        .await
+        .expect("the primary's join");
+    assert_eq!(
+        (join["session_id"].as_str(), join["role"].as_str()),
+        (Some(sid.as_str()), Some("primary"))
+    );
+    let bj = read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("B's join, placed at the primary's connection");
+    assert_eq!(bj["session_id"], sid.as_str());
+    let (_, read) = get_session(&app, &tid, &admin, &sid).await;
+    assert_eq!(
+        members(&read),
+        [
+            (primary.agent_id.clone(), "primary".to_string()),
+            (b.agent_id.clone(), "owner".to_string()),
+        ]
+    );
+    assert_eq!(
+        member_of(&app, &tid, &admin, &sid, &primary.agent_id).await["state"],
+        "pending"
+    );
+    assert_eq!(places().await, 2, "placed once more, by the connection");
+
+    ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let _ws = connect(&app, &primary.token, &primary.machine, RUNS_HIVE).await;
+    wait_agent_online(&app, &seeded, &primary.agent_id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(places().await, 2, "placed already: nothing more");
+}
+
+/// `first`'s database, served by a second server with the replicaset's
+/// switch off: as `first` restarted with `hive.replicaset = false`.
+async fn switch_off(first: &TestApp) -> TestApp {
+    let db = first.db.name().to_string();
+    TestApp::spawn_with_settings(move |s| {
+        s.database.name = db;
+        s.modules.hive = true;
+        s.hive.replicaset = false;
+        // Polls, like `serving_only`: the default limiter answers a poll
+        // loop 429 before the condition it waits for.
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// Every frame `ws` receives within `within`.
+async fn frames_within(ws: &mut AgentWs, within: Duration) -> Vec<Value> {
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    out.push(v);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    out
+}
+
+/// The replicaset's switch off is a session on its primary alone, as in P1,
+/// for sessions placed while it was on as well: no join goes to a member or
+/// to a primary owed one, at a connection or at an acceptance, and a start
+/// sent again does not say `replicated`.
+#[tokio::test]
+async fn with_the_switch_off_no_replica_frame_is_sent() {
+    let on = replicaset_app().await;
+    let seeded = on.seed_tenant("hiveswitchoff").await;
+    on_pro(&on, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(&on, &tid, &admin, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut primary = device(&on, &seeded, "mach-so-primary", RUNS_HIVE).await;
+    let (b_id, b_token) = enroll_agent(&on, &seeded, "mach-so-b", "mach-so-b").await;
+    set_device(&on, &b_id, doc! { "capabilities.rpc": ["hive-replica"] }).await;
+
+    // X starts alone, then gains B: its primary is owed its join.
+    let x = started(&on, &tid, &admin, &mut primary, "/srv/so-x").await;
+    let x = x["id"].as_str().unwrap().to_string();
+    let (code, p) = put_policy(&on, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{p}");
+    read_until(&mut primary.ws, "rc:hive.replica.join")
+        .await
+        .expect("X's primary join, with the switch on");
+    assert_eq!(
+        member_of(&on, &tid, &admin, &x, &primary.agent_id).await["state"],
+        "pending"
+    );
+    // Y starts with B as a member, and its device does not answer yet.
+    let caller = start(&on, &tid, &admin, &primary.agent_id, "/srv/so-y");
+    let target = async {
+        read_until(&mut primary.ws, "rc:hive.start")
+            .await
+            .expect("Y's start")
+    };
+    let (body, first) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "pending", "{body}");
+    assert_eq!(first["replicated"], true, "placed with B, the switch on");
+    let y = body["session"]["id"].as_str().unwrap().to_string();
+
+    // The switch off: the same database, served again.
+    let off = switch_off(&on).await;
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&on, &seeded, &primary.agent_id).await;
+    let mut ws = connect(&off, &primary.token, &primary.machine, RUNS_HIVE).await;
+    let frames = frames_within(&mut ws, Duration::from_millis(1500)).await;
+    let again = frames
+        .iter()
+        .find(|f| f["t"] == "rc:hive.start" && f["session_id"] == y.as_str())
+        .expect("Y's start, sent again");
+    assert!(again.get("replicated").is_none(), "not replicated: {again}");
+    assert!(
+        !frames.iter().any(|f| f["t"] == "rc:hive.replica.join"),
+        "no primary join: {frames:?}"
+    );
+
+    let mut b = connect(&off, &b_token, "mach-so-b", HOLDS_COPIES).await;
+    wait_agent_online(&off, &seeded, &b_id).await;
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.start_ack", "session_id": y, "fence": 1, "account": "dev"}),
+    )
+    .await;
+    assert!(
+        arrives(&mut b, "rc:hive.replica.join", Duration::from_millis(1200))
+            .await
+            .is_none(),
+        "no member join, at its connection or at Y's acceptance"
+    );
 }

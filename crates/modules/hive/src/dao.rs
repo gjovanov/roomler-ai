@@ -17,7 +17,7 @@ use roomler_ai_services::dao::base::{
 };
 
 use crate::model::{
-    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, ReplicaMember,
+    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, ReplicaMember, Replicaset,
     SessionStatus,
 };
 use crate::placement::MemberRole;
@@ -477,8 +477,10 @@ impl AgentSessionDao {
 
     /// FR-90 P2c-3 — a member's answer to its join: `joined`, or `refused`
     /// with the device's word. Only for a member the replicaset names as
-    /// THIS device, never the primary (whose copy is its run), and only at
-    /// the session's fence: an answer to an older join changes nothing.
+    /// THIS device, and only at the session's fence: an answer to an older
+    /// join changes nothing. The primary's counts only while it is owed its
+    /// join (P2c-4, `pending` or `refused`): one the start told, `joined`
+    /// from its placement, cannot be talked out of it.
     pub async fn member_answer(
         &self,
         id: ObjectId,
@@ -513,10 +515,16 @@ impl AgentSessionDao {
                     "fence": fence,
                     "replicaset.members": { "$elemMatch": {
                         "device_id": device_id,
-                        "role": { "$ne": MemberRole::Primary.as_str() },
                         // P2c-4 — an answer in flight when placement let the
                         // member go does not take it back.
                         "state": { "$ne": MemberState::Leaving.as_str() },
+                        "$or": [
+                            { "role": { "$ne": MemberRole::Primary.as_str() } },
+                            { "state": { "$in": [
+                                MemberState::Pending.as_str(),
+                                MemberState::Refused.as_str(),
+                            ] } },
+                        ],
                     } },
                 },
                 update,
@@ -575,6 +583,103 @@ impl AgentSessionDao {
                     } },
                 },
                 Some(doc! { "created_at": 1 }),
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — the sessions this device runs whose primary's join it
+    /// has still to answer `joined`: it is their primary, `pending` or
+    /// `refused`, while they have a member besides it, launched and not
+    /// being stopped. A primary that refused is asked again at every
+    /// connection: its build may have learned the word since.
+    pub async fn primary_joins_owed(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "location.device_id": device_id,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "$or": [
+                        { "accepted_at": { "$type": "date" } },
+                        { "status": statuses(&SessionStatus::LAUNCHED) },
+                    ],
+                    "$and": [
+                        { "replicaset.members": { "$elemMatch": {
+                            "device_id": device_id,
+                            "role": MemberRole::Primary.as_str(),
+                            "state": { "$in": [
+                                MemberState::Pending.as_str(),
+                                MemberState::Refused.as_str(),
+                            ] },
+                        } } },
+                        { "replicaset.members": { "$elemMatch": {
+                            "role": { "$ne": MemberRole::Primary.as_str() },
+                        } } },
+                    ],
+                },
+                Some(doc! { "created_at": 1 }),
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — the session gained its first member after its start
+    /// told the primary it had none: the primary is owed its join now.
+    /// `false` = it was not `joined` (already owed one, or none named).
+    pub async fn owe_primary_join(&self, id: ObjectId) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "replicaset.members": { "$elemMatch": {
+                        "role": MemberRole::Primary.as_str(),
+                        "state": MemberState::Joined.as_str(),
+                    } },
+                },
+                doc! {
+                    "$set": { "replicaset.members.$.state": MemberState::Pending.as_str() },
+                    "$unset": {
+                        "replicaset.members.$.refusal": "",
+                        "replicaset.members.$.answered_at": "",
+                    },
+                },
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — the live sessions this device runs that were never
+    /// placed: started before P2, or while `hive.replicaset` was off. Never
+    /// an adopted one, which is placed nowhere until P2f.
+    pub async fn unplaced_on(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Vec<AgentSession>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "location.device_id": device_id,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "replicaset": Bson::Null,
+                    "origin": { "$ne": crate::model::SessionOrigin::Adopted.as_str() },
+                },
+                Some(doc! { "created_at": 1 }),
+            )
+            .await
+    }
+
+    /// FR-90 P2c-4 — the first placement of a session that had none, unless
+    /// another connection placed it first. `false` = one did.
+    pub async fn place_unplaced(&self, id: ObjectId, replicaset: &Replicaset) -> DaoResult<bool> {
+        let r = bson::to_bson(replicaset)?;
+        self.base
+            .update_one(
+                doc! { "_id": id, "replicaset": Bson::Null },
+                doc! { "$set": { "replicaset": r } },
             )
             .await
     }

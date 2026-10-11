@@ -26,6 +26,7 @@ use roomler_ai_remote_control::hive::{
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::GENESIS;
 use roomler_hive_node::store::StoreError;
+use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
 use super::Supervisor;
@@ -66,6 +67,14 @@ pub(super) async fn decide(
             "a role this build cannot name".into(),
         );
     };
+    // P2c-4 — the primary's join is not a member's: `answer_join` takes it
+    // to `take_up_replication`, and no copy is ever held in that role.
+    if role == HiveReplicaRole::Primary {
+        return refuse(
+            HiveJoinRefusal::Other,
+            "a primary's join is not a member's".into(),
+        );
+    }
     if role == HiveReplicaRole::Archive && !cfg.archive {
         return refuse(
             HiveJoinRefusal::ArchiveDisabled,
@@ -151,7 +160,8 @@ pub(super) async fn tip_of(
 }
 
 impl Supervisor {
-    /// The device's answer to a join, from its config and store, logged.
+    /// The device's answer to a join, from its config and store, logged. A
+    /// primary's (P2c-4) is about a session it runs, not a copy it holds.
     pub(super) async fn answer_join(
         &self,
         primary: bool,
@@ -159,21 +169,101 @@ impl Supervisor {
         fence: u64,
         role: Option<HiveReplicaRole>,
     ) -> JoinAnswer {
-        let answer = decide(
-            &self.cfg,
-            self.store.as_ref(),
-            primary,
-            session,
-            fence,
-            role,
-        )
-        .await;
+        let answer = match role {
+            Some(HiveReplicaRole::Primary) => self.take_up_replication(primary, session, fence),
+            member => {
+                decide(
+                    &self.cfg,
+                    self.store.as_ref(),
+                    primary,
+                    session,
+                    fence,
+                    member,
+                )
+                .await
+            }
+        };
         info!(
             session = %session, fence, role = role.map(HiveReplicaRole::as_str),
             refused = answer.0.map(HiveJoinRefusal::as_str), detail = answer.1.as_deref(),
             "hive: a join answered"
         );
         answer
+    }
+
+    /// P2c-4 — `join {role: primary}`: the session this device runs has
+    /// members now, so each turn's end is checkpointed from here on, and
+    /// after a restart too. Idempotent. Refused on a secondary org's
+    /// connection, and when this device does not run the session at that
+    /// fence. `hive_replica` is not asked: the device holds no copy of
+    /// another's session, only its own run.
+    ///
+    /// ⚠️ The record, then the live session, then the record again if it was
+    /// not there yet. A session resuming now reads its record once it is live
+    /// (`launch`); a new one writes its record from the live flag, under the
+    /// record's lock. Either way a join that lands between the two is kept.
+    pub(super) fn take_up_replication(
+        &self,
+        primary: bool,
+        session: ObjectId,
+        fence: u64,
+    ) -> JoinAnswer {
+        let refuse = |word: HiveJoinRefusal, why: String| (Some(word), Some(why));
+        if !primary {
+            return refuse(
+                HiveJoinRefusal::SecondaryOrg,
+                "agent sessions run only for this device's primary organization".into(),
+            );
+        }
+        // Its record would not keep the change: the next daemon is asked
+        // again, at its first connection.
+        if self.going_down() {
+            return refuse(HiveJoinRefusal::Other, "this device is restarting".into());
+        }
+        let sid = session.to_hex();
+        let mark = || {
+            let mut held = None;
+            self.hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .update(&sid, |h| {
+                    held = Some(h.fence);
+                    if h.fence == fence {
+                        h.replicated = true;
+                    }
+                });
+            held
+        };
+        let hosted_at = mark();
+        let live_at = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|l| {
+                if l.fence == fence {
+                    l.replicated.store(true, Ordering::SeqCst);
+                }
+                l.fence
+            });
+        if hosted_at.is_none() {
+            mark();
+        }
+        match live_at.or(hosted_at) {
+            Some(f) if f == fence => (None, None),
+            Some(f) if f > fence => refuse(
+                HiveJoinRefusal::StaleFence,
+                format!("this device runs the session at fence {f}"),
+            ),
+            Some(f) => refuse(
+                HiveJoinRefusal::Other,
+                format!("this device runs the session at fence {f}, before the join's"),
+            ),
+            None => refuse(
+                HiveJoinRefusal::Other,
+                "this device does not run the session".into(),
+            ),
+        }
     }
 
     /// Whether this device has copies to tell the server about: its owner
@@ -187,7 +277,7 @@ impl Supervisor {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
-                .any(|l| l.replicated)
+                .any(|l| l.replicated.load(Ordering::SeqCst))
     }
 
     /// Every session this device holds a copy of, as a member or as the
@@ -203,7 +293,7 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(_, l)| l.replicated)
+            .filter(|(_, l)| l.replicated.load(Ordering::SeqCst))
             .map(|(id, _)| *id)
             .collect();
         match store.memberships().await {
@@ -299,6 +389,11 @@ mod tests {
             answer(&on, &store, true, sid, 1, None).await,
             Some(HiveJoinRefusal::Other),
             "a role this build cannot name"
+        );
+        assert_eq!(
+            answer(&on, &store, true, sid, 1, Some(HiveReplicaRole::Primary)).await,
+            Some(HiveJoinRefusal::Other),
+            "a primary's join is never a member's"
         );
         assert_eq!(
             answer(&on, &store, true, sid, 1, archive).await,

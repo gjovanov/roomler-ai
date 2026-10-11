@@ -21,6 +21,7 @@
 //! | P2c-4: deciding again keeps a member that still qualifies before it takes another, and a smaller `min` keeps the first | a copy that need not move does not: tagging an unrelated device must not move anyone's session |
 
 use bson::{DateTime, oid::ObjectId};
+use roomler_ai_remote_control::hive::HiveReplicaRole;
 use roomler_ai_remote_control::models::{Agent, RpcCap};
 use roomler_ai_services::dao::base::DaoResult;
 
@@ -413,6 +414,9 @@ async fn replace_one(
     // Joins go once the primary runs it; before that, its acceptance sends
     // them (`replica::send_joins`).
     let runs = s.accepted_at.is_some() || crate::model::SessionStatus::LAUNCHED.contains(&s.status);
+    // Whether the primary checkpoints already: its start said `replicated`,
+    // or it was owed its join when the first member came.
+    let told = crate::replica::replicated(s);
     let mut moved = false;
     for (device, role) in &chosen {
         let added = match others().find(|m| m.device_id == *device) {
@@ -438,6 +442,21 @@ async fn replace_one(
                 crate::replica::push_join(state, s.tenant_id, *device, sid, fence, r);
             }
         }
+    }
+    // The first member of a session that started alone: its primary takes
+    // no checkpoint until it is told, so a member would hold a copy of
+    // nothing. Owed its join, sent once the primary runs the session, and
+    // again at its every connection until it answers `joined`. (`moved` counts
+    // only additions here: the leaving come below.)
+    if moved && !told && state.sessions.owe_primary_join(sid).await? && runs {
+        crate::replica::push_join(
+            state,
+            s.tenant_id,
+            s.location.device_id,
+            sid,
+            fence,
+            HiveReplicaRole::Primary,
+        );
     }
     for m in others().filter(|m| m.state != MemberState::Leaving) {
         if !chosen.iter().any(|(d, _)| *d == m.device_id)
@@ -474,6 +493,68 @@ async fn replace_one(
         .await;
     }
     Ok(moved)
+}
+
+/// FR-90 P2c-4 — place what `device` runs that was never placed, now that it
+/// connected with the switch on: a session started before P2, or while
+/// `hive.replicaset` was off. Placed as at a start, except that it runs
+/// already without `replicated`, so its primary is owed its join once
+/// placement chose a member besides it. Returns how many were placed.
+pub async fn place_unplaced(
+    state: &HiveState,
+    tid: ObjectId,
+    device: ObjectId,
+) -> DaoResult<usize> {
+    let sessions = state.sessions.unplaced_on(tid, device).await?;
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+    let primary = match state.fleet.agents.find_live_in_tenant(tid, device).await {
+        Ok(a) => a,
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut placed = 0;
+    for s in sessions {
+        let Some(sid) = s.id else { continue };
+        let (mut replicaset, short) = place_new(state, tid, s.owner_id, device, &primary).await?;
+        let has_members = replicaset
+            .members
+            .iter()
+            .any(|m| m.role != MemberRole::Primary.as_str());
+        if has_members {
+            for m in &mut replicaset.members {
+                if m.role == MemberRole::Primary.as_str() {
+                    m.state = MemberState::Pending;
+                }
+            }
+        }
+        // Another connection of the same device may have placed it first.
+        if !state.sessions.place_unplaced(sid, &replicaset).await? {
+            continue;
+        }
+        placed += 1;
+        crate::routes::Audit {
+            tenant_id: tid,
+            user_id: s.owner_id,
+            target_id: None,
+            device_id: device,
+            session_id: Some(sid),
+            action: "place",
+            outcome: if short.is_some() { "short" } else { "placed" },
+            reason: short.map(Short::as_str),
+        }
+        .write(state)
+        .await;
+        // Its joins, the primary's among them, go once it runs; a start not
+        // answered yet sends them with its acceptance.
+        let runs =
+            s.accepted_at.is_some() || crate::model::SessionStatus::LAUNCHED.contains(&s.status);
+        if runs {
+            crate::replica::send_joins(state, sid).await;
+        }
+    }
+    Ok(placed)
 }
 
 #[cfg(test)]

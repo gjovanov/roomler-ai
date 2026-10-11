@@ -87,6 +87,7 @@ pub(crate) struct HostedSession {
     pub harness_started: Option<String>,
     /// P2b-3b — the server joined it as replicated, so each turn's end is
     /// checkpointed; a resume keeps doing so. Absent in a file from before.
+    /// P2c-4: set later by a primary's join, while the session runs.
     #[serde(default)]
     pub replicated: bool,
 }

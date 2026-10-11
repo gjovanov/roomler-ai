@@ -820,8 +820,9 @@ pub enum ClientMsg {
     },
 
     /// FR-90 P2c-3 — the device's answer to [`ServerMsg::HiveReplicaJoin`]:
-    /// whether it holds a copy of the session now. Sent on EVERY outcome,
-    /// refusals included: each names a different gate with a different fix.
+    /// whether it holds a copy of the session now (from the primary, P2c-4:
+    /// whether it checkpoints now). Sent on EVERY outcome, refusals included:
+    /// each names a different gate with a different fix.
     ///
     /// ⚠️ The server applies it only to a member the session's replicaset
     /// names as the sending device, at the session's fence; session ids are
@@ -2951,6 +2952,11 @@ pub enum ServerMsg {
     /// as a member. Answered by [`ClientMsg::HiveReplicaJoinAck`]. Pushed only
     /// to a connection advertising `hive-replica`, and re-sent on every
     /// connection until it is answered.
+    ///
+    /// P2c-4 — with `role: primary`, to the device that runs the session, on
+    /// a connection that runs Hive: the session has members now, so it
+    /// checkpoints. Re-sent on every such connection until it is answered
+    /// `joined`.
     ///
     /// ⚠️ It carries no content and opens nothing: the copy arrives over the
     /// carrier (P2d), from a source the server grants then.

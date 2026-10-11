@@ -292,9 +292,26 @@ impl AgentSocketLifecycle for HiveAgentSocket {
         tokio::spawn(async move {
             if state.scope.serves(tenant_id) {
                 reconcile_on_connect(&state, tenant_id, device_id, &conn).await;
-                // P2c-3 — and the joins it has still to answer, if this
-                // connection holds copies.
-                crate::replica::reconcile_joins(&state, tenant_id, device_id, &conn).await;
+                // P2c-4 — with the replicaset's switch off, no replica frame
+                // goes at all, for sessions placed while it was on as well: a
+                // primary's join turns checkpoints on.
+                if state.replicaset {
+                    // P2c-3 — the joins it has still to answer: as a member,
+                    // if this connection holds copies, and as a primary.
+                    crate::replica::reconcile_joins(&state, tenant_id, device_id, &conn).await;
+                    // And what it runs that was never placed.
+                    if state.fleet.rc_hub.agent_supports_hive_on(device_id, &conn) == Some(true) {
+                        match crate::placement::place_unplaced(&state, tenant_id, device_id).await {
+                            Ok(0) => {}
+                            Ok(placed) => {
+                                info!(device = %device_id, placed, "hive: sessions from before placement placed");
+                            }
+                            Err(e) => {
+                                warn!(device = %device_id, %e, "hive: sessions from before placement were not placed");
+                            }
+                        }
+                    }
+                }
             } else {
                 end_unserved(&state, tenant_id, device_id).await;
             }
@@ -359,7 +376,8 @@ async fn apply_reports(
                             room::note(state, &s, text).await;
                         }
                         // P2c-3 — it runs: its members may hold copies now.
-                        if refused.is_none() {
+                        // P2c-4: only while the replicaset's switch is on.
+                        if refused.is_none() && state.replicaset {
                             crate::replica::send_joins(state, session_id).await;
                         }
                     }
@@ -759,7 +777,10 @@ pub(crate) async fn reconcile_on_connect(
                     user_email: owner.email,
                     caller: owner.display_name,
                     resume: false,
-                    replicated: crate::replica::replicated(&s),
+                    // P2c-4 — and replicated only while the switch is on: a
+                    // session placed while it was on runs alone once it is
+                    // off, as every session did in P1.
+                    replicated: state.replicaset && crate::replica::replicated(&s),
                 };
                 match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
                     Ok(()) => {
