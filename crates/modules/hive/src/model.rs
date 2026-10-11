@@ -364,11 +364,11 @@ pub struct HiveAuditEvent {
     /// Absent for a start refused before a session was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
-    /// `start` | `stop` | `view` | `participant` | `brain`.
+    /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a).
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
     /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
-    /// `archived` | `refused`.
+    /// `archived` | `refused`; for `policy`, `set` | `refused`.
     pub outcome: String,
     /// Why, for `refused` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]

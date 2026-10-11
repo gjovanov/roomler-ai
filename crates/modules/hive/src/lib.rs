@@ -56,6 +56,7 @@ pub mod dao;
 pub mod hooks;
 pub mod model;
 pub mod participants;
+pub mod policy;
 pub mod room;
 pub mod routes;
 pub mod scope;
@@ -90,6 +91,10 @@ pub struct HiveState {
     pub brain: Arc<brain::BrainDao>,
     /// P1g — the organizations agent sessions serve (`hive.tenants`).
     pub scope: Arc<scope::TenantScope>,
+    /// P2c-2a — the organizations' replica policies.
+    pub policies: Arc<policy::PolicyDao>,
+    /// P2c — the replicaset's server switch (`hive.replicaset`, default off).
+    pub replicaset: bool,
 }
 
 impl std::ops::Deref for HiveState {
@@ -129,6 +134,8 @@ impl Module for HiveState {
             adopt_limiter: Arc::new(RateLimiter::new()),
             brain: Arc::new(brain::BrainDao::new(db)),
             scope: Arc::new(scope),
+            policies: Arc::new(policy::PolicyDao::new(db)),
+            replicaset: settings.hive.replicaset,
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -174,6 +181,11 @@ impl Module for HiveState {
         Router::new()
             // P1g — whether agent sessions serve this organization.
             .route("/tenant/{tenant_id}/hive", get(routes::serves))
+            // P2c-2a — where the organization's sessions are copied.
+            .route(
+                "/tenant/{tenant_id}/hive/policy",
+                get(policy::get_policy).put(policy::put_policy),
+            )
             .nest("/tenant/{tenant_id}/hive/session", session)
             .nest("/tenant/{tenant_id}/hive/brain", brain)
             .with_state(self.clone())
@@ -229,6 +241,13 @@ impl Module for HiveState {
                     index(bson::doc! { "session_id": 1, "at": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
+            },
+            // P2c-2a — one replica policy per organization: the unique index
+            // arbitrates two first writes.
+            IndexSet {
+                collection: policy::HivePolicy::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![index_unique(bson::doc! { "tenant_id": 1 })],
             },
             // P1e — a scope instance's facts, in the order they render.
             IndexSet {

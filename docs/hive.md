@@ -452,7 +452,7 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | The server hears THAT a session waits, how it ended and who answered. `rc:hive.approval` carries an id, a turn, a word and a user id, and its field set is locked by test. The stub reads "🔐 Approval needed · turn 2 — open the session to answer", then "🔐 Approval · turn 2 — ✅ allowed by Alice" | which tool, and what it would do, travel only over the viewer peer (AC5) | [`room.rs:250`](../crates/modules/hive/src/room.rs#L250) |
-| One `agent_approvals` record per (session, approval), held by a unique index, its end a compare-and-set on `open`; kept 90 days | a replayed frame posts no second stub | [`lib.rs:211`](../crates/modules/hive/src/lib.rs#L211) |
+| One `agent_approvals` record per (session, approval), held by a unique index, its end a compare-and-set on `open`; kept 90 days | a replayed frame posts no second stub | [`lib.rs:223`](../crates/modules/hive/src/lib.rs#L223) |
 | The notification names the session and never the call: `Claude · <device> needs approval`, by web push to every subscription of every driver still in the room | a desk with the app open is not a phone in a pocket | [`room.rs:477`](../crates/modules/hive/src/room.rs#L477) |
 | Only a driver's grant answers; a reader's `answer` is refused on the device | | device [`view.rs:821`](../agents/roomlerd/src/hive/view.rs#L821) |
 | Unanswered for 25 minutes is a denial that says so. Progress goes to Claude Code every 60 s while a person decides, and the tool-call timeout in the MCP config is 30 minutes | what the model reads is our answer, never a transport error | [`toolbelt.rs:69`](../agents/roomlerd/src/hive/toolbelt.rs#L69) |
@@ -687,7 +687,7 @@ Empty or `*` means every organization, which is what a self-hosted server wants.
 
 ⚠️ **The list is the switch.** A non-empty `hive.tenants` mounts the module by itself,
 with no `[modules] hive`, and `/api/capabilities` says so
-([`settings.rs:851`](../crates/config/src/settings.rs#L851) `Settings::hive_on`). A
+([`settings.rs:858`](../crates/config/src/settings.rs#L858) `Settings::hive_on`). A
 hosted server sets only the list, because that form fails safe. An image from before
 P1g never reads the list, so with `ROOMLER__MODULES__HIVE=true` beside it, promoting
 such an image (a rollback, or another session's older tag) would open the pillar to
@@ -1198,8 +1198,74 @@ Without it, a folder too big to add within the checkpoint's 120 s failed at ever
 end, because an add that is ended writes no index and the next one starts over. That was
 P2b-3b's open prerequisite for P2c.
 
+### P2c-2a: the org's replica policy
+
+Where an organization's sessions are copied is the organization's call (spec §3b,
+"Membership and placement"): one document per organization in `hive_policies`, unique on
+`tenant_id` ([`lib.rs:250`](../crates/modules/hive/src/lib.rs#L250)), written by an
+`ADMINISTRATOR` and audited. Until one is written, every reader gets decision 2's
+defaults ([`policy.rs:91`](../crates/modules/hive/src/policy.rs#L91)). The two routes,
+`GET` and `PUT …/hive/policy` ([`lib.rs:185`](../crates/modules/hive/src/lib.rs#L185),
+`docs/api.md`), answer **404** while the server's `hive.replicaset` is off
+([`settings.rs:83`](../crates/config/src/settings.rs#L83),
+[`policy.rs:247`](../crates/modules/hive/src/policy.rs#L247)) or `hive` does not serve the
+organization. Nothing reads the policy yet: placement (P2c-2b) is its first reader.
+
+```mermaid
+sequenceDiagram
+    participant A as an administrator
+    participant S as the server
+    participant D as hive_policies
+    A->>S: GET …/hive/policy
+    S->>D: the organization's policy
+    D-->>S: none
+    S-->>A: decision 2's defaults, revision 0
+    A->>S: PUT …/hive/policy, revision 0
+    S->>S: an ADMINISTRATOR, within bounds,<br/>each archive device live here and not ephemeral
+    S->>D: insert, at revision 1
+    D-->>S: stored
+    S-->>A: revision 1
+    Note over A,D: a second tab still holds revision 0
+    A->>S: PUT …/hive/policy, revision 0
+    S->>D: insert, at revision 1
+    D-->>S: duplicate key on tenant_id
+    S-->>A: 409, audited stale
+```
+
+| Field | What a write may set | Why |
+|---|---|---|
+| `replicaset.min` | 1 to 8; the primary counts | fewer copies than `min` is shown in the session's room, never accepted in silence |
+| `replicaset.max` | `min` to 8 | |
+| `replicaset.archive` | whether every archive replica the rules allow joins | |
+| `replicaset.prefer` | `owner_devices`, once; any other word is refused | the one order decision 2 names. Refused rather than stored, so a word the server cannot place by fails at the write, not silently at every placement |
+| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:926`](../crates/modules/fleet/src/agent.rs#L926)) | normalized as device tags are, so a tag compares equal to the one a device carries |
+| `retention_days` | 0 to 3650; 0 keeps sessions for ever | P2g applies it |
+| `archive_devices` | at most 16, each a live device of this organization and not ephemeral, each kept once ([`policy.rs:315`](../crates/modules/hive/src/policy.rs#L315)) | the administrator's half of an archive replica. The device's own `hive_archive` is the other half, read where placement runs, so either may come first |
+
+⚠️ **A write names the revision it read** ([`policy.rs:169`](../crates/modules/hive/src/policy.rs#L169)).
+A `PUT` replaces the whole policy, so two administrators editing at once would otherwise
+each write over the other's change unseen. The first write is an insert, and the unique
+index decides between two of them; every later one is an update filtered by
+`{tenant_id, revision}` ([`policy.rs:193`](../crates/modules/hive/src/policy.rs#L193)).
+Either way the loser gets **409** and reads again.
+
+⚠️ **An ephemeral device is never an archive replica**
+([`policy.rs:328`](../crates/modules/hive/src/policy.rs#L328)). FR-51 fixes `ephemeral`
+at enrollment, and the reaper hard-deletes such a row once it goes quiet: it could keep
+nothing for the retention, and never acknowledge a purge.
+
+⚠️ **Only a device that is not there is a refusal.** A lookup that failed is the
+database's answer: a **500**, never a `not_a_device` row in the audit blaming the caller.
+
+Every attempt lands in `hive_audit` as `action: policy`
+([`policy.rs:362`](../crates/modules/hive/src/policy.rs#L362)): `set`, or `refused` with
+`no_permission`, `invalid`, `not_a_device`, `ephemeral` or `stale`.
+
+A policy only ever says where copies **may** go. Whether a device holds one is still its
+owner's `hive_replica` (P2c-1), which no policy and no server can turn on.
+
 The rest of P2 is next (spec §3b and §4): the rest of membership and placement (P2c:
-the policy and the rules, the join, `tip` and `manifest`, the `agent_updated` hook), the
+the rules, the join, `tip` and `manifest`, the `agent_updated` hook), the
 QUIC carrier and the stream (P2d), promotion and
 fencing (P2e), teleport and fork (P2f), purges and retention (P2g), the archive
 replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the
@@ -1213,14 +1279,14 @@ field run (P2k). Its server switch is `hive.replicaset` and its device switch
 | Piece | Where |
 |---|---|
 | the wire: frames, refusal words, limits | [`crates/remote_control/src/hive.rs`](../crates/remote_control/src/hive.rs); the `rc:hive.*` variants in [`signaling.rs`](../crates/remote_control/src/signaling.rs) (`ClientMsg` `:655`–`:865`, `ServerMsg` `:2821`–`:3000`); `RpcCap::Hive`, `HiveView`, `HiveMemory` and `HiveAdopt` in [`models.rs`](../crates/remote_control/src/models.rs) `:626`–`:655`, matched by equality, since `hive` is a prefix of the other three |
-| the server module | [`crates/modules/hive/src/`](../crates/modules/hive/src/): `lib.rs` (the module, routes, indexes), `routes.rs` (start, list, get, stop), `agent_socket.rs` (reports, reconcile, the manifest), `view.rs` (grants and their signalling), `participants.rs`, `access.rs`, `room.rs`, `dao.rs`, `hooks.rs` (removals), `scope.rs` (`hive.tenants`), `adopt.rs`, `brain.rs` |
+| the server module | [`crates/modules/hive/src/`](../crates/modules/hive/src/): `lib.rs` (the module, routes, indexes), `routes.rs` (start, list, get, stop), `agent_socket.rs` (reports, reconcile, the manifest), `view.rs` (grants and their signalling), `participants.rs`, `access.rs`, `room.rs`, `dao.rs`, `hooks.rs` (removals), `scope.rs` (`hive.tenants`), `adopt.rs`, `brain.rs`, `policy.rs` (the replica policy) |
 | the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs`, `launch.rs`, `roots.rs`, `checkpoint.rs` |
 | the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the session task, the resume), `supervisor/adopt.rs`, `toolbelt.rs`, `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
 | what builds it | the `hive` feature, and `cfg(hive_host)` on Linux, macOS and Windows ([`build.rs:52`](../agents/roomlerd/build.rs#L52)); the capabilities in [`caps.rs:1619`](../agents/roomlerd/src/encode/caps.rs#L1619) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
 | the SPA | [`stores/hive.ts`](../ui/src/stores/hive.ts), [`useHiveViewer.ts`](../ui/src/composables/useHiveViewer.ts), [`components/hive/`](../ui/src/components/hive/), [`views/hive/`](../ui/src/views/hive/) |
-| the integration tests | `crates/tests/tests/hive_*.rs` |
+| the integration tests | `crates/tests/src/hive_tests.rs`, and the canary, drivers and memory in `crates/tests/tests/hive_*.rs` |
 
 ## Not built
 
