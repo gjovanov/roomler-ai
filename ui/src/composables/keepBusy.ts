@@ -165,6 +165,21 @@ export function patternLabel(p: KeepBusyPattern): string {
   return KEEP_BUSY_PATTERNS.find((x) => x.id === p)?.label ?? p
 }
 
+/** FR-92 P5b — the device list's tooltip for a device's keep-busy brief (the
+ *  heartbeat's claim). Empty unless it is on: off and unknown show nothing. */
+export function keepBusyBriefTitle(
+  b: { on: boolean; phase: string; reason?: string; pattern?: string; set_by?: string } | undefined,
+): string {
+  if (!b?.on) return ''
+  // A string, not a `KeepBusyPattern`: a newer agent may draw a pattern this
+  // dashboard has never heard of, and it is printed as the agent named it.
+  const label = b.pattern ? (KEEP_BUSY_PATTERNS.find((x) => x.id === b.pattern)?.label ?? b.pattern) : null
+  const what = label ? label.toLowerCase() : 'a pattern'
+  const who = b.set_by ? `, turned on by ${b.set_by}` : ''
+  const why = b.reason ? ` (${b.reason.replace(/_/g, ' ')})` : ''
+  return `Keep busy is on: ${what}${who}. Now ${b.phase}${why}, as the device reports it.`
+}
+
 /** What the viewer says about a refusal of its own request. */
 export function keepBusyRefusalText(code: string): string {
   switch (code) {

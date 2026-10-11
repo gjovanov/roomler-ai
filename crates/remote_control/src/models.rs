@@ -1079,6 +1079,28 @@ impl ExecPolicy {
     }
 }
 
+/// FR-92 P5b — what a device says about its keep busy, on every heartbeat.
+///
+/// A CLAIM by the device, like `ssh_activity`: shown to the org (which
+/// devices are being kept awake, and by whom), never enforced on — the
+/// device's own engine and gates are the enforcement. Strings, not enums,
+/// for the usual additive-wire reason: a newer agent's phase or reason must
+/// reach an older dashboard as a word it can print, not a parse failure.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct KeepBusyBrief {
+    pub on: bool,
+    /// `off` · `calibrating` · `running` · `paused` · `locked` · `unavailable`.
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// While on: the pattern drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// While on: the controller who turned it on, by display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Agent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -1152,6 +1174,12 @@ pub struct Agent {
     /// left behind. That was the operator's report, not a hypothetical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion_version: Option<String>,
+    /// FR-92 P5b — keep busy as the device last reported it on a heartbeat.
+    /// `None` = it does not say: a device without keep busy, one that
+    /// predates the field, or a supervised Mac's root daemon, which cannot
+    /// speak for the GUI worker that runs it. So "unknown", never "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_busy: Option<KeepBusyBrief>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.

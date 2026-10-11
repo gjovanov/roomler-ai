@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   KEEP_BUSY_PATTERNS,
+  keepBusyBriefTitle,
   keepBusyRefusalText,
   keepBusyResumesInS,
   keepBusySetMessage,
@@ -130,6 +131,21 @@ describe('keepBusyStatusLine', () => {
     expect(
       keepBusyStatusLine(parsed({ on: false, phase: 'off', reason: 'stopped_by_controller', sentence: 'x' })),
     ).toBe('Off.')
+  })
+})
+
+describe('keepBusyBriefTitle (FR-92 P5b)', () => {
+  it('says what runs, who turned it on and the phase — only while on', () => {
+    expect(
+      keepBusyBriefTitle({ on: true, phase: 'paused', reason: 'user_active', pattern: 'heart', set_by: 'Alice' }),
+    ).toBe('Keep busy is on: heart, turned on by Alice. Now paused (user active), as the device reports it.')
+    expect(keepBusyBriefTitle({ on: true, phase: 'running' })).toBe(
+      'Keep busy is on: a pattern. Now running, as the device reports it.',
+    )
+  })
+  it('says nothing for off or unknown', () => {
+    expect(keepBusyBriefTitle({ on: false, phase: 'off', reason: 'stopped_locally' })).toBe('')
+    expect(keepBusyBriefTitle(undefined)).toBe('')
   })
 })
 

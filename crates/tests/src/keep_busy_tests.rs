@@ -268,3 +268,82 @@ async fn the_word_reappearing_on_a_heartbeat_brings_the_policy_once() {
         "only on the reappearance"
     );
 }
+
+/// The device's agent row from the tenant's listing, polled (≤ ~5 s) until
+/// `ready` holds: the heartbeat and the GET travel different sockets. Slow
+/// enough that TestApp's rate limiter never sees a burst.
+async fn listed_until(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    agent_id: &str,
+    ready: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..16 {
+        let list: Value = app
+            .auth_get(&format!("/api/tenant/{tid}/agent"), token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(row) = list["items"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["id"] == agent_id))
+        {
+            last = row.clone();
+            if ready(&last) {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    last
+}
+
+/// P5b — a device's keep busy rides its heartbeat to the device list: shown
+/// as the device reports it, and GONE once it stops reporting (an older
+/// agent after a rollback, a supervised Mac's daemon) — unknown, never a
+/// stale "on" and never an invented "off".
+#[tokio::test]
+async fn the_device_list_shows_keep_busy_as_the_device_reports_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("kbbrief").await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (agent_id, token) = enroll_agent(&app, &seeded, "kb-brief", "KB brief").await;
+    let mut ws = connect(&app, &token, "KB brief", &["arbiter", "keep-busy"]).await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    let beat = |brief: Option<Value>| {
+        let mut hb = json!({
+            "t": "rc:agent.heartbeat", "rss_mb": 0, "cpu_pct": 0.0, "active_sessions": 0,
+        });
+        if let Some(b) = brief {
+            hb["keep_busy"] = b;
+        }
+        Message::Text(hb.to_string().into())
+    };
+
+    ws.send(beat(Some(json!({
+        "on": true, "phase": "running", "pattern": "heart", "set_by": "Alice",
+    }))))
+    .await
+    .unwrap();
+    let row = listed_until(&app, &tid, &admin, &agent_id, |r| {
+        r["keep_busy"]["on"] == true
+    })
+    .await;
+    assert_eq!(row["keep_busy"]["phase"], "running", "{row}");
+    assert_eq!(row["keep_busy"]["pattern"], "heart");
+    assert_eq!(row["keep_busy"]["set_by"], "Alice");
+
+    // A heartbeat that says nothing: the field goes.
+    ws.send(beat(None)).await.unwrap();
+    let row = listed_until(&app, &tid, &admin, &agent_id, |r| {
+        r.get("keep_busy").is_none()
+    })
+    .await;
+    assert!(row.get("keep_busy").is_none(), "{row}");
+}
