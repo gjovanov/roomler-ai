@@ -809,6 +809,8 @@ function main(): void {
     attribution: ATTRIBUTION_ENABLED
       ? emitter.publishBytes('attribution.js', carryScript(readFileSync(join(THEME_DIR, 'attribution.js'), 'utf8'), installPages))
       : undefined,
+    // The top bar's logo, from the SPA's own copy, so the two never drift.
+    logo: emitter.publishFile(join(UI_ROOT, 'src', 'assets', 'brand', 'roomler-logo.svg')),
   }
 
   const site: ShellNav = { current: 'docs', hasBlog }

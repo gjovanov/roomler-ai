@@ -165,7 +165,7 @@ ${head}
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-${renderTopbar(ctx.nav)}
+${renderTopbar(ctx.nav, ctx.assets.logo)}
 
 <div class="layout layout--blog">
   <main id="main" class="content content--blog">

@@ -312,7 +312,7 @@ ${head}
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-${renderTopbar(site)}
+${renderTopbar(site, assets.logo)}
 
 <div class="layout">
   <aside class="sidebar" data-nav>
