@@ -184,9 +184,12 @@ test.describe('vmtest viewer input (named agent)', () => {
         // agent's arbiter is left to release the button.
         page.on('crash', () => sent('crashed'))
         const cdp = await context.newCDPSession(page)
-        await cdp.send('Page.crash').catch(() => {
-          /* the crash tears down the session that sent it: expected */
-        })
+        // NOT awaited: the crash kills the target that would answer, so the
+        // call never settles. Measured: awaited, every attempt sat out the
+        // 4-minute test timeout after a crash that took 240 ms. Wait for the
+        // page's own crash event instead.
+        void cdp.send('Page.crash').catch(() => {})
+        await page.waitForEvent('crash', { timeout: 15_000 }).catch(() => {})
       } else {
         await page.close()
       }
