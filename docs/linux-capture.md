@@ -21,7 +21,7 @@ fixed order and every non-default arm is **opt-in**.
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:665`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:682`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -46,10 +46,10 @@ flowchart TD
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:771`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off** | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:807`) |
-| **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off** | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:64`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (XWayland's root has no readable framebuffer) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:843`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:810`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off** | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:846`) |
+| **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off** | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:66`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (XWayland's root has no readable framebuffer) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:877`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -66,7 +66,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:787`, `mod.rs:824`), because
+  asked for them and they fell through (`mod.rs:826`, `mod.rs:863`), because
   silently serving X11 instead would look like the feature simply not working.
 
 ## 2. The X11 arm, and the virtual desktop
@@ -130,9 +130,21 @@ bus asking it anything gets `no-session-bus`, which is the architecture rather
 than a misconfiguration. So the daemon spawns **itself** — the hidden
 `roomlerd portal-helper` subcommand — as the console user, with that session's
 `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY` and `WAYLAND_DISPLAY`
-(`capture/portal/mod.rs:755`), through a verified privilege drop rather than
+(`capture/portal/mod.rs:764`), through a verified privilege drop rather than
 `CommandExt::uid()` (which leaves the child in root's supplementary groups — a
 silent retention bug, not a visible failure).
+
+⚠️ **Only a root daemon drops.** A per-user daemon (`roomler.service`, the
+`install.sh` default) already *is* the session's owner, and "dropping" to
+itself is not a no-op: `setgroups(2)` needs `CAP_SETGID` even to set the groups
+a process already holds, so the drop's pre-exec hook failed `EPERM`, the helper
+never started, and the cascade fell through to Xwayland's empty root — a black
+stream on every per-user install that set `portal_capture`. Every FR-45 field
+run was under root, which hid it until the vmtest per-user cell ran with the
+keys set (#1719 run B). The rule is now three-way (`run_as`,
+`capture/portal/mod.rs:863`): root drops, the session's owner runs as itself,
+anyone else is refused with both uids named — and a per-user daemon looks up
+its **own** session, not the first active one.
 
 🔑 **The subcommand buys the session context; only `dlopen` buys the linkage.**
 A helper *subcommand* is the same ELF as the daemon, so linking `libpipewire`
@@ -454,11 +466,11 @@ defect — the capture arms only expose it by being knobs.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:665`) and the cascade; the FR-80 failure classifier (`:580`) |
+| `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:682`) and the cascade; the FR-80 failure classifier (`:594`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:107`, `primary` `:243`) |
-| `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:158`, `detect_in_session` `:245`); `pub mod helper` (`:264`): the `portal-helper` subcommand, `spawn_streaming` (`:631`), `spawn_child` (`:755`) |
+| `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect` `:158`, `detect_in_session` `:245`); `pub mod helper` (`:264`): the `portal-helper` subcommand, `spawn_streaming` (`:640`), `spawn_child` (`:764`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session()` (`:457`) — the logind lookup both the consent companion and the helper share |
 | `agents/roomlerd/src/capture/portal/screencast.rs` | the portal handshake (`open` `:256`), `SessionKind`, the `TokenStore` (`:524`) |
 | `agents/roomlerd/src/capture/portal/mutter.rs` | the mutter broker (`open` `:152`, `RecordMonitor` `:202`, `PipeWireStreamAdded` `:224`) |

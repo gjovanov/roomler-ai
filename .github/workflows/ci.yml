@@ -542,7 +542,14 @@ jobs:
         #     driving a stand-in harness through start, prompt, turn, crash and
         #     stop. Linux-only by construction and held out of `full`, so this
         #     is the one lane that runs it. Bundled SQLite compiles from C.
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive --lib
+        #   - the desktop portal + mutter capture helper (`portal-capture`,
+        #     FR-45): the same trap a fourth time — `capture::portal`'s whole
+        #     suite is behind that feature and ran in NO lane, which is how the
+        #     helper's spawn could fail EPERM in every per-user daemon with no
+        #     test anywhere near it (#1719 run B). zbus is pure Rust and
+        #     libpipewire is dlopen'd, never linked, so the runner needs no new
+        #     package; the EPERM test needs only that the runner is not root.
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,portal-capture --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback

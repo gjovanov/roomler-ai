@@ -765,7 +765,17 @@ pub mod helper {
         extra_args: &[&str],
         piped_stdin: bool,
     ) -> Result<std::process::Child, SpawnError> {
-        let sess = match crate::companion::graphical_session() {
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        // A per-user daemon may open the portal only in its OWN session, so it
+        // looks for that one: on a machine where two people are logged in,
+        // "the first active session" could be the other person's.
+        let found = if euid == 0 {
+            crate::companion::graphical_session()
+        } else {
+            crate::companion::graphical_session_matching(Some(euid), false)
+        };
+        let sess = match found {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(%e, "portal: no graphical session to run the helper in");
@@ -805,16 +815,59 @@ pub mod helper {
             cmd.env("WAYLAND_DISPLAY", w);
         }
 
-        // The one privilege story. Not `CommandExt::uid()`: that leaves the
-        // child in root's supplementary groups, which is a silent retention
-        // bug rather than a visible failure.
-        if let Err(e) = crate::exec::drop_to_std(&mut cmd, &sess.name) {
-            return Err(SpawnError::Other(format!(
-                "cannot run the portal helper as the session's owner: {e}"
-            )));
+        match run_as(euid, sess.uid) {
+            // The one privilege story. Not `CommandExt::uid()`: that leaves
+            // the child in root's supplementary groups, which is a silent
+            // retention bug rather than a visible failure.
+            RunAs::Drop => {
+                if let Err(e) = crate::exec::drop_to_std(&mut cmd, &sess.name) {
+                    return Err(SpawnError::Other(format!(
+                        "cannot run the portal helper as the session's owner: {e}"
+                    )));
+                }
+            }
+            // HOME, USER and LOGNAME are already this account's.
+            RunAs::Ourselves => {}
+            RunAs::Refuse { euid, owner } => {
+                return Err(SpawnError::Other(format!(
+                    "this daemon runs as uid {euid}, not as the session's owner (uid {owner}) — \
+                     a per-user daemon can open the portal only in its own session"
+                )));
+            }
         }
         cmd.spawn()
             .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))
+    }
+
+    /// How the helper comes to run as the session's owner.
+    #[derive(Debug, PartialEq, Eq)]
+    enum RunAs {
+        /// A root daemon: the verified drop to the session's owner.
+        Drop,
+        /// The daemon already IS the session's owner — a per-user install.
+        Ourselves,
+        /// Neither root nor the owner: another user's session is not ours to
+        /// open, and nothing this process can do would make it so.
+        Refuse { euid: u32, owner: u32 },
+    }
+
+    /// ⚠️ "Dropping" to the account we already run as is NOT a no-op.
+    /// `setgroups(2)` needs `CAP_SETGID` even to set the groups a process
+    /// already holds, so in a per-user daemon (`roomler.service`, the desktop
+    /// default) `drop_to_std`'s pre-exec hook failed `EPERM`, the helper never
+    /// started, and the cascade fell through to XShm on Xwayland's empty root:
+    /// a live black stream on every per-user install that set
+    /// `portal_capture`. FR-45 was only ever field-verified under a ROOT
+    /// daemon, which is how it stayed hidden until the vmtest per-user cell
+    /// ran with the keys set (#1719 run B).
+    fn run_as(euid: u32, owner: u32) -> RunAs {
+        if euid == 0 {
+            RunAs::Drop
+        } else if euid == owner {
+            RunAs::Ourselves
+        } else {
+            RunAs::Refuse { euid, owner }
+        }
     }
 
     pub(crate) fn spawn_in_session(
@@ -964,6 +1017,56 @@ pub mod helper {
             assert_eq!(parse_marked(""), None);
             assert_eq!(parse_marked("portal is fine, honest\n"), None);
             assert_eq!(parse_marked(&format!("{MARKER}not json")), None);
+        }
+
+        /// #1719 run B: only a root daemon drops privilege; a per-user daemon
+        /// IS the session's owner and runs the helper as itself; anyone else
+        /// is refused with both uids named.
+        #[test]
+        fn only_root_drops_and_a_per_user_daemon_runs_as_itself() {
+            assert_eq!(run_as(0, 1000), RunAs::Drop);
+            assert_eq!(
+                run_as(0, 0),
+                RunAs::Drop,
+                "root at the seat keeps the verified path"
+            );
+            assert_eq!(run_as(1000, 1000), RunAs::Ourselves);
+            assert_eq!(
+                run_as(1001, 1000),
+                RunAs::Refuse {
+                    euid: 1001,
+                    owner: 1000
+                }
+            );
+        }
+
+        /// The root cause, demonstrated rather than asserted: an unprivileged
+        /// process cannot "drop" to its OWN account through `drop_to_std`,
+        /// because `setgroups(2)` needs `CAP_SETGID` whatever the groups are.
+        /// This is why `RunAs::Ourselves` must skip the drop entirely.
+        #[test]
+        fn an_unprivileged_drop_to_ourselves_is_refused_by_the_kernel() {
+            // SAFETY: plain credential reads.
+            let euid = unsafe { libc::geteuid() };
+            if euid == 0 {
+                // Root holds CAP_SETGID, so the failing case cannot arise here.
+                return;
+            }
+            // SAFETY: `getpwuid` returns a pointer into static storage or
+            // null; it is read once, immediately, on this thread.
+            let name = unsafe {
+                let pw = libc::getpwuid(euid);
+                assert!(!pw.is_null(), "no passwd entry for uid {euid}");
+                std::ffi::CStr::from_ptr((*pw).pw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mut cmd = std::process::Command::new("true");
+            crate::exec::drop_to_std(&mut cmd, &name).expect("resolving our own account");
+            let err = cmd
+                .spawn()
+                .expect_err("setgroups must refuse an unprivileged caller");
+            assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
         }
     }
 }
