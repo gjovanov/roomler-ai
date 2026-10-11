@@ -1273,10 +1273,11 @@ pub enum Request {
     KeepBusyOff,
     /// FR-92 P10 — the person at the console turns keep busy ON (the tray's
     /// "Start keep busy", `roomler keep-busy on`). Unlike status and off,
-    /// this is gated: the peer must be that person
-    /// ([`ClientPeer::may_start_keep_busy`]) — never root or a service, which
-    /// is how `roomler exec` arrives, so the server still cannot start
-    /// synthetic input (FR-92 §7). Returns [`Response::KeepBusy`].
+    /// this is gated on the peer ([`ClientPeer::may_start_keep_busy`]): root
+    /// never, session 0 never, another session never. The server itself has
+    /// no "on" (FR-92 §7). ⚠️ The gate decides who is NAMED; it is not a wall
+    /// against `roomler exec`, which runs in the console session on Windows
+    /// and passes it (FR-92 §3g). Returns [`Response::KeepBusy`].
     KeepBusyOn {
         #[serde(default)]
         opts: KeepBusyStartOpts,
@@ -1968,16 +1969,24 @@ impl ClientPeer {
 /// FR-92 P10 — the pure decision behind [`ClientPeer::may_start_keep_busy`].
 ///
 /// Stricter than [`peer_is_console_user`] in one way that matters: **root
-/// never**. That gate lets root through on Unix, and root is exactly how
-/// `roomler exec` arrives there — so with it, the server could start
-/// synthetic input on any exec-enabled device, which FR-92 §7 rules out.
-/// - **Windows**: the active console session, and never session 0 (services
-///   and `roomler exec` as SYSTEM).
+/// never**. That gate lets root through on Unix, and root is how
+/// `roomler exec` arrives there — so with it, a plain
+/// `roomler exec <host> -- roomler keep-busy on` would start synthetic input
+/// under the person's name.
+/// - **Windows**: the active console session, and never session 0 (services).
 /// - **A per-user daemon's own socket** (macOS GUI worker, Linux user
 ///   daemon): its owner, who is the person.
 /// - **The person socket of a Linux system install** ([`Scope::Person`]):
 ///   its ACL admits only the person it was made for.
 /// - Anything unknown: no.
+///
+/// ⚠️ **Not a wall against `roomler exec`.** On Windows exec runs in the
+/// worker that holds the agent socket, and that worker lives in the console
+/// session — as the signed-in user, or as SYSTEM while a controller is
+/// connected — so an exec passes the session test and is named "the person
+/// at this computer" (measured on 0.4.129, FR-92 §9 row 43). On Unix root can
+/// `sudo -u` the person. Nothing a local gate sees tells them apart: what an
+/// exec caller may do on a device is the owner's `exec_enabled`, not this.
 pub fn peer_may_start_keep_busy(
     peer: &ClientPeer,
     scope: Scope,
@@ -2389,7 +2398,7 @@ fn not_the_console_user() -> Response {
 fn not_the_person_for_keep_busy() -> Response {
     Response::Error {
         message: "only the person at this device's console can turn keep busy on here — \
-                  not root, not a service, not `roomler exec` (anyone may stop it)"
+                  not root, not a background service, not another session (anyone may stop it)"
             .into(),
     }
 }
@@ -2679,7 +2688,8 @@ where
                 Ok(Request::KeepBusyOff) => state.keep_busy_off().await,
                 // P10 — turning it ON is the console person's alone: root
                 // never (how `roomler exec` arrives on Unix), session 0 never.
-                // The server must not be able to start synthetic input.
+                // ⚠️ Not a wall against exec on Windows, where it runs in the
+                // console session (FR-92 §3g).
                 Ok(Request::KeepBusyOn { .. }) if !peer.may_start_keep_busy(scope) => {
                     not_the_person_for_keep_busy()
                 }

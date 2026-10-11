@@ -638,8 +638,8 @@ enum KeepBusyAction {
         #[command(flatten)]
         fmt: OutputFmt,
     },
-    /// Turn keep busy on, as the person at this computer (not as root or a
-    /// service: `sudo` and `roomler exec` are refused). It stays on until
+    /// Turn keep busy on, as the person at this computer (root and services
+    /// are refused, so `sudo roomler keep-busy on` is). It stays on until
     /// someone turns it off, and resumes at your next login.
     On {
         /// The pattern: circle, triangle, square, star, figure8, heart,
