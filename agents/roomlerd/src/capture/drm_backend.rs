@@ -97,6 +97,67 @@ impl Drop for Mapping {
     }
 }
 
+/// Something that can close a GEM handle — the [`Card`], or a test's recorder.
+trait CloseHandle {
+    fn close_handle(&self, handle: drm::buffer::Handle);
+}
+
+impl CloseHandle for Card {
+    fn close_handle(&self, handle: drm::buffer::Handle) {
+        // A failed close leaves one handle open until the fd closes — the old
+        // behaviour for every frame — and nothing else can be done about it.
+        let _ = ControlDevice::close_buffer(self, handle);
+    }
+}
+
+/// The GEM handles one `drmModeGetFB2` handed back, closed on drop.
+///
+/// ⚠️ GETFB2 mints a NEW handle on every call: the kernel runs
+/// `drm_gem_handle_create` per buffer object, and closing it is the caller's
+/// job (libdrm's `drmCloseBufferHandle`; FFmpeg's kmsgrab does it). drm-rs
+/// hands them back as plain ids with no `Drop` — its own docs say to close
+/// them — and [`grab`] asks every frame, so before this guard every frame
+/// leaked one. Measured on the FR-93 Wayland lab (0.4.125, one DRM viewer
+/// session): `drm_gem_handle_create` 115, `drm_gem_handle_delete` 0. They
+/// lived until the device fd closed and pinned every scanout buffer the
+/// compositor had freed in the meantime.
+///
+/// Closing right after use is safe for the cached [`Mapping`]: the mmap holds
+/// the exported dma-buf, which holds the buffer — neither needs the handle.
+struct FbHandles<'a> {
+    closer: &'a dyn CloseHandle,
+    handles: Vec<drm::buffer::Handle>,
+}
+
+impl<'a> FbHandles<'a> {
+    fn new(closer: &'a dyn CloseHandle, buffers: [Option<drm::buffer::Handle>; 4]) -> Self {
+        Self {
+            closer,
+            handles: distinct_handles(buffers),
+        }
+    }
+}
+
+impl Drop for FbHandles<'_> {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            self.closer.close_handle(handle);
+        }
+    }
+}
+
+/// GETFB2 repeats a handle across planes that share one buffer object, and a
+/// second close of the same handle is an error — so each distinct one, once.
+fn distinct_handles(buffers: [Option<drm::buffer::Handle>; 4]) -> Vec<drm::buffer::Handle> {
+    let mut out = Vec::with_capacity(4);
+    for handle in buffers.into_iter().flatten() {
+        if !out.contains(&handle) {
+            out.push(handle);
+        }
+    }
+    out
+}
+
 /// Runtime gate. **Default OFF** — deliberately the inverse of the usual
 /// "kill switch" shape, because switching every Linux host to this backend
 /// would silently undo FR-29: the X11 path tracks damage and idles at ~2.8 %
@@ -314,6 +375,9 @@ fn worker(
             return;
         }
     };
+    // This look only reads the geometry; its handles close before the loop
+    // (and on every early return below, with the guard).
+    let open_handles = FbHandles::new(&card, info.buffers());
     if !modifier_is_linear(&info) {
         let _ = ready_tx.send(Err(anyhow!(
             "scanout modifier {:?} is not linear — detiling is FR-36 P2 and is not implemented; \
@@ -323,6 +387,7 @@ fn worker(
         return;
     }
     let (w, h) = info.size();
+    drop(open_handles);
     if ready_tx.send(Ok((w, h, path))).is_err() {
         return;
     }
@@ -363,6 +428,10 @@ fn grab(
     let info = card
         .get_planar_framebuffer(fb)
         .map_err(|e| anyhow!("drmModeGetFB2: {e}"))?;
+    // ⚠️ A NAMED binding: `let _ = …` would drop the guard — and close the
+    // handle — before the export below could use it. It closes at the end of
+    // this frame, on every return path including the bails.
+    let _handles = FbHandles::new(card, info.buffers());
 
     if !modifier_is_linear(&info) {
         bail!(
@@ -714,5 +783,59 @@ mod tests {
             "DRM_CAPTURE_DEFINITELY_UNSET_XYZ",
             false
         ));
+    }
+
+    /// Stands in for the device so the guard's closes are observable without
+    /// a DRM node.
+    struct Recorder(std::cell::RefCell<Vec<u32>>);
+
+    impl CloseHandle for Recorder {
+        fn close_handle(&self, handle: drm::buffer::Handle) {
+            self.0.borrow_mut().push(u32::from(handle));
+        }
+    }
+
+    fn handle(n: u32) -> drm::buffer::Handle {
+        drm::control::from_u32(n).expect("a non-zero handle")
+    }
+
+    /// FR-93 AC9: every handle a GETFB2 hands back is closed, each buffer
+    /// object exactly once (GETFB2 repeats a handle across planes that share
+    /// one, and a second close is an error), and none before the frame is done.
+    #[test]
+    fn every_getfb2_handle_is_closed_once_on_drop() {
+        let rec = Recorder(Default::default());
+        {
+            let _guard = FbHandles::new(
+                &rec,
+                [Some(handle(7)), Some(handle(7)), Some(handle(9)), None],
+            );
+            assert!(
+                rec.0.borrow().is_empty(),
+                "nothing may close while the frame still needs the handle"
+            );
+        }
+        assert_eq!(*rec.0.borrow(), vec![7, 9]);
+    }
+
+    /// The bails in `grab` — a modifier that turned non-linear, a pixel
+    /// format we cannot repack — return early, and they are exactly the frames
+    /// that leaked a handle every time. They close too.
+    #[test]
+    fn an_early_return_still_closes() {
+        fn bails(rec: &Recorder) -> Result<()> {
+            let _guard = FbHandles::new(rec, [Some(handle(3)), None, None, None]);
+            bail!("scanout modifier changed to a tiled one")
+        }
+        let rec = Recorder(Default::default());
+        assert!(bails(&rec).is_err());
+        assert_eq!(*rec.0.borrow(), vec![3]);
+    }
+
+    #[test]
+    fn a_framebuffer_with_no_handles_closes_nothing() {
+        let rec = Recorder(Default::default());
+        drop(FbHandles::new(&rec, [None; 4]));
+        assert!(rec.0.borrow().is_empty());
     }
 }
