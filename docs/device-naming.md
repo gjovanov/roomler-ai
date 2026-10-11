@@ -43,7 +43,7 @@ equal.
 `display_name` still never enters the netmap, so `PeerInfo.name` — the NAME
 `roomler peers` prints — is the MagicDNS label, and neither resolver a typed
 selector reaches knows a display name: the server's exec/SSH target resolver
-(`crates/modules/fleet/src/socket.rs:893` `resolve_exec_target`: hex id → exact
+(`crates/modules/fleet/src/socket.rs:899` `resolve_exec_target`: hex id → exact
 `agents.name` → case-insensitive `agents.name`) or the daemon's ping resolver
 (`agents/roomlerd/src/localapi_state.rs:485` `resolve_overlay`: literal address
 → mesh label, whole or first label). The CLI closes the gap **on the client**,

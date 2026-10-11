@@ -54,7 +54,10 @@ use async_trait::async_trait;
 use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
-    hive::{HiveManifestEntry, HiveRefusal, HiveRunState, HiveTurnStatus, hive_limits},
+    hive::{
+        HiveJoinRefusal, HiveManifestEntry, HiveRefusal, HiveReplicaManifestEntry, HiveRunState,
+        HiveTurnStatus, hive_limits,
+    },
     signaling::{ClientMsg, ServerMsg},
 };
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
@@ -102,6 +105,18 @@ enum Report {
     /// P1j — a terminal session the device offers for a record
     /// (`rc:hive.adopt`).
     Adopt(crate::adopt::Offer),
+    /// P2c-3 — a member's answer to its join (`rc:hive.replica.join_ack`).
+    JoinAck {
+        session_id: ObjectId,
+        fence: u64,
+        refused: Option<HiveJoinRefusal>,
+        detail: Option<String>,
+    },
+    /// P2c-3 — where a member's copy ends (`rc:hive.replica.tip`).
+    Tip(HiveReplicaManifestEntry),
+    /// P2c-3 — every session the device holds a copy of
+    /// (`rc:hive.replica.manifest`).
+    ReplicaManifest(Vec<HiveReplicaManifestEntry>),
     /// P0d-2 — a viewer-peer frame (`rc:hive.view.*`). In the same queue:
     /// the device's answer must reach the browser before its candidates.
     View(ClientMsg),
@@ -214,6 +229,31 @@ impl AgentMsgHandler for HiveAgentSocket {
                 account,
                 folder,
             }),
+            ClientMsg::HiveReplicaJoinAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            } => Report::JoinAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            },
+            ClientMsg::HiveReplicaTip {
+                session_id,
+                fence,
+                seq,
+                hash,
+                checkpoint,
+            } => Report::Tip(HiveReplicaManifestEntry {
+                session_id,
+                fence,
+                seq,
+                hash,
+                checkpoint,
+            }),
+            ClientMsg::HiveReplicaManifest { sessions } => Report::ReplicaManifest(sessions),
             view @ (ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -252,6 +292,9 @@ impl AgentSocketLifecycle for HiveAgentSocket {
         tokio::spawn(async move {
             if state.scope.serves(tenant_id) {
                 reconcile_on_connect(&state, tenant_id, device_id, &conn).await;
+                // P2c-3 — and the joins it has still to answer, if this
+                // connection holds copies.
+                crate::replica::reconcile_joins(&state, tenant_id, device_id, &conn).await;
             } else {
                 end_unserved(&state, tenant_id, device_id).await;
             }
@@ -314,6 +357,10 @@ async fn apply_reports(
                                 Some(_) => room::refused_note(&s),
                             };
                             room::note(state, &s, text).await;
+                        }
+                        // P2c-3 — it runs: its members may hold copies now.
+                        if refused.is_none() {
+                            crate::replica::send_joins(state, session_id).await;
                         }
                     }
                     Ok(false) => {
@@ -447,6 +494,19 @@ async fn apply_reports(
             }
             Report::Manifest(sessions) => {
                 end_what_the_device_does_not_run(state, tenant_id, device_id, &sessions).await;
+            }
+            Report::JoinAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            } => {
+                crate::replica::on_join_ack(state, device_id, session_id, fence, refused, detail)
+                    .await
+            }
+            Report::Tip(tip) => crate::replica::on_tip(state, device_id, tip).await,
+            Report::ReplicaManifest(sessions) => {
+                crate::replica::on_manifest(state, device_id, sessions).await
             }
             Report::Adopt(offer) => crate::adopt::offer(state, tenant_id, device_id, offer).await,
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
@@ -699,6 +759,7 @@ pub(crate) async fn reconcile_on_connect(
                     user_email: owner.email,
                     caller: owner.display_name,
                     resume: false,
+                    replicated: crate::replica::replicated(&s),
                 };
                 match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
                     Ok(()) => {

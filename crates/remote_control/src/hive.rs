@@ -486,6 +486,175 @@ where
     .ok())
 }
 
+/// FR-90 P2c-3 — bounds on the replica frames (`rc:hive.replica.*`), read by
+/// both ends.
+pub mod replica_limits {
+    /// Sessions one `rc:hive.replica.manifest` may carry. An archive replica
+    /// holds every session the rules give it for the retention, so this is
+    /// far above [`super::hive_limits::MAX_MANIFEST`]; a device that holds
+    /// more sends its newest first.
+    pub const MAX_REPLICA_MANIFEST: usize = 4096;
+    /// A member reports a session's tip at most this often, and again at
+    /// each checkpoint.
+    pub const TIP_INTERVAL_SECS: u64 = 5;
+    /// A hash on the replica frames: BLAKE3, as lowercase hex.
+    pub const HASH_HEX_LEN: usize = 64;
+}
+
+/// Whether `s` is a hash as the replica frames carry it: exactly
+/// [`replica_limits::HASH_HEX_LEN`] lowercase hex characters. Anything else
+/// from a device is dropped, never stored.
+pub fn is_hash_hex(s: &str) -> bool {
+    s.len() == replica_limits::HASH_HEX_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// FR-90 P2c-3 — why a device is asked to hold a copy of a session, in
+/// `rc:hive.replica.join`: the role placement chose for it. The device checks
+/// its own gate for each: `hive_replica` for both, `hive_archive` as well for
+/// an archive.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveReplicaRole {
+    /// An archive replica an `ADMINISTRATOR` designated.
+    Archive,
+    /// One of the session owner's own devices.
+    Owner,
+}
+
+impl HiveReplicaRole {
+    /// The spelling on the wire. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Owner => "owner",
+        }
+    }
+
+    /// Every role this build knows.
+    pub const ALL: [HiveReplicaRole; 2] = [Self::Archive, Self::Owner];
+}
+
+/// Lenient decoder for `rc:hive.replica.join`'s `role`: a role this build
+/// cannot name is `None`, so the device still reads the frame and refuses it
+/// (`other`) instead of dropping it unanswered.
+pub(crate) fn replica_role_lenient<'de, D>(de: D) -> Result<Option<HiveReplicaRole>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(None);
+    };
+    Ok(HiveReplicaRole::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .ok())
+}
+
+/// FR-90 P2c-3 — why a device refused `rc:hive.replica.join`, carried in
+/// `rc:hive.replica.join_ack`. Absent = the device holds the session now: its
+/// floor for it is at the join's fence, and it takes the copy when the
+/// carrier brings it (P2d). Each word names a different gate with a
+/// different fix, so none is folded into another.
+///
+/// ⚠️ Decoded LENIENTLY ([`join_refusal_lenient`]): an unknown word is
+/// [`Self::Other`], still a refusal. It must never land on "joined": that
+/// would count a copy on a device that has just said no.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveJoinRefusal {
+    /// The device's own `hive_replica` is off.
+    ReplicaDisabled,
+    /// Asked as an archive replica, and the device's own `hive_archive` is
+    /// off.
+    ArchiveDisabled,
+    /// The join came on a secondary org's connection: a device holds copies
+    /// only for its primary org.
+    SecondaryOrg,
+    /// The device purged this session. Removal is final.
+    Purged,
+    /// The join's fence is older than the floor the device holds for it.
+    StaleFence,
+    /// The device's store is at its `hive_store_quota_mib`.
+    Quota,
+    /// A word this build does not know, or a role it cannot name.
+    Other,
+}
+
+impl HiveJoinRefusal {
+    /// The spelling on the wire and in the session record. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicaDisabled => "replica_disabled",
+            Self::ArchiveDisabled => "archive_disabled",
+            Self::SecondaryOrg => "secondary_org",
+            Self::Purged => "purged",
+            Self::StaleFence => "stale_fence",
+            Self::Quota => "quota",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveJoinRefusal; 7] = [
+        Self::ReplicaDisabled,
+        Self::ArchiveDisabled,
+        Self::SecondaryOrg,
+        Self::Purged,
+        Self::StaleFence,
+        Self::Quota,
+        Self::Other,
+    ];
+}
+
+/// Lenient decoder for `rc:hive.replica.join_ack`'s `refused`, as
+/// [`refusal_lenient`]: only absent or `null` means joined.
+pub(crate) fn join_refusal_lenient<'de, D>(de: D) -> Result<Option<HiveJoinRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveJoinRefusal::Other));
+    };
+    Ok(Some(
+        HiveJoinRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveJoinRefusal::Other),
+    ))
+}
+
+/// FR-90 P2c-3 — a checkpoint a member holds: the `seq` of its `checkpoint`
+/// event, and that event's hash.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveCheckpointMark {
+    pub seq: u64,
+    pub hash: String,
+}
+
+/// FR-90 P2c-3 — one session a device holds a copy of, in
+/// `rc:hive.replica.manifest`: where its copy ends. Numbers and hashes only.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveReplicaManifestEntry {
+    #[serde(with = "crate::serde_helpers::oid_hex")]
+    pub session_id: bson::oid::ObjectId,
+    /// The fence of the event at `seq`.
+    pub fence: u64,
+    pub seq: u64,
+    /// That event's hash.
+    pub hash: String,
+    /// The newest checkpoint the copy holds, when it holds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<HiveCheckpointMark>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +868,81 @@ mod tests {
         assert_eq!(s(r#"{"state":"compacting"}"#), None);
         assert_eq!(s(r#"{"state":3}"#), None);
         assert_eq!(s("{}"), None);
+    }
+
+    /// FR-90 P2c-3 — WIRE LOCK for the join refusals, and the fallback's
+    /// direction: an unknown word still refuses, so a copy is never counted
+    /// on a device that said no in a word this build cannot read.
+    #[test]
+    fn join_refusals_are_locked_and_an_unknown_one_still_refuses() {
+        let words: Vec<&str> = HiveJoinRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "replica_disabled",
+                "archive_disabled",
+                "secondary_org",
+                "purged",
+                "stale_fence",
+                "quota",
+                "other"
+            ]
+        );
+        for r in HiveJoinRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct J {
+            #[serde(default, deserialize_with = "join_refusal_lenient")]
+            refused: Option<HiveJoinRefusal>,
+        }
+        let j = |s: &str| serde_json::from_str::<J>(s).unwrap().refused;
+        assert_eq!(j("{}"), None);
+        assert_eq!(j(r#"{"refused":null}"#), None);
+        assert_eq!(j(r#"{"refused":"purged"}"#), Some(HiveJoinRefusal::Purged));
+        assert_eq!(
+            j(r#"{"refused":"disk_on_fire"}"#),
+            Some(HiveJoinRefusal::Other)
+        );
+        assert_eq!(j(r#"{"refused":1}"#), Some(HiveJoinRefusal::Other));
+    }
+
+    /// FR-90 P2c-3 — the roles are locked, and a role this build cannot name
+    /// is `None`: the frame still decodes, and the device refuses it.
+    #[test]
+    fn replica_roles_are_locked_and_an_unknown_one_is_unnamed() {
+        let words: Vec<&str> = HiveReplicaRole::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(words, ["archive", "owner"]);
+        for r in HiveReplicaRole::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::json!(r.as_str())
+            );
+        }
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default, deserialize_with = "replica_role_lenient")]
+            role: Option<HiveReplicaRole>,
+        }
+        let r = |s: &str| serde_json::from_str::<R>(s).unwrap().role;
+        assert_eq!(r(r#"{"role":"archive"}"#), Some(HiveReplicaRole::Archive));
+        assert_eq!(r(r#"{"role":"witness"}"#), None);
+        assert_eq!(r(r#"{"role":2}"#), None);
+        assert_eq!(r("{}"), None);
+    }
+
+    /// A hash is 64 lowercase hex characters, and nothing else is one.
+    #[test]
+    fn a_hash_is_64_lowercase_hex_characters() {
+        let good = "0123456789abcdef".repeat(4);
+        assert!(is_hash_hex(&good));
+        assert!(!is_hash_hex(&good.to_uppercase()), "lowercase only");
+        assert!(!is_hash_hex(&good[..63]));
+        assert!(!is_hash_hex(&format!("{good}0")));
+        assert!(!is_hash_hex(&"g".repeat(64)));
+        assert!(!is_hash_hex(""));
     }
 }
