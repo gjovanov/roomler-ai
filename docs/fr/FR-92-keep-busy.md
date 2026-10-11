@@ -266,7 +266,9 @@ stateDiagram-v2
   - a live chip like Host-locked.
 - **Gating:** on the cap word and the session's `INPUT` bit; an unavailable or denied state is shown
   with its reason.
-- **Org admin:** a switch in `SettingsSection.vue` beside exec/SSH.
+- **Org admin:** a switch in `SettingsSection.vue` beside exec/SSH; since P8 a default-pattern
+  select beside it, and since P7 the History list (when · device · what · who, a device-reported
+  vs admin marker, a device filter, "load more").
 - **Device list (P5b):** a "keep busy · <phase>" chip, shown while it is on, naming the pattern and who
   turned it on. It is driven by an additive `AgentHeartbeat.keep_busy` (a device *claim*, shown and never
   enforced on), persisted by `touch_heartbeat`, and **unset** when a device stops saying (an older
@@ -280,11 +282,13 @@ stateDiagram-v2
 | P0 | Claim: issue #1942, this spec, the ledger row | Docs only | #1943, merged `058d6304a` |
 | P1 | Pure engine + patterns + fake-host tests; `cursor_px`/`move_px` + the arbiter `KbReq` seam; the Windows host; the control-DC verbs; the state file; `keep_busy_enabled`; the cap word | `keep_busy_enabled = false`; no cap word ⇒ the viewer hides it | #1948, merged `a9fc3f0de` |
 | P2 | Viewer: composable, menu, previews, chip | the cap word | #1949, merged `28fd63c19` |
-| P3 | **P3a, X11**: the X11 host (MIT-SCREEN-SAVER idle clock read as an interval, logind `LockedHint`, RandR ∩ `_NET_WORKAREA`), Xwayland refused from the display itself (`wayland`), the person followed under a root daemon or a SYSTEM worker, proven on Xvfb in CI. **P3b, macOS**: the CoreGraphics host, and the daemon handing every org's policy to the GUI worker | per-host cap word | P3a PR open; P3b next |
+| P3 | **P3a, X11**: the X11 host (MIT-SCREEN-SAVER idle clock read as an interval, logind `LockedHint`, RandR ∩ `_NET_WORKAREA`), Xwayland refused from the display itself (`wayland`), the person followed under a root daemon or a SYSTEM worker, proven on Xvfb in CI. **P3b, macOS**: the CoreGraphics host, and the daemon handing every org's policy to the GUI worker | per-host cap word | P3a #1959, merged `f47dfb5a1`; P3b #1960, merged `3a9fb7b12` |
 | P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | #1951, merged `51dfd2466` |
 | P5 | Org deny: tenant key, routes, admin UI; a standing `rc:agent.keep_busy_policy` on every connect and on every change, across pods. No per-session `Request` field (§3f). Forwarding to a supervised Mac's worker moves to P3. Deferred to P5b: the heartbeat brief, the device-list badge, the audit | the org switch (default allowed) | #1952, merged `19b1f9fc8`; P5b #1965, merged `fcccec0f5`: the brief + the device-list chip |
-| P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | docs PR open; the field log waits for a release candidate |
-| P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | P9 PR |
+| P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | #1963, merged `19a9df753`; the field log is §9 |
+| P7 | **A permanent history** (operator, 2026-10-11): `keep_busy_events`, owned by `fleet`, **no TTL**. Server rows (`org_denied` · `org_allowed` · `org_default_pattern`, only on a change, naming the admin) and device rows (`on` · `off`, derived on the heartbeat path from the previous stored brief against the new one — ONE `find_one_and_update` returning the row as it was — with a restart dedupe); `source` tells the server's decision from the device's claim. `GET …/keep-busy-history` (`MANAGE_AGENTS`, tenant + device scoped, `before`/`limit` paging); a History list with a device filter in the org's card. Resolution is the 30 s heartbeat; exact device-pushed edges would need an agent release | none (a record, not a gate; the route alone) | PR open |
+| P8 | **The default pattern**: circle stays the product default; `TenantSettings.keep_busy_default_pattern` lets an org choose another, validated by **equality** against the agent's 13 wire names, `null` clears, absent leaves alone; the settings `GET` becomes readable by any member so the viewer can pre-select it (`PUT` stays `MANAGE_TENANT`). No agent and no wire change: the menu pre-selects the org default only where the person has no remembered choice; a fetch failure means circle | unset the default (= circle) | PR open |
+| P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | #1978, merged `b2b715a50` |
 
 ## 5. Acceptance criteria
 
@@ -313,21 +317,32 @@ stateDiagram-v2
 - [ ] **AC10:** docs updated or created with mermaid diagrams (`docs/keep-busy.md`: the state machine,
   the sequence, the gates) and linked from `docs/README.md`; the configuration reference covers
   `keep_busy_enabled`.
+- [ ] **AC11 (P7):** the history records every on and off a device reports (with who and the pattern,
+  and the reason for an off) and every change to the org's settings (naming the admin, only on a
+  change), survives the device's removal, is readable only with `MANAGE_AGENTS` and only within the
+  tenant, pages by `before`, and is never aged out — field-verified on a release: a device turned on
+  and off from the viewer shows two rows with the right names within one heartbeat.
+- [ ] **AC12 (P8):** an org's default pattern is what a viewer's menu pre-selects on a device the
+  person has no remembered choice on; a person's own last choice wins over it; `null` clears it to
+  circle; an unknown pattern is refused; a plain member can read the setting and cannot set it.
 
 ## 6. Open decisions
 
-- **The default pattern.** Circle, which is what was asked for. Or `subtle`, which sends no visible
-  motion to connected viewers' cursor channel.
 - **Whether the arbiter should stop caching a `NoopInjector`.** That would harden RC input as well, but
   it changes RC behaviour and needs its own test and field check.
-- ~~**When Wayland ships.**~~ **Resolved 2026-10-11 (operator: "do … wayland support"): P9**, GNOME's
-  Mutter IdleMonitor plus the arbiter's uinput device, blind (it cannot read the pointer back). KDE and
-  wlroots have no idle clock a session helper can read, and report `no_idle_clock`. Coordinated with
-  FR-93 (#1972), which owns making uinput the default on Wayland and the one desktop-session resolver.
-- **A durable audit of keep-busy transitions.** P5b shows the CURRENT state on the device list. A
-  history (who turned it on where, and when) needs its own collection: an index-plan change, a
-  composition re-baseline, and a retention to choose. Until then the agent's log records every
-  on/off with who and why (`keep-busy: turned on`, `org policy received`).
+
+**Resolved 2026-10-11 (operator: "do permanent history, default pattern and wayland support"):**
+- *The default pattern* — circle stays the product default; an org may choose another (P8,
+  `keep_busy_default_pattern`). `subtle` was not made the default: the visible motion was what
+  was asked for.
+- *A durable audit of keep-busy transitions* — P7: its own collection, `keep_busy_events`, with
+  **no retention** (permanent), the index-plan change and the composition re-baseline it needed,
+  derived from the heartbeat briefs on the server (so no agent release) at the heartbeat's
+  resolution. The agent's log keeps recording every on/off locally as before.
+- *When Wayland ships* — P9: GNOME's Mutter IdleMonitor plus the arbiter's uinput device, blind (it
+  cannot read the pointer back). KDE and wlroots have no idle clock a session helper can read, and
+  report `no_idle_clock`. Coordinated with FR-93 (#1972), which owns making uinput the default on
+  Wayland and the one desktop-session resolver.
 
 ## 7. Out of scope
 
@@ -399,7 +414,7 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed: macOS (cells 6 of `docs/keep-busy.md` §12), the tray's Stop (AC7), a user-context
+Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), a user-context
 Windows worker, a self-update (AC4, the next release), and 24 h of EDR on the corporate laptop (AC8).
 
 ## 10. Related

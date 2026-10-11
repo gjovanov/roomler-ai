@@ -46,7 +46,7 @@ use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
-    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao,
+    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, keep_busy_event::KeepBusyEventDao,
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
 use tokio::sync::mpsc;
@@ -92,6 +92,10 @@ pub struct FleetState {
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
+    /// FR-92 P7 — the permanent keep-busy history: the server's own policy
+    /// changes and the devices' reported ons and offs, told apart by
+    /// `source`. No TTL (operator, 2026-10-11).
+    pub keep_busy_events: Arc<KeepBusyEventDao>,
     pub rc_hub: Arc<Hub>,
     /// Phase A-1 — the Redis presence owner-token per locally-registered
     /// agent WS. Written/removed by the agent socket; read by the shutdown
@@ -194,6 +198,7 @@ impl Module for FleetState {
             consent_requests,
             exec_audit: Arc::new(ExecAuditDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
+            keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
             presence_fanout: Arc::new(presence::PresenceFanout::default()),
@@ -318,11 +323,14 @@ impl Module for FleetState {
             "/",
             get(agent_exec::get_org_settings).put(agent_exec::set_org_settings),
         );
-        // FR-92 — the org's keep-busy deny (MANAGE_TENANT to set).
+        // FR-92 — the org's keep-busy deny + default pattern (any member
+        // reads, MANAGE_TENANT sets), and the permanent history (P7,
+        // MANAGE_AGENTS).
         let keep_busy_settings = Router::new().route(
             "/",
             get(keep_busy::get_org_settings).put(keep_busy::set_org_settings),
         );
+        let keep_busy_history = Router::new().route("/", get(keep_busy::history));
         // FR-51 P2 — the ephemeral-key class switch (MANAGE_TENANT).
         let ephemeral_key_settings = Router::new().route(
             "/",
@@ -385,6 +393,7 @@ impl Module for FleetState {
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
             .nest("/tenant/{tenant_id}/keep-busy-settings", keep_busy_settings)
+            .nest("/tenant/{tenant_id}/keep-busy-history", keep_busy_history)
             .nest(
                 "/tenant/{tenant_id}/ephemeral-key-settings",
                 ephemeral_key_settings,
@@ -398,8 +407,9 @@ impl Module for FleetState {
             .with_state(self.clone())
     }
 
-    /// The eight collections this module owns. The specs are the ones the db
-    /// crate's plan held before P5a, unchanged.
+    /// The nine collections this module owns. The first eight specs are the
+    /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
+    /// (FR-92 P7) was born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -480,6 +490,18 @@ impl Module for FleetState {
                     index(bson::doc! { "tenant_id": 1, "session_id": 1 }),
                     index_text(bson::doc! { "lines.msg": "text" }),
                     index_ttl(bson::doc! { "created_at": 1 }, 7 * 24 * 60 * 60),
+                ],
+            },
+            // FR-92 P7 — the keep-busy history. ⚠️ Deliberately NO TTL,
+            // unlike every audit collection above: the operator asked for a
+            // PERMANENT history (2026-10-11). Rows outlive the device (the
+            // name is denormalised), so there is no cascade to run either.
+            IndexSet {
+                collection: "keep_busy_events",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
                 ],
             },
         ]

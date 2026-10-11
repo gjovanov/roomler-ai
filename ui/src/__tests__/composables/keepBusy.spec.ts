@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   KEEP_BUSY_PATTERNS,
+  isKeepBusyPattern,
   keepBusyBriefTitle,
   keepBusyRefusalText,
   keepBusyResumesInS,
@@ -155,6 +156,16 @@ describe('keepBusyRefusalText', () => {
       expect(keepBusyRefusalText(code)).not.toBe('The device did not apply the change.')
     }
     expect(keepBusyRefusalText('something_new')).toBe('The device did not apply the change.')
+  })
+})
+
+describe('isKeepBusyPattern (FR-92 P8)', () => {
+  it('knows every pattern by its exact id and nothing else', () => {
+    for (const p of KEEP_BUSY_PATTERNS) expect(isKeepBusyPattern(p.id)).toBe(true)
+    // Equality: no prefix, no case-fold, no other type.
+    for (const v of ['hearts', 'hea', 'Heart', 'circle ', '', null, undefined, 3]) {
+      expect(isKeepBusyPattern(v)).toBe(false)
+    }
   })
 })
 

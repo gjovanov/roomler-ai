@@ -268,6 +268,8 @@ agent's session can change it.
 | POST | `…/agent/{aid}/overlay-key/rotate` | Order the device to retire its overlay (WireGuard) key — it mints locally, re-joins and reports back; the server never sees a private key (FR-40). `MANAGE_AGENTS`, one order per device per minute. 200 `{request_id, dispatch: "pushed" \| "queued", delivered}`; 409 `rate_limited` / `agent_unsupported` (online device without the `key-rotate` verb) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
 | GET | `…/exec-audit` | Org-wide exec attempt log (every refusal included) |
 | GET/PUT | `…/exec-settings` | Org exec kill-switch (gate 1 of 4) |
+| GET/PUT | `…/keep-busy-settings` | The org's keep-busy policy (FR-92): `{keep_busy_denied, keep_busy_default_pattern}`. **GET: any member** (a viewer pre-selects the default). **PUT: `MANAGE_TENANT`**; each field optional, absent = unchanged, `keep_busy_default_pattern: null` = the product default (circle); a pattern not in the agent's exact wire list is a 400; a deny in the body is pushed to every device — see [keep-busy.md](keep-busy.md) §7, §12 |
+| GET | `…/keep-busy-history` | The **permanent** keep-busy history (FR-92 P7), newest first: `?agent_id=<hex>&before=<RFC 3339 \| unix ms>&limit=<1..=200, default 50>`. `MANAGE_AGENTS`; always tenant-scoped (another org's device id answers with nothing). `source: server` rows are the server's own decisions, `device` rows the device's claims from its heartbeats — see [keep-busy.md](keep-busy.md) §11 |
 | GET | `…/session/{sid}` | Remote-desktop session detail |
 | POST | `…/session/{sid}/terminate` | Force-terminate |
 | GET | `…/session/{sid}/audit` | Session audit trail |

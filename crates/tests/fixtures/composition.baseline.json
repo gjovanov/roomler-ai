@@ -453,6 +453,10 @@
       "methods": "DELETE"
     },
     {
+      "path": "/api/tenant/{tenant_id}/keep-busy-history",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/keep-busy-settings",
       "methods": "GET,HEAD,PUT"
     },
@@ -1244,6 +1248,24 @@
             "key": {
               "tenant_id": 1,
               "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "keep_busy_events",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
             }
           }
         ]
@@ -2797,6 +2819,24 @@
             "key": {
               "tenant_id": 1,
               "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "keep_busy_events",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
             }
           }
         ]

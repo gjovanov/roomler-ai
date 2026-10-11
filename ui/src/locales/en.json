@@ -333,5 +333,40 @@
       "editTitle": "Edit the fact",
       "archive": "Archive — out of every future session's memory"
     }
+  },
+  "keepBusy": {
+    "defaultPattern": {
+      "label": "Default pattern",
+      "hint": "What a viewer's Keep busy menu pre-selects on a device they have not set it on before. Circle unless you change it; a person's own last choice for a device wins over it."
+    },
+    "history": {
+      "title": "History",
+      "subtitle": "Every time keep busy was turned on or off on a device, as the device reported it, and every change to these settings. Kept permanently.",
+      "allDevices": "All devices",
+      "organization": "Organization",
+      "when": "When",
+      "device": "Device",
+      "what": "What",
+      "who": "Who",
+      "empty": "Nothing yet.",
+      "loadMore": "Load more",
+      "refresh": "Refresh",
+      "kind": {
+        "on": "turned on",
+        "off": "turned off",
+        "org_denied": "denied for the organization",
+        "org_allowed": "allowed for the organization",
+        "org_default_pattern": "default pattern changed"
+      },
+      "productDefault": "circle (the default)",
+      "source": {
+        "device": "device-reported",
+        "server": "admin"
+      },
+      "sourceHint": {
+        "device": "What the device itself reported on a heartbeat: a claim, seen at the 30-second heartbeat, never a server decision.",
+        "server": "The server's own record of an admin's change."
+      }
+    }
   }
 }

@@ -1101,6 +1101,119 @@ pub struct KeepBusyBrief {
     pub set_by: Option<String>,
 }
 
+/// FR-92 P8 — the keep-busy patterns, by their exact wire names, as the
+/// agent spells them (`agents/roomlerd/src/keep_busy/patterns.rs`
+/// `Pattern::wire`) and the viewer lists them
+/// (`ui/src/composables/keepBusy.ts` `KEEP_BUSY_PATTERNS`). The org's
+/// default pattern is validated against this list by EQUALITY — never a
+/// prefix or a case-fold — because the word travels to the agent verbatim
+/// and an agent matches it by equality too.
+///
+/// ⚠️ Three copies, one spelling. A pattern added on the agent is not
+/// selectable as an org default until it is added here as well.
+pub const KEEP_BUSY_PATTERNS: &[&str] = &[
+    "circle",
+    "triangle",
+    "square",
+    "star",
+    "figure8",
+    "heart",
+    "spirograph",
+    "lissajous",
+    "rose",
+    "wave",
+    "wander",
+    "subtle",
+    "shuffle",
+];
+
+/// The product's default keep-busy pattern, what an org gets until it
+/// chooses another (operator, 2026-10-10: circle, as originally asked for).
+pub const KEEP_BUSY_DEFAULT_PATTERN: &str = "circle";
+
+/// FR-92 P7 — what one [`KeepBusyEvent`] records.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepBusyEventKind {
+    /// Keep busy came on on a device (`pattern` and `actor_name` say which
+    /// pattern and who, as the device reported them).
+    On,
+    /// Keep busy went off on a device (`reason` is the device's code).
+    Off,
+    /// The org denied keep busy.
+    OrgDenied,
+    /// The org allowed keep busy again.
+    OrgAllowed,
+    /// The org's default pattern changed (`pattern`; absent = cleared back
+    /// to the product default).
+    OrgDefaultPattern,
+}
+
+/// FR-92 P7 — who is speaking in a [`KeepBusyEvent`]. The same trust split
+/// as `ssh_audit` vs `ssh_activity`, inside ONE collection, so a reader can
+/// never mistake one for the other.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepBusyEventSource {
+    /// The server's OWN decision — an admin changed the org's policy through
+    /// an authenticated route. Authoritative.
+    Server,
+    /// A CLAIM reported by a device on its heartbeat (derived from two
+    /// consecutive briefs). A compromised host can say anything here; it is
+    /// shown as the device's word, never enforced on.
+    Device,
+}
+
+/// FR-92 P7 — one keep-busy transition, kept for good (`keep_busy_events`).
+///
+/// **Permanent — there is deliberately no TTL** (operator, 2026-10-11:
+/// "permanent history"), unlike every other audit collection in this file.
+/// Rows outlive the device: `agent_name` is denormalised at write time so a
+/// removed device still reads by name.
+///
+/// Two sources share the collection (see [`KeepBusyEventSource`]):
+/// - the server writes `org_*` rows itself, from the settings route, only
+///   when a value actually changed, naming the acting admin;
+/// - device rows are DERIVED on the heartbeat path from the previous stored
+///   brief against the new one, so their resolution is the heartbeat cadence
+///   (~30 s): an on and an off inside one beat are not seen at all.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KeepBusyEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// The device, for a device-sourced row. `None` for an org-level event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<ObjectId>,
+    /// The device's display label when the row was written. Denormalised:
+    /// the row must still read after the device is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    pub at: DateTime,
+    pub kind: KeepBusyEventKind,
+    pub source: KeepBusyEventSource,
+    /// Server rows: the admin who changed it. Device rows: never set — a
+    /// device reports a display name, not an identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_user_id: Option<ObjectId>,
+    /// Server rows: the admin's display name at the time. Device rows: the
+    /// brief's `set_by` claim, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_name: Option<String>,
+    /// `on`: the pattern the device drew. `org_default_pattern`: the new
+    /// default (`None` = cleared to the product default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// `off`: the device's reason code (`stopped_by_controller`, `expired`,
+    /// `org_denied`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl KeepBusyEvent {
+    pub const COLLECTION: &'static str = "keep_busy_events";
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Agent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]

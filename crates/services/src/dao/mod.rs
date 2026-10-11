@@ -10,6 +10,7 @@ pub mod enrollment_key;
 pub mod exec_audit;
 pub mod file;
 pub mod invite;
+pub mod keep_busy_event;
 pub mod key_rotation_audit;
 pub mod message;
 pub mod newsletter_issue;
