@@ -387,6 +387,22 @@ pub fn device_edge(
     }
 }
 
+/// After a gap in reporting (the previous brief ABSENT), an "off" is an edge
+/// only while the history's newest row about the device is still an `on`.
+/// Pure. Without the history check, every restart of a device that was never
+/// on would write an "off".
+pub fn off_after_gap(
+    last: Option<KeepBusyEventKind>,
+    new: Option<&KeepBusyBrief>,
+) -> Option<DeviceEdge> {
+    match (last, new) {
+        (Some(KeepBusyEventKind::On), Some(n)) if !n.on => Some(DeviceEdge::Off {
+            reason: n.reason.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Record the edge this heartbeat makes, if any. Called on the agent's read
 /// loop right after `touch_heartbeat` handed back the row as it was.
 ///
@@ -406,8 +422,29 @@ pub async fn record_device_edge(
     before: &HeartbeatBefore,
     new: Option<&KeepBusyBrief>,
 ) {
-    let Some(edge) = device_edge(before.keep_busy.as_ref(), new) else {
-        return;
+    let edge = match device_edge(before.keep_busy.as_ref(), new) {
+        Some(edge) => edge,
+        // Unknown → off is not an edge by itself — but if the history still
+        // says ON, the off happened inside the gap (stopped at the device, or
+        // an auto-off, while it was not reporting) and is recorded now;
+        // otherwise the history would end on an "on" that is long over.
+        None if before.keep_busy.is_none() && new.is_some_and(|n| !n.on) => {
+            match state
+                .keep_busy_events
+                .latest_for_agent(tenant_id, agent_id)
+                .await
+            {
+                Ok(last) => match off_after_gap(last.map(|e| e.kind), new) {
+                    Some(edge) => edge,
+                    None => return,
+                },
+                Err(e) => {
+                    warn!(%agent_id, %e, "keep-busy history: gap lookup failed; an off may be missing");
+                    return;
+                }
+            }
+        }
+        None => return,
     };
     if let DeviceEdge::On { pattern, set_by } = &edge
         && before.keep_busy.is_none()
@@ -508,6 +545,27 @@ mod tests {
             None,
             "off → off is nothing"
         );
+    }
+
+    /// An off that happened while the device was not reporting is recorded
+    /// when it reports again — but only while the history still says on.
+    #[test]
+    fn an_off_after_a_gap_is_an_edge_only_while_the_history_says_on() {
+        let off = brief(false, None, None, Some("stopped_locally"));
+        let on = brief(true, Some("heart"), Some("Alice"), None);
+        assert_eq!(
+            off_after_gap(Some(KeepBusyEventKind::On), Some(&off)),
+            Some(DeviceEdge::Off {
+                reason: Some("stopped_locally".into())
+            })
+        );
+        assert_eq!(
+            off_after_gap(Some(KeepBusyEventKind::Off), Some(&off)),
+            None
+        );
+        assert_eq!(off_after_gap(None, Some(&off)), None, "a device never on");
+        assert_eq!(off_after_gap(Some(KeepBusyEventKind::On), Some(&on)), None);
+        assert_eq!(off_after_gap(Some(KeepBusyEventKind::On), None), None);
     }
 
     /// P5b's rule, kept: a device that stops saying is UNKNOWN, never off.

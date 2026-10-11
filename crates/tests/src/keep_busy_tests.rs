@@ -637,9 +637,25 @@ async fn heartbeat_edges_make_the_device_rows() {
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert_eq!(rows[0]["kind"], "on");
     assert_eq!(rows[0]["pattern"], "wave");
+    // on → absent → off: the off happened while the device was not
+    // reporting, and the history still says on — so it is recorded now.
+    ws.send(beat_with(None)).await.unwrap();
+    listed_until(&app, &tid, &admin, &agent_id, |r| {
+        r.get("keep_busy").is_none()
+    })
+    .await;
+    ws.send(beat_with(Some(
+        json!({ "on": false, "phase": "off", "reason": "stopped_locally" }),
+    )))
+    .await
+    .unwrap();
+    let rows = history_until(&app, &tid, &admin, &mine, |r| r.len() >= 5).await;
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert_eq!(rows[0]["kind"], "off");
+    assert_eq!(rows[0]["reason"], "stopped_locally");
     // The org-wide listing carries the device rows too.
     let all: Vec<Value> = history(&app, &tid, &admin, "").await.json().await.unwrap();
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.len(), 5);
 }
 
 // ── FR-92 P8 — the default pattern ──────────────────────────────────

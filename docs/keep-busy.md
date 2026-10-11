@@ -481,7 +481,8 @@ flowchart TB
 | off, or absent (unknown) → on | **`on`**, with the pattern and `set_by` |
 | on → off | **`off`**, with the device's reason (`stopped_by_controller`, `expired`, `org_denied`, …) |
 | on → absent | nothing: a device that stops saying is **unknown**, never off (P5b's rule) |
-| the same state again · absent → off · absent → absent | nothing |
+| absent → off | **`off`** only while the newest row about the device is still an `on`: it stopped while it was not reporting (P7 review) |
+| the same state again · absent → absent | nothing |
 | on → on with another pattern or `set_by` | nothing: the history records ons and offs; the device row shows what is drawn now |
 
 **The restart dedupe.** When the previous brief was absent and this one is on,
@@ -490,6 +491,12 @@ pattern and the same `set_by`, this is the same keep busy seen again after a
 gap in reporting (a daemon update that briefly reported nothing, a rollback and
 re-update), and nothing is written. A failed lookup records anyway — a
 duplicate row beats a lost edge.
+
+**The gap the other way.** Absent → off writes an `off` only when the history
+still ends on an `on` (`off_after_gap`): keep busy was stopped — at the
+device, by an auto-off — while it was not reporting. Without that check the
+history would end on an "on" that is long over; with it, a device that was
+never on writes nothing at each restart.
 
 > [!NOTE]
 > **The resolution is the heartbeat.** Device rows come from consecutive
