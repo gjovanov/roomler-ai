@@ -24,7 +24,7 @@ use roomler_ai_remote_control::models::{Agent, RpcCap};
 use roomler_ai_services::dao::base::DaoResult;
 
 use crate::HiveState;
-use crate::model::{ReplicaMember, Replicaset, SessionOrigin};
+use crate::model::{MemberState, ReplicaMember, Replicaset, SessionOrigin};
 use crate::policy::{HivePolicy, ReplicasetRules};
 
 /// The one word `prefer` may name today: the session owner's own devices.
@@ -277,6 +277,16 @@ pub async fn place_new(
             .map(|(device_id, role)| ReplicaMember {
                 device_id,
                 role: role.as_str().to_string(),
+                // P2c-3 — the primary holds the session by running it; every
+                // other member's join is still to send.
+                state: if role == MemberRole::Primary {
+                    MemberState::Joined
+                } else {
+                    MemberState::Pending
+                },
+                refusal: None,
+                answered_at: None,
+                tip: None,
             })
             .collect(),
         short: p.short.map(|s| s.as_str().to_string()),
