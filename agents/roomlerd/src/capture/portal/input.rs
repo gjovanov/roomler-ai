@@ -136,6 +136,13 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
                 },
             ]
         }
+        // #1945 — the arbiter's release-all: no motion, so the button lets go
+        // where the pointer is. A move first threw it to (0,0), GNOME's
+        // Activities hot corner, whenever a viewer vanished mid-drag.
+        InputMsg::MouseRelease { btn } => vec![PortalCall::Button {
+            code: i32::from(button_code(*btn)),
+            down: false,
+        }],
         InputMsg::MouseWheel { dx, dy, mode } => match mode {
             // Smooth deltas pass through: the browser's pixels are already
             // libinput's "scroll distance", positive down/right on both ends.
@@ -369,6 +376,20 @@ mod tests {
             mon: 0,
         });
         assert_eq!(calls, vec![PortalCall::MotionAbs { x: 0.0, y: 1080.0 }]);
+    }
+
+    /// #1945 — the arbiter's release-all lets go where the pointer is: no
+    /// motion at all. (`clicks_position_then_press` is the control: the same
+    /// plan does produce a motion when an event carries one.)
+    #[test]
+    fn a_release_never_moves_the_pointer() {
+        assert_eq!(
+            plan1(InputMsg::MouseRelease { btn: Button::Left }),
+            vec![PortalCall::Button {
+                code: 0x110,
+                down: false
+            }]
+        );
     }
 
     /// Clicks position first, then press — same rule as uinput, same reason.

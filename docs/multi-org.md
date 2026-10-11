@@ -430,7 +430,10 @@ One process-global injection worker with per-session held state.
 - **`exclusive`**: a single INPUT holder with request/grant over
   `rc:control.state`, and a 2 s idle takeover.
 - Release-all on teardown, per-event actor audit, and `cursor:peer` ghost
-  cursors so each session sees where the others are pointing.
+  cursors so each session sees where the others are pointing. A held button is
+  released **where the pointer is** (`InputMsg::MouseRelease`, #1945), never
+  by a positioned button-up: that one moves first, and at the (0,0) it used to
+  carry it opened GNOME's Activities hot corner.
 
 `AgentCaps.input` gates the server's P3 single-INPUT-holder strip: the strip is
 lifted only for arbiter-capable agents, so a mixed-version fleet can never end

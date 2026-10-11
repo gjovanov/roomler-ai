@@ -302,6 +302,21 @@ impl UinputInjector {
         })
     }
 
+    /// An injector over any writable file, with none of the device setup, so
+    /// a test can read back exactly which events an `InputMsg` became. Its
+    /// `Drop` ioctl then fails on a plain file, harmlessly.
+    #[cfg(test)]
+    fn over(dev: File) -> Self {
+        Self {
+            dev,
+            wheel_rem: (0.0, 0.0),
+            warned_text: false,
+            warned_touch: false,
+            layout: None,
+            layout_name: String::new(),
+        }
+    }
+
     fn emit(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
         let ev = InputEvent {
             time: libc::timeval {
@@ -370,6 +385,13 @@ impl InputInjector for UinputInjector {
                 // compositor samples between the two.
                 self.move_abs(x, y)?;
                 self.emit(EV_KEY, button_code(btn), i32::from(down))?;
+                self.sync()
+            }
+            // #1945 — the arbiter's release-all: no EV_ABS, so the button
+            // lets go where the pointer is. With one, a viewer that vanished
+            // mid-drag threw the cursor to (0,0), GNOME's hot corner.
+            InputMsg::MouseRelease { btn } => {
+                self.emit(EV_KEY, button_code(btn), 0)?;
                 self.sync()
             }
             InputMsg::MouseWheel { dx, dy, mode } => {
@@ -524,4 +546,61 @@ mod tests {
 
     // The HID→evdev table tests moved to `super::super::hid_evdev` with the
     // table itself.
+
+    use crate::input::Button;
+
+    /// Inject one event into an injector over a plain file and decode what
+    /// it wrote, as `(type, code, value)`.
+    fn written(msg: InputMsg) -> Vec<(u16, u16, i32)> {
+        use std::io::{Read, Seek};
+        let mut file = tempfile::tempfile().expect("a temp file");
+        let mut inj = UinputInjector::over(file.try_clone().expect("clone the fd"));
+        inj.inject(msg).expect("inject");
+        drop(inj);
+        let mut bytes = Vec::new();
+        file.rewind().expect("rewind");
+        file.read_to_end(&mut bytes).expect("read back");
+        bytes
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|ev| {
+                // After the 16-byte timeval: u16 type, u16 code, i32 value.
+                let n = |at: usize| u16::from_ne_bytes([ev[at], ev[at + 1]]);
+                let value = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                (n(16), n(18), value)
+            })
+            .collect()
+    }
+
+    /// #1945 — the arbiter's release-all lets go where the pointer IS: one
+    /// key-up and a SYN, no EV_ABS. With a position, a viewer that vanished
+    /// mid-drag threw the cursor to (0,0), GNOME's Activities hot corner.
+    #[test]
+    fn a_release_never_moves_the_pointer() {
+        assert_eq!(
+            written(InputMsg::MouseRelease { btn: Button::Left }),
+            [(EV_KEY, BTN_LEFT, 0), (EV_SYN, SYN_REPORT, 0)]
+        );
+    }
+
+    /// The control: a viewer's own button-up still positions first, in the
+    /// same report — so the decoding above can see a move when there is one.
+    #[test]
+    fn a_button_up_from_a_viewer_still_lands_where_it_points() {
+        let half = (0.5 * ABS_MAX as f32).round() as i32;
+        assert_eq!(
+            written(InputMsg::MouseButton {
+                btn: Button::Left,
+                down: false,
+                x: 0.5,
+                y: 0.5,
+                mon: 0,
+            }),
+            [
+                (EV_ABS, ABS_X, half),
+                (EV_ABS, ABS_Y, half),
+                (EV_KEY, BTN_LEFT, 0),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
 }

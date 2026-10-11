@@ -106,15 +106,10 @@ impl Held {
                 down: false,
                 mods: 0,
             },
-            // Coordinates are ignored for an up of an already-known button
-            // position; (0,0) on the primary monitor is the safe no-move up.
-            Held::Btn(btn) => InputMsg::MouseButton {
-                btn,
-                down: false,
-                x: 0.0,
-                y: 0.0,
-                mon: 0,
-            },
+            // #1945 — never a `MouseButton` up: that carries a position, and
+            // every backend moves there first. The (0,0) this used to send
+            // was GNOME's Activities hot corner, and the end of the drag.
+            Held::Btn(btn) => InputMsg::MouseRelease { btn },
         }
     }
     fn is_modifier(&self) -> bool {
@@ -370,6 +365,9 @@ impl ArbiterState {
                     } else {
                         core.held.remove(&Held::Btn(*btn));
                     }
+                }
+                InputMsg::MouseRelease { btn } => {
+                    core.held.remove(&Held::Btn(*btn));
                 }
                 _ => {}
             }
@@ -1200,9 +1198,76 @@ mod tests {
         assert_eq!(releases.len(), 3, "shift + letter + button all released");
         assert!(releases.iter().all(|m| matches!(
             m,
-            InputMsg::Key { down: false, .. } | InputMsg::MouseButton { down: false, .. }
+            InputMsg::Key { down: false, .. } | InputMsg::MouseRelease { .. }
         )));
         // Idempotent.
+        assert!(st.close(a).is_empty());
+    }
+
+    /// #1945 — every path that lets go of a session's held button lets go
+    /// WHERE THE POINTER IS. A `MouseButton` up carries a position every
+    /// backend moves to first; the (0,0) the release-all used to send was
+    /// GNOME's Activities hot corner (a macOS hot corner may lock the screen),
+    /// and the end of the drag.
+    #[test]
+    fn a_held_button_is_released_without_moving_the_pointer() {
+        let moves = |ms: &[InputMsg]| {
+            ms.iter()
+                .filter(|m| matches!(m, InputMsg::MouseButton { .. } | InputMsg::MouseMove { .. }))
+                .count()
+        };
+        let released = |ms: &[InputMsg]| ms.contains(&InputMsg::MouseRelease { btn: Button::Left });
+        let now = Instant::now();
+
+        // The session closes mid-drag (tab closed, browser crashed, watchdog).
+        let mut st = ArbiterState::default();
+        let a = sid();
+        st.open(a, "A".into(), true, None, now);
+        st.plan(a, &click(true), now);
+        let r = st.close(a);
+        assert!(released(&r) && moves(&r) == 0, "close: {r:?}");
+
+        // Its input channel dies but the session lives on.
+        let mut st = ArbiterState::default();
+        st.open(a, "A".into(), true, None, now);
+        st.plan(a, &click(true), now);
+        let r = st.release_held(a);
+        assert!(released(&r) && moves(&r) == 0, "release_held: {r:?}");
+
+        // Exclusive mode: an idle holder's floor is taken over, and the holder
+        // hands it over on request.
+        let b = sid();
+        let mut st = ArbiterState::default();
+        st.open(a, "A".into(), true, Some(Mode::Exclusive), now);
+        st.open(b, "B".into(), true, None, now);
+        st.plan(a, &click(true), now);
+        let (granted, r) = st.request_floor(b, now + IDLE_TAKEOVER);
+        assert!(granted);
+        assert!(released(&r) && moves(&r) == 0, "takeover: {r:?}");
+
+        let mut st = ArbiterState::default();
+        st.open(a, "A".into(), true, Some(Mode::Exclusive), now);
+        st.open(b, "B".into(), true, None, now);
+        st.plan(a, &click(true), now);
+        assert!(
+            !st.request_floor(b, now).0,
+            "an active holder keeps the floor"
+        );
+        let (granted, r) = st.grant_floor(a, b);
+        assert!(granted);
+        assert!(released(&r) && moves(&r) == 0, "grant: {r:?}");
+    }
+
+    /// A viewer may send the no-move release itself; it ends the hold, so
+    /// nothing is released twice when the session closes.
+    #[test]
+    fn a_viewers_own_release_ends_the_hold() {
+        let mut st = ArbiterState::default();
+        let a = sid();
+        let now = Instant::now();
+        st.open(a, "A".into(), true, None, now);
+        st.plan(a, &click(true), now);
+        st.plan(a, &InputMsg::MouseRelease { btn: Button::Left }, now);
         assert!(st.close(a).is_empty());
     }
 
