@@ -1,7 +1,7 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** proposed 2026-10-10
-— spec and claim · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 merged; 0.4.125 released and field-verified 2026-10-11 (§9)
+· **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
 [FR-85](FR-85-hq-screen-recording.md) (`record_remote_enabled`, the device-owned key precedent),
@@ -400,6 +400,12 @@ Mutter's `GetIdletime` over the person's bus.
 | 18 | AC13 ON (**P9 build**) | Ubuntu 24.04 GNOME **Wayland**, system install, uinput on, GNOME's 60 s lock armed | the GNOME host came up 44 ms after the turn-on (`idle_clock=true geometry=true`), `detector` `clock`; **~5 min: 284 samples, Mutter idle max 46 ms (p99 33 ms), no lock** |
 | 19 | AC13: local input, lock (P9) | same | a key paused it in 0.64 s, a move of the VM's USB tablet in 0.54 s; each resumed after ~10 s. `loginctl lock-session` ⇒ `locked`; the unlock ⇒ paused for whoever unlocked, then running |
 | 20 | **the fix** (P9) | the Xorg host of cell 9, P9 installed | turned ON while locked: **`locked` in 229 ms, X idle growing** — the same cell 0.4.125 failed |
+| 21 | AC1: every viewer | two viewers on the GNOME Wayland guest, the second one with the floor | the floor holder switched it on; **the other viewer, doing nothing, saw it 13 ms later**, both toolbars "Keep busy · locked". The off reached the other in 15 ms (`stopped_by_controller`) |
+| 22 | AC5: the owner's off | the GNOME Wayland guest, running | `roomler config set keep_busy_enabled false` applied live: it stopped (`device_disabled`, "Turned off on this computer"), the `keep-busy` word left the server's listing within a heartbeat, and a raw `set on` was refused `device_disabled`. A connected viewer shows the control **disabled with the owner's reason** (the P2 design: `agentSupportsKeepBusy \|\| state`), not hidden |
+| 23 | AC7: a Linux system install's person socket | the GNOME Wayland guest, as the unprivileged user | `roomler keep-busy status` read the root daemon's state and `roomler keep-busy off` stopped it ("Turned off at this computer.") |
+| 24 | Worker types: the user-context worker | Win11 attended install (`worker role probed role=User`) | on ⇒ running in 228 ms; **69 samples before the touch, session idle max 32 ms**; a real local key paused it ~1 s later, and it resumed after 10.1 s. The store is the person's own `%LOCALAPPDATA%\roomler\roomler\data\keep-busy.json` (its owner reads `BUILTIN\Administrators`: the default owner of the worker's elevated token; access is the profile's inherited ACL) |
+| 25 | AC12 (P8), **prod** `hosted-20261011-a5429ac` | the vmtest org | the admin set the org default to `heart` (200). A FRESH viewer, with nothing remembered for the device, pre-selected `["heart"]`. Reset to `null` afterwards |
+| 26 | AC11 (P7), **prod** | the GNOME Wayland guest | on from the viewer at 09:37:21 ⇒ an `on` row (device, `vmtest admin`, circle) at 09:37:50, the next heartbeat; off at 09:39:08 ⇒ an `off` row (`stopped_by_controller`) at 09:39:20. The org-wide list, newest first: `off` · `org_default_pattern` → null (server, the admin) · `on` · `org_default_pattern` heart (server, the admin) — exactly the four changes made, nothing else |
 
 Wrong turns, recorded so nobody repeats them:
 - **An ephemeral (vmtest) device unenrolls on a clean OS restart.** Windows' servicing
@@ -414,8 +420,17 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), a user-context
-Windows worker, a self-update (AC4, the next release), and 24 h of EDR on the corporate laptop (AC8).
+Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), a self-update (AC4,
+the next release), AC9/AC13 on a release (P9 rides 0.4.126), and 24 h of EDR on the corporate
+laptop (AC8). AC11 and AC12 are proven on prod (rows 25–26).
+
+Two criteria need the operator's wording, not more testing:
+- **AC3** says "local input (… key …) pauses it within 1 s". An isolated single key tap can share a
+  `GetLastInputInfo` tick with an own move and is then invisible on Windows (1 of 9 in the field);
+  typing, clicks, the mouse and a held button are always caught. Accept it as documented, or reword.
+- **AC5** says "hides". The device withdraws the cap word (every surface that reads it hides keep
+  busy), but a connected viewer shows the control disabled with the owner's reason — by the P2
+  design, so a controller is told why rather than finding it gone.
 
 ## 10. Related
 
