@@ -231,6 +231,19 @@ fn derp_stream_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(t)
 }
 
+/// #2002 — the endpoint config for QUIC over DERP: quinn's, with fixed-bit
+/// greasing (RFC 9287) OFF. The DERP leg demuxes each payload by its first
+/// bytes ([`crate::transport::derp::payload_is_wg_or_disco`]), and greasing
+/// let a short header start anywhere below 0x40: 2.6-4.0% of a transfer's
+/// datagrams opened with a WireGuard type byte. An endpoint that does not
+/// advertise the parameter is never sent a greased packet, and sends none
+/// to a peer that does not advertise it either.
+fn derp_endpoint_config() -> quinn::EndpointConfig {
+    let mut cfg = quinn::EndpointConfig::default();
+    cfg.grease_quic_bit(false);
+    cfg
+}
+
 /// R4 — server config for the QUIC-over-DERP tunnel flavor: identical TLS
 /// posture to [`build_server_config`] (ephemeral self-signed cert whose
 /// fingerprint the client pins over signaling — the tunnel's auth model is
@@ -451,13 +464,9 @@ impl QuicPeer {
     pub fn server_over_derp(socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<(Self, String)> {
         let (cfg, fingerprint) = build_server_config_derp()?;
         let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
-        let endpoint = Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(cfg),
-            socket,
-            runtime,
-        )
-        .context("quic derp-tunnel server endpoint")?;
+        let endpoint =
+            Endpoint::new_with_abstract_socket(derp_endpoint_config(), Some(cfg), socket, runtime)
+                .context("quic derp-tunnel server endpoint")?;
         Ok((Self { endpoint }, fingerprint))
     }
 
@@ -467,13 +476,9 @@ impl QuicPeer {
         pinned_fingerprint_hex: &str,
     ) -> Result<Self> {
         let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
-        let mut endpoint = Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            runtime,
-        )
-        .context("quic derp-tunnel client endpoint")?;
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(derp_endpoint_config(), None, socket, runtime)
+                .context("quic derp-tunnel client endpoint")?;
         endpoint.set_default_client_config(build_client_config_derp(pinned_fingerprint_hex)?);
         Ok(Self { endpoint })
     }
@@ -1122,5 +1127,94 @@ mod tests {
             "mismatched token must be rejected"
         );
         conn.close(0u32.into(), b"done");
+    }
+
+    /// The DERP leg demuxes each payload by its first bytes
+    /// ([`crate::transport::derp::payload_is_wg_or_disco`]), so an endpoint
+    /// that rides it must never clear QUIC's fixed bit. quinn GREASES that
+    /// bit by default (RFC 9287): each end advertises it, and each then
+    /// clears it on about half of what it sends, so a short header starts
+    /// anywhere below 0x40, WireGuard's types 1..=4 among it. Measured over a
+    /// real transfer between the two DERP endpoints, both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_over_derp_never_clears_the_fixed_bit() {
+        use crate::transport::relay::{RelayConn, RelayUdpSocket, UdpRelayConn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// What one side sent, by its first byte.
+        #[derive(Default)]
+        struct Seen {
+            total: AtomicUsize,
+            greased: AtomicUsize,
+            wg_typed: AtomicUsize,
+        }
+        struct Recording {
+            inner: UdpRelayConn,
+            seen: Arc<Seen>,
+        }
+        #[async_trait::async_trait]
+        impl RelayConn for Recording {
+            async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
+                self.seen.total.fetch_add(1, Ordering::Relaxed);
+                if buf.first().is_some_and(|b| b & 0x40 == 0) {
+                    self.seen.greased.fetch_add(1, Ordering::Relaxed);
+                }
+                if matches!(buf.first(), Some(1..=4)) {
+                    self.seen.wg_typed.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.send_to(buf, dst).await
+            }
+            async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+                self.inner.recv_from(buf).await
+            }
+            fn local_addr(&self) -> std::io::Result<SocketAddr> {
+                self.inner.local_addr()
+            }
+        }
+        async fn side(seen: &Arc<Seen>) -> Arc<RelayUdpSocket> {
+            let udp = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+            let conn = Recording {
+                inner: UdpRelayConn(udp),
+                seen: Arc::clone(seen),
+            };
+            Arc::new(RelayUdpSocket::new(Arc::new(conn)).unwrap())
+        }
+
+        let seen = Arc::new(Seen::default());
+        let (server, fp) = QuicPeer::server_over_derp(side(&seen).await).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client_over_derp(side(&seen).await, &fp).unwrap();
+        const BYTES: usize = 2 * 1024 * 1024;
+        let echo = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let got = recv.read_to_end(BYTES).await.unwrap();
+            send.write_all(&got).await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+        let conn = client.connect(server_addr).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&vec![0x5a; BYTES]).await.unwrap();
+        send.finish().unwrap();
+        let back = recv.read_to_end(BYTES).await.unwrap();
+        assert_eq!(back.len(), BYTES, "the transfer came back whole");
+        conn.close(0u32.into(), b"done");
+        let _ = echo.await;
+
+        let (total, greased, wg_typed) = (
+            seen.total.load(Ordering::Relaxed),
+            seen.greased.load(Ordering::Relaxed),
+            seen.wg_typed.load(Ordering::Relaxed),
+        );
+        assert!(
+            total > 1000,
+            "a transfer worth measuring: {total} datagrams"
+        );
+        assert_eq!(
+            greased, 0,
+            "{greased} of {total} datagrams cleared the fixed bit; {wg_typed} of them \
+             start with a WireGuard type byte (1..=4)"
+        );
     }
 }

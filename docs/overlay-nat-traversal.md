@@ -369,6 +369,27 @@ cascade's guarantees while replacing its reactive counters:
   registers the new conn *before* the old one drops, so a blind clear would
   unregister the LIVE consumer, and the WG and tunnel routes are independent —
   a carrier going away must not take R4's tunnel route with it.
+- **WireGuard is its whole header, never its first byte (#2002).** The mux splits each
+  inbound payload between the WG and tunnel routes with `payload_is_wg_or_disco`
+  ([`derp.rs:234`](../crates/tunnel-core/src/transport/derp.rs#L234)), and the server's
+  relay reads the same function to decide what its tunnel shaper applies to
+  ([`modules/network/src/derp.rs:602`](../crates/modules/network/src/derp.rs#L602)). It
+  read the first byte only, 1..=4, and quinn **greases QUIC's fixed bit** by default
+  (RFC 9287): an end whose peer advertised the parameter clears the bit on about half of
+  what it sends, so a tunnel short header can open on any byte below 0x40. Measured over a
+  2 MiB echo between the two DERP endpoints: 1,881 of 3,761 datagrams greased, **151
+  (4.0 %) opening on a WireGuard type byte** (2.6 % on another run). Those went to boringtun, which discards
+  them, so every `quic-derp-v1` stream lost them, and they slipped past the tunnel shaper.
+  Two halves, either of which suffices between two fixed builds: the classifier takes
+  WireGuard only with its whole 4-byte header, a type and three zero bytes, which a
+  greased packet matches only if its random connection ID also opens on three zero bytes;
+  and the DERP endpoints advertise no greasing, so nobody greases toward them
+  (`derp_endpoint_config`, [`quic.rs:241`](../crates/tunnel-core/src/transport/quic.rs#L241);
+  the measurement is `quic_over_derp_never_clears_the_fixed_bit`,
+  [`quic.rs:1140`](../crates/tunnel-core/src/transport/quic.rs#L1140)).
+  ⚠️ During a rollout an old peer still advertises greasing, so a fixed build still
+  greases toward it, and the old peer still reads by the first byte: the old-to-fixed
+  direction is clean at once, the fixed-to-old one once the old end upgrades.
 - **The counters are readable (#32).** `drop_counts()` shipped with the signal
   and was surfaced nowhere for a day, so a real 2026-08-25 transition could only
   be argued about from an absence of log lines. `NodeStatus.derp_inbound_drops`
