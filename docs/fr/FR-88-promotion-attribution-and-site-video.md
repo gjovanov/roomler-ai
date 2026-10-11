@@ -20,7 +20,7 @@ visitor's device**, and gives the videos a home on the site.
 2. **Conversions**: purestat goals for `signup`, `subscribe`, `install-copy` and `github-outbound`.
 3. **Activation**: a platform-admin view of signups, and of signups whose tenant enrolled a device
    within 7 days, by source and campaign.
-4. **A link hub**: `/links/` plus short paths (`/yt`, `/tt`, `/ig`, `/fb`) that 302 there with UTM,
+4. **A link hub**: `/links/` plus short paths (`/yt`, `/tt`, `/x`, `/fb`) that 302 there with UTM,
    for places a link cannot carry parameters: a profile bio, a URL said out loud in a video.
 5. **Video on the site**: a `video:` key on blog posts and a `:::video` container on docs pages,
    rendered as a click-to-load youtube-nocookie facade with `VideoObject` structured data.
@@ -160,7 +160,11 @@ sequenceDiagram
 - **Channels** (`CHANNELS` in `ui/docs/site.ts`): the one list of the profiles. The hub lists them,
   and `ORG.sameAs` names them to search engines next to the repository.
 - **nginx** (`files/nginx-pod.conf`): `location = /yt { return 302 /links/?utm_source=youtube&utm_medium=bio&utm_campaign=profile; }`,
-  and the same for `/tt`, `/ig` and `/fb`. More short paths are added only by a PR.
+  and the same for `/tt`, `/x` and `/fb`. More short paths are added only by a PR.
+  - **2026-10-11: X replaced Instagram.** Instagram disabled @roomler.ai on 2026-10-10, so its
+    channel and its `/ig` path left together, and @roomler_ai on X took the slot as `/x`. A short
+    path lives only as long as its channel: the spec's both-ways check keeps nginx and `CHANNELS`
+    equal.
   - `utm_medium=bio&utm_campaign=profile` is what every profile link of the program carries, a
     profile's own website field included. So a visit through a bio is one source, whichever way it
     came. (This spec first said `utm_medium=profile`; P2 follows the program's convention instead.)
@@ -225,7 +229,7 @@ measured from their first view. Each phase is its own promote.
   a platform admin, and 404 for anyone else. With `fleet` unmounted, `activated` is `null`.
 - [ ] **AC6:** a scripted pass records exactly one event for each of the four purestat goals, and zero
   with `ANALYTICS = null` (control).
-- [ ] **AC7:** `curl -sI https://roomler.ai/yt` (and `/tt`, `/ig`, `/fb`) returns a 302 whose relative
+- [ ] **AC7:** `curl -sI https://roomler.ai/yt` (and `/tt`, `/x`, `/fb`) returns a 302 whose relative
   `Location` is `/links/` with that channel's `utm_source`, `utm_medium=bio` and
   `utm_campaign=profile`, and no SPA route answers any of those paths. `/links/` answers 200 with the
   hub and `/links` a 301 to it. Checked by `scripts/public-site-smoke.sh` §5c, shown failing on the
