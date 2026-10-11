@@ -139,6 +139,10 @@ pub mod system_context;
 /// `crate::tcc::…` call site here is unchanged.
 #[cfg(target_os = "macos")]
 pub use roomler_node_core::tcc;
+/// A tarball install's directories given back to root at every start: up to
+/// 0.4.126 a tarball install left `/usr` another account's.
+#[cfg(target_os = "linux")]
+pub mod tarball_owner;
 pub mod telemetry;
 pub mod tunnel;
 pub mod updater;

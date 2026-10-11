@@ -222,6 +222,60 @@ download() {
 
 # ─── daemon role ────────────────────────────────────────────────────────────
 
+# A tarball install up to 0.4.126 left these owned by the CI builder (uid
+# 1001): the directories the archive carried, and the files it put in them.
+# Put root back, PARENT BEFORE CHILD. Once a parent is root's, nothing below it
+# can be swapped under this loop, and a symlink or a non-directory where a
+# directory belongs stops the descent there.
+# The mode the distribution's own package records for a path. Fedora ships
+# /usr/bin and /usr/lib 0555, and an archive that rewrote them left 0755. With
+# no package database, the repair only takes write away from group and others.
+packaged_mode() {
+    command -v rpm >/dev/null 2>&1 || return 0
+    # ⚠️ For a path no package owns, `rpm -qf` prints "file … is not owned by
+    # any package" on STDOUT and exits 1. Measured: without these two guards
+    # the repair took "file" for a mode.
+    rpm -qf "$1" >/dev/null 2>&1 || return 0
+    rpm -qf --qf '[%{FILEMODES:octal} %{FILENAMES}\n]' "$1" 2>/dev/null \
+        | awk -v p="$1" '$2 == p && $1 ~ /^[0-7]+$/ { print substr($1, length($1) - 3); exit }'
+}
+
+repair_tarball_owners() {
+    skip=""
+    # RETIRED-NAME-ANCHOR(4): usr/lib/roomler-agent is the binary's RPATH and
+    # usr/share/doc/roomler-agent the payload's doc dir: what the tarball puts.
+    for d in /usr /usr/bin /usr/lib /usr/lib/roomler-agent /usr/lib/systemd \
+             /usr/lib/systemd/system /usr/lib/systemd/user /usr/share \
+             /usr/share/doc /usr/share/doc/roomler-agent; do
+        for s in $skip; do case "$d" in "$s"/*) continue 2 ;; esac; done
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+            warn "$d is not a plain directory; leaving it and everything below it"
+            skip="$skip $d"
+            continue
+        fi
+        [ -d "$d" ] || continue
+        owner="$(stat -c %u:%g "$d")" || { skip="$skip $d"; continue; }
+        [ "$owner" = "0:0" ] && continue
+        mode="$(packaged_mode "$d")"
+        warn "repairing $d: owned by $owner since an earlier tarball install; restoring root:root${mode:+, mode $mode}"
+        if [ -n "$mode" ]; then
+            sudo chown -h root:root "$d" && sudo chmod "$mode" "$d" || skip="$skip $d"
+        else
+            sudo chown -h root:root "$d" && sudo chmod go-w "$d" || skip="$skip $d"
+        fi
+    done
+    # RETIRED-NAME-ANCHOR(3): the same two payload dirs, for the files in them.
+    for f in /usr/bin/roomlerd /usr/bin/roomler /usr/lib/roomler-agent/* \
+             /usr/lib/systemd/system/roomlerd.service /usr/lib/systemd/user/roomler.service \
+             /usr/share/doc/roomler-agent/README.Debian; do
+        { [ -f "$f" ] && [ ! -L "$f" ]; } || continue
+        owner="$(stat -c %u:%g "$f")" || continue
+        [ "$owner" = "0:0" ] && continue
+        warn "repairing $f: owned by $owner; restoring root:root"
+        sudo chown -h root:root "$f" && sudo chmod go-w "$f"
+    done
+}
+
 install_daemon_linux() {
     releases="$STAGE/releases.json"
     say "resolving latest agent release via $SERVER/api/agent/latest-release"
@@ -289,8 +343,15 @@ install_daemon_linux() {
         # (identical to what the .deb installs). On a FIRST install there are
         # no operator-edited units to protect, so unpacking wholesale is fine;
         # the agent's own updater is the path that preserves them on upgrade.
-        sudo tar -xzf "$deb" --strip-components=1 -C /
+        # ⚠️ --no-same-owner --no-overwrite-dir. GNU tar running as root
+        # restores each entry's owner from the archive, and applies a
+        # directory entry's metadata to a directory that already exists.
+        # Tarballs up to 0.4.126 carried their directories with the CI
+        # builder's uid (1001), so this one line made /usr, /usr/bin and
+        # /usr/lib the property of whichever local account held that uid.
+        sudo tar --no-same-owner --no-overwrite-dir -xzf "$deb" --strip-components=1 -C /
         sudo test -x /usr/bin/roomlerd || { echo "error: tarball did not install /usr/bin/roomlerd" >&2; exit 1; }
+        repair_tarball_owners
     fi
 
     enroll_daemon /usr/bin/roomlerd

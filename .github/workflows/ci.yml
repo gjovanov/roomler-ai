@@ -701,6 +701,18 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" recording::launch
 
+      - name: The tarball repair, as root — another account's tree comes back root's, and no symlink is followed
+        # Up to 0.4.126 a tarball install left /usr and the unit directories
+        # another account's; the daemon repairs at start, as root
+        # (agents/roomlerd/src/tarball_owner.rs). Only root can chown, so the
+        # lib test binary runs under sudo, and ROOMLERD_TEST_REQUIRE_ROOT turns
+        # the test's skip into a failure.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/tob.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/tob.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" tarball_owner
+
       - name: The Linux user unit's sandbox (FR-85 P2c) — it starts on a fresh host, and the recorder writes ~/Videos
         # FR-85 P2c. `roomler.service` (the per-user install; what
         # `install.sh --role daemon` enables without `--system`) runs the

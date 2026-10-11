@@ -2839,6 +2839,13 @@ async fn run_cmd(
                 return already_running_exit().map(|()| None);
             }
         };
+    // Up to 0.4.126 a tarball install left /usr and the unit directories
+    // another account's (tarball_owner.rs). A host that is already damaged
+    // updates through its OLD updater, which never looks at a directory, so
+    // only this daemon's own start reaches it. Root only; a dozen fstats on a
+    // healthy host. After the lock, so one daemon does it.
+    #[cfg(target_os = "linux")]
+    roomlerd::tarball_owner::repair_at_start();
     let mut cfg = config::load(config_path).context("loading config")?;
 
     // FR-84 D3 — who will relaunch this process if it exits, decided once,
