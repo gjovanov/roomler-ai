@@ -1,0 +1,193 @@
+/**
+ * FR-93 (#1972) — the viewer's INPUT, end to end, on the FR-93 Wayland lab.
+ *
+ * A real browser drives the real remote-desktop page against the real server,
+ * exactly as `vmtest-remote.spec.ts` does, and this spec SENDS input and says
+ * what it sent: one `[vmtest-input] sent {…}` line per action. It decides
+ * nothing about the host, because the browser cannot see it. The harness
+ * (roomler-ai-deploy `vmtest/lab/measure/viewer-input.sh`) reads what ARRIVED
+ * from the lab guest's probe app, a fullscreen native Wayland client that logs
+ * every pointer, button, scroll and key event, and from the shell's own state.
+ *
+ * `E2E_INPUT_PLAN` picks what to send:
+ *   - `points` (AC4): the pointer to three known points, a click, a wheel
+ *     notch down, typed ASCII, and a letter typed under a held Shift.
+ *   - `vanish` (#1945): press, drag, then CLOSE THE PAGE mid-drag. The agent
+ *     releases the button the session still holds. That release must let go
+ *     where the pointer is; one that moves first lands in the top-left pixel,
+ *     GNOME's Activities hot corner.
+ *
+ * Coordinates are normalised to the remote picture, as on the wire. The spec
+ * finds the picture on the page (the largest live `<canvas>` or `<video>`,
+ * letterboxed with `object-fit: contain`), so a target of (0.25, 0.25) is a
+ * quarter of the way into the HOST's screen, whatever the viewport.
+ *
+ * Env: E2E_BASE_URL, E2E_API_URL, E2E_VMTEST_TENANT_ID, E2E_VMTEST_EMAIL,
+ * E2E_VMTEST_PASSWORD, E2E_AGENT_NAME (all required; the spec skips
+ * otherwise), E2E_INPUT_PLAN (`points` by default).
+ */
+import { test, expect, type Page } from '@playwright/test'
+
+const API_URL = process.env.E2E_API_URL || ''
+const BASE_URL = process.env.E2E_BASE_URL || ''
+const TENANT_ID = process.env.E2E_VMTEST_TENANT_ID || ''
+const EMAIL = process.env.E2E_VMTEST_EMAIL || ''
+const PASSWORD = process.env.E2E_VMTEST_PASSWORD || ''
+const AGENT_NAME = process.env.E2E_AGENT_NAME || ''
+const PLAN = process.env.E2E_INPUT_PLAN || 'points'
+
+/** The named agent's id once it reports online. Exact-name match only, as in
+ *  `vmtest-remote.spec.ts` (parallel VMs must never cross-match). */
+async function findNamedOnlineAgent(token: string): Promise<string | null> {
+  for (let i = 0; i < 24; i++) {
+    const resp = await fetch(`${API_URL}/api/tenant/${TENANT_ID}/agent`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (resp.ok) {
+      const body = (await resp.json()) as {
+        items?: Array<{
+          id: string
+          machine_name?: string
+          name?: string
+          display_name?: string
+          is_online: boolean
+        }>
+      }
+      const hit = body.items?.find(
+        (a) =>
+          a.is_online &&
+          (a.machine_name === AGENT_NAME || a.name === AGENT_NAME || a.display_name === AGENT_NAME),
+      )
+      if (hit) return hit.id
+    }
+    await new Promise((r) => setTimeout(r, 5000))
+  }
+  return null
+}
+
+type Picture = { x: number; y: number; w: number; h: number; srcW: number; srcH: number }
+
+/** Where the remote picture is drawn on the page: the largest `<canvas>` or
+ *  `<video>` that has decoded dimensions, with `object-fit: contain`'s
+ *  letterbox applied. `null` until a frame has been decoded. */
+async function picture(page: Page): Promise<Picture | null> {
+  return await page.evaluate(() => {
+    const els = [
+      ...Array.from(document.querySelectorAll('video')),
+      ...Array.from(document.querySelectorAll('canvas')),
+    ]
+    let best: { r: DOMRect; srcW: number; srcH: number } | null = null
+    for (const el of els) {
+      const r = el.getBoundingClientRect()
+      const srcW = el instanceof HTMLVideoElement ? el.videoWidth : el.width
+      const srcH = el instanceof HTMLVideoElement ? el.videoHeight : el.height
+      if (!srcW || !srcH || r.width < 50 || r.height < 50) continue
+      if (!best || r.width * r.height > best.r.width * best.r.height) best = { r, srcW, srcH }
+    }
+    if (!best) return null
+    const { r, srcW, srcH } = best
+    const scale = Math.min(r.width / srcW, r.height / srcH)
+    const w = srcW * scale
+    const h = srcH * scale
+    return { x: r.left + (r.width - w) / 2, y: r.top + (r.height - h) / 2, w, h, srcW, srcH }
+  })
+}
+
+/** One line per action, for the harness to compare against the probe's log.
+ *  `wall` is seconds since the epoch, like the probe's own field. */
+function sent(kind: string, fields: Record<string, unknown> = {}): void {
+  console.log(`[vmtest-input] sent ${JSON.stringify({ kind, wall: Date.now() / 1000, ...fields })}`)
+}
+
+const pause = (page: Page, ms: number) => page.waitForTimeout(ms)
+
+test.describe('vmtest viewer input (named agent)', () => {
+  test.skip(
+    !API_URL || !BASE_URL || !TENANT_ID || !EMAIL || !PASSWORD || !AGENT_NAME,
+    'vmtest env not set (E2E_BASE_URL/E2E_API_URL/E2E_VMTEST_TENANT_ID/E2E_VMTEST_EMAIL/E2E_VMTEST_PASSWORD/E2E_AGENT_NAME)',
+  )
+  test.setTimeout(4 * 60 * 1000)
+
+  test(`the viewer's input reaches the host (${PLAN})`, async ({ page, context }) => {
+    // Cookie-only sessions (#680/#690): log in through the context so the
+    // HttpOnly cookie lands in this context's jar — see vmtest-remote.spec.ts.
+    const loginResp = await context.request.post(`${API_URL}/api/auth/login`, {
+      data: { email: EMAIL, password: PASSWORD },
+    })
+    expect(loginResp.ok(), `browser login failed: ${loginResp.status()}`).toBeTruthy()
+    const token = ((await loginResp.json()) as { access_token: string }).access_token
+    await context.addInitScript(() => {
+      try {
+        window.localStorage.setItem('roomler-signed-in', '1')
+      } catch {
+        /* storage blocked: the cookie still authenticates */
+      }
+    })
+    const agentId = await findNamedOnlineAgent(token)
+    expect(agentId, `agent "${AGENT_NAME}" never reported online in tenant ${TENANT_ID}`).toBeTruthy()
+
+    await page.goto(`${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`)
+    await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
+    await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 90_000 })
+
+    let pic: Picture | null = null
+    await expect
+      .poll(async () => (pic = await picture(page)) !== null, {
+        timeout: 60_000,
+        message: 'no decoded remote picture appeared',
+      })
+      .toBe(true)
+    const p = pic as unknown as Picture
+    console.log(`[vmtest-input] picture ${JSON.stringify(p)}`)
+    const at = (fx: number, fy: number) => ({ x: p.x + fx * p.w, y: p.y + fy * p.h })
+    const moveTo = async (fx: number, fy: number) => {
+      const t = at(fx, fy)
+      // ONE jump, not a glide: each target should be one motion on the host.
+      await page.mouse.move(t.x, t.y, { steps: 1 })
+      sent('move', { fx, fy, px: Math.round(fx * p.srcW), py: Math.round(fy * p.srcH) })
+    }
+
+    if (PLAN === 'vanish') {
+      await moveTo(0.5, 0.5)
+      await pause(page, 1_000)
+      await page.mouse.down()
+      sent('press', { fx: 0.5, fy: 0.5 })
+      for (const f of [0.52, 0.54, 0.56, 0.58, 0.6]) {
+        await moveTo(f, f)
+        await pause(page, 150)
+      }
+      await pause(page, 1_500)
+      // The viewer vanishes with the button still held: no mouse-up is sent.
+      // The agent's release of that button is the event under test.
+      sent('vanish', { held_at_fx: 0.6, held_at_fy: 0.6 })
+      await page.close()
+      return
+    }
+
+    // `points` — AC4: three points, a click, a wheel notch, ASCII, Shift+A.
+    for (const [fx, fy] of [
+      [0.25, 0.25],
+      [0.75, 0.25],
+      [0.5, 0.75],
+    ]) {
+      await moveTo(fx, fy)
+      await pause(page, 1_500)
+    }
+    const c = at(0.5, 0.75)
+    await page.mouse.click(c.x, c.y)
+    sent('click', { fx: 0.5, fy: 0.75 })
+    await pause(page, 1_000)
+    await page.mouse.wheel(0, 120)
+    sent('wheel', { dy: 120 })
+    await pause(page, 1_000)
+    await page.keyboard.type('hello 123', { delay: 80 })
+    sent('type', { text: 'hello 123' })
+    await pause(page, 1_000)
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('KeyA')
+    await page.keyboard.up('Shift')
+    sent('shifted', { text: 'A' })
+    await pause(page, 1_500)
+    sent('done')
+  })
+})
