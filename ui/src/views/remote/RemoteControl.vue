@@ -223,6 +223,10 @@
         aria-live="polite"
       >
         <span v-if="metrics.codec" class="stats-pill">{{ statsCodecLabel }}</span>
+        <!-- FR-93 P2 — the Linux capture arm, under the codec toggle: DRM and
+             mutter capture without asking anyone, and the operator can see
+             that they did. Absent on Windows, macOS and older agents. -->
+        <span v-if="metrics.codec && statsCaptureLabel" class="stats-pill">{{ statsCaptureLabel }}</span>
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
@@ -1917,6 +1921,7 @@ import {
   resolutionCapAnnotation,
   resolutionOverrideHint,
   codecLabelFromDecoderConfig,
+  captureArmLabel,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3523,6 +3528,9 @@ const statsBitrateLabel = computed(() => {
  *  window), measured against the agent's clock via the rc:clock probe.
  *  Covers encode-output → send queue → network → decode → paint; the
  *  agent-side capture+encode (~10–15 ms) sits before the stamp. */
+/** FR-93 P2 — which Linux arm captures this session, and whether anyone at
+ *  the screen was asked. `''` (no pill) for Windows, macOS and older agents. */
+const statsCaptureLabel = computed(() => captureArmLabel(rc.videoInfo.value))
 const statsAgeLabel = computed(() => {
   const age = rc.decodeDiag.value?.age
   if (!age || age.n <= 0) return ''
