@@ -15,8 +15,8 @@
 //! | member | the source's answer and events | a copy off the source's chain set aside past the point both hold; then each event's blobs asked for and kept, the event applied through the store's chain check, each frame acked once on disk, and the tip reported to the server as it moves |
 //! | either | the server's `rc:hive.replica.close`, the connection's end, or the grant's | the endpoint, its socket and its allocation or route go, and the server is told why |
 //!
-//! This build does not advertise `hive-stream` yet: the member's wants,
-//! which ask the server for a grant, come with it (P2d-3b).
+//! A member asks for each stream it follows ([`super::follow`], P2d-3b), and
+//! a build carries both sides from then on, advertising `hive-stream`.
 //!
 //! ⚠️ What a member holds of these streams in memory is bounded across all of
 //! them, by this device's budgets for event bytes and blob bytes
@@ -94,7 +94,7 @@ const MAX_HELD_CANDIDATES: usize = 16;
 /// The most streams this device follows at once, as a member. Each holds a
 /// UDP socket, and on the relay rung an allocation; a dial past it is closed
 /// `busy`.
-const MAX_FOLLOWING: usize = 32;
+pub(super) const MAX_FOLLOWING: usize = 32;
 /// P2d-3 — the event bytes a source sends past the member's last ack before
 /// it waits for the next: enough to keep a path busy, and all a member that
 /// stopped reading leaves unread on its connection, well under the
@@ -153,6 +153,16 @@ pub(crate) struct Stream {
     /// the member.
     blobs: u64,
     task: tokio::task::AbortHandle,
+}
+
+impl Stream {
+    /// P2d-3b — whether the member's stream got past its opening exchange:
+    /// its rung carried, whatever ended it after.
+    fn answered(&self) -> bool {
+        self.answer
+            .as_ref()
+            .is_some_and(|a| !matches!(a, SourceMsg::Refused { .. }))
+    }
 }
 
 /// `rc:hive.replica.grant`, as the source reads it.
@@ -842,7 +852,7 @@ impl Supervisor {
     /// This device's DERP mux, the primary org's: the one Hive streams ride,
     /// as every Hive frame is the primary org's. `None` without the overlay
     /// features, or while the overlay is down.
-    fn derp_handle(&self) -> Option<DerpTunnelHandle> {
+    pub(super) fn derp_handle(&self) -> Option<DerpTunnelHandle> {
         #[cfg(test)]
         if let Some(forced) = self
             .derp_for_tests
@@ -942,8 +952,9 @@ impl Supervisor {
                 }
                 MemberMsg::Hello { fence, .. } if *fence != g.fence => (refuse("wrong_fence"), 0),
                 MemberMsg::Hello { tip, .. } => {
+                    let live = self.session_live(g.session_id);
                     let answer = match &self.store {
-                        Ok(store) => match store.answer_hello(hello.clone()).await {
+                        Ok(store) => match store.answer_hello(hello.clone(), live).await {
                             Ok(a) => a,
                             Err(e) => SourceMsg::Refused {
                                 reason: format!("the store could not answer: {e}"),
@@ -975,7 +986,7 @@ impl Supervisor {
             // P2d-3 — the events from where the opening exchange left the
             // member: its own tip, or the point both hold.
             let from = match &answer {
-                SourceMsg::Diverged { at } => at.seq,
+                SourceMsg::Diverged { at, .. } => at.seq,
                 _ => member_tip,
             };
             let Ok(store) = &self.store else {
@@ -1122,9 +1133,17 @@ impl Supervisor {
         if !primary {
             return self.report_close(d.grant_id, "secondary_org");
         }
+        // P2d-3b — the gate that survives a compromised server: a copy is
+        // followed only while the owner lets this device hold copies.
+        if !self.cfg.replica {
+            return self.report_close(d.grant_id, "replica_disabled");
+        }
         let path = match d.path {
             Some(p) => p,
-            None => return self.report_close(d.grant_id, "path_unavailable"),
+            None => {
+                self.on_dial_dropped(d.session_id, "path_unavailable");
+                return self.report_close(d.grant_id, "path_unavailable");
+            }
         };
         let grant_id = d.grant_id;
         let session_id = d.session_id;
@@ -1135,6 +1154,7 @@ impl Supervisor {
         }
         if streams.values().filter(|s| s.role == Role::Member).count() >= MAX_FOLLOWING {
             drop(streams);
+            self.on_dial_dropped(session_id, "busy");
             return self.report_close(grant_id, "busy");
         }
         let sup = Arc::clone(self);
@@ -1155,6 +1175,9 @@ impl Supervisor {
                 task: task.abort_handle(),
             },
         );
+        drop(streams);
+        // P2d-3b — the ask for this session has its answer: followed.
+        self.on_dialed(session_id, grant_id);
     }
 
     /// The member's side of one stream, by the grant's life at most.
@@ -1240,12 +1263,26 @@ impl Supervisor {
             }
             // P2d-3 — a copy off the source's chain is set aside past the
             // point both hold before it takes the source's events.
-            if let SourceMsg::Diverged { at } = &answer
+            if let SourceMsg::Diverged { at, .. } = &answer
                 && let Err(why) = set_aside(store, &sid, &hello, at).await
             {
                 return ended_by(&conn, "source", "source_closed", why);
             }
-            self.follow_events(store, &conn, send, recv, d, &sid).await
+            // P2d-3b — a session over on the source is followed only until
+            // the copy holds all of it: where the source's chain ends.
+            let until = match &answer {
+                SourceMsg::Hello {
+                    tip, live: false, ..
+                } => Some(tip.seq),
+                SourceMsg::Diverged {
+                    tip: Some(tip),
+                    live: false,
+                    ..
+                } => Some(tip.seq),
+                _ => None,
+            };
+            self.follow_events(store, &conn, send, recv, d, &sid, until)
+                .await
         })
         .await;
         // P2d-3 — where the copy ends now, whatever ended the stream, the
@@ -1260,6 +1297,11 @@ impl Supervisor {
     /// once all of it is on disk; the tip reported to the server as it
     /// moves. Until the source lets the connection go or sends what it may
     /// not, or the grant ends (the caller's deadline).
+    ///
+    /// P2d-3b — `until`: a session over on the source ends at that seq, and
+    /// the member lets the stream go (`caught_up`) once its copy holds it,
+    /// at once when it does already: nothing more will be appended.
+    #[allow(clippy::too_many_arguments)]
     async fn follow_events(
         &self,
         store: &StoreHandle,
@@ -1268,9 +1310,21 @@ impl Supervisor {
         mut recv: RecvStream,
         d: &Dial,
         sid: &str,
+        until: Option<u64>,
     ) -> String {
         let (moved, moves) = watch::channel(());
         let applying = async {
+            if let Some(end) = until {
+                let held = store
+                    .chain_tip(sid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or(0, |t| t.seq);
+                if held >= end {
+                    return "caught_up".to_string();
+                }
+            }
             loop {
                 let frame: SourceMsg = match read_frame(&mut recv).await {
                     Ok(f) => f,
@@ -1294,12 +1348,15 @@ impl Supervisor {
                         Err(why) => return why,
                     }
                 }
-                if let Some(tip) = tip
-                    && write_frame(&mut send, &wire::ack_of(&tip)).await.is_err()
-                {
-                    return "closed".to_string();
+                if let Some(tip) = tip {
+                    if write_frame(&mut send, &wire::ack_of(&tip)).await.is_err() {
+                        return "closed".to_string();
+                    }
+                    let _ = moved.send(());
+                    if until.is_some_and(|end| tip.seq >= end) {
+                        return "caught_up".to_string();
+                    }
                 }
-                let _ = moved.send(());
             }
         };
         let reason = tokio::select! {
@@ -1448,6 +1505,19 @@ impl Supervisor {
         std::future::pending().await
     }
 
+    /// P2d-3b — whether `session` is not over on this device: it runs here,
+    /// or its hosted record will resume it here. What a source tells its
+    /// member: a member caught up with a session that is over lets go.
+    pub(super) fn session_live(&self, session: ObjectId) -> bool {
+        self.holds_live(session)
+            || self
+                .hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&session.to_hex())
+                .is_some()
+    }
+
     /// P2d-3 — one more blob carried on `grant_id`'s stream.
     fn count_blob(&self, grant_id: ObjectId) {
         if let Some(s) = self
@@ -1544,7 +1614,8 @@ impl Supervisor {
     }
 
     /// A stream's task ended on its own: forget it, and tell the server why.
-    fn stream_ended(&self, grant_id: ObjectId, reason: &str) {
+    /// A member's own follow hears it too (P2d-3b).
+    fn stream_ended(self: &Arc<Self>, grant_id: ObjectId, reason: &str) {
         let gone = self
             .streams
             .lock()
@@ -1556,6 +1627,9 @@ impl Supervisor {
                 answer = ?s.answer, "hive stream: ended"
             );
             self.report_close(grant_id, reason);
+            if s.role == Role::Member {
+                self.on_stream_over(s.session_id, grant_id, reason, s.answered());
+            }
         }
     }
 
@@ -1583,7 +1657,7 @@ impl Supervisor {
     /// The server's `rc:hive.replica.close`: the stream ends here at once,
     /// its endpoint still being stood up or not, and nothing is said back
     /// (the server already forgot the grant).
-    pub(super) fn close_stream(&self, grant_id: ObjectId, reason: &str) {
+    pub(super) fn close_stream(self: &Arc<Self>, grant_id: ObjectId, reason: &str) {
         let gone = self
             .streams
             .lock()
@@ -1592,6 +1666,11 @@ impl Supervisor {
         if let Some(s) = gone {
             s.task.abort();
             info!(grant = %grant_id, session = %s.session_id, role = ?s.role, %reason, "hive stream: closed by the server");
+            // P2d-3b — a member's own follow hears it, in the server's word:
+            // `member_left` stops it, any other is a stream's end.
+            if s.role == Role::Member {
+                self.on_stream_over(s.session_id, grant_id, reason, s.answered());
+            }
         }
     }
 
@@ -1636,6 +1715,32 @@ impl Supervisor {
             .unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
+    /// P2d-3b — `session` hosted here, as one that runs or will resume: a
+    /// source that holds it says it is live.
+    #[cfg(all(test, unix))]
+    pub(super) fn host_for_tests(&self, session: ObjectId) {
+        self.hosted.lock().unwrap_or_else(|e| e.into_inner()).put(
+            crate::hive::hosted::HostedSession {
+                session: session.to_hex(),
+                fence: 1,
+                harness: "claude-code".into(),
+                harness_session: "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f70".into(),
+                folder: "/tmp".into(),
+                account: "dev".into(),
+                starter: ObjectId::new().to_hex(),
+                starter_email: String::new(),
+                turns: 0,
+                running: None,
+                approvals: Vec::new(),
+                resumed_at: None,
+                quick_resumes: 0,
+                harness_pid: None,
+                harness_started: None,
+                replicated: true,
+            },
+        );
+    }
+
     /// The blobs `grant_id`'s stream carried so far: sent, as the source;
     /// kept, as the member. `None` once the stream is over.
     #[cfg(all(test, unix))]
@@ -1660,7 +1765,7 @@ impl Supervisor {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::super::tests::{Rig, rig};
+    use super::super::tests::{Rig, rig, rig_with};
     use super::*;
     use roomler_hive_node::checkpoint::{Checkpoint, snapshot_whole};
     use roomler_hive_node::{GENESIS, TranscriptEvent};
@@ -1747,8 +1852,17 @@ mod tests {
         }
     }
 
-    /// The `ready` a grant is answered with, as the server hears it.
+    /// The `ready` a grant is answered with, as the server hears it. The
+    /// source hosts the session, so says it is live (P2d-3b): its member
+    /// follows on past the catch-up, as every stream did before.
     async fn ready_of(src: &Rig, g: Grant, primary: bool) -> ClientMsg {
+        src.sup.host_for_tests(g.session_id);
+        ready_as_is(src, g, primary).await
+    }
+
+    /// [`ready_of`], the source hosting nothing of its own accord: a session
+    /// over there, unless the test hosted it.
+    async fn ready_as_is(src: &Rig, g: Grant, primary: bool) -> ClientMsg {
         let (tx, mut rx) = mpsc::channel(4);
         src.sup.take_grant(g, primary, tx);
         tokio::time::timeout(Duration::from_secs(15), rx.recv())
@@ -1819,12 +1933,34 @@ mod tests {
         );
     }
 
-    /// The source serves `g`, and the member is told to dial it with
-    /// `token`.
+    /// A device whose owner lets it hold copies (`hive_replica`): a member.
+    /// Its connection does not start following on its own (P2d-3b): a test
+    /// drives that itself, so the connection's asks never race the test's.
+    fn member_rig() -> Rig {
+        rig_with(
+            true,
+            4,
+            |c| c.replica = true,
+            |s| s.without_follow_at_connect(),
+        )
+    }
+
+    /// The source serves `g`, a session live there, and the member is told
+    /// to dial it with `token`.
     async fn served_on(src: &Rig, mem: &Rig, g: Grant, token: &str) -> ObjectId {
         let ids = (g.grant_id, g.session_id, g.path);
         let ice = g.ice_servers.clone();
         let ready = ready_of(src, g, true).await;
+        dial(mem, ids, ready, token, ice);
+        ids.0
+    }
+
+    /// [`served_on`], the source hosting nothing of its own accord: a
+    /// session over there, unless the test hosted it.
+    async fn served_as_is(src: &Rig, mem: &Rig, g: Grant, token: &str) -> ObjectId {
+        let ids = (g.grant_id, g.session_id, g.path);
+        let ice = g.ice_servers.clone();
+        let ready = ready_as_is(src, g, true).await;
         dial(mem, ids, ready, token, ice);
         ids.0
     }
@@ -1925,7 +2061,7 @@ mod tests {
     #[tokio::test]
     async fn a_member_dials_its_source_and_hears_where_its_copy_stands() {
         let mut src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one", "two"]);
         let tip = src.store.chain_tip(&sid.to_hex()).await.unwrap().unwrap();
@@ -1940,6 +2076,7 @@ mod tests {
                     seq: tip.seq,
                     hash: hex::encode(tip.hash),
                 },
+                live: true,
             },
             "an empty copy is a prefix"
         );
@@ -1960,7 +2097,7 @@ mod tests {
     async fn a_member_follows_its_source_over_two_turn_allocations() {
         let (_turn, ice) = loopback_turn().await;
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one", "two"]);
         let tip = src.store.chain_tip(&sid.to_hex()).await.unwrap().unwrap();
@@ -1981,6 +2118,7 @@ mod tests {
                     seq: tip.seq,
                     hash: hex::encode(tip.hash),
                 },
+                live: true,
             },
             "over both allocations"
         );
@@ -1995,7 +2133,7 @@ mod tests {
     async fn without_its_permission_the_members_initials_never_arrive() {
         let (_turn, ice) = loopback_turn().await;
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2022,7 +2160,7 @@ mod tests {
     async fn a_candidate_before_the_allocation_is_permitted_when_it_lands() {
         let (_turn, ice) = loopback_turn().await;
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2030,6 +2168,8 @@ mod tests {
         let mut g = grant(sid, HiveStreamPath::Relay);
         g.ice_servers = ice.clone();
         let ids = (g.grant_id, g.session_id, g.path);
+        // Live there, so the member follows on past its catch-up.
+        src.sup.host_for_tests(sid);
         let (tx, mut rx) = mpsc::channel(4);
         src.sup.take_grant(g, true, tx);
         // One thread, nothing awaited yet: the grant's task has not run.
@@ -2114,7 +2254,7 @@ mod tests {
     async fn a_member_follows_its_source_over_derp() {
         let (on_src, on_mem) = derp_pair();
         let src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         src.sup.use_derp_for_tests(Some(on_src.clone()));
         mem.sup.use_derp_for_tests(Some(on_mem.clone()));
         let sid = ObjectId::new();
@@ -2143,6 +2283,7 @@ mod tests {
                     seq: tip.seq,
                     hash: hex::encode(tip.hash),
                 },
+                live: true,
             },
             "over DERP"
         );
@@ -2158,7 +2299,7 @@ mod tests {
     async fn streams_between_one_pair_carry_at_once_beside_its_tunnel() {
         let (on_src, on_mem) = derp_pair();
         let src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         src.sup.use_derp_for_tests(Some(on_src.clone()));
         mem.sup.use_derp_for_tests(Some(on_mem.clone()));
         // What a `quic-derp-v1` tunnel between the same two devices holds.
@@ -2205,7 +2346,7 @@ mod tests {
     #[tokio::test]
     async fn a_derp_grant_or_dial_this_device_cannot_carry_is_refused() {
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         src.sup.use_derp_for_tests(None);
         mem.sup.use_derp_for_tests(None);
         let sid = ObjectId::new();
@@ -2266,7 +2407,7 @@ mod tests {
     #[tokio::test]
     async fn a_tail_of_the_current_fence_is_never_set_aside() {
         let mut src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one", "two"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2293,7 +2434,7 @@ mod tests {
     #[tokio::test]
     async fn a_tail_a_promotion_cut_off_is_set_aside_for_the_sources() {
         let src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         let sid = ObjectId::new();
         let s = sid.to_hex();
         note(&src, sid, &["shared"]);
@@ -2327,7 +2468,12 @@ mod tests {
                 at: Mark {
                     seq: 2,
                     hash: hex::encode(common.hash()),
-                }
+                },
+                tip: Some(Mark {
+                    seq: end.seq,
+                    hash: hex::encode(end.hash),
+                }),
+                live: true,
             },
             "past the newest checkpoint both hold"
         );
@@ -2340,7 +2486,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_token_is_turned_away_before_any_hello() {
         let mut src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2442,7 +2588,7 @@ mod tests {
     #[tokio::test]
     async fn a_grant_or_dial_held_already_is_not_taken_twice() {
         let mut src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2480,7 +2626,7 @@ mod tests {
     /// `busy`, and nothing is dialed.
     #[tokio::test]
     async fn a_member_follows_at_most_its_limit() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         // A socket that takes the member's packets and answers none.
@@ -2527,7 +2673,7 @@ mod tests {
     #[tokio::test]
     async fn every_side_ends_with_its_grant() {
         let mut src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
@@ -2575,7 +2721,7 @@ mod tests {
     #[tokio::test]
     async fn a_dial_for_a_session_not_joined_is_closed_unasked() {
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["one"]);
         let grant_id = served(&src, &mem, sid, TOKEN).await;
@@ -2592,7 +2738,7 @@ mod tests {
     /// and one on a rung this build cannot name.
     #[tokio::test]
     async fn a_dial_this_device_does_not_follow_is_closed_unasked() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let dial = |path| Dial {
@@ -2627,7 +2773,7 @@ mod tests {
     /// member has nothing to allocate on.
     #[tokio::test]
     async fn a_relay_dial_without_a_turn_server_is_closed() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let grant_id = ObjectId::new();
@@ -2660,7 +2806,7 @@ mod tests {
     /// at once, and send nothing either way.)
     #[tokio::test]
     async fn a_dial_to_nowhere_a_source_could_be_is_closed() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let grant_id = ObjectId::new();
@@ -2977,7 +3123,7 @@ mod tests {
     #[tokio::test]
     async fn a_member_catches_up_then_follows_the_live_tail() {
         let src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         let texts: Vec<String> = (0..wire::MAX_BATCH + 20)
             .map(|i| format!("note {i}"))
@@ -3019,7 +3165,7 @@ mod tests {
     #[tokio::test]
     async fn a_checkpoints_blobs_are_asked_for_and_kept_before_it() {
         let src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         let sid = ObjectId::new();
         let s = sid.to_hex();
         note(&src, sid, &["before"]);
@@ -3055,7 +3201,7 @@ mod tests {
     #[tokio::test]
     async fn a_checkpoint_whose_blob_never_comes_is_never_applied() {
         let mut src = rig(true, 4);
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         note(&src, sid, &["before"]);
         checkpoint(&src, sid, &[b"never kept".as_slice()], false).await;
@@ -3084,7 +3230,7 @@ mod tests {
     #[tokio::test]
     async fn two_streams_of_one_session_carry_it_at_once() {
         let src = rig(true, 4);
-        let mem = rig(true, 4);
+        let mem = member_rig();
         let sid = ObjectId::new();
         let texts: Vec<String> = (0..200).map(|i| format!("note {i}")).collect();
         note(
@@ -3182,13 +3328,14 @@ mod tests {
     /// store's word.
     #[tokio::test]
     async fn an_event_off_the_chain_is_refused_and_nothing_of_it_kept() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
         let hello = SourceMsg::Hello {
             v: wire::STREAM_V,
             tip: Mark::genesis(),
+            live: true,
         };
         write_frame(&mut send, &hello).await.unwrap();
         let mut env = EventEnvelope::next(&sid.to_hex(), None, 1, 0, &said("forged"));
@@ -3206,7 +3353,7 @@ mod tests {
     /// the checkpoint naming them is not applied.
     #[tokio::test]
     async fn a_blob_not_as_asked_ends_the_stream() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let (snap, _) = snapshot_whole("f", 0o600, b"asked for", None);
@@ -3229,6 +3376,7 @@ mod tests {
             let hello = SourceMsg::Hello {
                 v: wire::STREAM_V,
                 tip: Mark::genesis(),
+                live: true,
             };
             write_frame(&mut send, &hello).await.unwrap();
             send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -3260,7 +3408,7 @@ mod tests {
     /// copy back, even a tail the store would let it set aside.
     #[tokio::test]
     async fn a_diverged_point_the_member_never_named_moves_nothing() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         let s = sid.to_hex();
         mem.store.join(&s, "owner", 1).await.unwrap();
@@ -3274,9 +3422,16 @@ mod tests {
             seq: 1,
             hash: hex::encode(first.hash()),
         };
-        write_frame(&mut send, &SourceMsg::Diverged { at })
-            .await
-            .unwrap();
+        write_frame(
+            &mut send,
+            &SourceMsg::Diverged {
+                at,
+                tip: None,
+                live: true,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             close_of(&mut mem, grant_id).await.as_deref(),
             Some("bad_answer"),
@@ -3289,13 +3444,14 @@ mod tests {
     /// listing, before a byte of it is read.
     #[tokio::test]
     async fn an_event_announced_past_the_limit_is_refused_unread() {
-        let mut mem = rig(true, 4);
+        let mut mem = member_rig();
         let sid = ObjectId::new();
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
         let hello = SourceMsg::Hello {
             v: wire::STREAM_V,
             tip: Mark::genesis(),
+            live: true,
         };
         write_frame(&mut send, &hello).await.unwrap();
         let listing = SourceMsg::Events {
@@ -3312,5 +3468,403 @@ mod tests {
             close_of(&mut mem, grant_id).await.as_deref(),
             Some("bad_frame")
         );
+    }
+
+    use super::super::follow::Phase;
+
+    /// P2d-3b — the next `rc:hive.replica.want` the rig's device sends for
+    /// `sid` on `path`, any other skipped, or `None` within 5 s: its fence,
+    /// its seq and the key it names.
+    async fn want_on(
+        r: &mut Rig,
+        sid: ObjectId,
+        path: HiveStreamPath,
+    ) -> Option<(u64, u64, Option<String>)> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, r.reports.recv())
+                .await
+                .ok()?
+                .expect("the reporter is open");
+            if let ClientMsg::HiveReplicaWant {
+                session_id,
+                fence,
+                seq,
+                path: Some(p),
+                derp_pubkey,
+                ..
+            } = msg
+                && session_id == sid
+                && p == path
+            {
+                return Some((fence, seq, derp_pubkey));
+            }
+        }
+    }
+
+    /// Whether the rig's device asks for `sid` at all within `within`.
+    async fn asks_within(r: &mut Rig, sid: ObjectId, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, r.reports.recv()).await {
+            if let ClientMsg::HiveReplicaWant { session_id, .. } = msg
+                && session_id == sid
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `sid`'s follow once it is `phase`, within 5 s.
+    async fn phase_of(r: &Rig, sid: ObjectId, phase: Phase) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if r.sup.follow_phase(sid) == Some(phase) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{sid}'s follow never became {phase:?}: {:?}",
+                r.sup.follow_phase(sid)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P2d-3b — each copy held asks for its stream from the top of the
+    /// ladder, naming its fence and where the copy ends.
+    #[tokio::test]
+    async fn each_copy_held_asks_for_its_stream_from_the_top() {
+        let mut mem = member_rig();
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        mem.store.join(&a.to_hex(), "owner", 3).await.unwrap();
+        mem.store.join(&b.to_hex(), "archive", 4).await.unwrap();
+        put(&mem, b, 4, said("held already"));
+        mem.sup.follow_all().await;
+        let mut asked = HashMap::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while asked.len() < 2 {
+            let msg = tokio::time::timeout_at(deadline, mem.reports.recv())
+                .await
+                .expect("an ask for each copy within 5 s")
+                .expect("the reporter is open");
+            if let ClientMsg::HiveReplicaWant {
+                session_id,
+                fence,
+                seq,
+                path,
+                derp_pubkey,
+                ..
+            } = msg
+            {
+                asked.insert(session_id, (fence, seq, path, derp_pubkey));
+            }
+        }
+        assert_eq!(
+            asked.get(&a),
+            Some(&(3, 0, Some(HiveStreamPath::Direct), None)),
+            "a copy that holds nothing yet"
+        );
+        assert_eq!(
+            asked.get(&b),
+            Some(&(4, 1, Some(HiveStreamPath::Direct), None)),
+            "a copy that ends at its first event"
+        );
+    }
+
+    /// P2d-3b — the ladder: each rung that does not carry, a rung down, the
+    /// floor naming this device's DERP key; past the bottom, a wait, then
+    /// the top again. Never ratchet.
+    #[tokio::test]
+    async fn the_ladder_climbs_down_and_back_to_the_top() {
+        use HiveStreamPath::{Derp, Direct, Relay};
+        let mut mem = member_rig();
+        let (here, _there) = derp_pair();
+        let key = here.self_pubkey_hex.clone();
+        mem.sup.use_derp_for_tests(Some(here));
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some(), "the top");
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(want_on(&mut mem, sid, Relay).await.is_some(), "a rung down");
+        mem.sup
+            .on_refused(sid, 1, Some(Relay), Some(HiveStreamRefusal::NoAnswer));
+        let (_, _, named) = want_on(&mut mem, sid, Derp).await.expect("the floor");
+        assert_eq!(named, Some(key), "naming this device's own key");
+        mem.sup
+            .on_refused(sid, 1, Some(Derp), Some(HiveStreamRefusal::PathUnavailable));
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Waiting),
+            "past the bottom, a wait"
+        );
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "then the top again"
+        );
+    }
+
+    /// P2d-3b — a refusal that says "not now" waits, and asks again on the
+    /// same rung.
+    #[tokio::test]
+    async fn a_refusal_that_says_later_asks_again_on_the_same_rung() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(want_on(&mut mem, sid, Relay).await.is_some());
+        mem.sup
+            .on_refused(sid, 1, Some(Relay), Some(HiveStreamRefusal::SourceOffline));
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Waiting));
+        assert!(
+            want_on(&mut mem, sid, Relay).await.is_some(),
+            "the same rung, after a wait"
+        );
+    }
+
+    /// P2d-3b — a member the server says is none asks no more, until a join;
+    /// and a refusal for no ask in flight (another rung, another fence)
+    /// moves nothing.
+    #[tokio::test]
+    async fn a_member_told_it_is_none_asks_no_more_until_a_join() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        mem.sup
+            .on_refused(sid, 1, Some(Relay), Some(HiveStreamRefusal::NotAMember));
+        mem.sup
+            .on_refused(sid, 2, Some(Direct), Some(HiveStreamRefusal::NotAMember));
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Wanting(Direct)),
+            "neither was the answer to the ask in flight"
+        );
+        mem.sup
+            .on_refused(sid, 1, Some(Direct), Some(HiveStreamRefusal::NotAMember));
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Stopped));
+        assert!(
+            !asks_within(&mut mem, sid, Duration::from_millis(700)).await,
+            "no more asks"
+        );
+        mem.sup.follow_joined(sid, 2);
+        assert_eq!(
+            want_on(&mut mem, sid, Direct).await.map(|w| w.0),
+            Some(2),
+            "a join starts it again, at its fence"
+        );
+    }
+
+    /// P2d-3b — a stream that never got past its opening exchange asks a
+    /// rung down; one that carried, from the top. The end of a stream that
+    /// is not the one followed moves nothing.
+    #[tokio::test]
+    async fn a_stream_that_did_not_carry_asks_a_rung_down() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        let (g1, g2, g3) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        mem.sup.on_dialed(sid, g1);
+        mem.sup.on_stream_over(sid, g1, "unreachable", false);
+        assert!(want_on(&mut mem, sid, Relay).await.is_some(), "a rung down");
+        mem.sup.on_dialed(sid, g2);
+        mem.sup.on_dialed(sid, g3);
+        mem.sup.on_stream_over(sid, g2, "expired", true);
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Following(g3)),
+            "an older stream's end"
+        );
+        mem.sup.on_stream_over(sid, g3, "expired", true);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "one that carried: from the top"
+        );
+    }
+
+    /// P2d-3b — a copy of a session that is over on its source lets the
+    /// stream go once it holds all of it, and the session is parked: asked
+    /// for no more.
+    #[tokio::test]
+    async fn a_copy_of_a_session_over_is_parked_once_whole() {
+        let mut src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two", "three"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .is_some()
+        );
+        // The server's half, played here: the source hosts nothing of it.
+        let grant_id = served_as_is(&src, &mem, grant(sid, HiveStreamPath::Direct), TOKEN).await;
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("caught_up"),
+            "the copy holds all of a session that is over"
+        );
+        assert_eq!(tip(&mem, sid).await, tip(&src, sid).await);
+        phase_of(&mem, sid, Phase::Parked).await;
+        assert_eq!(
+            close_of(&mut src, grant_id).await.as_deref(),
+            Some("member:caught_up"),
+            "and the source hears why"
+        );
+        assert!(
+            !asks_within(&mut mem, sid, Duration::from_millis(700)).await,
+            "asked for no more"
+        );
+    }
+
+    /// P2d-3b — a copy of a session still live on its source follows on,
+    /// whole or not.
+    #[tokio::test]
+    async fn a_live_session_is_followed_on_once_whole() {
+        let src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .is_some()
+        );
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(mem.sup.holds_stream(grant_id), "still following");
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(grant_id)));
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2d-3b — the server's `member_left` stops a follow.
+    #[tokio::test]
+    async fn a_member_let_go_stops_following() {
+        let src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .is_some()
+        );
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        phase_of(&mem, sid, Phase::Following(grant_id)).await;
+        mem.sup.close_stream(grant_id, "member_left");
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Stopped));
+        assert!(!asks_within(&mut mem, sid, Duration::from_millis(700)).await);
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2d-3b — at most [`MAX_FOLLOWING`] copies are asked for or followed
+    /// at once; the rest wait their turn, and take the first slot freed.
+    #[tokio::test]
+    async fn as_many_are_asked_for_as_may_be_and_the_rest_wait() {
+        let mem = member_rig();
+        let sessions: Vec<ObjectId> = (0..=MAX_FOLLOWING).map(|_| ObjectId::new()).collect();
+        for s in &sessions {
+            mem.store.join(&s.to_hex(), "archive", 1).await.unwrap();
+        }
+        mem.sup.follow_all().await;
+        let phases: Vec<Option<Phase>> =
+            sessions.iter().map(|s| mem.sup.follow_phase(*s)).collect();
+        let queued: Vec<ObjectId> = sessions
+            .iter()
+            .zip(&phases)
+            .filter(|(_, p)| **p == Some(Phase::Queued))
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(queued.len(), 1, "one waits its turn: {phases:?}");
+        assert_eq!(
+            phases
+                .iter()
+                .filter(|p| matches!(p, Some(Phase::Wanting(_))))
+                .count(),
+            MAX_FOLLOWING
+        );
+        let first = sessions
+            .iter()
+            .find(|s| matches!(mem.sup.follow_phase(**s), Some(Phase::Wanting(_))))
+            .copied()
+            .unwrap();
+        mem.sup.on_refused(
+            first,
+            1,
+            Some(HiveStreamPath::Direct),
+            Some(HiveStreamRefusal::SourceOffline),
+        );
+        phase_of(&mem, queued[0], Phase::Wanting(HiveStreamPath::Direct)).await;
+    }
+
+    /// P2d-3b — the primary organization's connection starts following each
+    /// copy held, as a device's does when it comes back; a device whose
+    /// owner holds no copies asks for none.
+    #[tokio::test]
+    async fn a_connection_follows_each_copy_held() {
+        for (replica, asks) in [(true, true), (false, false)] {
+            let r = rig_with(true, 4, |c| c.replica = replica, |s| s);
+            let sid = ObjectId::new();
+            r.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+            let (tx, mut reports) = mpsc::channel(64);
+            r.sup.connected(tx);
+            let deadline = Instant::now() + Duration::from_millis(if asks { 5000 } else { 700 });
+            let mut asked = false;
+            while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, reports.recv()).await {
+                if let ClientMsg::HiveReplicaWant { session_id, .. } = msg
+                    && session_id == sid
+                {
+                    asked = true;
+                    break;
+                }
+            }
+            assert_eq!(asked, asks, "hive_replica {replica}");
+        }
+    }
+
+    /// P2d-3b — a device whose owner holds no copies (`hive_replica` off)
+    /// follows no dial, whatever the server says: the gate that survives a
+    /// compromised server.
+    #[tokio::test]
+    async fn a_device_that_holds_no_copies_follows_no_dial() {
+        let src = rig(true, 4);
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        note(&src, sid, &["one"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("replica_disabled")
+        );
+        assert!(!mem.sup.holds_stream(grant_id));
+        src.sup.close_stream(grant_id, "test");
     }
 }
