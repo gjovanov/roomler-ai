@@ -1007,13 +1007,14 @@ pub struct AgentConfig {
     #[serde(default)]
     pub wayland_aware: Option<bool>,
     /// FR-93 P2 (decision D1) — a per-user install in a Wayland session,
-    /// with no capture key set, switches its capture on by itself
+    /// with no capture key set, switches capture on by itself
     /// (`ROOMLERD_WAYLAND_AUTO`). Built-in default: **ON**.
     ///
-    /// It tries mutter's own screencast first, which asks nobody (GNOME), then
-    /// the portal, which asks the person at the screen once (KDE renews the
-    /// grant every session). A root (system) install never switches an arm on
-    /// by itself: D1 keeps DRM and uinput opt-in there until a desktop
+    /// The one automatic arm is mutter's own screencast, which asks nobody
+    /// (GNOME). The portal stays opt-in (`portal_capture`) until its attended
+    /// flow can wait for the person at the screen without a new dialog per
+    /// viewer reconnect (FR-93 P2d). A root (system) install never switches an
+    /// arm on by itself: D1 keeps DRM and uinput opt-in there until a desktop
     /// companion ships for non-Debian hosts. Any capture key set, to anything,
     /// takes the choice back. `false` is the kill switch: the behaviour before
     /// P2, unchanged. Restart required.

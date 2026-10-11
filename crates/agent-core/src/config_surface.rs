@@ -1190,7 +1190,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-93 P2 - a PER-USER install in a Wayland session, with no capture key set, switches capture on by itself: mutter's own screencast first (GNOME, ** asks nobody **), then the portal, which asks the person at the screen once. A root (system) install never does: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
+        description: "FR-93 P2 - a PER-USER install in a GNOME Wayland session, with no capture key set, switches on mutter's own screencast by itself (** it asks nobody **). Other desktops keep the portal opt-in (portal_capture). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
     },
     KeyMeta {
         key: "x11_damage",
