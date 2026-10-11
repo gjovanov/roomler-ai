@@ -302,6 +302,37 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// FR-92 P5b — keep busy for the heartbeat, so the device list can show
+/// where it runs and who turned it on. `None` where this process cannot
+/// speak for it: no engine here, or a macOS ROOT daemon — on a supervised Mac
+/// the GUI worker runs keep busy, and the daemon's own engine (no GUI
+/// session, nothing to move) would report a confident, wrong "off". Every
+/// org's loop asks this one process-wide answer, so a secondary org cannot
+/// get it wrong either.
+pub fn brief() -> Option<roomler_ai_remote_control::models::KeepBusyBrief> {
+    SERVICE.get()?;
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+    }
+    Some(brief_of(&snapshot()))
+}
+
+/// The brief a snapshot makes. Pure. The pattern and who set it travel only
+/// while it is on: an "off" row names nobody.
+pub fn brief_of(s: &Snapshot) -> roomler_ai_remote_control::models::KeepBusyBrief {
+    roomler_ai_remote_control::models::KeepBusyBrief {
+        on: s.on,
+        phase: s.phase.wire().to_string(),
+        reason: s.reason.map(|r| r.wire().to_string()),
+        pattern: s.on.then(|| s.settings.pattern.wire().to_string()),
+        set_by: if s.on { s.set_by.clone() } else { None },
+    }
+}
+
 /// A watch of the public state, for the per-session emitters and the
 /// LocalAPI. `None` when the engine is not running on this host.
 pub fn subscribe() -> Option<tokio::sync::watch::Receiver<Snapshot>> {
@@ -798,6 +829,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FR-92 P5b — the device list learns the phase, the reason, and — only
+    /// while it is on — the pattern and who turned it on. An "off" row names
+    /// nobody, whatever the snapshot still carries.
+    #[test]
+    fn the_brief_names_the_pattern_and_who_only_while_on() {
+        let base = Snapshot {
+            rev: 3,
+            available: true,
+            on: true,
+            phase: engine::Phase::Running,
+            reason: None,
+            paused_by: None,
+            resumes_in: None,
+            settings: Settings {
+                pattern: patterns::Pattern::Heart,
+                ..Settings::default()
+            },
+            set_by: Some("Alice".into()),
+            set_at_ms: Some(1),
+            detector: "clock+cursor",
+            warn: Vec::new(),
+        };
+        let b = brief_of(&base);
+        assert!(b.on);
+        assert_eq!(b.phase, "running");
+        assert_eq!(b.reason, None);
+        assert_eq!(b.pattern.as_deref(), Some("heart"));
+        assert_eq!(b.set_by.as_deref(), Some("Alice"));
+
+        let paused = Snapshot {
+            phase: engine::Phase::Paused,
+            reason: Some(Reason::UserActive),
+            ..base.clone()
+        };
+        assert_eq!(brief_of(&paused).reason.as_deref(), Some("user_active"));
+
+        let off = Snapshot {
+            on: false,
+            phase: engine::Phase::Off,
+            reason: Some(Reason::StoppedLocally),
+            ..base
+        };
+        let b = brief_of(&off);
+        assert!(!b.on);
+        assert_eq!(b.reason.as_deref(), Some("stopped_locally"));
+        assert_eq!((b.pattern, b.set_by), (None, None));
     }
 
     #[test]

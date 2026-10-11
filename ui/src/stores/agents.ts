@@ -215,6 +215,19 @@ export interface VideoCell {
   hw: boolean
 }
 
+/** FR-92 P5b — what a device says about its keep busy on each heartbeat. A
+ *  CLAIM by the device, shown, never enforced on. `phase` and `reason` are the
+ *  agent's own wire words; an unknown one from a newer agent is printed as is. */
+export interface KeepBusyBrief {
+  on: boolean
+  phase: string
+  reason?: string
+  /** While on: the pattern drawn. */
+  pattern?: string
+  /** While on: who turned it on. */
+  set_by?: string
+}
+
 export interface Agent {
   id: string
   tenant_id: string
@@ -235,6 +248,10 @@ export interface Agent {
    *  mechanisms on every platform, so `agent_version` moving says nothing
    *  about this one. */
   companion_version?: string
+  /** FR-92 P5b — keep busy as the device last reported it on a heartbeat.
+   *  Absent = the device does not say (no keep busy there, an older agent,
+   *  or a supervised Mac's daemon): unknown, never "off". */
+  keep_busy?: KeepBusyBrief
   /** FR-51 — enrolled as temporary: the server reaps it after silence, and a
    *  clean stop removes it immediately. Removal is FINAL (hard delete) — a
    *  later enrollment is a NEW device. The grid badges it so nobody is

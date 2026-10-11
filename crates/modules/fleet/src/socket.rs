@@ -552,6 +552,7 @@ pub async fn handle_agent_socket(
                                 warm_relay,
                                 companion_version,
                                 caps,
+                                keep_busy,
                                 ..
                             } = &parsed
                             {
@@ -562,6 +563,7 @@ pub async fn handle_agent_socket(
                                     warm_relay.clone(),
                                     companion_version.clone(),
                                     caps.clone(),
+                                    keep_busy.clone(),
                                 ))
                             } else {
                                 None
@@ -576,6 +578,7 @@ pub async fn handle_agent_socket(
                                 warm_relay,
                                 companion_version,
                                 caps,
+                                keep_busy,
                             )) = heartbeat_sessions
                             {
                                 // FR-43 P2c — an agent announces changed
@@ -633,6 +636,7 @@ pub async fn handle_agent_socket(
                                         agent_id,
                                         warm_relay.as_deref(),
                                         companion_version.as_deref(),
+                                        keep_busy.as_ref(),
                                     )
                                     .await
                                 {

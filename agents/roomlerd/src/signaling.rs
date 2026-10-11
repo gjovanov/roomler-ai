@@ -1833,6 +1833,8 @@ async fn connect_once(
                     // on all but one heartbeat in twenty.
                     companion_version: crate::companion::installed_version(),
                     caps,
+                    // FR-92 P5b — where keep busy runs, for the device list.
+                    keep_busy: crate::keep_busy::brief(),
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
