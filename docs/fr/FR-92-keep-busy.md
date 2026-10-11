@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 merged; 0.4.125 released and field-verified 2026-10-11 (§9)
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11) and field-verified (§9); owed: macOS, the tray, 24 h of EDR
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -296,11 +296,17 @@ stateDiagram-v2
   same live state.
 - [ ] **AC2:** while it runs, host idle time stays under 2 s on Windows, macOS and X11, measured. The
   negative control (OFF ⇒ the host locks and Teams goes Away) is recorded first.
-- [ ] **AC3:** local input (move, click, key, scroll) and controller input each pause it within 1 s. It
+- [ ] **AC3:** local input (move, click, scroll, typing) and controller input each pause it within 1 s. It
   resumes after `resume_after`, and never while the screen is locked or a mouse button is held.
+  *Accepted limit (operator, 2026-10-11):* on Windows, a single isolated key tap that lands in the same
+  `GetLastInputInfo` tick (15.6 ms) as one of keep busy's own moves reads as that move and does not
+  pause it (1 of 9 in the field). A second key, a click or any pointer motion does.
 - [ ] **AC4:** it survives a disconnect, a daemon self-update and a reboot (resuming at the same
   person's next login).
-- [ ] **AC5:** `keep_busy_enabled = false` hides and refuses it, and the server cannot change that key.
+- [ ] **AC5:** `keep_busy_enabled = false` withdraws the `keep-busy` cap word, so every surface that reads it
+  hides keep busy; a viewer already connected shows the owner's reason ("Turned off on this computer")
+  instead of a working control; every enable is refused; and the server cannot change that key
+  (reworded 2026-10-11, operator: the connected viewer is told why rather than finding it gone).
 - [ ] **AC6:** an org deny refuses new enables and stops running instances, including on devices that
   reconnect later and across pods.
 - [ ] **AC7:** the tray's Stop and `roomler keep-busy status|off` work, including through a Linux
@@ -406,6 +412,9 @@ Mutter's `GetIdletime` over the person's bus.
 | 24 | Worker types: the user-context worker | Win11 attended install (`worker role probed role=User`) | on ⇒ running in 228 ms; **69 samples before the touch, session idle max 32 ms**; a real local key paused it ~1 s later, and it resumed after 10.1 s. The store is the person's own `%LOCALAPPDATA%\roomler\roomler\data\keep-busy.json` (its owner reads `BUILTIN\Administrators`: the default owner of the worker's elevated token; access is the profile's inherited ACL) |
 | 25 | AC12 (P8), **prod** `hosted-20261011-a5429ac` | the vmtest org | the admin set the org default to `heart` (200). A FRESH viewer, with nothing remembered for the device, pre-selected `["heart"]`. Reset to `null` afterwards |
 | 26 | AC11 (P7), **prod** | the GNOME Wayland guest | on from the viewer at 09:37:21 ⇒ an `on` row (device, `vmtest admin`, circle) at 09:37:50, the next heartbeat; off at 09:39:08 ⇒ an `off` row (`stopped_by_controller`) at 09:39:20. The org-wide list, newest first: `off` · `org_default_pattern` → null (server, the admin) · `on` · `org_default_pattern` heart (server, the admin) — exactly the four changes made, nothing else |
+| 27 | **The release**: `agent-v0.4.126` + `setup-v0.4.126` → `e5707816e` (#1981) | — | published 13:09:25Z / 13:10:31Z; 28 agent assets with 10 `.asc`; "Resolved MSI ProductVersion: 0.4.126 (from 0.4.126)"; `/api/agent/latest-release` served it at once. The merge tree was byte-identical to the rehearsed tree |
+| 28 | **AC4: a daemon self-update** | Win11 system install on **0.4.125**, keep busy running, no viewer | the agent's own updater: "installer signature verified … signer=G ROX LTD", "spawning installer and exiting current=0.4.125 latest=agent-v0.4.126"; 5 s later 0.4.126 started and **"keep-busy: restored from the per-person store"** (circle, `vmtest admin`) — running again with no viewer: 60 s of session idle, max 47 ms. (A server-pushed update is DROPPED while the device's `auto_update = false`, by design: "update trigger dropped — auto-update is off on this device".) |
+| 29 | **AC9 + AC13 on the release** | a fresh Ubuntu 24.04 GNOME Wayland system install of **0.4.126** (uinput on) | OFF: a real key, then GNOME locked at 60.35 s. ON from the viewer: running in 229 ms; the GNOME host came up 24 ms after "no X display to drive"; **2 min: Mutter idle max 39 ms, no lock**; a real local key paused it at once (`paused_by: local`) and it resumed 10.3 s later |
 
 Wrong turns, recorded so nobody repeats them:
 - **An ephemeral (vmtest) device unenrolls on a clean OS restart.** Windows' servicing
@@ -420,17 +429,17 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), a self-update (AC4,
-the next release), AC9/AC13 on a release (P9 rides 0.4.126), and 24 h of EDR on the corporate
-laptop (AC8). AC11 and AC12 are proven on prod (rows 25–26).
+Still owed: macOS (cell 6 of `docs/keep-busy.md` §14), the tray's Stop (AC7), and 24 h of EDR on
+the corporate laptop (AC8). AC11 and AC12 are proven on prod (rows 25–26); AC4's self-update and
+AC9/AC13 on the released 0.4.126 (rows 28–29).
 
-Two criteria need the operator's wording, not more testing:
-- **AC3** says "local input (… key …) pauses it within 1 s". An isolated single key tap can share a
-  `GetLastInputInfo` tick with an own move and is then invisible on Windows (1 of 9 in the field);
-  typing, clicks, the mouse and a held button are always caught. Accept it as documented, or reword.
-- **AC5** says "hides". The device withdraws the cap word (every surface that reads it hides keep
-  busy), but a connected viewer shows the control disabled with the owner's reason — by the P2
-  design, so a controller is told why rather than finding it gone.
+AC3 and AC5 were reworded on the operator's go (2026-10-11, "proceed per your recommendation"):
+- **AC3** keeps "within 1 s" for moves, clicks, scrolls and typing, and states the accepted limit: on
+  Windows, an isolated single key tap that shares a `GetLastInputInfo` tick with an own move is
+  invisible (1 of 9 in the field). Typing, clicks, the mouse and a held button are always caught.
+- **AC5** says what the device does: it withdraws the cap word, so every surface that reads it hides
+  keep busy, and a connected viewer is shown the owner's reason (the P2 design) rather than finding
+  the control gone.
 
 ## 10. Related
 

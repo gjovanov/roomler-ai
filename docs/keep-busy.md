@@ -3,9 +3,10 @@
 > **FR-92** ([#1942](https://github.com/gjovanov/roomler-ai/issues/1942),
 > [spec](fr/FR-92-keep-busy.md)).
 >
-> **Status: released in 0.4.125 and field-verified on Windows 11 and GNOME on
-> Xorg** ([spec §9](fr/FR-92-keep-busy.md#9-field-verification-log)). macOS is
-> still owed.
+> **Status: released (0.4.125; GNOME Wayland in 0.4.126) and field-verified on
+> Windows 11, GNOME on Xorg and GNOME Wayland**, a self-update included
+> ([spec §9](fr/FR-92-keep-busy.md#9-field-verification-log)). macOS is still
+> owed.
 >
 > | Part | What |
 > |---|---|
