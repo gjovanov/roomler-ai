@@ -102,6 +102,18 @@ covers every local address. The agent warns when its port shadows an existing
 one.
 :::
 
+## Remote desktop
+
+| Key | Default | Meaning |
+|---|---|---|
+| `keep_busy_enabled` | **on** | Let a remote-desktop controller with input turn on *keep busy* here: the pointer moves in a pattern so the screensaver, the idle lock and "Away" never come, and any real input — yours or a controller's — pauses it. Off hides it from the viewer, refuses new enables and stops one already running. Your organization can also deny it. Never settable by the server. Applied live |
+
+:::note The one remote-access feature that is on by default
+It only moves the pointer, never clicks or types, and the person at the
+machine always wins: touch the mouse or the keyboard and it stops until you have
+been idle again. Stop it from the tray, or with `roomler keep-busy off`.
+:::
+
 ## Media
 
 | Key | Meaning |
@@ -135,7 +147,7 @@ system-wide. If you are running a probe or a test instance, set
 
 | Applied | Which |
 |---|---|
-| **Live** | `exec_enabled`, most network settings |
+| **Live** | `exec_enabled`, `keep_busy_enabled`, most network settings |
 | **On restart** | The SSH settings — the SSH server splices into the packet path when the mesh is built |
 
 A machine reporting `needs_restart` after a configuration push is telling the
