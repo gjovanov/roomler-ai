@@ -267,8 +267,11 @@ stateDiagram-v2
 - **Gating:** on the cap word and the session's `INPUT` bit; an unavailable or denied state is shown
   with its reason.
 - **Org admin:** a switch in `SettingsSection.vue` beside exec/SSH.
-- **Device list:** a "Keep busy" badge driven by an additive `AgentHeartbeat.keep_busy`. Transitions are
-  audited as an agent *claim*.
+- **Device list (P5b):** a "keep busy · <phase>" chip, shown while it is on, naming the pattern and who
+  turned it on. It is driven by an additive `AgentHeartbeat.keep_busy` (a device *claim*, shown and never
+  enforced on), persisted by `touch_heartbeat`, and **unset** when a device stops saying (an older
+  build, a supervised Mac's root daemon, which cannot speak for its GUI worker). So it reads as
+  unknown, never a stale "on" or an invented "off". A durable transition audit is an open decision (§6).
 
 ## 4. Phases
 
@@ -279,7 +282,7 @@ stateDiagram-v2
 | P2 | Viewer: composable, menu, previews, chip | the cap word | #1949, merged `28fd63c19` |
 | P3 | **P3a, X11**: the X11 host (MIT-SCREEN-SAVER idle clock read as an interval, logind `LockedHint`, RandR ∩ `_NET_WORKAREA`), Xwayland refused from the display itself (`wayland`), the person followed under a root daemon or a SYSTEM worker, proven on Xvfb in CI. **P3b, macOS**: the CoreGraphics host, and the daemon handing every org's policy to the GUI worker | per-host cap word | P3a PR open; P3b next |
 | P4 | LocalAPI verbs (person socket), CLI, companion tray item. Not built: the OS notification (the companion has no notification plugin yet) and the viewing-banner row (the banner shows only during a session; the tray is the persistent surface) | — | #1951, merged `51dfd2466` |
-| P5 | Org deny: tenant key, routes, admin UI; a standing `rc:agent.keep_busy_policy` on every connect and on every change, across pods. No per-session `Request` field (§3f). Forwarding to a supervised Mac's worker moves to P3. Deferred to P5b: the heartbeat brief, the device-list badge, the audit | the org switch (default allowed) | PR open |
+| P5 | Org deny: tenant key, routes, admin UI; a standing `rc:agent.keep_busy_policy` on every connect and on every change, across pods. No per-session `Request` field (§3f). Forwarding to a supervised Mac's worker moves to P3. Deferred to P5b: the heartbeat brief, the device-list badge, the audit | the org switch (default allowed) | #1952, merged `19b1f9fc8`; P5b (the brief + the device-list chip) PR open |
 | P6 | Docs: `docs/keep-busy.md` (mermaid state machine + sequence), a cross-ref from `docs/remote-control.md` §6, the `docs/README.md` row, the configuration reference; the field log | — | — |
 
 ## 5. Acceptance criteria
@@ -312,6 +315,10 @@ stateDiagram-v2
 - **Whether the arbiter should stop caching a `NoopInjector`.** That would harden RC input as well, but
   it changes RC behaviour and needs its own test and field check.
 - **When Wayland ships.** GNOME's Mutter IdleMonitor plus uinput is the likely first path.
+- **A durable audit of keep-busy transitions.** P5b shows the CURRENT state on the device list. A
+  history (who turned it on where, and when) needs its own collection: an index-plan change, a
+  composition re-baseline, and a retention to choose. Until then the agent's log records every
+  on/off with who and why (`keep-busy: turned on`, `org policy received`).
 
 ## 7. Out of scope
 

@@ -716,6 +716,21 @@
               >
                 desktop v{{ a.companion_version }}
               </v-chip>
+              <!-- FR-92 P5b — keep busy, only while it is ON: an org that
+                   denies it, or simply wants to know, can see which devices
+                   are being kept awake and by whom. The device's claim, shown
+                   as such; off or unknown shows nothing. -->
+              <v-chip
+                v-if="a.keep_busy?.on"
+                size="x-small"
+                color="info"
+                variant="tonal"
+                prepend-icon="mdi-cursor-default-gesture-outline"
+                :title="keepBusyBriefTitle(a.keep_busy)"
+                data-testid="agent-keep-busy-chip"
+              >
+                keep busy · {{ a.keep_busy.phase }}
+              </v-chip>
               <v-chip
                 v-for="codec in codecChips(a)"
                 :key="codec.label"
@@ -1501,6 +1516,7 @@ import {
   type EnrollmentToken,
 } from '@/stores/agents'
 import { codecChips, permissionWarnings } from './agentCodecChips'
+import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
