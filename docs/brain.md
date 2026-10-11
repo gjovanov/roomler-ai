@@ -275,7 +275,7 @@ The whole run cost $0.24 in model calls.
 | Piece | Where |
 |---|---|
 | facts, budgets, revisions, snapshots, the routes | [`crates/modules/hive/src/brain.rs`](../crates/modules/hive/src/brain.rs): `reserve` `:376`, `recount` `:451`, `bump_rev` `:503`, `snapshot` `:641`, `may_write` `:785` |
-| the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:233`](../crates/modules/hive/src/lib.rs#L233) |
+| the indexes: facts by instance, one counter per instance, snapshots with a one-day TTL | [`crates/modules/hive/src/lib.rs:252`](../crates/modules/hive/src/lib.rs#L252) |
 | the snapshot at a start, and its re-send | [`routes.rs:397`](../crates/modules/hive/src/routes.rs#L397), [`agent_socket.rs:677`](../crates/modules/hive/src/agent_socket.rs#L677) |
 | the frame | `ServerMsg::HiveMemory` in [`signaling.rs:2886`](../crates/remote_control/src/signaling.rs#L2886); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
 | the device | [`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs): `receive_memory` `:710`, the launch `:1751`, `write_memory` `:2273`, `memory_note` `:2348`; the copy in `WRAPPER` `:93` and, on Windows, [`hive_win.rs:677`](../agents/roomlerd/src/hive_win.rs#L677) `prep` |
