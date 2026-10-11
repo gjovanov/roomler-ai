@@ -345,7 +345,34 @@ async fn attach_once(
                                 "delegation: the daemon's overlay footprint received"
                             );
                         }
-                        Ok(DelegateFrame::FromWorker { .. } | DelegateFrame::WorkerCaps { .. }) => {
+                        // FR-92 — a `roomler keep-busy status|off` reached the
+                        // DAEMON's LocalAPI (a root caller never sees our
+                        // per-user socket), and keep busy runs HERE. Answered
+                        // inline: a status is immediate and an `off` waits at
+                        // most `LOCAL_OFF_WAIT`, well inside the ping cadence.
+                        Ok(DelegateFrame::KeepBusyAsk { id, off }) => {
+                            let info = crate::keep_busy::answer_local(off).await;
+                            tracing::info!(
+                                id,
+                                off,
+                                on = info.on,
+                                phase = %info.phase,
+                                "delegation: answered the daemon's keep-busy question"
+                            );
+                            write_frame(
+                                &mut wr,
+                                &DelegateFrame::KeepBusyTold {
+                                    id,
+                                    info: Box::new(info),
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(
+                            DelegateFrame::FromWorker { .. }
+                            | DelegateFrame::WorkerCaps { .. }
+                            | DelegateFrame::KeepBusyTold { .. },
+                        ) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
                             tracing::warn!("delegation: daemon sent a worker-only frame; ignoring");

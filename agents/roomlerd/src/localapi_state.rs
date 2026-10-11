@@ -211,6 +211,11 @@ pub struct DaemonState {
     /// its pid so a client can tell the relaunched daemon from the one that
     /// left even when Windows hands the new process the old PID.
     started_at_ms: u64,
+    /// FR-92 — on a supervised Mac the GUI WORKER runs keep busy, not this
+    /// root daemon, so the keep-busy verbs ask it over the delegation channel.
+    /// `None` everywhere else, and in the worker itself: there this process's
+    /// own engine is the one that runs.
+    keep_busy_worker: Option<crate::delegate::DelegateHost>,
 }
 
 /// FR-84 D3 — what the `RestartDaemon` verb needs from `run_cmd`: who
@@ -382,7 +387,33 @@ impl DaemonState {
             restart: None,
             // Built once, in `run_cmd`, seconds into the process's life.
             started_at_ms: unix_now_ms(),
+            keep_busy_worker: None,
         }
+    }
+
+    /// FR-92 — answer the keep-busy verbs from the attached GUI worker of a
+    /// supervised Mac. ⚠️ A root caller (`roomler exec <mac> roomler keep-busy
+    /// off`) reaches THIS daemon, never the worker's per-user socket, and the
+    /// daemon's own engine never runs there: before this, a root `off` stopped
+    /// nothing and answered "off" while the worker kept moving the pointer
+    /// (field, 0.4.126). With no worker attached, the verbs answer for this
+    /// process as before.
+    pub fn with_keep_busy_worker(mut self, host: crate::delegate::DelegateHost) -> Self {
+        self.keep_busy_worker = Some(host);
+        self
+    }
+
+    /// FR-92 — a keep-busy verb, answered by the engine that runs keep busy:
+    /// a supervised Mac's attached worker, else this process's own.
+    async fn keep_busy_answer(&self, off: bool) -> tunnel_core::localapi::KeepBusyInfo {
+        if let Some(host) = &self.keep_busy_worker
+            && let Some(info) = host
+                .ask_worker_keep_busy(off, crate::delegate::KEEP_BUSY_ASK_WAIT)
+                .await
+        {
+            return info;
+        }
+        crate::keep_busy::answer_local(off).await
     }
 
     /// FR-84 D3 — attach the restart verb's handle (see [`RestartHandle`]).
@@ -1188,15 +1219,15 @@ impl LocalApiState for DaemonState {
 
     /// FR-92 — keep busy's state, for the tray and `roomler keep-busy`.
     async fn keep_busy_status(&self) -> Response {
-        Response::KeepBusy(crate::keep_busy::local_info(&crate::keep_busy::snapshot()))
+        Response::KeepBusy(self.keep_busy_answer(false).await)
     }
 
     /// FR-92 — the person at the machine stops keep busy. Waits (briefly)
     /// for the engine, so the answer usually already reads "off".
     async fn keep_busy_off(&self) -> Response {
-        let s = crate::keep_busy::stop_locally_and_wait(Duration::from_millis(800)).await;
-        tracing::info!(on = s.on, "localapi: keep busy stopped at this computer");
-        Response::KeepBusy(crate::keep_busy::local_info(&s))
+        let info = self.keep_busy_answer(true).await;
+        tracing::info!(on = info.on, "localapi: keep busy stopped at this computer");
+        Response::KeepBusy(info)
     }
 
     #[cfg(feature = "recording")]
@@ -2487,5 +2518,107 @@ mod tests {
         let status = st.status();
         assert_eq!(status.pid, Some(std::process::id()));
         assert!(status.started_at_ms.is_some_and(|t| t > 0));
+    }
+
+    /// FR-92 — a supervised Mac's root daemon answers the keep-busy verbs with
+    /// its GUI WORKER's state. The worker here says "running", which this
+    /// process's own engine (never started in a test) cannot say: an answer
+    /// from the daemon's own engine reads `on: false` and fails this. Field,
+    /// 0.4.126: a root `roomler keep-busy off` answered "off" from the
+    /// daemon's idle engine while the worker kept moving the pointer.
+    #[tokio::test]
+    async fn a_supervised_macs_daemon_answers_keep_busy_from_its_worker() {
+        use crate::delegate::{DelegateFrame, DelegateHost, write_frame};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let host = DelegateHost::new();
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(4096);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let serving =
+            tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let greeting = lines.next_line().await.unwrap().expect("attached");
+        assert!(greeting.contains("\"attached\""), "got {greeting}");
+        // A ping answered: the daemon's frame loop, and its queue toward the
+        // worker, are up.
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(
+            lines
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("\"pong\"")
+        );
+
+        let worker = tokio::spawn(async move {
+            loop {
+                let line = lines.next_line().await.unwrap().expect("a question");
+                if let Ok(DelegateFrame::KeepBusyAsk { id, off }) = serde_json::from_str(&line) {
+                    let info = tunnel_core::localapi::KeepBusyInfo {
+                        available: true,
+                        on: !off,
+                        phase: if off { "off" } else { "running" }.into(),
+                        pattern: "wander".into(),
+                        set_by: Some("Alice".into()),
+                        ..Default::default()
+                    };
+                    let told = DelegateFrame::KeepBusyTold {
+                        id,
+                        info: Box::new(info),
+                    };
+                    write_frame(&mut cwr, &told).await.unwrap();
+                    if off {
+                        return (lines, cwr);
+                    }
+                }
+            }
+        });
+
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("keepbusy"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_keep_busy_worker(host.clone());
+
+        match st.keep_busy_status().await {
+            Response::KeepBusy(i) => assert_eq!(
+                (i.on, i.phase.as_str(), i.set_by.as_deref()),
+                (true, "running", Some("Alice")),
+                "the status is the worker's"
+            ),
+            other => panic!("expected KeepBusy, got {other:?}"),
+        }
+        match st.keep_busy_off().await {
+            Response::KeepBusy(i) => assert_eq!(
+                (i.on, i.phase.as_str()),
+                (false, "off"),
+                "the worker was asked to stop, and said so"
+            ),
+            other => panic!("expected KeepBusy, got {other:?}"),
+        }
+
+        let (lines, cwr) = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the fake worker answered both")
+            .unwrap();
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
     }
 }

@@ -998,7 +998,18 @@ fn keep_busy_op(
 /// An injector the OS has not granted: a Noop (no backend at all) has no
 /// pixel read either; a real backend without permission (macOS
 /// Accessibility) does.
+///
+/// ⚠️ macOS asks the OS first. enigo now REFUSES to construct without
+/// Accessibility ("the application does not have the permission to simulate
+/// input"), so `open_default` hands back a Noop there too, and a Noop alone
+/// reads as `unsupported`: "Unavailable on this computer." Field, macOS 27,
+/// 0.4.126, with the grant switched off: exactly that, where the truth was
+/// one switch the owner can flip. `no_permission` is the reason that says so.
 fn classify_unpermitted(mut inj: Box<dyn super::InputInjector + Send>) -> KbReply {
+    #[cfg(target_os = "macos")]
+    if !crate::tcc::accessibility_trusted() {
+        return KbReply::NoPermission;
+    }
     match inj.cursor_px() {
         Err(e) if e.is::<super::PxUnsupported>() => KbReply::Unsupported,
         _ => KbReply::NoPermission,
@@ -1652,6 +1663,37 @@ mod tests {
         st.plan(a, &click(true), now);
         let _ = st.close(a);
         assert!(!st.any_button_held(), "a closed session holds nothing");
+    }
+
+    /// FR-92 — why keep busy cannot run, from an injector the OS has not
+    /// granted: no backend at all (a Noop) is `unsupported`; a backend that
+    /// can read the pointer but may not move it is `no_permission`. (A Mac
+    /// asks the OS first, because its enigo refuses to construct at all
+    /// without Accessibility; that branch is field-verified, not reachable
+    /// from here.)
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_unpermitted_injector_is_unsupported_only_when_there_is_no_backend() {
+        struct Unpermitted;
+        impl crate::input::InputInjector for Unpermitted {
+            fn inject(&mut self, _event: crate::input::InputMsg) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn has_permission(&self) -> bool {
+                false
+            }
+            fn cursor_px(&mut self) -> anyhow::Result<(i32, i32)> {
+                Ok((10, 10))
+            }
+        }
+        assert!(matches!(
+            classify_unpermitted(Box::new(crate::input::NoopInjector)),
+            KbReply::Unsupported
+        ));
+        assert!(matches!(
+            classify_unpermitted(Box::new(Unpermitted)),
+            KbReply::NoPermission
+        ));
     }
 
     /// An injector that records keep busy's normalised moves — uinput's
