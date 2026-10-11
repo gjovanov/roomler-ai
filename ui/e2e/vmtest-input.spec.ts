@@ -23,6 +23,14 @@
  *     the pointer. One that moved first landed in the top-left pixel, GNOME's
  *     Activities hot corner.
  *
+ *   - `cursor` (AC5): is the host's pointer visible in the viewer? The PERSON
+ *     at the screen moves it (the harness, over QMP, outside every roomler
+ *     input path), so this answers even where remote input reaches nothing.
+ *     The harness signals each position with a marker file in the shared
+ *     `/work`. At each one the spec reports what the picture shows there, and
+ *     whether the viewer's own cursor overlay (painted from the agent's
+ *     `cursor` channel) sits there.
+ *
  * Coordinates are normalised to the remote picture, as on the wire. The spec
  * finds the picture on the page (the largest live `<canvas>` or `<video>`,
  * letterboxed with `object-fit: contain`), so a target of (0.25, 0.25) is a
@@ -32,6 +40,7 @@
  * E2E_VMTEST_PASSWORD, E2E_AGENT_NAME (all required; the spec skips
  * otherwise), E2E_INPUT_PLAN (`points` by default).
  */
+import * as fs from 'node:fs'
 import { test, expect, type Page } from '@playwright/test'
 
 const API_URL = process.env.E2E_API_URL || ''
@@ -103,6 +112,65 @@ async function picture(page: Page): Promise<Picture | null> {
   })
 }
 
+/** AC5 — what the remote picture shows near each target: the count of
+ *  ACHROMATIC dark and bright pixels in a 48 px box from 8 px up-left of the
+ *  point (an arrow's hotspot is its tip). GNOME's arrow is black with a white
+ *  outline; the probe's own background is flat grey and its pointer crosshair
+ *  pure red, so neither counts. Read at the picture's native size. */
+async function cursorPixels(
+  page: Page,
+  targets: Array<[number, number]>,
+): Promise<Array<{ dark: number; bright: number }> | null> {
+  return await page.evaluate((targets) => {
+    const els = [
+      ...Array.from(document.querySelectorAll('video')),
+      ...Array.from(document.querySelectorAll('canvas')),
+    ]
+    let best: { el: HTMLVideoElement | HTMLCanvasElement; w: number; h: number; area: number } | null = null
+    for (const el of els) {
+      const r = el.getBoundingClientRect()
+      const w = el instanceof HTMLVideoElement ? el.videoWidth : el.width
+      const h = el instanceof HTMLVideoElement ? el.videoHeight : el.height
+      if (w < 320 || h < 200) continue
+      if (!best || r.width * r.height > best.area) best = { el, w, h, area: r.width * r.height }
+    }
+    if (!best) return null
+    const c = document.createElement('canvas')
+    c.width = best.w
+    c.height = best.h
+    const g = c.getContext('2d', { willReadFrequently: true })
+    if (!g) return null
+    g.drawImage(best.el, 0, 0, best.w, best.h)
+    return targets.map(([fx, fy]) => {
+      const x0 = Math.max(0, Math.round(fx * best.w) - 8)
+      const y0 = Math.max(0, Math.round(fy * best.h) - 8)
+      const d = g.getImageData(x0, y0, Math.min(48, best.w - x0), Math.min(48, best.h - y0)).data
+      let dark = 0
+      let bright = 0
+      for (let i = 0; i < d.length; i += 4) {
+        const hi = Math.max(d[i], d[i + 1], d[i + 2])
+        const lo = Math.min(d[i], d[i + 1], d[i + 2])
+        if (hi - lo < 30 && hi < 70) dark++
+        else if (hi - lo < 30 && lo > 200) bright++
+      }
+      return { dark, bright }
+    })
+  }, targets)
+}
+
+/** AC5 — where the viewer's own cursor overlay is, normalised to the picture:
+ *  the `.remote-cursor-canvas` painted from the agent's `cursor` channel.
+ *  `null` when the viewer shows none. */
+async function cursorOverlay(page: Page, p: Picture): Promise<{ fx: number; fy: number } | null> {
+  return await page.evaluate((p) => {
+    const el = document.querySelector('.remote-cursor-canvas')
+    if (!el) return null
+    const r = el.getBoundingClientRect()
+    if (r.width === 0 || r.height === 0) return null
+    return { fx: (r.left - p.x) / p.w, fy: (r.top - p.y) / p.h }
+  }, p)
+}
+
 /** One line per action, for the harness to compare against the probe's log.
  *  `wall` is seconds since the epoch, like the probe's own field. */
 function sent(kind: string, fields: Record<string, unknown> = {}): void {
@@ -163,6 +231,34 @@ test.describe('vmtest viewer input (named agent)', () => {
       // ONE jump, not a glide: each target should be one motion on the host.
       await page.mouse.move(t.x, t.y, { steps: 1 })
       sent('move', { fx, fy, px: Math.round(fx * p.srcW), py: Math.round(fy * p.srcH) })
+    }
+
+    if (PLAN === 'cursor') {
+      // AC5 — the harness moves the host's pointer to each target and touches
+      // `/work/cursor-at-<n>`. The spec samples a second and a half later, so
+      // a frame with the pointer in its new place has arrived.
+      const targets: Array<[number, number]> = [
+        [0.3, 0.6],
+        [0.7, 0.6],
+      ]
+      sent('cursor-ready', { targets })
+      for (let n = 0; n < targets.length; n++) {
+        const marker = `/work/cursor-at-${n}`
+        await expect
+          .poll(() => fs.existsSync(marker), {
+            timeout: 90_000,
+            message: `the harness never placed the pointer (${marker})`,
+          })
+          .toBe(true)
+        await pause(page, 1_500)
+        sent('cursor-sample', {
+          n,
+          regions: await cursorPixels(page, targets),
+          overlay: await cursorOverlay(page, p),
+        })
+      }
+      sent('done')
+      return
     }
 
     if (PLAN === 'close-mid-drag' || PLAN === 'crash-mid-drag') {
