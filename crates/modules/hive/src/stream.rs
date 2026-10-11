@@ -35,7 +35,8 @@ use std::time::Duration;
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_remote_control::hive::{
-    HiveStreamPath, HiveStreamRefusal, hive_limits, is_hash_hex, is_pubkey_hex, stream_limits,
+    HiveStreamPath, HiveStreamRefusal, hive_limits, is_dialable, is_hash_hex, is_pubkey_hex,
+    stream_limits,
 };
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, ServerMsg};
 use roomler_ai_remote_control::turn_creds::ice_servers_for_session_with_ttl;
@@ -110,9 +111,13 @@ fn mint_token() -> String {
 }
 
 /// An address a device may be told to dial: an IP literal and a port, never
-/// a name another resolver could answer differently.
+/// a name another resolver could answer differently, and one a device could
+/// be reached at ([`is_dialable`]: never the unspecified address, port 0,
+/// multicast or broadcast). The device checks it again before it dials or
+/// permits: this check is the server's courtesy, the device's the gate.
 fn dialable(addr: &str) -> bool {
-    addr.len() <= stream_limits::MAX_ADDR_LEN && addr.parse::<SocketAddr>().is_ok()
+    addr.len() <= stream_limits::MAX_ADDR_LEN
+        && addr.parse::<SocketAddr>().is_ok_and(|a| is_dialable(&a))
 }
 
 /// The credentials a device gets for a grant: STUN always, so it can learn

@@ -5145,6 +5145,78 @@ async fn the_relay_and_derp_rungs_carry_what_they_need() {
     assert_eq!(dial["path"], "derp");
 }
 
+/// FR-90 P2d-2b — an address no device could be reached at is never
+/// relayed: a `ready` that offers one is no ready (the member is refused
+/// `other`, the source's endpoint is told to go), and such a candidate is
+/// dropped. The device checks again before it dials or permits: this is the
+/// server's courtesy, the device's the gate.
+#[tokio::test]
+async fn an_address_no_device_could_be_reached_at_is_never_relayed() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivestreamaddrs").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-sa-primary", SERVES_STREAMS).await;
+    let mut member = device(&app, &seeded, "mach-sa-member", FOLLOWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/sa").await;
+
+    for nowhere in [
+        "224.0.0.251:5353",
+        "255.255.255.255:41641",
+        "0.0.0.0:41641",
+        "192.0.2.7:0",
+    ] {
+        send(&mut member.ws, want(&sid, "direct")).await;
+        let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+            .await
+            .expect("a grant");
+        let gid = grant["grant_id"].as_str().unwrap().to_string();
+        send(
+            &mut primary.ws,
+            json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("ab"),
+                   "addrs": [nowhere]}),
+        )
+        .await;
+        let no = refused_why(&mut member.ws, &format!("a ready offering {nowhere}")).await;
+        assert_eq!(no["reason"], "other", "{nowhere}: {no}");
+        let close = read_until(&mut primary.ws, "rc:hive.replica.close")
+            .await
+            .expect("the source's endpoint is told to go");
+        assert_eq!(close["reason"], "malformed", "{nowhere}");
+    }
+
+    send(&mut member.ws, want(&sid, "relay")).await;
+    let grant = read_until(&mut primary.ws, "rc:hive.replica.grant")
+        .await
+        .expect("a relay grant");
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut primary.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid, "cert_fingerprint": hash("cd"),
+               "addrs": ["203.0.113.9:49152"]}),
+    )
+    .await;
+    read_until(&mut member.ws, "rc:hive.replica.dial")
+        .await
+        .expect("a relay dial");
+    send(
+        &mut member.ws,
+        json!({"t": "rc:hive.replica.candidate", "grant_id": gid, "addr": "224.0.0.251:5353"}),
+    )
+    .await;
+    assert!(
+        arrives(
+            &mut primary.ws,
+            "rc:hive.replica.candidate",
+            Duration::from_millis(300)
+        )
+        .await
+        .is_none(),
+        "a multicast candidate is dropped"
+    );
+}
+
 /// Each of the server's gates refuses in its own word: not a member, another
 /// fence, a rung that cannot be had, a source away or of an older build, and
 /// the rate. A connection that does not carry streams is not heard at all.
