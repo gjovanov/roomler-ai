@@ -68,6 +68,8 @@ erDiagram
     agents ||--o{ agent_logs : uploads
     agents ||--o{ exec_audit : "exec attempts"
     agents ||--o{ key_rotation_audit : "overlay-key rotation orders (FR-40)"
+    tenants ||--o{ keep_busy_events : "keep-busy history, permanent (FR-92)"
+    agents ||--o{ keep_busy_events : "on / off, as the device reported"
     tenants ||--o{ tunnel_clients : enrolls
     tenants ||--o{ tunnel_policies : "default-deny ACL"
     tunnel_clients ||--o{ tunnel_audit : "flow log"
@@ -99,6 +101,7 @@ erDiagram
 | `agent_logs` | Centralized log batches (agent + browser ingest). **7 d TTL**, text index on `lines.msg` |
 | `exec_audit` | Fleet-RPC attempt log — every exec **including refusals**. 90 d TTL |
 | `key_rotation_audit` | FR-40 overlay-key rotation orders — every order **including refusals**: what the **server** decided (`dispatch: pushed`/`queued` or `denied: rate_limited`/`agent_unsupported`), who and when, never what the device did and never any key material. `(tenant_id, at)`, `(agent_id, at)`. 90 d TTL |
+| `keep_busy_events` | FR-92 P7 — the keep-busy history: `kind` (`on` · `off` · `org_denied` · `org_allowed` · `org_default_pattern`), `source` (**`server`** = the server's own decision from the settings route, naming the admin in `actor_user_id`/`actor_name`; **`device`** = a claim derived from two consecutive heartbeat briefs, `actor_name` the brief's `set_by`), `agent_id` (absent on an org row), `agent_name` (denormalised: the row outlives the device), `pattern`, `reason`, `at`. The `ssh_audit` / `ssh_activity` trust split inside one collection. `(tenant_id, at desc)`, `(tenant_id, agent_id, at desc)`. ⚠️ **No TTL — permanent** (operator decision, 2026-10-11); owned by the fleet module — see [keep-busy.md](keep-busy.md) §11 |
 | `tunnel_clients` | Enrolled `roomler` CLI identities (`owner_user_id`) |
 | `tunnel_policies` | Default-deny tunnel ACL: subject × target × destination (`dst_host`) |
 | `tunnel_audit` | One row per tunnel flow (`tunnel_session_id`). 90 d TTL |
@@ -133,7 +136,7 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 |---|---|
 | Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
 | Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
-| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
+| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` · **never** (permanent, by decision): `keep_busy_events` (FR-92 P7, operator 2026-10-11), `agent_sessions` |
 
 Two patterns worth knowing when touching this layer:
 

@@ -15,6 +15,26 @@ pub struct AgentDao {
     pub base: BaseDao<Agent>,
 }
 
+/// FR-92 P7 — the slice of the agent row a heartbeat read BEFORE it wrote
+/// ([`AgentDao::touch_heartbeat`]): what the device last said about keep
+/// busy, and the name to denormalise into a history row.
+#[derive(Debug, Clone)]
+pub struct HeartbeatBefore {
+    /// The previous stored brief; `None` = the device had not said (unknown,
+    /// never "off").
+    pub keep_busy: Option<roomler_ai_remote_control::models::KeepBusyBrief>,
+    pub name: String,
+    pub display_name: Option<String>,
+}
+
+impl HeartbeatBefore {
+    /// The label the device list shows: the admin's friendly name, else the
+    /// machine's.
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
 impl AgentDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -439,13 +459,19 @@ impl AgentDao {
     /// arrives over a live registered WS, so Online is definitionally
     /// true — and this bounds any status-clobber race (a displaced
     /// handler's or a late reaper's wrongful `Offline`) to ≤30 s.
+    ///
+    /// FR-92 P7: ONE `find_one_and_update` that hands back the row as it was
+    /// BEFORE this beat ([`HeartbeatBefore`]), so the caller can derive a
+    /// keep-busy edge from the previous brief against the new one with no
+    /// second round trip. `None` = no row matched (the device was removed
+    /// while its socket was still up).
     pub async fn touch_heartbeat(
         &self,
         agent_id: ObjectId,
         warm_relay: Option<&str>,
         companion_version: Option<&str>,
         keep_busy: Option<&roomler_ai_remote_control::models::KeepBusyBrief>,
-    ) -> DaoResult<bool> {
+    ) -> DaoResult<Option<HeartbeatBefore>> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
         // handed a dial target for this agent without waking its (possibly
@@ -492,12 +518,33 @@ impl AgentDao {
                 unset.insert("keep_busy", "");
             }
         }
+        // `update_one` would stamp this; a raw find-and-update must itself.
+        set.insert("updated_at", DateTime::now());
         let update = if unset.is_empty() {
             doc! { "$set": set }
         } else {
             doc! { "$set": set, "$unset": unset }
         };
-        self.base.update_by_id(agent_id, update).await
+        // Projected, so it is read as a plain document: an `Agent` cannot
+        // deserialise from three fields.
+        let before = self
+            .base
+            .collection()
+            .clone_with_type::<Document>()
+            .find_one_and_update(doc! { "_id": agent_id }, update)
+            .projection(doc! { "keep_busy": 1, "name": 1, "display_name": 1 })
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?;
+        Ok(before.map(|d| HeartbeatBefore {
+            // An unreadable stored brief reads as "the device did not say",
+            // the same as an absent one: unknown, never off.
+            keep_busy: d
+                .get_document("keep_busy")
+                .ok()
+                .and_then(|b| bson::from_document(b.clone()).ok()),
+            name: d.get_str("name").unwrap_or_default().to_string(),
+            display_name: d.get_str("display_name").ok().map(str::to_string),
+        }))
     }
 
     /// Multi-region relay PoPs: persist the agent's derived `relay_home` and

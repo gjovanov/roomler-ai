@@ -153,6 +153,19 @@ pub struct TenantSettings {
     #[serde(default)]
     pub keep_busy_denied: bool,
 
+    /// FR-92 P8 — the org's DEFAULT keep-busy pattern: what a viewer's menu
+    /// pre-selects for a device the person has no remembered choice on.
+    /// `None` (the default, and every pre-feature row) = the product default,
+    /// `circle`. Validated at the route against the agent's exact wire names
+    /// (`roomler_ai_remote_control::models::KEEP_BUSY_PATTERNS`), so a stored
+    /// value is always one the agent can draw.
+    ///
+    /// A preference, not a policy: it never reaches the agent (no wire
+    /// change), and a person's own remembered choice for a device wins over
+    /// it. Readable by any member of the org, settable with MANAGE_TENANT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_busy_default_pattern: Option<String>,
+
     /// FR-32 — how far plan-limit checks may go for this tenant. Defaults to
     /// `Warn`, so a pre-FR-32 tenant document deserialises into observe mode:
     /// every newly wired gate is measured and logged, and none of them refuse.
@@ -179,6 +192,7 @@ impl Default for TenantSettings {
             remote_ssh_enabled: false,
             ephemeral_keys_enabled: false,
             keep_busy_denied: false,
+            keep_busy_default_pattern: None,
             plan_enforcement: PlanEnforcement::default(),
         }
     }

@@ -9,7 +9,12 @@ import { createVuetify } from 'vuetify'
 import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
-import { parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from '@/composables/keepBusy'
+import {
+  parseKeepBusyState,
+  type KeepBusyPattern,
+  type KeepBusyRequest,
+  type KeepBusyState,
+} from '@/composables/keepBusy'
 
 const vuetify = createVuetify({ components, directives })
 
@@ -62,12 +67,26 @@ function state(over: Record<string, unknown> = {}): KeepBusyState {
   return s
 }
 
-function render(props: { state: KeepBusyState | null; canControl: boolean }) {
+function render(props: {
+  state: KeepBusyState | null
+  canControl: boolean
+  agentId?: string
+  defaultPattern?: KeepBusyPattern | null
+}) {
   return mount(KeepBusyMenu, {
-    props: { ...props, agentId: 'agent-1' },
+    props: { agentId: 'agent-1', ...props },
     global: { plugins: [vuetify] },
     attachTo: document.body,
   })
+}
+
+/** Is the pattern tile `id` the chosen one in the open menu? */
+function checked(id: string): boolean {
+  return (
+    document
+      .querySelector(`[data-testid="rc-keep-busy-pattern-${id}"]`)
+      ?.getAttribute('aria-checked') === 'true'
+  )
 }
 
 describe('KeepBusyMenu (FR-92)', () => {
@@ -119,6 +138,63 @@ describe('KeepBusyMenu (FR-92)', () => {
     const input = document.querySelector<HTMLInputElement>('[data-testid="rc-keep-busy-switch"] input')
     expect(input?.disabled).toBe(true)
     expect(document.body.textContent).toContain('view-only')
+    w.unmount()
+  })
+
+  // ── FR-92 P8 — the org's default pattern ──────────────────────────
+
+  const KEY = 'roomler-rc-keep-busy.v1:'
+
+  it('P8: pre-selects the org default on a device nothing is remembered for', async () => {
+    localStorage.removeItem(KEY + 'agent-fresh')
+    const w = render({ state: state(), canControl: true, agentId: 'agent-fresh', defaultPattern: 'heart' })
+    await w.find('[data-testid="rc-keep-busy-btn"]').trigger('click')
+    await flushPromises()
+    expect(checked('heart')).toBe(true)
+    expect(checked('circle')).toBe(false)
+    w.unmount()
+  })
+
+  it("P8: a person's remembered choice for the device wins over the org default", async () => {
+    localStorage.setItem(KEY + 'agent-kept', JSON.stringify({ pattern: 'star' }))
+    const w = render({ state: state(), canControl: true, agentId: 'agent-kept', defaultPattern: 'heart' })
+    await w.find('[data-testid="rc-keep-busy-btn"]').trigger('click')
+    await flushPromises()
+    expect(checked('star')).toBe(true)
+    expect(checked('heart')).toBe(false)
+    w.unmount()
+    localStorage.removeItem(KEY + 'agent-kept')
+  })
+
+  it('P8: the default arriving after the fetch fills the pattern — never once the person has chosen', async () => {
+    localStorage.removeItem(KEY + 'agent-late')
+    const w = render({ state: state(), canControl: true, agentId: 'agent-late', defaultPattern: null })
+    await w.setProps({ defaultPattern: 'wave' })
+    await w.find('[data-testid="rc-keep-busy-btn"]').trigger('click')
+    await flushPromises()
+    expect(checked('wave')).toBe(true)
+    document.querySelector<HTMLButtonElement>('[data-testid="rc-keep-busy-pattern-star"]')!.click()
+    await flushPromises()
+    await w.setProps({ defaultPattern: 'rose' })
+    await flushPromises()
+    expect(checked('star')).toBe(true)
+    expect(checked('rose')).toBe(false)
+    w.unmount()
+    localStorage.removeItem(KEY + 'agent-late')
+  })
+
+  it('P8: while it runs, the device’s own pattern shows, whatever the org default', async () => {
+    localStorage.removeItem(KEY + 'agent-running')
+    const w = render({
+      state: state({ on: true, phase: 'running', pattern: 'spirograph' }),
+      canControl: true,
+      agentId: 'agent-running',
+      defaultPattern: 'heart',
+    })
+    await w.find('[data-testid="rc-keep-busy-chip"]').trigger('click')
+    await flushPromises()
+    expect(checked('spirograph')).toBe(true)
+    expect(checked('heart')).toBe(false)
     w.unmount()
   })
 })

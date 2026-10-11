@@ -16,6 +16,8 @@
 > | P4 | the person at the device sees it and stops it: tray, `roomler keep-busy`, LocalAPI |
 > | P5 | the org deny |
 > | P5b | the device list shows where it runs and who turned it on |
+> | P7 | a **permanent history**: every on and off on every device, every change to the org's settings (§11) |
+> | P8 | the org's **default pattern** (§12) |
 > | P9 | **GNOME on Wayland**, and GNOME on Xorg under a root daemon, through uinput ([§2](#a-blind-host-gnome-through-uinput)) |
 >
 > Any other Wayland desktop is detected and reported unavailable, with its reason.
@@ -256,7 +258,7 @@ moves anything.
 |---|---|---|---|
 | The session's INPUT grant, and the floor in exclusive mode | the session | — | A `set` from a view-only session, or from a viewer without the floor, is refused to that viewer |
 | `keep_busy_enabled` (`crates/agent-core/src/config.rs` L1388) | the device's owner | **on** | Off: no cap word, a running keep busy stops, and new enables are refused. A local `ConfigSet` needs the console user. It is absent from `DesiredConfig`, so the server can never turn it back on |
-| `TenantSettings.keep_busy_denied` (`crates/db/src/models/tenant.rs` L154) | the org owner (MANAGE_TENANT) | allowed | Deny: pushed at once to online devices and at the next connect to the rest. The device stops and refuses |
+| `TenantSettings.keep_busy_denied` (`crates/db/src/models/tenant.rs` L154) | the org owner (MANAGE_TENANT to set; **any member reads** the settings route since P8, §12) | allowed | Deny: pushed at once to online devices and at the next connect to the rest. The device stops and refuses |
 
 ### How the org's deny reaches every device
 
@@ -322,9 +324,8 @@ A device that does not say shows nothing. That covers:
 
 Nothing means **unknown**: never a stale "on", never an invented "off".
 
-There is no durable history of who turned it on where, and when. That needs its own collection, and
-it is an open decision in the spec (§6). Until then, the agent's log records every on and off with
-who and why.
+The chip is the **current** state. Who turned it on where, and when — and every off, and every
+change to the org's settings — is the permanent history (§11), derived from these same briefs.
 
 ## 8. Where it remembers: per signed-in person
 
@@ -421,7 +422,125 @@ does not spawn `loginctl` forever.
 > (field, GNOME 46 on Ubuntu 24.04). P9's `logind::pick` falls back to the
 > active X11 session that names no display.
 
-## 11. Tests
+## 11. History (P7)
+
+Every on and off on every device, and every change to the org's keep-busy
+settings, is kept in `keep_busy_events` — **for good**. There is deliberately
+no TTL, unlike every other audit collection (operator, 2026-10-11: "permanent
+history"). A row outlives its device: the device's name is written on it when
+the row is made.
+
+Two sources share the collection, and the `source` field keeps them apart.
+It is the trust split `ssh_audit` (the server's decision) and `ssh_activity`
+(a claim by a host that may be compromised) make with two collections, made
+inside one:
+
+| `source` | Rows | Who speaks | Trust |
+|---|---|---|---|
+| `server` | `org_denied` · `org_allowed` · `org_default_pattern` | the settings route, naming the admin (`actor_user_id`, `actor_name`), only when the value **actually changed** | the server's own decision: authoritative |
+| `device` | `on` · `off` | the device, through two consecutive heartbeat briefs; `actor_name` is the brief's `set_by` claim and `pattern` the brief's | a **claim**, shown as one, never enforced on |
+
+```mermaid
+flowchart TB
+  subgraph S["source: server — the server's own decision"]
+    A[admin PUT keep-busy-settings] --> B{changed?}
+    B -- "deny flipped" --> C[(org_denied / org_allowed)]
+    B -- "default pattern" --> D[(org_default_pattern)]
+    B -- "no" --> N0[nothing]
+  end
+  subgraph V["source: device — the device's claim"]
+    H[heartbeat, every ~30 s] --> T["touch_heartbeat: ONE find-and-update,<br/>returns the row as it WAS"]
+    T --> E{previous brief → new brief}
+    E -- "off or unknown → on" --> DD{"unknown before, and the newest row<br/>is already this on (same pattern, same set_by)?"}
+    DD -- "yes" --> N1["nothing: seen again after a gap"]
+    DD -- "no" --> ON[(on: pattern, set_by)]
+    E -- "on → off" --> OFF[(off: reason)]
+    E -- "on → absent" --> N2["nothing: unknown is not off"]
+    E -- "same state" --> N3[nothing]
+  end
+  C --> K[(keep_busy_events)]
+  D --> K
+  ON --> K
+  OFF --> K
+  K --> R["GET …/keep-busy-history<br/>MANAGE_AGENTS · newest first · tenant + device scoped"]
+```
+
+| Piece | Where |
+|---|---|
+| The row | `KeepBusyEvent` (`crates/remote_control/src/models.rs`): `tenant_id`, `agent_id` (none for an org row), `agent_name`, `at`, `kind`, `source`, `actor_user_id`, `actor_name`, `pattern`, `reason` |
+| The server rows | `crates/modules/fleet/src/keep_busy.rs` `set_org_settings`: the settings before and after, a row per field that changed |
+| The device rows | `device_edge` (pure, the table below) and `record_device_edge`, on the agent's read loop right after the beat is stored |
+| The one round trip | `crates/services/src/dao/agent.rs` `touch_heartbeat`: one `find_one_and_update` that hands back the previous brief and the name, so an edge costs no second read |
+| The route | `history`, `GET /api/tenant/{tid}/keep-busy-history` |
+| The indexes | `(tenant_id, at desc)`, `(tenant_id, agent_id, at desc)` — in the fleet module's `indexes()`, never the db crate's plan |
+
+### The device's edges
+
+| Previous brief → this beat's brief | Row |
+|---|---|
+| off, or absent (unknown) → on | **`on`**, with the pattern and `set_by` |
+| on → off | **`off`**, with the device's reason (`stopped_by_controller`, `expired`, `org_denied`, …) |
+| on → absent | nothing: a device that stops saying is **unknown**, never off (P5b's rule) |
+| absent → off | **`off`** only while the newest row about the device is still an `on`: it stopped while it was not reporting (P7 review) |
+| the same state again · absent → absent | nothing |
+| on → on with another pattern or `set_by` | nothing: the history records ons and offs; the device row shows what is drawn now |
+
+**The restart dedupe.** When the previous brief was absent and this one is on,
+the newest row about this device decides: if it is already `on` with the same
+pattern and the same `set_by`, this is the same keep busy seen again after a
+gap in reporting (a daemon update that briefly reported nothing, a rollback and
+re-update), and nothing is written. A failed lookup records anyway — a
+duplicate row beats a lost edge.
+
+**The gap the other way.** Absent → off writes an `off` only when the history
+still ends on an `on` (`off_after_gap`): keep busy was stopped — at the
+device, by an auto-off — while it was not reporting. Without that check the
+history would end on an "on" that is long over; with it, a device that was
+never on writes nothing at each restart.
+
+> [!NOTE]
+> **The resolution is the heartbeat.** Device rows come from consecutive
+> ~30 s briefs, so an on and an off inside one beat are not seen at all, and
+> a row's `at` is when the server saw the change, not when the device made
+> it. Exact device-pushed edges — the engine reporting each transition itself
+> — are a possible later phase; they need an agent release. The org rows
+> have no such limit: they are written by the route that made the change.
+
+> [!IMPORTANT]
+> **Recording never fails a heartbeat.** A failed insert or lookup is logged
+> and the beat goes on: the history is a record, not a gate.
+
+### The route
+
+`GET /api/tenant/{tid}/keep-busy-history`, `MANAGE_AGENTS` — the permission
+of the device list the rows are about. Newest first, as a JSON list.
+
+| Query | Meaning |
+|---|---|
+| `agent_id=<hex>` | one device's rows. Always paired with the tenant in the filter: another org's device id answers with nothing |
+| `before=<RFC 3339 \| unix ms>` | rows strictly older than this — the "load more" cursor is the last row's `at` |
+| `limit=<1..=200>` | default 50; out of range is clamped |
+
+The org's keep-busy card (`SettingsSection.vue` → `KeepBusyHistorySection.vue`)
+lists the latest 50 — when, device (or "Organization"), what, who — with a
+small **device-reported** / **admin** marker on each row, a device filter,
+and "Load more". A 403 shows in the list and ends nothing (FR-82).
+
+## 12. The default pattern (P8)
+
+The product's default is **circle**, what the operator asked for. An org can
+choose another: `TenantSettings.keep_busy_default_pattern`, `None` = circle.
+
+| Rule | Where |
+|---|---|
+| Validated by **equality** against the agent's exact wire names (`circle` … `shuffle`, 13 of them); an unknown word is a 400 | `KEEP_BUSY_PATTERNS` (`crates/remote_control/src/models.rs`), `validate_pattern` (`fleet/src/keep_busy.rs`) |
+| `PUT …/keep-busy-settings` takes each field optionally: absent = unchanged, so the pre-P8 body `{keep_busy_denied}` still changes nothing else; `keep_busy_default_pattern: null` clears to the product default | `OrgKeepBusySettingsUpdate` |
+| `GET …/keep-busy-settings` returns both fields, and is readable by **any member** of the org (it was `MANAGE_AGENTS`): the payload is only the org's keep-busy policy, which every device and every viewer is already told. `PUT` stays `MANAGE_TENANT` | `get_org_settings` |
+| **No agent change, no wire change.** The default never reaches a device; the viewer reads it and pre-selects it | — |
+| The viewer pre-selects the org default **only** for a device the person has no remembered choice on (`roomler-rc-keep-busy.v1:<agent>` in localStorage), and never while keep busy runs (the device's pattern shows); a fetch failure means circle | `KeepBusyMenu.vue` `defaultPattern`, `stores/agents.ts` `fetchKeepBusyDefaultPattern` |
+| The org's card has a pattern select beside the switch, with the viewer's own labels | `SettingsSection.vue` |
+
+## 13. Tests
 
 ### `keep_busy/engine.rs` (fake host and clock)
 
@@ -472,15 +591,28 @@ The step runs with `--test-threads=1`: in parallel, another test's pointer move
   is listed) and uinput's move.
 - `win_identity.rs`: no token for the person means the store is not touched at all.
 - `delegate.rs`: the worker gets the strictest policy on attach and on change.
+- `crates/modules/fleet/src/keep_busy.rs`: the edge table, the pattern
+  validated by equality, absent vs `null` in the body, the `before` cursor,
+  the real `Query` extractor.
 - `crates/tests/src/keep_busy_tests.rs`:
   - the org route's permissions;
   - the push on connect and on every change, and when the word reappears;
-  - no frame to a device without the word.
+  - no frame to a device without the word;
+  - **P7**: the history's permission and tenant scope, a PUT recording only a
+    change with the admin's name, the heartbeat edges (on, off, a repeated
+    beat, a silent beat, the restart dedupe), paging;
+  - **P8**: every pattern accepted and near misses refused, `null` clears,
+    absent leaves alone, a member reads and a non-member does not.
 - The viewer:
   - `keepBusy.spec.ts`: the parser, the message, the status line, the previews.
-  - `KeepBusyMenu.spec.ts`: chip vs button, the countdown, asking, view-only.
+  - `KeepBusyMenu.spec.ts`: chip vs button, the countdown, asking, view-only,
+    the org default pre-selected only where nothing is remembered.
+  - `KeepBusyHistorySection.spec.ts`: the rows, the source marker, a removed
+    device by its written name, "load more" by the last row's instant, the
+    device filter, a refusal shown in place.
+  - `agents.spec.ts`: the ungated default read never throws; the history query.
 
-## 12. Field verification
+## 14. Field verification
 
 Run this on a release candidate, never on a machine someone is using. Record
 the negative control **first**. The runs so far, with their numbers, are in the

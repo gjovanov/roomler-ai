@@ -119,20 +119,29 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
-    /// FR-92 — the org's keep-busy DENY (`false` = allowed, the default).
-    pub async fn set_keep_busy_denied(
+    /// FR-92 — the org's keep-busy settings: the DENY (`false` = allowed, the
+    /// default) and, since P8, the default pattern. Each field is written only when
+    /// the caller SAID something about it: `None` leaves the stored value
+    /// alone, so the pre-P8 body `{keep_busy_denied}` still changes nothing
+    /// else. For the default pattern, `Some(None)` clears it back to the
+    /// product default. The pattern is validated by the route, not here.
+    pub async fn set_keep_busy_settings(
         &self,
         tenant_id: ObjectId,
-        denied: bool,
+        denied: Option<bool>,
+        default_pattern: Option<Option<String>>,
     ) -> DaoResult<Tenant> {
+        let mut set = doc! { "updated_at": DateTime::now() };
+        if let Some(denied) = denied {
+            set.insert("settings.keep_busy_denied", denied);
+        }
+        if let Some(pattern) = default_pattern {
+            // A stored `null` deserialises to `None` like an absent field,
+            // so clearing writes null rather than needing a second operator.
+            set.insert("settings.keep_busy_default_pattern", pattern);
+        }
         self.base
-            .update_by_id(
-                tenant_id,
-                doc! { "$set": {
-                    "settings.keep_busy_denied": denied,
-                    "updated_at": DateTime::now(),
-                } },
-            )
+            .update_by_id(tenant_id, doc! { "$set": set })
             .await?;
         self.base.find_by_id(tenant_id).await
     }

@@ -5,6 +5,7 @@ import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useTenantStore } from '@/stores/tenant'
 import { canManageOrgSettings } from '@/utils/permissions'
+import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -528,6 +529,36 @@ export type ExecDenyReason =
 
 /** One row of the Fleet-RPC attempt log. Every attempt lands here, allowed
  *  or denied — a refused exec is the interesting one. */
+/** FR-92 P7 — what one history row records. Mirrors the Rust
+ *  `KeepBusyEventKind`; a word a newer server adds must still render. */
+export type KeepBusyEventKind = 'on' | 'off' | 'org_denied' | 'org_allowed' | 'org_default_pattern'
+/** `server` = the server's own decision, authoritative; `device` = a claim
+ *  the device reported on a heartbeat. The `ssh_audit` / `ssh_activity`
+ *  trust split, in one collection. */
+export type KeepBusyEventSource = 'server' | 'device'
+
+export interface KeepBusyHistoryEntry {
+  id: string
+  tenant_id: string
+  /** Absent on an org-level row. */
+  agent_id?: string
+  /** The device's label when the row was written — it outlives the device. */
+  agent_name?: string
+  at: string
+  kind: KeepBusyEventKind | string
+  source: KeepBusyEventSource | string
+  /** Server rows only: the admin who changed it. */
+  actor_user_id?: string
+  /** Server rows: the admin's display name. Device rows: who the device
+   *  SAID turned it on (`set_by`), a claim. */
+  actor_name?: string
+  /** `on`: the pattern drawn. `org_default_pattern`: the new default, absent
+   *  when cleared to the product default. */
+  pattern?: string
+  /** `off`: the device's reason code. */
+  reason?: string
+}
+
 export interface ExecAuditEntry {
   id?: string
   tenant_id: string
@@ -1096,30 +1127,97 @@ export const useAgentStore = defineStore('agents', () => {
   /** Whether the org DENIES keep busy. `null` until fetched / on a 403 —
    *  same "not an admin ≠ a value" rule as the exec and SSH switches. */
   const orgKeepBusyDenied = ref<boolean | null>(null)
+  /** FR-92 P8 — the org's default pattern as STORED: `null` = the product
+   *  default (circle). Known whenever `orgKeepBusyDenied` is (one fetch
+   *  carries both), so "unknown" is read off that flag, not off this one. */
+  const orgKeepBusyDefaultPattern = ref<string | null>(null)
 
+  /** FR-92 P8 — the body the settings route speaks. Absent = leave alone;
+   *  `keep_busy_default_pattern: null` = clear to the product default. */
+  interface OrgKeepBusySettingsPatch {
+    keep_busy_denied?: boolean
+    keep_busy_default_pattern?: string | null
+  }
+  interface OrgKeepBusySettingsResponse {
+    keep_busy_denied: boolean
+    keep_busy_default_pattern: string | null
+  }
+
+  /** The ADMIN card's read: gated like the other org switches, so a
+   *  non-owner's card shows "unknown" and sends nothing. (Any member may
+   *  read the route since P8 — `fetchKeepBusyDefaultPattern` is the
+   *  ungated read a viewer uses.) */
   async function fetchOrgKeepBusyDenied(tenantId: string) {
     if (!(await mayReadOrgSettings(tenantId))) {
       orgKeepBusyDenied.value = null
       return
     }
     try {
-      const resp = await api.get<{ keep_busy_denied: boolean }>(
+      const resp = await api.get<OrgKeepBusySettingsResponse>(
         `/tenant/${tenantId}/keep-busy-settings`,
       )
       orgKeepBusyDenied.value = resp.keep_busy_denied
+      orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
     } catch {
       orgKeepBusyDenied.value = null
     }
   }
 
-  /** Set the deny. MANAGE_TENANT server-side; pushed to online devices at
-   *  once and to the rest at their next connect. */
-  async function setOrgKeepBusyDenied(tenantId: string, denied: boolean) {
-    const resp = await api.put<{ keep_busy_denied: boolean }>(
+  /** Change one or both settings. MANAGE_TENANT server-side; a deny in the
+   *  body is pushed to online devices at once and to the rest at their next
+   *  connect, and every actual change lands in the history. */
+  async function setOrgKeepBusySettings(tenantId: string, patch: OrgKeepBusySettingsPatch) {
+    const resp = await api.put<OrgKeepBusySettingsResponse>(
       `/tenant/${tenantId}/keep-busy-settings`,
-      { keep_busy_denied: denied },
+      patch,
     )
     orgKeepBusyDenied.value = resp.keep_busy_denied
+    orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
+  }
+
+  /** Set the deny alone — the pre-P8 body, unchanged. */
+  async function setOrgKeepBusyDenied(tenantId: string, denied: boolean) {
+    await setOrgKeepBusySettings(tenantId, { keep_busy_denied: denied })
+  }
+
+  /** FR-92 P8 — set the org's default pattern; `null` clears it. */
+  async function setOrgKeepBusyDefaultPattern(tenantId: string, pattern: string | null) {
+    await setOrgKeepBusySettings(tenantId, { keep_busy_default_pattern: pattern })
+  }
+
+  /** FR-92 P8 — the org's default pattern for a VIEWER's menu. Deliberately
+   *  ungated (the route is readable by any member) and it never throws:
+   *  unset, a word this viewer cannot draw, a 403 or a network failure all
+   *  mean `circle`, the product default. A person's own remembered choice
+   *  for a device wins over it in the menu. */
+  async function fetchKeepBusyDefaultPattern(tenantId: string): Promise<KeepBusyPattern> {
+    try {
+      const resp = await api.get<OrgKeepBusySettingsResponse>(
+        `/tenant/${tenantId}/keep-busy-settings`,
+      )
+      return isKeepBusyPattern(resp.keep_busy_default_pattern)
+        ? resp.keep_busy_default_pattern
+        : 'circle'
+    } catch {
+      return 'circle'
+    }
+  }
+
+  /** FR-92 P7 — one row of the permanent keep-busy history. `source` tells
+   *  the server's own decision (`server`: an admin changed a setting) from a
+   *  device's CLAIM (`device`: derived from its heartbeats, so an on and an
+   *  off inside one ~30 s beat are not seen). */
+  async function fetchKeepBusyHistory(
+    tenantId: string,
+    opts: { agentId?: string; before?: string; limit?: number } = {},
+  ): Promise<KeepBusyHistoryEntry[]> {
+    const q = new URLSearchParams()
+    if (opts.agentId) q.set('agent_id', opts.agentId)
+    if (opts.before) q.set('before', opts.before)
+    q.set('limit', String(opts.limit ?? 50))
+    return api.get<KeepBusyHistoryEntry[]>(
+      `/tenant/${tenantId}/keep-busy-history?${q.toString()}`,
+    )
   }
 
   // ── FR-51 — ephemeral enrollment keys ────────────────────────────
@@ -1349,8 +1447,13 @@ export const useAgentStore = defineStore('agents', () => {
     fetchOrgSshEnabled,
     setOrgSshEnabled,
     orgKeepBusyDenied,
+    orgKeepBusyDefaultPattern,
     fetchOrgKeepBusyDenied,
+    setOrgKeepBusySettings,
     setOrgKeepBusyDenied,
+    setOrgKeepBusyDefaultPattern,
+    fetchKeepBusyDefaultPattern,
+    fetchKeepBusyHistory,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,

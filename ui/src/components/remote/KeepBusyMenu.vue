@@ -181,6 +181,11 @@ const props = defineProps<{
   canControl: boolean
   /** For the remembered form, per device. */
   agentId: string
+  /** FR-92 P8 — the org's default pattern, once the viewer has read it.
+   *  Pre-selected ONLY while nothing is remembered for this device and
+   *  nothing is running: a person's own last choice wins, and what runs
+   *  shows the device's pattern. `null`/absent = circle. */
+  defaultPattern?: KeepBusyPattern | null
 }>()
 
 const emit = defineEmits<{ set: [req: KeepBusyRequest] }>()
@@ -196,17 +201,23 @@ interface Form {
 const STORAGE_PREFIX = 'roomler-rc-keep-busy.v1:'
 const defaults: Form = { pattern: 'circle', speed: 'normal', size: 'm', resumeAfterS: 30, autoOffMin: 0 }
 
-function loadForm(): Form {
+/** The remembered form for this device, or the defaults with the org's
+ *  default pattern (when already known) in place of circle. */
+function loadForm(): { form: Form; remembered: boolean } {
   try {
     const raw = globalThis.localStorage?.getItem(STORAGE_PREFIX + props.agentId)
-    if (raw) return { ...defaults, ...(JSON.parse(raw) as Partial<Form>) }
+    if (raw) return { form: { ...defaults, ...(JSON.parse(raw) as Partial<Form>) }, remembered: true }
   } catch {
     /* a private window or blocked storage: defaults */
   }
-  return { ...defaults }
+  return { form: { ...defaults, pattern: props.defaultPattern ?? defaults.pattern }, remembered: false }
 }
 
-const form = reactive<Form>(loadForm())
+const loaded = loadForm()
+const form = reactive<Form>(loaded.form)
+// True once this device has a remembered choice — from storage, or from a
+// choice made in this visit. The org's default never overrides one.
+let remembered = loaded.remembered
 
 function saveForm() {
   try {
@@ -214,7 +225,18 @@ function saveForm() {
   } catch {
     /* storage unavailable: the form still works for this visit */
   }
+  remembered = true
 }
+
+// P8 — the org's default usually arrives after a fetch, once the menu
+// exists. It fills the pattern only while nothing is remembered for this
+// device and nothing is running.
+watch(
+  () => props.defaultPattern,
+  (p) => {
+    if (p && !remembered && !props.state?.on) form.pattern = p
+  },
+)
 
 // While it is on, the form shows what the DEVICE is doing.
 watch(
