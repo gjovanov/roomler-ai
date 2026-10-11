@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::{
-    models::{AgentCaps, DisplayInfo, EndReason, OsKind},
+    models::{AgentCaps, DisplayInfo, EndReason, OsKind, RpcCap},
     signaling::{AgentCloseReason, ClientMsg, CloseReason, ServerMsg},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1235,6 +1235,12 @@ async fn connect_once(
 
     // Say hello.
     let mut hello_caps = stub_caps(cfg.overlay_multi_org);
+    // FR-90 P2c-3 — copies are held for the primary organization only: a
+    // secondary org's connection never offers them, so its placement never
+    // picks this device.
+    if !ctx.is_primary {
+        strip_replica_verbs(&mut hello_caps.rpc);
+    }
     // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
     // worker can record. Saying the root daemon's own list (nothing) would
     // strip RECORD for the 30 s until the first heartbeat corrects it, after
@@ -1810,6 +1816,9 @@ async fn connect_once(
                     // stay OURS, because we are the half that answers
                     // `rc:session.request` (the P2b-3 lesson).
                     let mut c = stub_caps(cfg.overlay_multi_org);
+                    if !ctx.is_primary {
+                        strip_replica_verbs(&mut c.rpc);
+                    }
                     c.record = record_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
@@ -4415,14 +4424,25 @@ async fn handle_server_msg(
                 debug!(grant = %grant_id, "rc:hive.view.close ignored");
             }
         }
-        // FR-90 P2c-3 — hold a copy of a session. This build does not
-        // advertise `hive-replica`, so no server sends it one; the device's
-        // gates on a join, and its answer, come with the build that does.
+        // FR-90 P2c-3 — hold a copy of a session. Answered with
+        // `rc:hive.replica.join_ack` on THIS connection, after the device's
+        // own gates; a secondary org's connection is refused there.
         ServerMsg::HiveReplicaJoin {
             session_id,
             fence,
             role,
         } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_replica_join(
+                session_id,
+                fence,
+                role,
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            // No answer from this build: it does not advertise
+            // `hive-replica`, so no server sends it a join.
+            #[cfg(not(hive_host))]
             debug!(
                 session = %session_id, fence, ?role,
                 "rc:hive.replica.join ignored — this build holds no copies"
@@ -5075,6 +5095,14 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     caps
 }
 
+/// FR-90 P2c-3 — take the replica words out of a secondary org's caps: a
+/// device holds copies for its primary organization only, so another org's
+/// placement must never see it offer them. Equality, never a prefix: `hive`
+/// is a prefix of both, and stays.
+fn strip_replica_verbs(rpc: &mut Vec<String>) {
+    rpc.retain(|v| v != RpcCap::HiveReplica.wire() && v != RpcCap::HiveArchive.wire());
+}
+
 /// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
 /// and whether a recorder can run here. Config-dependent and live, so it is
 /// filled at every announcement (the hello, a heartbeat that re-announces),
@@ -5099,6 +5127,24 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-90 P2c-3 — a secondary org's caps lose the two replica words, by
+    /// equality: `hive` and every other `hive-*` word stays.
+    #[test]
+    fn a_secondary_connection_never_offers_copies() {
+        let mut rpc: Vec<String> = [
+            "exec",
+            "hive",
+            "hive-replica",
+            "hive-archive",
+            "hive-view",
+            "hive-adopt",
+        ]
+        .map(String::from)
+        .to_vec();
+        strip_replica_verbs(&mut rpc);
+        assert_eq!(rpc, ["exec", "hive", "hive-view", "hive-adopt"]);
+    }
 
     /// FR-27 P10 — the host's Disconnect names itself on the wire. The
     /// viewer's "the person at the device ended the session" notice and the

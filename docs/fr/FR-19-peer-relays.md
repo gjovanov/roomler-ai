@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2117`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1502`).
+(`agents/roomlerd/src/signaling.rs:1508`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.

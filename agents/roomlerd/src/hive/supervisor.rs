@@ -237,6 +237,9 @@ struct Live {
     approvals: Arc<toolbelt::Pending>,
     /// P1h — the harness's pid, which leads its process group.
     pid: Option<u32>,
+    /// P2c-3 — the server placed members besides this device: it checkpoints,
+    /// and its tip is reported.
+    replicated: bool,
 }
 
 /// What a launch hands the session task.
@@ -287,6 +290,7 @@ enum Launcher {
 
 /// P1j — terminal sessions adopted on this device.
 mod adopt;
+mod replica;
 
 pub struct Supervisor {
     cfg: HiveConfig,
@@ -495,6 +499,48 @@ pub fn handle_adopt_ack(
 /// sessions: what decides whether it advertises `hive-adopt`.
 pub fn adopt_enabled() -> bool {
     global().is_some_and(|s| s.cfg.adopt)
+}
+
+/// FR-90 P2c-3 — whether this device holds copies of its owner's sessions
+/// run elsewhere: its owner's `hive_replica`, with the store open. What
+/// decides whether it advertises `hive-replica`.
+pub fn replica_enabled() -> bool {
+    global().is_some_and(|s| s.cfg.replica && s.store.is_ok())
+}
+
+/// FR-90 P2c-3 — whether it also offers itself as the org's archive replica
+/// (`hive_archive`, only ever with `hive_replica`): `hive-archive`.
+pub fn archive_enabled() -> bool {
+    global().is_some_and(|s| s.cfg.archive && s.store.is_ok())
+}
+
+/// FR-90 P2c-3 — `rc:hive.replica.join`: answered with
+/// `rc:hive.replica.join_ack` on the connection it came on, after the
+/// device's own gates ([`replica`]).
+pub fn handle_replica_join(
+    session_id: ObjectId,
+    fence: u64,
+    role: Option<roomler_ai_remote_control::hive::HiveReplicaRole>,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    tokio::spawn(async move {
+        let (refused, detail) = match global() {
+            Some(sup) => sup.answer_join(is_primary, session_id, fence, role).await,
+            None => (
+                Some(roomler_ai_remote_control::hive::HiveJoinRefusal::ReplicaDisabled),
+                Some("agent sessions are not set up on this device".to_string()),
+            ),
+        };
+        let _ = tx
+            .send(ClientMsg::HiveReplicaJoinAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            })
+            .await;
+    });
 }
 
 /// FR-90 P0f — an integration test's supervisor: sessions launch as the
@@ -1164,6 +1210,13 @@ impl Supervisor {
             let _ = tx.try_send(ClientMsg::HiveManifest {
                 sessions: me.manifest(),
             });
+            // P2c-3 — and every copy it holds, with its tip, once the
+            // resumed sessions are among them. Only from a device that holds
+            // copies or runs a replicated session: no other has one to tell.
+            if me.reports_copies() {
+                let sessions = me.replica_manifest().await;
+                let _ = tx.try_send(ClientMsg::HiveReplicaManifest { sessions });
+            }
         });
     }
 
@@ -1814,6 +1867,7 @@ impl Supervisor {
                 waiting: Arc::clone(&waiting),
                 approvals: toolbelt.pending(),
                 pid,
+                replicated: order.replicated,
             },
         );
         if prior.is_some() {
@@ -3047,11 +3101,16 @@ async fn checkpoint_or_stop(
             }
         }
     };
-    if let Err(failed) = taken
-        && !task.sup.went_down_with_daemon().await
-        && let Some(c) = task.checkpoints.as_mut()
-    {
-        c.say(&task.store, &task.sid, task.fence, failed);
+    match taken {
+        // P2c-3 — kept: the server hears where the copy ends now.
+        Ok(()) => task.sup.report_tip(task.session).await,
+        Err(failed) => {
+            if !task.sup.went_down_with_daemon().await
+                && let Some(c) = task.checkpoints.as_mut()
+            {
+                c.say(&task.store, &task.sid, task.fence, failed);
+            }
+        }
     }
     None
 }
