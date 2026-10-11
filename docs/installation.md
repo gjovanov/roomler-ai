@@ -164,7 +164,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   - the runtime dir (`%t`), which holds the single-instance lock and the
     LocalAPI socket;
   - `~/.local/state/roomler`, the portal's restore token, created 0700 by an
-    unsandboxed `ExecStartPre=+`;
+    unsandboxed `ExecStartPre=-+` (a failure costs one prompt per session, never the start);
   - `~/Downloads` (incoming files) and `~/Videos` (screen recordings, FR-85 P2c).
 
   Every `ReadWritePaths=` entry that may be missing carries systemd's `-`

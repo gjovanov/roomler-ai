@@ -80,15 +80,17 @@ ReadWritePaths=-%h/Videos
 #     renewed, so the person at the screen is asked again every session. A
 #     ReadWritePaths entry binds only a folder that EXISTS when the sandbox is
 #     built, so the `+` line (run outside the sandbox) creates it first, 0700
-#     as TokenStore::save sets it. ⚠️ Not StateDirectory=: measured on systemd
-#     255, it found ~/.config/roomler, took that for its own pre-XDG-state
-#     location, and symlinked ~/.local/state/roomler to it. Every enrolled host
-#     has that folder, so the token would have moved into the config folder.
+#     as TokenStore::save sets it. Its `-` matters as much: a folder that
+#     cannot be made costs one prompt per session, never the daemon's start.
+#     ⚠️ Not StateDirectory=: measured on systemd 255, it found
+#     ~/.config/roomler, took that for its own pre-XDG-state location, and
+#     symlinked ~/.local/state/roomler to it. Every enrolled host has that
+#     folder, so the token would have moved into the config folder.
 #     A custom XDG_STATE_HOME is not covered and costs that prompt per session.
 #   * ~/Downloads, where incoming files land (files.rs default_download_dir).
 #     `-` and the localized-name caveat as for ~/Videos.
 ReadWritePaths=%t
-ExecStartPre=+/bin/mkdir -p -m 0700 %h/.local/state/roomler
+ExecStartPre=-+/bin/mkdir -p -m 0700 %h/.local/state/roomler
 ReadWritePaths=-%h/.local/state/roomler
 ReadWritePaths=-%h/Downloads
 
