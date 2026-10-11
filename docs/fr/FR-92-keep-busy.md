@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11) and field-verified (§9), macOS included; owed: 24 h of EDR (10-12 07:00Z) and the two macOS fixes of #1991 on a release
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11) and field-verified (§9), macOS included; #1991 rides 0.4.127; P10 (a local On, operator 2026-10-11) built; owed: 24 h of EDR (10-12 07:00Z), #1991 and P10 in the field
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -32,6 +32,10 @@ disconnects, self-updates and reboots.
    (`keep_busy_enabled`, never server-settable), and an **org admin can deny it org-wide** in v1. The
    deny also stops it where it is already running.
 3. **Host side:** a companion tray item ("Keep busy is on · Stop") and `roomler keep-busy status|off`.
+   - **Amended 2026-10-11** (operator, "i want an On in roomler-desktop too"): the person at the
+     computer can also turn it on, from the tray ("Start keep busy") and with `roomler keep-busy on`.
+     This is P10. Only that person may do it: never root, a service or `roomler exec`, so the server
+     still cannot start it (§7).
 
 ## 2. Evidence (master `83aede0bd`, 2026-10-10)
 
@@ -244,13 +248,31 @@ stateDiagram-v2
 ### 3g. Host side
 
 - **LocalAPI `KeepBusyStatus` / `KeepBusyOff`**, both on the person-socket allowlist.
-  - There is no local enable verb.
   - Off is open to every peer the endpoint admits (including `roomler exec` as SYSTEM/root), because
     stopping is the safe direction.
-- **CLI:** `roomler keep-busy [status|off] [--json]`.
+- **LocalAPI `KeepBusyOn { opts }` (P10)**, also on the person-socket allowlist, and gated on the
+  peer by `ClientPeer::may_start_keep_busy` (`crates/localapi`):
+  - Windows: the active console session, never session 0;
+  - a per-user daemon's socket (the macOS GUI worker, a Linux user daemon): its owner;
+  - a Linux system install's person socket: its person;
+  - **root never**. The console-user gate the recording verbs use lets root through on Unix, and root
+    is how `roomler exec` arrives there.
+  - `opts` are the viewer's wire names (pattern, size, speed, `resume_after_s`, `auto_off_min`),
+    checked by the viewer's own parser (`wire::parse_set`); absent means the product default.
+  - The start names `"the person at this computer"` as who turned it on: the person's account name
+    is not ours to show every viewer and the org's history.
+  - A supervised Mac's root daemon refuses it rather than relay it. The person's clients reach the
+    GUI worker directly, and nothing that can only reach the root daemon may start synthetic input.
+- **CLI:** `roomler keep-busy [status|on|off] [--json]`. `on` takes `--pattern`, `--size`, `--speed`,
+  `--resume-after SECONDS` and `--auto-off MINUTES`.
 - **Companion:**
   - a tray item and tooltip, polled like the recording item (`roomler-desktop/src/tray.rs`
-    `spawn_recording_watch`);
+    `spawn_recording_watch`). Since P10 it is a toggle:
+    - "Stop keep busy (Pattern · phase)" while it is on;
+    - "Start keep busy" while it is off and can run here (the product default pattern);
+    - "Keep busy: unavailable", disabled, where it cannot run.
+
+    The click reads the state at that moment, since the label may be 3 s old;
   - a one-shot notification when it turns on;
   - a "Keep busy is on · Stop" row in the viewing banner while that banner is up.
 
@@ -289,6 +311,7 @@ stateDiagram-v2
 | P7 | **A permanent history** (operator, 2026-10-11): `keep_busy_events`, owned by `fleet`, **no TTL**. Server rows (`org_denied` · `org_allowed` · `org_default_pattern`, only on a change, naming the admin) and device rows (`on` · `off`, derived on the heartbeat path from the previous stored brief against the new one — ONE `find_one_and_update` returning the row as it was — with a restart dedupe); `source` tells the server's decision from the device's claim. `GET …/keep-busy-history` (`MANAGE_AGENTS`, tenant + device scoped, `before`/`limit` paging); a History list with a device filter in the org's card. Resolution is the 30 s heartbeat; exact device-pushed edges would need an agent release | none (a record, not a gate; the route alone) | #1977 open |
 | P8 | **The default pattern**: circle stays the product default; `TenantSettings.keep_busy_default_pattern` lets an org choose another, validated by **equality** against the agent's 13 wire names, `null` clears, absent leaves alone; the settings `GET` becomes readable by any member so the viewer can pre-select it (`PUT` stays `MANAGE_TENANT`). No agent and no wire change: the menu pre-selects the org default only where the person has no remembered choice; a fetch failure means circle | unset the default (= circle) | #1977 open |
 | P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | #1978, merged `b2b715a50` |
+| P10 | **A local On** (operator, 2026-10-11). The person at the computer turns it on from the tray's "Start keep busy" or with `roomler keep-busy on [--pattern …]`. LocalAPI `KeepBusyOn`, gated to the console person: never root (`roomler exec` on Unix), never session 0, never relayed by a supervised Mac's root daemon. It names "the person at this computer". The server still has no "on" | `keep_busy_enabled = false` and an org deny refuse it, as they refuse a viewer's | this PR |
 
 ## 5. Acceptance criteria
 
@@ -317,6 +340,11 @@ stateDiagram-v2
 - [ ] **AC9:** Wayland and portal-only hosts that keep busy cannot drive report `unavailable` with a
   reason the viewer shows (`wayland` without the uinput path; `no_idle_clock` on a desktop with no idle
   clock a helper can read).
+- [ ] **AC14 (P10):** the person at the computer turns it on from the tray's "Start keep busy", and
+  with `roomler keep-busy on` (any pattern, checked by the viewer's parser), on Windows and on a
+  supervised Mac. Every connected viewer shows "turned on by the person at this computer".
+  `roomler exec … roomler keep-busy on` (root/SYSTEM) is refused. The owner's switch and an org deny
+  refuse a local start as they refuse a viewer's.
 - [ ] **AC13 (P9):** on GNOME on Wayland, through a system install with uinput on, keep busy runs:
   the negative control (OFF ⇒ GNOME locks at its idle delay) recorded first, then ON ⇒ no lock and
   Mutter's idle clock under 2 s, and a local key pauses it within 1 s.
@@ -354,13 +382,20 @@ stateDiagram-v2
 
 - Sleep and power assertions (FR-55).
 - Clicks, keys or scrolling of any kind.
-- Enabling keep-busy without a consented, `INPUT`-granted session. A server-side enable would be the
-  only server-forgeable input path in the product, so there is none.
+- **A server "on".** A server-side enable would be the only server-forgeable input path in the
+  product, so there is none. The only ways to turn it on are a consented, `INPUT`-granted session
+  and, since P10, the person at the computer. `roomler exec` is refused for that start (root,
+  SYSTEM, session 0). Where exec runs inside the console session — a Windows worker — it already
+  holds every power a mouse jiggler needs, and the device owner's `exec_enabled` is the gate there.
 - Work-hour schedules.
 - A per-device admin deny in `AccessPolicy`.
 
 ## 8. Rejected along the way
 
+- **Reusing the recording verbs' console-user gate for P10's local On.** `peer_is_console_user` lets
+  root through on Unix (`p == own || p == 0`), and root is how `roomler exec` arrives there. With it,
+  the server could start synthetic input on every exec-enabled Linux or macOS device. The On has its
+  own gate (`peer_may_start_keep_busy`): root never.
 - **Low-level hooks or raw input to tell real from synthetic input.** They're exact (`LLMHF_INJECTED`,
   a null `hDevice`), but EDR reads them as keylogging.
 - **Cursor warps** (`SetCursorPos`, `CGWarpMouseCursorPosition`, `XWarpPointer`). They move the

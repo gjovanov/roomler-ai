@@ -11,10 +11,11 @@
 //!                           the recorder (a light poll, every 3 s), and
 //!                           the ICON turns red while any recording runs,
 //!                           this device's own or a controller's
-//!   - Stop keep busy     — FR-92: shows while a controller has left keep
-//!                           busy on (pattern · phase) and stops it; disabled
-//!                           ("Keep busy: off") otherwise — there is no local
-//!                           "on". A light poll, every 3 s
+//!   - Start/Stop keep busy — FR-92: "Stop keep busy (pattern · phase)" while
+//!                           it is on, whoever turned it on; "Start keep
+//!                           busy" while it is off (P10: the person at the
+//!                           computer may turn it on here); disabled where it
+//!                           cannot run. A light poll, every 3 s
 //!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Welcome tour…      — FR-84 D6: the first-run tour, again
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
@@ -41,7 +42,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let open_web = MenuItem::with_id(app, "open_web", "Open Roomler…", true, None::<&str>)?;
     // FR-85 — disabled until the service says it has a recorder.
     let record = MenuItem::with_id(app, RECORD_ITEM_ID, "Start recording", false, None::<&str>)?;
-    // FR-92 — disabled while keep busy is off: there is no local "on".
+    // FR-92 — disabled until the service says what keep busy is doing.
     let keep_busy = MenuItem::with_id(
         app,
         KEEP_BUSY_ITEM_ID,
@@ -79,7 +80,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         "open_status" => show_window(app, "/overview"),
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
-        KEEP_BUSY_ITEM_ID => stop_keep_busy(app),
+        KEEP_BUSY_ITEM_ID => toggle_keep_busy(app),
         "onboarding" => show_window(app, "/onboarding"),
         "welcome" => show_window(app, "/welcome"),
         "check_updates" => check_updates(app),
@@ -169,13 +170,17 @@ const FALLBACK_TRAY_ID: &str = "roomler-desktop-tray";
 
 /// FR-85 — the Start/Stop recording menu item.
 const RECORD_ITEM_ID: &str = "record_toggle";
-/// FR-92 — the keep-busy item: its state, and Stop.
-const KEEP_BUSY_ITEM_ID: &str = "keep_busy_stop";
+/// FR-92 — the keep-busy item: its state, Start and Stop.
+const KEEP_BUSY_ITEM_ID: &str = "keep_busy_toggle";
 
-/// FR-92 — the tray's keep-busy item: `(text, enabled)`. Enabled only while
-/// keep busy is on, and then it is a Stop — the person at the device must
-/// always be able to end what a controller left running on their pointer.
-/// `None` (no service answered yet, or an older one) reads as off.
+/// FR-92 — the tray's keep-busy item: `(text, enabled)`.
+/// - On, whoever turned it on: a Stop. The person at the device must always
+///   be able to end what is moving their pointer.
+/// - Off where it can run: a Start (P10, the person's own "on").
+/// - Off where it cannot (the owner switched it off, the org denies it, no
+///   permission, an unsupported desktop): disabled. The agent's reason is in
+///   `roomler keep-busy status`.
+/// - `None` (no service answered yet, or one older than FR-92): disabled.
 fn keep_busy_labels(state: Option<&roomler_localapi::KeepBusyInfo>) -> (String, bool) {
     match state {
         Some(s) if s.on => {
@@ -188,7 +193,9 @@ fn keep_busy_labels(state: Option<&roomler_localapi::KeepBusyInfo>) -> (String, 
             };
             (format!("Stop keep busy ({pattern} · {})", s.phase), true)
         }
-        _ => ("Keep busy: off".into(), false),
+        Some(s) if s.available => ("Start keep busy".into(), true),
+        Some(_) => ("Keep busy: unavailable".into(), false),
+        None => ("Keep busy: off".into(), false),
     }
 }
 
@@ -222,15 +229,28 @@ fn spawn_keep_busy_watch<R: Runtime>(item: MenuItem<R>) {
     });
 }
 
-/// FR-92 — the person at the device stops keep busy.
-fn stop_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
+/// FR-92 — the person at the device starts or stops keep busy: whatever it
+/// is NOW, read at the click (the label may be up to 3 s old). Off starts it
+/// with the product defaults (P10); anything on stops it.
+fn toggle_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
-        let outcome = match roomler_localapi::connect().await {
-            Ok(mut c) => c.keep_busy_off().await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = outcome {
-            tracing::warn!(%e, "tray: could not stop keep busy");
+        let outcome: std::io::Result<roomler_localapi::KeepBusyInfo> = async {
+            let mut c = roomler_localapi::connect().await?;
+            if c.keep_busy_status().await?.on {
+                c.keep_busy_off().await
+            } else {
+                c.keep_busy_on(Default::default()).await
+            }
+        }
+        .await;
+        match outcome {
+            Ok(s) if !s.on && s.reason.is_some() => tracing::warn!(
+                reason = s.reason.as_deref().unwrap_or("-"),
+                sentence = s.sentence.as_deref().unwrap_or("-"),
+                "tray: keep busy did not start"
+            ),
+            Ok(s) => tracing::info!(on = s.on, phase = %s.phase, "tray: keep busy toggled"),
+            Err(e) => tracing::warn!(%e, "tray: could not toggle keep busy"),
         }
     });
 }
@@ -531,9 +551,10 @@ mod tests {
     /// older service, or no answer at all leave it disabled (there is no
     /// local "on" to offer).
     #[test]
-    fn keep_busy_item_is_a_stop_only_while_it_is_on() {
+    fn keep_busy_item_is_a_stop_while_on_and_a_start_where_it_can_run() {
         assert_eq!(keep_busy_labels(None), ("Keep busy: off".into(), false));
         let mut s = roomler_localapi::KeepBusyInfo {
+            available: true,
             on: true,
             phase: "paused".into(),
             pattern: "heart".into(),
@@ -543,11 +564,13 @@ mod tests {
             keep_busy_labels(Some(&s)),
             ("Stop keep busy (Heart · paused)".into(), true)
         );
+        // FR-92 P10 — off where it can run: the person's own Start.
         s.on = false;
-        assert_eq!(keep_busy_labels(Some(&s)), ("Keep busy: off".into(), false));
+        assert_eq!(keep_busy_labels(Some(&s)), ("Start keep busy".into(), true));
+        // Off where it cannot (owner, org, permission, desktop): no Start.
         assert_eq!(
             keep_busy_labels(Some(&roomler_localapi::KeepBusyInfo::unavailable())),
-            ("Keep busy: off".into(), false)
+            ("Keep busy: unavailable".into(), false)
         );
     }
 
