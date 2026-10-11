@@ -9371,6 +9371,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     function onPointerMove(ev: PointerEvent) {
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
+      // FR-93 — every synthetic button-up reuses this (`releaseHeldInputs` on
+      // blur or a hidden tab, and a drag that ends outside the picture), so it
+      // must follow the POINTER. Updated on press and release only, it held
+      // the press point: on the FR-93 lab a tab closed mid-drag let go at
+      // (0.5,0.5) after the drag had reached (0.6,0.6), and the host's cursor
+      // snapped back to where the drag began.
+      lastPointerNorm = { x, y }
       pendingMove = { x, y, mon: 0 }
       schedulePendingMove()
     }
@@ -9491,8 +9498,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // and force-released when this window loses focus (alt-tab, minimize,
     // OS-level steal) — see createHeldInputTracker for the stuck-Alt story.
     const heldInputs = createHeldInputTracker()
-    // Last normalized pointer position — synthetic button-ups reuse it so
-    // releasing a stuck drag doesn't teleport the host cursor.
+    // Last normalized pointer position inside the picture — synthetic
+    // button-ups reuse it so releasing a stuck drag doesn't teleport the host
+    // cursor. ⚠️ Every pointer MOVE updates it (onPointerMove), not only a
+    // press: a press-only value is exactly the teleport this exists to avoid.
     let lastPointerNorm = { x: 0.5, y: 0.5 }
 
     function releaseHeldInputs() {
