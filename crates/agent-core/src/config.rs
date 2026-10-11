@@ -2693,6 +2693,84 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 3
     ]
 }
 
+/// S2 — the whole config→env fallback map (`tunnel_core::env`'s
+/// `register_config_fallbacks`), built in ONE place. The daemon publishes it
+/// at start, before anything reads a knob; FR-93 P1 has `capture-smoke` and
+/// `input-smoke` publish the same map, so a key set with `roomler config set`
+/// is honoured by the smoke test that is meant to prove it. Before that they
+/// read env and built-in defaults only, and answered about a cascade the
+/// daemon was not running.
+///
+/// Precedence at every read site: env (either prefix) > these fallbacks >
+/// built-in default. Bools map to the "1"/"0" strings every read-site parser
+/// already accepts.
+pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, String> {
+    let mut fallbacks = std::collections::HashMap::new();
+    // rc.280 — the pair lists live in `env_bridge_*` (one source,
+    // parity-tested against the editable surface) instead of literals here.
+    for (suffix, value) in env_bridge_bools(cfg) {
+        if let Some(v) = value {
+            fallbacks.insert(suffix.to_string(), if v { "1" } else { "0" }.to_string());
+        }
+    }
+    // Numeric knobs ride the same map as their decimal strings.
+    for (suffix, value) in env_bridge_numerics(cfg) {
+        if let Some(v) = value {
+            fallbacks.insert(suffix.to_string(), v.to_string());
+        }
+    }
+    // Sibling-safe stable-port default (2026-08-15: both household
+    // laptops pinned the fleet-wide 43648 behind ONE Fritz!Box — the
+    // loser's srflx went per-destination and every inbound punch hit
+    // the sibling ⇒ relay-locked pairs). Applied ONLY when the
+    // operator left the key unset; like every bridge entry this is a
+    // FALLBACK — an explicit config value or a real env var wins.
+    if cfg.overlay_direct_port.is_none() {
+        fallbacks.insert(
+            "OVERLAY_DIRECT_PORT".to_string(),
+            derived_default_direct_port(&cfg.machine_id).to_string(),
+        );
+    }
+    // PR-D — overlay_pathmon is multi-state (on|shadow|off), so it rides
+    // the fallback map as a string, not the bool pairs above.
+    if let Some(mode) = &cfg.overlay_pathmon {
+        fallbacks.insert("OVERLAY_PATHMON".to_string(), mode.clone());
+    }
+    // B2 — overlay_demote (off|shadow|on), same string ride.
+    if let Some(mode) = &cfg.overlay_demote {
+        fallbacks.insert("OVERLAY_DEMOTE".to_string(), mode.clone());
+    }
+    // P4 — overlay_rpf (off|warn|enforce), same string ride.
+    if let Some(mode) = &cfg.overlay_rpf {
+        fallbacks.insert("OVERLAY_RPF".to_string(), mode.clone());
+    }
+    // P4 demotion — numeric heartbeat override, same string ride.
+    if let Some(secs) = cfg.overlay_route_tick_secs {
+        fallbacks.insert("OVERLAY_ROUTE_TICK_SECS".to_string(), secs.to_string());
+    }
+    // netstate — numeric debounce override, same string ride.
+    if let Some(ms) = cfg.overlay_netmon_debounce_ms {
+        fallbacks.insert("OVERLAY_NETMON_DEBOUNCE_MS".to_string(), ms.to_string());
+    }
+    // FR-77 — the cell denylist is a string key: it reaches the probe
+    // child through `config_fallbacks_for_child` like every other knob.
+    if let Some(v) = &cfg.encoder_cells_deny {
+        fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
+    }
+    // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
+    // probe child too.
+    if let Some(v) = &cfg.vaapi_device {
+        fallbacks.insert("VAAPI_DEVICE".to_string(), v.clone());
+    }
+    if let Some(v) = &cfg.d3d12_adapter {
+        fallbacks.insert("D3D12_ADAPTER".to_string(), v.clone());
+    }
+    if let Some(v) = &cfg.vulkan_device {
+        fallbacks.insert("VULKAN_DEVICE".to_string(), v.clone());
+    }
+    fallbacks
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs =
         crate::appdirs::project_dirs().context("could not resolve a platform config directory")?;
@@ -2996,6 +3074,45 @@ fn derive_ws_url(http_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-93 P1 — the ONE fallback map, which the daemon and both smoke
+    /// commands publish: every kind of bridged value reaches it, an unset key
+    /// publishes nothing, and the derived stable port fills in only while the
+    /// operator left it unset.
+    #[test]
+    fn env_fallbacks_carry_every_bridged_kind() {
+        let mut cfg = test_fixture();
+        cfg.drm_capture = Some(true);
+        cfg.uinput = Some(false);
+        cfg.overlay_pathmon = Some("shadow".into());
+        cfg.encoder_cells_deny = Some("h264/nvenc".into());
+        let m = env_fallbacks(&cfg);
+        let get = |k: &str| m.get(k).map(String::as_str);
+        assert_eq!(get("DRM_CAPTURE"), Some("1"));
+        assert_eq!(
+            get("UINPUT"),
+            Some("0"),
+            "an explicit false is published, as 0"
+        );
+        assert_eq!(get("OVERLAY_PATHMON"), Some("shadow"));
+        assert_eq!(get("ENCODER_CELLS_DENY"), Some("h264/nvenc"));
+        assert_eq!(
+            get("PORTAL_CAPTURE"),
+            None,
+            "an unset key publishes nothing"
+        );
+        let derived = derived_default_direct_port(&cfg.machine_id).to_string();
+        assert_eq!(get("OVERLAY_DIRECT_PORT"), Some(derived.as_str()));
+
+        cfg.overlay_direct_port = Some(41641);
+        assert_eq!(
+            env_fallbacks(&cfg)
+                .get("OVERLAY_DIRECT_PORT")
+                .map(String::as_str),
+            Some("41641"),
+            "the operator's port, not the derived one"
+        );
+    }
 
     /// Smallest document `try_load` accepts — enough to exercise save/load.
     fn minimal_toml() -> String {
