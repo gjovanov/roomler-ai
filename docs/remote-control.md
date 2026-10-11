@@ -375,6 +375,14 @@ Key design choices:
   may lock the screen. Each backend's no-move arm is locked by a test that
   records what it emits (`a_release_never_moves_the_pointer` in
   `enigo_backend.rs`, `uinput_backend.rs` and `capture/portal/input.rs`).
+  ⚠️ **The page lets go first, when it can.** On blur or a hidden tab
+  (`releaseHeldInputs`), and for a drag that ends outside the picture, the
+  viewer sends a positioned button-up at `lastPointerNorm`, because an older
+  agent does not know `MouseRelease`. That position must follow every pointer
+  move. Updated only on press, it held the press point: a tab closed mid-drag
+  snapped the host cursor back to where the drag began (FR-93 lab, the
+  `close-mid-drag` oracle). The agent's release-all is the path for a page that
+  cannot run any code at all (a crash, `crash-mid-drag`).
 - **Mouse coalescing on the controller**, not the agent. The browser fires `pointermove` at up to display refresh rate; we coalesce to one msg per RAF (~16 ms), preserving the *last* position but dropping intermediate samples. Click/key events are never coalesced.
 - **`enigo` is the default**, with OS-specific direct backends behind a feature flag for performance and edge cases (UIPI on Windows, IME composition on macOS, `uinput` on Wayland because XTest doesn't exist there).
 
