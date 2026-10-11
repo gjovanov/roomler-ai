@@ -364,6 +364,12 @@ pub fn delegable_outbound(msg: &ClientMsg) -> bool {
     )
 }
 
+/// FR-92 — one deny from any org is enough; an org that never said anything
+/// (an older server) does not deny.
+fn strictest_keep_busy(policies: &std::collections::BTreeMap<String, bool>) -> bool {
+    policies.values().any(|d| *d)
+}
+
 /// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
 /// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
 pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
@@ -406,6 +412,12 @@ struct Inner {
     /// `Terminate`, because a recording outlives its session by the re-attach
     /// grace and its last claims come after.
     record_sessions: Mutex<std::collections::VecDeque<String>>,
+    /// FR-92 — every org's last keep-busy policy (tenant hex → denied), as
+    /// this daemon's control WS loops received it. On a supervised Mac the
+    /// WORKER runs keep busy, while delegation itself is primary-only — so
+    /// the daemon is the one place that hears every org, and it hands the
+    /// worker the strictest ([`DelegateHost::note_keep_busy_policy`]).
+    keep_busy: Mutex<std::collections::BTreeMap<String, bool>>,
     /// #1882 — where the frame loop reads the overlay footprint it pushes to
     /// an attached worker ([`DelegateFrame::OverlayFootprint`]). Set by the
     /// daemon to `tunnel_core::overlay_footprint::v4_nets`; unset (every test
@@ -589,6 +601,39 @@ impl DelegateHost {
         .is_ok()
     }
 
+    /// FR-92 — one org's keep-busy policy arrived on this daemon's control
+    /// WS. The attached worker gets the STRICTEST of every org's (any org's
+    /// deny stops keep busy device-wide), as an ordinary
+    /// `rc:agent.keep_busy_policy`. The worker files it under its own tenant —
+    /// the primary, the one org key its store keeps across restarts — which
+    /// is exactly the device-wide answer it needs. No worker attached: it
+    /// gets the same frame on attach ([`Self::keep_busy_replay`]).
+    pub fn note_keep_busy_policy(&self, tenant: &str, denied: bool) {
+        let strictest = {
+            let mut m = self.inner.keep_busy.lock().expect("keep_busy mutex");
+            m.insert(tenant.to_string(), denied);
+            strictest_keep_busy(&m)
+        };
+        if self.send_to_worker(&ServerMsg::KeepBusyPolicy { denied: strictest }) {
+            tracing::info!(
+                denied = strictest,
+                "delegation: keep-busy policy handed to the GUI worker"
+            );
+        }
+    }
+
+    /// The keep-busy frame an attaching worker needs, once any org has said
+    /// anything. A policy that arrived while no worker was attached (the
+    /// connect-time push always does) would otherwise never reach it.
+    fn keep_busy_replay(&self) -> Option<DelegateFrame> {
+        let m = self.inner.keep_busy.lock().expect("keep_busy mutex");
+        (!m.is_empty()).then(|| DelegateFrame::ToWorker {
+            msg: Box::new(ServerMsg::KeepBusyPolicy {
+                denied: strictest_keep_busy(&m),
+            }),
+        })
+    }
+
     /// Hand the worker the parameters the daemon resolved for a session.
     ///
     /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
@@ -757,6 +802,11 @@ impl DelegateHost {
         // #1882 — the worker's OWN sessions need the overlay's blocks too.
         let mut footprint_sent = Vec::new();
         if let Some(frame) = self.footprint_update(&mut footprint_sent) {
+            write_frame(&mut wr, &frame).await?;
+        }
+        // FR-92 — and keep busy needs the orgs' policy, which the server
+        // pushed on connect, before this worker was here to hear it.
+        if let Some(frame) = self.keep_busy_replay() {
             write_frame(&mut wr, &frame).await?;
         }
 
@@ -1048,6 +1098,80 @@ mod tests {
             .await
             .expect("the daemon loop ends with its channel")
             .unwrap();
+    }
+
+    /// FR-92 — keep busy runs in the WORKER of a supervised Mac, and the
+    /// server pushes the org policy to the DAEMON, on connect — before any
+    /// worker is there. So: a policy heard before the attach is replayed
+    /// right after it, and a later one goes straight through, always as the
+    /// strictest of every org's (a secondary org's deny included).
+    #[tokio::test]
+    async fn the_worker_gets_the_strictest_keep_busy_policy_on_attach_and_on_change() {
+        fn denied(frame: DelegateFrame) -> bool {
+            match frame {
+                DelegateFrame::ToWorker { msg } => match *msg {
+                    ServerMsg::KeepBusyPolicy { denied } => denied,
+                    other => panic!("expected a keep-busy policy, got {other:?}"),
+                },
+                other => panic!("expected a ToWorker frame, got {other:?}"),
+            }
+        }
+        let host = DelegateHost::new();
+        // Heard on connect, with no worker yet: the primary allows.
+        host.note_keep_busy_policy("primary", false);
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(4096);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        async fn next<R: tokio::io::AsyncBufRead + Unpin>(
+            lines: &mut tokio::io::Lines<R>,
+        ) -> DelegateFrame {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("a frame within 5 s")
+                .unwrap()
+                .expect("a frame, not EOF");
+            serde_json::from_str(&line).unwrap()
+        }
+        assert!(matches!(
+            next(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        assert!(!denied(next(&mut lines).await), "replayed on attach");
+
+        // A SECONDARY org denies: the worker hears the device-wide answer.
+        host.note_keep_busy_policy("secondary", true);
+        assert!(denied(next(&mut lines).await));
+        // The primary allowing again changes nothing while the secondary
+        // still denies.
+        host.note_keep_busy_policy("primary", false);
+        assert!(denied(next(&mut lines).await));
+        // The secondary re-allows: allowed.
+        host.note_keep_busy_policy("secondary", false);
+        assert!(!denied(next(&mut lines).await));
+
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+    }
+
+    /// With no org heard from yet, an attaching worker gets no policy frame
+    /// at all — silence is not a deny, and not an allow either.
+    #[test]
+    fn no_policy_heard_means_no_frame_on_attach() {
+        let host = DelegateHost::new();
+        assert!(host.keep_busy_replay().is_none());
+        host.note_keep_busy_policy("primary", true);
+        assert!(matches!(
+            host.keep_busy_replay(),
+            Some(DelegateFrame::ToWorker { .. })
+        ));
     }
 
     /// An unknown frame must not close the channel: a NEWER worker may send one,
