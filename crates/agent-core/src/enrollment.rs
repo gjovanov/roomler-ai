@@ -140,6 +140,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_core_memory: false,
         hive_adopt: false,
         hive_allow_passwordless_sudo: false,
+        hive_replica: false,
+        hive_archive: false,
+        hive_store_quota_mib: None,
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,

@@ -461,6 +461,26 @@ pub struct AgentConfig {
     /// call alone. Linux needs no such key: a session there cannot `sudo`.
     #[serde(default)]
     pub hive_allow_passwordless_sudo: bool,
+    /// FR-90 P2c — hold copies of the sessions this device's owner runs on
+    /// their other devices: a replica, which a promotion can move a session
+    /// to once its device is gone. Default OFF, and never pushable: a replica
+    /// is a plaintext copy of everything the agent saw, so whether this
+    /// device holds one is its owner's call alone. Off, it advertises no
+    /// `hive-replica` and refuses a join on its own word.
+    #[serde(default)]
+    pub hive_replica: bool,
+    /// FR-90 P2c — offer this device as an archive replica of the org: once
+    /// an `ADMINISTRATOR` designates it, it holds every session the org's
+    /// rules allow, for their retention. Counts only with `hive_replica` on.
+    /// Default OFF, never pushable: offering is the device owner's, as
+    /// designating is the org's.
+    #[serde(default)]
+    pub hive_archive: bool,
+    /// FR-90 P2c — the most this device keeps of the sessions it holds as a
+    /// replica, in MiB; `None` = no bound but the disk's. Never pushable: the
+    /// device owner's disk.
+    #[serde(default)]
+    pub hive_store_quota_mib: Option<u32>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2258,6 +2278,9 @@ pub fn test_fixture() -> AgentConfig {
         hive_core_memory: false,
         hive_adopt: false,
         hive_allow_passwordless_sudo: false,
+        hive_replica: false,
+        hive_archive: false,
+        hive_store_quota_mib: None,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

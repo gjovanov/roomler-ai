@@ -74,7 +74,7 @@ actor can turn one device into the org's traffic chokepoint.
 
 | # | gate | owner | default | where |
 |---|---|---|---|---|
-| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2065`](../crates/remote_control/src/models.rs#L2065) |
+| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2087`](../crates/remote_control/src/models.rs#L2087) |
 | 2 | overlay ACL grants **each** member the relay node | the policy author | no grant | [`org_relay.rs:377`](../crates/modules/network/src/org_relay.rs#L377) |
 | 3 | per-device approval `peer_relay_policy.serve` | the fleet admin (`MANAGE_AGENTS` **and** `EXEC_DEVICE`) | `false` | [`routes/peer_relay.rs:53`](../crates/modules/network/src/routes/peer_relay.rs#L53) |
 | 4 | the relay device's own `relay_server_enabled` | the relay host's owner, **locally** | off | [`orgrelay/mod.rs:36`](../crates/tunnel-core/src/overlay/orgrelay/mod.rs#L36) |
