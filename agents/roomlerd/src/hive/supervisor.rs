@@ -294,6 +294,7 @@ enum Launcher {
 /// P1j — terminal sessions adopted on this device.
 mod adopt;
 mod replica;
+mod stream;
 
 pub struct Supervisor {
     cfg: HiveConfig,
@@ -351,6 +352,9 @@ pub struct Supervisor {
     adopted: Mutex<adopt::AdoptedFile>,
     /// P1j — adopt offers waiting for the server's word, by offer id.
     adopt_offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<adopt::OfferAnswer>>>,
+    /// P2d — the replica streams this device is a side of, by grant: the
+    /// ones it serves as a source and the ones it follows as a member.
+    streams: Mutex<HashMap<ObjectId, stream::Stream>>,
     /// P2b-3b — how a test's sessions take their checkpoints (in-process,
     /// failing, never finishing); a device always runs `hive-checkpoint` as
     /// the account.
@@ -544,6 +548,89 @@ pub fn handle_replica_join(
             })
             .await;
     });
+}
+
+/// FR-90 P2d — `rc:hive.replica.grant`: serve a stream of a session this
+/// device holds to one of its members, answered with `rc:hive.replica.ready`
+/// on the connection it came on ([`stream`]).
+#[allow(clippy::too_many_arguments)]
+pub fn handle_replica_grant(
+    grant_id: ObjectId,
+    session_id: ObjectId,
+    fence: u64,
+    member_id: ObjectId,
+    path: Option<roomler_ai_remote_control::hive::HiveStreamPath>,
+    token: String,
+    ice_servers: Vec<roomler_ai_remote_control::signaling::IceServer>,
+    ttl_secs: u32,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    let g = stream::Grant {
+        grant_id,
+        session_id,
+        fence,
+        member_id,
+        path,
+        token,
+        ice_servers,
+        ttl_secs,
+    };
+    tokio::spawn(async move {
+        let ready = match global() {
+            Some(sup) => sup.serve_grant(g, is_primary).await,
+            None => ClientMsg::HiveReplicaReady {
+                grant_id,
+                refused: Some(roomler_ai_remote_control::hive::HiveStreamRefusal::NotHeld),
+                detail: Some("agent sessions are not set up on this device".into()),
+                cert_fingerprint: None,
+                addrs: Vec::new(),
+                derp_pubkey: None,
+            },
+        };
+        let _ = tx.send(ready).await;
+    });
+}
+
+/// FR-90 P2d — `rc:hive.replica.dial`: the source this device asked for is
+/// ready; dial it as a member ([`stream`]).
+#[allow(clippy::too_many_arguments)]
+pub fn handle_replica_dial(
+    grant_id: ObjectId,
+    session_id: ObjectId,
+    fence: u64,
+    source_id: ObjectId,
+    path: Option<roomler_ai_remote_control::hive::HiveStreamPath>,
+    token: String,
+    cert_fingerprint: String,
+    addrs: Vec<String>,
+    ttl_secs: u32,
+    is_primary: bool,
+) {
+    if let Some(sup) = global() {
+        sup.follow_dial(
+            stream::Dial {
+                grant_id,
+                session_id,
+                fence,
+                source_id,
+                path,
+                token,
+                cert_fingerprint,
+                addrs,
+                ttl_secs,
+            },
+            is_primary,
+        );
+    }
+}
+
+/// FR-90 P2d — `rc:hive.replica.close`: the server ended a stream this
+/// device is a side of.
+pub fn handle_replica_close(grant_id: ObjectId, reason: String) {
+    if let Some(sup) = global() {
+        sup.close_stream(grant_id, &reason);
+    }
 }
 
 /// FR-90 P0f — an integration test's supervisor: sessions launch as the
@@ -761,6 +848,7 @@ impl Supervisor {
             memory: Mutex::new(HashMap::new()),
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
             #[cfg(test)]
             checkpoint_runner: None,
         }

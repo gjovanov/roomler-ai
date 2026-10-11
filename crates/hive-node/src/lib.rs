@@ -17,6 +17,8 @@
 //! - [`roots`] — confining a session's folder to the device's `hive_roots`;
 //! - [`checkpoint`] — what a checkpoint takes of a session's config directory
 //!   (FR-90 P2b), and how a member puts it back together.
+//! - [`stream`] — the replica stream between a member and its source: the
+//!   messages, their framing, and the opening exchange (FR-90 P2d).
 //!
 //! What it deliberately does not do: spawn processes, drop privileges, or talk
 //! to the network. The daemon does those, with the one privilege path it
@@ -31,6 +33,7 @@ pub mod event;
 pub mod launch;
 pub mod roots;
 pub mod store;
+pub mod stream;
 pub mod stream_json;
 
 pub use chain::{ChainError, ChainTip, EventEnvelope, GENESIS};
