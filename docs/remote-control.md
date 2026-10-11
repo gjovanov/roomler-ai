@@ -392,6 +392,30 @@ Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which r
 
 As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
 
+**Saying so (FR-93 P1).** An injector that reaches nothing does not fail. XTest
+into Xwayland *succeeds*, and moves only Xwayland's own pointer, which the
+compositor ignores. On GNOME 49 and later, Xwayland runs `-enable-ei-portal`,
+and XTest reaches no window at all: measured on GNOME 50, 0 events in a native
+window and 0 in an Xwayland one. So each session works out what its input will
+reach (`input/reach.rs`), from the facts `input::open_default` decides from,
+after capture has opened (a portal capture registers its input route as it
+opens).
+
+| The session finds | `reach` |
+|---|---|
+| a live portal RemoteDesktop route, or uinput that is on and opens | `full` |
+| XTest on a real X server (Xorg, or the daemon's own Xvfb) | `full` |
+| XTest on Xwayland | `xwayland_only` |
+| XTest on an Xwayland with `-enable-ei-portal` (read from that process's own command line) | `none` |
+| no X display and no uinput · a build without an injector · a Mac without Accessibility | `none` |
+
+When `reach` is anything but `full`, the agent sends `rc:input-reach {reach,
+reason}` once over the control DC, with the same retry-until-open as FR-80's
+notice. A session that reaches everything sends nothing, and an older viewer
+ignores the message. The viewer then shows a closable warning on any session
+that has input: *"Your mouse and keyboard do not reach this device's desktop."*,
+followed by the agent's reason, which names the key that would fix it.
+
 ### 6.1a Keep busy — a second input source (FR-92)
 
 A controller with input can leave the host's pointer moving in a pattern so the

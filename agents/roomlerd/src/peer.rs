@@ -2294,6 +2294,9 @@ async fn media_pump(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P1 — and what its input will reach. After the capture opened: a
+    // portal capture registers its input route as it opens.
+    spawn_input_reach_notice(session_id, control_dc.clone());
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
@@ -3341,6 +3344,9 @@ async fn media_pump_vp9_444_dc(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P1 — and what its input will reach. After the capture opened: a
+    // portal capture registers its input route as it opens.
+    spawn_input_reach_notice(session_id, control_dc.clone());
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
@@ -4820,24 +4826,89 @@ fn spawn_capture_unavailable_notice(
         "capture unavailable — this session will produce no pixels; telling the controller"
     );
     tokio::spawn(async move {
-        let started = std::time::Instant::now();
-        while started.elapsed() < DEADLINE {
-            let cdc = control_dc.lock().await.clone();
-            if let Some(cdc) = cdc
-                && matches!(
-                    tokio::time::timeout(SEND_BUDGET, cdc.send_text(payload.clone())).await,
-                    Ok(Ok(_))
-                )
-            {
-                return;
-            }
-            tokio::time::sleep(RETRY_EVERY).await;
+        if !send_control_notice(&control_dc, &payload, RETRY_EVERY, DEADLINE, SEND_BUDGET).await {
+            warn!(
+                %session_id,
+                "capture-unavailable notice never reached the controller — its control channel \
+                 did not open within the deadline"
+            );
+        }
+    });
+}
+
+/// Retry one control-DC message until it is sent or `deadline` passes. The
+/// channel usually opens AFTER capture (and seconds late on a relay), so a
+/// one-shot send would be lost. `true` once it went out.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+async fn send_control_notice(
+    control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    payload: &str,
+    retry_every: std::time::Duration,
+    deadline: std::time::Duration,
+    send_budget: std::time::Duration,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        let cdc = control_dc.lock().await.clone();
+        if let Some(cdc) = cdc
+            && matches!(
+                tokio::time::timeout(send_budget, cdc.send_text(payload.to_string())).await,
+                Ok(Ok(_))
+            )
+        {
+            return true;
+        }
+        tokio::time::sleep(retry_every).await;
+    }
+    false
+}
+
+/// FR-93 P1 — tell the controller, once, when this session's input will NOT
+/// reach the whole desktop (`rc:input-reach`). An injector that reaches
+/// nothing does not fail (XTest into Xwayland succeeds and moves nobody's
+/// pointer), so without this a session on such a host looked interactive and
+/// did nothing. A session whose input reaches everything sends nothing, like
+/// FR-80's notice, and an older viewer ignores the message.
+///
+/// The verdict probes the X server and reads `/proc`, so it runs on the
+/// blocking pool, never on the pump.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn spawn_input_reach_notice(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+) {
+    tokio::spawn(async move {
+        let Ok(reach) = tokio::task::spawn_blocking(crate::input::reach::current).await else {
+            return;
+        };
+        if reach.reach == crate::input::reach::Reach::Full {
+            debug!(%session_id, reason = %reach.reason, "input: this session's input reaches the whole desktop");
+            return;
         }
         warn!(
             %session_id,
-            "capture-unavailable notice never reached the controller — its control channel \
-             did not open within the deadline"
+            reach = reach.reach.wire(),
+            reason = %reach.reason,
+            "input: this session's input will not reach the whole desktop; telling the controller"
         );
+        let payload = crate::input::reach::payload(&reach);
+        let sent = send_control_notice(
+            &control_dc,
+            &payload,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        if !sent {
+            warn!(%session_id, "input-reach notice never reached the controller");
+        }
     });
 }
 
@@ -5208,6 +5279,9 @@ async fn media_pump_ffmpeg_dc(
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
     }
+    // FR-93 P1 — and what its input will reach. After the capture opened: a
+    // portal capture registers its input route as it opens.
+    spawn_input_reach_notice(session_id, control_dc.clone());
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();

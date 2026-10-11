@@ -1988,6 +1988,23 @@ describe('parseControlInbound', () => {
     expect(r).toEqual({ kind: 'host_locked', locked: false })
   })
 
+  // FR-93 P1 — the agent's wire shape (input/reach.rs `payload`, locked there).
+  it('parses rc:input-reach, keeping an unknown reach and a missing reason', () => {
+    expect(
+      parseControlInbound(
+        '{"t":"rc:input-reach","reach":"none","reason":"XTest reaches no window at all"}',
+      ),
+    ).toEqual({
+      kind: 'input_reach',
+      reach: { reach: 'none', reason: 'XTest reaches no window at all' },
+    })
+    expect(parseControlInbound('{"t":"rc:input-reach","reach":"some_future_value"}')).toEqual({
+      kind: 'input_reach',
+      reach: { reach: 'some_future_value', reason: '' },
+    })
+    expect(parseControlInbound('{"t":"rc:input-reach"}')).toBeNull()
+  })
+
   it('returns null for non-string input', () => {
     // Real ondatachannel messages can deliver Blob / ArrayBuffer
     // when the sender uses binary mode; our agent always sends
