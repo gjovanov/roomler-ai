@@ -1,8 +1,9 @@
 # FR-93: Linux Wayland out of the box — a stock desktop install is seen, driven and told, and a lab proves it
 
-**Issue:** [#1972](https://github.com/gjovanov/roomler-ai/issues/1972) · **Status:** proposed 2026-10-11 — spec and claim. The operator approved the plan
-and P0 (the lab on zeus, enrolled in the vmtest org — D2, D8); D1 (default-on policy) and D3 (x86
-hardware) stay open · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
+**Issue:** [#1972](https://github.com/gjovanov/roomler-ai/issues/1972) · **Status:** P1 merged 2026-10-11 and
+field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. The operator approved the plan and P0 (the
+lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
+stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
 **Anchors:** master `8098ebbe3`, fleet 0.4.124 (0.4.125 bumped, not yet released) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput),
 [FR-45](FR-45-portal-capture.md) (portal + mutter), [FR-56](FR-56-remote-apps-on-wayland.md) (Remote Apps),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) P10/P11 (companion, person socket),
@@ -336,7 +337,7 @@ flowchart TD
 
 | Session | Install | → capture | → input |
 |---|---|---|---|
-| Wayland user session | system | DRM if a LINEAR CRTC, else mutter (GNOME), else portal | uinput · Mutter RemoteDesktop · portal RemoteDesktop |
+| Wayland user session | system | **opt-in until a non-Debian companion ships (D1)**; armed: DRM if a LINEAR CRTC, else mutter (GNOME), else portal | uinput · Mutter RemoteDesktop · portal RemoteDesktop |
 | Wayland user session | per-user | mutter (GNOME — same bus, no root, no dialog), else portal | Mutter RemoteDesktop · portal RemoteDesktop |
 | greeter / locked | system | DRM (D1b) | uinput |
 | greeter / locked | per-user | refused with the reason — a per-user daemon cannot see the greeter | — |
@@ -513,10 +514,10 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
 | # | Decision | Recommendation |
 |---|---|---|
-| **D1** | Default policy on Wayland — the auto-cascade, unattended arms included | **Yes**, for both install types, X11 untouched, explicit keys override, kill switch. Enrolment plus the per-session consent mode is the consent; the indicator is the precondition (§4.3) |
-| **D1b** | Does an auto system install capture the greeter and the lock screen? | **Yes on system installs** — parity with Windows SystemContext, and the reason unattended access exists; an audit row records `capture_arm` and the surface |
+| **D1** | Default policy on Wayland: the auto-cascade, unattended arms included | ✅ **Decided 2026-10-11: split.** **Per-user installs: on.** Mutter on GNOME, the portal elsewhere (on KDE, the person picks the screen once, and the restore token renews each session now that #1998 lets the per-user daemon write it). Explicit keys override, X11 untouched, kill switch. **System installs: DRM + uinput stay opt-in** until a desktop companion ships for non-Debian hosts. The companion is a `.deb` only, so on Fedora, RHEL, SUSE and Arch a system install has no "being viewed" banner and no Disconnect (P6). *(Recommended was: yes for both install types.)* |
+| **D1b** | Does an auto system install capture the greeter and the lock screen? | ⏸ **Deferred with D1's system half**: moot while system installs are opt-in. *(Recommended: yes on system installs, for parity with Windows SystemContext.)* |
 | **D2** | The lab on zeus (a prod cluster host) | ✅ **approved 2026-10-11** (the operator's go-ahead on this plan) — `wlab-*` prefix, 6 GiB guests, one running by default, never jupiter |
-| **D3** | A real x86 Wayland box | Buy an N100-class mini-PC + HDMI dummy plug, at the operator's home, enrolled. Without it P3g cannot start and DRM stays "linear only" |
+| **D3** | A real x86 Wayland box | ⏸ **Deferred 2026-10-11: decide when P3 starts.** It blocks only P3g (tiled scanout); everything else in this FR runs on the lab. *(Recommended: an N100-class mini-PC + an HDMI dummy plug, at the operator's home, enrolled. Without it DRM stays "linear only".)* |
 | **D4** | FR-45 AC8 | Option (b): the capture arm on the wire (P2) and viewer copy |
 | **D5** | An aarch64 companion | Yes — `build-linux-arm64` builds `roomlerd` only today; Asahi-class hosts otherwise have no prompt and no banner |
 | **D6** | A Notifications-with-actions consent surface | Yes, as the fallback where no companion runs — coordinate with FR-27's owner |
