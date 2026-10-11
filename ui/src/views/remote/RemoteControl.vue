@@ -730,6 +730,28 @@
         {{ rc.notice.value }}
       </v-alert>
 
+      <!-- FR-93 P1 — the agent says this session's mouse and keyboard will not
+           reach the whole desktop. An injector that reaches nothing does not
+           fail, so before this a GNOME Wayland session looked interactive and
+           did nothing. Only for a session that HAS input: a view-only grant
+           is already its own state. -->
+      <v-alert
+        v-if="rc.inputReach.value && rc.inputGranted.value && rc.phase.value === 'connected'
+          && rc.inputReach.value !== dismissedInputReach"
+        type="warning"
+        variant="tonal"
+        density="comfortable"
+        class="ma-4"
+        closable
+        data-testid="rc-input-reach"
+        @click:close="dismissedInputReach = rc.inputReach.value"
+      >
+        <strong>{{ rc.inputReach.value.reach === 'xwayland_only'
+          ? 'Your mouse and keyboard reach only some apps on this device.'
+          : 'Your mouse and keyboard do not reach this device’s desktop.' }}</strong>
+        {{ rc.inputReach.value.reason }}
+      </v-alert>
+
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
         <!-- FR-27 P10 - the person at the device ended the session. Said in
              so many words, and the viewer stays put: reconnecting from here is
@@ -1947,6 +1969,9 @@ const { mobile } = useDisplay()
 // rc.199 — the single grouped Settings panel (gear button opens it at every
 // viewport, replacing the desktop inline Row 2 + the mobile bottom-sheet).
 const settingsOpen = ref(false)
+// FR-93 P1 — the input-reach warning the operator closed, by identity: the
+// next session's verdict is a new object, so it shows again.
+const dismissedInputReach = ref<object | null>(null)
 const clipboardBusy = ref(false)
 
 // FR-85 P3c — recording the remote screen (docs/recording.md §10). The file is

@@ -647,19 +647,36 @@ fn seat_shows_wayland() -> bool {
 /// that its RandR monitors, all named `XWAYLAND<n>` — so a 22.04-era GNOME is
 /// recognised too, not streamed black.
 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
-fn x_server_is_xwayland(display: &str) -> bool {
-    x_server_query(display, |conn, root| {
-        x_has_extension(conn, "XWAYLAND") || x_has_xwayland_monitor(conn, root)
-    }) == Some(true)
+pub(crate) fn x_server_is_xwayland(display: &str) -> bool {
+    x_server_xwayland(display) == Some(true)
 }
 
-#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+/// [`x_server_is_xwayland`] with the third answer it folds into "no": `None`
+/// when no Unix socket reaches an X server at all. `input::reach` needs it,
+/// because "no X display" and "a real X server" reach very different things.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+pub(crate) fn x_server_xwayland(display: &str) -> Option<bool> {
+    x_server_query(display, |conn, root| {
+        x_has_extension(conn, "XWAYLAND") || x_has_xwayland_monitor(conn, root)
+    })
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
 fn x_has_extension(conn: &x11rb::rust_connection::RustConnection, name: &'static str) -> bool {
     use x11rb::connection::RequestConnection as _;
     matches!(conn.extension_information(name), Ok(Some(_)))
 }
 
-#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
 fn x_has_xwayland_monitor(
     conn: &x11rb::rust_connection::RustConnection,
     root: x11rb::protocol::xproto::Window,
@@ -701,7 +718,10 @@ fn x_has_xwayland_monitor(
 /// mirrored networking, with systemd's /tmp hiding WSLg's X0 socket) that
 /// fallback stalled this probe for over a minute, measured, in front of every
 /// capture open. A display reached over TCP is simply not probed.
-#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
 fn x_server_query(
     display: &str,
     ask: impl FnOnce(&x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::Window) -> bool,
