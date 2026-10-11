@@ -130,9 +130,13 @@ itself on the affected run's page. Baseline when the program started: releases t
       `…-4829dd40`, a prefix restore), while every other salted job restored master's key
       with a full match (run 36907082419)
 - [x] No silent-save/skip path remains (verify-after-publish on every save)
-- [ ] **No cache write depends on the Actions budget** (wave 21): the limit is the free 10
+- [x] **No cache write depends on the Actions budget** (waves 21–22): the limit is the free 10
       GB, master's working set fits it with room for a family's rotation (≤ ~8.5 GB
-      steady), and master runs save with no "Cache reservation failed" warning
+      steady), and master runs save with no "Cache reservation failed" warning. Field,
+      2026-10-11: the pool settled at **7.48 GiB**, the seven Linux lanes (7,325 MiB) plus apt
+      and bun, with no superseded or PR-ref entries. That leaves ~2.5 GiB for a rotation of
+      the largest family (`ci-unit`, 2.1 GiB). Saves land with no budget warning, and the six
+      moved families republished from master to the `seed-cache` release (log)
 - [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
       **not met.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
       waves 18 and 19, whose agent code is 0.4.114's) took **14.9 min**: Windows MSI
@@ -527,3 +531,16 @@ itself on the affected run's page. Baseline when the program started: releases t
   - A dry run in WSL caught one bug before any of this: without `zstd`, `tar` left 0-byte
     archives, and the first draft uploaded them over the good cache. `ci-seed-save` now
     refuses a failed pack.
+- 2026-10-11: **wave 22 on master** (`7fe30a471`, #1954).
+  - The first master runs (CI 38096524857, integration-tests 38096524893, installer-smoke
+    38096524865) restored each of the six from the `seed-cache` release. Each saw the key
+    change, since removing the validation clause changed each job's definition, and
+    republished under master's key (`cache published: ci-…`). Times: macOS overlay 7.3 min,
+    macOS pkg 8.5, Windows clippy 6.7, Windows recorder 8.2, Windows MSI 12.2, integration
+    13.3. The jobs' annotations held only GitHub's Node.js 20 notice and a macOS capacity
+    notice, no cache warning.
+  - The six families' old Actions-cache entries were deleted by hand (8 entries,
+    ~6.4 GiB), along with the orphaned plain-recorder family. One more
+    `installer-smoke-windows` entry appeared at 00:00:31Z, written by the last run on the
+    old workflow (38095828862, `f47dfb5a1`, started before the merge), and was deleted.
+  - Settled pool: **7.48 GiB in 12 entries**, against the free 10 GiB.
