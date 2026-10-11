@@ -317,7 +317,7 @@ while read -r from to; do
 done <<'PAIRS'
 /yt /links/?utm_source=youtube&utm_medium=bio&utm_campaign=profile
 /tt /links/?utm_source=tiktok&utm_medium=bio&utm_campaign=profile
-/ig /links/?utm_source=instagram&utm_medium=bio&utm_campaign=profile
+/x /links/?utm_source=x&utm_medium=bio&utm_campaign=profile
 /fb /links/?utm_source=facebook&utm_medium=bio&utm_campaign=profile
 PAIRS
 
