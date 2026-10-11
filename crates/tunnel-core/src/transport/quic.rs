@@ -35,7 +35,7 @@ use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 // agent + tunnel-client) can name flow-stream halves WITHOUT a direct
 // quinn dependency — which would otherwise need its own ring crypto-
 // provider feature config to avoid pulling aws-lc-rs (a C build).
-pub use quinn::{Connection as QuicConnection, RecvStream, SendStream};
+pub use quinn::{Connection as QuicConnection, ConnectionError, RecvStream, SendStream};
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

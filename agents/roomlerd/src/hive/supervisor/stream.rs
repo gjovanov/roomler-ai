@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P2d-2 — the replica stream on the device (spec §3b, "The carrier"
-//! and "The stream"): the source's endpoint for a grant, the member's dial,
-//! the token and the opening exchange, on the `direct` rung (P2d-2a), the
-//! `relay` rung (P2d-2b) and the `derp` rung (P2d-2c).
+//! FR-90 P2d-2 and P2d-3 — the replica stream on the device (spec §3b, "The
+//! carrier" and "The stream"): the source's endpoint for a grant, the
+//! member's dial, the token and the opening exchange, on the `direct` rung
+//! (P2d-2a), the `relay` rung (P2d-2b) and the `derp` rung (P2d-2c); then
+//! the events, the blobs and the acks (P2d-3).
 //!
 //! | Side | On | Does |
 //! |---|---|---|
 //! | source | `rc:hive.replica.grant` | registers the grant at once, then stands its endpoint up: on `direct`, one UDP socket, STUN asked on that very socket, a QUIC server on it; on `relay`, a TURN allocation and a QUIC server over it; on `derp`, a QUIC server over its own `/derp` connection, on a route of the stream's own toward the member's key. Answers `rc:hive.replica.ready` with its certificate, and its addresses or its key |
 //! | source | `rc:hive.replica.candidate` | the member's relayed address: a TURN permission for it, held until the allocation lands |
-//! | source | the member's connection | serves ONE: the token first, then the member's hello, answered from its chain |
+//! | source | the member's connection | serves ONE: the token first, then the member's hello, answered from its chain; then the events past where the member's copy ends, from the store and then as they are appended, and each blob the member asks for |
 //! | member | `rc:hive.replica.dial` | on `relay`, first its own allocation, on the source's TURN worker, and its relayed address sent for the source's permission; on `derp`, a route of the stream's own toward the source's key; then the source dialed, the certificate pinned, the token presented, and where its copy ends said |
+//! | member | the source's answer and events | a copy off the source's chain set aside past the point both hold; then each event's blobs asked for and kept, the event applied through the store's chain check, each frame acked once on disk, and the tip reported to the server as it moves |
 //! | either | the server's `rc:hive.replica.close`, the connection's end, or the grant's | the endpoint, its socket and its allocation or route go, and the server is told why |
 //!
-//! The events, blobs and acks after the opening exchange are P2d-3. This
-//! build does not advertise `hive-stream` yet: a source that answers the
-//! hello but streams no event would hold a member waiting for nothing, so the
-//! verb is advertised once events flow (P2d-3).
+//! This build does not advertise `hive-stream` yet: the member's wants,
+//! which ask the server for a grant, come with it (P2d-3b).
+//!
+//! ⚠️ What a member holds of these streams in memory is bounded across all of
+//! them, by this device's budgets for event bytes and blob bytes
+//! ([`EVENT_BUDGET`], [`BLOB_BUDGET`]): 32 sources must not each make it hold
+//! their largest at once.
 //!
 //! ⚠️ On `derp`, never the tunnel's route ([`DerpMux::tunnel_conn_for`]):
 //! that one is one per peer, last one wins, so a stream on it would take a
@@ -39,8 +44,9 @@
 //! only once built would wait out its whole grant, holding its socket and its
 //! allocation, with nobody coming.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -50,17 +56,23 @@ use roomler_ai_remote_control::hive::{
 };
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use roomler_ai_remote_control::turn_url;
-use roomler_hive_node::stream::{self as wire, MemberMsg, SourceMsg};
+use roomler_hive_node::checkpoint::Digest;
+use roomler_hive_node::store::StoreError;
+use roomler_hive_node::stream::{self as wire, BlobMsg, EventMeta, Mark, MemberMsg, SourceMsg};
+use roomler_hive_node::{ChainError, ChainTip, EventEnvelope};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use tunnel_core::transport::derp::{DerpTunnelHandle, parse_pubkey_hex};
-use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer, RecvStream, SendStream};
+use tunnel_core::transport::quic::{
+    self, ConnectionError, QuicConnection, QuicPeer, RecvStream, SendStream,
+};
 use tunnel_core::transport::relay::{self, RelayConn, RelayUdpSocket};
 
 use super::Supervisor;
+use crate::hive::store::{StoreHandle, WriterError};
 
 /// How long each address is tried, and how long the source waits for the
 /// member's token once it connected.
@@ -83,6 +95,39 @@ const MAX_HELD_CANDIDATES: usize = 16;
 /// UDP socket, and on the relay rung an allocation; a dial past it is closed
 /// `busy`.
 const MAX_FOLLOWING: usize = 32;
+/// P2d-3 — the event bytes a source sends past the member's last ack before
+/// it waits for the next: enough to keep a path busy, and all a member that
+/// stopped reading leaves unread on its connection, well under the
+/// flow-control window its blobs need beside it.
+const AHEAD_BYTES: u64 = 4 * 1024 * 1024;
+/// P2d-3 — how long a read in the middle of something (an event's JSON, a
+/// blob, the next stream of a wave) waits for its next byte. A total time
+/// would cut a slow path short; none would let a side that stopped part way
+/// hold the stream to its grant's end.
+const STALL: Duration = Duration::from_secs(60);
+/// P2d-3 — the most often a member reports its tip while events land.
+const TIP_EVERY: Duration = Duration::from_secs(5);
+/// P2d-3 — the event bytes this device holds in memory as a member, across
+/// every stream it follows: two of the largest the stream carries.
+pub(super) const EVENT_BUDGET: usize = 2 * wire::MAX_EVENT_BYTES;
+/// P2d-3 — the blob bytes, likewise: a wave's worth, four of the largest.
+pub(super) const BLOB_BUDGET: usize = 4 * wire::MAX_STREAM_BLOB;
+
+// P2d-3 — what the limits promise, held at build time. The largest event a
+// device records fits the stream: a checkpoint's manifest, a stream-json
+// line, an adopted session's line; a producer raised past it fails the build
+// here, not a copy in the field. And each budget holds the largest thing it
+// counts, so a wait for it always ends.
+const _: () = {
+    assert!(crate::hive::checkpointer::MAX_HEADER < wire::MAX_EVENT_BYTES);
+    assert!(super::MAX_LINE < wire::MAX_EVENT_BYTES);
+    assert!(tunnel_core::localapi::hive_adopt::MAX_LINE < wire::MAX_EVENT_BYTES);
+    assert!(EVENT_BUDGET >= wire::MAX_EVENT_BYTES);
+    assert!(BLOB_BUDGET >= wire::MAX_STREAM_BLOB);
+};
+/// P2d-3 — the code a side closes the connection with when it ends the
+/// stream on its own word, which the close's reason carries.
+const ENDED: u32 = 2;
 
 /// Which side of a stream this device is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +149,9 @@ pub(crate) struct Stream {
     relay: Option<Arc<dyn RelayConn>>,
     /// The member's relayed addresses that arrived before the allocation.
     held: Vec<SocketAddr>,
+    /// P2d-3 — the blobs this side carried: sent, as the source; kept, as
+    /// the member.
+    blobs: u64,
     task: tokio::task::AbortHandle,
 }
 
@@ -306,6 +354,311 @@ async fn connect_first(peer: &QuicPeer, addrs: &[SocketAddr]) -> Option<QuicConn
     None
 }
 
+/// P2d-3 — `buf` filled from `recv`, each piece within [`STALL`] of the
+/// last. A stream that ends first is `cut`'s word.
+async fn read_within(recv: &mut RecvStream, buf: &mut [u8], cut: &str) -> Result<(), String> {
+    let mut got = 0;
+    while got < buf.len() {
+        match tokio::time::timeout(STALL, recv.read(&mut buf[got..])).await {
+            Ok(Ok(Some(n))) if n > 0 => got += n,
+            Ok(Ok(_)) => return Err(cut.to_string()),
+            Ok(Err(_)) => return Err("closed".to_string()),
+            Err(_) => return Err("stalled".to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// P2d-3 — the reason a stream ended, in the close's words. Below this,
+/// `closed` is a connection the other side let go. This side's own word
+/// ends the connection with it, for the other side to read as the close's
+/// reason. When the other side ended it on its word, that word, as
+/// `<side>:<word>` and held to letters, digits and `_` (the other side is a
+/// device of the org, not a trusted one); when it just let go, `gone`.
+fn ended_by(conn: &QuicConnection, side: &str, gone: &str, reason: String) -> String {
+    if reason != "closed" {
+        conn.close(ENDED.into(), reason.as_bytes());
+        return reason;
+    }
+    let word: String = match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(c))
+            if c.error_code.into_inner() == u64::from(ENDED) =>
+        {
+            String::from_utf8_lossy(&c.reason)
+                .chars()
+                .filter(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '_')
+                .take(32)
+                .collect()
+        }
+        _ => String::new(),
+    };
+    if word.is_empty() {
+        gone.to_string()
+    } else {
+        format!("{side}:{word}")
+    }
+}
+
+/// P2d-3 — what a source sent and the member acked.
+#[derive(Default)]
+struct Sent {
+    /// Each frame sent and not yet acked: its last event's seq and hash,
+    /// and the event bytes sent up to and with it.
+    frames: VecDeque<(u64, [u8; 32], u64)>,
+    /// Event bytes sent, in all.
+    bytes: u64,
+    /// The event bytes the member acked, and the seq of its last ack.
+    acked_bytes: u64,
+    acked_seq: u64,
+}
+
+/// P2d-3 — one `events` frame, once the member's acks bring what is in
+/// flight under [`AHEAD_BYTES`]: its listing, then each event's JSON, byte
+/// for byte. Recorded as sent before it is written, so the member's ack
+/// never finds it missing.
+async fn send_events(
+    send: &mut SendStream,
+    sent: &Mutex<Sent>,
+    acked: &mut watch::Receiver<u64>,
+    envs: &[EventEnvelope],
+) -> Result<(), String> {
+    let Some(last) = envs.last() else {
+        return Ok(());
+    };
+    if let Some(big) = envs
+        .iter()
+        .find(|e| e.event_json.len() > wire::MAX_EVENT_BYTES)
+    {
+        warn!(
+            session = %big.session, seq = big.seq, len = big.event_json.len(),
+            "hive stream: an event past the stream's limit — no copy follows past it"
+        );
+        return Err("event_too_large".to_string());
+    }
+    loop {
+        let ahead = {
+            let s = sent.lock().unwrap_or_else(|e| e.into_inner());
+            s.bytes - s.acked_bytes
+        };
+        if ahead < AHEAD_BYTES {
+            break;
+        }
+        if acked.changed().await.is_err() {
+            // The reader is gone, and its reason ends the stream.
+            return std::future::pending().await;
+        }
+    }
+    let len: u64 = envs.iter().map(|e| e.event_json.len() as u64).sum();
+    {
+        let mut s = sent.lock().unwrap_or_else(|e| e.into_inner());
+        s.bytes += len;
+        let upto = s.bytes;
+        s.frames.push_back((last.seq, last.hash(), upto));
+    }
+    let listing = SourceMsg::Events {
+        events: envs.iter().map(EventMeta::of).collect(),
+    };
+    if write_frame(send, &listing).await.is_err() {
+        return Err("closed".to_string());
+    }
+    for env in envs {
+        if send.write_all(env.event_json.as_bytes()).await.is_err() {
+            return Err("closed".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// P2d-3 — the events past `cursor` the store holds, a frame at a time,
+/// until it holds no more: the catch-up, and the fill after a gap or a feed
+/// that lagged.
+async fn send_from_store(
+    store: &StoreHandle,
+    sid: &str,
+    send: &mut SendStream,
+    sent: &Mutex<Sent>,
+    acked: &mut watch::Receiver<u64>,
+    cursor: &mut u64,
+) -> Result<(), String> {
+    loop {
+        let page = store
+            .page_within(sid, *cursor, wire::MAX_BATCH, wire::BATCH_BYTES)
+            .await
+            .map_err(|e| {
+                warn!(session = sid, %e, "hive stream: the store could not be read");
+                "store_error".to_string()
+            })?;
+        let Some(next) = page.last().map(|e| e.seq) else {
+            return Ok(());
+        };
+        send_events(send, sent, acked, &page).await?;
+        *cursor = next;
+    }
+}
+
+/// P2d-3 — the member's frames, until it lets the connection go or sends
+/// what it may not. An `ack` must name the last event of a frame sent and
+/// not yet acked, by its hash; a `need` goes to the blob sender, and the
+/// next frame is read once it was taken.
+async fn read_member(
+    mut recv: RecvStream,
+    sent: &Mutex<Sent>,
+    acked: watch::Sender<u64>,
+    need: mpsc::Sender<Vec<Digest>>,
+) -> String {
+    loop {
+        let msg: MemberMsg = match read_frame(&mut recv).await {
+            Ok(m) => m,
+            Err(e) if e.is::<wire::FrameError>() => return "bad_frame".to_string(),
+            Err(_) => return "closed".to_string(),
+        };
+        match msg {
+            MemberMsg::Ack { seq, hash } => {
+                let mut s = sent.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(at) = s
+                    .frames
+                    .iter()
+                    .position(|f| f.0 == seq && hex::encode(f.1) == hash)
+                else {
+                    return "bad_ack".to_string();
+                };
+                let upto = s.frames[at].2;
+                s.frames.drain(..=at);
+                s.acked_bytes = upto;
+                s.acked_seq = seq;
+                drop(s);
+                let _ = acked.send(seq);
+            }
+            MemberMsg::Need { blobs } => {
+                if wire::check_need(&blobs).is_err() {
+                    return "bad_frame".to_string();
+                }
+                if need.send(blobs).await.is_err() {
+                    // The blob sender ended, and its reason ends the stream.
+                    return std::future::pending().await;
+                }
+            }
+            MemberMsg::Hello { .. } => return "bad_frame".to_string(),
+        }
+    }
+}
+
+/// P2d-3 — one wave's blobs, each on the stream the source opened for it,
+/// all read at once: a stream left waiting for another would fill the
+/// connection's flow-control window under it, and the one waited for could
+/// then never arrive. Each must be one the wave asked for, at the length
+/// asked, and come once.
+async fn read_wave(
+    conn: &QuicConnection,
+    wave: &[(Digest, u64)],
+) -> Result<Vec<(Digest, Vec<u8>)>, String> {
+    let asked: Arc<Mutex<HashMap<Digest, u64>>> =
+        Arc::new(Mutex::new(wave.iter().copied().collect()));
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in wave {
+        let uni = match tokio::time::timeout(STALL, conn.accept_uni()).await {
+            Ok(Ok(uni)) => uni,
+            Ok(Err(_)) => return Err("closed".to_string()),
+            Err(_) => return Err("stalled".to_string()),
+        };
+        readers.spawn(read_blob(uni, Arc::clone(&asked)));
+    }
+    let mut out = Vec::with_capacity(wave.len());
+    while let Some(done) = readers.join_next().await {
+        match done {
+            Ok(Ok(blob)) => out.push(blob),
+            Ok(Err(why)) => return Err(why),
+            Err(_) => return Err("bad_blob".to_string()),
+        }
+    }
+    Ok(out)
+}
+
+/// P2d-3 — one blob's stream: its header held to what the wave asked for
+/// before a byte of the blob is read, then its bytes.
+async fn read_blob(
+    mut uni: RecvStream,
+    asked: Arc<Mutex<HashMap<Digest, u64>>>,
+) -> Result<(Digest, Vec<u8>), String> {
+    let BlobMsg::Blob { hash, len } =
+        match tokio::time::timeout(STALL, read_frame::<BlobMsg>(&mut uni)).await {
+            Ok(Ok(header)) => header,
+            Ok(Err(e)) if e.is::<wire::FrameError>() => return Err("bad_blob".to_string()),
+            Ok(Err(_)) => return Err("closed".to_string()),
+            Err(_) => return Err("stalled".to_string()),
+        };
+    // Taken once: a second stream for one blob is not one the wave asked for.
+    let wanted = asked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&hash);
+    if wanted != Some(len) {
+        return Err("bad_blob".to_string());
+    }
+    let mut bytes = vec![0u8; len as usize];
+    read_within(&mut uni, &mut bytes, "bad_blob").await?;
+    Ok((hash, bytes))
+}
+
+/// P2d-3 — `diverged {at}`: the member's copy past `at` set aside, the one
+/// rewrite a store allows, and only of an older fence's tail. `at` must be a
+/// point the member named, genesis or one of its hello's checkpoints: a
+/// source's word alone never moves a copy back.
+async fn set_aside(
+    store: &StoreHandle,
+    sid: &str,
+    hello: &MemberMsg,
+    at: &Mark,
+) -> Result<(), String> {
+    let named = match hello {
+        MemberMsg::Hello { checkpoints, .. } => *at == Mark::genesis() || checkpoints.contains(at),
+        _ => false,
+    };
+    if !named {
+        return Err("bad_answer".to_string());
+    }
+    match store.set_aside_after(sid, at.seq).await {
+        Ok(moved) => {
+            info!(
+                session = sid,
+                at = at.seq,
+                moved,
+                "hive stream: a copy off the source's chain set aside"
+            );
+            Ok(())
+        }
+        Err(WriterError::Store(StoreError::NotOlderThanFloor {
+            seq, fence, floor, ..
+        })) => {
+            warn!(
+                session = sid,
+                at = at.seq,
+                seq,
+                fence,
+                floor,
+                "hive stream: the copy's tail is of the current fence, and is never set aside"
+            );
+            Err("diverged_at_floor".to_string())
+        }
+        Err(WriterError::Store(StoreError::Purged { .. })) => Err("purged".to_string()),
+        Err(e) => {
+            warn!(session = sid, %e, "hive stream: the copy could not be set aside");
+            Err("store_error".to_string())
+        }
+    }
+}
+
+/// P2d-3 — the close's word for an event the store refused.
+fn refused_word(e: &WriterError) -> &'static str {
+    match e {
+        WriterError::Store(StoreError::Chain(ChainError::StaleFence { .. })) => "stale_fence",
+        WriterError::Store(StoreError::Chain(ChainError::Gap { .. })) => "gap",
+        WriterError::Store(StoreError::Chain(ChainError::Broken { .. })) => "broken_chain",
+        WriterError::Store(StoreError::Purged { .. }) => "purged",
+        _ => "store_error",
+    }
+}
+
 impl Supervisor {
     /// `rc:hive.replica.grant`: what needs only this device's word is
     /// answered at once; otherwise the grant is registered, and its task
@@ -376,6 +729,7 @@ impl Supervisor {
                 answer: None,
                 relay: None,
                 held: Vec::new(),
+                blobs: 0,
                 task: task.abort_handle(),
             },
         );
@@ -579,27 +933,28 @@ impl Supervisor {
                     _ => return "no_hello".to_string(),
                 };
             // The token proved the grant; the hello must be for it.
-            let MemberMsg::Hello { session, fence, .. } = &hello;
-            let answer = if *session != g.session_id.to_hex() {
-                SourceMsg::Refused {
-                    reason: "wrong_session".into(),
+            let refuse = |reason: &str| SourceMsg::Refused {
+                reason: reason.into(),
+            };
+            let (answer, member_tip) = match &hello {
+                MemberMsg::Hello { session, .. } if *session != g.session_id.to_hex() => {
+                    (refuse("wrong_session"), 0)
                 }
-            } else if *fence != g.fence {
-                SourceMsg::Refused {
-                    reason: "wrong_fence".into(),
-                }
-            } else {
-                match &self.store {
-                    Ok(store) => match store.answer_hello(hello).await {
-                        Ok(a) => a,
-                        Err(e) => SourceMsg::Refused {
-                            reason: format!("the store could not answer: {e}"),
+                MemberMsg::Hello { fence, .. } if *fence != g.fence => (refuse("wrong_fence"), 0),
+                MemberMsg::Hello { tip, .. } => {
+                    let answer = match &self.store {
+                        Ok(store) => match store.answer_hello(hello.clone()).await {
+                            Ok(a) => a,
+                            Err(e) => SourceMsg::Refused {
+                                reason: format!("the store could not answer: {e}"),
+                            },
                         },
-                    },
-                    Err(_) => SourceMsg::Refused {
-                        reason: "not_held".into(),
-                    },
+                        Err(_) => refuse("not_held"),
+                    };
+                    (answer, tip.seq)
                 }
+                // A need or an ack before any hello.
+                _ => (refuse("not_a_hello"), 0),
             };
             let refused = matches!(answer, SourceMsg::Refused { .. });
             if write_frame(&mut send, &answer).await.is_err() {
@@ -617,13 +972,148 @@ impl Supervisor {
                 let _ = tokio::time::timeout(HELLO_TIMEOUT, conn.closed()).await;
                 return "refused".to_string();
             }
-            // P2d-3 streams the events from here. Until then the connection
-            // is held until the member closes it or the grant ends.
-            conn.closed().await;
-            "closed".to_string()
+            // P2d-3 — the events from where the opening exchange left the
+            // member: its own tip, or the point both hold.
+            let from = match &answer {
+                SourceMsg::Diverged { at } => at.seq,
+                _ => member_tip,
+            };
+            let Ok(store) = &self.store else {
+                // A served answer read the store.
+                return "not_held".to_string();
+            };
+            let sid = g.session_id.to_hex();
+            self.serve_events(store, &conn, send, recv, g.grant_id, &sid, from)
+                .await
         })
         .await;
         served.unwrap_or_else(|_| "expired".to_string())
+    }
+
+    /// P2d-3 — the source's side once the opening exchange is done: the
+    /// events past `from`, from the store and then as they are appended, no
+    /// more than [`AHEAD_BYTES`] past the member's last ack; each blob the
+    /// member asks for, on a stream of its own; and the member's acks, each
+    /// checked against what was sent. Until the member lets the connection
+    /// go or sends what it may not, or the grant ends (the caller's
+    /// deadline). The reason it ended, as the close says it.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_events(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        mut send: SendStream,
+        recv: RecvStream,
+        grant_id: ObjectId,
+        sid: &str,
+        from: u64,
+    ) -> String {
+        // Subscribe FIRST, then catch up from the store: an event appended in
+        // between is in one or the other, and the cursor drops what is in
+        // both (the viewer's `follow`, `view.rs`).
+        let mut feed = store.subscribe();
+        let sent = Mutex::new(Sent::default());
+        let (acked_tx, mut acked) = watch::channel(0u64);
+        let (need_tx, need_rx) = mpsc::channel(1);
+        let events = async {
+            let mut cursor = from;
+            if let Err(why) =
+                send_from_store(store, sid, &mut send, &sent, &mut acked, &mut cursor).await
+            {
+                return why;
+            }
+            loop {
+                let step = match feed.recv().await {
+                    Ok(env) if env.session == sid && env.seq > cursor => {
+                        if env.seq == cursor + 1 {
+                            let one = std::slice::from_ref(&*env);
+                            send_events(&mut send, &sent, &mut acked, one)
+                                .await
+                                .map(|()| cursor = env.seq)
+                        } else {
+                            // Out of step: the store has what came between.
+                            send_from_store(store, sid, &mut send, &sent, &mut acked, &mut cursor)
+                                .await
+                        }
+                    }
+                    Ok(_) => Ok(()),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(
+                            session = sid,
+                            lagged = n,
+                            "hive stream: the feed lagged — re-reading the store"
+                        );
+                        send_from_store(store, sid, &mut send, &sent, &mut acked, &mut cursor).await
+                    }
+                    Err(broadcast::error::RecvError::Closed) => Err("store_closed".to_string()),
+                };
+                if let Err(why) = step {
+                    return why;
+                }
+            }
+        };
+        let reason = tokio::select! {
+            why = events => why,
+            why = read_member(recv, &sent, acked_tx, need_tx) => why,
+            why = self.send_blobs(conn, store, grant_id, sid, need_rx) => why,
+        };
+        let reason = ended_by(conn, "member", "closed", reason);
+        let s = sent.lock().unwrap_or_else(|e| e.into_inner());
+        info!(
+            grant = %grant_id, session = sid, from, acked = s.acked_seq,
+            sent_bytes = s.bytes, %reason, "hive stream: served"
+        );
+        reason
+    }
+
+    /// P2d-3 — each blob the member asks for, in its order, on a stream of
+    /// its own: `blob {hash, len}`, then its bytes. A blob this store does
+    /// not hold for the session ends the stream (`blob_missing`): the event
+    /// naming it was sent, and a source keeps a checkpoint's blobs before
+    /// the checkpoint, so this copy cannot finish the member's.
+    async fn send_blobs(
+        &self,
+        conn: &QuicConnection,
+        store: &StoreHandle,
+        grant_id: ObjectId,
+        sid: &str,
+        mut need: mpsc::Receiver<Vec<Digest>>,
+    ) -> String {
+        while let Some(blobs) = need.recv().await {
+            for hash in blobs {
+                let bytes = match store.get_blob(sid, hash.0).await {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        warn!(session = sid, blob = %hash, "hive stream: a blob the member asked for is not held here");
+                        return "blob_missing".to_string();
+                    }
+                    Err(e) => {
+                        warn!(session = sid, blob = %hash, %e, "hive stream: a blob could not be read");
+                        return "store_error".to_string();
+                    }
+                };
+                if bytes.len() > wire::MAX_STREAM_BLOB {
+                    warn!(session = sid, blob = %hash, len = bytes.len(), "hive stream: a blob past the stream's limit");
+                    return "blob_too_large".to_string();
+                }
+                let Ok(mut uni) = conn.open_uni().await else {
+                    return "closed".to_string();
+                };
+                let header = BlobMsg::Blob {
+                    hash,
+                    len: bytes.len() as u64,
+                };
+                if write_frame(&mut uni, &header).await.is_err()
+                    || uni.write_all(&bytes).await.is_err()
+                {
+                    return "closed".to_string();
+                }
+                let _ = uni.finish();
+                self.count_blob(grant_id);
+            }
+        }
+        // The reader let `need` go, and its reason ends the stream.
+        std::future::pending().await
     }
 
     /// `rc:hive.replica.dial`: dial the source and say where this copy
@@ -661,6 +1151,7 @@ impl Supervisor {
                 answer: None,
                 relay: None,
                 held: Vec::new(),
+                blobs: 0,
                 task: task.abort_handle(),
             },
         );
@@ -742,19 +1233,231 @@ impl Supervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&d.grant_id)
             {
-                s.answer = Some(answer);
+                s.answer = Some(answer.clone());
             }
             if refused {
                 return "refused".to_string();
             }
-            // P2d-3 receives the events from here; until then the
-            // connection is held until the source closes it or the grant
-            // ends.
-            conn.closed().await;
-            "closed".to_string()
+            // P2d-3 — a copy off the source's chain is set aside past the
+            // point both hold before it takes the source's events.
+            if let SourceMsg::Diverged { at } = &answer
+                && let Err(why) = set_aside(store, &sid, &hello, at).await
+            {
+                return ended_by(&conn, "source", "source_closed", why);
+            }
+            self.follow_events(store, &conn, send, recv, d, &sid).await
         })
         .await;
+        // P2d-3 — where the copy ends now, whatever ended the stream, the
+        // grant's end among them, which cuts it off mid-way.
+        self.report_tip(d.session_id).await;
         followed.unwrap_or_else(|_| "expired".to_string())
+    }
+
+    /// P2d-3 — the member's side once the opening exchange is done: each
+    /// `events` frame read, each event's blobs asked for and kept before the
+    /// event is applied through the store's chain check, and the frame acked
+    /// once all of it is on disk; the tip reported to the server as it
+    /// moves. Until the source lets the connection go or sends what it may
+    /// not, or the grant ends (the caller's deadline).
+    async fn follow_events(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        d: &Dial,
+        sid: &str,
+    ) -> String {
+        let (moved, moves) = watch::channel(());
+        let applying = async {
+            loop {
+                let frame: SourceMsg = match read_frame(&mut recv).await {
+                    Ok(f) => f,
+                    Err(e) if e.is::<wire::FrameError>() => return "bad_frame".to_string(),
+                    Err(_) => return "closed".to_string(),
+                };
+                // Past the opening exchange, events are all a source says.
+                let SourceMsg::Events { events } = frame else {
+                    return "bad_frame".to_string();
+                };
+                if wire::check_events(&events).is_err() {
+                    return "bad_frame".to_string();
+                }
+                let mut tip = None;
+                for meta in &events {
+                    match self
+                        .take_event(store, conn, &mut send, &mut recv, d.grant_id, sid, meta)
+                        .await
+                    {
+                        Ok(t) => tip = Some(t),
+                        Err(why) => return why,
+                    }
+                }
+                if let Some(tip) = tip
+                    && write_frame(&mut send, &wire::ack_of(&tip)).await.is_err()
+                {
+                    return "closed".to_string();
+                }
+                let _ = moved.send(());
+            }
+        };
+        let reason = tokio::select! {
+            why = applying => why,
+            // Never ends: the applier's end is the stream's.
+            () = self.report_tips(d.session_id, moves) => "closed".to_string(),
+        };
+        ended_by(conn, "source", "source_closed", reason)
+    }
+
+    /// P2d-3 — one event of a frame: its JSON read within this device's event
+    /// budget, the blobs it names that the store lacks asked for and kept,
+    /// then the event applied. Its tip, or the close's word.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_event(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        grant_id: ObjectId,
+        sid: &str,
+        meta: &EventMeta,
+    ) -> Result<ChainTip, String> {
+        // At most MAX_EVENT_BYTES (`check_events`), which the budget holds.
+        let len = meta.len as usize;
+        let Ok(_held) = self.replica_events.acquire_many(len as u32).await else {
+            return Err("closed".to_string());
+        };
+        let mut json = vec![0u8; len];
+        read_within(recv, &mut json, "bad_frame").await?;
+        let Ok(json) = String::from_utf8(json) else {
+            return Err("bad_frame".to_string());
+        };
+        let env = meta.envelope(sid, json);
+        let tip = env.tip();
+        self.fetch_blobs(store, conn, send, grant_id, sid, &env)
+            .await?;
+        // Held already when another stream of the session carried it first
+        // (a renewal beside the stream it replaces), its blobs before it.
+        match store.apply_unless_held(env).await {
+            Ok(_) => Ok(tip),
+            Err(e) => {
+                warn!(session = sid, seq = meta.seq, %e, "hive stream: an event refused");
+                Err(refused_word(&e).to_string())
+            }
+        }
+    }
+
+    /// P2d-3 — the blobs `env` names that the store lacks, asked for and
+    /// kept, a wave at a time: as many as this device's blob budget holds, at
+    /// most [`wire::MAX_NEED`], the budget taken BEFORE the `need` goes, so
+    /// every blob of a wave is read the moment it arrives.
+    async fn fetch_blobs(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        send: &mut SendStream,
+        grant_id: ObjectId,
+        sid: &str,
+        env: &EventEnvelope,
+    ) -> Result<(), String> {
+        let mut missing = Vec::new();
+        for (hash, len) in wire::blobs_named(env) {
+            if wire::check_blob_len(len).is_err() {
+                warn!(session = sid, seq = env.seq, blob = %hash, len, "hive stream: an event names a blob past the stream's limit");
+                return Err("blob_too_large".to_string());
+            }
+            match store.has_blob(sid, hash.0).await {
+                Ok(true) => {}
+                Ok(false) => missing.push((hash, len)),
+                Err(e) => {
+                    warn!(session = sid, blob = %hash, %e, "hive stream: the store could not say whether it holds a blob");
+                    return Err("store_error".to_string());
+                }
+            }
+        }
+        let mut rest = missing.as_slice();
+        while !rest.is_empty() {
+            // At least one, each at most MAX_STREAM_BLOB, which the budget
+            // holds four of: the budget is never asked for more than it has.
+            let (mut n, mut bytes) = (0, 0u64);
+            while n < rest.len()
+                && n < wire::MAX_NEED
+                && (n == 0 || bytes + rest[n].1 <= BLOB_BUDGET as u64)
+            {
+                bytes += rest[n].1;
+                n += 1;
+            }
+            let (wave, after) = rest.split_at(n);
+            rest = after;
+            let Ok(_held) = self.replica_blobs.acquire_many(bytes as u32).await else {
+                return Err("closed".to_string());
+            };
+            let need = MemberMsg::Need {
+                blobs: wave.iter().map(|(h, _)| *h).collect(),
+            };
+            if write_frame(send, &need).await.is_err() {
+                return Err("closed".to_string());
+            }
+            for (hash, bytes) in read_wave(conn, wave).await? {
+                match store.put_named_blob(sid, hash.0, bytes).await {
+                    Ok(()) => self.count_blob(grant_id),
+                    Err(WriterError::Store(StoreError::BlobMismatch { .. })) => {
+                        return Err("bad_blob".to_string());
+                    }
+                    Err(WriterError::Store(StoreError::Purged { .. })) => {
+                        return Err("purged".to_string());
+                    }
+                    Err(e) => {
+                        warn!(session = sid, blob = %hash, %e, "hive stream: a blob could not be kept");
+                        return Err("store_error".to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// P2d-3 — the member's tip reported as its stream moves it: at once,
+    /// then at most every [`TIP_EVERY`], what lands meanwhile in one report
+    /// after it. Never returns; the stream's end is the caller's to report.
+    async fn report_tips(&self, session: ObjectId, mut moves: watch::Receiver<()>) {
+        while moves.changed().await.is_ok() {
+            loop {
+                self.report_tip(session).await;
+                let rest = tokio::time::sleep(TIP_EVERY);
+                tokio::pin!(rest);
+                let mut due = false;
+                loop {
+                    tokio::select! {
+                        () = &mut rest => break,
+                        moved = moves.changed() => {
+                            if moved.is_err() {
+                                return std::future::pending().await;
+                            }
+                            due = true;
+                        }
+                    }
+                }
+                if !due {
+                    break;
+                }
+            }
+        }
+        std::future::pending().await
+    }
+
+    /// P2d-3 — one more blob carried on `grant_id`'s stream.
+    fn count_blob(&self, grant_id: ObjectId) {
+        if let Some(s) = self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&grant_id)
+        {
+            s.blobs += 1;
+        }
     }
 
     /// The member's client on the derp rung: a QUIC client over this device's
@@ -933,6 +1636,17 @@ impl Supervisor {
             .unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
+    /// The blobs `grant_id`'s stream carried so far: sent, as the source;
+    /// kept, as the member. `None` once the stream is over.
+    #[cfg(all(test, unix))]
+    pub(super) fn stream_blobs(&self, grant_id: ObjectId) -> Option<u64> {
+        self.streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&grant_id)
+            .map(|s| s.blobs)
+    }
+
     /// The member's addresses held for `grant_id`'s allocation.
     #[cfg(all(test, unix))]
     pub(super) fn held_candidates(&self, grant_id: ObjectId) -> usize {
@@ -948,8 +1662,8 @@ impl Supervisor {
 mod tests {
     use super::super::tests::{Rig, rig};
     use super::*;
-    use roomler_hive_node::TranscriptEvent;
-    use roomler_hive_node::stream::Mark;
+    use roomler_hive_node::checkpoint::{Checkpoint, snapshot_whole};
+    use roomler_hive_node::{GENESIS, TranscriptEvent};
     use std::net::Ipv4Addr;
     use webrtc::turn::auth::{AuthHandler, generate_auth_key};
     use webrtc::turn::relay::relay_static::RelayAddressGeneratorStatic;
@@ -1545,25 +2259,77 @@ mod tests {
         );
     }
 
-    /// A copy whose tip is off the source's chain hears where the two
-    /// diverge: genesis, when they share no checkpoint.
+    /// P2d-3 — a copy whose tail is of the current fence is never set aside,
+    /// whatever the source says: told it diverged (at genesis, no checkpoint
+    /// shared), the member ends the stream with its copy as it was, and the
+    /// source hears why.
     #[tokio::test]
-    async fn a_copy_off_the_sources_chain_hears_where_they_diverge() {
-        let src = rig(true, 4);
-        let mem = rig(true, 4);
+    async fn a_tail_of_the_current_fence_is_never_set_aside() {
+        let mut src = rig(true, 4);
+        let mut mem = rig(true, 4);
         let sid = ObjectId::new();
         note(&src, sid, &["one", "two"]);
         mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
         note(&mem, sid, &["something else"]);
-        assert!(mem.store.chain_tip(&sid.to_hex()).await.unwrap().is_some());
+        let before = tip(&mem, sid).await;
+        assert!(before.is_some());
 
         let grant_id = served(&src, &mem, sid, TOKEN).await;
         assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("diverged_at_floor")
+        );
+        assert_eq!(tip(&mem, sid).await, before, "nothing of the copy moved");
+        assert_eq!(
+            close_of(&mut src, grant_id).await.as_deref(),
+            Some("member:diverged_at_floor"),
+            "the source hears why"
+        );
+    }
+
+    /// P2d-3 — a copy whose tail a promotion cut off (an older fence's
+    /// events past the newest checkpoint both hold) sets that tail aside and
+    /// takes the new primary's events in its place.
+    #[tokio::test]
+    async fn a_tail_a_promotion_cut_off_is_set_aside_for_the_sources() {
+        let src = rig(true, 4);
+        let mem = rig(true, 4);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        note(&src, sid, &["shared"]);
+        checkpoint(&src, sid, &[], true).await;
+        mem.store.join(&s, "owner", 1).await.unwrap();
+        for env in src.store.page(&s, 0, 10).await.unwrap() {
+            mem.store.apply(env).await.unwrap();
+        }
+        // The old primary's last word, which reached the member and never
+        // the new primary; then the promotion: the new primary writes at
+        // fence 2, and the member's floor is raised to it.
+        put(&mem, sid, 1, said("the old primary's last word"));
+        put(&src, sid, 2, said("the new primary's first"));
+        put(&src, sid, 2, said("and its second"));
+        mem.store.raise_floor(&s, 2).await.unwrap();
+        let common = src.store.page(&s, 1, 1).await.unwrap().remove(0);
+
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+        assert_eq!(
+            mem.store.page(&s, 0, 10).await.unwrap(),
+            src.store.page(&s, 0, 10).await.unwrap(),
+            "the copy is the new primary's chain, event for event"
+        );
+        // Read once the copy followed: a stream that ended takes its answer
+        // with it.
+        assert_eq!(
             answer_of(&mem, grant_id).await,
             SourceMsg::Diverged {
-                at: Mark::genesis()
+                at: Mark {
+                    seq: 2,
+                    hash: hex::encode(common.hash()),
+                }
             },
-            "off the source's chain, and no checkpoint shared"
+            "past the newest checkpoint both hold"
         );
         mem.sup.close_stream(grant_id, "test");
         src.sup.close_stream(grant_id, "test");
@@ -2037,5 +2803,514 @@ mod tests {
             "refused on the header"
         );
         conn.close(0u32.into(), b"done");
+    }
+
+    fn said(text: &str) -> TranscriptEvent {
+        TranscriptEvent::Note { text: text.into() }
+    }
+
+    /// `event` appended to `sid` in `r`'s store at `fence`, as the device
+    /// that runs the session writes it.
+    fn put(r: &Rig, sid: ObjectId, fence: u64, event: TranscriptEvent) {
+        r.store.append(&sid.to_hex(), fence, event);
+    }
+
+    /// A checkpoint of `sid` in `r`'s store at fence 1, a file for each of
+    /// `blobs`, the blobs kept BEFORE the checkpoint as a device keeps them
+    /// (`keep`), or none of them. The blobs' names, in order.
+    async fn checkpoint(r: &Rig, sid: ObjectId, blobs: &[&[u8]], keep: bool) -> Vec<Digest> {
+        let mut files = Vec::new();
+        for (i, bytes) in blobs.iter().enumerate() {
+            let (snap, _) = snapshot_whole(&format!("f{i}"), 0o600, bytes, None);
+            if keep {
+                r.store
+                    .put_blob(&sid.to_hex(), bytes.to_vec())
+                    .await
+                    .unwrap();
+            }
+            files.push(snap);
+        }
+        let names = files.iter().map(|f| f.chunks[0].hash).collect();
+        let cp = Checkpoint {
+            n: 1,
+            turn: 1,
+            files,
+            skipped: Vec::new(),
+            workspace: None,
+        };
+        put(r, sid, 1, TranscriptEvent::Checkpoint(cp));
+        names
+    }
+
+    async fn tip(r: &Rig, sid: ObjectId) -> Option<ChainTip> {
+        r.store.chain_tip(&sid.to_hex()).await.unwrap()
+    }
+
+    /// The member's tip of `sid` once its copy reaches `seq`, within 15 s.
+    async fn tip_at(mem: &Rig, sid: ObjectId, seq: u64) -> ChainTip {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(t) = tip(mem, sid).await
+                && t.seq >= seq
+            {
+                return t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the member's copy never reached seq {seq}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The hash in the `rc:hive.replica.tip` the rig's device, a member,
+    /// sends for `sid` at `seq`, or `None` within 15 s.
+    async fn tip_report_of(r: &mut Rig, sid: ObjectId, seq: u64) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, r.reports.recv())
+                .await
+                .ok()?
+                .expect("the reporter is open");
+            if let ClientMsg::HiveReplicaTip {
+                session_id,
+                seq: at,
+                hash,
+                ..
+            } = msg
+                && session_id == sid
+                && at == seq
+            {
+                return Some(hash);
+            }
+        }
+    }
+
+    /// The hello of a member that holds nothing of `sid` yet.
+    fn empty_hello(sid: ObjectId) -> MemberMsg {
+        MemberMsg::Hello {
+            v: wire::STREAM_V,
+            session: sid.to_hex(),
+            fence: 1,
+            tip: Mark::genesis(),
+            floor: 1,
+            checkpoints: Vec::new(),
+        }
+    }
+
+    /// The `events` frames a source sends until it falls quiet for a
+    /// second, each read whole, as the envelopes they carry. Quiet means no
+    /// frame began, so the stream is whole for the next call.
+    async fn frames_until_quiet(recv: &mut RecvStream, sid: ObjectId) -> Vec<Vec<EventEnvelope>> {
+        let mut frames = Vec::new();
+        loop {
+            let Ok(frame) =
+                tokio::time::timeout(Duration::from_secs(1), read_frame::<SourceMsg>(recv)).await
+            else {
+                return frames;
+            };
+            let SourceMsg::Events { events } = frame.unwrap() else {
+                panic!("not an events frame");
+            };
+            let mut envs = Vec::new();
+            for meta in events {
+                let mut json = vec![0u8; meta.len as usize];
+                recv.read_exact(&mut json).await.unwrap();
+                envs.push(meta.envelope(&sid.to_hex(), String::from_utf8(json).unwrap()));
+            }
+            frames.push(envs);
+        }
+    }
+
+    /// A source by hand, so a test can send what a source of this build
+    /// never would: a QUIC server on loopback the member is told to dial for
+    /// `sid`, its connection taken, its token checked and its hello read.
+    async fn source_by_hand(
+        mem: &Rig,
+        sid: ObjectId,
+    ) -> (QuicPeer, ObjectId, QuicConnection, SendStream, RecvStream) {
+        let (peer, fingerprint) = QuicPeer::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let at = peer.local_addr().unwrap();
+        let grant_id = ObjectId::new();
+        mem.sup.follow_dial(
+            Dial {
+                grant_id,
+                session_id: sid,
+                fence: 1,
+                source_id: ObjectId::new(),
+                path: Some(HiveStreamPath::Direct),
+                token: TOKEN.into(),
+                cert_fingerprint: fingerprint,
+                addrs: vec![at.to_string()],
+                ice_servers: Vec::new(),
+                derp_pubkey: None,
+                ttl_secs: 30,
+            },
+            true,
+        );
+        let conn = tokio::time::timeout(Duration::from_secs(15), peer.accept())
+            .await
+            .expect("the member dials")
+            .expect("a connection comes")
+            .expect("and it connects");
+        quic::server_authenticate(&conn, TOKEN).await.unwrap();
+        let (send, mut recv) = conn.accept_bi().await.unwrap();
+        let hello: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert!(matches!(hello, MemberMsg::Hello { .. }), "{hello:?}");
+        (peer, grant_id, conn, send, recv)
+    }
+
+    /// `envs` as one `events` frame, written by hand.
+    async fn send_by_hand(send: &mut SendStream, envs: &[EventEnvelope]) {
+        let listing = SourceMsg::Events {
+            events: envs.iter().map(EventMeta::of).collect(),
+        };
+        write_frame(send, &listing).await.unwrap();
+        for env in envs {
+            send.write_all(env.event_json.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// P2d-3 — a member that holds nothing takes the source's whole chain,
+    /// more than one frame of it, then each event the source appends, and
+    /// says where its copy ends.
+    #[tokio::test]
+    async fn a_member_catches_up_then_follows_the_live_tail() {
+        let src = rig(true, 4);
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        let texts: Vec<String> = (0..wire::MAX_BATCH + 20)
+            .map(|i| format!("note {i}"))
+            .collect();
+        note(
+            &src,
+            sid,
+            &texts.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        let caught = tip(&src, sid).await.unwrap();
+        assert_eq!(
+            tip_at(&mem, sid, caught.seq).await,
+            caught,
+            "the source's chain, every event of it"
+        );
+        put(&src, sid, 1, said("after the catch-up"));
+        let live = tip(&src, sid).await.unwrap();
+        assert_eq!(
+            tip_at(&mem, sid, live.seq).await,
+            live,
+            "and what the source appends after"
+        );
+        assert_eq!(
+            tip_report_of(&mut mem, sid, live.seq).await,
+            Some(hex::encode(live.hash)),
+            "the member says where its copy ends"
+        );
+        assert!(mem.sup.holds_stream(grant_id), "and goes on following");
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2d-3 — the blobs a checkpoint names reach the member before the
+    /// checkpoint, and only those it lacked are sent: one it held already
+    /// is never asked for. An empty file's blob is one like any other.
+    #[tokio::test]
+    async fn a_checkpoints_blobs_are_asked_for_and_kept_before_it() {
+        let src = rig(true, 4);
+        let mem = rig(true, 4);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        note(&src, sid, &["before"]);
+        let blobs: [&[u8]; 4] = [b"one\n", b"two\n", b"", b"three\n"];
+        let names = checkpoint(&src, sid, &blobs, true).await;
+        note(&src, sid, &["after"]);
+        mem.store.join(&s, "owner", 1).await.unwrap();
+        mem.store.put_blob(&s, blobs[1].to_vec()).await.unwrap();
+
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+        for (name, bytes) in names.iter().zip(blobs) {
+            assert_eq!(
+                mem.store.get_blob(&s, name.0).await.unwrap().as_deref(),
+                Some(bytes),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            src.sup.stream_blobs(grant_id),
+            Some(3),
+            "only what the member lacked was sent"
+        );
+        assert_eq!(mem.sup.stream_blobs(grant_id), Some(3), "and each kept");
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2d-3 — a blob the source does not hold ends the stream before the
+    /// checkpoint naming it: the copy stops short of the checkpoint rather
+    /// than hold it without its files, and the member hears why.
+    #[tokio::test]
+    async fn a_checkpoint_whose_blob_never_comes_is_never_applied() {
+        let mut src = rig(true, 4);
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        note(&src, sid, &["before"]);
+        checkpoint(&src, sid, &[b"never kept".as_slice()], false).await;
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        assert_eq!(
+            close_of(&mut src, grant_id).await.as_deref(),
+            Some("blob_missing")
+        );
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("source:blob_missing"),
+            "the member hears why"
+        );
+        assert_eq!(
+            tip(&mem, sid).await.map(|t| t.seq),
+            Some(1),
+            "the copy stops before the checkpoint"
+        );
+    }
+
+    /// P2d-3 — two streams of one session reach a member at once while a
+    /// renewal comes up beside the stream it replaces: whichever carries an
+    /// event first applies it, the other finds it held, and neither ends.
+    #[tokio::test]
+    async fn two_streams_of_one_session_carry_it_at_once() {
+        let src = rig(true, 4);
+        let mem = rig(true, 4);
+        let sid = ObjectId::new();
+        let texts: Vec<String> = (0..200).map(|i| format!("note {i}")).collect();
+        note(
+            &src,
+            sid,
+            &texts.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+
+        let first = served(&src, &mem, sid, TOKEN).await;
+        let second = served(&src, &mem, sid, TOKEN).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+        put(&src, sid, 1, said("live"));
+        let live = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, live.seq).await, live);
+        // Long enough for the slower of the two to carry it as well.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for grant_id in [first, second] {
+            assert!(mem.sup.holds_stream(grant_id), "neither ended");
+            mem.sup.close_stream(grant_id, "test");
+            src.sup.close_stream(grant_id, "test");
+        }
+    }
+
+    /// P2d-3 — a source sends no further past the member's last ack than
+    /// its window, and an ack lets it go on from where it stopped.
+    #[tokio::test]
+    async fn a_source_goes_no_further_than_its_window_past_the_last_ack() {
+        let src = rig(true, 4);
+        let sid = ObjectId::new();
+        // Each over a frame's bytes, so each comes alone.
+        let big = "x".repeat(wire::BATCH_BYTES);
+        note(&src, sid, &[big.as_str(); 8]);
+        let g = grant(sid, HiveStreamPath::Direct);
+        let (_peer, conn, mut send, mut recv) = dial_by_hand(ready_of(&src, g, true).await).await;
+        write_frame(&mut send, &empty_hello(sid)).await.unwrap();
+        let answer: SourceMsg = read_frame(&mut recv).await.unwrap();
+        assert!(matches!(answer, SourceMsg::Hello { .. }), "{answer:?}");
+
+        let first = frames_until_quiet(&mut recv, sid).await;
+        let sent: u64 = first
+            .iter()
+            .flatten()
+            .map(|e| e.event_json.len() as u64)
+            .sum();
+        assert!(
+            (AHEAD_BYTES..AHEAD_BYTES + big.len() as u64 + 64).contains(&sent),
+            "the window and one frame past it at most, not {sent}"
+        );
+        let stopped = first.last().unwrap().last().unwrap().seq;
+        assert!(stopped < 8, "not every event");
+        // An ack of the second frame frees what it covers.
+        let acked = first[1].last().unwrap();
+        write_frame(&mut send, &wire::ack_of(&acked.tip()))
+            .await
+            .unwrap();
+        let more = frames_until_quiet(&mut recv, sid).await;
+        assert_eq!(
+            more.first().map(|f| f[0].seq),
+            Some(stopped + 1),
+            "an ack lets the source go on, from where it stopped"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// P2d-3 — an ack must name what was sent, by its hash: one that does
+    /// not ends the stream, in the source's word.
+    #[tokio::test]
+    async fn an_ack_for_what_was_never_sent_ends_the_stream() {
+        let mut src = rig(true, 4);
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        let g = grant(sid, HiveStreamPath::Direct);
+        let grant_id = g.grant_id;
+        let (_peer, conn, mut send, mut recv) = dial_by_hand(ready_of(&src, g, true).await).await;
+        write_frame(&mut send, &empty_hello(sid)).await.unwrap();
+        let _: SourceMsg = read_frame(&mut recv).await.unwrap();
+        let frames = frames_until_quiet(&mut recv, sid).await;
+        let last = frames.last().unwrap().last().unwrap();
+        let forged = MemberMsg::Ack {
+            seq: last.seq,
+            hash: "ab".repeat(32),
+        };
+        write_frame(&mut send, &forged).await.unwrap();
+        assert_eq!(
+            close_of(&mut src, grant_id).await.as_deref(),
+            Some("bad_ack")
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// P2d-3 — an event that does not follow the member's tip is refused by
+    /// its store, and nothing of it kept: the member ends the stream in the
+    /// store's word.
+    #[tokio::test]
+    async fn an_event_off_the_chain_is_refused_and_nothing_of_it_kept() {
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        let mut env = EventEnvelope::next(&sid.to_hex(), None, 1, 0, &said("forged"));
+        env.prev_hash = [7; 32];
+        send_by_hand(&mut send, &[env]).await;
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("broken_chain")
+        );
+        assert_eq!(tip(&mem, sid).await, None, "nothing of it kept");
+    }
+
+    /// P2d-3 — a member reads only the blobs it asked for, at the length
+    /// asked, hashing to their names: anything else ends the stream, and
+    /// the checkpoint naming them is not applied.
+    #[tokio::test]
+    async fn a_blob_not_as_asked_ends_the_stream() {
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        let (snap, _) = snapshot_whole("f", 0o600, b"asked for", None);
+        let asked = snap.chunks[0].hash;
+        let cp = TranscriptEvent::Checkpoint(Checkpoint {
+            n: 1,
+            turn: 1,
+            files: vec![snap],
+            skipped: Vec::new(),
+            workspace: None,
+        });
+        let env = EventEnvelope::next(&sid.to_hex(), None, 1, 0, &cp);
+        let other: &[u8] = b"something else";
+        for (case, hash, bytes) in [
+            ("another blob", Digest::of(other), other),
+            ("another length", asked, other),
+            ("other bytes", asked, b"asked fox".as_slice()),
+        ] {
+            let (_peer, grant_id, conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+            let hello = SourceMsg::Hello {
+                v: wire::STREAM_V,
+                tip: Mark::genesis(),
+            };
+            write_frame(&mut send, &hello).await.unwrap();
+            send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+            let need: MemberMsg = read_frame(&mut recv).await.unwrap();
+            assert_eq!(
+                need,
+                MemberMsg::Need { blobs: vec![asked] },
+                "{case}: it asks for what the checkpoint names"
+            );
+            let mut uni = conn.open_uni().await.unwrap();
+            let header = BlobMsg::Blob {
+                hash,
+                len: bytes.len() as u64,
+            };
+            write_frame(&mut uni, &header).await.unwrap();
+            uni.write_all(bytes).await.unwrap();
+            let _ = uni.finish();
+            assert_eq!(
+                close_of(&mut mem, grant_id).await.as_deref(),
+                Some("bad_blob"),
+                "{case}"
+            );
+            assert_eq!(tip(&mem, sid).await, None, "{case}: not applied");
+        }
+    }
+
+    /// P2d-3 — `diverged` must be at a point the member named, genesis or
+    /// one of its hello's checkpoints: a source's word alone never moves a
+    /// copy back, even a tail the store would let it set aside.
+    #[tokio::test]
+    async fn a_diverged_point_the_member_never_named_moves_nothing() {
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        mem.store.join(&s, "owner", 1).await.unwrap();
+        note(&mem, sid, &["one", "two", "three"]);
+        // An older fence's tail: the store would set it aside if asked.
+        mem.store.raise_floor(&s, 2).await.unwrap();
+        let before = tip(&mem, sid).await;
+        let first = mem.store.page(&s, 0, 1).await.unwrap().remove(0);
+        let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
+        let at = Mark {
+            seq: 1,
+            hash: hex::encode(first.hash()),
+        };
+        write_frame(&mut send, &SourceMsg::Diverged { at })
+            .await
+            .unwrap();
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("bad_answer"),
+            "a point of the copy, but none the member named"
+        );
+        assert_eq!(tip(&mem, sid).await, before, "nothing moved");
+    }
+
+    /// P2d-3 — an event announced past the stream's limit is refused on its
+    /// listing, before a byte of it is read.
+    #[tokio::test]
+    async fn an_event_announced_past_the_limit_is_refused_unread() {
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        let listing = SourceMsg::Events {
+            events: vec![EventMeta {
+                seq: 1,
+                fence: 1,
+                ts_ms: 0,
+                prev_hash: GENESIS,
+                len: wire::MAX_EVENT_BYTES as u64 + 1,
+            }],
+        };
+        write_frame(&mut send, &listing).await.unwrap();
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("bad_frame")
+        );
     }
 }
