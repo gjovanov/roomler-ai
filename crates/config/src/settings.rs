@@ -74,6 +74,13 @@ pub struct HiveSettings {
     /// [`JwtSettings::previous_secrets`]: an env var cannot become a sequence.
     #[serde(default)]
     pub tenants: String,
+    /// FR-90 P2c — the replicaset (`ROOMLER__HIVE__REPLICASET`): an
+    /// organization's replica policy, placement, and the frames that make a
+    /// device a member. Default OFF, P2's server kill switch: off, the policy
+    /// routes answer as if they were not there and no session gets a
+    /// replicaset, so a roll that ships it exposes nothing.
+    #[serde(default)]
+    pub replicaset: bool,
 }
 
 /// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.
