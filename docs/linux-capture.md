@@ -257,7 +257,7 @@ deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:964`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:988`, which every `roomler config`
 reader sees) and the helper's own log line. The web viewer does **not** know
 which capture backend a session runs on — no `rc:*` field carries it — so it
 cannot yet say it; whether it should is FR-45's open AC8.
@@ -399,7 +399,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file
-(`crates/agent-core/src/config_surface.rs:948-995`, `:1446`).
+(`crates/agent-core/src/config_surface.rs:972-995`, `:1470`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

@@ -558,11 +558,12 @@ fn store_path(wanted: impl FnOnce(&Path) -> bool) -> Result<Option<PathBuf>, Str
 }
 
 /// FR-90 P1h-2 — whether this daemon keeps a replica store: while its owner
-/// runs or adopts agent sessions, or once it holds one (whose transcripts
-/// are still served after `hive_enabled` goes off). A device that never
-/// turned agent sessions on keeps none.
+/// runs or adopts agent sessions, or (P2c) holds copies of sessions run
+/// elsewhere, or once it holds one (whose transcripts are still served after
+/// `hive_enabled` goes off). A device that never turned any of it on keeps
+/// none.
 fn store_wanted(hive: &HiveConfig, store_exists: bool) -> bool {
-    hive.enabled || hive.adopt || store_exists
+    hive.enabled || hive.adopt || hive.replica || store_exists
 }
 
 /// Create `dir` if missing and lock it to the daemon's account. A link on
@@ -3228,6 +3229,14 @@ pub(crate) mod tests {
             ..HiveConfig::closed()
         };
         assert!(store_wanted(&adopting, false));
+        // P2c — a replica runs nothing, but keeps the copies it holds: the
+        // archive replica's container among them, whose `hive_enabled` stays
+        // off.
+        let replica = HiveConfig {
+            replica: true,
+            ..HiveConfig::closed()
+        };
+        assert!(store_wanted(&replica, false));
     }
 
     /// A stand-in for Claude Code that speaks just enough stream-json. Like
@@ -3353,6 +3362,9 @@ done
             core_memory: false,
             adopt: false,
             allow_passwordless_sudo: false,
+            replica: false,
+            archive: false,
+            store_quota_mib: None,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();

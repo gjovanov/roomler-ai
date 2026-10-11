@@ -42,6 +42,14 @@ pub struct HiveConfig {
     /// Decision 15 — whether a Mac runs sessions as an account whose `sudo`
     /// needs no password (`hive_allow_passwordless_sudo`).
     pub allow_passwordless_sudo: bool,
+    /// P2c — whether this device holds copies of its owner's sessions run
+    /// elsewhere (`hive_replica`).
+    pub replica: bool,
+    /// P2c — whether it offers itself as the org's archive (`hive_archive`):
+    /// only ever with `replica`.
+    pub archive: bool,
+    /// P2c — the most it keeps as a replica, in MiB (`hive_store_quota_mib`).
+    pub store_quota_mib: Option<u32>,
 }
 
 impl HiveConfig {
@@ -67,6 +75,9 @@ impl HiveConfig {
             // advertise `hive-adopt` or keep a store for it.
             adopt: cfg.hive_adopt && cfg!(unix),
             allow_passwordless_sudo: cfg.hive_allow_passwordless_sudo,
+            replica: cfg.hive_replica,
+            archive: cfg.hive_archive && cfg.hive_replica,
+            store_quota_mib: cfg.hive_store_quota_mib,
         }
     }
 
@@ -84,6 +95,9 @@ impl HiveConfig {
             core_memory: false,
             adopt: false,
             allow_passwordless_sudo: false,
+            replica: false,
+            archive: false,
+            store_quota_mib: None,
         }
     }
 }
@@ -149,6 +163,25 @@ mod tests {
         assert_eq!(HiveConfig::from_agent(&agent).adopt, cfg!(unix));
         agent.hive_adopt = false;
         assert!(!HiveConfig::from_agent(&agent).adopt);
+    }
+
+    /// P2c — the replica keys are the owner's word, and an archive is only
+    /// ever a replica too: `hive_archive` alone reads off.
+    #[test]
+    fn an_archive_is_only_ever_a_replica_too() {
+        let mut agent = crate::config::test_fixture();
+        let hive = HiveConfig::from_agent(&agent);
+        assert!(!hive.replica && !hive.archive && hive.store_quota_mib.is_none());
+        agent.hive_archive = true;
+        assert!(
+            !HiveConfig::from_agent(&agent).archive,
+            "no replica, no archive"
+        );
+        agent.hive_replica = true;
+        agent.hive_store_quota_mib = Some(2048);
+        let hive = HiveConfig::from_agent(&agent);
+        assert!(hive.replica && hive.archive);
+        assert_eq!(hive.store_quota_mib, Some(2048));
     }
 
     #[test]
