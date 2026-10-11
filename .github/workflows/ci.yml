@@ -1188,12 +1188,14 @@ jobs:
       # it: the toolbelt over its named pipe, processes by creation time, the
       # store's file in a DACL'd directory. (The supervisor's own tests drive a
       # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
+      # #2010: `win_service::tests` — the SCM host's own (the STOP_PENDING
+      # report and its order against the supervisor), also in no lane before.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive -- hive:: hive_win win_service::supervisor win_service::tests
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
