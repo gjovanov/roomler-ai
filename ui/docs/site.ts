@@ -83,7 +83,9 @@ export const REPO_URL = 'https://github.com/gjovanov/roomler-ai'
 export const CHANNELS = [
   { id: 'youtube', name: 'YouTube', handle: '@RoomlerAI', url: 'https://www.youtube.com/@RoomlerAI', short: '/yt' },
   { id: 'tiktok', name: 'TikTok', handle: '@roomler.ai', url: 'https://www.tiktok.com/@roomler.ai', short: '/tt' },
-  { id: 'instagram', name: 'Instagram', handle: '@roomler.ai', url: 'https://www.instagram.com/roomler.ai/', short: '/ig' },
+  // X took Instagram's place on 2026-10-11, after Instagram disabled the account.
+  // A channel leaves this list together with its short path, so `/ig` is gone.
+  { id: 'x', name: 'X', handle: '@roomler_ai', url: 'https://x.com/roomler_ai', short: '/x' },
   // The page has no @username yet, so this is its numeric address.
   { id: 'facebook', name: 'Facebook', handle: 'Roomler', url: 'https://www.facebook.com/profile.php?id=100044550434196', short: '/fb' },
 ] as const
