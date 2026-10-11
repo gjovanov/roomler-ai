@@ -51,7 +51,7 @@ use crate::model::{
     AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionOrigin, SessionStatus,
     SessionView,
 };
-use crate::{HiveState, room};
+use crate::{HiveState, placement, room};
 
 /// `POST …/hive/session`.
 #[derive(Debug, Deserialize)]
@@ -418,6 +418,21 @@ pub async fn start(
     } else {
         None
     };
+    // P2c-2b — where its copies go, chosen now and kept on the record.
+    // Replication never blocks a start: a placement that could not be read
+    // is logged, and the session runs on its primary alone, as with the
+    // switch off.
+    let (replicaset, short) = if state.replicaset {
+        match placement::place_new(&state, tid, auth.user_id, device_id, &device).await {
+            Ok((r, short)) => (Some(r), short),
+            Err(e) => {
+                warn!(session = %sid, %e, "hive: placement not read — the session runs on its primary alone");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
     // The session's room first (P0d): the record names it, and a session
     // nobody could see is no session.
     let room_id = room::open(&state, tid, sid, &title, auth.user_id).await?;
@@ -450,10 +465,25 @@ pub async fn start(
         ended_at: None,
         brain_rev: memory.as_ref().map(|m| m.brain_rev),
         origin: SessionOrigin::Started,
+        replicaset,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.
     state.sessions.create(&session).await?;
+    if session.replicaset.is_some() {
+        Audit {
+            tenant_id: tid,
+            user_id,
+            target_id: None,
+            device_id,
+            session_id: Some(sid),
+            action: "place",
+            outcome: if short.is_some() { "short" } else { "placed" },
+            reason: short.map(placement::Short::as_str),
+        }
+        .write(&state)
+        .await;
+    }
     // P1e — the snapshot, kept for a re-send of the start, then sent ahead
     // of it on the same socket, so the device holds it when the launch comes.
     if let Some(m) = &memory {

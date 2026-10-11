@@ -163,6 +163,43 @@ pub struct AgentSession {
     /// (every record before P1j).
     #[serde(default, skip_serializing_if = "SessionOrigin::is_started")]
     pub origin: SessionOrigin,
+    /// FR-90 P2c-2b — the devices that hold its copies, as placement chose
+    /// them at its start ([`crate::placement`]). Absent: placed nowhere — it
+    /// started with `hive.replicaset` off, before P2, or as an adopted
+    /// session, which is never placed until it is a managed one (P2f).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicaset: Option<Replicaset>,
+}
+
+/// FR-90 P2c-2b — where a session's copies go: its primary first, then the
+/// members placement chose, never more than `max`. A plan until the joins
+/// (P2c-3) say which members took it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Replicaset {
+    /// The policy revision placement read; 0 is decision 2's defaults.
+    pub policy_revision: i64,
+    pub min: u32,
+    pub max: u32,
+    /// The restricted tags the session carries, in the policy's spelling.
+    /// Sticky: a later placement adds to them and never takes one away, so
+    /// a session that was restricted stays restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_tags: Vec<String>,
+    pub members: Vec<ReplicaMember>,
+    /// Why it holds fewer than `min` copies, when it does
+    /// ([`crate::placement::Short::as_str`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
+    pub placed_at: DateTime,
+}
+
+/// One member of a session's replicaset.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaMember {
+    pub device_id: ObjectId,
+    /// [`crate::placement::MemberRole::as_str`]: `primary` | `archive` |
+    /// `owner`.
+    pub role: String,
 }
 
 /// FR-90 P1j — how a session came to be.
@@ -273,6 +310,49 @@ pub struct SessionView {
     pub brain_rev: Option<i64>,
     /// P1j — `started` or `adopted` (read-only: nobody prompts it).
     pub origin: SessionOrigin,
+    /// P2c-2b — where its copies go. Absent: placed nowhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicaset: Option<ReplicasetView>,
+}
+
+/// [`Replicaset`] as the API answers it.
+#[derive(Serialize, Debug, Clone)]
+pub struct ReplicasetView {
+    pub policy_revision: i64,
+    pub min: u32,
+    pub max: u32,
+    pub restricted_tags: Vec<String>,
+    pub members: Vec<ReplicaMemberView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
+    pub placed_at: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct ReplicaMemberView {
+    pub device_id: String,
+    pub role: String,
+}
+
+impl From<&Replicaset> for ReplicasetView {
+    fn from(r: &Replicaset) -> Self {
+        Self {
+            policy_revision: r.policy_revision,
+            min: r.min,
+            max: r.max,
+            restricted_tags: r.restricted_tags.clone(),
+            members: r
+                .members
+                .iter()
+                .map(|m| ReplicaMemberView {
+                    device_id: m.device_id.to_hex(),
+                    role: m.role.clone(),
+                })
+                .collect(),
+            short: r.short.clone(),
+            placed_at: rfc3339(r.placed_at),
+        }
+    }
 }
 
 fn rfc3339(t: DateTime) -> String {
@@ -304,6 +384,7 @@ impl From<&AgentSession> for SessionView {
             ended_at: s.ended_at.map(rfc3339),
             brain_rev: s.brain_rev,
             origin: s.origin,
+            replicaset: s.replicaset.as_ref().map(ReplicasetView::from),
         }
     }
 }
@@ -364,13 +445,15 @@ pub struct HiveAuditEvent {
     /// Absent for a start refused before a session was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
-    /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a).
+    /// `start` | `stop` | `view` | `participant` | `brain` | `policy` (P2c-2a) |
+    /// `place` (P2c-2b).
     pub action: String,
     /// `sent` | `queued` | `refused`; for `participant`, the role given —
     /// `driver` | `reader` — or `removed`; for `brain`, `added` | `edited` |
-    /// `archived` | `refused`; for `policy`, `set` | `refused`.
+    /// `archived` | `refused`; for `policy`, `set` | `refused`; for `place`,
+    /// `placed`, or `short` with why ([`crate::placement::Short`]).
     pub outcome: String,
-    /// Why, for `refused` — the server's own reason word.
+    /// Why, for `refused` and `short` — the server's own reason word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at: DateTime,
@@ -473,6 +556,7 @@ mod tests {
             ended_at: None,
             brain_rev: None,
             origin: SessionOrigin::Started,
+            replicaset: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
