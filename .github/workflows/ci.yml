@@ -760,8 +760,8 @@ jobs:
         # #1997. The cell above copies the unit's sandbox into a SYSTEM unit,
         # where `%t` means /run, and its oneshot never takes the lock. So it
         # could not see the per-user daemon failing to start on Fedora, every
-        # 5 s, forever: "opening /run/user/$UID/roomler-agent-<id>.lock:
-        # Read-only file system". This cell starts the SHIPPED unit under the
+        # 5 s, forever: "acquiring single-instance lock … Read-only file
+        # system". This cell starts the SHIPPED unit under the
         # runner's own user manager, as an install does. Ubuntu's AppArmor
         # stops a user manager from mounting inside an unprivileged user
         # namespace, and the unit then runs with NO sandbox, as on every

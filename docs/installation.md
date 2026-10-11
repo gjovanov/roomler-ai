@@ -174,9 +174,9 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   sandbox applies. CI starts a unit with these sandbox lines on a fresh runner
   (`ci.yml`, "The Linux user unit's sandbox").
 - ⚠️ **Until #1997 the per-user daemon could not start wherever the sandbox
-  applies**, Fedora among them: it restarted every 5 s with `opening
-  /run/user/$UID/roomler-agent-<id>.lock: Read-only file system`, because `%t`
-  was not writable. The P2c cell could not see it: a system unit's `%t` is
+  applies**, Fedora among them: it restarted every 5 s with `acquiring
+  single-instance lock` … `Read-only file system`, because `%t` was not
+  writable. The P2c cell could not see it: a system unit's `%t` is
   `/run`, and its oneshot never takes the lock. A second cell ("…where its
   user manager sandboxes it") starts the shipped unit under the runner's own
   user manager, with AppArmor's user-namespace restriction lifted (Fedora's

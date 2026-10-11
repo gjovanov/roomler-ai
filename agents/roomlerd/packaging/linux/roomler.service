@@ -71,7 +71,7 @@ ReadWritePaths=-%h/Videos
 # #1997 — three more paths the daemon writes, each one denied wherever the
 # sandbox applies. Measured on Fedora 44, whose user manager DOES apply it: the
 # daemon could not start at all, and restarted every 5 s forever with
-# "opening /run/user/1000/roomler-agent-<id>.lock: Read-only file system".
+# "acquiring single-instance lock … Read-only file system (os error 30)".
 #   * `%t`, the runtime dir: ProtectSystem=strict leaves /run read-only, and
 #     /run/user/$UID with it. The single-instance lock (instance_lock.rs) and
 #     the LocalAPI socket ($XDG_RUNTIME_DIR/roomler.sock) both live there.
