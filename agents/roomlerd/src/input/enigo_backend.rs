@@ -109,7 +109,10 @@ pub(super) fn dispatch_for_external(enigo: &mut Enigo, msg: InputMsg) -> Result<
     dispatch(enigo, msg)
 }
 
-fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
+/// Generic over enigo's two traits only so a test can record which calls an
+/// event makes (`tests::a_release_never_moves_the_pointer`); production
+/// passes the one concrete `Enigo`.
+fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
     match msg {
         InputMsg::MouseMove { x, y, mon } => {
             // rc.227 — coarse layout sampling (every 32nd event) so a
@@ -148,6 +151,14 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             };
             enigo
                 .button(map_button(btn), direction)
+                .map_err(|e| anyhow!("button: {e}"))?;
+        }
+        // #1945 — the arbiter's release-all: let go where the pointer IS.
+        // Moving first, as a click does, threw the cursor to (0,0) — GNOME's
+        // Activities hot corner — whenever a viewer vanished mid-drag.
+        InputMsg::MouseRelease { btn } => {
+            enigo
+                .button(map_button(btn), Direction::Release)
                 .map_err(|e| anyhow!("button: {e}"))?;
         }
         InputMsg::MouseWheel { dx, dy, mode } => {
@@ -295,7 +306,7 @@ pub(crate) fn map_normalised_to_virtual(
 ///
 /// Legacy path (default, gate off): returns `enigo.main_display()`
 /// (i.e. origin (0,0) + primary dims). Math is identical to pre-rc.54.
-fn resolve_target_monitor(enigo: &Enigo, mon: u8) -> (i32, i32, i32, i32) {
+fn resolve_target_monitor<E: Mouse>(enigo: &E, mon: u8) -> (i32, i32, i32, i32) {
     if virtual_screen_enabled() {
         #[cfg(target_os = "windows")]
         {
@@ -333,7 +344,7 @@ fn resolve_target_monitor(enigo: &Enigo, mon: u8) -> (i32, i32, i32, i32) {
 /// multi-monitor hosts where the primary monitor isn't at (0,0).
 /// Default off; flip the default in a later rc once the field-test
 /// host smoke confirms the path on rc.54.
-fn to_pixels(enigo: &Enigo, x: f32, y: f32, mon: u8) -> (i32, i32) {
+fn to_pixels<E: Mouse>(enigo: &E, x: f32, y: f32, mon: u8) -> (i32, i32) {
     use std::sync::atomic::Ordering;
     const DIAG_INFO_LIMIT: u32 = 50;
 
@@ -980,5 +991,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Stands in for `Enigo`: records every call `dispatch` makes.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<String>,
+    }
+
+    impl Mouse for Recorder {
+        fn button(&mut self, button: EnigoButton, direction: Direction) -> enigo::InputResult<()> {
+            self.calls.push(format!("button {button:?} {direction:?}"));
+            Ok(())
+        }
+        fn move_mouse(&mut self, x: i32, y: i32, c: Coordinate) -> enigo::InputResult<()> {
+            self.calls.push(format!("move {x},{y} {c:?}"));
+            Ok(())
+        }
+        fn scroll(&mut self, length: i32, axis: Axis) -> enigo::InputResult<()> {
+            self.calls.push(format!("scroll {length} {axis:?}"));
+            Ok(())
+        }
+        fn main_display(&self) -> enigo::InputResult<(i32, i32)> {
+            Ok((1920, 1080))
+        }
+        fn location(&self) -> enigo::InputResult<(i32, i32)> {
+            Ok((0, 0))
+        }
+    }
+
+    impl Keyboard for Recorder {
+        fn fast_text(&mut self, _text: &str) -> enigo::InputResult<Option<()>> {
+            Ok(None)
+        }
+        fn key(&mut self, key: Key, direction: Direction) -> enigo::InputResult<()> {
+            self.calls.push(format!("key {key:?} {direction:?}"));
+            Ok(())
+        }
+        fn raw(&mut self, keycode: u16, direction: Direction) -> enigo::InputResult<()> {
+            self.calls.push(format!("raw {keycode} {direction:?}"));
+            Ok(())
+        }
+    }
+
+    /// #1945 — the arbiter's release-all lets go where the pointer IS. A
+    /// click moves first so it lands on its target; a release that did the
+    /// same threw the cursor to (0,0), GNOME's Activities hot corner, every
+    /// time a viewer vanished mid-drag.
+    #[test]
+    fn a_release_never_moves_the_pointer() {
+        let mut r = Recorder::default();
+        dispatch(&mut r, InputMsg::MouseRelease { btn: Button::Left }).unwrap();
+        assert_eq!(r.calls, ["button Left Release"]);
+    }
+
+    /// The control: a viewer's own button-up still moves first. The recorder
+    /// is shown to see a move, so the test above cannot pass by seeing none.
+    #[test]
+    fn a_button_up_from_a_viewer_still_lands_where_it_points() {
+        let mut r = Recorder::default();
+        dispatch(
+            &mut r,
+            InputMsg::MouseButton {
+                btn: Button::Left,
+                down: false,
+                x: 0.5,
+                y: 0.5,
+                mon: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.calls, ["move 960,540 Abs", "button Left Release"]);
     }
 }

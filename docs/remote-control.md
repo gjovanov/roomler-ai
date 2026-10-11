@@ -350,6 +350,7 @@ Three input planes, all over a single SCTP-unreliable data channel labeled `inpu
 enum InputMsg {
     MouseMove   { x: f32, y: f32, mon: u8 },        // normalized 0..1 per monitor
     MouseButton { btn: Button, down: bool, x: f32, y: f32, mon: u8 },
+    MouseRelease { btn: Button },                     // let go WHERE THE POINTER IS (#1945)
     MouseWheel  { dx: f32, dy: f32, mode: WheelMode },
     Key         { code: u32, down: bool, mods: u8 }, // USB HID usage code
     KeyText     { text: String },                    // for IME / unicode
@@ -363,6 +364,16 @@ Key design choices:
 - **Normalized coordinates** (0..1 per monitor index), not pixels. The browser doesn't know the agent's resolution, and the agent's resolution can change mid-session (laptop docking, etc.). The agent maps to absolute pixels using its current monitor geometry.
 - **HID usage codes**, not browser key codes or X11 keysyms. Browser keyboard events expose `KeyboardEvent.code` which maps cleanly to HID; the agent maps HID → OS-native scan codes. This is the only way to get layout-independent behavior (a German controller pressing the physical "Z" key sends "Y" on a US-layout host *correctly*, because the host's layout interprets the scan code).
 - **Unreliable DC, ordered=false, maxRetransmits=0** — input is real-time; a dropped move event is replaced by the next one a few ms later. Latency >> reliability.
+- **A click moves first; a release-all never moves** (#1945). Every backend
+  positions the pointer before a `MouseButton` event, so a click lands on its
+  target even if the moves before it were coalesced away. The arbiter's
+  release of what a closing session still holds is a `MouseRelease` instead,
+  because it has no position worth moving to. It used to be a `MouseButton` up
+  at (0,0), so a viewer that vanished mid-drag threw the host's cursor into the
+  top-left corner: GNOME's Activities hot corner, or a macOS hot corner that
+  may lock the screen. Each backend's no-move arm is locked by a test that
+  records what it emits (`a_release_never_moves_the_pointer` in
+  `enigo_backend.rs`, `uinput_backend.rs` and `capture/portal/input.rs`).
 - **Mouse coalescing on the controller**, not the agent. The browser fires `pointermove` at up to display refresh rate; we coalesce to one msg per RAF (~16 ms), preserving the *last* position but dropping intermediate samples. Click/key events are never coalesced.
 - **`enigo` is the default**, with OS-specific direct backends behind a feature flag for performance and edge cases (UIPI on Windows, IME composition on macOS, `uinput` on Wayland because XTest doesn't exist there).
 

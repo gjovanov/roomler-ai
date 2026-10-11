@@ -171,6 +171,23 @@ pub enum InputMsg {
         y: f32,
         mon: u8,
     },
+    /// #1945 — let go of a button WITHOUT moving the pointer: how the arbiter
+    /// releases what a closing session still holds.
+    ///
+    /// A `MouseButton` carries a position, and every backend moves there
+    /// before the button so a click lands on its target. The release-all used
+    /// to send a `MouseButton` up at (0,0), so a viewer that vanished mid-drag
+    /// threw the host's cursor into the top-left corner: GNOME's Activities
+    /// hot corner, or whatever a Mac has bound to that corner (Lock Screen,
+    /// the screen saver). The drag ended there, too.
+    ///
+    /// It is a real variant, not a flag: the portal path serialises every
+    /// event to its helper, and each backend's match is exhaustive, so a new
+    /// backend cannot forget it. A viewer may send it as well; it can only let
+    /// go of a button.
+    MouseRelease {
+        btn: Button,
+    },
     MouseWheel {
         dx: f32,
         dy: f32,
