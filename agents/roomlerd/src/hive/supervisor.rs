@@ -355,6 +355,11 @@ pub struct Supervisor {
     /// P2d — the replica streams this device is a side of, by grant: the
     /// ones it serves as a source and the ones it follows as a member.
     streams: Mutex<HashMap<ObjectId, stream::Stream>>,
+    /// P2d-2c — a test's own DERP mux in place of the primary org's (`Some`),
+    /// so one test stands a source and a member on two muxes wired to each
+    /// other; `Some(None)` for none at all, whatever another test registered.
+    #[cfg(test)]
+    derp_for_tests: Mutex<Option<Option<tunnel_core::transport::derp::DerpTunnelHandle>>>,
     /// P2b-3b — how a test's sessions take their checkpoints (in-process,
     /// failing, never finishing); a device always runs `hive-checkpoint` as
     /// the account.
@@ -563,6 +568,7 @@ pub fn handle_replica_grant(
     path: Option<roomler_ai_remote_control::hive::HiveStreamPath>,
     token: String,
     ice_servers: Vec<roomler_ai_remote_control::signaling::IceServer>,
+    member_derp_pubkey: Option<String>,
     ttl_secs: u32,
     is_primary: bool,
     tx: mpsc::Sender<ClientMsg>,
@@ -575,6 +581,7 @@ pub fn handle_replica_grant(
         path,
         token,
         ice_servers,
+        member_derp_pubkey,
         ttl_secs,
     };
     match global() {
@@ -609,6 +616,7 @@ pub fn handle_replica_dial(
     cert_fingerprint: String,
     addrs: Vec<String>,
     ice_servers: Vec<roomler_ai_remote_control::signaling::IceServer>,
+    derp_pubkey: Option<String>,
     ttl_secs: u32,
     is_primary: bool,
 ) {
@@ -624,6 +632,7 @@ pub fn handle_replica_dial(
                 cert_fingerprint,
                 addrs,
                 ice_servers,
+                derp_pubkey,
                 ttl_secs,
             },
             is_primary,
@@ -864,6 +873,8 @@ impl Supervisor {
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            derp_for_tests: Mutex::new(None),
             #[cfg(test)]
             checkpoint_runner: None,
         }

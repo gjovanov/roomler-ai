@@ -371,7 +371,7 @@ cascade's guarantees while replacing its reactive counters:
   a carrier going away must not take R4's tunnel route with it.
 - **WireGuard is its whole header, never its first byte (#2002).** The mux splits each
   inbound payload between the WG and tunnel routes with `payload_is_wg_or_disco`
-  ([`derp.rs:234`](../crates/tunnel-core/src/transport/derp.rs#L234)), and the server's
+  ([`derp.rs:269`](../crates/tunnel-core/src/transport/derp.rs#L269)), and the server's
   relay reads the same function to decide what its tunnel shaper applies to
   ([`modules/network/src/derp.rs:602`](../crates/modules/network/src/derp.rs#L602)). It
   read the first byte only, 1..=4, and quinn **greases QUIC's fixed bit** by default
@@ -390,6 +390,18 @@ cascade's guarantees while replacing its reactive counters:
   ⚠️ During a rollout an old peer still advertises greasing, so a fixed build still
   greases toward it, and the old peer still reads by the first byte: the old-to-fixed
   direction is clean at once, the fixed-to-old one once the old end upgrades.
+- **A Hive stream has a route of its own (FR-90 P2d-2c).** The tunnel's route is one per
+  peer, and the last caller of `tunnel_conn_for` takes it, so a Hive replica stream on it
+  would take a `quic-derp-v1` tunnel's route between the same two devices, and a second
+  stream between the pair the first's. `hive_conn_for(peer, tag)`
+  ([`derp.rs:521`](../crates/tunnel-core/src/transport/derp.rs#L521)) vends a route per
+  stream, tagged with its grant's id: its payloads travel as `RMHIVE01` · the 12-byte tag ·
+  the packet, and `deliver` splits them off FIRST
+  ([`derp.rs:596`](../crates/tunnel-core/src/transport/derp.rs#L596)), so they never reach
+  the WG or tunnel consumer. ⚠️ A Hive miss (a tag nobody holds, or a frame cut short) is
+  counted in its own `hive_drops` and never reported `Unrouted`, since that event sends the
+  runtime after a WG peer to follow. ⚠️ Retirement follows #32's rule: a dropped Hive conn
+  clears only its own tag's route, and only while it is still its own sender.
 - **The counters are readable (#32).** `drop_counts()` shipped with the signal
   and was surfaced nowhere for a day, so a real 2026-08-25 transition could only
   be argued about from an absence of log lines. `NodeStatus.derp_inbound_drops`
