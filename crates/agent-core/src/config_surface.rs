@@ -1177,6 +1177,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
     },
     KeyMeta {
+        key: "wayland_aware",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-93 - when this host shows a Wayland desktop and nothing on this device may capture it, say so (wayland_not_enabled, naming the keys that would) instead of calling the host headless or streaming Xwayland's empty root as a black picture. Switches no capture on. Built-in default: ON. Off = the behaviour before FR-93, unchanged (the kill switch). Env: ROOMLERD_WAYLAND_AWARE. Restart required.",
+    },
+    KeyMeta {
         key: "x11_damage",
         group: Group::CaptureInput,
         tier: Tier::Advanced,
@@ -1856,6 +1864,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "portal_input" => cfg.portal_input.map(fmt_bool),
         "mutter_capture" => cfg.mutter_capture.map(fmt_bool),
         "window_capture" => cfg.window_capture.map(fmt_bool),
+        "wayland_aware" => cfg.wayland_aware.map(fmt_bool),
         "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
@@ -2379,6 +2388,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "portal_input" => cfg.portal_input = parse_tribool(value)?,
         "mutter_capture" => cfg.mutter_capture = parse_tribool(value)?,
         "window_capture" => cfg.window_capture = parse_tribool(value)?,
+        "wayland_aware" => cfg.wayland_aware = parse_tribool(value)?,
         "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
@@ -3113,6 +3123,7 @@ mod tests {
             "portal_input",
             "mutter_capture",
             "window_capture",
+            "wayland_aware",
         ] {
             apply(&mut cfg, key, Some("on")).unwrap();
             assert_eq!(
@@ -3151,6 +3162,8 @@ mod tests {
         cfg.portal_input = Some(false);
         cfg.mutter_capture = Some(true);
         cfg.window_capture = Some(true);
+        // FR-93 — default ON, so the direction worth bridging is the kill switch.
+        cfg.wayland_aware = Some(false);
         let bridged = crate::config::env_bridge_bools(&cfg);
         for (name, want) in [
             ("DRM_CAPTURE", Some(true)),
@@ -3160,6 +3173,7 @@ mod tests {
             ("PORTAL_INPUT", Some(false)),
             ("MUTTER_CAPTURE", Some(true)),
             ("WINDOW_CAPTURE", Some(true)),
+            ("WAYLAND_AWARE", Some(false)),
         ] {
             let got = bridged
                 .iter()

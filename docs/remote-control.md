@@ -288,7 +288,7 @@ sequenceDiagram
     A->>C: open_default(fps, downscale)
     C->>OS: try each backend in cascade order
     OS-->>C: every backend refuses
-    Note over C: the LAST error is classified, not guessed —<br/>macOS asks the TCC preflight, Linux checks<br/>DISPLAY/WAYLAND_DISPLAY, the rest stay honest
+    Note over C: the LAST error is classified, not guessed —<br/>macOS asks the TCC preflight, Linux asks the<br/>seat and the X server (FR-93), the rest stay honest
     C-->>A: NoopCapture carrying CaptureUnavailable{code, detail}
     A->>V: rc:media-unavailable {code, detail, hint}
     Note over A,V: retried until the control DC opens —<br/>on a relay session it opens seconds late
@@ -301,6 +301,7 @@ sequenceDiagram
 | `no_display` | Nothing to capture — headless, no desktop session | Nothing. Shell, files and tunnels are unaffected |
 | `not_built` | A signalling-only agent build, no capture backend compiled in | Install a full agent build |
 | `backend_error` | The backend failed and the agent did not attribute it | Read `detail` (the backend's own words) and the agent log |
+| `wayland_not_enabled` | FR-93: a Wayland desktop is showing, and every arm that could capture it is off on this device. Before FR-93 a per-user daemon streamed **black** here, and a system one said "headless" | Switch on the arm the `hint` names for this install: `drm_capture` + `uinput` on a system install, `portal_capture` (+ `mutter_capture` on GNOME) on a per-user one. See [`linux-capture.md` §1.1](linux-capture.md#11-a-wayland-desktop-with-nothing-switched-on-fr-93-p1) |
 
 ⚠️ **The `hint` sentence is composed by the AGENT, not the viewer**, because
 only the host knows which OS it is on — the same reason the consent surface

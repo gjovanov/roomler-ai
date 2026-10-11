@@ -451,6 +451,12 @@ pub enum CaptureUnavailableCode {
     /// The backend failed and we did not attribute it. `detail` carries its
     /// own words; "we do not know" is a better answer than a guess.
     BackendError,
+    /// FR-93 — a Wayland desktop is right there, and every arm that could
+    /// capture it is switched off on this device. Before this code the root
+    /// daemon called such a host "headless" (`no_display`) and the per-user
+    /// daemon streamed Xwayland's empty root: a live black picture with no
+    /// reason at all (the FR-93 lab, 0.4.125).
+    WaylandNotEnabled,
 }
 
 impl CaptureUnavailableCode {
@@ -462,6 +468,7 @@ impl CaptureUnavailableCode {
             Self::NoDisplay => "no_display",
             Self::NotBuilt => "not_built",
             Self::BackendError => "backend_error",
+            Self::WaylandNotEnabled => "wayland_not_enabled",
         }
     }
 
@@ -498,8 +505,222 @@ impl CaptureUnavailableCode {
                 "The host's capture backend failed to start. Its own error is in the detail; \
                  the agent log has the full line."
             }
+            Self::WaylandNotEnabled => wayland_hint(running_as_root()),
         }
     }
+}
+
+/// The `wayland_not_enabled` sentence, by install type: only a root daemon can
+/// read the scanout (DRM) or create a uinput device, and a per-user daemon on
+/// GNOME has mutter's own screencast on its session bus.
+///
+/// ⚠️ A hint goes on the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+fn wayland_hint(root: bool) -> &'static str {
+    if root {
+        "This computer is showing a Wayland desktop, and capturing it is switched off on this \
+         device. On the host an administrator can run sudo roomler config set drm_capture true \
+         and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
+         the screen below the desktop, the lock screen included. Remote shell and file transfer \
+         still work."
+    } else {
+        "This computer is showing a Wayland desktop, and capturing it is switched off on this \
+         device. On GNOME, run roomler config set portal_capture true and roomler config set \
+         mutter_capture true, then roomler restart. On other desktops portal_capture alone asks \
+         the person at the screen once. Remote shell and file transfer still work."
+    }
+}
+
+/// Root or not decides which keys a hint can honestly name: only a root daemon
+/// can read the scanout (DRM) or create a uinput device.
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// FR-93 P1 kill switch (`ROOMLERD_WAYLAND_AWARE` / `wayland_aware`), default
+/// ON. It enables no capture; it only stops a Wayland desktop with nothing
+/// switched on from reading as "headless" or streaming black. `false` gives
+/// back 0.4.125's behaviour byte for byte.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wayland_aware() -> bool {
+    tunnel_core::env::flag("WAYLAND_AWARE", true)
+}
+
+/// FR-93 — what to call "every arm failed" on Linux, as a pure function.
+///
+/// - `display` / `wayland_display`: the DAEMON's own variables. A root systemd
+///   daemon never has them, which is why they cannot answer "is there a
+///   desktop" on their own — the seat is asked (`seat_is_wayland`, lazily: it
+///   runs loginctl).
+/// - `arm_failed`: an operator switched a Wayland arm on (DRM or the portal)
+///   and it could not open. Then the true answer is that arm's own error, not
+///   "switched off".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_no_pixels_code(
+    display: bool,
+    wayland_display: bool,
+    aware: bool,
+    arm_failed: bool,
+    seat_is_wayland: impl FnOnce() -> bool,
+) -> CaptureUnavailableCode {
+    use CaptureUnavailableCode::*;
+    if !aware {
+        // 0.4.125's rule, unchanged.
+        return if !display && !wayland_display {
+            NoDisplay
+        } else {
+            BackendError
+        };
+    }
+    if arm_failed || display {
+        // An arm the operator asked for, or an X display scrap could not
+        // open: a real error, in its own words.
+        return BackendError;
+    }
+    if wayland_display || seat_is_wayland() {
+        WaylandNotEnabled
+    } else {
+        NoDisplay
+    }
+}
+
+/// FR-93 — scrap OPENED, on an X server that is Xwayland. On a Wayland desktop
+/// that root window is empty, so the "success" is a live black stream.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "scrap-capture")),
+    allow(dead_code)
+)]
+fn xwayland_verdict(
+    is_xwayland: bool,
+    aware: bool,
+    arm_failed: bool,
+) -> Option<CaptureUnavailableCode> {
+    if !aware || !is_xwayland {
+        return None;
+    }
+    Some(if arm_failed {
+        CaptureUnavailableCode::BackendError
+    } else {
+        CaptureUnavailableCode::WaylandNotEnabled
+    })
+}
+
+/// Is a graphical session on this host Wayland? logind knows; the daemon's
+/// environment does not (a root unit has none of the session's variables).
+#[cfg(target_os = "linux")]
+fn seat_shows_wayland() -> bool {
+    crate::companion::graphical_session()
+        .map(|s| s.wayland_display.is_some())
+        .unwrap_or(false)
+}
+
+/// Is the X server on `display` Xwayland? Asked of the server itself rather
+/// than inferred from the session type, so the daemon's own Xvfb (the virtual
+/// desktop) and a real Xorg are never mistaken for it. An unreachable server
+/// is "no": scrap then reports its own error.
+///
+/// Two signals, the same two keep busy reads (`keep_busy::host_x11`, FR-92):
+/// the `XWAYLAND` extension, which Xwayland has carried since 23.1, and before
+/// that its RandR monitors, all named `XWAYLAND<n>` — so a 22.04-era GNOME is
+/// recognised too, not streamed black.
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+fn x_server_is_xwayland(display: &str) -> bool {
+    x_server_query(display, |conn, root| {
+        x_has_extension(conn, "XWAYLAND") || x_has_xwayland_monitor(conn, root)
+    }) == Some(true)
+}
+
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+fn x_has_extension(conn: &x11rb::rust_connection::RustConnection, name: &'static str) -> bool {
+    use x11rb::connection::RequestConnection as _;
+    matches!(conn.extension_information(name), Ok(Some(_)))
+}
+
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+fn x_has_xwayland_monitor(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: x11rb::protocol::xproto::Window,
+) -> bool {
+    use x11rb::protocol::randr::{self, ConnectionExt as _};
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    if !x_has_extension(conn, randr::X11_EXTENSION_NAME) {
+        return false;
+    }
+    let monitors_known = conn
+        .randr_query_version(1, 5)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some_and(|v| (v.major_version, v.minor_version) >= (1, 5));
+    if !monitors_known {
+        return false;
+    }
+    let Some(reply) = conn
+        .randr_get_monitors(root, true)
+        .ok()
+        .and_then(|c| c.reply().ok())
+    else {
+        return false;
+    };
+    reply.monitors.iter().any(|m| {
+        conn.get_atom_name(m.name)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.name.starts_with(b"XWAYLAND"))
+    })
+}
+
+/// Ask the X server on `display` one question. `None` when no Unix socket
+/// reaches it, or it refuses us.
+///
+/// ⚠️ Unix sockets ONLY — Xwayland is a local server. `x11rb::connect` falls
+/// back to TCP `localhost:6000+N` when the socket is missing, and where a
+/// localhost connect to a closed port hangs instead of being refused (WSL2's
+/// mirrored networking, with systemd's /tmp hiding WSLg's X0 socket) that
+/// fallback stalled this probe for over a minute, measured, in front of every
+/// capture open. A display reached over TCP is simply not probed.
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+fn x_server_query(
+    display: &str,
+    ask: impl FnOnce(&x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::Window) -> bool,
+) -> Option<bool> {
+    use x11rb::connection::Connection as _;
+    use x11rb::reexports::x11rb_protocol::parse_display::{ConnectAddress, parse_display};
+    use x11rb::reexports::x11rb_protocol::xauth::get_auth;
+    use x11rb::rust_connection::{DefaultStream, RustConnection};
+
+    let parsed = parse_display(Some(display)).ok()?;
+    for addr in parsed.connect_instruction() {
+        if !matches!(addr, ConnectAddress::Socket(_)) {
+            continue;
+        }
+        let Ok((stream, (family, address))) = DefaultStream::connect(&addr) else {
+            continue;
+        };
+        // The same auth lookup x11rb's own connect does; Xwayland under GNOME
+        // and KDE requires the session's cookie.
+        let (auth_name, auth_data) = get_auth(family, &address, parsed.display)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let conn = RustConnection::connect_to_stream_with_auth_info(
+            stream,
+            parsed.screen.into(),
+            auth_name,
+            auth_data,
+        )
+        .ok()?;
+        let root = conn.setup().roots.get(usize::from(parsed.screen))?.root;
+        return Some(ask(&conn, root));
+    }
+    None
 }
 
 /// FR-80 — the reason a session will produce no pixels, carried by the
@@ -591,7 +812,10 @@ impl ScreenCapture for NoopCapture {
 /// Only the scrap arm calls it today (scrap is the cascade's last real
 /// backend), so a build without that feature has nothing to classify.
 #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
-pub(crate) fn classify_capture_failure(detail: String) -> CaptureUnavailable {
+pub(crate) fn classify_capture_failure(
+    detail: String,
+    wayland_arm_error: Option<&str>,
+) -> CaptureUnavailable {
     #[cfg(target_os = "macos")]
     {
         // ORDER IS THE ANSWER. A root LaunchDaemon is in session 0, which has
@@ -607,16 +831,34 @@ pub(crate) fn classify_capture_failure(detail: String) -> CaptureUnavailable {
             return CaptureUnavailable::new(CaptureUnavailableCode::Permission, detail);
         }
     }
+    // Only reached once every backend has already failed. "No display
+    // variables" describes the DAEMON, not the host: a root systemd daemon
+    // never has them, even with a Wayland desktop on the seat — so before FR-93
+    // a GNOME host with someone at it read as "headless". The seat is asked
+    // (linux_no_pixels_code), and an arm the operator switched on that failed
+    // gets to say why in its own words.
     #[cfg(target_os = "linux")]
-    {
-        // Only reached once every backend has already failed, so "no display
-        // variables and nothing opened" is a fair attribution rather than a
-        // guess. A DRM or portal host that got this far has a real error.
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return CaptureUnavailable::new(CaptureUnavailableCode::NoDisplay, detail);
-        }
-    }
-    CaptureUnavailable::new(CaptureUnavailableCode::BackendError, detail)
+    let (code, detail) = {
+        let aware = wayland_aware();
+        let code = linux_no_pixels_code(
+            std::env::var_os("DISPLAY").is_some(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            aware,
+            wayland_arm_error.is_some(),
+            seat_shows_wayland,
+        );
+        let detail = match (code, wayland_arm_error) {
+            (CaptureUnavailableCode::BackendError, Some(err)) if aware => err.to_string(),
+            _ => detail,
+        };
+        (code, detail)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let code = {
+        let _ = wayland_arm_error;
+        CaptureUnavailableCode::BackendError
+    };
+    CaptureUnavailable::new(code, detail)
 }
 
 /// Open the best-available capture backend for the current host. Falls
@@ -805,6 +1047,13 @@ fn open_with(
     // 45.8 % of a core to 2.8 % precisely BY not grabbing an unchanged screen.
     // A Wayland or headless host sets `ROOMLERD_DRM_CAPTURE=1`; everyone else
     // keeps the existing cascade byte-for-byte.
+    // FR-93 — the Wayland arms the operator switched ON and that failed, in
+    // operator words. On a Wayland desktop the fallback below is then a real
+    // error worth naming, not "capture is switched off".
+    #[cfg(target_os = "linux")]
+    #[allow(unused_mut, unused_variables)] // assigned/read only in featured builds
+    let mut wayland_arm_error: Option<String> = None;
+
     #[cfg(all(target_os = "linux", feature = "drm-capture"))]
     {
         if drm_backend::env_enabled() {
@@ -825,6 +1074,9 @@ fn open_with(
                         error = %format!("{e:#}"),
                         "ROOMLERD_DRM_CAPTURE=1 but DRM capture could not open — falling through to the standard cascade"
                     );
+                    wayland_arm_error = Some(format!(
+                        "drm_capture is on, but DRM capture could not open: {e:#}"
+                    ));
                 }
             }
         }
@@ -863,6 +1115,12 @@ fn open_with(
                         "ROOMLERD_PORTAL_CAPTURE=1 but portal capture could not open — falling \
                          through to the standard cascade"
                     );
+                    let portal =
+                        format!("portal_capture is on, but the portal could not open: {e:#}");
+                    wayland_arm_error = Some(match wayland_arm_error.take() {
+                        Some(drm) => format!("{drm}; {portal}"),
+                        None => portal,
+                    });
                 }
             }
         }
@@ -873,6 +1131,38 @@ fn open_with(
     // Each arm BINDS the reason rather than assigning into a pre-declared
     // `None`: on the success path this function returns, so an initial value
     // would be one no path ever reads.
+    // FR-93 — never stream Xwayland's empty root. On a Wayland desktop a
+    // per-user daemon's DISPLAY is Xwayland, XShm on it OPENS, and every frame
+    // is black: the FR-93 lab measured `backend=scrap · lit=0.0 %` on a stock
+    // GNOME 50 install, and the controller was told nothing. Ask the X server
+    // whether it is Xwayland; if so, refuse it and say why.
+    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+    if let Some(display) = std::env::var_os("DISPLAY") {
+        let display = display.to_string_lossy().into_owned();
+        let aware = wayland_aware();
+        let is_xwayland = aware && x_server_is_xwayland(&display);
+        if let Some(code) = xwayland_verdict(is_xwayland, aware, wayland_arm_error.is_some()) {
+            let detail = match (code, wayland_arm_error.as_deref()) {
+                (CaptureUnavailableCode::BackendError, Some(err)) => err.to_string(),
+                _ => format!(
+                    "DISPLAY {display} is Xwayland: on a Wayland desktop its root window is \
+                     empty, so XShm would stream a black picture"
+                ),
+            };
+            let reason = CaptureUnavailable::new(code, detail);
+            tracing::warn!(
+                code = reason.code.wire(),
+                detail = %reason.detail,
+                "capture: this is a Wayland desktop — refusing XShm on Xwayland's empty root (FR-93)"
+            );
+            return Box::new(NoopCapture::unavailable(reason));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+    let wayland_arm_failure = wayland_arm_error.as_deref();
+    #[cfg(all(not(target_os = "linux"), feature = "scrap-capture"))]
+    let wayland_arm_failure: Option<&str> = None;
     #[cfg(feature = "scrap-capture")]
     let reason = match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
         Ok(c) => {
@@ -885,7 +1175,7 @@ fn open_with(
         }
         Err(e) => {
             let detail = format!("{e:#}");
-            let classified = classify_capture_failure(detail.clone());
+            let classified = classify_capture_failure(detail.clone(), wayland_arm_failure);
             tracing::warn!(
                 error = %detail,
                 code = classified.code.wire(),
@@ -1168,5 +1458,282 @@ mod frame_tests {
         assert_eq!(f.native_dims(), (1024, 640), "no source = own dims");
         f.source = Some((1920, 1200));
         assert_eq!(f.native_dims(), (1920, 1200));
+    }
+}
+
+/// FR-93 P1 — the verdicts, as tables. Pure on purpose: each test that set
+/// `DISPLAY` or `WAYLAND_DISPLAY` would race every other test in the binary.
+#[cfg(test)]
+mod wayland_reason_tests {
+    use super::CaptureUnavailableCode::{self, *};
+    use super::{linux_no_pixels_code, wayland_hint, xwayland_verdict};
+
+    fn seat(answer: bool) -> impl FnOnce() -> bool {
+        move || answer
+    }
+
+    fn seat_unasked() -> impl FnOnce() -> bool {
+        || -> bool { panic!("logind was asked, and this answer does not depend on the seat") }
+    }
+
+    /// The root-daemon bug (FR-93 AC2): a systemd unit has no display
+    /// variables, so before FR-93 a host with GNOME on its seat read as
+    /// headless. Only the SEAT can tell the two apart.
+    #[test]
+    fn a_root_daemon_asks_the_seat_before_calling_a_host_headless() {
+        assert_eq!(
+            linux_no_pixels_code(false, false, true, false, seat(true)),
+            WaylandNotEnabled
+        );
+        assert_eq!(
+            linux_no_pixels_code(false, false, true, false, seat(false)),
+            NoDisplay,
+            "a host with no graphical session is still headless"
+        );
+    }
+
+    #[test]
+    fn the_daemons_own_wayland_display_needs_no_seat_lookup() {
+        assert_eq!(
+            linux_no_pixels_code(false, true, true, false, seat_unasked()),
+            WaylandNotEnabled
+        );
+    }
+
+    /// An arm the operator switched on that failed is a real error, in its own
+    /// words — never "switched off", which would tell them to set a key they
+    /// already set.
+    #[test]
+    fn a_wayland_arm_that_failed_is_an_error_not_switched_off() {
+        for (display, wayland_display) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            assert_eq!(
+                linux_no_pixels_code(display, wayland_display, true, true, seat_unasked()),
+                BackendError,
+                "DISPLAY={display} WAYLAND_DISPLAY={wayland_display}"
+            );
+        }
+    }
+
+    /// An X display that scrap could not open is scrap's error. (One that
+    /// OPENED on Xwayland never reaches the classifier: `xwayland_verdict`.)
+    #[test]
+    fn an_x_display_scrap_could_not_open_stays_a_backend_error() {
+        assert_eq!(
+            linux_no_pixels_code(true, false, true, false, seat_unasked()),
+            BackendError
+        );
+    }
+
+    /// The kill switch gives back the rule before FR-93 exactly, and never
+    /// asks logind.
+    #[test]
+    fn wayland_aware_off_is_the_old_rule_and_asks_nobody() {
+        let old = |display: bool, wayland_display: bool| {
+            if !display && !wayland_display {
+                NoDisplay
+            } else {
+                BackendError
+            }
+        };
+        for arm_failed in [false, true] {
+            for (display, wayland_display) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                assert_eq!(
+                    linux_no_pixels_code(
+                        display,
+                        wayland_display,
+                        false,
+                        arm_failed,
+                        seat_unasked()
+                    ),
+                    old(display, wayland_display),
+                    "DISPLAY={display} WAYLAND_DISPLAY={wayland_display} arm_failed={arm_failed}"
+                );
+            }
+        }
+    }
+
+    /// The per-user-daemon bug (FR-93 AC1): XShm OPENS on Xwayland and
+    /// streams its empty root — black.
+    #[test]
+    fn xshm_on_xwayland_is_refused_with_a_reason() {
+        assert_eq!(xwayland_verdict(true, true, false), Some(WaylandNotEnabled));
+        assert_eq!(
+            xwayland_verdict(true, true, true),
+            Some(BackendError),
+            "an arm that failed says why, rather than streaming black"
+        );
+        assert_eq!(
+            xwayland_verdict(false, true, false),
+            None,
+            "a real X server is captured"
+        );
+        assert_eq!(xwayland_verdict(false, true, true), None);
+        assert_eq!(
+            xwayland_verdict(true, false, false),
+            None,
+            "the kill switch"
+        );
+        assert_eq!(xwayland_verdict(true, false, true), None);
+    }
+
+    /// The hint is spliced into the `rc:media-unavailable` JSON unescaped
+    /// (`peer::capture_unavailable_payload`), and `hint()` shows only the
+    /// variant for THIS process's euid — so both variants are checked here.
+    #[test]
+    fn every_hint_is_a_safe_json_literal() {
+        let codes: [CaptureUnavailableCode; 5] = [
+            Permission,
+            NoDisplay,
+            NotBuilt,
+            BackendError,
+            WaylandNotEnabled,
+        ];
+        let mut hints: Vec<&str> = codes.iter().map(|c| c.hint()).collect();
+        hints.push(wayland_hint(true));
+        hints.push(wayland_hint(false));
+        for hint in hints {
+            assert!(
+                !hint
+                    .chars()
+                    .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20),
+                "a hint would break the payload: {hint}"
+            );
+        }
+    }
+
+    /// Each install type is told the keys it can actually use: only root can
+    /// read the scanout or create a uinput device, and a per-user daemon on
+    /// GNOME has mutter's screencast on its own session bus.
+    #[test]
+    fn the_hint_names_the_keys_this_install_can_use() {
+        let root = wayland_hint(true);
+        assert!(
+            root.contains("sudo roomler config set drm_capture true"),
+            "{root}"
+        );
+        assert!(root.contains("uinput"), "{root}");
+        assert!(!root.contains("portal_capture"), "{root}");
+
+        let user = wayland_hint(false);
+        assert!(
+            user.contains("roomler config set portal_capture true"),
+            "{user}"
+        );
+        assert!(user.contains("mutter_capture"), "{user}");
+        assert!(!user.contains("sudo"), "{user}");
+        assert!(!user.contains("drm_capture"), "{user}");
+    }
+}
+
+/// FR-93 — the Xwayland guard against a REAL X server, the half CI can run:
+/// a server that is NOT Xwayland must never be refused, or every X11 host and
+/// the daemon's own virtual desktop would lose capture (AC11). The Xwayland
+/// half is proven on the FR-93 lab's GNOME guests. `ROOMLERD_TEST_X11=1` makes
+/// a missing server a failure, as in `capture::pointer`'s lane.
+#[cfg(all(test, target_os = "linux", feature = "scrap-capture"))]
+mod xwayland_probe_tests {
+    use super::{x_has_extension, x_server_is_xwayland, x_server_query};
+    use std::time::{Duration, Instant};
+
+    /// Only the CI lane knows its server is Xvfb; a developer's own session
+    /// may well BE Xwayland.
+    fn xvfb_display() -> Option<String> {
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return None;
+        }
+        Some(std::env::var("DISPLAY").expect("ROOMLERD_TEST_X11=1 but DISPLAY is unset"))
+    }
+
+    #[test]
+    fn an_x_server_that_is_not_xwayland_is_captured() {
+        let Some(display) = xvfb_display() else {
+            return;
+        };
+        // The control: the probe's own Unix-only path REACHES the server and
+        // reads a real answer. Without it, a probe that could never connect
+        // would pass the assertion below by saying "no" to everything.
+        assert_eq!(
+            x_server_query(&display, |c, _| x_has_extension(c, "XFIXES")),
+            Some(true),
+            "the probe could not read {display}'s extensions"
+        );
+        assert!(
+            !x_server_is_xwayland(&display),
+            "Xvfb on {display} read as Xwayland: the guard would refuse every X11 host"
+        );
+        println!("x11-real: Xvfb does not advertise XWAYLAND");
+    }
+
+    /// Xwayland before 23.1 has no extension of its own, and the lab's GNOME 50
+    /// cannot show that half — so it is shown here: RandR 1.5 lets any client
+    /// define a monitor, and Xvfb lacks the extension, so ONLY the monitor
+    /// fallback can see this one.
+    #[test]
+    fn an_old_xwayland_is_known_by_its_monitors() {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::randr::{ConnectionExt as _, MonitorInfo};
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        use x11rb::wrapper::ConnectionExt as _;
+        let Some(display) = xvfb_display() else {
+            return;
+        };
+        let (conn, screen) = x11rb::connect(Some(&display)).expect("the Xvfb");
+        let root = conn.setup().roots[screen].root;
+        conn.randr_query_version(1, 5).unwrap().reply().unwrap();
+        let name = conn
+            .intern_atom(false, b"XWAYLAND0")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let monitor = MonitorInfo {
+            name,
+            primary: false,
+            automatic: false,
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            width_in_millimeters: 10,
+            height_in_millimeters: 10,
+            outputs: Vec::new(),
+        };
+        conn.randr_set_monitor(root, monitor).unwrap();
+        conn.sync().unwrap();
+        let seen = x_server_is_xwayland(&display);
+        conn.randr_delete_monitor(root, name).unwrap();
+        conn.sync().unwrap();
+        assert!(seen, "an XWAYLAND0 monitor did not read as Xwayland");
+        assert!(
+            !x_server_is_xwayland(&display),
+            "and once it is gone, the server is plain X again"
+        );
+        println!("x11-real: an XWAYLAND monitor reads as Xwayland");
+    }
+
+    /// The stall the Unix-only rule exists for: `x11rb::connect` would try
+    /// TCP for this display, and a TEST-NET-1 address never answers a SYN.
+    #[test]
+    fn a_tcp_display_is_never_dialled() {
+        let start = Instant::now();
+        assert_eq!(x_server_query("192.0.2.1:0", |_, _| true), None);
+        assert!(!x_server_is_xwayland("192.0.2.1:0"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the probe dialled TCP: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_x_server_with_no_socket_is_not_xwayland() {
+        // Scrap then reports its own connection error, which is the truth.
+        assert_eq!(x_server_query(":4242", |_, _| true), None);
+        assert!(!x_server_is_xwayland(":4242"));
     }
 }

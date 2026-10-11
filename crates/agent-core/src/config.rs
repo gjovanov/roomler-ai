@@ -993,6 +993,19 @@ pub struct AgentConfig {
     /// nobody at it the capture simply never starts. Restart required.
     #[serde(default)]
     pub window_capture: Option<bool>,
+    /// FR-93 — name a Wayland desktop that nothing on this device may capture,
+    /// instead of calling the host headless or streaming black
+    /// (`ROOMLERD_WAYLAND_AWARE`). Built-in default: **ON**.
+    ///
+    /// It switches no capture on. With every Wayland arm off, a root daemon
+    /// reported `no_display` ("headless") for a host with GNOME on its seat —
+    /// a root unit has none of the session's variables — and a per-user daemon
+    /// streamed Xwayland's empty root window: a live black picture with no
+    /// reason given. With this on, both report `wayland_not_enabled` and name
+    /// the keys that would capture it. `false` is the kill switch: the
+    /// behaviour before FR-93, unchanged. Restart required.
+    #[serde(default)]
+    pub wayland_aware: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -2370,6 +2383,7 @@ pub fn test_fixture() -> AgentConfig {
         portal_input: None,
         mutter_capture: None,
         window_capture: None,
+        wayland_aware: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -2532,7 +2546,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 85] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2567,6 +2581,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84]
         ("PORTAL_INPUT", cfg.portal_input),
         ("MUTTER_CAPTURE", cfg.mutter_capture),
         ("WINDOW_CAPTURE", cfg.window_capture),
+        ("WAYLAND_AWARE", cfg.wayland_aware),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
