@@ -80,6 +80,18 @@ function render(props: {
   })
 }
 
+/** Change the org default on a mounted menu, as the late fetch does.
+ *
+ *  ⚠️ `setProps`' argument is typed from the component, and where vue-tsc
+ *  resolves `.vue` through `env.d.ts`'s shim — the hosted image's build runs
+ *  it in `oven/bun`, which has no `node` — the shim's props are `object`.
+ *  An object literal naming a REAL prop then fails the excess-property check
+ *  there and nowhere else (CI and local builds type it from the SFC). The
+ *  prop is real; vitest exercises it at run time. */
+function setDefaultPattern(w: ReturnType<typeof render>, defaultPattern: KeepBusyPattern | null) {
+  return w.setProps({ defaultPattern } as unknown as Parameters<typeof w.setProps>[0])
+}
+
 /** Is the pattern tile `id` the chosen one in the open menu? */
 function checked(id: string): boolean {
   return (
@@ -169,13 +181,13 @@ describe('KeepBusyMenu (FR-92)', () => {
   it('P8: the default arriving after the fetch fills the pattern — never once the person has chosen', async () => {
     localStorage.removeItem(KEY + 'agent-late')
     const w = render({ state: state(), canControl: true, agentId: 'agent-late', defaultPattern: null })
-    await w.setProps({ defaultPattern: 'wave' })
+    await setDefaultPattern(w, 'wave')
     await w.find('[data-testid="rc-keep-busy-btn"]').trigger('click')
     await flushPromises()
     expect(checked('wave')).toBe(true)
     document.querySelector<HTMLButtonElement>('[data-testid="rc-keep-busy-pattern-star"]')!.click()
     await flushPromises()
-    await w.setProps({ defaultPattern: 'rose' })
+    await setDefaultPattern(w, 'rose')
     await flushPromises()
     expect(checked('star')).toBe(true)
     expect(checked('rose')).toBe(false)
