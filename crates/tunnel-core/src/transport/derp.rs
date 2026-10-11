@@ -211,8 +211,8 @@ struct PeerRoutes {
 const DISCO_MAGIC: &[u8; 8] = b"RMDISCO1";
 
 /// Which consumer an inbound DERP payload belongs to. WireGuard frames start
-/// with their LE u32 message type — first byte 1..=4 — and disco frames with
-/// the 8-byte `RMDISCO1` magic (designed disjoint from WG, doc'd in
+/// with their LE u32 message type — `[1..=4, 0, 0, 0]` — and disco frames
+/// with the 8-byte `RMDISCO1` magic (designed disjoint from WG, doc'd in
 /// `overlay::disco`); both belong to the carrier/WG consumer. EVERYTHING else
 /// (QUIC long headers ≥0xC0, short headers 0x40..=0x7F, version-negotiation
 /// 0x80..=0xBF) is tunnel traffic — but only when a tunnel consumer is
@@ -221,8 +221,25 @@ const DISCO_MAGIC: &[u8; 8] = b"RMDISCO1";
 /// legacy path for anything unexpected). A QUIC short-header packet CAN start
 /// with 0x52 ('R'), which is why the disco check is the full 8-byte magic and
 /// runs first.
+///
+/// ⚠️ #2002 — WireGuard is the WHOLE 4-byte header, never the first byte
+/// alone. quinn greases QUIC's fixed bit by default (RFC 9287): an end whose
+/// peer advertised it clears the bit on about half of what it sends, and a
+/// short header then starts anywhere below 0x40, 1..=4 among it — measured at
+/// 2.6-4.0% of a transfer's datagrams (`quic::tests::
+/// quic_over_derp_never_clears_the_fixed_bit`). Read by the first byte alone,
+/// those went to the WG consumer and were lost, and the server's tunnel
+/// shaper let them by. A greased QUIC packet that still passes must also open
+/// its random connection ID with three zero bytes.
 pub fn payload_is_wg_or_disco(payload: &[u8]) -> bool {
-    matches!(payload.first(), Some(1..=4)) || payload.len() >= 8 && &payload[..8] == DISCO_MAGIC
+    is_wg_header(payload) || payload.len() >= 8 && &payload[..8] == DISCO_MAGIC
+}
+
+/// WireGuard's own message header: the type (1 handshake initiation, 2
+/// response, 3 cookie reply, 4 transport data) and three reserved bytes, zero
+/// in every WireGuard message.
+fn is_wg_header(payload: &[u8]) -> bool {
+    matches!(payload, [1..=4, 0, 0, 0, ..])
 }
 
 /// R4 — everything the tunnel driver needs to run the `quic-derp-v1` flavor:
@@ -719,12 +736,16 @@ mod tests {
         let wg_payload = [1u8, 0, 0, 0, 0xAA]; // WG handshake-init shape
         let quic_short = [0x52u8, 9, 9, 9, 9]; // 'R' but NOT the disco magic
         let quic_long = [0xC3u8, 0, 0, 0, 1];
+        // #2002 — a short header whose fixed bit quinn greased, opening on a
+        // WireGuard type byte; its connection ID follows.
+        let quic_greased = [0x03u8, 0x9c, 0x41, 0x7e, 0x2d];
         let mut disco = DISCO_MAGIC.to_vec();
         disco.extend_from_slice(&[7; 24]);
 
         mux.deliver(&frame(peer, &wg_payload));
         mux.deliver(&frame(peer, &quic_short));
         mux.deliver(&frame(peer, &quic_long));
+        mux.deliver(&frame(peer, &quic_greased));
         mux.deliver(&frame(peer, &disco));
 
         let mut buf = [0u8; 128];
@@ -734,8 +755,47 @@ mod tests {
         assert_eq!(&buf[..n], &quic_short, "QUIC short header → tunnel");
         let (n, _) = tun_conn.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &quic_long, "QUIC long header → tunnel");
+        // Bounded: read by its first byte alone, this frame went to the WG
+        // consumer, and an unbounded read would wait for it forever.
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), tun_conn.recv_from(&mut buf))
+            .await
+            .expect("a greased QUIC short header → tunnel")
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            &quic_greased,
+            "a greased QUIC short header → tunnel"
+        );
         let (n, _) = wg_conn.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &disco[..], "disco magic → WG consumer");
+    }
+
+    /// #2002 — WireGuard is its whole 4-byte header: each of its four
+    /// message types with three zero bytes, and nothing that only shares the
+    /// first byte. quinn greases QUIC's fixed bit by default, so a short
+    /// header can open on 1..=4 too, and only its connection ID follows.
+    #[test]
+    fn only_a_wireguard_header_is_taken_for_wireguard() {
+        for t in 1..=4u8 {
+            assert!(
+                payload_is_wg_or_disco(&[t, 0, 0, 0, 0xAA, 0xBB]),
+                "WireGuard type {t}"
+            );
+            assert!(
+                !payload_is_wg_or_disco(&[t, 0x9c, 0x41, 0x7e, 0x2d]),
+                "a greased QUIC short header opening on {t}"
+            );
+            assert!(
+                !payload_is_wg_or_disco(&[t, 0, 0, 1, 0x2d]),
+                "type {t} with a nonzero reserved byte"
+            );
+        }
+        assert!(!payload_is_wg_or_disco(&[1, 0, 0]), "a header cut short");
+        assert!(!payload_is_wg_or_disco(&[0, 0, 0, 0, 1]), "type 0 is none");
+        assert!(!payload_is_wg_or_disco(&[5, 0, 0, 0, 1]), "type 5 is none");
+        let mut disco = DISCO_MAGIC.to_vec();
+        disco.extend_from_slice(&[7; 24]);
+        assert!(payload_is_wg_or_disco(&disco), "disco");
     }
 
     /// R4 — with NO tunnel consumer registered the mux behaves exactly as
