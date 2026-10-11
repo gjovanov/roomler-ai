@@ -592,6 +592,21 @@ fn linux_no_pixels_code(
     }
 }
 
+/// FR-93 — the `detail` of a `wayland_not_enabled` the classifier reached:
+/// what the agent FOUND, ahead of X11's own words. The viewer prints the
+/// detail under the reason, and on its own X11's "no primary display:
+/// connection refused" reads like a network fault, on a host whose only
+/// problem is a switched-off key (the FR-93 lab, system guest).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wayland_not_enabled_detail(wayland_display: bool, x11_error: &str) -> String {
+    let found = if wayland_display {
+        "this daemon runs inside a Wayland session (WAYLAND_DISPLAY is set)"
+    } else {
+        "logind shows a Wayland session on this host, and this daemon has no display of its own"
+    };
+    format!("{found}; X11 capture said: {x11_error}")
+}
+
 /// FR-93 — scrap OPENED, on an X server that is Xwayland. On a Wayland desktop
 /// that root window is empty, so the "success" is a live black stream.
 #[cfg_attr(
@@ -840,15 +855,19 @@ pub(crate) fn classify_capture_failure(
     #[cfg(target_os = "linux")]
     let (code, detail) = {
         let aware = wayland_aware();
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY").is_some();
         let code = linux_no_pixels_code(
             std::env::var_os("DISPLAY").is_some(),
-            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            wayland_display,
             aware,
             wayland_arm_error.is_some(),
             seat_shows_wayland,
         );
         let detail = match (code, wayland_arm_error) {
             (CaptureUnavailableCode::BackendError, Some(err)) if aware => err.to_string(),
+            (CaptureUnavailableCode::WaylandNotEnabled, _) => {
+                wayland_not_enabled_detail(wayland_display, &detail)
+            }
             _ => detail,
         };
         (code, detail)
@@ -1466,7 +1485,7 @@ mod frame_tests {
 #[cfg(test)]
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
-    use super::{linux_no_pixels_code, wayland_hint, xwayland_verdict};
+    use super::{linux_no_pixels_code, wayland_hint, wayland_not_enabled_detail, xwayland_verdict};
 
     fn seat(answer: bool) -> impl FnOnce() -> bool {
         move || answer
@@ -1578,6 +1597,20 @@ mod wayland_reason_tests {
             "the kill switch"
         );
         assert_eq!(xwayland_verdict(true, false, true), None);
+    }
+
+    /// The viewer prints the detail under the reason, and X11's own words
+    /// alone ("connection refused") read like a network fault. What the agent
+    /// found comes first, and fits the wire's 200-char cap with room to spare.
+    #[test]
+    fn the_detail_says_what_was_found_before_x11s_words() {
+        let x11 = "no primary display: connection refused";
+        let seat = wayland_not_enabled_detail(false, x11);
+        assert!(seat.starts_with("logind shows a Wayland session"), "{seat}");
+        assert!(seat.ends_with(x11), "{seat}");
+        assert!(seat.chars().count() <= 200, "{seat}");
+        let own = wayland_not_enabled_detail(true, x11);
+        assert!(own.contains("WAYLAND_DISPLAY"), "{own}");
     }
 
     /// The hint is spliced into the `rc:media-unavailable` JSON unescaped
