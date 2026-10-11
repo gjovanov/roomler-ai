@@ -37,7 +37,7 @@
 //! ⚠️ A workspace that cannot be taken never fails the checkpoint. The config
 //! directory is what a resume needs, so the workspace is skipped, in words.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -51,6 +51,14 @@ pub(crate) const MAX_PACK: usize = 512 * 1024 * 1024;
 /// A lock older than this on a checkpoint's own index is stale: no checkpoint
 /// is let run this long (`CHECKPOINT_TIMEOUT`, 120 s), so none still holds it.
 pub(crate) const STALE_LOCK: Duration = Duration::from_secs(300);
+
+/// FR-90 P2c — the most files, and bytes, a folder may hold that its index
+/// does not have yet: what one `git add` hashes. Past either, the workspace is
+/// skipped at once, in words, instead of hashing for the checkpoint's whole
+/// time limit and failing: an add that is ended writes no index, so every
+/// turn's end would start it over (P2b-3b).
+pub(crate) const MAX_NEW_FILES: usize = 20_000;
+pub(crate) const MAX_NEW_BYTES: u64 = MAX_PACK as u64;
 
 /// Who the checkpoint commits say made them: never the person, whose name
 /// would then sign a commit they did not write.
@@ -76,6 +84,8 @@ pub(crate) struct Git {
     /// each command so a repository around a temp directory cannot claim a
     /// folder, without touching the process's environment.
     ceiling: Option<PathBuf>,
+    /// [`MAX_NEW_FILES`] and [`MAX_NEW_BYTES`]; a test sets smaller ones.
+    new_limits: (usize, u64),
 }
 
 impl Git {
@@ -83,6 +93,7 @@ impl Git {
         Self {
             program: PathBuf::from("git"),
             ceiling: None,
+            new_limits: (MAX_NEW_FILES, MAX_NEW_BYTES),
         }
     }
 
@@ -90,15 +101,25 @@ impl Git {
     fn at(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
-            ceiling: None,
+            ..Self::on_path()
         }
     }
 
     #[cfg(test)]
     pub(crate) fn under(ceiling: &Path) -> Self {
         Self {
-            program: PathBuf::from("git"),
             ceiling: Some(ceiling.to_path_buf()),
+            ..Self::on_path()
+        }
+    }
+
+    /// This git, holding a folder to `files` and `bytes` it has not taken
+    /// yet in place of the real limits.
+    #[cfg(test)]
+    pub(crate) fn with_new_limits(self, files: usize, bytes: u64) -> Self {
+        Self {
+            new_limits: (files, bytes),
+            ..self
         }
     }
 }
@@ -289,12 +310,78 @@ fn read_folder(
             let _ = std::fs::remove_file(&index);
         }
     }
+    within_new_limits(git, folder, repo, &index)?;
     run(
         cmd(git, folder, Some(repo), Some(&index)).args(["add", "-A", "--", "."]),
         "add",
     )?;
     let tree = write_tree(git, folder, repo, &index)?;
     Ok((tree, index))
+}
+
+/// P2c — refuse, before hashing anything, a folder holding more than one
+/// `git add` can take within the checkpoint's time: more than
+/// [`MAX_NEW_FILES`] files, or [`MAX_NEW_BYTES`], that `index` does not have
+/// yet. `git ls-files --others` walks the folder without hashing, ignores
+/// honoured, and the walk stops at the first limit passed.
+fn within_new_limits(git: &Git, folder: &Path, repo: &Repo, index: &Path) -> Result<(), String> {
+    let (max_files, max_bytes) = git.new_limits;
+    let mut c = cmd(git, folder, Some(repo), Some(index));
+    c.args([
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--",
+        ".",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(spawn_err)?;
+    let mut stderr = child.stderr.take();
+    let said = std::thread::spawn(move || {
+        let mut s = Vec::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = e.read_to_end(&mut s);
+        }
+        s
+    });
+    let stdout = child.stdout.take().ok_or("git ls-files has no stdout")?;
+    let (mut files, mut bytes) = (0usize, 0u64);
+    let mut over = false;
+    for name in std::io::BufReader::new(stdout).split(0) {
+        let Ok(name) = name else { break };
+        let Ok(name) = std::str::from_utf8(&name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        files += 1;
+        bytes += std::fs::symlink_metadata(folder.join(name)).map_or(0, |m| m.len());
+        if files > max_files || bytes > max_bytes {
+            over = true;
+            break;
+        }
+    }
+    if over {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "the folder holds more than one checkpoint takes ({} files or {} MiB not yet \
+             in it): leave build output and other generated files to .gitignore",
+            max_files,
+            max_bytes >> 20
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("waiting for git ls-files: {e}"))?;
+    if !status.success() {
+        let said = said.join().unwrap_or_default();
+        return Err(format!("git ls-files failed: {}", tail(&said)));
+    }
+    Ok(())
 }
 
 /// The repository `folder` is in, or its shadow in `state_dir`.
@@ -1479,6 +1566,55 @@ mod tests {
             .output()
             .unwrap();
         assert!(!ours.status.success(), "the ref is not moved");
+    }
+
+    /// P2c — a folder holding more than one checkpoint can take is skipped at
+    /// once, in words, before anything is hashed; at the limits it is taken as
+    /// ever, and what it already holds, or ignores, counts for nothing. (The
+    /// limits made small here; the real ones are 20,000 files and 512 MiB.)
+    #[test]
+    fn a_folder_too_big_for_one_checkpoint_is_skipped_at_once() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("work");
+        for i in 0..5 {
+            write(&folder, &format!("f{i}.txt"), "x\n");
+        }
+        let state = root.path().join("state");
+        let skipped = |o: Outcome| match o {
+            Outcome::Skipped(why) => why,
+            other => panic!("taken: {other:?}"),
+        };
+        let git = Git::under(root.path()).with_new_limits(4, u64::MAX);
+        let why = skipped(checkpoint(&git, &folder, &state, SID, 1, 1, None));
+        assert!(why.contains("more than one checkpoint takes"), "{why}");
+        assert!(why.contains(".gitignore"), "{why}");
+        let git = Git::under(root.path()).with_new_limits(5, u64::MAX);
+        let (one, _) = taken(checkpoint(&git, &folder, &state, SID, 1, 1, None));
+
+        // Only what the index does not have yet counts: one new file, by its
+        // bytes.
+        write(&folder, "big.txt", "more than ten bytes\n");
+        let git = Git::under(root.path()).with_new_limits(5, 10);
+        let why = skipped(checkpoint(&git, &folder, &state, SID, 2, 2, Some(&one)));
+        assert!(why.contains("more than one checkpoint takes"), "{why}");
+
+        // An ignored file counts for nothing.
+        let tmp = repo_with_a_commit();
+        write(tmp.path(), "secret.env", &"x".repeat(100));
+        let git = Git::on_path().with_new_limits(5, 10);
+        let src_state = tempfile::tempdir().unwrap();
+        taken(checkpoint(
+            &git,
+            tmp.path(),
+            src_state.path(),
+            SID,
+            1,
+            1,
+            None,
+        ));
     }
 
     /// No `git`, or a session id that is not one, skips the workspace in words.
