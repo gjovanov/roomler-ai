@@ -4449,6 +4449,131 @@ async fn handle_server_msg(
             );
         }
 
+        // FR-90 P2d — serve a stream of a session this device holds to one
+        // of its members. Answered with `rc:hive.replica.ready` on THIS
+        // connection; a secondary org's is refused there.
+        ServerMsg::HiveReplicaGrant {
+            grant_id,
+            session_id,
+            fence,
+            member_id,
+            path,
+            token,
+            ice_servers,
+            ttl_secs,
+            member_derp_pubkey,
+        } => {
+            #[cfg(hive_host)]
+            {
+                // The `derp` rung's key is read from P2d-2c.
+                let _ = member_derp_pubkey;
+                crate::hive::handle_replica_grant(
+                    grant_id,
+                    session_id,
+                    fence,
+                    member_id,
+                    path,
+                    token,
+                    ice_servers,
+                    ttl_secs,
+                    ctx.is_primary,
+                    outbound_tx.clone(),
+                );
+            }
+            // No answer from this build: it does not advertise
+            // `hive-stream`, so no server grants it a stream to serve.
+            #[cfg(not(hive_host))]
+            {
+                let _ = (
+                    session_id,
+                    fence,
+                    member_id,
+                    path,
+                    token,
+                    ice_servers,
+                    ttl_secs,
+                    member_derp_pubkey,
+                );
+                debug!(grant = %grant_id, "rc:hive.replica.grant ignored — this build carries no streams");
+            }
+        }
+
+        // FR-90 P2d — the source this device asked for is ready: dial it.
+        ServerMsg::HiveReplicaDial {
+            grant_id,
+            session_id,
+            fence,
+            source_id,
+            path,
+            token,
+            cert_fingerprint,
+            addrs,
+            derp_pubkey,
+            ice_servers,
+            ttl_secs,
+        } => {
+            #[cfg(hive_host)]
+            {
+                // The `relay` and `derp` rungs read these from P2d-2b/2c.
+                let _ = (derp_pubkey, ice_servers);
+                crate::hive::handle_replica_dial(
+                    grant_id,
+                    session_id,
+                    fence,
+                    source_id,
+                    path,
+                    token,
+                    cert_fingerprint,
+                    addrs,
+                    ttl_secs,
+                    ctx.is_primary,
+                );
+            }
+            #[cfg(not(hive_host))]
+            {
+                let _ = (
+                    session_id,
+                    fence,
+                    source_id,
+                    path,
+                    token,
+                    cert_fingerprint,
+                    addrs,
+                    derp_pubkey,
+                    ice_servers,
+                    ttl_secs,
+                );
+                debug!(grant = %grant_id, "rc:hive.replica.dial ignored — this build carries no streams");
+            }
+        }
+
+        // FR-90 P2d — the member's relayed address, for the `relay` rung's
+        // TURN permission (P2d-2b); and a want the server refused (the
+        // ladder that acts on it comes with the follow, P2d-3).
+        ServerMsg::HiveReplicaCandidate { grant_id, addr } => {
+            debug!(grant = %grant_id, %addr, "rc:hive.replica.candidate — the relay rung is not served yet");
+        }
+        ServerMsg::HiveReplicaRefused {
+            session_id,
+            fence,
+            path,
+            reason,
+            detail,
+        } => {
+            info!(
+                session = %session_id, fence, path = ?path, reason = ?reason, detail = ?detail,
+                "rc:hive.replica.refused"
+            );
+        }
+
+        // FR-90 P2d — the server ended a stream this device is a side of.
+        ServerMsg::HiveReplicaClose { grant_id, reason } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_replica_close(grant_id, reason);
+            #[cfg(not(hive_host))]
+            debug!(grant = %grant_id, %reason, "rc:hive.replica.close ignored — this build carries no streams");
+        }
+
         // Roomler SSH — the answer to a session THIS device asked for
         // (`roomler ssh`). Handed to whichever LocalAPI call is parked on it;
         // an unknown id means that caller already gave up.
@@ -5098,9 +5223,14 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
 /// FR-90 P2c-3 — take the replica words out of a secondary org's caps: a
 /// device holds copies for its primary organization only, so another org's
 /// placement must never see it offer them. Equality, never a prefix: `hive`
-/// is a prefix of both, and stays.
+/// is a prefix of each, and stays. P2d: nor does it carry another org's
+/// streams (`hive-stream`).
 fn strip_replica_verbs(rpc: &mut Vec<String>) {
-    rpc.retain(|v| v != RpcCap::HiveReplica.wire() && v != RpcCap::HiveArchive.wire());
+    rpc.retain(|v| {
+        v != RpcCap::HiveReplica.wire()
+            && v != RpcCap::HiveArchive.wire()
+            && v != RpcCap::HiveStream.wire()
+    });
 }
 
 /// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
@@ -5128,8 +5258,9 @@ pub(crate) fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// FR-90 P2c-3 — a secondary org's caps lose the two replica words, by
-    /// equality: `hive` and every other `hive-*` word stays.
+    /// FR-90 P2c-3 — a secondary org's caps lose the replica words, by
+    /// equality: `hive` and every other `hive-*` word stays. P2d: and
+    /// `hive-stream`, so it carries no other org's streams.
     #[test]
     fn a_secondary_connection_never_offers_copies() {
         let mut rpc: Vec<String> = [
@@ -5137,6 +5268,7 @@ mod tests {
             "hive",
             "hive-replica",
             "hive-archive",
+            "hive-stream",
             "hive-view",
             "hive-adopt",
         ]

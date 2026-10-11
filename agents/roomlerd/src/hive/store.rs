@@ -146,6 +146,18 @@ enum Member {
     SizeBytes {
         reply: Reply<u64>,
     },
+    /// P2d — a member's stream hello: where its copy of a session ends.
+    HelloOf {
+        session: String,
+        fence: u64,
+        reply: Reply<roomler_hive_node::stream::MemberMsg>,
+    },
+    /// P2d — the source's answer to a member's hello, read against its
+    /// chain in one go on this thread.
+    AnswerHello {
+        hello: roomler_hive_node::stream::MemberMsg,
+        reply: Reply<roomler_hive_node::stream::SourceMsg>,
+    },
 }
 
 /// FR-90 P2a — why a member command did not do what it asked.
@@ -456,6 +468,29 @@ impl StoreHandle {
     pub(crate) async fn size_bytes(&self) -> Result<u64, WriterError> {
         self.ask(|reply| Member::SizeBytes { reply }).await
     }
+
+    /// FR-90 P2d — the member's stream hello for `session`, at `fence`.
+    pub(crate) async fn member_hello(
+        &self,
+        session: &str,
+        fence: u64,
+    ) -> Result<roomler_hive_node::stream::MemberMsg, WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::HelloOf {
+            session,
+            fence,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2d — the source's answer to a member's stream hello.
+    pub(crate) async fn answer_hello(
+        &self,
+        hello: roomler_hive_node::stream::MemberMsg,
+    ) -> Result<roomler_hive_node::stream::SourceMsg, WriterError> {
+        self.ask(|reply| Member::AnswerHello { hello, reply }).await
+    }
 }
 
 fn now_ms() -> i64 {
@@ -616,6 +651,18 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
         }
         Member::SizeBytes { reply } => {
             let _ = reply.send(store.size_bytes());
+        }
+        Member::HelloOf {
+            session,
+            fence,
+            reply,
+        } => {
+            let _ = reply.send(roomler_hive_node::stream::member_hello(
+                store, &session, fence,
+            ));
+        }
+        Member::AnswerHello { hello, reply } => {
+            let _ = reply.send(roomler_hive_node::stream::answer_hello(store, &hello));
         }
     }
 }

@@ -706,6 +706,56 @@ impl Store {
         Ok(out)
     }
 
+    /// FR-90 P2d — the event of `session` at `seq`, when the store holds it.
+    /// Never one of the divergent table's: what was set aside is not the
+    /// chain.
+    pub fn event_at(&self, session: &str, seq: u64) -> Result<Option<EventEnvelope>, StoreError> {
+        if seq == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .page(session, seq - 1, 1)?
+            .into_iter()
+            .find(|e| e.seq == seq))
+    }
+
+    /// FR-90 P2d — the newest `limit` checkpoints of `session`, newest first,
+    /// each as the `seq` and hash of its event: what a member names in its
+    /// stream's hello, and how a source finds one both hold.
+    pub fn checkpoint_marks(
+        &self,
+        session: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, [u8; 32])>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, fence, ts_ms, prev_hash, event_json FROM events
+             WHERE session = ?1 AND kind = 'checkpoint' ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, fence, ts_ms, prev, event_json) = row?;
+            let env = EventEnvelope {
+                session: session.to_string(),
+                seq: seq as u64,
+                fence: fence as u64,
+                ts_ms,
+                prev_hash: to_hash(&prev, session, seq as u64)?,
+                event_json,
+            };
+            out.push((env.seq, env.hash()));
+        }
+        Ok(out)
+    }
+
     /// Full-text search, best matches first (FTS5 `rank`). `sessions` limits
     /// the search to the sessions a view grant names; `None` searches
     /// everything this store holds (the daemon's own use, never a viewer's).
@@ -848,7 +898,7 @@ fn to_hash(raw: &[u8], session: &str, seq: u64) -> Result<[u8; 32], StoreError> 
     })
 }
 
-fn hex(hash: &[u8; 32]) -> String {
+pub(crate) fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
