@@ -1528,18 +1528,24 @@ async fn daemon_main() -> Result<()> {
             dump,
             fps,
             downscale,
-        } => capture_smoke_cmd(frames, dump.as_deref(), fps, &downscale).await,
+        } => {
+            publish_config_for_smoke(&config_path, "capture-smoke");
+            capture_smoke_cmd(frames, dump.as_deref(), fps, &downscale).await
+        }
         Command::InputSmoke {
             move_to,
             click,
             text,
             delay_ms,
-        } => input_smoke_cmd(
-            move_to.as_deref(),
-            click.as_deref(),
-            text.as_deref(),
-            delay_ms,
-        ),
+        } => {
+            publish_config_for_smoke(&config_path, "input-smoke");
+            input_smoke_cmd(
+                move_to.as_deref(),
+                click.as_deref(),
+                text.as_deref(),
+                delay_ms,
+            )
+        }
         Command::SystemCaptureSmoke {
             desktop,
             frames,
@@ -2857,69 +2863,9 @@ async fn run_cmd(
     // prefix — > these fallbacks > built-in default). Bools map to the
     // "1"/"0" strings every read-site parser already accepts.
     {
-        let mut fallbacks = std::collections::HashMap::new();
-        // rc.280 — the pair lists live in `config::env_bridge_*` (one source,
-        // parity-tested against the editable surface) instead of literals here.
-        for (suffix, value) in config::env_bridge_bools(&cfg) {
-            if let Some(v) = value {
-                fallbacks.insert(suffix.to_string(), if v { "1" } else { "0" }.to_string());
-            }
-        }
-        // Numeric knobs ride the same map as their decimal strings.
-        for (suffix, value) in config::env_bridge_numerics(&cfg) {
-            if let Some(v) = value {
-                fallbacks.insert(suffix.to_string(), v.to_string());
-            }
-        }
-        // Sibling-safe stable-port default (2026-08-15: both household
-        // laptops pinned the fleet-wide 43648 behind ONE Fritz!Box — the
-        // loser's srflx went per-destination and every inbound punch hit
-        // the sibling ⇒ relay-locked pairs). Applied ONLY when the
-        // operator left the key unset; like every bridge entry this is a
-        // FALLBACK — an explicit config value or a real env var wins.
-        if cfg.overlay_direct_port.is_none() {
-            fallbacks.insert(
-                "OVERLAY_DIRECT_PORT".to_string(),
-                config::derived_default_direct_port(&cfg.machine_id).to_string(),
-            );
-        }
-        // PR-D — overlay_pathmon is multi-state (on|shadow|off), so it rides
-        // the fallback map as a string, not the bool pairs above.
-        if let Some(mode) = &cfg.overlay_pathmon {
-            fallbacks.insert("OVERLAY_PATHMON".to_string(), mode.clone());
-        }
-        // B2 — overlay_demote (off|shadow|on), same string ride.
-        if let Some(mode) = &cfg.overlay_demote {
-            fallbacks.insert("OVERLAY_DEMOTE".to_string(), mode.clone());
-        }
-        // P4 — overlay_rpf (off|warn|enforce), same string ride.
-        if let Some(mode) = &cfg.overlay_rpf {
-            fallbacks.insert("OVERLAY_RPF".to_string(), mode.clone());
-        }
-        // P4 demotion — numeric heartbeat override, same string ride.
-        if let Some(secs) = cfg.overlay_route_tick_secs {
-            fallbacks.insert("OVERLAY_ROUTE_TICK_SECS".to_string(), secs.to_string());
-        }
-        // netstate — numeric debounce override, same string ride.
-        if let Some(ms) = cfg.overlay_netmon_debounce_ms {
-            fallbacks.insert("OVERLAY_NETMON_DEBOUNCE_MS".to_string(), ms.to_string());
-        }
-        // FR-77 — the cell denylist is a string key: it reaches the probe
-        // child through `config_fallbacks_for_child` like every other knob.
-        if let Some(v) = &cfg.encoder_cells_deny {
-            fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
-        }
-        // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
-        // probe child too.
-        if let Some(v) = &cfg.vaapi_device {
-            fallbacks.insert("VAAPI_DEVICE".to_string(), v.clone());
-        }
-        if let Some(v) = &cfg.d3d12_adapter {
-            fallbacks.insert("D3D12_ADAPTER".to_string(), v.clone());
-        }
-        if let Some(v) = &cfg.vulkan_device {
-            fallbacks.insert("VULKAN_DEVICE".to_string(), v.clone());
-        }
+        // FR-93 P1 — built by `config::env_fallbacks`, the one place, so the
+        // smoke commands publish exactly the map the daemon runs on.
+        let fallbacks = config::env_fallbacks(&cfg);
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
                 "config-backed env fallbacks registered");
@@ -5452,6 +5398,62 @@ fn apps_probe_cmd(config_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The capture and input keys a smoke command names when it starts, so the
+/// line says which cascade it is about to test.
+const SMOKE_CONFIG_KEYS: [&str; 8] = [
+    "DRM_CAPTURE",
+    "UINPUT",
+    "PORTAL_CAPTURE",
+    "PORTAL_INPUT",
+    "MUTTER_CAPTURE",
+    "WINDOW_CAPTURE",
+    "X11_DAMAGE",
+    "WAYLAND_AWARE",
+];
+
+/// FR-93 P1 — a smoke test answers as the DAEMON would: it publishes the
+/// device's own config-backed knobs first (`config::env_fallbacks`, the map
+/// `run` publishes), so a key set with `roomler config set` is honoured by the
+/// smoke that is meant to prove it. Before this, `capture-smoke` read env and
+/// built-in defaults only, and on a host configured through the config file
+/// it tested a cascade the daemon was not running.
+///
+/// ⚠️ `read_if_present`, not `load`, as `apps-probe` does: a diagnostic must
+/// never write the config it probes (`load` self-heals).
+fn publish_config_for_smoke(config_path: &std::path::Path, what: &str) {
+    let Some(cfg) = config::read_if_present(&config_path.to_path_buf()) else {
+        println!(
+            "{what}: no config at {} — env and built-in defaults only",
+            config_path.display()
+        );
+        return;
+    };
+    let fallbacks = config::env_fallbacks(&cfg);
+    let set: Vec<String> = SMOKE_CONFIG_KEYS
+        .iter()
+        .filter_map(|k| {
+            fallbacks
+                .get(*k)
+                .map(|v| format!("{}={v}", k.to_ascii_lowercase()))
+        })
+        .collect();
+    println!(
+        "{what}: config {} — {} (an env var still wins)",
+        config_path.display(),
+        if set.is_empty() {
+            "no capture or input keys set".to_string()
+        } else {
+            set.join(" ")
+        }
+    );
+    tunnel_core::env::register_config_fallbacks(fallbacks);
+}
+
+/// FR-93 P1 — how long one `next_frame` may take before the smoke calls the
+/// backend stalled. Generous: every real arm delivers in milliseconds once
+/// open (the portal's consent wait is inside `open_default`, bounded there).
+const SMOKE_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn capture_smoke_cmd(
     frames: u32,
     dump: Option<&str>,
@@ -5483,6 +5485,17 @@ async fn capture_smoke_cmd(
     }
 
     let mut cap = capture::open_default(fps.max(1), policy);
+    // FR-93 P1 — a capturer that already knows it will produce nothing says so,
+    // with the reason a viewer would be given. Asked for frames anyway, it
+    // parked this command for an HOUR per frame (`NoopCapture::next_frame`).
+    if let Some(reason) = cap.unavailable() {
+        bail!(
+            "capture-smoke FAILED: this host produces no pixels — {} ({}). {}",
+            reason.code.wire(),
+            reason.detail,
+            reason.code.hint()
+        );
+    }
     let mut delivered = 0u32;
     let mut empty = 0u32;
     let mut last: Option<capture::Frame> = None;
@@ -5491,7 +5504,14 @@ async fn capture_smoke_cmd(
 
     for _ in 0..frames.max(1) {
         let t0 = std::time::Instant::now();
-        match cap.next_frame().await {
+        let Ok(next) = tokio::time::timeout(SMOKE_FRAME_DEADLINE, cap.next_frame()).await else {
+            bail!(
+                "capture-smoke FAILED: the backend opened, then gave no answer within {} s \
+                 ({delivered} frames delivered before it stalled)",
+                SMOKE_FRAME_DEADLINE.as_secs()
+            );
+        };
+        match next {
             Ok(Some(f)) => {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 total_ms += ms;
