@@ -23,7 +23,8 @@ export const SITE_NAME = 'Roomler'
 export const SITE_TITLE_SUFFIX = 'Roomler Docs'
 
 /** Social card. Lives in the repo already (`docs/assets/social-preview.png`)
- *  and is copied into the output by the build.
+ *  and is copied into the output by the build. It is final artwork from the
+ *  brand kit, as is the repo root's copy GitHub shows, not a render.
  *  ⚠️ The ONE asset that keeps a stable, unhashed name (FR-87): the SPA's
  *  `ui/index.html` names it as its own og:image. */
 export const OG_IMAGE = `${BASE}/assets/social-preview.png`
@@ -116,11 +117,12 @@ export const ORG = {
 } as const
 
 /** The social card's real size and alt text, for `og:image:*`. Measured from
- *  the file (1280×640); `images.spec.ts` locks it. */
+ *  the file (1280×640); `images.spec.ts` locks it. The alt says what the card
+ *  shows: the logo and its one line. */
 export const OG_IMAGE_META = {
   width: 1280,
   height: 640,
-  alt: 'Roomler: remote desktop, a private network and team chat on one agent',
+  alt: 'The Roomler logo, with the line: remote desktop, private mesh network, chat & video',
 } as const
 
 // ── the blog (FR-87 P4) ─────────────────────────────────────────────────

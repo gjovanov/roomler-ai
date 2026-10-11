@@ -4,7 +4,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!--
+      The favicon set keeps root paths (browsers ask for /favicon.ico on their
+      own). nginx serves images `immutable` for a year, so a favicon whose BYTES
+      change bumps the `?v=` below and in ui/docs/theme/shell.ts, or a returning
+      visitor keeps the old one (docs/public-site.md §3).
+    -->
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Roomler — remote desktop, private mesh network, chat &amp; video</title>
     <!--

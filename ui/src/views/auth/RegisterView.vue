@@ -6,7 +6,7 @@
       <v-col cols="12" sm="8" md="4">
         <v-card class="pa-3 pa-md-4">
           <v-card-title class="text-center text-h5 mb-4">
-            <v-icon color="primary" class="mr-2">mdi-forum</v-icon>
+            <img :src="brandMark" alt="" width="28" height="28" class="mr-2" style="vertical-align: middle" />
             {{ $t('auth.register') }}
           </v-card-title>
 
@@ -104,6 +104,7 @@ import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
+import { useBrand } from '@/composables/useBrand'
 import {
   ATTRIBUTION_ENABLED,
   SELF_REPORTED_OPTIONS,
@@ -122,6 +123,7 @@ const router = useRouter()
 const route = useRoute()
 const { rules } = useValidation()
 const { t } = useI18n()
+const { mark: brandMark } = useBrand()
 
 const formRef = ref()
 const email = ref('')

@@ -32,6 +32,10 @@ export interface SiteAssets {
    *  install and download links (`attribution.js`). Absent when
    *  `ATTRIBUTION_ENABLED` is off, and then no page loads it. */
   attribution?: string
+  /** The top bar's logo: the light lockup the SPA also uses
+   *  (`ui/src/assets/brand/roomler-logo.svg`; the site has no dark theme).
+   *  Without it the brand is the plain word, as in a test fixture. */
+  logo?: string
 }
 
 export interface OgImage {
@@ -125,7 +129,13 @@ export function renderHead(h: HeadInput): string {
     `<meta name="twitter:image" content="${image.url}">`,
     `<meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">`,
     '<meta name="theme-color" content="#009688">',
-    '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
+    // The SPA's favicon set, at the site root (ui/public/). The `?v=` moves a
+    // returning reader off the year-long `immutable` copy of the old icon; it
+    // matches the one in ui/index.html.
+    '<link rel="icon" href="/favicon.ico" sizes="48x48">',
+    '<link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">',
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
+    '<link rel="manifest" href="/site.webmanifest">',
     h.feed ? `<link rel="alternate" type="application/atom+xml" title="${BLOG_TITLE}" href="${FEED_URL}">` : '',
     h.prevUrl ? `<link rel="prev" href="${h.prevUrl}">` : '',
     h.nextUrl ? `<link rel="next" href="${h.nextUrl}">` : '',
@@ -143,7 +153,7 @@ export function renderHead(h: HeadInput): string {
     .join('\n')
 }
 
-export function renderTopbar(nav: ShellNav = DOCS_NAV): string {
+export function renderTopbar(nav: ShellNav = DOCS_NAV, logo?: string): string {
   const { current } = nav
   const here = (on: boolean) => (on ? ' aria-current="page"' : '')
   // The burger opens the docs sidebar; no other page has one to open.
@@ -151,10 +161,14 @@ export function renderTopbar(nav: ShellNav = DOCS_NAV): string {
     current === 'docs'
       ? `<button class="topbar__burger" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>${icon('menu', { size: 22 })}</button>`
       : ''
+  // The lockup is 422×120; at the bar's 32 px that is 113 px wide.
+  const mark = logo
+    ? `<img class="brand__logo" src="${logo}" alt="Roomler" width="113" height="32">`
+    : '<span class="brand__mark">Roomler</span>'
   const brand =
     current === 'home' || current === 'links'
-      ? `<a class="brand" href="/"><span class="brand__mark">Roomler</span></a>`
-      : `<a class="brand" href="${current === 'blog' ? BLOG_BASE : BASE}/"><span class="brand__mark">Roomler</span><span class="brand__docs">${current === 'blog' ? 'Blog' : 'Docs'}</span></a>`
+      ? `<a class="brand" href="/">${mark}</a>`
+      : `<a class="brand" href="${current === 'blog' ? BLOG_BASE : BASE}/">${mark}<span class="brand__docs">${current === 'blog' ? 'Blog' : 'Docs'}</span></a>`
   const docsLink = `<a href="${BASE}/"${here(current === 'docs')}>Docs</a>\n      `
   const blogLink = nav.hasBlog ? `<a href="${BLOG_BASE}/"${here(current === 'blog')}>Blog</a>\n      ` : ''
   // FR-87 P6: the product page IS `/` now (`/landing` and `/pricing` 301 there),

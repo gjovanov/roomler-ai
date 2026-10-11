@@ -161,3 +161,25 @@ describe('the head', () => {
     expect(json['@graph'].map((n: { '@type': string }) => n['@type'])).toEqual(['Organization', 'CollectionPage'])
   })
 })
+
+describe('the brand', () => {
+  it('links the favicon set, the SVG versioned past the old icon cached `immutable` for a year', () => {
+    const html = render({})
+    expect(html).toContain('<link rel="icon" href="/favicon.ico" sizes="48x48">')
+    expect(html).toContain('<link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">')
+    expect(html).toContain('<link rel="apple-touch-icon" href="/apple-touch-icon.png">')
+    expect(html).toContain('<link rel="manifest" href="/site.webmanifest">')
+    expect(html).not.toContain('href="/favicon.svg"')
+  })
+
+  it('puts the logo in the top bar when the build published one, and the word when not', () => {
+    const logo = '/docs/assets/roomler-logo.4444444444.svg'
+    const withLogo = renderPage({ nav: [], page: base, assets: { ...assets, logo } }, new Set())
+    const top = withLogo.slice(withLogo.indexOf('<header class="topbar">'), withLogo.indexOf('</header>'))
+    expect(top).toContain(
+      `<a class="brand" href="/docs/"><img class="brand__logo" src="${logo}" alt="Roomler" width="113" height="32"><span class="brand__docs">Docs</span></a>`,
+    )
+    expect(top).not.toContain('brand__mark')
+    expect(render({})).toContain('<span class="brand__mark">Roomler</span>')
+  })
+})
