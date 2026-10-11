@@ -554,7 +554,12 @@ jobs:
         #     downscale, FR-93's GEM-handle guard) was compiled by the `full`
         #     clippy step and RUN by none. drm/drm-sys are pure Rust (drm-sys
         #     builds without bindgen) and no test opens a DRM node.
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,portal-capture,drm-capture --lib
+        #   - the injectors (`uinput-input`, `enigo-input`, #1945): a sixth —
+        #     each backend's own suite (uinput's ABI pins and the events it
+        #     writes, enigo's key and pointer mapping, and #1945's release that
+        #     never moves) ran in no lane; the Xvfb step runs only its real-X modules.
+        #     uinput is plain ioctls, and no test opens /dev/uinput or needs X.
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,portal-capture,drm-capture,uinput-input,enigo-input --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
