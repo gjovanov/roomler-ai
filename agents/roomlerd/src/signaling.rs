@@ -4291,6 +4291,22 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2e-1 — the session's lease moved past this device: what runs
+        // here at an older fence ends, and nothing here resumes it.
+        ServerMsg::HiveDemote {
+            session_id,
+            fence,
+            reason,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_demote(session_id, fence, reason, ctx.is_primary);
+            #[cfg(not(hive_host))]
+            {
+                let _ = (fence, &reason);
+                debug!(session = %session_id, "rc:hive.demote ignored — this build does not run agent sessions");
+            }
+        }
+
         // FR-90 P1e — a session's core memory, just ahead of its start. Kept
         // for that start's launch; whether the session sees it is the
         // device's own `hive_core_memory`.

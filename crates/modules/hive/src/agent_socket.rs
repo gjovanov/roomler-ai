@@ -412,7 +412,7 @@ async fn apply_reports(
                         // It launched something the record gave up on (ended
                         // while the start was in flight, or `lost`).
                         if refused.is_none() {
-                            stop_if_over(state, session_id, device_id, fence).await;
+                            stop_if_over(state, tenant_id, session_id, device_id, fence).await;
                         }
                     }
                     Err(e) => {
@@ -466,7 +466,7 @@ async fn apply_reports(
                             "hive: a state report matched no live session at that fence on this device"
                         );
                         if run != HiveRunState::Ended {
-                            stop_if_over(state, session_id, device_id, fence).await;
+                            stop_if_over(state, tenant_id, session_id, device_id, fence).await;
                         }
                     }
                     Err(e) => {
@@ -495,10 +495,14 @@ async fn apply_reports(
                         // open a new one; a turn it says is running, it stops.
                         let running = matches!(report.status, Some(HiveTurnStatus::Running) | None);
                         if running {
-                            stop_if_over(state, session_id, device_id, fence).await;
+                            stop_if_over(state, tenant_id, session_id, device_id, fence).await;
                         } else if s.last_turn.is_some_and(|t| t.turn == report.turn) {
                             room::turn_stub(state, &s, report).await;
                         }
+                    }
+                    // P2e-1 — an old primary still running turns of it.
+                    Ok(Some(s)) if s.location.device_id != device_id => {
+                        demote_if_elsewhere(state, tenant_id, device_id, &s);
                     }
                     Ok(_) => debug!(
                         session = %session_id, device = %device_id, fence,
@@ -522,6 +526,10 @@ async fn apply_reports(
                             && u64::try_from(s.fence).ok() == Some(fence) =>
                     {
                         room::approval(state, &s, report).await;
+                    }
+                    // P2e-1 — an old primary still asking for approvals.
+                    Ok(Some(s)) if s.location.device_id != device_id => {
+                        demote_if_elsewhere(state, tenant_id, device_id, &s);
                     }
                     Ok(_) => debug!(
                         session = %session_id, device = %device_id, fence,
@@ -564,6 +572,9 @@ async fn apply_reports(
 /// its room told and its open approvals withdrawn. An oversized list is not
 /// a device's, and changes nothing: the safe direction. A connection without
 /// `hive` gets the empty list from [`reconcile_on_connect`].
+///
+/// P2e-1 — and a session the list names that the record holds on ANOTHER
+/// device is answered with `rc:hive.demote` ([`demote_if_elsewhere`]).
 async fn end_what_the_device_does_not_run(
     state: &HiveState,
     tenant_id: ObjectId,
@@ -582,6 +593,27 @@ async fn end_what_the_device_does_not_run(
             return;
         }
     };
+    // P2e-1 — a session the list names that is held elsewhere: an old
+    // primary that came back still running it is told it no longer holds it.
+    // One read for all of them, of this organization's sessions only.
+    let ours: HashSet<ObjectId> = held.iter().filter_map(|s| s.id).collect();
+    let others: Vec<ObjectId> = runs
+        .iter()
+        .map(|(sid, _)| *sid)
+        .filter(|sid| !ours.contains(sid))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    match state.sessions.find_many_in_tenant(tenant_id, &others).await {
+        Ok(named) => {
+            for s in &named {
+                demote_if_elsewhere(state, tenant_id, device_id, s);
+            }
+        }
+        Err(e) => {
+            warn!(device = %device_id, %e, "hive: the sessions a manifest names were not read")
+        }
+    }
     for s in held {
         let Some(sid) = s.id else { continue };
         if runs.contains(&(sid, u64::try_from(s.fence).unwrap_or_default())) {
@@ -610,7 +642,16 @@ async fn end_what_the_device_does_not_run(
 /// process (reconcile re-sends only what is pending), and the record is the
 /// source of truth. A device answers a stop for a session it does not run with
 /// `ended`, which changes nothing here, so this cannot loop.
-async fn stop_if_over(state: &HiveState, session_id: ObjectId, device_id: ObjectId, fence: u64) {
+///
+/// P2e-1 — and one the record holds on ANOTHER device is told it no longer
+/// holds it ([`demote_if_elsewhere`]).
+async fn stop_if_over(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    session_id: ObjectId,
+    device_id: ObjectId,
+    fence: u64,
+) {
     let s = match state.sessions.find(session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return,
@@ -619,9 +660,11 @@ async fn stop_if_over(state: &HiveState, session_id: ObjectId, device_id: Object
             return;
         }
     };
-    // Only the session's own device is told — a report naming someone
-    // else's session stops nothing.
-    if s.location.device_id != device_id || !s.status.is_terminal() {
+    if demote_if_elsewhere(state, tenant_id, device_id, &s) {
+        return;
+    }
+    // The session's own device, then: told to stop only what is over.
+    if !s.status.is_terminal() {
         return;
     }
     let msg = ServerMsg::HiveStop {
@@ -638,6 +681,44 @@ async fn stop_if_over(state: &HiveState, session_id: ObjectId, device_id: Object
             debug!(session = %session_id, %e, "hive: a stop for a session that is over was not sent")
         }
     }
+}
+
+/// FR-90 P2e-1 — a device reported a session the record holds on ANOTHER
+/// device: it is told it no longer holds it (`rc:hive.demote`, at the
+/// record's fence), and what it runs of it at an older fence ends there. An
+/// old primary hears it this way when it could not be told at a move, or
+/// when it comes back after one. Another organization's session tells the
+/// device nothing and changes nothing. `true` when the record is elsewhere.
+fn demote_if_elsewhere(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    device_id: ObjectId,
+    s: &crate::model::AgentSession,
+) -> bool {
+    if s.location.device_id == device_id {
+        return false;
+    }
+    let Some(session_id) = s.id else {
+        return true;
+    };
+    if s.tenant_id != tenant_id {
+        debug!(session = %session_id, device = %device_id, "hive: a report naming another organization's session — ignored");
+        return true;
+    }
+    let fence = u64::try_from(s.fence).unwrap_or_default();
+    let msg = ServerMsg::HiveDemote {
+        session_id,
+        fence,
+        reason: "not_location".to_string(),
+    };
+    match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
+        Ok(()) => info!(
+            session = %session_id, device = %device_id, fence,
+            "hive: a device reported a session held elsewhere — demoted"
+        ),
+        Err(e) => debug!(session = %session_id, %e, "hive: a demote was not sent"),
+    }
+    true
 }
 
 /// P1g — agent sessions no longer serve this device's organization (it left
