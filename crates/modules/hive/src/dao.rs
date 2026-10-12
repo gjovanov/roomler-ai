@@ -391,6 +391,23 @@ impl AgentSessionDao {
             .await
     }
 
+    /// FR-90 P2e-1 — the sessions of `tenant_id` among `ids`, in one read: a
+    /// manifest's names that the device does not run here, whose holder it
+    /// may have to be told is someone else.
+    pub async fn find_many_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        ids: &[ObjectId],
+    ) -> DaoResult<Vec<AgentSession>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Bson> = ids.iter().map(|id| Bson::ObjectId(*id)).collect();
+        self.base
+            .find_many(doc! { "tenant_id": tenant_id, "_id": { "$in": ids } }, None)
+            .await
+    }
+
     /// FR-90 P1b — the sessions the server holds as running on `device_id`:
     /// live, and launched there on the device's own word — its answer to the
     /// start, or a run state only it reports ([`SessionStatus::LAUNCHED`]).
