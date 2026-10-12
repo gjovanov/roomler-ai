@@ -10,10 +10,12 @@
         <v-btn icon="mdi-close" size="small" variant="text" @click="close" aria-label="Close" />
       </v-card-title>
 
-      <!-- Say plainly what running a command here means. This is not a
-           terminal on someone's desktop session: the daemon is SYSTEM on
-           Windows and root under systemd, so every command is elevated. An
-           operator should learn that from the UI, not from an incident. -->
+      <!-- Say plainly what running a command here means. Under systemd the
+           daemon is root. On Windows a command runs as the console-session
+           worker: the signed-in user on an attended install (their elevated
+           token if they are an admin), SYSTEM in SystemContext mode — FR-94
+           makes SYSTEM the default. An operator should learn that from the
+           UI, not from an incident. -->
       <v-card-subtitle class="pb-0">
         <v-alert
           type="warning"
@@ -22,8 +24,10 @@
           class="my-2"
           icon="mdi-shield-alert-outline"
         >
-          Commands run with the Roomler daemon's privileges —
-          <strong>SYSTEM</strong> on Windows, <strong>root</strong> on Linux.
+          Commands run with the Roomler daemon's privileges:
+          <strong>root</strong> on Linux. On Windows they run as the
+          <strong>signed-in user</strong> on an attended install, or as
+          <strong>SYSTEM</strong> in SystemContext mode.
           Every attempt is recorded in the org's execution audit log.
         </v-alert>
       </v-card-subtitle>

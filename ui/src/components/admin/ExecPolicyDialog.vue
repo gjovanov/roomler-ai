@@ -20,9 +20,10 @@
           icon="mdi-shield-alert-outline"
         >
           Allowing remote execution on this device lets permitted users run
-          commands as <strong>SYSTEM</strong> (Windows) or <strong>root</strong>
-          (Linux). It is a separate power from remote control, which is
-          consent-gated, visible on screen, and runs as the signed-in user.
+          commands as <strong>root</strong> (Linux) or, on Windows, as the
+          <strong>signed-in user</strong> on an attended install and as
+          <strong>SYSTEM</strong> in SystemContext mode. It is a separate power
+          from remote control, which is consent-gated and visible on screen.
         </v-alert>
 
         <v-switch

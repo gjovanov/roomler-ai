@@ -36,9 +36,10 @@
         >
           When enabled, users holding the <strong>EXEC_DEVICE</strong>
           permission can run commands on devices that individually opt in.
-          Commands run as <strong>SYSTEM</strong> (Windows) or
-          <strong>root</strong> (Linux) and are all recorded in the audit log
-          below.
+          Commands run as <strong>root</strong> (Linux) or, on Windows, as the
+          <strong>signed-in user</strong> on an attended install and as
+          <strong>SYSTEM</strong> in SystemContext mode. They are all recorded
+          in the audit log below.
         </v-alert>
 
         <v-switch
