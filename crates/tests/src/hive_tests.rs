@@ -3591,10 +3591,12 @@ async fn promote_back_to_a(app: &TestApp, m: &mut Moving, answer: Value) -> (u16
         m.a.agent_id.clone(),
     );
     let caller = post_promote(app, &tid, &admin, &sid, &to, None);
+    // A refusal at the route asks nothing of A: no prepare, and the caller's
+    // answer says why.
     let target = async {
-        let prep = read_until(&mut m.a.ws, "rc:hive.prepare")
-            .await
-            .expect("A is asked to prepare");
+        let Some(prep) = read_until(&mut m.a.ws, "rc:hive.prepare").await else {
+            return Value::Null;
+        };
         let mut ack = json!({"t": "rc:hive.prepare_ack", "session_id": sid,
                              "fence": prep["fence"], "account": "dev"});
         if let Value::Object(extra) = answer {
