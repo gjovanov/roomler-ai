@@ -36,6 +36,11 @@ use super::backend::{HANDSHAKE_DEADLINE, PortalCapture, PortalOpen};
 /// timeout.
 const WAIT: Duration = Duration::from_secs(HANDSHAKE_DEADLINE.as_secs() + 5);
 
+/// P2d-2 — how long an open waits before the controller is told it is waiting
+/// for the person at the screen. A restore token answers in well under a
+/// second with no dialog at all, and must not flash "waiting" on the viewer.
+const TELL_AFTER: Duration = Duration::from_secs(2);
+
 /// The portal arm's open. An attended request (a dialog for the person at the
 /// screen) goes through the host's one-request broker. mutter
 /// (`mutter_capture`) asks nobody and opens in milliseconds, so it opens
@@ -47,9 +52,19 @@ pub fn open(target_fps: u32) -> anyhow::Result<PortalCapture> {
     }
     static BROKER: Broker<PortalCapture> = Broker::new();
     BROKER
-        .open(WAIT, move || {
-            PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}"))
-        })
+        .open(
+            WAIT,
+            TELL_AFTER,
+            move || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}")),
+            // P2d-2 — still parked: tell this open's pump (and so the
+            // controller) until when the dialog can still be answered.
+            |started| {
+                crate::capture::tell_open_waiting(crate::capture::OpenWait {
+                    gives_up_in: (started + HANDSHAKE_DEADLINE)
+                        .saturating_duration_since(Instant::now()),
+                })
+            },
+        )
         .map_err(|miss| anyhow::anyhow!("{miss}"))
 }
 
@@ -84,6 +99,9 @@ impl std::fmt::Display for Miss {
 struct Request<T> {
     state: Mutex<State<T>>,
     landed: Condvar,
+    /// When the request started: its own deadline counts from here, whichever
+    /// waiter is told about it.
+    started: Instant,
 }
 
 struct State<T> {
@@ -112,10 +130,16 @@ impl<T: Send + 'static> Broker<T> {
     /// Wait up to `deadline` for a request's outcome. `start` runs on a thread
     /// of its own, and only when no request is in flight. It returns when the
     /// person answers or the request fails.
+    ///
+    /// P2d-2 — a waiter still waiting `tell_after` in calls `on_wait` once,
+    /// with the request's start, so its session can say who it waits for. One
+    /// that gets its outcome, or leaves, sooner never calls it.
     pub(crate) fn open(
         &self,
         deadline: Duration,
+        tell_after: Duration,
         start: impl FnOnce() -> Result<T, String> + Send + 'static,
+        on_wait: impl FnOnce(Instant),
     ) -> Result<T, Miss> {
         let (request, ticket) = {
             let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,6 +161,7 @@ impl<T: Send + 'static> Broker<T> {
                             done: false,
                         }),
                         landed: Condvar::new(),
+                        started: Instant::now(),
                     });
                     // Join BEFORE the request starts: an answer that lands at
                     // once must find its waiter, not be dropped as unwanted.
@@ -157,7 +182,7 @@ impl<T: Send + 'static> Broker<T> {
                 }
             }
         };
-        request.wait(ticket, deadline)
+        request.wait(ticket, deadline, tell_after, on_wait)
     }
 }
 
@@ -192,8 +217,18 @@ impl<T> Request<T> {
         self.landed.notify_all();
     }
 
-    fn wait(&self, ticket: u64, deadline: Duration) -> Result<T, Miss> {
-        let until = Instant::now() + deadline;
+    fn wait(
+        &self,
+        ticket: u64,
+        deadline: Duration,
+        tell_after: Duration,
+        on_wait: impl FnOnce(Instant),
+    ) -> Result<T, Miss> {
+        let joined = Instant::now();
+        let until = joined + deadline;
+        // `None` = never tell (a `tell_after` too long to add).
+        let tell_at = joined.checked_add(tell_after);
+        let mut on_wait = Some(on_wait);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if st.newest != ticket {
@@ -215,9 +250,25 @@ impl<T> Request<T> {
                 st.waiting -= 1;
                 return Err(Miss::TimedOut);
             }
+            let tell_pending = on_wait.is_some() && tell_at.is_some();
+            if tell_pending && tell_at.is_some_and(|t| now >= t) {
+                if let Some(tell) = on_wait.take() {
+                    // Never call out holding the lock: the hook sends a
+                    // notice, and an answer landing meanwhile must not wait
+                    // on it. Then look again, from the top.
+                    drop(st);
+                    tell(self.started);
+                    st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                continue;
+            }
+            let wake = match tell_at {
+                Some(t) if tell_pending => t.min(until),
+                _ => until,
+            };
             st = self
                 .landed
-                .wait_timeout(st, until - now)
+                .wait_timeout(st, wake.saturating_duration_since(now))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
@@ -229,6 +280,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc;
+
+    /// A `tell_after` no waiter reaches, and a hook that hears nothing: for the
+    /// tests about the handoff itself.
+    const NEVER: Duration = Duration::MAX;
+    fn quiet(_: Instant) {}
 
     /// A request the test answers when it chooses.
     fn gated() -> (
@@ -244,7 +300,7 @@ mod tests {
         let b = Broker::<u32>::new();
         let (answer, start) = gated();
         answer.send(Ok(7)).unwrap();
-        assert_eq!(b.open(Duration::from_secs(5), start), Ok(7));
+        assert_eq!(b.open(Duration::from_secs(5), NEVER, start, quiet), Ok(7));
     }
 
     #[test]
@@ -261,16 +317,21 @@ mod tests {
         };
         let first = {
             let b = b.clone();
-            std::thread::spawn(move || b.open(Duration::from_secs(10), counted))
+            std::thread::spawn(move || b.open(Duration::from_secs(10), NEVER, counted, quiet))
         };
         // Let the first waiter join before the second asks.
         std::thread::sleep(Duration::from_millis(100));
         let second = {
             let b = b.clone();
             std::thread::spawn(move || {
-                b.open(Duration::from_secs(10), || -> Result<u32, String> {
-                    panic!("a second request must never start while one is in flight")
-                })
+                b.open(
+                    Duration::from_secs(10),
+                    NEVER,
+                    || -> Result<u32, String> {
+                        panic!("a second request must never start while one is in flight")
+                    },
+                    quiet,
+                )
             })
         };
         std::thread::sleep(Duration::from_millis(100));
@@ -304,7 +365,7 @@ mod tests {
         };
         // The only waiter gives up before the person answers.
         assert!(matches!(
-            b.open(Duration::from_millis(50), start),
+            b.open(Duration::from_millis(50), NEVER, start, quiet),
             Err(Miss::TimedOut)
         ));
         tx.send(()).unwrap();
@@ -315,9 +376,12 @@ mod tests {
         }
         assert_eq!(dropped.load(SeqCst), 1, "the late capture was dropped");
         // And the next session raises a new request rather than waiting on the old.
-        let fresh = b.open(Duration::from_secs(5), || {
-            Ok(Capture(Arc::new(AtomicUsize::new(0))))
-        });
+        let fresh = b.open(
+            Duration::from_secs(5),
+            NEVER,
+            || Ok(Capture(Arc::new(AtomicUsize::new(0)))),
+            quiet,
+        );
         assert!(fresh.is_ok());
     }
 
@@ -325,12 +389,110 @@ mod tests {
     fn a_failed_request_reaches_the_waiter_with_its_reason() {
         let b = Broker::<u32>::new();
         assert_eq!(
-            b.open(Duration::from_secs(5), || Err(
-                "the dialog was refused".into()
-            )),
+            b.open(
+                Duration::from_secs(5),
+                NEVER,
+                || Err("the dialog was refused".into()),
+                quiet
+            ),
             Err(Miss::Failed("the dialog was refused".into()))
         );
         // Over: the next open starts again.
-        assert_eq!(b.open(Duration::from_secs(5), || Ok(1)), Ok(1));
+        assert_eq!(
+            b.open(Duration::from_secs(5), NEVER, || Ok(1), quiet),
+            Ok(1)
+        );
+    }
+
+    /// P2d-2 — a waiter still parked once `tell_after` has passed is told, once,
+    /// while it waits; the answer still reaches it afterwards.
+    #[test]
+    fn a_waiter_still_parked_is_told_once() {
+        let b = Arc::new(Broker::<u32>::new());
+        let (answer, start) = gated();
+        let told = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let before = Instant::now();
+        let waiter = {
+            let (b, told) = (b.clone(), told.clone());
+            std::thread::spawn(move || {
+                b.open(
+                    Duration::from_secs(10),
+                    Duration::from_millis(50),
+                    start,
+                    move |started| told.lock().unwrap().push(started),
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while told.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(told.lock().unwrap().len(), 1, "told while still waiting");
+        answer.send(Ok(5)).unwrap();
+        assert_eq!(
+            waiter.join().unwrap(),
+            Ok(5),
+            "and the answer still arrives"
+        );
+        let told = told.lock().unwrap();
+        assert_eq!(told.len(), 1, "told once, never again");
+        assert!(told[0] >= before, "with the request's start");
+    }
+
+    /// P2d-2 — an answer inside `tell_after` (a restore token answers with no
+    /// dialog in well under a second) tells nobody.
+    #[test]
+    fn an_answer_inside_the_grace_tells_nobody() {
+        let b = Broker::<u32>::new();
+        let mut told = false;
+        assert_eq!(
+            b.open(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                || Ok(9),
+                |_| told = true
+            ),
+            Ok(9)
+        );
+        assert!(!told, "a request answered at once is nothing to wait for");
+    }
+
+    /// P2d-2 — a session that joins a pending request is told the REQUEST's
+    /// start, not its own join: the dialog's deadline counts from when it was
+    /// raised, whichever session is waiting for it.
+    #[test]
+    fn a_joining_session_is_told_the_request_start() {
+        let b = Arc::new(Broker::<u32>::new());
+        let (answer, start) = gated();
+        let first = {
+            let b = b.clone();
+            std::thread::spawn(move || b.open(Duration::from_secs(10), NEVER, start, quiet))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let joined_at = Instant::now();
+        let told = Arc::new(Mutex::new(None::<Instant>));
+        let second = {
+            let (b, told) = (b.clone(), told.clone());
+            std::thread::spawn(move || {
+                b.open(
+                    Duration::from_secs(10),
+                    Duration::from_millis(50),
+                    || -> Result<u32, String> { panic!("no second request") },
+                    move |started| *told.lock().unwrap() = Some(started),
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while told.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = told.lock().unwrap().expect("the joining session was told");
+        assert!(
+            started < joined_at,
+            "the request's start, from before this session joined"
+        );
+        answer.send(Ok(3)).unwrap();
+        assert_eq!(first.join().unwrap(), Err(Miss::Superseded));
+        assert_eq!(second.join().unwrap(), Ok(3));
     }
 }

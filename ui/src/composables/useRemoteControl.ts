@@ -697,6 +697,37 @@ export interface RcInputReach {
   reason: string
 }
 
+/** FR-93 P2d-2 — `rc:media-waiting`: this session's capture is waiting for the
+ *  person at the screen to answer a dialog (the desktop portal's "share your
+ *  screen"). Sent once per open that waits, about 2 s in, because a restore
+ *  token answers sooner with no dialog at all. Until `deadlineMs` the media
+ *  watchdog does not count the silence as a stall. Before this the viewer
+ *  re-created the session every 10 s, so the session the person finally
+ *  answered for was rarely the one on screen.
+ *
+ *  `for` is `person_at_screen` today, typed as a string on purpose: a newer
+ *  agent may wait for something else, and its `hint` still reads. */
+export interface RcMediaWaiting {
+  for: string
+  /** When the dialog gives up, on THIS browser's clock: the agent sends how
+   *  long is left (`waits_ms`), not a time of day, so the two clocks never
+   *  have to agree. */
+  deadlineMs: number
+  /** The operator-facing sentence, composed by the agent. May be empty. */
+  hint: string
+}
+
+/** FR-93 P2d-2 — slack past the dialog's deadline before the watchdog counts
+ *  stalls again. The agent's waiter outlives the request by 5 s, and the
+ *  reason it then sends (`rc:media-unavailable`) has to reach us. */
+export const RC_MEDIA_WAITING_GRACE_MS = 10_000
+
+/** FR-93 P2d-2 — is the agent still saying it waits for the person at the
+ *  screen? Pure so the watchdog's rule is testable. */
+export function agentIsWaiting(waiting: RcMediaWaiting | null, nowMs: number): boolean {
+  return waiting !== null && nowMs < waiting.deadlineMs + RC_MEDIA_WAITING_GRACE_MS
+}
+
 export interface RcVideoInfo {
   codec: string
   encoder: string
@@ -1024,6 +1055,7 @@ export type RcControlInbound =
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
+  | { kind: 'media_waiting'; for: string; waitsMs: number; hint: string }
   | { kind: 'input_reach'; reach: RcInputReach }
   | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
@@ -1117,6 +1149,23 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         detail: typeof obj.detail === 'string' ? obj.detail : '',
         hint: typeof obj.hint === 'string' ? obj.hint : '',
       },
+    }
+  }
+  // FR-93 P2d-2 — the agent is waiting for the person at the screen. The
+  // duration is turned into a deadline by the caller, at receipt, on this
+  // browser's clock. An unknown `for` is kept, like an unknown FR-80 code.
+  if (
+    obj.t === 'rc:media-waiting'
+    && typeof obj.for === 'string'
+    && typeof obj.waits_ms === 'number'
+    && Number.isFinite(obj.waits_ms)
+    && obj.waits_ms >= 0
+  ) {
+    return {
+      kind: 'media_waiting',
+      for: obj.for,
+      waitsMs: obj.waits_ms,
+      hint: typeof obj.hint === 'string' ? obj.hint : '',
     }
   }
   // FR-93 P1 — the session's input will not reach the whole desktop. An
@@ -4140,9 +4189,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
       }
+      // FR-93 P2d-2 — the first frame ends any wait the agent announced.
+      if (advanced && mediaWaiting.value !== null) mediaWaiting.value = null
       // FR-93 — an agent that said it cannot capture is believed: no probe,
-      // no re-create, the reason stays on the screen.
-      stallTicks = nextStallTicks(stallTicks, advanced, mediaUnavailable.value !== null)
+      // no re-create, the reason stays on the screen. P2d-2 — and so is one
+      // that said it waits for the person at the screen, until the dialog's
+      // deadline: a re-created session would only hand the person's answer to
+      // a session this viewer no longer shows.
+      stallTicks = nextStallTicks(
+        stallTicks,
+        advanced,
+        mediaUnavailable.value !== null || agentIsWaiting(mediaWaiting.value, Date.now()),
+      )
       degraded.value = classifyDegraded({
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
@@ -4241,6 +4299,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** FR-93 P1 — set when the agent says this session's input will not reach
    *  the whole desktop; cleared on every new connect, like `mediaUnavailable`. */
   const inputReach = ref<RcInputReach | null>(null)
+  /** FR-93 P2d-2 — set while the agent says its capture waits for the person
+   *  at the screen. Cleared by the first frame, by `rc:media-unavailable` (the
+   *  wait ended without an answer, and that message says why), and on every
+   *  new connect. */
+  const mediaWaiting = ref<RcMediaWaiting | null>(null)
   /** FR-80 — the WebCodecs config string the active DataChannel decoder was
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
@@ -7440,7 +7503,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       isDeadAir({
         mediaEverFlowed,
         connected: phase.value === 'connected',
-        agentSaidNoPixels: mediaUnavailable.value !== null,
+        // P2d-2 — a session that ended while the agent said it waited for
+        // the person at the screen was not dead air either.
+        agentSaidNoPixels: mediaUnavailable.value !== null || mediaWaiting.value !== null,
       })
     ) {
       deadAirStreak.value += 1
@@ -7587,6 +7652,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // yesterday's reason, and the pill must not carry the last session's
     // codec into one that has not named its own yet.
     mediaUnavailable.value = null
+    mediaWaiting.value = null
     inputReach.value = null
     dcDecoderCodec.value = null
     remoteLayout.value = null
@@ -8685,6 +8751,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // the alternative the operator had was a black rectangle and a
         // stall that names nothing.
         mediaUnavailable.value = parsed.reason
+        // FR-93 P2d-2 — a wait that ended without an answer ends here: this
+        // message says why, and replaces the "waiting" notice on the canvas.
+        mediaWaiting.value = null
         console.warn(
           `[rc] the host cannot capture its screen (${parsed.reason.code}) — ${parsed.reason.hint}`,
           parsed.reason.detail,
@@ -8692,6 +8761,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // FR-93 — this arrived over the control channel, so the path to the
         // device works: earlier frameless attempts were not a network
         // problem, and a notice saying they were must not sit over the reason.
+        deadAirStreak.value = 0
+        reconnectAttempt.value = 0
+        notice.value = null
+      } else if (parsed?.kind === 'media_waiting') {
+        // FR-93 P2d-2 — the host is asking the person at its screen to share
+        // it. The deadline is set HERE, on this browser's clock.
+        mediaWaiting.value = {
+          for: parsed.for,
+          deadlineMs: Date.now() + parsed.waitsMs,
+          hint: parsed.hint,
+        }
+        console.info(
+          `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
+        )
+        // Like FR-80's notice, this came over the control channel, so the
+        // path to the device works: earlier frameless attempts were not a
+        // network problem.
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
         notice.value = null
@@ -11199,6 +11285,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  badge falls back to a selection-derived label then. */
     videoInfo,
     mediaUnavailable,
+    mediaWaiting,
     inputReach,
     dcDecoderCodec,
     // P6 — multi-user: arbiter state, ghost cursors, floor control.

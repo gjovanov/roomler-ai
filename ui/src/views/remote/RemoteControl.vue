@@ -1004,6 +1004,20 @@
             Remote shell, file transfer and the other channels are unaffected.
           </p>
         </div>
+        <!-- FR-93 P2d-2 — the host is asking the person at its screen to share
+             it. Before this the canvas stayed blank and the viewer re-created
+             the session every 10 s, so the session the person answered for was
+             rarely the one on screen. -->
+        <div v-else-if="rc.mediaWaiting.value" class="no-media-overlay" data-testid="rc-media-waiting">
+          <v-icon size="72" color="info">mdi-timer-sand</v-icon>
+          <p class="text-body-1 mt-3">Waiting for the person at the screen to share it.</p>
+          <p v-if="rc.mediaWaiting.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ rc.mediaWaiting.value.hint }}
+          </p>
+          <p class="text-caption text-medium-emphasis mt-2">
+            If nobody answers, the request ends at {{ mediaWaitingEnds }}.
+          </p>
+        </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
           <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
@@ -3836,6 +3850,13 @@ const phaseColor = computed(() => {
     default: return 'info'
   }
 })
+// FR-93 P2d-2 — when the host's dialog gives up, as a time of day on this
+// browser's clock (the deadline was set here, at receipt). A time rather than a
+// countdown, so the overlay needs no timer of its own.
+const mediaWaitingEnds = computed(() => {
+  const w = rc.mediaWaiting.value
+  return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
+})
 // S3 — human wording for the sub-connected health states.
 const degradedLabel = computed(() => {
   // FR-80 — when the host has told us it cannot capture, say THAT instead of
@@ -3843,6 +3864,8 @@ const degradedLabel = computed(() => {
   // an operator reading "video stalled" has no idea the fix is a permission
   // on the far machine.
   if (rc.mediaUnavailable.value) return 'connected · no screen capture'
+  // FR-93 P2d-2 — not "video stalled": the host said why there is no video yet.
+  if (rc.mediaWaiting.value) return 'connected · waiting for the person at the screen'
   switch (rc.degraded.value) {
     case 'transport_unstable': return 'connected · unstable link'
     case 'media_stalled': return 'connected · video stalled'
