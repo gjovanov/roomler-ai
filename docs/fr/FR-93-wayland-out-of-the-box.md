@@ -524,12 +524,12 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
 - [ ] **AC1** — a default **per-user** install on GNOME 50 Wayland, no keys: the viewer shows the real desktop
   (canvas ≈ `virsh screenshot`, the probe counter fresh within 2 s). Red on 0.4.124 first.
-- [ ] **AC2** — the same for a default **system** install. Red on 0.4.124 first ("headless").
-  ⚠️ **Unreachable as written while D1's system half holds.** A default system install switches nothing on
-  until a desktop companion ships for non-Debian hosts, so it answers `wayland_not_enabled` with the root
-  hint (P1c), and a picture needs `drm_capture` + `uinput`. The operator decides whether AC2 waits for that
-  companion or is re-worded to "the root hint, and a picture once the keys are set". This spec does not
-  change it.
+- [ ] **AC2** — a default **system** install on GNOME 50 Wayland, no keys: the viewer reads
+  `wayland_not_enabled` with the root hint naming `drm_capture` + `uinput` (never "headless"), and once those
+  two keys are set it shows the real desktop (canvas ≈ `virsh screenshot`). Red on 0.4.124 first ("headless").
+  *Re-worded 2026-10-12 (operator), because D1 keeps system installs opt-in. Switching them on by default is
+  [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (#2041), gated on the person at the screen being able
+  to see it on every distro.*
 - [ ] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
@@ -573,6 +573,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - The controller running on a Wayland desktop beyond the §6.3 conference smoke — the browser's job.
 - X11 behaviour changes, except where the shared resolver fixes a shared lookup.
 - GPU-accelerated VMs (virgl); NVIDIA-proprietary specifics; FR-36 P3's privilege split (stays FR-36's).
+- System installs on by default (D1's system half): [FR-95](FR-95-system-installs-on-by-default-on-wayland.md)
+  (#2041), split out 2026-10-12 with AC2's re-wording.
 
 ## 10. Risks
 
