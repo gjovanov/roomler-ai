@@ -1,6 +1,9 @@
 # Linux self-update — design
 
-**Status:** design. Prerequisite [#456](https://github.com/gjovanov/roomler-ai/pull/456) (arch-aware asset picker + aarch64 `.deb`) must land first.
+**Status:** shipped for **system** installs: the tarball path landed in #462 (2026-08-15), after
+[#456](https://github.com/gjovanov/roomler-ai/pull/456) (the arch-aware picker and the aarch64 `.deb`). A
+**per-user** install cannot install its own update, whichever format. Its root update half is
+[FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md) (#2052), [below](#the-update-half-of-a-per-user-install-fr-96).
 
 ## The problem
 
@@ -85,8 +88,15 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 
 ## Installing the tarball
 
-New `install_tarball_linux` alongside `run_linux_install_candidates`, same
-privilege ladder (root direct; otherwise `sudo -n`, then `pkexec`).
+New `install_tarball_linux` alongside `run_linux_install_candidates`.
+
+⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
+non-root daemon (`agents/roomlerd/src/updater.rs:1826-1835`). It places the files
+in-process rather than running one command it could hand to `sudo`, so there is
+nothing to escalate. A per-user tarball install therefore never updated (#2046)
+until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
+The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
+(`updater.rs:1761-1775`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -192,11 +202,73 @@ old archive.
 4. `install.sh`: arch + format detection
 5. Field-verify on `scw-m2-asahi`, then re-enable `auto_update` there
 
+## The update half of a per-user install (FR-96)
+
+A per-user daemon runs as the user, and writing `/usr` needs root, whichever
+format the host takes. So a per-user install could never install its own update
+(#2046). The tarball path refuses outright, and the `.deb` ladder's `pkexec` puts
+a password prompt in front of whoever is at the screen. FR-96 gives it the root
+half macOS has had since FR-5: `roomlerd update-helper`, run as root by
+`roomler-update.service`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as per-user roomlerd
+    participant W as /var/tmp/roomler-update-check
+    participant P as roomler-update.path / .timer
+    participant U as roomlerd update-helper (root)
+    D->>W: touch: a wake, its content never read (P2)
+    W-->>P: PathExists
+    Note over P: the timer fires too: 5 min after boot, then every 6 h
+    P->>U: start roomler-update.service
+    U->>U: consume the wake file; the opt-out; the cooldown
+    U->>U: check_once, then download_asset (the pinned release key)
+    U->>U: install as root: apt-get / dpkg, or the tarball
+    Note over D: runs the new binary from its next restart (P2 asks it, once idle)
+```
+
+| unit | what | the macOS twin (`com.roomler.update.plist`) |
+|---|---|---|
+| `roomler-update.service` | `Type=oneshot`, `ExecStart=/usr/bin/roomlerd update-helper` | the program |
+| `roomler-update.timer` | `OnBootSec=5min`, `OnUnitActiveSec=6h`, `RandomizedDelaySec=30min` | `RunAtLoad`, `StartInterval` |
+| `roomler-update.path` | `PathExists=/var/tmp/roomler-update-check` | `WatchPaths` |
+
+- **Shipped in both packages, disabled.**
+  - The `.deb` lists the three units as assets (`agents/roomlerd/Cargo.toml`).
+  - The tarball stages them (`scripts/stage-linux-tarball.sh`) and installs each
+    only where absent (`TARBALL_INSTALL_IF_ABSENT`, `updater.rs`).
+  - The `.deb`'s `postinst` enables nothing, by rule (`deb_postinst_is_a_unix_shell_script`,
+    `watchdog.rs`).
+- ⚠️ **One owner per host.** `install.sh` enables the timer and the path for a
+  **per-user** install only (FR-96 P3). A system install's root daemon updates
+  itself in-process, and two updaters must never race.
+- ⚠️ **The wake file is a wake, never an instruction.** Its content is never read,
+  and a symlink at its path is deleted, never followed. Whoever can write
+  `/var/tmp` can cause an update *check* as root, never choose what gets
+  installed: the helper resolves and verifies the release itself
+  (`update_trigger_path`, `queue_update_check`, `run_update_helper`, `updater.rs`).
+- **The opt-out** is the macOS one, `/etc/roomler/disable-auto-update`, honoured
+  by the helper itself.
+- **Root only.** The helper refuses any other uid before it touches the wake
+  file, the network or the install.
+
+The phases:
+
+| phase | ships |
+|---|---|
+| **P1** | the helper on Linux, and the three units in both packages, disabled |
+| **P2** | the per-user daemon wakes the helper instead of installing, and is restarted onto the new binary once idle |
+| **P3** | `install.sh` enables the units for a per-user install |
+
+Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).
+
 ## Deliberately out of scope
 
-- **`.rpm` lane** — the tarball makes self-update work everywhere; an `.rpm`
-  only adds package-DB integration for one distro family. Revisit if a customer
-  needs `dnf` to own the install.
+- **`.rpm` lane** — the tarball makes self-update work on every distro: for a
+  system install directly, and for a per-user one through FR-96's helper. An
+  `.rpm` only adds package-DB integration for one distro family. Revisit if a
+  customer needs `dnf` to own the install.
 - **musl / Alpine** — the payload is glibc-linked. A musl target is a separate
   build, not a packaging change.
 - **arm64 FFmpeg** — the aarch64 build ships without `ffmpeg-encoder` (no
