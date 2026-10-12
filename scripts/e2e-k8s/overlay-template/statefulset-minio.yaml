@@ -18,7 +18,9 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:latest
+          # minio/minio is gone from Docker Hub (#2034): the self-host compose's pinned Chainguard
+          # build. emptyDir is world-writable, so its default non-root user is fine here.
+          image: cgr.dev/chainguard/minio:latest@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
           args: ["server", "/data", "--console-address", ":9001"]
           ports:
             - containerPort: 9000
