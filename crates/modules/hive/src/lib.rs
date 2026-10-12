@@ -54,6 +54,7 @@ pub mod agent_socket;
 pub mod brain;
 pub mod dao;
 pub mod hooks;
+pub mod lease;
 pub mod model;
 pub mod participants;
 pub mod placement;

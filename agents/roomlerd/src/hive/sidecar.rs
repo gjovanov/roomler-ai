@@ -160,6 +160,52 @@ impl Supervisor {
         }
         Ok(())
     }
+
+    /// P2e-2 — a leased run calls the model only once the server has said,
+    /// on the connection that is the latest now, that this device still
+    /// holds it. After a reconnect the call waits for that word, at most
+    /// `lease_wait`, and is refused past it in the provider's "overloaded"
+    /// shape, which Claude Code retries. A call of any other run is the
+    /// admission's to judge ([`Self::sidecar_admit`]).
+    ///
+    /// ⚠️ While the device is offline the latest connection is the one that
+    /// closed, so its word still counts and `offline_grace` decides, as for
+    /// every session (P0e). Only a NEW connection voids the word: the server
+    /// may have moved the session while this device could not hear.
+    pub(crate) async fn wait_for_lease_word(
+        &self,
+        session: ObjectId,
+        token: Option<&str>,
+    ) -> Result<(), Refusal> {
+        let Some((owner, fence)) = token.and_then(|t| self.tokens().resolve(t)) else {
+            return Ok(());
+        };
+        if owner != session || !self.leased(session, fence) {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + self.lease_wait();
+        loop {
+            // Registered before the check, so a word that lands between the
+            // two still wakes this call.
+            let heard = self.lease_heard().notified();
+            tokio::pin!(heard);
+            heard.as_mut().enable();
+            if self.has_word(session, fence) {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, heard).await.is_err() {
+                return Err(Refusal::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "overloaded_error",
+                    format!(
+                        "this device has not yet heard from Roomler that it still holds this \
+                         session (waited {} s); ask again in a moment",
+                        self.lease_wait().as_secs()
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Run the device's key helper and return the first line it prints. Never
@@ -365,6 +411,11 @@ async fn handle(
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let token = presented_token(req.headers());
+    // P2e-2 — a leased run waits for the server's word first.
+    if let Err(r) = sup.wait_for_lease_word(session, token.as_deref()).await {
+        debug!(session = %session, "hive: a leased run's model call had no word from the server");
+        return refusal(r);
+    }
     if let Err(r) = sup.sidecar_admit(session, token.as_deref()) {
         debug!(session = %session, status = r.status.as_u16(), "hive: a model call was refused");
         return refusal(r);

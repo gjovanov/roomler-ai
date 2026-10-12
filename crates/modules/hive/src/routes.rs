@@ -498,6 +498,7 @@ pub async fn start(
 
     // And the waiter before the push, for the same reason.
     let pending = state.start_acks.expect(sid, device_id);
+    let replicated = crate::replica::replicated(&session);
     let msg = ServerMsg::HiveStart {
         session_id: sid,
         harness: session.harness.id.clone(),
@@ -508,7 +509,12 @@ pub async fn start(
         user_email: user.email,
         caller: user.display_name,
         resume: false,
-        replicated: crate::replica::replicated(&session),
+        replicated,
+        // P2e-2 — a replicated session is leased, on a device that holds a
+        // lease to the server's word: the start is that word, on the
+        // connection it goes to.
+        lease: replicated
+            && state.fleet.rc_hub.agent_supports_hive_lease(device_id, tid) == Some(true),
     };
     if let Err(e) = state.fleet.rc_hub.push_hive(device_id, tid, msg) {
         // The device left — or reconnected as a build without Hive — between
