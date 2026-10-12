@@ -155,7 +155,7 @@ describe("the repo's own images", () => {
     expect(manifest.icons.length).toBeGreaterThan(0)
     for (const icon of manifest.icons) {
       const [width, height] = icon.sizes.split('x').map(Number)
-      expect(imageSize(readFileSync(join(ui, 'public', icon.src)))).toEqual({ width, height })
+      expect(imageSize(readFileSync(join(ui, 'public', icon.src.split('?')[0])))).toEqual({ width, height })
     }
     expect(imageSize(readFileSync(join(ui, 'public/apple-touch-icon.png')))).toEqual({ width: 180, height: 180 })
   })

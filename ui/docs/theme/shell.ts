@@ -132,9 +132,9 @@ export function renderHead(h: HeadInput): string {
     // The SPA's favicon set, at the site root (ui/public/). The `?v=` moves a
     // returning reader off the year-long `immutable` copy of the old icon; it
     // matches the one in ui/index.html.
-    '<link rel="icon" href="/favicon.ico" sizes="48x48">',
-    '<link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">',
-    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
+    '<link rel="icon" href="/favicon.ico?v=2" sizes="48x48">',
+    '<link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">',
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">',
     '<link rel="manifest" href="/site.webmanifest">',
     h.feed ? `<link rel="alternate" type="application/atom+xml" title="${BLOG_TITLE}" href="${FEED_URL}">` : '',
     h.prevUrl ? `<link rel="prev" href="${h.prevUrl}">` : '',
