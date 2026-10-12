@@ -18,8 +18,12 @@ services:
     ports:
       - "6379:6379"
 
+  # The same pinned Chainguard build as docker-compose.selfhost.yml, and for the same reasons:
+  # minio/minio is gone from Docker Hub (#2034), and a dev volume made by the old image is
+  # root-owned.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
+    user: "0:0"
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"

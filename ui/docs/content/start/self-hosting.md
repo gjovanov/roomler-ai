@@ -51,13 +51,18 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 Compose treats a service that has a `build:` section as buildable, so a missing
 image is **compiled from source instead of downloaded**. Skipping the `pull`
 costs you the twenty minutes the published image exists to save, and it does it
-silently. A measured clean-box run is about **88 seconds** with `pull`, against
-roughly **six minutes** building on a 16-core machine.
+silently. On a clean 4-vCPU VM with a data-centre connection, `pull` took
+**10 seconds**, `up -d` **21**, and `/health` answered **32 seconds** after the
+first command (measured 2026-10-12). The pull is the part a slower connection
+stretches: an earlier run over a home connection took 88 seconds in all.
+Building instead takes roughly **six minutes** on a 16-core machine.
 :::
 
-Images are published at `ghcr.io/gjovanov/roomler-ai` for **linux/amd64** and
-are anonymously pullable. On arm64 — Apple Silicon, a Raspberry Pi, an ARM VPS —
-there is no published image yet, so add `--build` and compile from source.
+Images are published at `ghcr.io/gjovanov/roomler-ai` for **linux/amd64 and
+linux/arm64** and are anonymously pullable; every other image in the file is
+published for both as well. The arm64 Roomler image is built and smoke-tested
+on a native arm64 machine, but the whole stack has not yet been run on an arm64
+host.
 
 Watch it come up:
 
@@ -124,7 +129,7 @@ back those up, not the container.
 
 - **Single node.** The compose stack runs one API instance. Multi-node scale-out *is* supported by the code, but it is a Kubernetes topology rather than this file.
 - **No automatic TLS.** Deliberate — see above.
-- **arm64 builds from source.** No published arm64 image yet.
+- **arm64 is published but not yet run end to end.** Every image has an arm64 build; nobody has brought the whole stack up on an arm64 host yet.
 - **The relay is optional.** A separate TURN server is not on the critical path: the built-in relay floor over the API's own port already guarantees connectivity when no direct path exists.
 
 ## Licensing
