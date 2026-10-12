@@ -524,12 +524,29 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
 - [ ] **AC1** — a default **per-user** install on GNOME 50 Wayland, no keys: the viewer shows the real desktop
   (canvas ≈ `virsh screenshot`, the probe counter fresh within 2 s). Red on 0.4.124 first.
-- [ ] **AC2** — a default **system** install on GNOME 50 Wayland, no keys: the viewer reads
+  ⏳ 0.4.130 (the guest's own updater from 0.4.129): `lit=90.0 %` and `100.0 %` in two sessions,
+  `capture: backend=portal via org.gnome.Mutter.ScreenCast, AUTOMATIC`, and the pill reads
+  "GNOME screencast · asks nobody". 🔴 first on 0.4.125: `BLACK (lit=0.0%)`, `backend=scrap` (step log 3).
+  **Not ticked:** the per-user probe is a GTK4 Wayland window that draws **no counter**, so "fresh within
+  2 s" has nothing to read. The probe needs a counter on its Wayland surface first.
+- [x] **AC2** — a default **system** install on GNOME 50 Wayland, no keys: the viewer reads
   `wayland_not_enabled` with the root hint naming `drm_capture` + `uinput` (never "headless"), and once those
   two keys are set it shows the real desktop (canvas ≈ `virsh screenshot`). Red on 0.4.124 first ("headless").
   *Re-worded 2026-10-12 (operator), because D1 keeps system installs opt-in. Switching them on by default is
   [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (#2041), gated on the person at the screen being able
   to see it on every distro.*
+  ✅ **0.4.130**, the GNOME 50 system guest, updated by its own updater from 0.4.129
+  (`SucceededVerified`):
+  - **No keys** (two sessions): the viewer reads *"This computer is showing a Wayland desktop, and capturing
+    it is switched off on this device. On the host an administrator can run `sudo roomler config set
+    drm_capture true` and `sudo roomler config set uinput true` …"*, with code `wayland_not_enabled`. The word
+    "headless" appears nowhere on the page.
+  - **With the two keys:** `lit=89.8 %` (pill "DRM scanout · asks nobody", 29 fps), and `95.3 %` in the
+    standard baseline run. The canvas shows the probe at `counter=66`, the guest's own `virsh screenshot`
+    shows it at `counter=71` a few seconds later, and the layout is the same.
+  - 🔴 first on 0.4.125, the release then and 0.4.124's code: *"This host has no display to capture
+    (headless, or no desktop session)"* (step log 3).
+  - Step log 43 on #1972.
 - [ ] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
@@ -547,7 +564,18 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - [ ] **AC11** — X11 hosts unchanged (FR-29's idle numbers), Windows and macOS unchanged; the kill switch
   restores 0.4.124's behaviour exactly.
 - [ ] **AC12** — Asahi (real scanout) passes AC1/AC4/AC5/AC7 on the released build.
-- [ ] **AC13** — the server reports how many Linux hosts are Wayland and which arm serves each.
+- [x] **AC13** — the server reports how many Linux hosts are Wayland and which arm serves each.
+  ✅ Prod (`hosted-20261012-d31e3c7`) reports the vmtest org's overview from hellos sent by released
+  **0.4.130** devices:
+
+  `"desktops":[{"total":2,"type":"wayland","capture_arm":"drm"},{"total":1,"type":"wayland","capture_arm":"mutter"}]`
+
+  That matches the three Wayland guests:
+  - the GNOME system and KDE system guests, each with `drm_capture` set (`drm`);
+  - the GNOME per-user guest, whose P2a arm is `mutter`.
+
+  Fleet-wide, the same pipeline backs `admin_orgs`; `stats_tests::desktops_are_counted_by_type_and_arm_per_org_and_fleet_wide`
+  covers it. P2b, #2028; step log 43 on #1972.
 - [ ] **AC14** — Docs: `docs/wayland.md`, `docs/linux-capture.md` refreshed with anchors re-verified, the lab
   runbook, and the `docs/README.md` index row.
 
@@ -593,7 +621,12 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
 | Date | Host | Build | What | Result |
 |---|---|---|---|---|
-| — | — | 0.4.124 | **the baseline (fail-first)**: per-user and system `default` cells on `wlab-gnome`, `wlab-kde` and vmtest noble — capture, input (probe log), cursor, clipboard, the consent surface | owed |
+| — | — | 0.4.124 | **the baseline (fail-first)**: per-user and system `default` cells on `wlab-gnome`, `wlab-kde` and vmtest noble — capture, input (probe log), cursor, clipboard, the consent surface | capture recorded (next row); input, cursor, clipboard and the consent surface are owed |
+| 2026-10-11 | `wlab-gnome`, `wlab-gnome-sys` | 0.4.125 (0.4.124's code) | fail-first, capture: AC1 per-user stock, AC2 system stock | 🔴 AC1 `BLACK (lit=0.0%)`, `backend=scrap`; 🔴 AC2 *"no display to capture (headless …)"*. Step log 3 |
+| 2026-10-11 | `wlab-gnome-sys` | 0.4.128 | AC9: GEM handles over a 30-minute DRM session | ✅ `@create 51143 / @delete 51143`; 🔴 first on 0.4.125, `124 / 0`. Step log 31 |
+| 2026-10-12 | `wlab-gnome-sys` | 0.4.130, its own updater | AC2 (re-worded): no keys, then `drm_capture` + `uinput` | ✅ `wayland_not_enabled` + the root hint, never "headless"; with the keys `lit=89.8 %` / `95.3 %`, canvas ≈ `virsh screenshot`. Step log 43 |
+| 2026-10-12 | `wlab-gnome` | 0.4.130, its own updater | AC1: no keys | ⏳ `lit=90–100 %`, mutter AUTOMATIC; the probe draws no counter, so freshness is unmeasured and AC1 stays open. Step log 43 |
+| 2026-10-12 | prod, the vmtest org | `hosted-20261012-d31e3c7` + 0.4.130 devices | AC13: the overview's `desktops` | ✅ `wayland/drm ×2`, `wayland/mutter ×1`, matching the three guests. Step log 43 |
 
 ## 12. Related
 
