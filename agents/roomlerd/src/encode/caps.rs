@@ -1678,6 +1678,16 @@ fn rpc_caps() -> Vec<String> {
     // own words, and a secondary org's connection refuses both.
     #[cfg(hive_host)]
     caps.push(RpcCap::HivePromote);
+    // FR-90 P2f-1a — and takes part in a teleport, a move to a device that
+    // holds no copy yet: as the target, a teleport's prepare passes every
+    // start gate but the copy and admits that one session's join, whatever
+    // `hive_replica` says; as the primary, a join in the primary's role
+    // checkpoints at once when no turn runs and says where its copy ends. A
+    // property of the BUILD, like `hive-promote`, and kept on a secondary
+    // org's connection like it: no placement chooses a teleport's target, and
+    // that org's prepare and join are refused there either way.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HiveTeleport);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

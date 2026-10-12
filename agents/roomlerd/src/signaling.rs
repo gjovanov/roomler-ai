@@ -4349,7 +4349,8 @@ async fn handle_server_msg(
 
         // FR-90 P2e-5 — could this device take the session over? A start's
         // every gate, as configured now, and none of its side effects; the
-        // answer goes back on THIS connection.
+        // answer goes back on THIS connection. P2f-1a — a teleport's asks
+        // every gate but the copy, which the device takes after it.
         ServerMsg::HivePrepare {
             session_id,
             fence,
@@ -4359,6 +4360,7 @@ async fn handle_server_msg(
             user_id,
             user_email,
             caller,
+            teleport,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_prepare(
@@ -4375,6 +4377,7 @@ async fn handle_server_msg(
                     replicated: true,
                     lease: true,
                 },
+                teleport,
                 ctx.is_primary,
                 outbound_tx.clone(),
             );
@@ -4388,6 +4391,7 @@ async fn handle_server_msg(
                     user_id,
                     &user_email,
                     &caller,
+                    teleport,
                 );
                 debug!(session = %session_id, "rc:hive.prepare ignored — this build does not run agent sessions");
             }

@@ -342,6 +342,21 @@ fn resume_note_of(dir: &Path, sid: &str) -> (String, Value) {
     (note, settings["hooks"]["SessionStart"][0].clone())
 }
 
+/// FR-90 P2f-1a — whether the device's stored row advertises the verb `word`,
+/// as its last hello said.
+async fn advertises(app: &TestApp, agent_id: &str, word: &str) -> bool {
+    let row = app
+        .db
+        .collection::<bson::Document>("agents")
+        .find_one(bson::doc! { "_id": bson::oid::ObjectId::parse_str(agent_id).unwrap() })
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    row.get_document("capabilities")
+        .and_then(|c| c.get_array("rpc"))
+        .is_ok_and(|rpc| rpc.iter().any(|v| v.as_str() == Some(word)))
+}
+
 /// Whether the process `pid` names is still there.
 fn alive(pid: &str) -> bool {
     Path::new("/proc").join(pid.trim()).exists()
@@ -384,6 +399,14 @@ async fn scenario() {
     runs_and_holds(&mut b_cfg, &seeded, &b_dir);
     let b = b_cfg.agent_id.clone();
     let b_proc = device(&app, &seeded, &b_dir, &b_cfg).await;
+    // P2f-1a — every build that runs agent sessions takes part in a
+    // teleport, the device in this process and the one in its own alike.
+    for (name, id) in [("A", &a), ("B", &b)] {
+        assert!(
+            advertises(&app, id, "hive-teleport").await,
+            "{name} advertises hive-teleport"
+        );
+    }
 
     // ── The session on A, placed with B, and two prompts ───────────────────
     let s = start(&app, &seeded, &a, &a_work).await;

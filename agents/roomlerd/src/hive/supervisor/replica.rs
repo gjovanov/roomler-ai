@@ -7,7 +7,8 @@
 //! | Gate, in order | Refused with | Why |
 //! |---|---|---|
 //! | the primary enrollment's connection | `secondary_org` | a device holds copies for its primary organization only: another org's admin must not place its sessions on the owner's disk |
-//! | the owner's `hive_replica` | `replica_disabled` | the gate that survives a compromised server |
+//! | P2f-1a — a teleport's join: a teleport's prepare passed here for the session, naming the fence after the join's, within `TELEPORT_ADMISSION` | `not_prepared` | the gates that let a device RUN a session (`hive_enabled`, the account, the folder) are the prepare's; a device that passed them takes the copy it will run whatever its `hive_replica` |
+//! | the owner's `hive_replica`, for every other role | `replica_disabled` | the gate that survives a compromised server |
 //! | a role this build can name | `other` | a newer server's word is still a refusal, never a copy held for a reason nobody here read |
 //! | the owner's `hive_archive`, for an archive | `archive_disabled` | an administrator designates; the device's owner offers |
 //! | the fences' ends (P2e-5b), each one readable | `other` | below the floor an end is the one way an older fence's events are taken: one the device cannot read whole is never taken in part |
@@ -52,6 +53,10 @@ const MIB: u64 = 1024 * 1024;
 pub(super) type JoinAnswer = (Option<HiveJoinRefusal>, Option<String>);
 
 /// The device's own gates on a join, in order, then the join itself.
+/// `prepared`: a teleport's prepare passed here for this join (P2f-1a,
+/// [`Supervisor::teleport_admitted`]), which a join in the teleport's role
+/// needs, and which admits nothing else.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn decide(
     cfg: &HiveConfig,
     store: Result<&StoreHandle, &String>,
@@ -60,6 +65,7 @@ pub(super) async fn decide(
     fence: u64,
     role: Option<HiveReplicaRole>,
     fences: &[HiveFenceMark],
+    prepared: bool,
 ) -> JoinAnswer {
     let refuse = |word: HiveJoinRefusal, why: String| (Some(word), Some(why));
     if !primary {
@@ -68,7 +74,14 @@ pub(super) async fn decide(
             "this device holds copies for its primary organization only".into(),
         );
     }
-    if !cfg.replica {
+    if role == Some(HiveReplicaRole::Teleport) {
+        if !prepared {
+            return refuse(
+                HiveJoinRefusal::NotPrepared,
+                "this device was not prepared to run the session here".into(),
+            );
+        }
+    } else if !cfg.replica {
         return refuse(
             HiveJoinRefusal::ReplicaDisabled,
             "hive_replica is off on this device".into(),
@@ -233,6 +246,8 @@ impl Supervisor {
                 self.take_up_replication(primary, session, fence).await
             }
             member => {
+                let prepared = member == Some(HiveReplicaRole::Teleport)
+                    && self.teleport_admitted(session, fence);
                 decide(
                     &self.cfg,
                     self.store.as_ref(),
@@ -241,6 +256,7 @@ impl Supervisor {
                     fence,
                     member,
                     fences,
+                    prepared,
                 )
                 .await
             }
@@ -260,6 +276,8 @@ impl Supervisor {
     /// `hive_replica` is not asked: the device holds no copy of another's
     /// session, only its own run. P2e-5c — one for a session it does not
     /// run yet is a promotion's, ahead of its start ([`Self::ahead_of_start`]).
+    /// P2f-1a — the run here is told: its first checkpoint now when no turn
+    /// runs, and where its copy ends either way ([`Self::tell_replicated`]).
     ///
     /// ⚠️ The record, then the live session, then the record again if it was
     /// not there yet. A session resuming now reads its record once it is live
@@ -298,22 +316,31 @@ impl Supervisor {
             held
         };
         let hosted_at = mark();
-        let live_at = self
+        // P2f-1a — the run at the join's fence, its input, and whether this
+        // join is what turned it replicated.
+        let live = self
             .live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&session)
             .map(|l| {
-                if l.fence == fence {
-                    l.replicated.store(true, Ordering::SeqCst);
-                }
-                l.fence
+                let here = (l.fence == fence).then(|| {
+                    let turned = !l.replicated.swap(true, Ordering::SeqCst);
+                    (l.input.clone(), turned)
+                });
+                (l.fence, here)
             });
         if hosted_at.is_none() {
             mark();
         }
+        let live_at = live.as_ref().map(|(f, _)| *f);
         match live_at.or(hosted_at) {
-            Some(f) if f == fence => (None, None),
+            Some(f) if f == fence => {
+                if let Some((_, Some((input, turned)))) = live {
+                    self.tell_replicated(session, &input, turned).await;
+                }
+                (None, None)
+            }
             Some(f) if f > fence => refuse(
                 HiveJoinRefusal::StaleFence,
                 format!("this device runs the session at fence {f}"),
@@ -324,6 +351,25 @@ impl Supervisor {
             ),
             None => self.ahead_of_start(session, fence).await,
         }
+    }
+
+    /// P2f-1a — a primary's join was taken up for the run here: one it
+    /// turned replicated takes its first checkpoint now when no turn runs
+    /// (`checkpoint_now`), and says where its copy ends with it; one that was
+    /// replicated already says so at once. Either way the server hears how
+    /// far a member that joins now has to catch up, which a teleport waits
+    /// for before it drains the session. A run whose input is full is told
+    /// nothing, and says where its copy ends at once.
+    async fn tell_replicated(
+        &self,
+        session: ObjectId,
+        input: &tokio::sync::mpsc::Sender<super::Input>,
+        turned: bool,
+    ) {
+        if turned && input.try_send(super::Input::Replicated).is_ok() {
+            return;
+        }
+        self.report_tip(session).await;
     }
 
     /// P2e-5c — `join {role: primary}` for a session this device does not
@@ -380,9 +426,10 @@ impl Supervisor {
     }
 
     /// Whether this device has copies to tell the server about: its owner
-    /// lets it hold copies, or it runs a replicated session. Every other
-    /// device sends no replica frame, so a server from before P2c-3 never
-    /// hears a word it cannot read.
+    /// lets it hold copies, or it runs a replicated session, or (P2f-1a) it
+    /// was prepared for a teleport, whose copy it takes. Every other device
+    /// sends no replica frame, so a server from before P2c-3 never hears a
+    /// word it cannot read.
     pub(super) fn reports_copies(&self) -> bool {
         self.cfg.replica
             || self
@@ -391,6 +438,7 @@ impl Supervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .any(|l| l.replicated.load(Ordering::SeqCst))
+            || self.prepared_for_teleport()
     }
 
     /// Every session this device holds a copy of, as a member or as the
@@ -490,7 +538,7 @@ mod tests {
         fence: u64,
         role: Option<HiveReplicaRole>,
     ) -> Option<HiveJoinRefusal> {
-        decide(cfg, Ok(store), primary, session, fence, role, &[])
+        decide(cfg, Ok(store), primary, session, fence, role, &[], false)
             .await
             .0
     }
@@ -528,7 +576,9 @@ mod tests {
         );
         let missing = "no store".to_string();
         assert_eq!(
-            decide(&on, Err(&missing), true, sid, 1, owner, &[]).await.0,
+            decide(&on, Err(&missing), true, sid, 1, owner, &[], false)
+                .await
+                .0,
             Some(HiveJoinRefusal::Other)
         );
         assert_eq!(
@@ -557,6 +607,67 @@ mod tests {
         assert_eq!(
             answer(&on, &store, true, sid, 3, owner).await,
             Some(HiveJoinRefusal::Purged)
+        );
+    }
+
+    /// P2f-1a — a join in the teleport's role passes only where a teleport's
+    /// prepare passed for it, and then whatever the owner's `hive_replica`:
+    /// `hive_replica` on is no prepare, a prepare admits no other role, and
+    /// a secondary org's connection takes nothing. The store's own gates
+    /// still apply, and the membership it keeps is the teleport's.
+    #[tokio::test]
+    async fn a_teleports_join_passes_only_where_its_prepare_did() {
+        let store = StoreHandle::spawn(None).unwrap();
+        let sid = ObjectId::new();
+        let teleport = Some(HiveReplicaRole::Teleport);
+        let off = cfg(false, false, None);
+        let at = |cfg: HiveConfig, primary: bool, role, prepared: bool| {
+            let store = store.clone();
+            async move {
+                decide(&cfg, Ok(&store), primary, sid, 1, role, &[], prepared)
+                    .await
+                    .0
+            }
+        };
+        assert_eq!(
+            at(off.clone(), true, teleport, false).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "nobody prepared it"
+        );
+        assert_eq!(
+            at(cfg(true, false, None), true, teleport, false).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "hive_replica on is no prepare"
+        );
+        assert_eq!(
+            at(off.clone(), false, teleport, true).await,
+            Some(HiveJoinRefusal::SecondaryOrg)
+        );
+        assert_eq!(
+            at(off.clone(), true, Some(HiveReplicaRole::Owner), true).await,
+            Some(HiveJoinRefusal::ReplicaDisabled),
+            "a prepare admits the teleport's role only"
+        );
+        assert_eq!(
+            at(cfg(false, false, Some(0)), true, teleport, true).await,
+            Some(HiveJoinRefusal::Quota),
+            "the store's quota still holds"
+        );
+        assert!(
+            store.memberships().await.unwrap().is_empty(),
+            "nothing refused was kept"
+        );
+        assert_eq!(
+            at(off, true, teleport, true).await,
+            None,
+            "prepared: it takes the copy it will run, hive_replica off"
+        );
+        let held = store.memberships().await.unwrap();
+        assert_eq!(
+            held.iter()
+                .map(|m| (m.session.as_str(), m.role.as_str(), m.fence))
+                .collect::<Vec<_>>(),
+            [(sid.to_hex().as_str(), "teleport", 1)]
         );
     }
 
@@ -606,7 +717,7 @@ mod tests {
             ("not a hash", 2, vec![end(2, "AB".repeat(32))]),
             ("short", 2, vec![end(2, "ab".repeat(31))]),
         ] {
-            let (word, why) = decide(&on, Ok(&store), true, sid, at, owner, &marks).await;
+            let (word, why) = decide(&on, Ok(&store), true, sid, at, owner, &marks, false).await;
             assert_eq!(word, Some(HiveJoinRefusal::Other), "{case}: {why:?}");
             assert!(why.is_some(), "{case}: says why");
             assert!(store.memberships().await.unwrap().is_empty(), "{case}");
@@ -614,7 +725,7 @@ mod tests {
         }
 
         assert_eq!(
-            decide(&on, Ok(&store), true, sid, 2, owner, &ended).await,
+            decide(&on, Ok(&store), true, sid, 2, owner, &ended, false).await,
             (None, None)
         );
         store
@@ -636,7 +747,7 @@ mod tests {
         // Before P2e-5b: the same join naming no end, the history refused.
         let without = StoreHandle::spawn(None).unwrap();
         assert_eq!(
-            decide(&on, Ok(&without), true, sid, 2, owner, &[]).await,
+            decide(&on, Ok(&without), true, sid, 2, owner, &[], false).await,
             (None, None)
         );
         assert!(
