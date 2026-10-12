@@ -19,7 +19,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use super::super::supervisor::tests::{
-    Rig, dev, harness_asks, next_state, order, release, rig, until_awaiting,
+    Rig, dev, harness_asks, next_state, order, release, rig, rig_with, until_awaiting,
 };
 use super::*;
 
@@ -34,6 +34,7 @@ fn grant(session: ObjectId, user: ObjectId, may_prompt: bool, ttl_secs: u32) -> 
         may_prompt,
         user_email: None,
         driving_refused: None,
+        copy: false,
         ttl_secs,
     }
 }
@@ -471,6 +472,83 @@ async fn a_driver_this_device_does_not_map_reads_and_is_told_why() {
     let _ = b.pc.close().await;
     let _ = o.pc.close().await;
     r.sup.stop(sid, 1, "owner".into());
+}
+
+/// P2d-5 — a member serves a viewer from the copy it holds of a session run
+/// elsewhere on `hive_replica` alone, with agent sessions themselves off: read
+/// only whoever the server named, its hello saying it is a copy, and a prompt
+/// refused. An owner who no longer holds copies serves none of those still on
+/// disk, `hive_enabled` or not.
+#[tokio::test]
+async fn a_member_serves_its_copy_read_only_on_hive_replica_alone() {
+    let mut r = rig_with(false, 4, |c| c.replica = true, |s| s);
+    let sid = ObjectId::new();
+    r.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+    r.store.append(
+        &sid.to_hex(),
+        1,
+        roomler_hive_node::TranscriptEvent::Note {
+            text: "held".into(),
+        },
+    );
+    // The starter's grant, as a server that names them a driver mints it.
+    let g = grant(sid, r.user, true, 60);
+    let gid = g.grant_id;
+    r.sup
+        .view_grant(g, true)
+        .await
+        .expect("a copy is served on hive_replica alone");
+    let mut b = dial(&mut r, gid).await;
+    b.send(json!({"op": "hello"})).await;
+    let hello = b.recv_op("hello").await;
+    assert_eq!(
+        (
+            hello["copy"].as_bool(),
+            hello["may_prompt"].as_bool(),
+            hello["may_answer"].as_bool(),
+            hello["live"].as_bool(),
+        ),
+        (Some(true), Some(false), Some(false), Some(false)),
+        "a copy, read only: {hello}"
+    );
+    assert!(hello["driving_refused"].is_null(), "{hello}");
+    let tip = hello["tip"].as_u64().unwrap();
+    assert!(tip >= 1, "the copy's own tip: {hello}");
+    b.send(json!({"op": "prompt", "id": "x", "text": "rm -rf"}))
+        .await;
+    let ack = b.recv_op("prompt").await;
+    assert_eq!(ack["ok"], false, "{ack}");
+    assert!(
+        ack["error"].as_str().unwrap().starts_with("read_only"),
+        "{ack}"
+    );
+    r.sup.viewers().command(gid, Cmd::Close("test".into()));
+    wait_viewers(&r, 0).await;
+    let _ = b.pc.close().await;
+
+    for enabled in [false, true] {
+        let off = rig_with(enabled, 4, |c| c.replica = false, |s| s);
+        off.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        off.store.append(
+            &sid.to_hex(),
+            1,
+            roomler_hive_node::TranscriptEvent::Note {
+                text: "held".into(),
+            },
+        );
+        let refused = off
+            .sup
+            .view_grant(grant(sid, off.user, false, 60), true)
+            .await
+            .expect_err("no copies held: no copy served");
+        assert_eq!(
+            refused.0,
+            HiveViewRefusal::HiveDisabled,
+            "no copies held, hive_enabled {enabled}: {}",
+            refused.1
+        );
+        assert!(refused.1.contains("hive_replica"), "{}", refused.1);
+    }
 }
 
 /// Frames a viewer sends are bounded: a message larger than a prompt may be

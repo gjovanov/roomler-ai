@@ -115,6 +115,10 @@ pub struct ViewGrant {
     /// as the session's account — set by the device's gate, never by the
     /// server; the viewer is told in `hello`.
     pub driving_refused: Option<String>,
+    /// P2d-5 — the session is a copy this device holds as a member, not one
+    /// it runs: read only. Set by the device's gate, never by the server;
+    /// the viewer is told in `hello`.
+    pub copy: bool,
     pub ttl_secs: u32,
 }
 
@@ -270,7 +274,24 @@ impl Supervisor {
         // P1j — an adopted session is served on `hive_adopt` alone: a device
         // may allow adopting with agent sessions themselves off.
         let adopted = self.adopt_allowed() && self.adopt_holds(grant.session_id);
-        if !self.enabled() && !adopted {
+        // P2d-5 — a copy this device holds as a member of a session run
+        // elsewhere is served on `hive_replica` alone, as an adopted one on
+        // `hive_adopt`: an archive replica holds copies with agent sessions
+        // themselves off. And only on it: an owner who no longer holds
+        // copies serves none of those still on disk until the purge, whatever
+        // the server asks.
+        let copy = !adopted
+            && !self.holds_live(grant.session_id)
+            && self.holds_a_copy(grant.session_id).await;
+        if copy && !self.holds_copies() {
+            return Err((
+                HiveViewRefusal::HiveDisabled,
+                "this device serves copies of sessions run elsewhere only while it holds \
+                 them (hive_replica)"
+                    .into(),
+            ));
+        }
+        if !self.enabled() && !adopted && !copy {
             return Err((
                 HiveViewRefusal::HiveDisabled,
                 "agent sessions are off on this device (hive_enabled)".into(),
@@ -328,7 +349,12 @@ impl Supervisor {
         // P1c-2 — the server names drivers; THIS device decides whom it lets
         // act as one of its accounts.
         let mut grant = grant;
-        if grant.may_prompt
+        grant.copy = copy;
+        if grant.copy {
+            // P2d-5 — a copy is read only, whoever the server named: the
+            // harness runs on another device. The hello says why.
+            grant.may_prompt = false;
+        } else if grant.may_prompt
             && let Err(why) =
                 self.drives_here(grant.session_id, grant.user_id, grant.user_email.as_deref())
         {
@@ -341,10 +367,24 @@ impl Supervisor {
         }
         info!(
             grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
-            may_prompt = grant.may_prompt, "hive: view granted"
+            may_prompt = grant.may_prompt, copy = grant.copy, "hive: view granted"
         );
         tokio::spawn(run(Arc::clone(self), grant, store, rx));
         Ok(())
+    }
+
+    /// P2d-5 — whether this device's store holds `session` as a member's
+    /// copy: a membership, which a session it runs never has (a primary's
+    /// join is not a member's, P2c-4). A store it cannot read holds none.
+    async fn holds_a_copy(&self, session: ObjectId) -> bool {
+        let Ok(store) = self.store_handle() else {
+            return false;
+        };
+        let sid = session.to_hex();
+        store
+            .memberships()
+            .await
+            .is_ok_and(|held| held.iter().any(|m| m.session == sid))
     }
 }
 
@@ -748,6 +788,9 @@ async fn on_request(
                 // P1c-2 — why this device keeps a driver the server named
                 // read only; null when it does not.
                 "driving_refused": grant.driving_refused,
+                // P2d-5 — a copy this device holds as a member: read only,
+                // the session running (or having run) elsewhere.
+                "copy": grant.copy,
                 "approvals": sup.pending_approvals(grant.session_id),
             }))
             .await

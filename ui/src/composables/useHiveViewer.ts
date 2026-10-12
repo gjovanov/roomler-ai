@@ -138,6 +138,9 @@ export function useHiveViewer() {
    *  own `hive_accounts` does not map us to the session's account), in its
    *  words; null when it does not. */
   const drivingRefused = ref<string | null>(null)
+  /** P2d-5 — the device serves a copy it holds as a member, not the session
+   *  it runs: read only, whoever we are. */
+  const copy = ref(false)
   /** The approval ids open now, as the device last said. */
   const pendingApprovals = ref<string[]>([])
   const live = ref(false)
@@ -235,6 +238,7 @@ export function useHiveViewer() {
     // Nothing is answerable through a peer that is gone.
     pendingApprovals.value = []
     drivingRefused.value = null
+    copy.value = false
   }
 
   function merge(incoming: HiveEvent[], where: 'append' | 'prepend'): void {
@@ -301,6 +305,7 @@ export function useHiveViewer() {
     mayPrompt.value = !!hello.may_prompt
     mayAnswer.value = !!hello.may_answer
     drivingRefused.value = typeof hello.driving_refused === 'string' ? hello.driving_refused : null
+    copy.value = hello.copy === true
     pendingApprovals.value = Array.isArray(hello.approvals) ? hello.approvals.map(String) : []
     live.value = !!hello.live
     runState.value = hello.state ?? null
@@ -516,6 +521,7 @@ export function useHiveViewer() {
     mayPrompt,
     mayAnswer,
     drivingRefused,
+    copy,
     pendingApprovals,
     live,
     hasEarlier,
