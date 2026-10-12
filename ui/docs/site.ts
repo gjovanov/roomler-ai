@@ -27,7 +27,7 @@ export const SITE_TITLE_SUFFIX = 'Roomler Docs'
  *  brand kit, as is the repo root's copy GitHub shows, not a render.
  *  ⚠️ The ONE asset that keeps a stable, unhashed name (FR-87): the SPA's
  *  `ui/index.html` names it as its own og:image. */
-export const OG_IMAGE = `${BASE}/assets/social-preview.png`
+export const OG_IMAGE = `${BASE}/assets/social-preview.png?v=2`
 
 /**
  * FR-87 (#1776) P2: when true, also publish every hashed asset under its old,
@@ -114,7 +114,7 @@ export const ORG = {
   name: SITE_NAME,
   legalName: 'G ROX EOOD',
   url: `${SITE_ORIGIN}/`,
-  logo: `${SITE_ORIGIN}/logo.svg`,
+  logo: `${SITE_ORIGIN}/logo.svg?v=2`,
   sameAs: [REPO_URL, ...CHANNELS.map((c) => c.url)],
 } as const
 

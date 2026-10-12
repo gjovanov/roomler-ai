@@ -879,7 +879,7 @@ function main(): void {
   // a listing page never points into the image's `/docs/assets/`. Absent in
   // the full build, where the default is that same card's /docs/ URL.
   const blogOgImage: OgImage | undefined = BLOG_ONLY
-    ? { url: `${SITE_ORIGIN}${BLOG_BASE}/assets/social-preview.png`, ...OG_IMAGE_META }
+    ? { url: `${SITE_ORIGIN}${BLOG_BASE}/assets/social-preview.png?v=2`, ...OG_IMAGE_META }
     : undefined
   const blogUrls: UrlEntry[] = []
   if (hasBlog) {

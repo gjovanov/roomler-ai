@@ -163,11 +163,11 @@ describe('the head', () => {
 })
 
 describe('the brand', () => {
-  it('links the favicon set, the SVG versioned past the old icon cached `immutable` for a year', () => {
+  it('links the favicon set, each reused name versioned past the old icon cached `immutable` for a year', () => {
     const html = render({})
-    expect(html).toContain('<link rel="icon" href="/favicon.ico" sizes="48x48">')
-    expect(html).toContain('<link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">')
-    expect(html).toContain('<link rel="apple-touch-icon" href="/apple-touch-icon.png">')
+    expect(html).toContain('<link rel="icon" href="/favicon.ico?v=2" sizes="48x48">')
+    expect(html).toContain('<link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">')
+    expect(html).toContain('<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">')
     expect(html).toContain('<link rel="manifest" href="/site.webmanifest">')
     expect(html).not.toContain('href="/favicon.svg"')
   })
