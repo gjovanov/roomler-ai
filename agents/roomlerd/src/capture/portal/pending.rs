@@ -16,8 +16,12 @@
 //!   session the viewer has already replaced.
 //! - When the person answers, the outcome goes to the **newest** waiter, the
 //!   session the viewer is showing now.
-//! - If nobody is waiting any more, the capture is dropped, which stops the
-//!   screencast at once: a late answer for a dead session starts nothing.
+//! - A late answer for a dead session starts nothing. A waiter is a blocking
+//!   thread, not a session: the session's end aborts its pump, which detaches
+//!   the open (`capture::open_default_async`), so the capture its waiter takes
+//!   is dropped as it arrives and the screencast stops at once. An outcome that
+//!   outlives its last waiter (each waits 5 s past the request's own deadline)
+//!   is dropped in `Request::land`.
 //!
 //! The broker is generic over what a request produces, so its handoff unit-tests
 //! with no portal at all.
@@ -171,7 +175,10 @@ impl<T> Request<T> {
     }
 
     /// The request's outcome. With nobody waiting it is dropped here, which for
-    /// a capture means its helper is killed and the screencast stops.
+    /// a capture means its helper is killed and the screencast stops. This is
+    /// the backstop for a request that outlives its last waiter: a waiter whose
+    /// SESSION ended is still waiting here, and its capture is dropped by the
+    /// detached open instead (see the module doc).
     fn land(&self, outcome: Result<T, String>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.waiting == 0 {

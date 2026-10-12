@@ -1,9 +1,10 @@
 # FR-93: Linux Wayland out of the box — a stock desktop install is seen, driven and told, and a lab proves it
 
 **Issue:** [#1972](https://github.com/gjovanov/roomler-ai/issues/1972) · **Status:** P1 merged 2026-10-11 and
-field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. P2a (mutter only, #2019) and P2c (#2020)
-merged 2026-10-12, P2a lab-verified; P2b (the desktop brief and the server's count) built 2026-10-12. P2d is an
-operator decision. The operator approved the plan and P0 (the
+field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. P2a (mutter only, #2019), P2b (the
+desktop brief and the server's count, #2028) and P2c (#2020) shipped in **0.4.130** (2026-10-12), with the server
+promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1, the agent half, is lab-verified
+(#2043). The operator approved the plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
 **Anchors:** master `8098ebbe3`, fleet 0.4.124 (0.4.125 bumped, not yet released) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput),

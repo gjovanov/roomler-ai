@@ -532,10 +532,20 @@ the portal automatically on KDE and measured what that did with nobody answering
   "Share screen with" dialogs stacked within a minute.
 - **A capture for nobody.** Answering a stale dialog late started a capture for a
   session already gone, with the sharing indicator on.
-- **A held worker.** The pumps called `capture::open_default` inline, so each
-  unanswered dialog blocked one runtime worker for the whole wait
-  (`hs_rx.recv_timeout`, `backend.rs:161`). Four of them is every worker of a
-  4-core host, with the signalling loop and the heartbeats queued behind them.
+- **A held worker, then a dead daemon.** The pumps called
+  `capture::open_default` inline, so each unanswered dialog blocked one runtime
+  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:161`). Four of
+  them is every worker of a 4-core host. Measured on the released **0.4.130**
+  (the KDE guest, 4 cores, `portal_capture` on, one viewer trying):
+  - The viewer's watchdog re-created the session 4 times in 30 s, raising 4
+    helpers and stacking 4 dialogs.
+  - The runtime then stopped. The daemon logged nothing for 86 s, and a fifth
+    session sat at `awaiting_consent` because nothing answered it.
+  - Then `watchdog-of-watchdog: async watchdog has not heartbeat in 60.0s;
+    forcing exit(2)`, and systemd restarted the daemon.
+
+  So a viewer that keeps trying a host where nobody answers takes the daemon
+  down.
 
 The explicit `portal_capture` path had all three from the start. P2d's agent half
 fixes them there, and is the precondition for the portal ever going automatic:
@@ -555,16 +565,16 @@ sequenceDiagram
     K-->>A: superseded (A is gone anyway)
     P->>K: Share
     K-->>B: the capture (the newest waiter)
-    Note over K: had nobody been waiting, the capture is dropped at once
+    Note over B,K: had B's session ended first, its pump was aborted:<br/>the capture lands in a detached open and is dropped at once
 ```
 
 | | what | where |
 |---|---|---|
 | the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1267`, the eight pump call sites in `peer.rs` |
-| one request per host | `portal::pending::open`: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:39`, `Broker::open` `:111` |
-| the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:188` |
-| nobody there, nothing starts | an outcome that lands with no waiter is dropped, so its helper is killed and the screencast stops | `Request::land` `:175` |
-| mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:41` |
+| one request per host | `portal::pending::open`: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:43`, `Broker::open` `:115` |
+| the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:195` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1267`, `Request::land` `:182` |
+| mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:45` |
 
 ⚠️ **The viewer half is still owed** (P2d-2). The viewer still re-creates its
 session every 10 s while no frames arrive. Each new session now joins the same
