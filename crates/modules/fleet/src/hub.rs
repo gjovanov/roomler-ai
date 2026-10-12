@@ -171,6 +171,12 @@ pub struct ConnectedAgent {
     /// only between two connections with it. Per connection, for the same
     /// reason; neither `hive` nor `hive-lease` implies it.
     pub supports_hive_promote: bool,
+    /// FR-90 P2f-1 — the agent advertises `hive-teleport`: as a teleport's
+    /// target it answers a prepare that asks no copy and takes the join that
+    /// prepare admits; as its primary it says where its copy ends at a join.
+    /// The server teleports only between two connections with it. Per
+    /// connection, for the same reason; `hive-promote` does NOT imply it.
+    pub supports_hive_teleport: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -470,6 +476,9 @@ impl Hub {
             // FR-90 P2e-3 — set by `set_agent_hive_promote_support`; `false` =
             // no promotion starts on, or moves away from, this connection.
             supports_hive_promote: false,
+            // FR-90 P2f-1 — set by `set_agent_hive_teleport_support`; `false` =
+            // no teleport moves a session to, or away from, this connection.
+            supports_hive_teleport: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -2034,6 +2043,79 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !entry.supports_hive_promote {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2f-1 — record whether this connection takes part in a teleport
+    /// (`hive-teleport`), right after registration.
+    pub fn set_agent_hive_teleport_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_teleport = supports;
+        }
+    }
+
+    /// FR-90 P2f-1 — whether the device's CURRENT connection on this pod
+    /// advertises everything a teleport asks of either end: what a promotion
+    /// asks ([`Self::agent_supports_hive_promote`]) and `hive-teleport`.
+    /// `None` = not online here, or another tenant's (answered alike, as
+    /// [`Self::push_hive`] answers).
+    pub fn agent_supports_hive_teleport(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .map(|a| {
+                a.supports_hive
+                    && a.supports_hive_lease
+                    && a.supports_hive_promote
+                    && a.supports_hive_teleport
+            })
+    }
+
+    /// FR-90 P2f-1 — whether THIS connection advertises `hive-teleport`, as
+    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or
+    /// a newer connection holds the slot.
+    pub fn agent_supports_hive_teleport_on(
+        &self,
+        agent_id: ObjectId,
+        tx: &ClientTx,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| ptr_eq(&a.tx, tx))
+            .map(|a| a.supports_hive_teleport)
+    }
+
+    /// FR-90 P2f-1 — push a teleport's frame (its prepare, and its target's
+    /// join), checked in the lookup that sends it, as [`Self::push_hive`]:
+    /// offline or another tenant's is [`Error::AgentOffline`]; a connection
+    /// without `hive-teleport` is [`Error::ExecUnsupported`] and receives
+    /// nothing. A target's join goes here, not through
+    /// [`Self::push_hive_replica`]: its owner need not let it hold copies.
+    pub fn push_hive_teleport(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_hive_teleport {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }
@@ -4145,6 +4227,54 @@ mod tests {
         assert!(hub.unregister_agent(agent_id, Some(&new)));
         assert_eq!(hub.agent_supports_hive_on(agent_id, &new), None);
         assert_eq!(hub.agent_supports_hive_on(agent_id, &old), None);
+    }
+
+    /// FR-90 P2f-1 — a teleport's frames reach only a connection that
+    /// advertises `hive-teleport`: one that holds copies and runs sessions
+    /// takes no teleport, and another org's is not reachable at all. The
+    /// route's gate and the join's re-send read the same word first; this is
+    /// the gate in the lookup that sends.
+    #[tokio::test]
+    async fn a_teleports_frame_reaches_only_a_connection_that_takes_a_teleport() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let join = || ServerMsg::HiveReplicaJoin {
+            session_id: ObjectId::new(),
+            fence: 1,
+            role: Some(roomler_ai_remote_control::hive::HiveReplicaRole::Teleport),
+            fences: Vec::new(),
+        };
+        hub.set_agent_hive_support(agent_id, true);
+        hub.set_agent_hive_replica_support(agent_id, true);
+        let err = hub
+            .push_hive_teleport(agent_id, tenant, join())
+            .expect_err("a connection without hive-teleport");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        hub.set_agent_hive_teleport_support(agent_id, true);
+        let err = hub
+            .push_hive_teleport(agent_id, ObjectId::new(), join())
+            .expect_err("another org's connection");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        hub.push_hive_teleport(agent_id, tenant, join())
+            .expect("a connection that takes a teleport");
+        assert!(
+            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveReplicaJoin { .. })),
+            "the frame reached it"
+        );
     }
 
     // ─── Fleet RPC broker ────────────────────────────────────────────

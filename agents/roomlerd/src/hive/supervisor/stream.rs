@@ -1144,7 +1144,9 @@ impl Supervisor {
         }
         // P2d-3b — the gate that survives a compromised server: a copy is
         // followed only while the owner lets this device hold copies.
-        if !self.cfg.replica {
+        // P2f-1b — or it is the copy of a teleport this device was prepared
+        // for (P2f-1a), the one it will run.
+        if !self.cfg.replica && !self.teleport_admitted(d.session_id, d.fence) {
             return self.report_close(d.grant_id, "replica_disabled");
         }
         let path = match d.path {
@@ -4113,6 +4115,34 @@ mod tests {
         phase_of(&mem, queued[0], Phase::Wanting(HiveStreamPath::Direct)).await;
     }
 
+    /// FR-90 P2f-1b — on a device whose owner holds no copies, a connection
+    /// follows the copy of a teleport it was prepared for, and none other it
+    /// holds: a leftover of a teleport that is over waits for the purge.
+    #[tokio::test]
+    async fn a_connection_of_a_device_that_holds_no_copies_follows_its_teleports_copy() {
+        let r = rig(true, 4);
+        let (teleport, leftover) = (ObjectId::new(), ObjectId::new());
+        r.store
+            .join(&teleport.to_hex(), "teleport", 1)
+            .await
+            .unwrap();
+        r.store
+            .join(&leftover.to_hex(), "teleport", 1)
+            .await
+            .unwrap();
+        r.sup.admit_teleport(teleport, 2);
+        let (tx, mut reports) = mpsc::channel(64);
+        r.sup.connected(tx);
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        let mut asked = Vec::new();
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, reports.recv()).await {
+            if let ClientMsg::HiveReplicaWant { session_id, .. } = msg {
+                asked.push(session_id);
+            }
+        }
+        assert_eq!(asked, [teleport], "the teleport's copy, and only that");
+    }
+
     /// P2d-3b — the primary organization's connection starts following each
     /// copy held, as a device's does when it comes back; a device whose
     /// owner holds no copies asks for none.
@@ -4154,6 +4184,39 @@ mod tests {
             Some("replica_disabled")
         );
         assert!(!mem.sup.holds_stream(grant_id));
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// FR-90 P2f-1b — a device whose owner holds no copies follows the dial
+    /// of a teleport it was prepared for (P2f-1a): the copy it will run. The
+    /// gate holds for anything else: once the session launched there, the
+    /// admission is done with, and the next dial is refused again.
+    #[tokio::test]
+    async fn a_device_that_holds_no_copies_follows_a_teleports_dial() {
+        let src = rig(true, 4);
+        let mut mem = rig(true, 4);
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        mem.store.join(&sid.to_hex(), "teleport", 1).await.unwrap();
+        // Prepared for the start at fence 2: its join, at fence 1, is the
+        // teleport's.
+        mem.sup.admit_teleport(sid, 2);
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        assert_eq!(
+            tip_at(&mem, sid, 2).await.seq,
+            2,
+            "the teleport's copy follows the source"
+        );
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+
+        mem.sup.forget_teleport(sid, 2);
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("replica_disabled"),
+            "the admission is done with"
+        );
         src.sup.close_stream(grant_id, "test");
     }
 

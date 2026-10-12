@@ -220,6 +220,11 @@ pub enum PromotionState {
     /// The member it moves to was sent `rc:hive.prepare`, and has not said
     /// it is ready.
     Preparing,
+    /// FR-90 P2f-1 — a teleport's target is ready: it was added to the
+    /// replicaset in the `teleport` role and sent its join, the primary its
+    /// join as the primary; the target's copy catches up with the primary's
+    /// while the session still runs.
+    Joining,
     /// The member is ready; the primary was sent `rc:hive.drain`.
     Draining,
     /// The primary drained; the member's copy is to reach the drained tip.
@@ -233,6 +238,7 @@ impl PromotionState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Preparing => "preparing",
+            Self::Joining => "joining",
             Self::Draining => "draining",
             Self::Syncing => "syncing",
             Self::Moving => "moving",
@@ -241,8 +247,12 @@ impl PromotionState {
 
     /// Before the lease moves: a failure here leaves the session where it
     /// was.
-    pub const BEFORE_THE_MOVE: [PromotionState; 3] =
-        [Self::Preparing, Self::Draining, Self::Syncing];
+    pub const BEFORE_THE_MOVE: [PromotionState; 4] = [
+        Self::Preparing,
+        Self::Joining,
+        Self::Draining,
+        Self::Syncing,
+    ];
 }
 
 /// FR-90 P2e-3 — the tip a drained primary's copy ends at. BSON has no
@@ -294,6 +304,12 @@ pub struct Promotion {
     /// to take the session over from its copy: its start says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior: Option<MovedStart>,
+    /// FR-90 P2f-1 — a teleport: the device it moves to held no copy of the
+    /// session, and takes one in the `joining` step before the drain. A
+    /// failure before the move lets that copy go (`leaving`). Absent = a
+    /// promotion to a member, every one before P2f-1.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub teleport: bool,
 }
 
 impl Promotion {
@@ -331,7 +347,8 @@ pub struct Replicaset {
 pub struct ReplicaMember {
     pub device_id: ObjectId,
     /// [`crate::placement::MemberRole::as_str`]: `primary` | `archive` |
-    /// `owner`.
+    /// `owner` | `teleport` (P2f-1: a teleport's target, which takes the
+    /// copy it will run).
     pub role: String,
     /// P2c-3 — whether it took its copy. The primary is `joined` from its
     /// placement: it runs the session. Absent on a record placed before
@@ -528,6 +545,10 @@ pub struct PromotionView {
     pub state: PromotionState,
     pub started_at: String,
     pub deadline: String,
+    /// P2f-1 — a teleport, to a device that held no copy. Absent: a
+    /// promotion to a member.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub teleport: bool,
 }
 
 impl From<&Promotion> for PromotionView {
@@ -543,6 +564,7 @@ impl From<&Promotion> for PromotionView {
             state: p.state,
             started_at: rfc3339(p.started_at),
             deadline: rfc3339(p.deadline),
+            teleport: p.teleport,
         }
     }
 }
@@ -921,13 +943,14 @@ mod tests {
     fn a_promotion_is_stored_in_its_words_and_absent_before_p2e3() {
         let all = [
             PromotionState::Preparing,
+            PromotionState::Joining,
             PromotionState::Draining,
             PromotionState::Syncing,
             PromotionState::Moving,
         ];
         assert_eq!(
             all.map(PromotionState::as_str),
-            ["preparing", "draining", "syncing", "moving"]
+            ["preparing", "joining", "draining", "syncing", "moving"]
         );
         for s in all {
             assert_eq!(
@@ -971,6 +994,7 @@ mod tests {
             }),
             unreachable_from: false,
             prior: None,
+            teleport: false,
         };
         assert!(p.in_flight(now));
         assert!(
@@ -980,10 +1004,34 @@ mod tests {
         s.promotion = Some(p.clone());
         let back: AgentSession = bson::from_document(bson::to_document(&s).unwrap()).unwrap();
         assert_eq!(back.promotion, Some(p.clone()));
+        let stored = bson::to_document(&s).unwrap();
+        assert!(
+            !stored
+                .get_document("promotion")
+                .unwrap()
+                .contains_key("teleport"),
+            "a promotion stores no teleport word, as every one before P2f-1"
+        );
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert_eq!(v["promotion"]["state"], "syncing", "{v}");
         assert!(v["promotion"]["deadline"].is_string(), "{v}");
         assert_eq!(v["promotion"]["to"], p.to.to_hex());
+        assert!(v["promotion"].get("teleport").is_none(), "{v}");
+
+        // P2f-1 — a teleport says so, stored and viewed.
+        s.promotion = Some(Promotion {
+            teleport: true,
+            state: PromotionState::Joining,
+            ..p
+        });
+        let back: AgentSession = bson::from_document(bson::to_document(&s).unwrap()).unwrap();
+        assert!(back.promotion.as_ref().is_some_and(|p| p.teleport));
+        let v = serde_json::to_value(SessionView::from(&s)).unwrap();
+        assert_eq!(
+            (&v["promotion"]["teleport"], &v["promotion"]["state"]),
+            (&serde_json::json!(true), &serde_json::json!("joining")),
+            "{v}"
+        );
     }
 
     /// FR-90 P2c-3 — the member words are locked, and a member placed before

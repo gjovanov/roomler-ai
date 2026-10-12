@@ -504,6 +504,75 @@ impl AgentSessionDao {
             .await
     }
 
+    /// FR-90 P2f-1 — a teleport's target is ready: it joins the replicaset in
+    /// the `teleport` role, `pending`, and the teleport takes its `joining`
+    /// step with `deadline`, in one compare-and-set on the promotion still
+    /// `preparing`. A row the device already has that holds no copy (pending,
+    /// refused, leaving) is taken over, what it last said cleared; else a row
+    /// is added. `false` = neither: the promotion moved on, or the device
+    /// took a copy meanwhile.
+    pub async fn begin_joining(
+        &self,
+        id: ObjectId,
+        pid: ObjectId,
+        target: ObjectId,
+        deadline: DateTime,
+    ) -> DaoResult<bool> {
+        let joining = doc! {
+            "promotion.state": PromotionState::Joining.as_str(),
+            "promotion.deadline": deadline,
+        };
+        let mut set = joining.clone();
+        set.insert("replicaset.members.$.role", MemberRole::Teleport.as_str());
+        set.insert("replicaset.members.$.state", MemberState::Pending.as_str());
+        let taken_over = self
+            .base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "promotion.id": pid,
+                    "promotion.state": PromotionState::Preparing.as_str(),
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": target,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": { "$ne": MemberState::Joined.as_str() },
+                    } },
+                },
+                doc! {
+                    "$set": set,
+                    "$unset": {
+                        "replicaset.members.$.refusal": "",
+                        "replicaset.members.$.answered_at": "",
+                        "replicaset.members.$.tip": "",
+                    },
+                },
+            )
+            .await?;
+        if taken_over {
+            return Ok(true);
+        }
+        let member = bson::to_bson(&ReplicaMember {
+            device_id: target,
+            role: MemberRole::Teleport.as_str().to_string(),
+            state: MemberState::Pending,
+            refusal: None,
+            answered_at: None,
+            tip: None,
+        })?;
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "promotion.id": pid,
+                    "promotion.state": PromotionState::Preparing.as_str(),
+                    "replicaset": { "$type": "object" },
+                    "replicaset.members.device_id": { "$ne": target },
+                },
+                doc! { "$set": joining, "$push": { "replicaset.members": member } },
+            )
+            .await
+    }
+
     /// FR-90 P2e-3 — a promotion ends, done or failed: only the one named,
     /// only while it is in one of `states`. The record as it stood before,
     /// promotion and all, for the room's note; `None` = it is not there any
@@ -635,7 +704,9 @@ impl AgentSessionDao {
     /// while the promotion is `moving` and the member's start unanswered.
     /// The member is a member again, in its old role; the old primary is the
     /// primary again; both, and every other member that held its copy, are
-    /// owed their join at the new fence. The promotion ends with it.
+    /// owed their join at the new fence. The promotion ends with it. P2f-1 —
+    /// a teleport's target is let go instead (`leaving`): it took its copy
+    /// only to run the session.
     pub async fn move_lease_back(&self, id: ObjectId, p: &Promotion) -> DaoResult<bool> {
         // The member's fence ends where it began: it ran nothing.
         let Some(mark) = fence_mark(p, p.from_fence + 1) else {
@@ -650,6 +721,11 @@ impl AgentSessionDao {
             at: DateTime::now(),
         }))?;
         let (to, from) = (p.to, p.from.device_id);
+        let to_state = if p.teleport {
+            MemberState::Leaving
+        } else {
+            MemberState::Pending
+        };
         let opts = mongodb::options::UpdateOptions::builder()
             .array_filters(vec![
                 doc! { "to.device_id": to },
@@ -684,7 +760,7 @@ impl AgentSessionDao {
                         "location.device_name": &p.from.device_name,
                         "location.folder": &p.from.folder,
                         "replicaset.members.$[to].role": &p.to_role,
-                        "replicaset.members.$[to].state": MemberState::Pending.as_str(),
+                        "replicaset.members.$[to].state": to_state.as_str(),
                         "replicaset.members.$[from].role": MemberRole::Primary.as_str(),
                         "replicaset.members.$[from].state": MemberState::Pending.as_str(),
                         "replicaset.members.$[other].state": MemberState::Pending.as_str(),

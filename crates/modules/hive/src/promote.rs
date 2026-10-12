@@ -14,6 +14,7 @@
 //! | State | Entered when | Leaves when | Past its bound |
 //! |---|---|---|---|
 //! | `preparing` | the owner promotes: `rc:hive.prepare` to the member | the member's `rc:hive.prepare_ack`; away from an unreachable primary, a ready one goes straight to `syncing` at the member's own tip (P2e-6a) | failed, nothing moved |
+//! | `joining` (P2f-1, a teleport only) | the target is ready: it joins the replicaset in the `teleport` role, and the target and the primary are each sent their join | both answered `joined`, the primary said where its copy ends since the teleport began, and the target's copy holds as much: `rc:hive.drain` to the primary | failed; the target lets its copy go (`leaving`) |
 //! | `draining` | the member is ready: `rc:hive.drain` to the primary | the primary's `rc:hive.drained` | failed; the primary gets its lease word back |
 //! | `syncing` | the primary drained, at `{seq, hash}` | the member's own tip equals it: the lease moves | failed, as above |
 //! | `moving` | the lease moved: join, `rc:hive.move`, `rc:hive.start` to the member | its start's answer | nothing moves back on silence (P2e-6b) |
@@ -28,6 +29,9 @@
 //! | the room carries every outcome, in its words | FR-83: a move that cannot happen says so, with the gate that said no |
 //! | P2e-6a — a primary with no connection and no heartbeat for [`UNREACHABLE_SECS`], whose last build holds a leased session to the word, is moved away from with no drain, to the member that holds the most, at that member's own tip | it cannot drain; its sidecar stopped calling the model by then, and back, it runs nothing before it is demoted. What it wrote past that tip is set aside when it follows the new primary (P2d-3) |
 //! | P2e-6a — a primary that did not drain in time keeps its socket | a link that carries one way only is closed already, by the device's receive deadline or the server's reaper; a slow drain on a healthy link (the device may take 120 s, the server waits 75 s) must not cost the device a reconnect |
+//! | P2f-1 — a teleport moves a session to a device that holds no copy of it: `POST …/teleport`, never to a joined member (that is a promotion), between two connections advertising `hive-teleport`, with the primary online | the stream's only source is the primary, so a teleport away from an unreachable one has nothing to copy from |
+//! | P2f-1 — the drain is asked only once the target's copy holds what the primary said it holds, after the teleport began | the whole copy moves while the session still runs; the drain moves only what it added |
+//! | P2f-1 — a teleport that fails before the move, or whose start is refused after it, lets the target's copy go (`leaving`) | its owner never offered to hold copies: it took one only to run the session |
 
 use std::time::Duration;
 
@@ -62,10 +66,12 @@ use crate::room;
 use crate::routes::{Audit, clean_folder, device_refusal_message, member_tenant, parse_oid};
 
 /// How long each step before the move may take
-/// (`hive.promote_{prepare,drain,sync}_secs`).
+/// (`hive.promote_{prepare,join,drain,sync}_secs`).
 #[derive(Debug, Clone, Copy)]
 pub struct Bounds {
     pub prepare: Duration,
+    /// P2f-1 — a teleport's target's copy catching up.
+    pub join: Duration,
     pub drain: Duration,
     pub sync: Duration,
 }
@@ -74,6 +80,7 @@ impl Bounds {
     pub fn of(settings: &roomler_ai_config::HiveSettings) -> Self {
         Self {
             prepare: Duration::from_secs(settings.promote_prepare_secs),
+            join: Duration::from_secs(settings.promote_join_secs),
             drain: Duration::from_secs(settings.promote_drain_secs),
             sync: Duration::from_secs(settings.promote_sync_secs),
         }
@@ -82,6 +89,7 @@ impl Bounds {
     fn of_state(&self, s: PromotionState) -> Duration {
         match s {
             PromotionState::Preparing => self.prepare,
+            PromotionState::Joining => self.join,
             PromotionState::Draining => self.drain,
             PromotionState::Syncing => self.sync,
             // Expiry only: a start the member never answered is re-sent on
@@ -98,10 +106,10 @@ fn deadline_after(d: Duration) -> DateTime {
     DateTime::from_millis(DateTime::now().timestamp_millis().saturating_add(ms))
 }
 
-/// `POST …/session/{session_id}/promote`.
+/// `POST …/session/{session_id}/promote`, and (P2f-1) `…/teleport`.
 #[derive(Debug, Deserialize)]
 pub struct PromoteBody {
-    /// The member to move it to.
+    /// The member to move it to; for a teleport, a device that holds no copy.
     pub device_id: String,
     /// Where it runs there, as typed. Defaults to the folder it runs in now.
     #[serde(default)]
@@ -118,6 +126,8 @@ pub enum PromoteDenyReason {
     InProgress,
     MovedTooOften,
     NotAMember,
+    /// P2f-1 — a teleport to a device that holds a copy already.
+    AlreadyAMember,
     NotFreshest,
     AlreadyPrimary,
     DeviceOffline,
@@ -137,6 +147,7 @@ impl PromoteDenyReason {
             Self::InProgress => "promotion_in_progress",
             Self::MovedTooOften => "moved_too_often",
             Self::NotAMember => "not_a_member",
+            Self::AlreadyAMember => "already_a_member",
             Self::NotFreshest => "not_freshest",
             Self::AlreadyPrimary => "already_primary",
             Self::DeviceOffline => "device_offline",
@@ -166,7 +177,10 @@ impl PromoteDenyReason {
             }
             Self::NotAMember => {
                 "the device holds no copy of the session: only a member of its replicaset \
-                 that took its copy can run it"
+                 that took its copy can run it — or teleport the session there"
+            }
+            Self::AlreadyAMember => {
+                "the device holds a copy of the session already: promote the session to it"
             }
             Self::NotFreshest => {
                 "the device the session runs on is unreachable, and another member holds more \
@@ -179,7 +193,8 @@ impl PromoteDenyReason {
             }
             Self::PrimaryOffline => {
                 "the device the session runs on is offline, so it cannot hand the session over; \
-                 once it has been unreachable for 230 s, the session can be moved away from it"
+                 once it has been unreachable for 230 s, the session can be moved away from it \
+                 to a member of its replicaset"
             }
             Self::PrimaryUnsupported => {
                 "the device the session runs on does not take part in moving sessions — update it"
@@ -188,13 +203,14 @@ impl PromoteDenyReason {
         }
     }
 
-    pub const ALL: [PromoteDenyReason; 13] = [
+    pub const ALL: [PromoteDenyReason; 14] = [
         Self::OrgArchived,
         Self::NoPermission,
         Self::NotRunning,
         Self::InProgress,
         Self::MovedTooOften,
         Self::NotAMember,
+        Self::AlreadyAMember,
         Self::NotFreshest,
         Self::AlreadyPrimary,
         Self::DeviceOffline,
@@ -364,14 +380,42 @@ fn reported(s: &AgentSession, device: ObjectId) -> (i64, i64) {
         .map_or((0, 0), |t| (t.fence, t.seq))
 }
 
+/// FR-90 P2f-1 — what moves the session: a promotion to a member of its
+/// replicaset, or a teleport to a device that holds no copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Promote,
+    Teleport,
+}
+
+impl Kind {
+    /// The audit's action.
+    const fn action(self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Teleport => "teleport",
+        }
+    }
+
+    fn of(p: &Promotion) -> Self {
+        if p.teleport {
+            Self::Teleport
+        } else {
+            Self::Promote
+        }
+    }
+}
+
 /// Gates 4 on, past the session and the device lookups. The outer `Result`
 /// is the infrastructure, the inner one the policy — as the start's. P2e-6a —
-/// and where the primary is.
+/// and where the primary is. P2f-1 — a teleport's target holds no copy yet,
+/// and its primary must be online: the stream copies the session from it.
 async fn authorize(
     state: &HiveState,
     s: &AgentSession,
     target: ObjectId,
     user_id: ObjectId,
+    kind: Kind,
 ) -> Result<Result<Reach, PromoteDenyReason>, ApiError> {
     let tid = s.tenant_id;
     let tenant = state.tenants.base.find_by_id(tid).await?;
@@ -400,8 +444,11 @@ async fn authorize(
         .as_ref()
         .filter(|p| p.in_flight(DateTime::now()));
     if let Some(p) = moving {
-        let replaceable =
-            unanswered && p.state == PromotionState::Moving && p.to == s.location.device_id;
+        // A teleport never replaces a move: it copies from the primary.
+        let replaceable = kind == Kind::Promote
+            && unanswered
+            && p.state == PromotionState::Moving
+            && p.to == s.location.device_id;
         if !replaceable {
             return Ok(Err(PromoteDenyReason::InProgress));
         }
@@ -415,14 +462,45 @@ async fn authorize(
     if target == s.location.device_id {
         return Ok(Err(PromoteDenyReason::AlreadyPrimary));
     }
-    if member_role(s, target).is_none() {
-        return Ok(Err(PromoteDenyReason::NotAMember));
-    }
     let hub = &state.fleet.rc_hub;
-    match hub.agent_supports_hive_promote(target, tid) {
+    let takes_part = match kind {
+        Kind::Promote => {
+            if member_role(s, target).is_none() {
+                return Ok(Err(PromoteDenyReason::NotAMember));
+            }
+            hub.agent_supports_hive_promote(target, tid)
+        }
+        // P2f-1 — a device that holds a copy already is promoted to.
+        Kind::Teleport => {
+            if member_role(s, target).is_some() {
+                return Ok(Err(PromoteDenyReason::AlreadyAMember));
+            }
+            hub.agent_supports_hive_teleport(target, tid)
+        }
+    };
+    match takes_part {
         None => return Ok(Err(PromoteDenyReason::DeviceOffline)),
         Some(false) => return Ok(Err(PromoteDenyReason::DeviceUnsupported)),
         Some(true) => {}
+    }
+    // P2f-1 — a teleport copies the session from its primary, which must
+    // be online here: no copy elsewhere can stand in for it yet.
+    if kind == Kind::Teleport {
+        if unanswered {
+            return Ok(Err(PromoteDenyReason::NotRunning));
+        }
+        match hub.agent_supports_hive_teleport(s.location.device_id, tid) {
+            None => return Ok(Err(PromoteDenyReason::PrimaryOffline)),
+            Some(false) => return Ok(Err(PromoteDenyReason::PrimaryUnsupported)),
+            Some(true) => {}
+        }
+        if !state
+            .start_limiter
+            .check(user_id, target, hive_limits::START_RATE_PER_MINUTE)
+        {
+            return Ok(Err(PromoteDenyReason::RateLimited));
+        }
+        return Ok(Ok(Reach::Online));
     }
     // P2e-6a — an unreachable primary is waited out, then moved away from
     // with no drain, to the member that holds the most.
@@ -513,7 +591,9 @@ fn member_role(s: &AgentSession, device: ObjectId) -> Option<String> {
     })
 }
 
+/// The audit row of a move, `promote` or (P2f-1) `teleport`.
 fn audit(
+    kind: Kind,
     s: &AgentSession,
     by: ObjectId,
     device: ObjectId,
@@ -526,7 +606,7 @@ fn audit(
         target_id: None,
         device_id: device,
         session_id: s.id,
-        action: "promote",
+        action: kind.action(),
         outcome,
         reason,
     }
@@ -542,30 +622,72 @@ pub async fn promote(
     Path((tenant_id, session_id)): Path<(String, String)>,
     Json(body): Json<PromoteBody>,
 ) -> Result<Json<PromoteResponse>, ApiError> {
-    let tid = member_tenant(&state, &tenant_id, &auth).await?;
+    begin(state, auth, &tenant_id, &session_id, body, Kind::Promote).await
+}
+
+/// FR-90 P2f-1 — `POST /api/tenant/{tenant_id}/hive/session/{session_id}/teleport`
+/// — the owner moves the session to a device that holds no copy of it. The
+/// device prepares, joins the replicaset for this one session and takes a
+/// copy while the session still runs; then the promotion goes on as to any
+/// member. Answered once the device said whether it is ready, as `promote`
+/// is: `teleporting`, `refused` or `pending`.
+pub async fn teleport(
+    State(state): State<HiveState>,
+    auth: AuthUser,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    Json(body): Json<PromoteBody>,
+) -> Result<Json<PromoteResponse>, ApiError> {
+    begin(state, auth, &tenant_id, &session_id, body, Kind::Teleport).await
+}
+
+/// A move's route, either kind: the gates, the record, the prepare, and the
+/// target's answer.
+async fn begin(
+    state: HiveState,
+    auth: AuthUser,
+    tenant_id: &str,
+    session_id: &str,
+    body: PromoteBody,
+    kind: Kind,
+) -> Result<Json<PromoteResponse>, ApiError> {
+    let tid = member_tenant(&state, tenant_id, &auth).await?;
     if !state.replicaset {
         return Err(ApiError::NotFound(
             "moving sessions is off on this server".into(),
         ));
     }
-    let sid = parse_oid(&session_id, "session_id")?;
+    let sid = parse_oid(session_id, "session_id")?;
     // The owner's alone: anyone else's read of the id is a 404.
-    let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
+    let mut s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
     let target = parse_oid(&body.device_id, "device_id")?;
     let folder = clean_folder(body.folder.as_deref().unwrap_or(&s.location.folder))?;
     // LIVE in this org: a removed or foreign device answers like a bogus one.
     let device = state.fleet.agents.find_live_in_tenant(tid, target).await?;
+    // P2f-1 — a teleport adds its target to the replicaset: a session that
+    // has none yet (started before the switch, its device not back since)
+    // is placed first, as its device's next connection would place it.
+    if kind == Kind::Teleport && s.replicaset.is_none() {
+        crate::placement::place_unplaced(&state, tid, s.location.device_id).await?;
+        s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
+    }
 
-    let reach = match authorize(&state, &s, target, auth.user_id).await? {
+    let reach = match authorize(&state, &s, target, auth.user_id, kind).await? {
         Ok(reach) => reach,
         Err(reason) => {
             info!(
                 tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
-                reason = reason.as_str(), "hive: promotion refused"
+                reason = reason.as_str(), action = kind.action(), "hive: move refused"
             );
-            audit(&s, auth.user_id, target, "refused", Some(reason.as_str()))
-                .write(&state)
-                .await;
+            audit(
+                kind,
+                &s,
+                auth.user_id,
+                target,
+                "refused",
+                Some(reason.as_str()),
+            )
+            .write(&state)
+            .await;
             return Ok(Json(PromoteResponse::refused(
                 reason.as_str(),
                 reason.message().to_string(),
@@ -573,8 +695,13 @@ pub async fn promote(
             )));
         }
     };
-    let to_role = member_role(&s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into());
-    let unanswered = unanswered_move(&s);
+    let to_role = match kind {
+        Kind::Promote => {
+            member_role(&s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into())
+        }
+        Kind::Teleport => MemberRole::Teleport.as_str().into(),
+    };
+    let unanswered = kind == Kind::Promote && unanswered_move(&s);
     // Read before the promotion begins: nothing after it may fail on the way
     // to the push, or the promotion would wait out its bound for nothing.
     let user = state.users.base.find_by_id(s.owner_id).await?;
@@ -594,6 +721,7 @@ pub async fn promote(
         drained: None,
         unreachable_from: reach == Reach::Unreachable,
         prior: unanswered.then(|| prior_of(&s)).flatten(),
+        teleport: kind == Kind::Teleport,
     };
     if !state
         .sessions
@@ -607,9 +735,16 @@ pub async fn promote(
         } else {
             PromoteDenyReason::NotRunning
         };
-        audit(&s, auth.user_id, target, "refused", Some(reason.as_str()))
-            .write(&state)
-            .await;
+        audit(
+            kind,
+            &s,
+            auth.user_id,
+            target,
+            "refused",
+            Some(reason.as_str()),
+        )
+        .write(&state)
+        .await;
         return Ok(Json(PromoteResponse::refused(
             reason.as_str(),
             reason.message().to_string(),
@@ -630,9 +765,14 @@ pub async fn promote(
         user_id: s.owner_id,
         user_email: user.email,
         caller: user.display_name,
-        teleport: false,
+        teleport: kind == Kind::Teleport,
     };
-    if let Err(e) = state.fleet.rc_hub.push_hive_promote(target, tid, msg) {
+    let hub = &state.fleet.rc_hub;
+    let pushed = match kind {
+        Kind::Promote => hub.push_hive_promote(target, tid, msg),
+        Kind::Teleport => hub.push_hive_teleport(target, tid, msg),
+    };
+    if let Err(e) = pushed {
         // Gone, or reconnected as a build that takes no part, between the
         // gate and the push: nothing reached it.
         state.prepare_acks.forget(p.id);
@@ -644,9 +784,16 @@ pub async fn promote(
             HubError::ExecUnsupported(_) => PromoteDenyReason::DeviceUnsupported,
             _ => PromoteDenyReason::DeviceOffline,
         };
-        audit(&s, auth.user_id, target, "refused", Some(reason.as_str()))
-            .write(&state)
-            .await;
+        audit(
+            kind,
+            &s,
+            auth.user_id,
+            target,
+            "refused",
+            Some(reason.as_str()),
+        )
+        .write(&state)
+        .await;
         let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
         return Ok(Json(PromoteResponse::refused(
             reason.as_str(),
@@ -654,12 +801,12 @@ pub async fn promote(
             &s,
         )));
     }
-    audit(&s, auth.user_id, target, "sent", None)
+    audit(kind, &s, auth.user_id, target, "sent", None)
         .write(&state)
         .await;
     info!(
         tenant = %tid, session = %sid, from = %s.location.device_id, to = %target,
-        user = %auth.user_id, "hive: promotion started — prepare sent"
+        user = %auth.user_id, action = kind.action(), "hive: move started — prepare sent"
     );
     tokio::spawn(watch(state.clone(), sid, p.id));
 
@@ -672,7 +819,10 @@ pub async fn promote(
     let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
     Ok(Json(match heard {
         Ok(Ok(PrepareAnswer::Ready)) => PromoteResponse {
-            outcome: "promoting",
+            outcome: match kind {
+                Kind::Promote => "promoting",
+                Kind::Teleport => "teleporting",
+            },
             reason: None,
             message: None,
             session: SessionView::from(&s),
@@ -692,7 +842,7 @@ pub async fn promote(
 }
 
 /// Why a promotion failed before the lease moved.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Failure {
     /// The member said no to the prepare, in the start's words.
     PrepareRefused {
@@ -728,6 +878,31 @@ pub(crate) enum Failure {
     /// P2e-6a — the member's copy ends past where an older fence ended:
     /// it holds a tail a move cut off, which it has not set aside yet.
     CutOff,
+    /// P2f-1 — the teleport's target refused its join, in its words
+    /// ([`roomler_ai_remote_control::hive::HiveJoinRefusal`]).
+    JoinRefused { word: String },
+    /// P2f-1 — the primary refused its join as the primary: it does not say
+    /// where its copy ends, so the target has no tip to catch up with.
+    PrimaryJoinRefused { word: String },
+    /// P2f-1 — the session changed under the teleport before its target
+    /// joined: the device took a copy meanwhile, or its row went.
+    Changed,
+}
+
+/// P2f-1 — what a join refusal means, in the room's words.
+fn join_refusal_message(word: &str) -> &'static str {
+    match word {
+        "not_prepared" => {
+            "it was no longer prepared to run the session (its daemon may have restarted)"
+        }
+        "quota" => "its store is at its quota (hive_store_quota_mib)",
+        "purged" => "it purged the session, and removal is final",
+        "stale_fence" => "it holds the session at a newer fence",
+        "secondary_org" => "the session is not its primary organization's",
+        "replica_disabled" => "it does not hold copies (hive_replica)",
+        "archive_disabled" => "it does not offer itself as an archive (hive_archive)",
+        _ => "it said no",
+    }
 }
 
 impl Failure {
@@ -736,6 +911,7 @@ impl Failure {
         match self {
             Self::PrepareRefused { word, .. } => word.as_str(),
             Self::Timeout(PromotionState::Preparing) => "prepare_timeout",
+            Self::Timeout(PromotionState::Joining) => "join_timeout",
             Self::Timeout(PromotionState::Draining) => "drain_timeout",
             Self::Timeout(PromotionState::Syncing) => "sync_timeout",
             Self::Timeout(PromotionState::Moving) => "start_timeout",
@@ -752,6 +928,9 @@ impl Failure {
             Self::NotFreshest => "not_freshest",
             Self::PrimaryBack => "primary_back",
             Self::CutOff => "cut_off",
+            Self::JoinRefused { .. } => "join_refused",
+            Self::PrimaryJoinRefused { .. } => "primary_join_refused",
+            Self::Changed => "changed",
         }
     }
 
@@ -775,7 +954,9 @@ impl Failure {
             Self::Timeout(PromotionState::Draining) => {
                 format!("{from} did not finish its turn and hand the session over in time")
             }
-            Self::Timeout(PromotionState::Syncing) | Self::Timeout(PromotionState::Moving) => {
+            Self::Timeout(PromotionState::Joining)
+            | Self::Timeout(PromotionState::Syncing)
+            | Self::Timeout(PromotionState::Moving) => {
                 format!("the copy on {to} did not catch up in time")
             }
             Self::DrainRefused {
@@ -798,6 +979,15 @@ impl Failure {
                 "the copy on {to} holds events an earlier move left out; it sets them aside \
                  once it follows the session again"
             ),
+            Self::JoinRefused { word } => format!(
+                "{to} did not take a copy of the session: {}",
+                join_refusal_message(word)
+            ),
+            Self::PrimaryJoinRefused { word } => format!(
+                "{from} did not say where its copy of the session ends: {}",
+                join_refusal_message(word)
+            ),
+            Self::Changed => "the session changed while it was being moved: try again".into(),
         }
     }
 }
@@ -832,6 +1022,11 @@ pub(crate) async fn fail(
     let Some(was) = before.promotion.clone() else {
         return;
     };
+    // P2f-1 — a teleport's target, added at its joining step, took its copy
+    // only to run the session.
+    if was.teleport && was.state != PromotionState::Preparing {
+        let_go(state, session_id, was.to).await;
+    }
     // A session stopped or ended meanwhile: its end says so, and it holds
     // no lease to give back.
     let runs = SessionStatus::REPORTABLE.contains(&before.status);
@@ -856,9 +1051,16 @@ pub(crate) async fn fail(
         session = %session_id, to = %was.to, state = was.state.as_str(),
         reason = failure.reason(), "hive: promotion failed — nothing moved"
     );
-    audit(&before, was.by, was.to, "failed", Some(failure.reason()))
-        .write(state)
-        .await;
+    audit(
+        Kind::of(&was),
+        &before,
+        was.by,
+        was.to,
+        "failed",
+        Some(failure.reason()),
+    )
+    .write(state)
+    .await;
     if runs {
         room::note(state, &before, room::move_failed_note(&was, &why)).await;
     }
@@ -874,6 +1076,16 @@ pub(crate) async fn fail(
             message: why,
         },
     );
+}
+
+/// P2f-1 — a teleport that did not happen lets its target go (`leaving`), and
+/// that target's streams of the session end: it took its copy only to run the
+/// session. What it holds goes with the purge (P2g).
+async fn let_go(state: &HiveState, sid: ObjectId, target: ObjectId) {
+    if let Err(e) = state.sessions.mark_leaving(sid, target).await {
+        warn!(session = %sid, device = %target, %e, "hive: a teleport's target was not let go");
+    }
+    crate::stream::end_for_member(state, sid, target, "teleport_ended");
 }
 
 /// The one timer of a promotion: a step that runs past its bound fails it.
@@ -953,17 +1165,41 @@ pub(crate) async fn on_prepare_ack(
         )
         .await;
     }
+    // P2f-1 — a teleport's target takes its copy before anything drains.
+    if p.teleport {
+        return begin_joining(state, &s, &p).await;
+    }
     // P2e-6a — away from a primary that was unreachable: no drain. One
     // heard from again meanwhile drains after all.
     if p.unreachable_from && !primary_heard_from(state, &s, &p).await {
         return move_from_unreachable(state, &s, &p, device_id, tip).await;
     }
+    if drain_primary(state, &s, &p, PromotionState::Preparing).await {
+        state
+            .prepare_acks
+            .deliver(p.id, device_id, PrepareAnswer::Ready);
+    }
+}
+
+/// The member is ready, or (P2f-1) a teleport's target caught up: the
+/// promotion steps from `from` to `draining`, and the primary is told to
+/// drain; one that cannot be told fails the promotion. `true` = the drain
+/// was asked.
+async fn drain_primary(
+    state: &HiveState,
+    s: &AgentSession,
+    p: &Promotion,
+    from: PromotionState,
+) -> bool {
+    let Some(session_id) = s.id else {
+        return false;
+    };
     match state
         .sessions
         .advance_promotion(
             session_id,
             p.id,
-            PromotionState::Preparing,
+            from,
             PromotionState::Draining,
             deadline_after(state.promote_bounds.drain),
             doc! {},
@@ -971,9 +1207,10 @@ pub(crate) async fn on_prepare_ack(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return,
+        Ok(false) => return false,
         Err(e) => {
-            return warn!(session = %session_id, %e, "hive: a promotion did not take its next step");
+            warn!(session = %session_id, %e, "hive: a promotion did not take its next step");
+            return false;
         }
     }
     let drain = ServerMsg::HiveDrain {
@@ -988,16 +1225,171 @@ pub(crate) async fn on_prepare_ack(
         debug!(session = %session_id, %e, "hive: the drain did not reach the primary");
         let draining = Promotion {
             state: PromotionState::Draining,
-            ..p
+            ..p.clone()
         };
-        return fail(state, session_id, &draining, Failure::PrimaryGone, true).await;
+        fail(state, session_id, &draining, Failure::PrimaryGone, true).await;
+        return false;
     }
-    info!(session = %session_id, to = %device_id, "hive: the member is ready — the primary drains");
+    info!(session = %session_id, to = %p.to, "hive: the member is ready — the primary drains");
     let by = display_name(state, p.by).await;
-    room::note(state, &s, room::moving_note(&p, &by)).await;
-    state
-        .prepare_acks
-        .deliver(p.id, device_id, PrepareAnswer::Ready);
+    room::note(state, s, room::moving_note(p, &by)).await;
+    true
+}
+
+/// FR-90 P2f-1 — a teleport's target is ready: it joins the replicaset in the
+/// `teleport` role, and the teleport takes its `joining` step. The target is
+/// sent its join, and the primary its join as the primary, which it answers
+/// by saying where its copy ends; a session that ran alone is owed that
+/// join, and leased from then on, as when placement gives it a first member
+/// (P2c-4, P2e-2). The caller hears the target is ready; the drain waits for
+/// the target's copy ([`check_joined`]).
+async fn begin_joining(state: &HiveState, s: &AgentSession, p: &Promotion) {
+    let Some(sid) = s.id else { return };
+    // Before the target's row: whether the primary checkpoints already.
+    let told = crate::replica::replicated(s);
+    match state
+        .sessions
+        .begin_joining(sid, p.id, p.to, deadline_after(state.promote_bounds.join))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // Moved on by another frame, or the device took a copy meanwhile.
+            if let Ok(Some(now)) = state.sessions.find(sid).await
+                && let Some(q) = now
+                    .promotion
+                    .filter(|q| q.id == p.id && q.state == PromotionState::Preparing)
+            {
+                fail(state, sid, &q, Failure::Changed, false).await;
+            }
+            return;
+        }
+        Err(e) => return warn!(session = %sid, %e, "hive: a teleport's target did not join"),
+    }
+    let s = match state.sessions.find(sid).await {
+        Ok(Some(s)) => s,
+        _ => return warn!(session = %sid, "hive: a joining teleport's record was not read back"),
+    };
+    if !told {
+        if let Err(e) = state.sessions.owe_primary_join(sid).await {
+            warn!(session = %sid, %e, "hive: the primary was not owed its join");
+        }
+        let fence = u64::try_from(s.fence).unwrap_or_default();
+        crate::lease::push(state, s.tenant_id, s.location.device_id, sid, fence);
+    }
+    crate::replica::push_join(state, &s, p.to, HiveReplicaRole::Teleport);
+    crate::replica::push_join(state, &s, s.location.device_id, HiveReplicaRole::Primary);
+    info!(session = %sid, to = %p.to, "hive: the teleport's target is ready — it takes a copy first");
+    let by = display_name(state, p.by).await;
+    room::note(state, &s, room::teleporting_note(p, &by)).await;
+    state.prepare_acks.deliver(p.id, p.to, PrepareAnswer::Ready);
+    // The answers may be in already.
+    if let Ok(Some(now)) = state.sessions.find(sid).await {
+        check_joined(state, &now).await;
+    }
+}
+
+/// P2f-1 — where a teleport's joining step stands.
+#[derive(Debug, PartialEq)]
+enum Joined {
+    /// Not yet: a join unanswered, no tip from the primary since the
+    /// teleport began, or the target's copy behind that tip.
+    Waiting,
+    /// The target's copy holds what the primary said it holds: drain.
+    CaughtUp,
+    /// It cannot go on.
+    Failed(Failure),
+}
+
+/// P2f-1 — the joining step of `p`, from the record: the target's row and
+/// the primary's, their answers, and their tips. The primary's tip counts
+/// only once heard since the teleport began: its join asks for it, and an
+/// older one may predate what the session did since. Compared as
+/// [`on_chain`] does, a tail past an ended fence counting for nothing.
+fn joined_of(s: &AgentSession, p: &Promotion) -> Joined {
+    let row = |device: ObjectId, primary: bool| {
+        s.replicaset.as_ref().and_then(|r| {
+            r.members.iter().find(|m| {
+                m.device_id == device && (m.role == MemberRole::Primary.as_str()) == primary
+            })
+        })
+    };
+    let word =
+        |m: &crate::model::ReplicaMember| m.refusal.clone().unwrap_or_else(|| "other".into());
+    let Some(target) = row(p.to, false) else {
+        return Joined::Failed(Failure::MemberLeft);
+    };
+    match target.state {
+        MemberState::Refused => return Joined::Failed(Failure::JoinRefused { word: word(target) }),
+        MemberState::Leaving => return Joined::Failed(Failure::MemberLeft),
+        MemberState::Pending => return Joined::Waiting,
+        MemberState::Joined => {}
+    }
+    let Some(primary) = row(s.location.device_id, true) else {
+        return Joined::Failed(Failure::Changed);
+    };
+    match primary.state {
+        MemberState::Refused => {
+            return Joined::Failed(Failure::PrimaryJoinRefused {
+                word: word(primary),
+            });
+        }
+        MemberState::Pending | MemberState::Leaving => return Joined::Waiting,
+        MemberState::Joined => {}
+    }
+    let Some(ends) = primary.tip.as_ref().filter(|t| t.at >= p.started_at) else {
+        return Joined::Waiting;
+    };
+    let Some(holds) = target.tip.as_ref() else {
+        return Joined::Waiting;
+    };
+    if on_chain(s, holds.fence, holds.seq) >= on_chain(s, ends.fence, ends.seq) {
+        Joined::CaughtUp
+    } else {
+        Joined::Waiting
+    }
+}
+
+/// P2f-1 — a teleport joining: on to the drain once its target caught up,
+/// failed when it cannot go on, and nothing while it waits.
+async fn check_joined(state: &HiveState, s: &AgentSession) {
+    let (Some(sid), Some(p)) = (s.id, s.promotion.clone()) else {
+        return;
+    };
+    if p.state != PromotionState::Joining {
+        return;
+    }
+    match joined_of(s, &p) {
+        Joined::Waiting => {}
+        Joined::CaughtUp => {
+            info!(session = %sid, to = %p.to, "hive: the teleport's target caught up");
+            drain_primary(state, s, &p, PromotionState::Joining).await;
+        }
+        Joined::Failed(f) => fail(state, sid, &p, f, false).await,
+    }
+}
+
+/// P2f-1 — a join's answer landed (`rc:hive.replica.join_ack`): a teleport
+/// joining, if one waits on that device, its target or its primary, may go
+/// on.
+pub(crate) async fn on_join_answer(state: &HiveState, session_id: ObjectId, device_id: ObjectId) {
+    match state
+        .sessions
+        .base
+        .find_one(doc! {
+            "_id": session_id,
+            "promotion.state": PromotionState::Joining.as_str(),
+            "$or": [
+                { "promotion.to": device_id },
+                { "promotion.from.device_id": device_id },
+            ],
+        })
+        .await
+    {
+        Ok(Some(s)) => check_joined(state, &s).await,
+        Ok(None) => {}
+        Err(e) => warn!(session = %session_id, %e, "hive: a join answer's teleport was not read"),
+    }
 }
 
 /// P2e-6a — whether the promotion's primary has been heard from since it
@@ -1175,19 +1567,34 @@ pub(crate) async fn on_drained(
 
 /// A member's tip landed (`rc:hive.replica.tip`, or a manifest's entry):
 /// the promotion moving the session to that member, if one is syncing, may
-/// move the lease now.
+/// move the lease now. P2f-1 — and a teleport joining may go on to the
+/// drain, on its target's tip or on its primary's.
 pub(crate) async fn on_tip(state: &HiveState, session_id: ObjectId, device_id: ObjectId) {
     match state
         .sessions
         .base
         .find_one(doc! {
             "_id": session_id,
-            "promotion.state": PromotionState::Syncing.as_str(),
-            "promotion.to": device_id,
+            "$or": [
+                {
+                    "promotion.state": PromotionState::Syncing.as_str(),
+                    "promotion.to": device_id,
+                },
+                {
+                    "promotion.state": PromotionState::Joining.as_str(),
+                    "$or": [
+                        { "promotion.to": device_id },
+                        { "promotion.from.device_id": device_id },
+                    ],
+                },
+            ],
         })
         .await
     {
-        Ok(Some(s)) => check_sync(state, &s).await,
+        Ok(Some(s)) => match s.promotion.as_ref().map(|p| p.state) {
+            Some(PromotionState::Joining) => check_joined(state, &s).await,
+            _ => check_sync(state, &s).await,
+        },
         Ok(None) => {}
         Err(e) => warn!(session = %session_id, %e, "hive: a tip's promotion was not read"),
     }
@@ -1268,7 +1675,9 @@ async fn move_lease(state: &HiveState, s: &AgentSession, p: &Promotion) {
         session = %sid, from = %p.from.device_id, to = %p.to, fence = next,
         old_primary = member_state.as_str(), "hive: the lease moved"
     );
-    audit(&s, p.by, p.to, "moved", None).write(state).await;
+    audit(Kind::of(p), &s, p.by, p.to, "moved", None)
+        .write(state)
+        .await;
     // What the old primary's run had open belongs to a run that is over.
     room::withdraw_approvals(state, &s).await;
     crate::view::end_grants_of_session(state, sid, "moved").await;
@@ -1457,7 +1866,9 @@ pub(crate) async fn on_launched(
         _ => s,
     };
     info!(session = %session_id, device = %device_id, fence, "hive: promotion done — the session runs on its new primary");
-    audit(&s, p.by, p.to, "done", None).write(state).await;
+    audit(Kind::of(&p), &s, p.by, p.to, "done", None)
+        .write(state)
+        .await;
     let by = display_name(state, p.by).await;
     room::note(state, &s, room::moved_note(&s, &p, &by)).await;
     true
@@ -1499,9 +1910,16 @@ pub(crate) async fn on_start_refused(
         session = %session_id, refused = word.as_str(), back_to = %p.from.device_id,
         fence = s.fence, "hive: the member refused the moved start — the lease moved back"
     );
-    audit(&s, p.by, p.to, "moved_back", Some(word.as_str()))
-        .write(state)
-        .await;
+    audit(
+        Kind::of(&p),
+        &s,
+        p.by,
+        p.to,
+        "moved_back",
+        Some(word.as_str()),
+    )
+    .write(state)
+    .await;
     // P2e-5c — and every view and stream of the session ends, as at the
     // move. The member never ran it: a stream it was asked to serve would
     // tell its member the session runs nowhere, and the member would park a
@@ -1607,6 +2025,7 @@ mod tests {
             }),
             unreachable_from: false,
             prior: None,
+            teleport: false,
         };
         let member = |device_id, role: &str, tip| ReplicaMember {
             device_id,
@@ -1882,6 +2301,108 @@ mod tests {
         assert_eq!(prior_of(&s), None);
     }
 
+    /// FR-90 P2f-1 — a teleport joining goes on to the drain only once its
+    /// target joined, its primary joined and said where its copy ends since
+    /// the teleport began, and the target's copy holds that much; a refused
+    /// join or a target let go fails it, each in its own word.
+    #[test]
+    fn a_teleport_drains_only_once_its_target_holds_the_primarys_tip() {
+        let (mut s, mut p) = syncing(None, None);
+        p.teleport = true;
+        p.state = PromotionState::Joining;
+        p.started_at = DateTime::from_millis(DateTime::now().timestamp_millis() - 1000);
+        fn at(s: &mut AgentSession, device: ObjectId) -> &mut ReplicaMember {
+            s.replicaset
+                .as_mut()
+                .unwrap()
+                .members
+                .iter_mut()
+                .find(|m| m.device_id == device)
+                .unwrap()
+        }
+        at(&mut s, p.to).role = "teleport".into();
+        // The primary joined and said where its copy ends since the teleport
+        // began; the target holds as much, but has not answered its join.
+        at(&mut s, p.from.device_id).tip = Some(tip(9, "ff"));
+        at(&mut s, p.to).state = MemberState::Pending;
+        at(&mut s, p.to).tip = Some(tip(9, "ab"));
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Waiting,
+            "the target has not answered its join"
+        );
+        at(&mut s, p.to).state = MemberState::Joined;
+        at(&mut s, p.from.device_id).state = MemberState::Pending;
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Waiting,
+            "the primary has not answered its join"
+        );
+        at(&mut s, p.from.device_id).state = MemberState::Joined;
+        // The primary's tip from before the teleport began.
+        at(&mut s, p.from.device_id).tip = Some(MemberTip {
+            at: DateTime::from_millis(p.started_at.timestamp_millis() - 1),
+            ..tip(9, "ff")
+        });
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Waiting,
+            "the primary's tip predates the teleport"
+        );
+        at(&mut s, p.from.device_id).tip = Some(tip(14, "ff"));
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Waiting,
+            "the target's copy is behind the primary's"
+        );
+        at(&mut s, p.to).tip = Some(tip(14, "ab"));
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::CaughtUp,
+            "the target holds what the primary said it holds"
+        );
+
+        at(&mut s, p.to).state = MemberState::Refused;
+        at(&mut s, p.to).refusal = Some("not_prepared".into());
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Failed(Failure::JoinRefused {
+                word: "not_prepared".into()
+            }),
+            "the target refused its join"
+        );
+        at(&mut s, p.to).state = MemberState::Leaving;
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Failed(Failure::MemberLeft),
+            "the target was let go"
+        );
+        at(&mut s, p.to).state = MemberState::Joined;
+        at(&mut s, p.from.device_id).state = MemberState::Refused;
+        at(&mut s, p.from.device_id).refusal = Some("other".into());
+        assert_eq!(
+            joined_of(&s, &p),
+            Joined::Failed(Failure::PrimaryJoinRefused {
+                word: "other".into()
+            }),
+            "the primary refused its join"
+        );
+    }
+
+    /// FR-90 P2f-1 — by default a teleport waits for its target's copy for
+    /// less time than the target admits its join: a join re-sent after the
+    /// admission ran out would be refused `not_prepared`.
+    #[test]
+    fn a_teleport_waits_less_than_its_target_admits_its_join() {
+        use roomler_ai_remote_control::hive::promote_limits::TELEPORT_ADMISSION_SECS;
+        let defaults = roomler_ai_config::HiveSettings::default();
+        assert!(
+            defaults.promote_join_secs < TELEPORT_ADMISSION_SECS,
+            "{} s against {TELEPORT_ADMISSION_SECS} s",
+            defaults.promote_join_secs
+        );
+    }
+
     /// The member's role, only as a joined member, never the primary's row.
     #[test]
     fn only_a_joined_member_can_be_promoted_to() {
@@ -1949,6 +2470,14 @@ mod tests {
             Failure::NotFreshest,
             Failure::PrimaryBack,
             Failure::CutOff,
+            Failure::Timeout(PromotionState::Joining),
+            Failure::JoinRefused {
+                word: "not_prepared".into(),
+            },
+            Failure::PrimaryJoinRefused {
+                word: "other".into(),
+            },
+            Failure::Changed,
         ];
         let mut words: Vec<&str> = all.iter().map(Failure::reason).collect();
         words.sort_unstable();

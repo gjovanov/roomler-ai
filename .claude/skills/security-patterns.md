@@ -22,7 +22,7 @@ let cors = CorsLayer::new()
 
 ### JWT Default Secret — discovered 2026-03-10
 **Symptom:** Default JWT secret is "change-me-in-production"
-**Root cause:** `crates/config/src/settings.rs:146` sets `.set_default("jwt.secret", "change-me-in-production")`
+**Root cause:** `crates/config/src/settings.rs:160` sets `.set_default("jwt.secret", "change-me-in-production")`
 **Status:** OPEN — production MUST override via `ROOMLER__JWT__SECRET` env var
 **Recurrence prevention:** Health check verifies JWT secret length > 32 chars in production
 

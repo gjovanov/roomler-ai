@@ -2848,6 +2848,7 @@ async fn the_promotions_compare_and_sets_move_the_lease_once() {
         }),
         unreachable_from: false,
         prior: None,
+        teleport: false,
     };
     let (one, two) = (promotion(), promotion());
     assert!(
@@ -3999,6 +4000,635 @@ async fn a_promotion_is_refused_by_the_gate_it_failed() {
     ] {
         assert!(reasons.iter().any(|r| r == want), "{want}: {reasons:?}");
     }
+}
+
+// ─── P2f-1 — teleport ──────────────────────────────────────────────────────
+
+/// What a build that takes part in a teleport advertises at either end:
+/// everything a promotion asks, and `hive-teleport`.
+const TELEPORTS: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+];
+
+/// …and a target whose owner never let it hold copies: no `hive-replica`.
+const TELEPORT_TARGET: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+];
+
+/// [`promote_app`], with the teleport's joining step bound to 6 s.
+async fn teleport_app() -> TestApp {
+    teleport_app_joining(6).await
+}
+
+/// [`teleport_app`], the joining step bound to `join_secs`.
+async fn teleport_app_joining(join_secs: u64) -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+        s.hive.promote_prepare_secs = 4;
+        s.hive.promote_join_secs = join_secs;
+        s.hive.promote_drain_secs = 4;
+        s.hive.promote_sync_secs = 4;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// A session running alone on `a` (the policy's `min` is 1), and `b`, which
+/// holds no copy of it and advertises `b_caps`.
+async fn teleportable(app: &TestApp, tag: &str, b_caps: &[&str]) -> Moving {
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(app, &tid, &admin, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), TELEPORTS).await;
+    let b = device(app, &seeded, &format!("mach-{tag}-b"), b_caps).await;
+    let (s, frame) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
+    assert_ne!(frame["replicated"], true, "alone: {frame}");
+    Moving {
+        tid,
+        admin,
+        admin_id: seeded.admin.id.clone(),
+        sid: s["id"].as_str().unwrap().to_string(),
+        a,
+        b,
+        more: Vec::new(),
+        seeded,
+    }
+}
+
+async fn post_teleport(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    device: &str,
+    folder: Option<&str>,
+) -> (u16, Value) {
+    let mut body = json!({ "device_id": device });
+    if let Some(f) = folder {
+        body["folder"] = json!(f);
+    }
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/hive/session/{sid}/teleport"),
+            token,
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// Teleport `m`'s session to `b` into `folder`, `b` answering its prepare
+/// `answer` (`None` = ready): the route's answer and the prepare `b` got.
+async fn teleport_answered(
+    app: &TestApp,
+    m: &mut Moving,
+    folder: Option<&str>,
+    answer: Option<Value>,
+) -> (Value, Value) {
+    let (tid, admin, sid, to) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+    let caller = post_teleport(app, &tid, &admin, &sid, &to, folder);
+    let target = async {
+        let prep = read_until(&mut m.b.ws, "rc:hive.prepare")
+            .await
+            .expect("the target is asked to prepare");
+        let mut ack = json!({"t": "rc:hive.prepare_ack", "session_id": sid,
+                             "fence": prep["fence"], "account": "dev"});
+        if let Some(Value::Object(extra)) = answer {
+            for (k, v) in extra {
+                ack[k] = v;
+            }
+        }
+        send(&mut m.b.ws, ack).await;
+        prep
+    };
+    let ((code, body), prep) = tokio::join!(caller, target);
+    assert_eq!(code, 200, "{body}");
+    (body, prep)
+}
+
+/// [`teleport_answered`], ready: the target is sent its join (returned), the
+/// primary its own, and the record is `joining`.
+async fn joining(app: &TestApp, m: &mut Moving, folder: Option<&str>) -> Value {
+    let (body, prep) = teleport_answered(app, m, folder, None).await;
+    assert_eq!(body["outcome"], "teleporting", "{body}");
+    assert_eq!(
+        prep["teleport"], true,
+        "a teleport's prepare says so: {prep}"
+    );
+    let join = read_until(&mut m.b.ws, "rc:hive.replica.join")
+        .await
+        .expect("the target is sent its join");
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(1), Some("teleport")),
+        "{join}"
+    );
+    join
+}
+
+/// A join's answer, `joined`, from `ws` at fence 1.
+async fn joined(ws: &mut AgentWs, sid: &str) {
+    send(
+        ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+}
+
+/// The `teleport` audit rows of `sid`, in order: (outcome, reason).
+async fn teleport_audit(app: &TestApp, sid: &str) -> Vec<(String, String)> {
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "session_id": ObjectId::parse_str(sid).unwrap(), "action": "teleport" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        out.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+        ));
+    }
+    out
+}
+
+/// FR-90 P2f-1 — the whole teleport, with fake devices at both ends. The
+/// target, which holds no copy and does not hold copies at all, is asked a
+/// teleport's prepare; ready, it joins the replicaset in the `teleport` role
+/// and is sent its join, the session that ran alone is leased and its
+/// primary sent its join as the primary. Nothing drains until both answered,
+/// the primary said where its copy ends, and the target's copy holds that
+/// much; then the drain, the sync and the move run as a promotion's, the
+/// target the primary at fence 2, in the folder the teleport named. Every
+/// audit row says `teleport`.
+#[tokio::test]
+async fn a_teleport_joins_its_target_then_moves_the_session_as_a_promotion() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleport", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    let (body, prep) = teleport_answered(&app, &mut m, Some("/srv/elsewhere"), None).await;
+    assert_eq!(body["outcome"], "teleporting", "{body}");
+    assert_eq!(
+        (
+            prep["teleport"].as_bool(),
+            prep["fence"].as_u64(),
+            prep["folder"].as_str()
+        ),
+        (Some(true), Some(2), Some("/srv/elsewhere")),
+        "{prep}"
+    );
+    assert_eq!(
+        (
+            body["session"]["promotion"]["state"].as_str(),
+            body["session"]["promotion"]["teleport"].as_bool()
+        ),
+        (Some("joining"), Some(true)),
+        "{body}"
+    );
+
+    let b_join = read_until(&mut m.b.ws, "rc:hive.replica.join")
+        .await
+        .expect("the target is sent its join, though it holds no copies");
+    assert_eq!(
+        (b_join["fence"].as_u64(), b_join["role"].as_str()),
+        (Some(1), Some("teleport")),
+        "{b_join}"
+    );
+    // The lease word goes first, then the join: each read in its turn.
+    let word = arrives(&mut m.a.ws, "rc:hive.lease", Duration::from_secs(5)).await;
+    assert!(
+        word.is_some_and(|w| w["fence"] == 1),
+        "a session that ran alone is leased from its first member on"
+    );
+    let a_join = arrives(&mut m.a.ws, "rc:hive.replica.join", Duration::from_secs(5))
+        .await
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        (a_join["fence"].as_u64(), a_join["role"].as_str()),
+        (Some(1), Some("primary")),
+        "the primary is asked to join as the primary: {a_join}"
+    );
+    let s = stored(&app, &sid).await;
+    assert_eq!(promotion_state(&s), Some("joining"));
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("teleport".into(), "pending".into())
+    );
+    assert_eq!(
+        stored_member(&s, &m.a.agent_id),
+        ("primary".into(), "pending".into()),
+        "a session that ran alone: its primary is owed its join"
+    );
+
+    joined(&mut m.b.ws, &sid).await;
+    joined(&mut m.a.ws, &sid).await;
+    send(&mut m.a.ws, tip_at(&sid, 1, 7, "ab")).await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 5, "cd")).await;
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(800)).await,
+        "the target's copy is behind the primary's: no drain"
+    );
+    let s = stored(&app, &sid).await;
+    assert_eq!(promotion_state(&s), Some("joining"));
+    assert_eq!(
+        (
+            stored_member(&s, &m.b.agent_id),
+            stored_member(&s, &m.a.agent_id)
+        ),
+        (
+            ("teleport".into(), "joined".into()),
+            ("primary".into(), "joined".into())
+        )
+    );
+    send(&mut m.b.ws, tip_at(&sid, 1, 7, "ab")).await;
+    let drain = read_until(&mut m.a.ws, "rc:hive.drain")
+        .await
+        .expect("caught up: the primary is told to drain");
+    assert_eq!(drain["fence"], 1);
+
+    send(&mut m.a.ws, drained(&sid, 8, "ef")).await;
+    wait_stored(&app, &sid, "syncing", |s| {
+        promotion_state(s) == Some("syncing")
+    })
+    .await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 8, "ef")).await;
+    let b_frames = frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let kinds: Vec<&str> = b_frames.iter().map(|f| f["t"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"]
+    );
+    assert_eq!(
+        (b_frames[0]["fence"].as_u64(), b_frames[0]["role"].as_str()),
+        (Some(2), Some("primary"))
+    );
+    assert_eq!(
+        (
+            b_frames[2]["fence"].as_u64(),
+            b_frames[2]["folder"].as_str()
+        ),
+        (Some(2), Some("/srv/elsewhere")),
+        "the folder the teleport named"
+    );
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_i64("fence").unwrap(), 2);
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("primary".into(), "pending".into())
+    );
+    assert_eq!(
+        stored_member(&s, &m.a.agent_id),
+        ("owner".into(), "pending".into()),
+        "the old primary, the owner's own that holds copies, stays a member"
+    );
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2, "account": "dev"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "done", |s| {
+        !s.contains_key("promotion") && s.get_datetime("accepted_at").is_ok()
+    })
+    .await;
+    assert_eq!(
+        notes_with(&app, &m, "which holds no copy of it yet")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(wait_note(&app, &m, "🔀 Moved from").await.len(), 1);
+    assert_eq!(
+        teleport_audit(&app, &sid).await,
+        [
+            ("sent".to_string(), String::new()),
+            ("moved".to_string(), String::new()),
+            ("done".to_string(), String::new()),
+        ]
+    );
+    assert!(
+        promote_audit(&app, &sid).await.is_empty(),
+        "no row of it reads as a promotion"
+    );
+}
+
+/// FR-90 P2f-1 — a teleport is refused by the gate it failed, each in its
+/// own word: the route is not there with the replicaset off; a device that
+/// holds a copy already is promoted to, not teleported to; the target and the
+/// primary must both advertise `hive-teleport`, and both be online: a
+/// teleport copies the session from its primary.
+#[tokio::test]
+async fn a_teleport_is_refused_by_the_gate_it_failed() {
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("teleportoff").await;
+    let (code, _) = post_teleport(
+        &off,
+        &seeded.tenant_id,
+        &seeded.admin.access_token,
+        &ObjectId::new().to_hex(),
+        &ObjectId::new().to_hex(),
+        None,
+    )
+    .await;
+    assert_eq!(code, 404, "with the replicaset off the route is not there");
+
+    let app = teleport_app().await;
+    let refused = |body: &Value, why: &str| {
+        assert_eq!(
+            (body["outcome"].as_str(), body["reason"].as_str()),
+            (Some("refused"), Some(why)),
+            "{body}"
+        );
+        assert!(body["message"].as_str().is_some_and(|t| !t.is_empty()));
+    };
+    // A session with a member that took its copy; its primary takes no part
+    // in a teleport.
+    let mut p = promotable(&app, "teleportmember", 0, PROMOTES).await;
+    let (tid, admin, sid) = (p.tid.clone(), p.admin.clone(), p.sid.clone());
+    let try_to = |sid: String, device: String| {
+        let (app, tid, admin) = (&app, tid.clone(), admin.clone());
+        async move {
+            post_teleport(app, &tid, &admin, &sid, &device, None)
+                .await
+                .1
+        }
+    };
+    refused(
+        &try_to(sid.clone(), p.b.agent_id.clone()).await,
+        "already_a_member",
+    );
+    refused(
+        &try_to(sid.clone(), p.a.agent_id.clone()).await,
+        "already_primary",
+    );
+    let target = device(&app, &p.seeded, "mach-teleportmember-t", TELEPORT_TARGET).await;
+    refused(
+        &try_to(sid.clone(), target.agent_id.clone()).await,
+        "primary_unsupported",
+    );
+    let old = device(&app, &p.seeded, "mach-teleportmember-o", PROMOTES).await;
+    refused(
+        &try_to(sid.clone(), old.agent_id.clone()).await,
+        "device_unsupported",
+    );
+    p.b.ws.close(None).await.unwrap();
+
+    // A session alone: its primary offline, then the target too.
+    let mut m = teleportable(&app, "teleportgate", TELEPORT_TARGET).await;
+    m.a.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.a.agent_id).await;
+    let (_, body) = post_teleport(&app, &m.tid, &m.admin, &m.sid, &m.b.agent_id, None).await;
+    refused(&body, "primary_offline");
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.b.agent_id).await;
+    let (_, body) = post_teleport(&app, &m.tid, &m.admin, &m.sid, &m.b.agent_id, None).await;
+    refused(&body, "device_offline");
+
+    let reasons = |rows: Vec<(String, String)>| -> Vec<String> {
+        rows.into_iter()
+            .filter(|(o, _)| o == "refused")
+            .map(|(_, r)| r)
+            .collect()
+    };
+    assert_eq!(
+        reasons(teleport_audit(&app, &sid).await),
+        [
+            "already_a_member",
+            "already_primary",
+            "primary_unsupported",
+            "device_unsupported"
+        ]
+    );
+    assert_eq!(
+        reasons(teleport_audit(&app, &m.sid).await),
+        ["primary_offline", "device_offline"]
+    );
+}
+
+/// FR-90 P2f-1 — a target that refuses its join fails the teleport in its
+/// word: nothing drains, the target's copy is let go (`leaving`), and the
+/// room says why.
+#[tokio::test]
+async fn a_teleport_whose_target_refuses_its_join_lets_it_go() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleportrefuse", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    joining(&app, &mut m, None).await;
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1,
+               "refused": "not_prepared", "detail": "a restart came between"}),
+    )
+    .await;
+    let s = wait_stored(&app, &sid, "the teleport fails", |s| {
+        !s.contains_key("promotion")
+    })
+    .await;
+    assert_eq!(
+        teleport_audit(&app, &sid).await.last(),
+        Some(&("failed".to_string(), "join_refused".to_string())),
+        "failed in the device's word"
+    );
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("teleport".into(), "leaving".into()),
+        "its copy is let go"
+    );
+    assert_eq!(s.get_i64("fence").unwrap(), 1, "nothing moved");
+    let why = wait_note(&app, &m, "did not take a copy of the session").await;
+    assert!(why[0].contains("no longer prepared"), "{}", why[0]);
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(500)).await,
+        "the primary never drains"
+    );
+}
+
+/// FR-90 P2f-1 — a target whose copy never catches up fails the teleport at
+/// the joining step's bound: the primary was never told to drain, so it has
+/// nothing to give back, and the target's copy is let go.
+#[tokio::test]
+async fn a_teleport_whose_target_never_catches_up_fails_at_its_bound() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleportslow", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    joining(&app, &mut m, None).await;
+    joined(&mut m.b.ws, &sid).await;
+    joined(&mut m.a.ws, &sid).await;
+    send(&mut m.a.ws, tip_at(&sid, 1, 9, "ab")).await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 3, "cd")).await;
+    let s = wait_stored(&app, &sid, "the joining step runs out", |s| {
+        !s.contains_key("promotion")
+    })
+    .await;
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("teleport".into(), "leaving".into())
+    );
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(300)).await,
+        "never drained"
+    );
+    let why = wait_note(&app, &m, "did not catch up in time").await;
+    assert_eq!(why.len(), 1, "{why:?}");
+    assert_eq!(
+        teleport_audit(&app, &sid).await.last(),
+        Some(&("failed".to_string(), "join_timeout".to_string()))
+    );
+}
+
+/// FR-90 P2f-1 — a target back before it answered its join is sent it again
+/// on a connection that takes a teleport, whatever it says of holding
+/// copies; never on one that does not.
+#[tokio::test]
+async fn a_teleports_target_back_before_it_answered_hears_its_join_again() {
+    // Two disconnections fit in the joining step's bound.
+    let app = teleport_app_joining(60).await;
+    let mut m = teleportable(&app, "teleportback", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    joining(&app, &mut m, None).await;
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.b.agent_id).await;
+
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, HOLDS_COPIES).await;
+    wait_agent_online(&app, &m.seeded, &m.b.agent_id).await;
+    assert!(
+        arrives(
+            &mut m.b.ws,
+            "rc:hive.replica.join",
+            Duration::from_millis(800)
+        )
+        .await
+        .is_none(),
+        "a connection that holds copies but takes no teleport: no join"
+    );
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.b.agent_id).await;
+
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, TELEPORT_TARGET).await;
+    let join = read_until(&mut m.b.ws, "rc:hive.replica.join")
+        .await
+        .expect("sent again on a connection that takes a teleport");
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(1), Some("teleport")),
+        "{join}"
+    );
+    joined(&mut m.b.ws, &sid).await;
+    let s = wait_stored(&app, &sid, "joined", |s| {
+        stored_member(s, &m.b.agent_id).1 == "joined"
+    })
+    .await;
+    assert_eq!(promotion_state(&s), Some("joining"));
+}
+
+/// FR-90 P2f-1 — placement decided again while a teleport joins leaves its
+/// target alone: no placement chose it, and it must not be let go for that.
+#[tokio::test]
+async fn a_placement_decided_again_leaves_a_teleports_target_alone() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleportplace", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    joining(&app, &mut m, None).await;
+    let (code, p) = put_policy(&app, &m.tid, &m.admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{p}");
+    // Placed again: the record names the policy the placement read.
+    let s = wait_stored(&app, &sid, "placed again", |s| {
+        s.get_document("replicaset")
+            .is_ok_and(|r| r.get_i64("policy_revision") == Ok(2))
+    })
+    .await;
+    assert_eq!(promotion_state(&s), Some("joining"));
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("teleport".into(), "pending".into()),
+        "the teleport's, not placement's"
+    );
+}
+
+/// FR-90 P2f-1 — a moved start its target refuses moves the lease back, as
+/// a promotion's does, and lets the target's copy go: it is `leaving`, never
+/// owed its join again.
+#[tokio::test]
+async fn a_teleports_moved_start_the_target_refuses_lets_its_copy_go() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleportback2", TELEPORT_TARGET).await;
+    let sid = m.sid.clone();
+    joining(&app, &mut m, None).await;
+    joined(&mut m.b.ws, &sid).await;
+    joined(&mut m.a.ws, &sid).await;
+    send(&mut m.a.ws, tip_at(&sid, 1, 4, "ab")).await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 4, "ab")).await;
+    read_until(&mut m.a.ws, "rc:hive.drain")
+        .await
+        .expect("the primary drains");
+    send(&mut m.a.ws, drained(&sid, 4, "ab")).await;
+    let start = read_until(&mut m.b.ws, "rc:hive.start")
+        .await
+        .expect("the moved start");
+    assert_eq!(start["fence"], 2);
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2,
+               "refused": "launch_failed", "detail": "the folder could not be put in place"}),
+    )
+    .await;
+    let s = wait_stored(&app, &sid, "the lease moves back", |s| {
+        s.get_i64("fence").ok() == Some(3)
+    })
+    .await;
+    assert_eq!(
+        s.get_document("location")
+            .unwrap()
+            .get_object_id("device_id")
+            .unwrap()
+            .to_hex(),
+        m.a.agent_id
+    );
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("teleport".into(), "leaving".into()),
+        "let go, not owed its join again"
+    );
+    assert!(
+        arrives(
+            &mut m.b.ws,
+            "rc:hive.replica.join",
+            Duration::from_millis(600)
+        )
+        .await
+        .is_none(),
+        "no join at the new fence"
+    );
 }
 
 // ─── P0d-2b — the viewer peer's signalling ─────────────────────────────────

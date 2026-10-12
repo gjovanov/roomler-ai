@@ -96,10 +96,23 @@ pub struct HiveSettings {
     /// network) is where an operator lengthens it.
     #[serde(default = "hive_default_promote_sync_secs")]
     pub promote_sync_secs: u64,
+    /// FR-90 P2f-1 — how long a teleport waits for its target's copy to
+    /// catch up with the primary's before it drains the session
+    /// (`ROOMLER__HIVE__PROMOTE_JOIN_SECS`): the whole copy moves in this
+    /// time, while the session still runs. ⚠️ Under the device's own
+    /// admission of the target's join (`hive::promote_limits::
+    /// TELEPORT_ADMISSION_SECS`, 30 min): a join re-sent after that is
+    /// refused `not_prepared`.
+    #[serde(default = "hive_default_promote_join_secs")]
+    pub promote_join_secs: u64,
 }
 
 fn hive_default_promote_prepare_secs() -> u64 {
     30
+}
+
+fn hive_default_promote_join_secs() -> u64 {
+    600
 }
 
 fn hive_default_promote_drain_secs() -> u64 {
@@ -118,6 +131,7 @@ impl Default for HiveSettings {
             promote_prepare_secs: hive_default_promote_prepare_secs(),
             promote_drain_secs: hive_default_promote_drain_secs(),
             promote_sync_secs: hive_default_promote_sync_secs(),
+            promote_join_secs: hive_default_promote_join_secs(),
         }
     }
 }

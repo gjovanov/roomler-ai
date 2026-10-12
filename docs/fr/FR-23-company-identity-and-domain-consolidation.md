@@ -134,18 +134,18 @@ The `/ws` check applies **only to the cookie path** (`handler.rs:88-113`) — a
 presence and RC signalling all die.
 
 ⚠️ **Measured 2026-08-28: "list both in the configmap" is IMPOSSIBLE today.**
-`settings.rs:543` is `Environment::default().separator("__").prefix("ROOMLER")`
+`settings.rs:557` is `Environment::default().separator("__").prefix("ROOMLER")`
 with **no `list_separator`**, and `app.cors_origins` is `Vec<String>` — so a
 scalar env var deserialising into a sequence *fails outright*
 (`invalid type: string, expected a sequence`) and the API would **refuse to
 boot**. The repo already knows this: `jwt.previous_secrets` is deliberately a
-`String` for exactly this reason (`settings.rs:400-406`), and the e2e overlay's
+`String` for exactly this reason (`settings.rs:414-420`), and the e2e overlay's
 configmap carries the same warning.
 
 Two real paths, neither of them "just set the configmap":
 
 - **A — mount a file.** `Settings::load` also reads
-  `File::with_name("config/local")` (`settings.rs:541`) and the Dockerfile's
+  `File::with_name("config/local")` (`settings.rs:555`) and the Dockerfile's
   runtime stage sets **no `WORKDIR`**, so CWD is `/` and a ConfigMap at
   `/config/local.toml` is read. No code change. ⚠️ But the source is
   `required(false)`, so **a wrong path is a silent no-op** — the API boots, the

@@ -18,6 +18,9 @@
 //! Any other connection receives nothing, and the join waits, pending, for
 //! one that does. The primary's goes to a connection that runs Hive: it holds
 //! no copy of another device's session, so its `hive_replica` is not asked.
+//! P2f-1 — and a teleport's target's to a connection advertising
+//! `hive-teleport`: it takes the copy it will run, which its prepare
+//! admitted, whatever its owner says of holding copies.
 //! ⚠️ Everything a device says here is a claim, applied only where the record
 //! names that device as a member: a frame about someone else's session, or
 //! from a device placement did not choose, matches nothing.
@@ -47,6 +50,8 @@ pub(crate) fn wire_role(role: &str) -> Option<HiveReplicaRole> {
         Some(HiveReplicaRole::Owner)
     } else if role == MemberRole::Primary.as_str() {
         Some(HiveReplicaRole::Primary)
+    } else if role == MemberRole::Teleport.as_str() {
+        Some(HiveReplicaRole::Teleport)
     } else {
         None
     }
@@ -137,10 +142,14 @@ pub(crate) fn push_join(
         fences: fence_marks(s),
     };
     let hub = &state.fleet.rc_hub;
-    let pushed = if role == HiveReplicaRole::Primary {
-        hub.push_hive(device_id, tenant_id, msg)
-    } else {
-        hub.push_hive_replica(device_id, tenant_id, msg)
+    // P2f-1 — a teleport's target is no device that holds copies by its
+    // owner's word: its join goes to a connection that takes a teleport.
+    let pushed = match role {
+        HiveReplicaRole::Primary => hub.push_hive(device_id, tenant_id, msg),
+        HiveReplicaRole::Teleport => hub.push_hive_teleport(device_id, tenant_id, msg),
+        HiveReplicaRole::Archive | HiveReplicaRole::Owner => {
+            hub.push_hive_replica(device_id, tenant_id, msg)
+        }
     };
     match pushed {
         Ok(()) => {
@@ -219,7 +228,12 @@ pub(crate) async fn reconcile_joins(
             }
         }
     }
-    if hub.agent_supports_hive_replica_on(device_id, conn) != Some(true) {
+    // P2f-1 — a teleport's target's join goes to a connection that takes a
+    // teleport, whatever its owner says of holding copies; every other
+    // member's to one that holds copies.
+    let holds = hub.agent_supports_hive_replica_on(device_id, conn) == Some(true);
+    let teleports = hub.agent_supports_hive_teleport_on(device_id, conn) == Some(true);
+    if !holds && !teleports {
         return;
     }
     let sessions = match state.sessions.pending_joins(tenant_id, device_id).await {
@@ -231,7 +245,12 @@ pub(crate) async fn reconcile_joins(
     };
     for s in sessions {
         for (member, role) in pending(&s) {
-            if member == device_id {
+            let taken = if role == HiveReplicaRole::Teleport {
+                teleports
+            } else {
+                holds
+            };
+            if member == device_id && taken {
                 push_join(state, &s, device_id, role);
             }
         }
@@ -261,11 +280,15 @@ pub(crate) async fn on_join_ack(
         )
         .await
     {
-        Ok(true) => info!(
-            session = %session_id, device = %device_id,
-            refused = refused.map(HiveJoinRefusal::as_str), detail = detail.as_deref(),
-            "hive: a member answered its join"
-        ),
+        Ok(true) => {
+            info!(
+                session = %session_id, device = %device_id,
+                refused = refused.map(HiveJoinRefusal::as_str), detail = detail.as_deref(),
+                "hive: a member answered its join"
+            );
+            // P2f-1 — a teleport joining, if one waits on this answer.
+            crate::promote::on_join_answer(state, session_id, device_id).await;
+        }
         Ok(false) => debug!(
             session = %session_id, device = %device_id, fence,
             "hive: a join answer matched no member — not this device's, or a stale fence"
