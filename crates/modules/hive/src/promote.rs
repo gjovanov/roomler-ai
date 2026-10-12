@@ -1203,6 +1203,12 @@ pub(crate) async fn on_start_refused(
     audit(&s, p.by, p.to, "moved_back", Some(word.as_str()))
         .write(state)
         .await;
+    // P2e-5c — and every view and stream of the session ends, as at the
+    // move. The member never ran it: a stream it was asked to serve would
+    // tell its member the session runs nowhere, and the member would park a
+    // copy of a session that runs on.
+    crate::view::end_grants_of_session(state, session_id, "moved").await;
+    crate::stream::end_for_session(state, session_id, "moved");
     let detail = crate::agent_socket::clamp_words(detail, hive_limits::MAX_DETAIL_LEN);
     let why = Failure::PrepareRefused { word, detail }.why(&p);
     room::note(state, &s, room::move_failed_note(&p, &why)).await;

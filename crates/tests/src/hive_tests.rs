@@ -3007,12 +3007,65 @@ async fn a_moved_start_the_member_refuses_moves_the_lease_back() {
     let mut m = promotable(&app, "promoteback", 0, PROMOTES).await;
     let sid = m.sid.clone();
     moved(&app, &mut m).await;
+    // P2e-5c — A, a member at the new fence, follows the session where it
+    // moved: a stream B is asked to serve, before B has run anything.
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 2}),
+    )
+    .await;
+    let (tid, admin, a_id) = (m.tid.clone(), m.admin.clone(), m.a.agent_id.clone());
+    wait_member(
+        &app,
+        &tid,
+        &admin,
+        &sid,
+        &a_id,
+        "A joined at fence 2",
+        |mm| mm["state"] == "joined",
+    )
+    .await;
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.want", "session_id": sid, "fence": 2,
+               "seq": 5, "hash": hash("ab"), "path": "direct"}),
+    )
+    .await;
+    let g = read_until(&mut m.b.ws, "rc:hive.replica.grant")
+        .await
+        .expect("B is asked to serve A");
+    let gid = g["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.replica.ready", "grant_id": gid,
+               "cert_fingerprint": hash("ab"), "addrs": ["192.0.2.7:41641"]}),
+    )
+    .await;
+    read_until(&mut m.a.ws, "rc:hive.replica.dial")
+        .await
+        .expect("A dials B");
     send(
         &mut m.b.ws,
         json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2,
                "refused": "launch_failed", "detail": "no claude"}),
     )
     .await;
+    // P2e-5c — the stream ends at the move back, as every stream of the
+    // session ends at a move: B never ran it, and A, told by it that the
+    // session runs nowhere, would have parked a copy of one that runs on.
+    for (who, ws) in [
+        ("B, its source", &mut m.b.ws),
+        ("A, its member", &mut m.a.ws),
+    ] {
+        let c = read_until(ws, "rc:hive.replica.close")
+            .await
+            .unwrap_or_else(|| panic!("{who} is told the stream ended at the move back"));
+        assert_eq!(
+            (c["grant_id"].as_str(), c["reason"].as_str()),
+            (Some(gid.as_str()), Some("moved")),
+            "{who}"
+        );
+    }
 
     let a_frames = frames_until(
         &mut m.a.ws,

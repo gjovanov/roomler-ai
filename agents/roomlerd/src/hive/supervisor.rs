@@ -1320,6 +1320,17 @@ impl Supervisor {
             .map(|(m, _)| m.clone())
     }
 
+    /// P2e-5c — whether a move of `session` is kept here, at any fence: the
+    /// session moves to this device, and its start is on its way or being
+    /// taken.
+    fn moving_here(&self, session: ObjectId) -> bool {
+        self.moves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|((s, _), (_, at))| *s == session && at.elapsed() < MOVE_WAIT)
+    }
+
     /// P2e-5 — the start it came for launched.
     fn forget_move(&self, session: ObjectId, fence: u64) {
         self.moves
@@ -5871,6 +5882,62 @@ done
             .into_iter()
             .map(|m| m.session)
             .collect()
+    }
+
+    /// P2e-5c — a promotion's target hears its join as the primary before
+    /// its start, for a session it does not run yet. It holds the session's
+    /// copy, so its floor rises to the join's fence and the join is taken
+    /// up; nothing runs, and nothing else is marked. One below the floor it
+    /// holds, or for a session it holds nothing of, is refused.
+    #[tokio::test]
+    async fn a_primarys_join_ahead_of_its_start_raises_the_floor_of_its_copy() {
+        use roomler_ai_remote_control::hive::{HiveJoinRefusal, HiveReplicaRole};
+        use roomler_hive_node::EventEnvelope;
+        let r = rig(true, 4);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let primary = Some(HiveReplicaRole::Primary);
+        assert_eq!(
+            r.sup.answer_join(true, sid, 2, primary, &[]).await.0,
+            Some(HiveJoinRefusal::Other),
+            "nothing of it held here"
+        );
+        assert_eq!(r.store.floor(&s).await.unwrap(), None, "nothing raised");
+
+        // The member's copy, as it stood at the move.
+        r.store.join(&s, "owner", 1).await.unwrap();
+        let held = EventEnvelope::next(
+            &s,
+            None,
+            1,
+            0,
+            &TranscriptEvent::Note {
+                text: "held".into(),
+            },
+        );
+        r.store.apply(held).await.unwrap();
+        assert_eq!(
+            r.sup.answer_join(true, sid, 2, primary, &[]).await,
+            (None, None),
+            "the copy is held: taken up ahead of the start"
+        );
+        assert_eq!(
+            r.store.floor(&s).await.unwrap(),
+            Some(2),
+            "its floor is the new fence before it writes"
+        );
+        assert!(!runs_replicated(&r, sid), "nothing runs until the start");
+        assert!(hosted_on_disk(&r).is_empty(), "and nothing is hosted");
+        assert_eq!(
+            r.sup.answer_join(true, sid, 2, primary, &[]).await,
+            (None, None),
+            "idempotent"
+        );
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary, &[]).await.0,
+            Some(HiveJoinRefusal::StaleFence),
+            "below the floor it holds"
+        );
     }
 
     /// P2c-4 — a primary's join holds across the restart after it: the next

@@ -1523,6 +1523,13 @@ impl Supervisor {
     /// P2d-3b — whether `session` is not over on this device: it runs here,
     /// or its hosted record will resume it here. What a source tells its
     /// member: a member caught up with a session that is over lets go.
+    ///
+    /// P2e-5c — or it moves here: a promotion moved the session to this
+    /// device, whose start at that fence is on its way or being taken, the
+    /// copy put in place first. ⚠️ Without it, from the lease's move until
+    /// that start launched, the new primary told every member it streamed to
+    /// that the session was over, and a member that held its copy whole
+    /// parked it, while the session went on here.
     pub(super) fn session_live(&self, session: ObjectId) -> bool {
         self.holds_live(session)
             || self
@@ -1531,6 +1538,7 @@ impl Supervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&session.to_hex())
                 .is_some()
+            || self.moving_here(session)
     }
 
     /// P2d-3 — one more blob carried on `grant_id`'s stream.
@@ -3882,6 +3890,135 @@ mod tests {
         assert!(
             !asks_within(&mut mem, sid, Duration::from_millis(700)).await,
             "asked for no more"
+        );
+    }
+
+    /// P2e-5c — a copy of a session that moves to its source, whose start
+    /// for it is still on its way, follows on once whole: the session runs on
+    /// there, and is never parked.
+    #[tokio::test]
+    async fn a_session_moving_to_its_source_is_followed_on_once_whole() {
+        let src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        // The promotion's move, kept for the start right behind it.
+        src.sup.receive_move(super::super::Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 1,
+            from_device_id: ObjectId::new(),
+        });
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .is_some()
+        );
+        let grant_id = served_as_is(&src, &mem, grant(sid, HiveStreamPath::Direct), TOKEN).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            mem.sup.holds_stream(grant_id),
+            "still following: the session runs on there"
+        );
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(grant_id)));
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2e-5c — a newer join while a stream is followed: that stream's end,
+    /// in a word that would stop or park the follow, is about the fence the
+    /// session left, so the session is asked for again, at its new fence.
+    #[tokio::test]
+    async fn a_stop_for_a_stream_a_newer_join_overtook_asks_again() {
+        let src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert_eq!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .map(|w| w.0),
+            Some(1)
+        );
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        phase_of(&mem, sid, Phase::Following(grant_id)).await;
+        // The session moves while it is followed: the member's join at fence 2.
+        mem.store.join(&sid.to_hex(), "owner", 2).await.unwrap();
+        mem.sup.follow_joined(sid, 2);
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Following(grant_id)),
+            "the stream followed goes on until it ends"
+        );
+        mem.sup.close_stream(grant_id, "member_left");
+        assert_eq!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .map(|w| w.0),
+            Some(2),
+            "asked for again at its new fence, never stopped"
+        );
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2e-5c — a newer join overtakes an ask out: the session is asked for
+    /// again at once, at the new fence, never after the old ask's timeout,
+    /// and the old ask's refusal, naming the fence it asked at, moves
+    /// nothing.
+    #[tokio::test]
+    async fn a_newer_join_asks_again_at_once_while_an_ask_is_out() {
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert_eq!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .map(|w| w.0),
+            Some(1)
+        );
+        mem.store.join(&sid.to_hex(), "owner", 2).await.unwrap();
+        mem.sup.follow_joined(sid, 2);
+        assert_eq!(
+            want_on_within(
+                &mut mem,
+                sid,
+                HiveStreamPath::Direct,
+                Duration::from_secs(1)
+            )
+            .await
+            .map(|w| w.0),
+            Some(2),
+            "asked again at once, at the new fence"
+        );
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(HiveStreamPath::Direct),
+            Some(HiveStreamRefusal::StaleFence),
+        );
+        assert!(
+            matches!(mem.sup.follow_phase(sid), Some(Phase::Wanting(_))),
+            "the old ask's refusal moves nothing: {:?}",
+            mem.sup.follow_phase(sid)
+        );
+        // A refusal of the ask at the new fence is that ask's own: it stops.
+        mem.sup.on_refused(
+            sid,
+            2,
+            Some(HiveStreamPath::Direct),
+            Some(HiveStreamRefusal::NotAMember),
+        );
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Stopped),
+            "a stop about the fence it asked at is taken"
         );
     }
 
