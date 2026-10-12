@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129; field-verified (§9), macOS and 24 h of EDR included. P10b (SYSTEM never starts it) merged, riding the next release. P10b (SYSTEM never starts it) is in **0.4.130** (2026-10-12). The tray's Start and Stop, and `no_permission`, are field-verified on both platforms (rows 46–48). Owed: P10b on a SystemContext-mode host, then the close
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129, P10b (SYSTEM never starts it) in 0.4.130; field-verified (§9), macOS, 24 h of EDR and P10b's negative control included. Owed before the close: the field gaps listed under "Still owed" (AC2's Teams clause, AC9's two reasons, AC12's other clauses)
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -541,6 +541,23 @@ machine's own logs, the companion's and the agent's.
 | 48 | **Row 37's fix on a release** (#1991) | the MacBook | With `roomlerd` switched off under Device Control & Data Access by the operator and the GUI worker restarted (new in 5 s), the person's `roomler keep-busy on` answered `phase: unavailable`, **`reason: no_permission`**: "Unavailable: the agent is not allowed to control the pointer here (macOS: Accessibility)." On 0.4.126 the same cell said `unsupported` (row 37) ✅. The worker logged `enigo init failed — input injection disabled`, and a connected viewer was told its input would not reach the desktop. **A finding:** before that On, `status` said `available: true`. The missing grant only shows when an On probes, so the tray offers a Start that will answer `no_permission`. After the re-grant and a restart (new in 9 s): "Screen Recording + Accessibility both granted", the worker announced `["screen-capture", "input"]`, and the reconnected viewer had input ✅ |
 | 49 | **A misleading tray log line** (fixed with these rows) | both | A successful **Stop** from the tray logged `WARN tray: keep busy did not start reason="stopped_locally"` (15:35:29Z on the PC, 18:23:17Z on the Mac). The outcome match didn't know which way it had toggled. It now logs by the action taken: `stopped`, `started`, or `did not start` only for an On that was refused |
 
+**P10b on vmtest, 2026-10-12**: throwaway Win11 VMs on zeus in the vmtest org, driven from mars as the
+org's admin. It is the `win11/installer/system` cell (SystemContext mode) twice: pinned to **0.4.129**
+(no P10b) with `VMTEST_AGENT_VERSION`, then on the latest, **0.4.131**. Both runs passed the lane's own
+18 checks. Exec goes through the HTTP route (`POST …/agent/{id}/exec`), with its four gates opened for
+the test: the org switch was on for the test only and restored to off, the device policy was `on` with
+consent `auto`, and `exec_enabled` was set by the person. "The person" is the guest's signed-in user in
+the console session, reached through an interactive scheduled task (`/IT`, the lane's own pattern).
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 50 | **P10b, the negative control** | `win11/installer/system`, SystemContext mode, **0.4.129** | Exec ran as `NT AUTHORITY\SYSTEM` in **session 1**, and `roomler keep-busy on --pattern subtle` **started it** (`running`), named "the person at this computer" ❌. That is the defect P10b closes. It was stopped again |
+| 51 | **P10b on the release** | the same cell on **0.4.131** | The same exec (`NT AUTHORITY\SYSTEM`, session 1) was **refused**: "only the person at this device's console can turn keep busy on here — not root or SYSTEM, not a background service, not another session (anyone may stop it)". The state stayed `off` ✅. The person (the guest's signed-in user, session 1) started it: `running`, "the person at this computer" ✅. An Off sent through exec, as SYSTEM, stopped it: stopping is open to every peer |
+| 52 | **AC14: the owner's switch and an org deny refuse a local start** | the 0.4.131 guest | With `keep_busy_enabled = false`, the person's On answered `device_disabled`: "Turned off on this computer (keep_busy_enabled = false)." With the org deny on (for 6 s, then restored), it answered `org_denied`: "Disabled by your organization." ✅ |
+| 53 | **AC14: every connected viewer shows who turned it on** | the 0.4.129 guest (P10 is in it); the production viewer as the org's admin, through the lane's Playwright container | The viewer connected at 20:59:42.251Z, and the person's local On was fired at 20:59:42. At 20:59:45.347Z the toolbar chip's title read "Running: subtle, turned on by the person at this computer." ✅ |
+| 54 | **P10b: no regression for the person on an attended install** | the Win11 PC on 0.4.131 (it had auto-updated) | The person's own `roomler keep-busy on` ran (`set_by` "the person at this computer"), and `off` stopped it ✅: the account check reads a user's own token. Exec there, as the signed-in user in session 1, still passes, as documented (§3g) |
+| 55 | **AC8: the source scan fails on a planted line** | `no_keylogger_shaped_api_anywhere_in_keep_busy`, run locally on master `37d6d9b26` in a throwaway worktree | A real constant, `"SetWindowsHookExW"` (not a comment), was planted in `host_win.rs`, and the plant was confirmed to be there. The test **failed**, `host_win.rs:161: uses SetWindowsHookEx`. Restored (no diff), it passed ✅. With row 17's import diff and row 44's EDR window, every clause of AC8 has its evidence |
+
 Wrong turns, recorded so nobody repeats them:
 - **On Windows, `roomler exec` is not SYSTEM in session 0.** P10's gate was designed on that belief,
   which `docs/fleet-rpc.md` stated. Exec runs in the worker that holds the agent socket, inside the
@@ -568,11 +585,24 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed:
-- **P10b on a release** (in 0.4.130, released 2026-10-12). On a Windows host in SystemContext mode,
-  `roomler exec … roomler keep-busy on` must be refused, naming SYSTEM, while the person's own tray
-  and CLI still start it. 0.4.129 (no P10b) admits that exec, and that is the negative control to
-  record first. On an attended install, check the person's On still passes the new account check.
+Still owed before the close (a re-read of every criterion against its rows, 2026-10-12):
+- **AC2, its Teams clause.** The negative control recorded on every host is the screen **locking**
+  (rows 1, 8, 12, 30). "Teams goes Away" was never measured, because no lab host runs Teams. Either
+  measure it on a host with Teams, or reword the clause to the lock on the operator's word.
+- **AC9, both reasons.** Row 11 answered `unsupported`, not `wayland`, and P9 then made GNOME on
+  Wayland run. Still unmeasured: `wayland` on a Wayland desktop without the uinput path, and
+  `no_idle_clock` on KDE or wlroots.
+- **AC12, the clauses past the pre-select** (row 25). "An unknown pattern is refused" is now
+  field-proven: on prod, as the vmtest org's admin, a PUT of `"no-such-pattern"` answered **HTTP 400**,
+  "Unknown keep-busy pattern; one of: circle, …, shuffle", and the setting stayed `null` (2026-10-12).
+  Two clauses rest on tests:
+  - **a plain member can read but not set**: `keep_busy_tests.rs`, where a member's PUT gets 403 and
+    any member may read (`the_default_pattern_is_validated_and_any_member_may_read`). The vmtest org
+    has no member account, and none is created on production for a test;
+  - **a person's remembered choice wins**: `KeepBusyMenu.spec.ts`, "a person's remembered choice for
+    the device wins over the org default".
+
+  Whether test-level evidence closes these two is the operator's call.
 
 Proven so far:
 - macOS: rows 30–37.
@@ -582,6 +612,8 @@ Proven so far:
 - The tray reads the state on Windows: row 45.
 - The tray's Start and Stop on Windows and on a supervised Mac, and row 37's fix on a release: rows
   46–48.
+- **AC14, every clause**, P10b with its negative control included: rows 42–43, 46–47 and 50–54.
+- **AC8, every clause**: the planted line (row 55), the import diff (row 17), and 24 h of EDR (row 44).
 - AC11 and AC12, on prod: rows 25–26.
 - AC4's self-update, and AC9/AC13 on the released 0.4.126: rows 28–29.
 
