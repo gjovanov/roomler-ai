@@ -499,6 +499,10 @@ pub mod replica_limits {
     pub const TIP_INTERVAL_SECS: u64 = 5;
     /// A hash on the replica frames: BLAKE3, as lowercase hex.
     pub const HASH_HEX_LEN: usize = 64;
+    /// FR-90 P2e-5b — the most fence marks one `rc:hive.replica.join`
+    /// carries: one per fence a promotion superseded. A join with more is
+    /// refused whole by the device, never taken in part.
+    pub const MAX_FENCE_MARKS: usize = 256;
 }
 
 /// Whether `s` is a hash as the replica frames carry it: exactly
@@ -636,6 +640,17 @@ where
         )
         .unwrap_or(HiveJoinRefusal::Other),
     ))
+}
+
+/// FR-90 P2e-5b — where a fence a promotion superseded ended: the `seq` of
+/// the last event written at `fence`, and that event's hash. A member whose
+/// floor rose past `fence` still takes that fence's events up to here, and
+/// at `seq` only the event whose hash this is.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveFenceMark {
+    pub fence: u64,
+    pub seq: u64,
+    pub hash: String,
 }
 
 /// FR-90 P2c-3 — a checkpoint a member holds: the `seq` of its `checkpoint`

@@ -17,6 +17,7 @@
 //! | the drain, a promotion `draining` this device | takes no new prompt; answers `rc:hive.drained` with its store's tip | the record moved on to `syncing`, holding that tip; a prompt refused in words |
 //! | the word, `rc:hive.lease` at its fence | lifts the drain | a prompt answered, and in the harness's stdin |
 //! | the prepare, a promotion `preparing` toward this device (P2e-5) | runs a start's gates: it holds no copy of the session to take it over from | the room, in the device's own words |
+//! | a member's join after a move (P2e-5b), naming where fence 1 ended | refuses one naming an end it cannot read; joins the one the server sends | the record's member: its answer, in the device's word |
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -24,7 +25,11 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use roomler_ai_mod_hive::dao::AgentSessionDao;
-use roomler_ai_mod_hive::model::{AgentSession, Promotion, PromotionState};
+use roomler_ai_mod_hive::model::{
+    AgentSession, FenceMark, MemberState, Promotion, PromotionState, ReplicaMember, Replicaset,
+    SessionStatus,
+};
+use roomler_ai_remote_control::hive::{HiveFenceMark, HiveReplicaRole};
 use roomler_ai_remote_control::signaling::ServerMsg;
 use roomler_ai_tests::fixtures::test_app::TestApp;
 use serde_json::{Value, json};
@@ -74,6 +79,11 @@ async fn until_read(folder: &std::path::Path, n: usize) -> Vec<String> {
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// The one member of a session this test placed by hand.
+fn member_of(s: &AgentSession) -> &ReplicaMember {
+    &s.replicaset.as_ref().expect("placed").members[0]
 }
 
 /// Poll the stored session until `pred` holds.
@@ -138,6 +148,8 @@ async fn scenario() {
     std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut cfg = enrol(&app, &seeded, "hive-drain").await;
     cfg.hive_enabled = true;
+    // P2e-5b — it holds copies too, so a member's join reaches it.
+    cfg.hive_replica = true;
     cfg.hive_accounts
         .insert(seeded.admin.id.clone(), "drainer".into());
     cfg.hive_roots = vec![roots.display().to_string()];
@@ -310,6 +322,78 @@ async fn scenario() {
         );
         tokio::time::sleep(POLL).await;
     }
+
+    // ── A member's join after a move (P2e-5b), on this same connection ─────
+    // Another session, moved once, names this device a member at fence 2. A
+    // join naming an end the device cannot read (of the join's own fence) is
+    // refused whole; the one the server sends, where fence 1 ended, is joined.
+    let other = ObjectId::new();
+    let mut moved = rec.clone();
+    moved.id = Some(other);
+    moved.fence = 2;
+    moved.status = SessionStatus::Ended;
+    moved.location.device_id = ObjectId::new();
+    moved.room_id = None;
+    moved.promotion = None;
+    moved.fences = vec![FenceMark {
+        fence: 1,
+        seq: 5,
+        hash: "ab".repeat(32),
+    }];
+    moved.replicaset = Some(Replicaset {
+        policy_revision: 0,
+        min: 2,
+        max: 4,
+        restricted_tags: Vec::new(),
+        members: vec![ReplicaMember {
+            device_id: agent,
+            role: "owner".into(),
+            state: MemberState::Pending,
+            refusal: None,
+            answered_at: None,
+            tip: None,
+        }],
+        short: None,
+        placed_at: bson::DateTime::now(),
+    });
+    dao.create(&moved).await.unwrap();
+    let join = |fence_of_end: u64| ServerMsg::HiveReplicaJoin {
+        session_id: other,
+        fence: 2,
+        role: Some(HiveReplicaRole::Owner),
+        fences: vec![HiveFenceMark {
+            fence: fence_of_end,
+            seq: 5,
+            hash: "ab".repeat(32),
+        }],
+    };
+    let answer_after = |after: Option<bson::DateTime>| {
+        let dao = &dao;
+        async move {
+            let s = until_stored(dao, other, "the device never answered the join", |s| {
+                member_of(s).answered_at.is_some() && member_of(s).answered_at != after
+            })
+            .await;
+            member_of(&s).clone()
+        }
+    };
+    let hub = &app.state.fleet().rc_hub;
+    hub.push_hive_replica(agent, tenant, join(2))
+        .expect("the join reaches the device");
+    let refused = answer_after(None).await;
+    assert_eq!(
+        (refused.state, refused.refusal.as_deref()),
+        (MemberState::Refused, Some("other")),
+        "an end of the join's own fence, which the device cannot read, refused whole"
+    );
+    hub.push_hive_replica(agent, tenant, join(1))
+        .expect("the join reaches the device");
+    let joined = answer_after(refused.answered_at).await;
+    assert_eq!(
+        (joined.state, joined.refusal.as_deref()),
+        (MemberState::Joined, None),
+        "where fence 1 ended: joined"
+    );
     own.close(&mut ows).await;
     let _ = stop_device.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), device_task).await;

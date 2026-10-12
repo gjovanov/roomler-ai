@@ -127,6 +127,20 @@ pub enum ChainError {
     Broken { seq: u64 },
     #[error("fence {got} is older than the newest fence seen, {current}: a stale writer")]
     StaleFence { current: u64, got: u64 },
+    /// FR-90 P2e-5b: at the very `seq` a superseded fence ended with, another
+    /// event: this copy of the history is not the record's.
+    #[error("seq {seq} is where fence {fence} ended, and this is not the event it ended with")]
+    NotFenceEnd { fence: u64, seq: u64 },
+}
+
+/// FR-90 P2e-5b — where a fence a promotion superseded ended, as the record
+/// keeps it (`rc:hive.replica.join`'s `fences`): the `seq` of its last event,
+/// and that event's hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceEnd {
+    pub fence: u64,
+    pub seq: u64,
+    pub hash: [u8; 32],
 }
 
 /// Can `next` follow `tip` — or start the session, when `tip` is `None`?
@@ -184,13 +198,43 @@ pub fn check_next_with_floor(
     next: &EventEnvelope,
 ) -> Result<(), ChainError> {
     // `None` orders below every `Some`, so this is the newest fence seen.
+    check_next_with_ends(tip, floor, &[], next)
+}
+
+/// FR-90 P2e-5b — [`check_next_with_floor`], with where each superseded fence
+/// ended: an event of a fence older than the floor is still taken up to that
+/// fence's end, so a member that joins after a move, or was behind at it,
+/// syncs the history below its floor; at the end itself only the very event
+/// it names. An older fence's event past its end, or of a fence with no end,
+/// is a stale writer's.
+pub fn check_next_with_ends(
+    tip: Option<ChainTip>,
+    floor: Option<u64>,
+    ends: &[FenceEnd],
+    next: &EventEnvelope,
+) -> Result<(), ChainError> {
+    // `None` orders below every `Some`, so this is the newest fence seen.
     if let Some(current) = tip.map(|t| t.fence).max(floor)
         && next.fence < current
     {
-        return Err(ChainError::StaleFence {
+        let stale = ChainError::StaleFence {
             current,
             got: next.fence,
-        });
+        };
+        let Some(end) = ends.iter().find(|e| e.fence == next.fence) else {
+            return Err(stale);
+        };
+        if next.seq > end.seq {
+            return Err(stale);
+        }
+        check_next(tip, next)?;
+        if next.seq == end.seq && next.hash() != end.hash {
+            return Err(ChainError::NotFenceEnd {
+                fence: end.fence,
+                seq: end.seq,
+            });
+        }
+        return Ok(());
     }
     check_next(tip, next)
 }
@@ -417,6 +461,62 @@ mod tests {
                 check_next(None, next)
             );
         }
+    }
+
+    /// P2e-5b — a member that joined after a move, its floor at fence 2 with
+    /// nothing held yet, takes fence 1's history up to where fence 1 ended,
+    /// at the end only the very event it ended with, and nothing of fence 1
+    /// past it; then fence 2's events, as any.
+    #[test]
+    fn below_the_floor_a_fence_is_taken_up_to_its_end_and_no_further() {
+        let mut chain = chain_of(3, 1);
+        let end = FenceEnd {
+            fence: 1,
+            seq: 3,
+            hash: chain[2].hash(),
+        };
+        let ends = [end];
+        let mut tip = None;
+        for ev in &chain {
+            assert_eq!(
+                check_next_with_floor(tip, Some(2), ev),
+                Err(ChainError::StaleFence { current: 2, got: 1 }),
+                "without its end, fence 1 is all a stale writer's"
+            );
+            check_next_with_ends(tip, Some(2), &ends, ev)
+                .unwrap_or_else(|e| panic!("below the floor, fence 1 is taken up to its end: {e}"));
+            tip = Some(ev.tip());
+        }
+        let late = EventEnvelope::next("s1", tip, 1, 9, &note("late"));
+        assert_eq!(
+            check_next_with_ends(tip, Some(2), &ends, &late),
+            Err(ChainError::StaleFence { current: 2, got: 1 }),
+            "past its end, an old primary's late write"
+        );
+        let resumed = EventEnvelope::next("s1", tip, 2, 9, &note("resumed"));
+        check_next_with_ends(tip, Some(2), &ends, &resumed).unwrap();
+
+        // At the end, another event: this copy is not the record's.
+        let other = EventEnvelope::next("s1", Some(chain[1].tip()), 1, 9, &note("other"));
+        assert_eq!(
+            check_next_with_ends(Some(chain[1].tip()), Some(2), &ends, &other),
+            Err(ChainError::NotFenceEnd { fence: 1, seq: 3 }),
+            "at its end, only the event it ended with"
+        );
+        // An end never excuses what check_next refuses.
+        chain[1].prev_hash = [7; 32];
+        assert_eq!(
+            check_next_with_ends(Some(chain[0].tip()), Some(2), &ends, &chain[1]),
+            Err(ChainError::Broken { seq: 2 }),
+            "an end never excuses what check_next refuses"
+        );
+        // Another fence's end is no end of this one.
+        let elsewhere = [FenceEnd { fence: 3, ..end }];
+        assert_eq!(
+            check_next_with_ends(None, Some(4), &elsewhere, &chain_of(1, 1)[0]),
+            Err(ChainError::StaleFence { current: 4, got: 1 }),
+            "another fence's end is no end of this one"
+        );
     }
 
     #[test]

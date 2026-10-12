@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn a_members_hello_reads_its_own_store() {
         let mut store = Store::open_in_memory().unwrap();
-        store.join("s", "owner", 2).unwrap();
+        store.join("s", "owner", 2, &[]).unwrap();
         assert_eq!(
             member_hello(&store, "s", 2).unwrap(),
             MemberMsg::Hello {

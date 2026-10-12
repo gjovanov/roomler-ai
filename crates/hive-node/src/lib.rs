@@ -36,5 +36,5 @@ pub mod store;
 pub mod stream;
 pub mod stream_json;
 
-pub use chain::{ChainError, ChainTip, EventEnvelope, GENESIS};
+pub use chain::{ChainError, ChainTip, EventEnvelope, FenceEnd, GENESIS};
 pub use event::{TranscriptEvent, Usage, approval_outcome};

@@ -10,6 +10,7 @@
 //! | the owner's `hive_replica` | `replica_disabled` | the gate that survives a compromised server |
 //! | a role this build can name | `other` | a newer server's word is still a refusal, never a copy held for a reason nobody here read |
 //! | the owner's `hive_archive`, for an archive | `archive_disabled` | an administrator designates; the device's owner offers |
+//! | the fences' ends (P2e-5b), each one readable | `other` | below the floor an end is the one way an older fence's events are taken: one the device cannot read whole is never taken in part |
 //! | the store, open | `other` | |
 //! | `hive_store_quota_mib` | `quota` | |
 //! | not purged here | `purged` | removal is final |
@@ -18,14 +19,25 @@
 //! A join that passes raises the floor to its fence and keeps the membership,
 //! in one transaction (`Store::join`). The copy itself arrives with the
 //! carrier (P2d).
+//!
+//! P2e-5b — **the fences' ends.** After a promotion every event the session
+//! had is of an older fence than the floor a join raises, so a member that
+//! joins then would refuse the whole history. A join carries where each
+//! superseded fence ended (`fences`, the record's), kept in the same
+//! transaction: the store takes such a fence's events up to its end, and at
+//! the end only the event it ended with. ⚠️ Checked whole before the store
+//! is asked: at most [`replica_limits::MAX_FENCE_MARKS`], each older than the
+//! join's fence, in order, its hash readable. A primary's join does not read
+//! them: the device runs the session, and took its history before the move.
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HiveCheckpointMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole, replica_limits,
+    HiveCheckpointMark, HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole,
+    is_hash_hex, replica_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
-use roomler_hive_node::GENESIS;
 use roomler_hive_node::store::StoreError;
+use roomler_hive_node::{FenceEnd, GENESIS};
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
@@ -47,6 +59,7 @@ pub(super) async fn decide(
     session: ObjectId,
     fence: u64,
     role: Option<HiveReplicaRole>,
+    fences: &[HiveFenceMark],
 ) -> JoinAnswer {
     let refuse = |word: HiveJoinRefusal, why: String| (Some(word), Some(why));
     if !primary {
@@ -81,6 +94,10 @@ pub(super) async fn decide(
             "hive_archive is off on this device".into(),
         );
     }
+    let ends = match fence_ends(fence, fences) {
+        Ok(ends) => ends,
+        Err(why) => return refuse(HiveJoinRefusal::Other, why),
+    };
     let store = match store {
         Ok(s) => s,
         Err(e) => {
@@ -107,7 +124,10 @@ pub(super) async fn decide(
             }
         }
     }
-    match store.join(&session.to_hex(), role.as_str(), fence).await {
+    match store
+        .join_with_ends(&session.to_hex(), role.as_str(), fence, ends)
+        .await
+    {
         Ok(_) => (None, None),
         Err(WriterError::Store(StoreError::Purged { .. })) => refuse(
             HiveJoinRefusal::Purged,
@@ -122,6 +142,43 @@ pub(super) async fn decide(
             format!("the replica store refused the join: {e}"),
         ),
     }
+}
+
+/// P2e-5b — a join's `fences` as the store keeps them, or why the join is
+/// refused whole: more than [`replica_limits::MAX_FENCE_MARKS`], a fence not
+/// older than the join's, two out of order or twice, or a hash that is not
+/// one. A server of this build sends none of those; a join that carries one
+/// is not a join this device can read, and no part of it is taken.
+fn fence_ends(fence: u64, marks: &[HiveFenceMark]) -> Result<Vec<FenceEnd>, String> {
+    if marks.len() > replica_limits::MAX_FENCE_MARKS {
+        return Err(format!(
+            "the join names {} fences' ends, more than {}",
+            marks.len(),
+            replica_limits::MAX_FENCE_MARKS
+        ));
+    }
+    let mut ends: Vec<FenceEnd> = Vec::with_capacity(marks.len());
+    for m in marks {
+        if m.fence >= fence {
+            return Err(format!(
+                "the join at fence {fence} names the end of fence {}, not an older one",
+                m.fence
+            ));
+        }
+        if ends.last().is_some_and(|prev| prev.fence >= m.fence) {
+            return Err("the join names its fences' ends out of order".into());
+        }
+        let mut hash = [0u8; 32];
+        if !is_hash_hex(&m.hash) || hex::decode_to_slice(&m.hash, &mut hash).is_err() {
+            return Err(format!("the end of fence {} is not a hash", m.fence));
+        }
+        ends.push(FenceEnd {
+            fence: m.fence,
+            seq: m.seq,
+            hash,
+        });
+    }
+    Ok(ends)
 }
 
 /// Where this device's copy of `session` ends, as the replica frames carry
@@ -161,13 +218,15 @@ pub(super) async fn tip_of(
 
 impl Supervisor {
     /// The device's answer to a join, from its config and store, logged. A
-    /// primary's (P2c-4) is about a session it runs, not a copy it holds.
+    /// primary's (P2c-4) is about a session it runs, not a copy it holds, so
+    /// the fences' ends (P2e-5b) are a member's alone.
     pub(super) async fn answer_join(
         &self,
         primary: bool,
         session: ObjectId,
         fence: u64,
         role: Option<HiveReplicaRole>,
+        fences: &[HiveFenceMark],
     ) -> JoinAnswer {
         let answer = match role {
             Some(HiveReplicaRole::Primary) => self.take_up_replication(primary, session, fence),
@@ -179,12 +238,13 @@ impl Supervisor {
                     session,
                     fence,
                     member,
+                    fences,
                 )
                 .await
             }
         };
         info!(
-            session = %session, fence, role = role.map(HiveReplicaRole::as_str),
+            session = %session, fence, role = role.map(HiveReplicaRole::as_str), ends = fences.len(),
             refused = answer.0.map(HiveJoinRefusal::as_str), detail = answer.1.as_deref(),
             "hive: a join answered"
         );
@@ -363,7 +423,7 @@ mod tests {
         fence: u64,
         role: Option<HiveReplicaRole>,
     ) -> Option<HiveJoinRefusal> {
-        decide(cfg, Ok(store), primary, session, fence, role)
+        decide(cfg, Ok(store), primary, session, fence, role, &[])
             .await
             .0
     }
@@ -401,7 +461,7 @@ mod tests {
         );
         let missing = "no store".to_string();
         assert_eq!(
-            decide(&on, Err(&missing), true, sid, 1, owner).await.0,
+            decide(&on, Err(&missing), true, sid, 1, owner, &[]).await.0,
             Some(HiveJoinRefusal::Other)
         );
         assert_eq!(
@@ -430,6 +490,91 @@ mod tests {
         assert_eq!(
             answer(&on, &store, true, sid, 3, owner).await,
             Some(HiveJoinRefusal::Purged)
+        );
+    }
+
+    /// P2e-5b — a join after a move names where the fence it superseded
+    /// ended: the member takes that fence's events below its new floor up to
+    /// there, and none past it. Ends it cannot read whole refuse the join,
+    /// and nothing of it is kept.
+    #[tokio::test]
+    async fn a_join_keeps_the_fences_ends_or_refuses_them_whole() {
+        let on = cfg(true, false, None);
+        let owner = Some(HiveReplicaRole::Owner);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let note = |tip, n: &str| {
+            EventEnvelope::next(&s, tip, 1, 1, &TranscriptEvent::Note { text: n.into() })
+        };
+        let first = note(None, "one");
+        let second = note(Some(first.tip()), "two");
+        let end = |seq, hash: String| HiveFenceMark {
+            fence: 1,
+            seq,
+            hash,
+        };
+        let ended = [end(2, hex::encode(second.hash()))];
+
+        // One end for each fence below a join far above them, in order: only
+        // their number is wrong.
+        let many: Vec<HiveFenceMark> = (1..=replica_limits::MAX_FENCE_MARKS as u64 + 1)
+            .map(|fence| HiveFenceMark {
+                fence,
+                ..ended[0].clone()
+            })
+            .collect();
+
+        let store = StoreHandle::spawn(None).unwrap();
+        for (case, at, marks) in [
+            ("more than a join may name", 1000, many),
+            (
+                "not older than the join",
+                2,
+                vec![HiveFenceMark {
+                    fence: 2,
+                    ..ended[0].clone()
+                }],
+            ),
+            ("twice", 2, vec![ended[0].clone(), ended[0].clone()]),
+            ("not a hash", 2, vec![end(2, "AB".repeat(32))]),
+            ("short", 2, vec![end(2, "ab".repeat(31))]),
+        ] {
+            let (word, why) = decide(&on, Ok(&store), true, sid, at, owner, &marks).await;
+            assert_eq!(word, Some(HiveJoinRefusal::Other), "{case}: {why:?}");
+            assert!(why.is_some(), "{case}: says why");
+            assert!(store.memberships().await.unwrap().is_empty(), "{case}");
+            assert_eq!(store.floor(&s).await.unwrap(), None, "{case}: no floor");
+        }
+
+        assert_eq!(
+            decide(&on, Ok(&store), true, sid, 2, owner, &ended).await,
+            (None, None)
+        );
+        store
+            .apply(first.clone())
+            .await
+            .expect("below the floor, fence 1 is taken up to its end");
+        store.apply(second.clone()).await.unwrap();
+        let late = note(Some(second.tip()), "the old primary, past its end");
+        assert!(
+            matches!(
+                store.apply(late).await,
+                Err(WriterError::Store(StoreError::Chain(
+                    roomler_hive_node::ChainError::StaleFence { .. }
+                )))
+            ),
+            "past its end, the old primary's late write"
+        );
+
+        // Before P2e-5b: the same join naming no end, the history refused.
+        let without = StoreHandle::spawn(None).unwrap();
+        assert_eq!(
+            decide(&on, Ok(&without), true, sid, 2, owner, &[]).await,
+            (None, None)
+        );
+        assert!(
+            without.apply(first).await.is_err(),
+            "before P2e-5b: the history below the floor, refused"
         );
     }
 
