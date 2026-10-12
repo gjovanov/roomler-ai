@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P2e-4 — the primary's drain, end to end: a real server and a real
-//! device in-process, as the canary (`hive_canary.rs`; this is its own binary
-//! for the same reason: the device's Hive supervisor is process-global).
+//! FR-90 P2e-4 and P2e-5 — a device's frames of a promotion, end to end: a real
+//! server and a real device in-process, as the canary (`hive_canary.rs`; this
+//! is its own binary for the same reason: the device's Hive supervisor is
+//! process-global).
 //!
-//! No build advertises `hive-promote` before P2e-5, so the route refuses every
-//! promotion. The server's drain step is therefore seeded on the record: a
-//! promotion `draining` this device at its fence. `rc:hive.drain` then goes
-//! over the device's control connection, as that step sends it. What the test
-//! reads is the server's own: the record its handler of the device's answer
-//! wrote, and the device's answers to prompts over the owner's viewer peer.
+//! No build advertises `hive-promote` yet, so the route refuses every
+//! promotion. The server's steps are therefore seeded on the record, and each
+//! frame goes over the device's control connection, as that step sends it.
+//! What the test reads is the server's own: the record, and the room its
+//! handler of the device's answer wrote to, and the device's answers to
+//! prompts over the owner's viewer peer.
 //!
 //! | step | the device | what the test reads |
 //! |---|---|---|
-//! | the drain | takes no new prompt; answers `rc:hive.drained` with its store's tip | the record moved on to `syncing`, holding that tip; a prompt refused in words |
+//! | the drain, a promotion `draining` this device | takes no new prompt; answers `rc:hive.drained` with its store's tip | the record moved on to `syncing`, holding that tip; a prompt refused in words |
 //! | the word, `rc:hive.lease` at its fence | lifts the drain | a prompt answered, and in the harness's stdin |
+//! | the prepare, a promotion `preparing` toward this device (P2e-5) | runs a start's gates: it holds no copy of the session to take it over from | the room, in the device's own words |
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -44,6 +46,9 @@ done
 
 /// What a prompt hears while its session drains.
 const MOVING: &str = "the session is moving to another device — ask again in a minute";
+
+/// P2e-5 — a prepare's refusal from a device that holds no copy.
+const NO_COPY: &str = "holds no copy of the session to take it over from";
 
 /// Each prompt the harness has read so far, as text.
 fn harness_read(folder: &std::path::Path) -> Vec<String> {
@@ -90,7 +95,7 @@ async fn until_stored(
 }
 
 #[test]
-fn a_drain_over_the_control_connection_quiets_the_session_until_the_word() {
+fn a_drain_and_a_prepare_over_the_control_connection_are_answered_in_the_devices_words() {
     // Its own thread with a deep stack, and a current-thread runtime, as the
     // canary: several servers' worth of tasks live in one body.
     let joined = std::thread::Builder::new()
@@ -245,6 +250,66 @@ async fn scenario() {
         tokio::time::sleep(POLL).await;
     }
     let read = until_read(&work, 2).await;
+
+    // ── A member's prepare (P2e-5), toward this very device ─────────────────
+    // The drain's promotion over, one preparing toward this device asks it
+    // whether it could take the session over at the next fence. It runs it at
+    // this one, and holds no checkpoint of it (no member: never replicated),
+    // so it refuses, and the room says so in the device's own words.
+    assert!(
+        dao.end_promotion(session_id, promotion.id, &[PromotionState::Syncing])
+            .await
+            .unwrap()
+            .is_some(),
+        "the drain's promotion, ended"
+    );
+    let preparing = Promotion {
+        id: ObjectId::new(),
+        to: agent,
+        state: PromotionState::Preparing,
+        drained: None,
+        ..promotion.clone()
+    };
+    assert!(
+        dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &preparing)
+            .await
+            .unwrap(),
+        "the prepare's promotion begins"
+    );
+    let room = s["room_id"].as_str().unwrap().to_string();
+    app.state
+        .fleet()
+        .rc_hub
+        .push_hive(
+            agent,
+            tenant,
+            ServerMsg::HivePrepare {
+                session_id,
+                fence: fence + 1,
+                harness: rec.harness.id.clone(),
+                harness_session: rec.harness.session.clone(),
+                folder: rec.location.folder.clone(),
+                user_id: rec.owner_id,
+                user_email: seeded.admin.email.clone(),
+                caller: "hivedrain Admin".into(),
+            },
+        )
+        .expect("the prepare reaches the device");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let said = room_messages(&app, &seeded, &room)
+            .await
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|c| c.contains(NO_COPY)));
+        if said {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the device's answer to the prepare never reached the room"
+        );
+        tokio::time::sleep(POLL).await;
+    }
     own.close(&mut ows).await;
     let _ = stop_device.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), device_task).await;

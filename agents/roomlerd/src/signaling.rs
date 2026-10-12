@@ -4347,12 +4347,85 @@ async fn handle_server_msg(
             }
         }
 
-        // FR-90 P2e-3 — the member's frames of a promotion. No build
-        // advertises `hive-promote` yet (the prepare and the move are P2e-5),
-        // so no server sends them; one that did gets no answer, and its
-        // promotion fails at its bound with nothing moved.
-        ServerMsg::HivePrepare { session_id, .. } | ServerMsg::HiveMove { session_id, .. } => {
-            debug!(session = %session_id, "a promotion frame ignored — this build takes no part in moving sessions");
+        // FR-90 P2e-5 — could this device take the session over? A start's
+        // every gate, as configured now, and none of its side effects; the
+        // answer goes back on THIS connection.
+        ServerMsg::HivePrepare {
+            session_id,
+            fence,
+            harness,
+            harness_session,
+            folder,
+            user_id,
+            user_email,
+            caller,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_prepare(
+                crate::hive::StartOrder {
+                    session_id,
+                    harness,
+                    harness_session,
+                    fence,
+                    folder,
+                    user_id,
+                    user_email,
+                    caller,
+                    resume: true,
+                    replicated: true,
+                    lease: true,
+                },
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            #[cfg(not(hive_host))]
+            {
+                let _ = (
+                    fence,
+                    &harness,
+                    &harness_session,
+                    &folder,
+                    user_id,
+                    &user_email,
+                    &caller,
+                );
+                debug!(session = %session_id, "rc:hive.prepare ignored — this build does not run agent sessions");
+            }
+        }
+
+        // FR-90 P2e-5 — the record's word for the start right behind it: the
+        // turns the session has had, and where it ran. Kept for that start,
+        // which takes the session over from its copy when it ran elsewhere.
+        ServerMsg::HiveMove {
+            session_id,
+            fence,
+            turns,
+            from_device_id,
+            from_device_name,
+            from_folder,
+            moved_by,
+            moved_by_name,
+            moved_at_ms,
+        } => {
+            // Where it came from and who moved it are for P2e-7's resume
+            // note; the move's log line names them.
+            info!(
+                session = %session_id, fence, from = %from_device_name,
+                by = %moved_by_name, "the session moves to this device"
+            );
+            let _ = (&from_folder, moved_by, moved_at_ms);
+            #[cfg(hive_host)]
+            crate::hive::handle_move(
+                crate::hive::Moved {
+                    session_id,
+                    fence,
+                    turns,
+                    from_device_id,
+                },
+                ctx.is_primary,
+            );
+            #[cfg(not(hive_host))]
+            let _ = (turns, from_device_id);
         }
 
         // FR-90 P1e — a session's core memory, just ahead of its start. Kept
