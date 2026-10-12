@@ -15,6 +15,7 @@
 //! | the old primary | A is demoted: its harness stops, and it holds a member's copy at fence 2 | A's harness gone; A's member row joined |
 //! | a third device, joined after the move (P2e-5b) | its join names where fence 1 ended, so it takes the whole history below its floor | its tip at B's; its store, event for event, B's, and fence 1's end in it |
 //! | a move back to A, into a folder holding work of its own | A prepares and the lease moves, but its take-over refuses to write over that work: the lease moves back to B at fence 4, and B resumes its own state | the record on B at fence 4; the room says the move did not happen; A's folder as it was; B remembers all three prompts; C at B's tip, holding three fences' ends |
+//! | B unreachable (P2e-6a): its process gone, then waited out | refused while B may still call the model; then A's own ready names where its copy ends, and the lease moves there with no drain | `primary_offline`, then `promoting`; the record on A at fence 5, fence 4 ending at A's tip, which was B's; the room's "cannot be reached"; A remembers all four prompts; C at A's tip, its store A's, event for event |
 //!
 //! ⚠️ The streams ride `direct` on loopback: the tests build carries no
 //! overlay, as in the canary.
@@ -285,6 +286,46 @@ async fn promote(
 fn copy_of(db: &Path, sid: &str) -> Vec<roomler_hive_node::EventEnvelope> {
     let store = roomler_hive_node::store::Store::open(db).expect("the device's store");
     store.page(sid, 0, 100_000).expect("its copy")
+}
+
+/// Poll until the server no longer holds the device online.
+async fn wait_offline(app: &TestApp, seeded: &SeededTenant, agent_id: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let row: Value = app
+            .auth_get(
+                &format!("/api/tenant/{}/agent/{agent_id}", seeded.tenant_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        if row["status"].as_str() == Some("offline") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the device never went offline");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// As if the server last heard from the device `secs` ago.
+async fn heard_last(app: &TestApp, agent_id: &str, secs: u64) {
+    let ms = i64::try_from(secs * 1000).unwrap();
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": bson::oid::ObjectId::parse_str(agent_id).unwrap() },
+            bson::doc! { "$set": {
+                "last_seen_at": bson::DateTime::from_millis(
+                    bson::DateTime::now().timestamp_millis() - ms,
+                ),
+            } },
+        )
+        .await
+        .unwrap();
 }
 
 /// Whether the process `pid` names is still there.
@@ -598,20 +639,137 @@ async fn scenario() {
         "A's fence ran nothing: it ended where it began"
     );
 
+    // ── B unreachable: waited out, then moved to A with no drain (P2e-6a) ──
+    // A holds B's whole history at fence 4. B's process stops, so nothing
+    // drains it: refused while B may still call the model, then moved to
+    // where A's own ready says its copy ends, into a folder of A's own.
+    use roomler_ai_remote_control::hive::promote_limits::UNREACHABLE_SECS;
+    let want = primary_tip(&mut ws, &sid).await;
+    until_session(
+        &app,
+        &seeded,
+        &sid,
+        LONG,
+        "A's copy never reached B's tip at fence 4",
+        |s| {
+            member(s, &a).is_some_and(|m| {
+                m["state"] == "joined"
+                    && m["tip"]["fence"] == 4
+                    && m["tip"]["seq"].as_u64() == Some(want)
+            })
+        },
+    )
+    .await;
+    stop(b_proc).await;
+    wait_offline(&app, &seeded, &b).await;
+    let again = a_dir.join("roots").join("again");
+    std::fs::create_dir_all(&again).unwrap();
+    let answer = promote(&app, &tid, &owner, &sid, &a, &again).await;
+    assert_eq!(
+        (answer["outcome"].as_str(), answer["reason"].as_str()),
+        (Some("refused"), Some("primary_offline")),
+        "B just went: {answer}"
+    );
+    heard_last(&app, &b, UNREACHABLE_SECS + 1).await;
+    let answer = promote(&app, &tid, &owner, &sid, &a, &again).await;
+    assert_eq!(
+        answer["outcome"], "promoting",
+        "A is ready, and B unreachable: {answer}"
+    );
+    let moved = until_session(
+        &app,
+        &seeded,
+        &sid,
+        LONG,
+        "the lease never moved to A",
+        |s| {
+            s["device_id"] == a.as_str()
+                && s["fence"] == 5
+                && s["promotion"].is_null()
+                && s["status"] == "idle"
+        },
+    )
+    .await;
+    assert_eq!(moved["folder"], again.display().to_string(), "{moved}");
+    let noted = until_room_message(&app, &seeded, &room, |m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("cannot be reached"))
+    })
+    .await;
+    assert!(noted, "the room says what the session goes on from");
+    assert_eq!(
+        std::fs::read_to_string(again.join("notes.md"))
+            .ok()
+            .as_deref(),
+        Some(WORK),
+        "the folder came with the session, from A's copy"
+    );
+    let mut on_a = view(&mut ws, &sid).await;
+    on_a.send(json!({"op": "hello"})).await;
+    let hello = on_a.recv_op("hello").await;
+    assert_eq!(hello["may_prompt"], true, "A serves it now: {hello}");
+    let tip = hello["tip"].as_u64().unwrap_or(0);
+    on_a.send(json!({"op": "follow", "after": tip})).await;
+    let turn = prompt(&mut on_a, "p5", "recall").await;
+    assert!(
+        turn.iter().any(|e| text_of(e).contains("history: 5")),
+        "A resumed B's state from its copy, all four prompts and this one: {turn:?}"
+    );
+    on_a.close(&mut ws).await;
+    let record = roomler_ai_mod_hive::dao::AgentSessionDao::new(&app.db)
+        .find(bson::oid::ObjectId::parse_str(&sid).unwrap())
+        .await
+        .unwrap()
+        .expect("the session's record");
+    assert_eq!(
+        record.fences.iter().map(|m| m.fence).collect::<Vec<_>>(),
+        [1, 2, 3, 4],
+        "{:?}",
+        record.fences
+    );
+    assert_eq!(
+        record.fences[3].seq,
+        i64::try_from(want).unwrap(),
+        "fence 4 ends at A's tip, which was B's: nothing it held was lost"
+    );
+    // C follows A at fence 5.
+    let want = primary_tip(&mut ws, &sid).await;
+    until_session(
+        &app,
+        &seeded,
+        &sid,
+        LONG,
+        "C's copy never reached A's tip at fence 5",
+        |s| {
+            member(s, &c).is_some_and(|m| {
+                m["state"] == "joined"
+                    && m["tip"]["fence"] == 5
+                    && m["tip"]["seq"].as_u64() == Some(want)
+            })
+        },
+    )
+    .await;
+
     // ── The devices gone, their stores read ─────────────────────────────────
     stop(c_proc).await;
-    stop(b_proc).await;
     let _ = stop_a.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), a_task).await;
+    let on_a = copy_of(&a_dir.join("hive.db"), &sid);
     let on_b = copy_of(&b_dir.join("hive.db"), &sid);
     let on_c = copy_of(&c_dir.join("hive.db"), &sid);
-    assert_eq!(on_c, on_b, "C's copy is B's history, event for event");
+    assert_eq!(on_c, on_a, "C's copy is A's history, event for event");
+    assert_eq!(
+        on_c.get(..on_b.len()),
+        Some(&on_b[..]),
+        "B's history is where A's and C's begin: the move lost none of it"
+    );
     let fences: Vec<u64> = {
         let mut f: Vec<u64> = on_c.iter().map(|e| e.fence).collect();
         f.dedup();
         f
     };
-    assert_eq!(fences, [1, 2, 4], "A's fence 3 wrote nothing: {on_c:?}");
+    assert_eq!(fences, [1, 2, 4, 5], "A's fence 3 wrote nothing: {on_c:?}");
     let c_store = roomler_hive_node::store::Store::open(&c_dir.join("hive.db")).unwrap();
     let c_ends: Vec<(u64, u64, String)> = c_store
         .fence_ends(&sid)

@@ -981,6 +981,12 @@ pub enum ClientMsg {
         /// receipt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// FR-90 P2e-6a — when ready, where the device's copy ends: what a
+        /// promotion away from an unreachable primary moves the lease to.
+        /// Absent from a device before P2e-6a, which such a promotion then
+        /// refuses rather than guesses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tip: Option<crate::hive::HiveCopyTip>,
     },
 
     /// FR-90 P2e-3 — the primary's answer to [`ServerMsg::HiveDrain`]: it
@@ -4919,13 +4925,37 @@ mod tests {
             refused: None,
             account: Some("dev".into()),
             detail: None,
+            tip: None,
         };
         assert_eq!(
             serde_json::to_value(&ready).unwrap(),
             serde_json::json!({
                 "t": "rc:hive.prepare_ack", "session_id": sid.to_hex(), "fence": 2,
                 "account": "dev"
-            })
+            }),
+            "a ready with no tip is the frame it was before P2e-6a"
+        );
+        // P2e-6a — where the copy ends, numbers and a hash.
+        let tipped = ClientMsg::HivePrepareAck {
+            session_id: sid,
+            fence: 2,
+            refused: None,
+            account: Some("dev".into()),
+            detail: None,
+            tip: Some(crate::hive::HiveCopyTip {
+                fence: 1,
+                seq: 41,
+                hash: "cd".repeat(32),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&tipped).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.prepare_ack", "session_id": sid.to_hex(), "fence": 2,
+                "account": "dev",
+                "tip": {"fence": 1, "seq": 41, "hash": "cd".repeat(32)}
+            }),
+            "a ready names where its copy ends"
         );
         let refused: ClientMsg = serde_json::from_value(serde_json::json!({
             "t": "rc:hive.prepare_ack", "session_id": sid.to_hex(), "fence": 2,

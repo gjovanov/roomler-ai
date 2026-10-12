@@ -561,19 +561,27 @@ pub fn handle_move(m: Moved, is_primary: bool) {
 pub fn handle_prepare(order: StartOrder, is_primary: bool, tx: mpsc::Sender<ClientMsg>) {
     let sup = global();
     tokio::spawn(async move {
-        let answer = match sup {
-            Some(sup) => sup.prepare(&order, is_primary).await,
-            None => Answer::refused(
-                HiveRefusal::HiveDisabled,
-                "agent sessions are not set up on this device",
+        let (answer, tip) = match sup {
+            Some(sup) => sup.prepare_with_tip(&order, is_primary).await,
+            None => (
+                Answer::refused(
+                    HiveRefusal::HiveDisabled,
+                    "agent sessions are not set up on this device",
+                ),
+                None,
             ),
         };
-        let _ = tx.send(prepare_ack(&order, answer)).await;
+        let _ = tx.send(prepare_ack(&order, answer, tip)).await;
     });
 }
 
-/// FR-90 P2e-5 — a prepare's answer as `rc:hive.prepare_ack` says it.
-fn prepare_ack(order: &StartOrder, a: Answer) -> ClientMsg {
+/// FR-90 P2e-5 — a prepare's answer as `rc:hive.prepare_ack` says it; P2e-6a —
+/// with where the copy ends, when ready.
+fn prepare_ack(
+    order: &StartOrder,
+    a: Answer,
+    tip: Option<roomler_ai_remote_control::hive::HiveCopyTip>,
+) -> ClientMsg {
     ClientMsg::HivePrepareAck {
         session_id: order.session_id,
         fence: order.fence,
@@ -582,6 +590,7 @@ fn prepare_ack(order: &StartOrder, a: Answer) -> ClientMsg {
         detail: a
             .detail
             .map(|d| d.chars().take(hive_limits::MAX_DETAIL_LEN).collect()),
+        tip,
     }
 }
 
@@ -1742,6 +1751,24 @@ impl Supervisor {
             },
             copy_dest(order, &console.profile, folder),
         ))
+    }
+
+    /// P2e-6a — [`Self::prepare`]'s answer, and when ready, where this
+    /// device's copy of the session ends: what `rc:hive.prepare_ack` carries.
+    /// A promotion away from an unreachable primary moves the lease to that
+    /// tip, so it is read here, at the answer, never from an older report.
+    pub(crate) async fn prepare_with_tip(
+        self: &Arc<Self>,
+        order: &StartOrder,
+        is_primary: bool,
+    ) -> (Answer, Option<roomler_ai_remote_control::hive::HiveCopyTip>) {
+        let answer = self.prepare(order, is_primary).await;
+        let tip = if answer.refused.is_none() {
+            self.copy_tip(order.session_id).await
+        } else {
+            None
+        };
+        (answer, tip)
     }
 
     /// P2e-5 — `rc:hive.prepare`: could this device take the session over at
@@ -8950,6 +8977,37 @@ done
         );
         r.sup.stop(sid, 2, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-6a — a ready prepare names where this device's copy of the session
+    /// ends, its store's tip; a refused one names none.
+    #[tokio::test]
+    async fn the_prepare_names_where_its_copy_ends_when_ready() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 1);
+        let o = ran_twice(&mut r).await;
+        let held = r
+            .store
+            .chain_tip(&o.session_id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        let (answer, tip) = r.sup.prepare_with_tip(&at_fence(&o, 2), true).await;
+        assert_eq!(answer, Answer::accepted("dev"));
+        assert_eq!(
+            tip,
+            Some(roomler_ai_remote_control::hive::HiveCopyTip {
+                fence: held.fence,
+                seq: held.seq,
+                hash: hex::encode(held.hash),
+            }),
+            "ready: where its copy ends, the store's tip"
+        );
+        let mut no_copy = at_fence(&o, 2);
+        no_copy.session_id = ObjectId::new();
+        let (answer, tip) = r.sup.prepare_with_tip(&no_copy, true).await;
+        assert!(answer.refused.is_some());
+        assert_eq!(tip, None, "refused: no tip");
     }
 
     /// P2e-5 — the prepare answers with every gate a start passes, as the

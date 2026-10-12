@@ -55,7 +55,7 @@ use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
     hive::{
-        HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HiveRefusal,
+        HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HiveRefusal,
         HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
     },
     signaling::{ClientMsg, ServerMsg},
@@ -124,6 +124,8 @@ enum Report {
         fence: u64,
         refused: Option<HiveRefusal>,
         detail: Option<String>,
+        /// P2e-6a — where the member's copy ends, when it is ready.
+        tip: Option<HiveCopyTip>,
     },
     /// P2e-3 — a primary's answer to a promotion's drain (`rc:hive.drained`).
     Drained {
@@ -282,11 +284,13 @@ impl AgentMsgHandler for HiveAgentSocket {
                 refused,
                 account: _,
                 detail,
+                tip,
             } => Report::PrepareAck {
                 session_id,
                 fence,
                 refused,
                 detail,
+                tip,
             },
             ClientMsg::HiveDrained {
                 session_id,
@@ -652,9 +656,12 @@ async fn apply_reports(
                 fence,
                 refused,
                 detail,
+                tip,
             } => {
-                crate::promote::on_prepare_ack(state, device_id, session_id, fence, refused, detail)
-                    .await
+                crate::promote::on_prepare_ack(
+                    state, device_id, session_id, fence, refused, detail, tip,
+                )
+                .await
             }
             Report::Drained {
                 session_id,
