@@ -1035,6 +1035,25 @@ fn remove_under(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::run_as`], again while the script it runs is busy
+    /// ([`super::super::child::unbusy`]): a test here writes the child it
+    /// runs, and another test of this binary may fork meanwhile.
+    #[cfg(unix)]
+    async fn run_as(
+        exe: &Path,
+        account: Option<&str>,
+        env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        target: &Target,
+        planned: &Planned,
+        blobs: &Blobs<'_>,
+        timeout: Duration,
+    ) -> Result<Done, String> {
+        super::super::child::unbusy(|| {
+            super::run_as(exe, account, env.clone(), target, planned, blobs, timeout)
+        })
+        .await
+    }
     use roomler_hive_node::checkpoint::{Previous, take};
     use std::collections::{BTreeMap, HashMap};
 
