@@ -112,6 +112,20 @@ pub(crate) fn moving_note(p: &Promotion, by: &str) -> String {
     )
 }
 
+/// FR-90 P2e-6a — the move away from a primary that cannot be reached: the
+/// session goes on from the member's copy, and what the primary did after
+/// that copy ends is not in it.
+pub(crate) fn moving_unreachable_note(p: &Promotion, by: &str) -> String {
+    format!(
+        "🔀 **{}** is moving the session to {} — {} cannot be reached, so the session goes on from the copy {} holds; anything {} did after that copy ends is not in it",
+        md_escape(by),
+        name_label(&p.to_name),
+        name_label(&p.from.device_name),
+        name_label(&p.to_name),
+        name_label(&p.from.device_name)
+    )
+}
+
 /// FR-90 P2e-3 — "moved": from where, to where, by whom, in which folder,
 /// and as whom the device says it runs now. `s` is the record after the move.
 pub(crate) fn moved_note(s: &AgentSession, p: &Promotion, by: &str) -> String {
@@ -751,11 +765,18 @@ mod tests {
             started_at: now,
             deadline: now,
             drained: None,
+            unreachable_from: false,
         };
         let moving = moving_note(&p, "Alice");
         assert_eq!(
             moving,
             r"🔀 **Alice** is moving the session to **\[venus\]\(javascript:1\)** — **mars** takes no new prompt meanwhile"
+        );
+        // P2e-6a — away from a primary that cannot be reached, the note says
+        // what the session goes on from, the names escaped as everywhere.
+        assert_eq!(
+            moving_unreachable_note(&p, "Alice"),
+            r"🔀 **Alice** is moving the session to **\[venus\]\(javascript:1\)** — **mars** cannot be reached, so the session goes on from the copy **\[venus\]\(javascript:1\)** holds; anything **mars** did after that copy ends is not in it"
         );
         let s = AgentSession {
             id: Some(ObjectId::new()),

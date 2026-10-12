@@ -260,9 +260,17 @@ pub struct Promotion {
     /// has failed, whether or not the pod that started it is still there to
     /// say so; in `moving`, it may be replaced once past it.
     pub deadline: DateTime,
-    /// The primary's word on where its copy ends, once it drained.
+    /// The primary's word on where its copy ends, once it drained. P2e-6a —
+    /// for a primary that was unreachable, the member's own word on where
+    /// its copy ends, from its ready answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drained: Option<DrainedTip>,
+    /// FR-90 P2e-6a — the primary had been unreachable for
+    /// `UNREACHABLE_SECS` when the promotion began: no drain is asked of it,
+    /// and the lease moves to where the member's copy ends. Absent = a
+    /// promotion that drains, every one before P2e-6a.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreachable_from: bool,
 }
 
 impl Promotion {
@@ -937,6 +945,7 @@ mod tests {
                 seq: 9,
                 hash: "ab".repeat(32),
             }),
+            unreachable_from: false,
         };
         assert!(p.in_flight(now));
         assert!(
