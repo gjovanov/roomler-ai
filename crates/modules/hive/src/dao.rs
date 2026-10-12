@@ -17,8 +17,8 @@ use roomler_ai_services::dao::base::{
 };
 
 use crate::model::{
-    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, Promotion, PromotionState,
-    ReplicaMember, Replicaset, SessionStatus,
+    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, MovedStart, Promotion,
+    PromotionState, ReplicaMember, Replicaset, SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -431,31 +431,53 @@ impl AgentSessionDao {
         owner_id: ObjectId,
         id: ObjectId,
         p: &Promotion,
+        unanswered: bool,
     ) -> DaoResult<bool> {
         let now = DateTime::now();
         let promotion = bson::to_bson(p)?;
+        let mut filter = doc! {
+            "_id": id,
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+            "fence": p.from_fence,
+            "location.device_id": p.from.device_id,
+        };
+        if unanswered {
+            // P2e-6b — a moved start its device never answered: still
+            // starting there, past the first fence, and the move that sent it
+            // (in flight or not) replaced.
+            filter.insert("status", SessionStatus::Starting.as_str());
+            filter.insert("accepted_at", Bson::Null);
+            filter.insert("fence", doc! { "$eq": p.from_fence, "$gt": 1_i64 });
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "promotion": Bson::Null },
+                    doc! { "promotion.deadline": { "$lt": now } },
+                    doc! {
+                        "promotion.state": PromotionState::Moving.as_str(),
+                        "promotion.to": p.from.device_id,
+                    },
+                ],
+            );
+        } else {
+            filter.insert("status", statuses(&SessionStatus::REPORTABLE));
+            filter.insert(
+                "$and",
+                vec![
+                    doc! { "$or": [
+                        { "accepted_at": { "$type": "date" } },
+                        { "status": statuses(&SessionStatus::LAUNCHED) },
+                    ] },
+                    doc! { "$or": [
+                        { "promotion": Bson::Null },
+                        { "promotion.deadline": { "$lt": now } },
+                    ] },
+                ],
+            );
+        }
         self.base
-            .update_one(
-                doc! {
-                    "_id": id,
-                    "tenant_id": tenant_id,
-                    "owner_id": owner_id,
-                    "fence": p.from_fence,
-                    "location.device_id": p.from.device_id,
-                    "status": statuses(&SessionStatus::REPORTABLE),
-                    "$and": [
-                        { "$or": [
-                            { "accepted_at": { "$type": "date" } },
-                            { "status": statuses(&SessionStatus::LAUNCHED) },
-                        ] },
-                        { "$or": [
-                            { "promotion": Bson::Null },
-                            { "promotion.deadline": { "$lt": now } },
-                        ] },
-                    ],
-                },
-                doc! { "$set": { "promotion": promotion } },
-            )
+            .update_one(filter, doc! { "$set": { "promotion": promotion } })
             .await
     }
 
@@ -532,6 +554,12 @@ impl AgentSessionDao {
             return Ok(false);
         };
         let (to, from) = (p.to, p.from.device_id);
+        // P2e-6b — the member's start comes from where the session ran.
+        let moved = bson::to_bson(&MovedStart {
+            from: p.from.clone(),
+            by: p.by,
+            at: DateTime::now(),
+        })?;
         let opts = mongodb::options::UpdateOptions::builder()
             .array_filters(vec![
                 doc! { "to.device_id": to },
@@ -577,6 +605,7 @@ impl AgentSessionDao {
                         "replicaset.members.$[other].state": MemberState::Pending.as_str(),
                         "promotion.state": PromotionState::Moving.as_str(),
                         "promotion.deadline": deadline,
+                        "moved": moved,
                         "updated_at": DateTime::now(),
                     },
                     // The fence it supersedes ends at the drained tip.
@@ -612,6 +641,14 @@ impl AgentSessionDao {
         let Some(mark) = fence_mark(p, p.from_fence + 1) else {
             return Ok(false);
         };
+        // P2e-6b — the start back comes from the device it returns to, which
+        // holds the session as it left it; or, for a device that never
+        // answered the start it was moved, from where that start came.
+        let moved = bson::to_bson(&p.prior.clone().unwrap_or_else(|| MovedStart {
+            from: p.from.clone(),
+            by: p.by,
+            at: DateTime::now(),
+        }))?;
         let (to, from) = (p.to, p.from.device_id);
         let opts = mongodb::options::UpdateOptions::builder()
             .array_filters(vec![
@@ -651,6 +688,7 @@ impl AgentSessionDao {
                         "replicaset.members.$[from].role": MemberRole::Primary.as_str(),
                         "replicaset.members.$[from].state": MemberState::Pending.as_str(),
                         "replicaset.members.$[other].state": MemberState::Pending.as_str(),
+                        "moved": moved,
                         "updated_at": DateTime::now(),
                     },
                     "$push": { "fences": mark },

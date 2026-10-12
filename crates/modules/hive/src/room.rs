@@ -766,6 +766,7 @@ mod tests {
             deadline: now,
             drained: None,
             unreachable_from: false,
+            prior: None,
         };
         let moving = moving_note(&p, "Alice");
         assert_eq!(
@@ -810,6 +811,7 @@ mod tests {
             replicaset: None,
             promotion: None,
             fences: Vec::new(),
+            moved: None,
         };
         assert_eq!(
             moved_note(&s, &p, "Alice"),
