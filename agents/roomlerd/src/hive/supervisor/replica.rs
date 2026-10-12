@@ -229,7 +229,9 @@ impl Supervisor {
         fences: &[HiveFenceMark],
     ) -> JoinAnswer {
         let answer = match role {
-            Some(HiveReplicaRole::Primary) => self.take_up_replication(primary, session, fence),
+            Some(HiveReplicaRole::Primary) => {
+                self.take_up_replication(primary, session, fence).await
+            }
             member => {
                 decide(
                     &self.cfg,
@@ -254,15 +256,16 @@ impl Supervisor {
     /// P2c-4 — `join {role: primary}`: the session this device runs has
     /// members now, so each turn's end is checkpointed from here on, and
     /// after a restart too. Idempotent. Refused on a secondary org's
-    /// connection, and when this device does not run the session at that
-    /// fence. `hive_replica` is not asked: the device holds no copy of
-    /// another's session, only its own run.
+    /// connection, and when this device runs the session at another fence.
+    /// `hive_replica` is not asked: the device holds no copy of another's
+    /// session, only its own run. P2e-5c — one for a session it does not
+    /// run yet is a promotion's, ahead of its start ([`Self::ahead_of_start`]).
     ///
     /// ⚠️ The record, then the live session, then the record again if it was
     /// not there yet. A session resuming now reads its record once it is live
     /// (`launch`); a new one writes its record from the live flag, under the
     /// record's lock. Either way a join that lands between the two is kept.
-    pub(super) fn take_up_replication(
+    pub(super) async fn take_up_replication(
         &self,
         primary: bool,
         session: ObjectId,
@@ -319,9 +322,59 @@ impl Supervisor {
                 HiveJoinRefusal::Other,
                 format!("this device runs the session at fence {f}, before the join's"),
             ),
-            None => refuse(
+            None => self.ahead_of_start(session, fence).await,
+        }
+    }
+
+    /// P2e-5c — `join {role: primary}` for a session this device does not
+    /// run yet: a promotion's target hears it before its start, and so does
+    /// the device a refused moved start moves the session back to
+    /// (`promote::before_start` on the server). Taken up when the device
+    /// holds the session's copy: its floor rises to the join's fence first,
+    /// so nothing of an older fence is taken from here on, before the start
+    /// at that fence writes (spec §3b, "every member's floor is the new fence
+    /// before the new primary writes: the target's with its join"). The
+    /// start says `replicated` itself, so nothing else is marked.
+    ///
+    /// ⚠️ Before P2e-5c this was refused (`other`, "this device does not
+    /// run the session"), and after every real move the target's own row read
+    /// refused until it next connected. A device that holds nothing of the
+    /// session, or holds it at a newer floor, is still refused.
+    async fn ahead_of_start(&self, session: ObjectId, fence: u64) -> JoinAnswer {
+        let refuse = |word: HiveJoinRefusal, why: String| (Some(word), Some(why));
+        let not_here = || {
+            refuse(
                 HiveJoinRefusal::Other,
                 "this device does not run the session".into(),
+            )
+        };
+        let Ok(store) = &self.store else {
+            return not_here();
+        };
+        let sid = session.to_hex();
+        match store.chain_tip(&sid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return not_here(),
+            Err(e) => {
+                return refuse(
+                    HiveJoinRefusal::Other,
+                    format!("the replica store could not be read: {e}"),
+                );
+            }
+        }
+        match store.raise_floor(&sid, fence).await {
+            Ok(floor) if floor > fence => refuse(
+                HiveJoinRefusal::StaleFence,
+                format!("this device holds the session at fence {floor}"),
+            ),
+            Ok(_) => (None, None),
+            Err(WriterError::Store(StoreError::Purged { .. })) => refuse(
+                HiveJoinRefusal::Purged,
+                "this device purged the session, and removal is final".into(),
+            ),
+            Err(e) => refuse(
+                HiveJoinRefusal::Other,
+                format!("the replica store refused the floor: {e}"),
             ),
         }
     }

@@ -15,6 +15,7 @@
 //! | a stream that carried and ended (`expired`, the source let go) | at once, from the top |
 //! | a stream ended `caught_up`: the copy holds all of a session that is over | nothing more: parked |
 //! | refused `not_a_member` or `stale_fence`; the server's close `member_left` or `device_removed` | stopped, until the next join |
+//! | P2e-5c: any of the last two, when a newer join came after the ask that got it | at once, from the top, at the new fence: that answer was about the fence the session left |
 //!
 //! P2d-4 — **renewals.** A grant lives `ttl_secs` (10 min). At half its life
 //! the member asks for the session again, from the top of the ladder, beside
@@ -108,6 +109,10 @@ pub(crate) enum Phase {
 struct Follow {
     /// The membership's fence, which every ask names.
     fence: u64,
+    /// P2e-5c — the fence the last ask named. A newer join raises `fence`
+    /// while that ask, or the stream it got, is still out: its verdict is
+    /// about a fence the session has left.
+    asked_fence: u64,
     /// The rung the next ask tries, into [`Supervisor::ladder`].
     rung: usize,
     /// Outcomes in a row that carried nothing: each doubles the wait.
@@ -148,6 +153,7 @@ impl Follow {
     fn new(fence: u64) -> Self {
         Self {
             fence,
+            asked_fence: fence,
             rung: 0,
             misses: 0,
             phase: Phase::Waiting,
@@ -323,12 +329,25 @@ impl Supervisor {
     /// A join this device passed as a member, at `fence`: the session is
     /// followed from the top, whatever it was doing, unless it is followed
     /// or asked for already, which the new fence goes to.
+    ///
+    /// P2e-5c — an ask out at an older fence is asked again now, at the new
+    /// one: the session moved, and that ask's answer can only name where it
+    /// was. A grant toward its old location is ended by the server at the
+    /// move, before its dial, and a member never hears of a grant it was not
+    /// dialed for, so it would wait out the ask's whole timeout. The old
+    /// ask's answer then moves nothing: a refusal names its fence, and a
+    /// timer its generation.
     pub(super) fn follow_joined(self: &Arc<Self>, session: ObjectId, fence: u64) {
         let ask = {
             let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
             let f = follows.map.entry(session).or_insert(Follow::new(fence));
             f.fence = f.fence.max(fence);
             match f.phase {
+                Phase::Wanting(_) if f.fence > f.asked_fence => {
+                    f.rung = 0;
+                    f.misses = 0;
+                    true
+                }
                 Phase::Wanting(_) | Phase::Following(_) | Phase::Queued => false,
                 Phase::Waiting | Phase::Parked | Phase::Stopped => {
                     f.rung = 0;
@@ -374,6 +393,7 @@ impl Supervisor {
             }
             let path = ladder[f.rung];
             f.phase = Phase::Wanting(path);
+            f.asked_fence = f.fence;
             (path, f.fence, f.generation)
         };
         let (path, fence, generation) = asked;
@@ -771,12 +791,22 @@ impl Supervisor {
     /// session that waited longest for one.
     fn next(self: &Arc<Self>, session: ObjectId, next: Next) {
         let ladder_len = self.ladder().len();
-        let (ask_now, wait, generation) = {
+        let (ask_now, wait, generation, next) = {
             let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
             let Some(f) = follows.map.get_mut(&session) else {
                 return;
             };
             f.generation += 1;
+            // P2e-5c — a session parked or stopped by the answer to an ask
+            // that a newer join overtook is asked for again, from the top, at
+            // its new fence: that answer was about the fence the session
+            // left. A move is the one way to a newer join, and a session that
+            // moves runs on.
+            let next = if matches!(next, Next::Park | Next::Stop) && f.fence > f.asked_fence {
+                Next::Again
+            } else {
+                next
+            };
             // Out of its stream or its ask either way: the slot is free
             // until the next ask takes it. A renewal asked for goes with it
             // (P2d-4): its answer, should it come, is taken for the next
@@ -817,7 +847,7 @@ impl Supervisor {
                     (false, None)
                 }
             };
-            (ask_now, wait, f.generation)
+            (ask_now, wait, f.generation, next)
         };
         info!(session = %session, ?next, wait_ms = wait.map(|w| w.as_millis() as u64), "hive: a follow moves on");
         if ask_now {

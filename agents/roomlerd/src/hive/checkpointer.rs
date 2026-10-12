@@ -663,6 +663,24 @@ pub fn checkpoint_main(request: &Path) -> i32 {
 mod tests {
     use super::*;
 
+    /// [`super::run_as`], again while the script it runs is busy
+    /// ([`super::super::child::unbusy`]): every test here writes the child
+    /// it runs, and another test of this binary may fork meanwhile.
+    #[cfg(unix)]
+    async fn run_as(
+        exe: &Path,
+        request_path: &Path,
+        req: &Request,
+        account: Option<&str>,
+        env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        timeout: Duration,
+    ) -> Result<(Checkpoint, Vec<Vec<u8>>), String> {
+        super::super::child::unbusy(|| {
+            super::run_as(exe, request_path, req, account, env.clone(), timeout)
+        })
+        .await
+    }
+
     const HID: &str = "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9";
     const SID: &str = "6aca8ef5dac84dd57e492eb7";
 
