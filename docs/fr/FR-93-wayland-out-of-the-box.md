@@ -364,8 +364,9 @@ always had, and that automatic use would put in front of every KDE user:
   sharing indicator on.
 - Each pending open parks a runtime worker for up to 120 s.
 
-That is now **P2d** (the table below), and an **operator decision**: whether the portal half of D1 waits for
-P2d, as built, or ships as it is. Two choices the flowchart leaves open:
+That is now **P2d** (the table below). ✅ **Decided 2026-10-12 (operator): the portal waits for P2d.** Its agent
+half (P2d-1, `linux-capture.md` §4.6) is built first, because it also fixes the explicit `portal_capture` path that
+has all three problems today. The flip (P2d-3) waits for P2b's counts. Two choices the flowchart leaves open:
 
 - **"Any capture key" means set to anything.** `drm_capture`, `portal_capture`, `mutter_capture` and
   `window_capture` count, so `portal_capture = false` keeps the portal off as before. A virtual desktop also
@@ -462,7 +463,10 @@ bridge for text and images in the lab before deciding.
 | **P1** | honest failure (§4.2), #1945, the GEM-handle fix (§4.4a), `capture-smoke` reads config | `ROOMLERD_WAYLAND_AWARE=0` | lab, vmtest `default` cells | S–M |
 | **P2** | the auto-cascade (§4.3) + the wire (§4.9) | `ROOMLERD_WAYLAND_AUTO=0`; explicit keys | lab ×2, vmtest, Asahi | M |
 | ↳ P2a | the per-user automatic arm, **mutter** (D1), and `rc:video-info` `capture_arm` + `attended` | `wayland_auto`; any capture key | lab: GNOME per-user red/green, KDE per-user unchanged, GNOME system unchanged | S |
-| ↳ P2d | the attended portal flow, then the portal goes automatic (D1's "elsewhere"): a "waiting for the person at the screen" notice the viewer's watchdog honours, one pending request per host, an open that parks no worker, a late answer for a dead session dropped | `wayland_auto`; any capture key | lab: KDE per-user, first use with nobody at the screen | M |
+| ↳ P2d | the attended portal flow, then the portal goes automatic (D1's "elsewhere") | `wayland_auto`; any capture key | lab: KDE per-user, first use with nobody at the screen | M |
+| ↳↳ P2d-1 | the agent half (`linux-capture.md` §4.6): one pending request per host, handed to the newest session; an open that holds no runtime worker; a late answer for a dead session dropped. It fixes the explicit `portal_capture` path as it stands | — (behaviour-preserving for a request that is answered) | lab: KDE per-user, `portal_capture`, sessions re-created with nobody answering: one dialog, red first on 0.4.130 | S |
+| ↳↳ P2d-2 | the viewer half: a "waiting for the person at the screen" notice the media watchdog honours, instead of a blank canvas and a session re-created every 10 s | additive wire | lab, after a promote | S |
+| ↳↳ P2d-3 | the flip: the portal goes automatic where mutter is absent, sized by P2b's counts (operator, 2026-10-12) | `wayland_auto` | lab, then the fleet | S |
 | ↳ P2b | the hello's `desktop` object, and the server's count of Wayland hosts and the arm serving each (AC13) | additive wire | lab, then the fleet | S |
 | ↳ P2c | the viewer names the arm and whether it asked (FR-45 AC8 option b) | — | lab, after a promote | S |
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
