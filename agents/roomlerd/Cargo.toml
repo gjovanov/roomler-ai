@@ -345,6 +345,13 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["damage", "screensaver", "randr"], optional = true }
 
+# FR-96 security review (#2055) — the root update helper stages each download in
+# a FRESH private directory (mkdtemp) instead of a fixed world-creatable name in
+# /tmp, and moves a planted wake-file entry aside into one. Linux-only: the
+# staging + consume code is `#[cfg(target_os = "linux")]`. Already a dev-dep
+# below and in the lockfile, so this adds no new dependency tree.
+tempfile = { workspace = true }
+
 # FR-36 P1 — DRM/KMS scanout capture (`drm-capture`). MIT, and its whole tree
 # (drm-ffi / drm-sys / drm-fourcc) is MIT too, so it is clean under FR-24's
 # no-AGPL-in-a-shipped-agent rule. drm-sys builds from `linux-raw-sys` with NO

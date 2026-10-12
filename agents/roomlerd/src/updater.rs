@@ -1007,6 +1007,126 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
     releases.into_iter().next()
 }
 
+/// Name prefix of a private per-download staging directory. A cleanup
+/// recognises its own by this prefix and removes nothing else.
+#[cfg(target_os = "linux")]
+const STAGING_DIR_PREFIX: &str = "roomlerd-update.";
+
+/// Where a just-downloaded installer is staged before it runs.
+///
+/// ⚠️ Linux: a FRESH private directory per download (mkdtemp — a random name,
+/// created 0700 then relaxed to 0755, owned by the caller). NEVER the old fixed
+/// `/tmp/roomlerd-update/<asset>`: `/tmp` is sticky but a SUBDIRECTORY of it is
+/// not, so any local user could `mkdir /tmp/roomlerd-update` first (and own
+/// it), then — in the window between this download's in-memory signature check
+/// and the installer's own read of the PATH (`apt-get install <path>`,
+/// `tar -xzf <path>`) — `rename` an attacker package over the genuine one,
+/// making root install arbitrary code (dpkg maintainer scripts run as root).
+/// A directory nobody else owns closes it: a non-owner cannot create, rename
+/// or unlink inside it. 0755 (not 0700) so apt's `_apt` sandbox user can read
+/// the `.deb` — else apt warns and falls back to an unsandboxed-root install
+/// anyway, but the warning is noise we can avoid. FR-96 security review (#2055).
+#[cfg(target_os = "linux")]
+fn stage_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let td = tempfile::Builder::new()
+        .prefix(STAGING_DIR_PREFIX)
+        .tempdir_in(std::env::temp_dir())?;
+    // mkdtemp created it 0700 and ours; relax to exactly 0755 with an explicit
+    // chmod (bypassing umask) now that it exists and only we can reach it.
+    std::fs::set_permissions(td.path(), std::fs::Permissions::from_mode(0o755))?;
+    Ok(td.keep())
+}
+
+/// macOS/Windows: the per-user (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`) or
+/// SYSTEM (Windows `GetTempPath2`) temp dir is already a trust boundary, and a
+/// fixed name is needed on Windows where the companion refresh re-downloads the
+/// same asset name across calls — so the historical shared dir is kept.
+#[cfg(not(target_os = "linux"))]
+fn stage_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("roomlerd-update");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Write the downloaded installer to its staging path.
+///
+/// ⚠️ Linux: `O_CREAT|O_EXCL` (`create_new`) — refuse to write through anything
+/// already at the name rather than follow a symlink or truncate a planted file.
+/// Belt to [`stage_dir`]'s braces (the fresh private dir already means nobody
+/// else can plant here); kept because the cost is one flag and what is written
+/// runs as root.
+#[cfg(target_os = "linux")]
+fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+/// macOS/Windows: the shared staging dir reuses a file name per release (the
+/// Windows companion refresh re-downloads the same name), so a create-or-
+/// truncate is what the repeated download needs.
+#[cfg(not(target_os = "linux"))]
+fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Whether `dir` is one of our private staging directories, by name
+/// (`STAGING_DIR_PREFIX` + mkdtemp's random suffix) and location (directly in
+/// `temp_dir()`). Name-and-place only, on purpose: the guard's job is to stop a
+/// cleanup touching a path that is NOT ours — the old fixed `roomlerd-update`
+/// (no trailing dot, so excluded) from a pre-fix build, or a wizard-supplied
+/// installer elsewhere.
+#[cfg(target_os = "linux")]
+fn is_staging_dir(dir: &std::path::Path) -> bool {
+    dir.parent() == Some(std::env::temp_dir().as_path())
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(STAGING_DIR_PREFIX))
+}
+
+/// Remove the private staging directory that holds `installer_path`, if it is
+/// one of ours. Best-effort: a failure is logged, never fatal. `remove_dir_all`
+/// does not follow symlinks (std ≥ 1.58.1); in a 0755 dir nobody else could
+/// have planted one anyway.
+#[cfg(target_os = "linux")]
+fn discard_staging(installer_path: &std::path::Path) {
+    let Some(dir) = installer_path.parent() else {
+        return;
+    };
+    if !is_staging_dir(dir) {
+        return;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "update: could not remove the private staging dir"
+        ),
+    }
+}
+
+/// Discard a staged download that will not be installed (a failed verification,
+/// or the debug dry-run). Linux: the whole private dir (it holds only this
+/// file). Elsewhere: the file alone — the staging dir is shared across
+/// downloads.
+fn discard_download(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    {
+        discard_staging(path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Download an asset to a temp file and return the path. Verifies the
 /// downloaded size against the asset metadata + the minimum plausible
 /// size so we don't run a ~200 byte HTML error page as an installer.
@@ -1057,10 +1177,9 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             "no digest field on asset; falling through to size floor only"
         );
     }
-    let dir = std::env::temp_dir().join("roomlerd-update");
-    std::fs::create_dir_all(&dir).context("creating temp update dir")?;
+    let dir = stage_dir().context("creating the staging dir")?;
     let path = dir.join(&asset.name);
-    std::fs::write(&path, &bytes).context("writing installer to disk")?;
+    write_installer(&path, &bytes).context("writing installer to disk")?;
 
     // Publisher check — the anchor the serving channel cannot forge. Whatever
     // is on disk here is about to run as SYSTEM, so it must be attributable to
@@ -1082,7 +1201,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 tracing::info!(asset = %asset.name, %signer, "installer signature verified");
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                discard_download(&path);
                 bail!(
                     "refusing to install {}: {e}. The download was discarded and this \
                      agent keeps its current version.",
@@ -1134,7 +1253,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                discard_download(&path);
                 bail!(
                     "refusing to install {}: {e:#}. The download was discarded and this \
                      agent keeps its current version.",
@@ -1171,7 +1290,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             tracing::info!(asset = %asset.name, reason = %e, "no artifact-version binding available");
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&path);
+            discard_download(&path);
             bail!(
                 "refusing to install {}: {e}. The download was discarded and this \
                  agent keeps its current version.",
@@ -1997,11 +2116,19 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         let path_str = installer_path.to_string_lossy().into_owned();
         // SAFETY: `geteuid` is always-succeeding and takes no arguments.
         let euid = unsafe { libc::geteuid() };
-        if path_str.ends_with(".tar.gz") {
+        let result = if path_str.ends_with(".tar.gz") {
             install_tarball_linux(euid, installer_path)
         } else {
             run_linux_install_candidates(euid, &path_str)
-        }
+        };
+        // FR-96 review — the installer file has now been consumed (apt/dpkg
+        // read it, the tarball was extracted and placed), and on Linux no
+        // watcher ever re-runs it (that path is Windows-only, post_install.rs).
+        // Remove our private per-download staging dir — ours alone, guarded by
+        // the prefix so a wizard-supplied path outside temp_dir() is untouched.
+        // Without this a fresh mkdtemp dir per download would accrete in /tmp.
+        discard_staging(installer_path);
+        result
     }
     #[cfg(target_os = "macos")]
     {
@@ -2455,6 +2582,10 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
                     "auto-updater: DRY RUN — would spawn the installer now; nothing installed"
                 );
                 hold_agent_prompts(false);
+                // FR-96 review — the dry run downloaded but will not install, so
+                // nothing else will clean the private staging dir up.
+                #[cfg(target_os = "linux")]
+                discard_staging(&installer_path);
                 return false;
             }
             tracing::warn!(
@@ -3718,6 +3849,102 @@ mod tests {
             err.to_string().contains("must run as root"),
             "unexpected refusal: {err:#}"
         );
+    }
+
+    // ── FR-96 security review (#2055): the private staging dir ───────
+
+    /// Every download gets its own directory, 0755 and owned by the caller, so
+    /// no other local user can swap the installer between its verification and
+    /// the installer's own read of the path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_dir_is_fresh_private_and_ours() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let a = stage_dir().expect("stage_dir a");
+        let b = stage_dir().expect("stage_dir b");
+        assert_ne!(a, b, "each download gets a fresh directory");
+        for d in [&a, &b] {
+            assert!(
+                is_staging_dir(d),
+                "our own dir is recognised: {}",
+                d.display()
+            );
+            let meta = std::fs::metadata(d).expect("stat");
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o755,
+                "staging dir is 0755"
+            );
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            assert_eq!(
+                meta.uid(),
+                unsafe { libc::geteuid() },
+                "owned by the caller"
+            );
+        }
+        assert!(
+            !is_staging_dir(std::env::temp_dir().as_path()),
+            "temp_dir itself is not one of ours"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The write refuses anything already at the name — a planted symlink
+    /// (never followed) or a planted file (never truncated).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_installer_refuses_a_planted_symlink_and_a_planted_file() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A symlink at the target: refused, and NOT written through.
+        let canary = tmp.path().join("canary");
+        std::fs::write(&canary, b"original").expect("canary");
+        let link = tmp.path().join("installer-link");
+        std::os::unix::fs::symlink(&canary, &link).expect("symlink");
+        let err = write_installer(&link, b"payload").expect_err("must refuse a symlink");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"original",
+            "the symlink target was not written through"
+        );
+        // A plain file at the target: refused, NOT truncated.
+        let existing = tmp.path().join("installer");
+        std::fs::write(&existing, b"existing").expect("existing");
+        let err = write_installer(&existing, b"payload").expect_err("must refuse an existing file");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"existing",
+            "not truncated"
+        );
+    }
+
+    /// Cleanup removes our own staging dir whole, and refuses to touch anything
+    /// that is not ours (a wrong-prefix sibling, a path outside temp_dir()).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discard_staging_removes_only_our_own_dir() {
+        // Our own dir, with the installer in it: removed whole.
+        let ours = stage_dir().expect("stage_dir");
+        let installer = ours.join("roomlerd-0.4.0-x86_64-unknown-linux-gnu.deb");
+        std::fs::write(&installer, b"x").expect("write installer");
+        discard_staging(&installer);
+        assert!(!ours.exists(), "our own staging dir is removed");
+
+        // A sibling in temp_dir() with a DIFFERENT prefix: left alone.
+        let not_ours = tempfile::Builder::new()
+            .prefix("not-ours.")
+            .tempdir_in(std::env::temp_dir())
+            .expect("not-ours dir");
+        let other = not_ours.path().join("foo.deb");
+        std::fs::write(&other, b"y").expect("write other");
+        discard_staging(&other);
+        assert!(other.exists(), "a dir that is not ours is left alone");
+
+        // A path whose parent is not a staging dir at all: a no-op, no panic.
+        discard_staging(std::path::Path::new("/usr/bin/roomlerd"));
     }
 
     // ── Linux .deb install candidates ───────────────────────────────
