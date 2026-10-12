@@ -1458,6 +1458,11 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // `signaling::stub_caps` fills them at every announcement (the hello,
         // and a heartbeat that re-announces when they change).
         record: Vec::new(),
+        // FR-93 P2b — `None` HERE on purpose, like `record`: the desktop brief
+        // is live (a login or a logout changes it) and reads logind, which has
+        // no business in the probe child. `stub_caps` fills it from the
+        // daemon's own refresher at every announcement.
+        desktop: None,
     }
 }
 

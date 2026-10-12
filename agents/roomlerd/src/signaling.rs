@@ -1256,6 +1256,9 @@ async fn connect_once(
     // FR-92 — and whether the hello advertised keep-busy, so a flipped
     // `keep_busy_enabled` reaches the server within a beat.
     let mut last_announced_keep_busy = hello_caps.input.iter().any(|w| w == "keep-busy");
+    // FR-93 P2b — and the desktop brief it carried, so a login, a logout or
+    // the greeter reaches the server within a beat.
+    let mut last_announced_desktop = hello_caps.desktop.clone();
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
@@ -1800,15 +1803,18 @@ async fn connect_once(
                     .flatten()
                     .unwrap_or_else(record_caps);
                 let keep_busy_now = crate::keep_busy::advertised();
+                let desktop_now = crate::desktop_brief::current();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
+                    && desktop_now == last_announced_desktop
                 {
                     None
                 } else {
                     last_announced_permissions = caps_now.clone();
                     last_announced_record = record_now.clone();
                     last_announced_keep_busy = keep_busy_now;
+                    last_announced_desktop = desktop_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -1827,6 +1833,7 @@ async fn connect_once(
                     info!(
                         permissions = ?c.permissions,
                         record = ?c.record,
+                        desktop = ?c.desktop,
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );
                     Some(Box::new(c))
@@ -5224,6 +5231,10 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     if crate::keep_busy::advertised() {
         caps.input.push("keep-busy".into());
     }
+    // FR-93 P2b — the desktop a controller would see now, read from the
+    // refresher's cache (never logind on this path). Live, like the words
+    // above: the heartbeat re-announces when it changes.
+    caps.desktop = crate::desktop_brief::current();
     caps
 }
 

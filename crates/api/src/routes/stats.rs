@@ -348,6 +348,37 @@ pub(crate) fn tier_coll(base: &str, tier: Tier) -> String {
     }
 }
 
+/// FR-93 P2b (AC13) — devices by desktop type and the capture arm that would
+/// serve them, from each device's own `capabilities.desktop` (its hello and
+/// heartbeat). A device that never sent one (Windows, macOS, an agent older
+/// than P2b) is not counted, so this is what the fleet SAYS. `machines.total`
+/// beside it says how many devices there are. `extra` narrows the match (a
+/// tenant), and the rest of the match is fixed.
+pub(crate) fn desktop_breakdown_pipeline(extra: Document) -> Vec<Document> {
+    let mut filter = extra;
+    filter.insert("deleted_at", Bson::Null);
+    filter.insert("capabilities.desktop", doc! { "$type": "object" });
+    vec![
+        doc! { "$match": filter },
+        doc! { "$group": {
+            "_id": {
+                "type": "$capabilities.desktop.type",
+                "capture_arm": "$capabilities.desktop.capture_arm",
+            },
+            "total": { "$sum": 1 },
+            "online": { "$sum": { "$cond": [ { "$eq": [ "$last_presence", "online" ] }, 1, 0 ] } },
+        }},
+        doc! { "$project": {
+            "_id": 0,
+            "type": "$_id.type",
+            "capture_arm": "$_id.capture_arm",
+            "total": 1,
+            "online": 1,
+        }},
+        doc! { "$sort": { "type": 1, "capture_arm": 1 } },
+    ]
+}
+
 // ── Tenant endpoints ────────────────────────────────────────────────────
 
 /// GET /api/tenant/{tid}/stats/overview — ANY member. Powers the org
@@ -441,6 +472,13 @@ pub async fn tenant_overview(
         machine_series_pipeline(tid, floor_dt(86_400), Tier::Hour),
     )
     .await?;
+    // FR-93 P2b — the org's Linux desktops and the arm serving each.
+    let desktops = agg(
+        &state,
+        "agents",
+        desktop_breakdown_pipeline(doc! { "tenant_id": tid }),
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({
         "enabled": true,
@@ -448,6 +486,7 @@ pub async fn tenant_overview(
         "calls": { "active": calls_active, "minutes_today": minutes_today },
         "spark_machines": spark_machines,
         "spark_minutes": minutes_rows,
+        "desktops": desktops,
     })))
 }
 
@@ -1479,12 +1518,16 @@ pub async fn admin_orgs(
         ],
     )
     .await?;
+    // FR-93 P2b — the whole fleet's Linux desktops: the denominator a field
+    // check after a roll needs, which an exec sweep (online only) cannot give.
+    let desktops = agg(&state, "agents", desktop_breakdown_pipeline(doc! {})).await?;
     Ok(Json(serde_json::json!({
         "enabled": true,
         "tenants": tenants,
         "machines": machines,
         "members": members,
         "calls": calls,
+        "desktops": desktops,
     })))
 }
 

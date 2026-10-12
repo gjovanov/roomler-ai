@@ -695,12 +695,106 @@ fn own_session() -> OwnSession {
     // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
     let uid = unsafe { libc::geteuid() };
     crate::keep_busy::logind::sessions()
-        .and_then(|all| {
-            all.into_iter()
-                .find(|s| s.uid == uid && s.is_user() && s.active && s.kind == "wayland")
-        })
-        .map(|_| OwnSession::Wayland)
+        .map(|all| own_session_in(&all, uid))
         .unwrap_or(OwnSession::Other)
+}
+
+/// [`own_session`] over sessions already read, so a caller that has them
+/// (the desktop brief) does not run loginctl twice.
+#[cfg(target_os = "linux")]
+fn own_session_in(all: &[crate::keep_busy::logind::Session], uid: u32) -> OwnSession {
+    if all
+        .iter()
+        .any(|s| s.uid == uid && s.is_user() && s.active && s.kind == "wayland")
+    {
+        OwnSession::Wayland
+    } else {
+        OwnSession::Other
+    }
+}
+
+/// FR-93 P2b — the facts the cascade's first choice is made from.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ArmFacts {
+    /// [`wayland_plan`] said `Auto`, and mutter answered on this session's bus.
+    pub auto_mutter: bool,
+    /// `drm_capture`, in a build with the DRM backend.
+    pub drm: bool,
+    /// `portal_capture`, in a build with the portal backend.
+    pub portal: bool,
+    /// `mutter_capture`: the portal arm runs on mutter's API instead.
+    pub portal_via_mutter: bool,
+    /// The daemon captures its own Xvfb.
+    pub virtual_desktop: bool,
+    /// The session a controller would see is an X11 one.
+    pub x11_session: bool,
+    /// A build with the X11 backend.
+    pub x11_built: bool,
+}
+
+/// FR-93 P2b — the arm a session opened now would try first, in
+/// [`open_with`]'s own order (keep the two together): the automatic mutter
+/// arm, then `drm_capture`, then `portal_capture` (on mutter's API with
+/// `mutter_capture`), then X11, which a Wayland desktop refuses. So nothing
+/// switched on there means nothing captures (`None`). A plan, not a promise:
+/// an arm that fails at session time falls through, and that session's
+/// `rc:video-info` names what served it.
+#[cfg(target_os = "linux")]
+pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
+    if f.auto_mutter {
+        return Some(CaptureArm::Mutter);
+    }
+    if f.drm {
+        return Some(CaptureArm::Drm);
+    }
+    if f.portal {
+        return Some(if f.portal_via_mutter {
+            CaptureArm::Mutter
+        } else {
+            CaptureArm::Portal
+        });
+    }
+    ((f.virtual_desktop || f.x11_session) && f.x11_built).then_some(CaptureArm::X11)
+}
+
+/// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
+/// is logind's list (read once by the caller); mutter is asked only when the
+/// plan is `Auto`, as the cascade asks it.
+#[cfg(target_os = "linux")]
+pub(crate) fn arm_facts(
+    sessions: Option<&[crate::keep_busy::logind::Session]>,
+    root: bool,
+    uid: u32,
+    x11_session: bool,
+) -> ArmFacts {
+    let virtual_desktop = crate::virtual_desktop::requested();
+    #[allow(unused_variables)] // read only with portal-capture
+    let plan = wayland_plan(
+        wayland_aware(),
+        wayland_auto(),
+        root,
+        capture_keys_set(),
+        virtual_desktop,
+        || sessions.map_or(OwnSession::Other, |all| own_session_in(all, uid)),
+    );
+    #[cfg(feature = "portal-capture")]
+    let auto_mutter = plan == WaylandPlan::Auto && portal::mutter::available().is_ok();
+    #[cfg(not(feature = "portal-capture"))]
+    let auto_mutter = false;
+    #[cfg(feature = "drm-capture")]
+    let drm = drm_backend::env_enabled();
+    #[cfg(not(feature = "drm-capture"))]
+    let drm = false;
+    ArmFacts {
+        auto_mutter,
+        drm,
+        portal: cfg!(feature = "portal-capture") && tunnel_core::env::flag("PORTAL_CAPTURE", false),
+        portal_via_mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
+        virtual_desktop,
+        x11_session,
+        x11_built: cfg!(feature = "scrap-capture"),
+    }
 }
 
 /// FR-93 P2 — what the automatic mutter arm came to.
@@ -2008,6 +2102,104 @@ mod wayland_auto_tests {
         for key in super::CAPTURE_KEYS.iter().chain(["WAYLAND_AUTO"].iter()) {
             assert!(bridged.contains(key), "{key} is not in env_bridge_bools");
         }
+    }
+}
+
+/// FR-93 P2b — the desktop brief's `capture_arm` as a table, in the cascade's
+/// order. Pure, like the plan above: no test reads the environment or logind.
+#[cfg(all(test, target_os = "linux"))]
+mod planned_arm_tests {
+    use super::{ArmFacts, CaptureArm, OwnSession, own_session_in, planned_arm};
+    use crate::keep_busy::logind::Session;
+
+    fn built() -> ArmFacts {
+        ArmFacts {
+            x11_built: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_cascade_order_decides_and_the_first_arm_switched_on_wins() {
+        let all = ArmFacts {
+            auto_mutter: true,
+            drm: true,
+            portal: true,
+            x11_session: true,
+            ..built()
+        };
+        assert_eq!(planned_arm(&all), Some(CaptureArm::Mutter), "auto first");
+        let keys = ArmFacts {
+            auto_mutter: false,
+            ..all
+        };
+        assert_eq!(
+            planned_arm(&keys),
+            Some(CaptureArm::Drm),
+            "then drm_capture"
+        );
+        let portal = ArmFacts { drm: false, ..keys };
+        assert_eq!(planned_arm(&portal), Some(CaptureArm::Portal));
+        let via_mutter = ArmFacts {
+            portal_via_mutter: true,
+            ..portal
+        };
+        assert_eq!(planned_arm(&via_mutter), Some(CaptureArm::Mutter));
+        // `mutter_capture` alone opens nothing: the portal block is gated on
+        // `portal_capture`.
+        let mutter_key_only = ArmFacts {
+            portal: false,
+            portal_via_mutter: true,
+            x11_session: false,
+            ..built()
+        };
+        assert_eq!(planned_arm(&mutter_key_only), None);
+    }
+
+    #[test]
+    fn a_wayland_desktop_with_nothing_switched_on_captures_nothing() {
+        // Not X11, no arm: the Xwayland guard refuses scrap, so `none`.
+        assert_eq!(planned_arm(&built()), None);
+        // An X11 session, or the daemon's own Xvfb, is X11's.
+        let x11 = ArmFacts {
+            x11_session: true,
+            ..built()
+        };
+        assert_eq!(planned_arm(&x11), Some(CaptureArm::X11));
+        let xvfb = ArmFacts {
+            virtual_desktop: true,
+            ..built()
+        };
+        assert_eq!(planned_arm(&xvfb), Some(CaptureArm::X11));
+        // …in a build that has the X11 backend at all.
+        let unbuilt = ArmFacts {
+            x11_built: false,
+            ..x11
+        };
+        assert_eq!(planned_arm(&unbuilt), None);
+    }
+
+    #[test]
+    fn own_session_in_counts_only_this_users_active_wayland_desktop() {
+        let s = |uid: u32, class: &str, active: bool, kind: &str| Session {
+            id: "1".into(),
+            uid,
+            class: class.into(),
+            active,
+            locked: false,
+            display: None,
+            kind: kind.into(),
+            desktop: None,
+        };
+        let mine = [s(1000, "user", true, "wayland")];
+        assert_eq!(own_session_in(&mine, 1000), OwnSession::Wayland);
+        assert_eq!(own_session_in(&mine, 1001), OwnSession::Other);
+        let greeter = [s(1000, "greeter", true, "wayland")];
+        assert_eq!(own_session_in(&greeter, 1000), OwnSession::Other);
+        let idle = [s(1000, "user", false, "wayland")];
+        assert_eq!(own_session_in(&idle, 1000), OwnSession::Other);
+        let x11 = [s(1000, "user", true, "x11")];
+        assert_eq!(own_session_in(&x11, 1000), OwnSession::Other);
     }
 }
 
