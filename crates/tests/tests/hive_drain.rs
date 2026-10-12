@@ -308,6 +308,7 @@ async fn scenario() {
                 user_id: rec.owner_id,
                 user_email: seeded.admin.email.clone(),
                 caller: "hivedrain Admin".into(),
+                teleport: false,
             },
         )
         .expect("the prepare reaches the device");

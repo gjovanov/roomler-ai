@@ -3314,6 +3314,13 @@ pub enum ServerMsg {
     /// The prepare holds nothing on the device beyond its answer. Pushed only
     /// to a connection advertising [`crate::models::RpcCap::HivePromote`].
     ///
+    /// FR-90 P2f-1a — `teleport`: the device holds no copy yet, and takes one
+    /// after this (a join in [`crate::hive::HiveReplicaRole::Teleport`]).
+    /// Every start gate but the copy is applied, and a device that passes
+    /// them admits that one session's teleport join, whatever its own
+    /// `hive_replica`. Pushed only to a connection advertising
+    /// [`crate::models::RpcCap::HiveTeleport`].
+    ///
     /// ⚠️ Metadata only, as [`Self::HiveStart`]: the field set is locked by
     /// test.
     #[serde(rename = "rc:hive.prepare")]
@@ -3337,6 +3344,11 @@ pub enum ServerMsg {
         user_email: String,
         /// Display name, for the device's log.
         caller: String,
+        /// P2f-1a — a teleport's prepare: the device holds no copy yet.
+        /// Absent = a promotion's, to a member that holds one (every prepare
+        /// before P2f-1a).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        teleport: bool,
     },
 
     /// FR-90 P2e-3 — the session's lease is about to leave this device, its
@@ -4863,15 +4875,45 @@ mod tests {
             user_id: uid,
             user_email: "a@example.com".into(),
             caller: "Alice".into(),
+            teleport: false,
         };
+        let promotion_prepare = serde_json::json!({
+            "t": "rc:hive.prepare", "session_id": sid.to_hex(), "fence": 2,
+            "harness": "claude-code", "harness_session": "u-1", "folder": "/srv/app",
+            "user_id": uid.to_hex(), "user_email": "a@example.com", "caller": "Alice"
+        });
         assert_eq!(
             serde_json::to_value(&prepare).unwrap(),
-            serde_json::json!({
-                "t": "rc:hive.prepare", "session_id": sid.to_hex(), "fence": 2,
-                "harness": "claude-code", "harness_session": "u-1", "folder": "/srv/app",
-                "user_id": uid.to_hex(), "user_email": "a@example.com", "caller": "Alice"
-            })
+            promotion_prepare,
+            "a promotion's prepare is the frame it was before P2f-1a"
         );
+        // P2f-1a — a teleport's says so, and a prepare that does not say is
+        // a promotion's.
+        let teleport = ServerMsg::HivePrepare {
+            session_id: sid,
+            fence: 2,
+            harness: "claude-code".into(),
+            harness_session: "u-1".into(),
+            folder: "/srv/app".into(),
+            user_id: uid,
+            user_email: "a@example.com".into(),
+            caller: "Alice".into(),
+            teleport: true,
+        };
+        let mut teleport_prepare = promotion_prepare.clone();
+        teleport_prepare["teleport"] = serde_json::json!(true);
+        assert_eq!(serde_json::to_value(&teleport).unwrap(), teleport_prepare);
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(teleport_prepare).unwrap(),
+            ServerMsg::HivePrepare { teleport: true, .. }
+        ));
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(promotion_prepare).unwrap(),
+            ServerMsg::HivePrepare {
+                teleport: false,
+                ..
+            }
+        ));
         let drain = ServerMsg::HiveDrain {
             session_id: sid,
             fence: 1,

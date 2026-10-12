@@ -517,8 +517,8 @@ pub fn is_hash_hex(s: &str) -> bool {
 /// FR-90 P2c-3 — why a device is asked to hold a copy of a session, in
 /// `rc:hive.replica.join`: the role placement chose for it. The device checks
 /// its own gate for each: `hive_replica` for a member, `hive_archive` as well
-/// for an archive, and for the primary that it runs the session at that
-/// fence.
+/// for an archive, for the primary that it runs the session at that fence,
+/// and for a teleport that it passed the session's teleport prepare.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HiveReplicaRole {
@@ -530,7 +530,17 @@ pub enum HiveReplicaRole {
     /// takes a checkpoint at each turn's end from here on, as a start with
     /// `replicated` would have had it do. Sent to a session that gained its
     /// first member after it started, over the connection that runs it.
+    /// P2f-1a — the device takes its first checkpoint at once when no turn
+    /// runs, and says where its copy ends either way: how far a member that
+    /// joins now has to catch up.
     Primary,
+    /// P2f-1a — the device the session's owner is moving the session to,
+    /// which holds no copy of it yet: it takes one to run the session there.
+    /// The device admits it only after its own gates passed a
+    /// [`crate::signaling::ServerMsg::HivePrepare`] with `teleport` for the
+    /// session, whatever its `hive_replica`: a device that will RUN a session
+    /// needs `hive_enabled`, not `hive_replica`.
+    Teleport,
 }
 
 impl HiveReplicaRole {
@@ -540,11 +550,13 @@ impl HiveReplicaRole {
             Self::Archive => "archive",
             Self::Owner => "owner",
             Self::Primary => "primary",
+            Self::Teleport => "teleport",
         }
     }
 
     /// Every role this build knows.
-    pub const ALL: [HiveReplicaRole; 3] = [Self::Archive, Self::Owner, Self::Primary];
+    pub const ALL: [HiveReplicaRole; 4] =
+        [Self::Archive, Self::Owner, Self::Primary, Self::Teleport];
 }
 
 /// Lenient decoder for `rc:hive.replica.join`'s `role`: a role this build
@@ -592,6 +604,10 @@ pub enum HiveJoinRefusal {
     StaleFence,
     /// The device's store is at its `hive_store_quota_mib`.
     Quota,
+    /// P2f-1a — a teleport's join for a session no teleport prepare passed
+    /// here: the gates that let a device RUN the session (its account, its
+    /// folder, `hive_enabled`) are the prepare's, and they were not asked.
+    NotPrepared,
     /// A word this build does not know, or a role it cannot name.
     Other,
 }
@@ -606,18 +622,20 @@ impl HiveJoinRefusal {
             Self::Purged => "purged",
             Self::StaleFence => "stale_fence",
             Self::Quota => "quota",
+            Self::NotPrepared => "not_prepared",
             Self::Other => "other",
         }
     }
 
     /// Every word this build knows.
-    pub const ALL: [HiveJoinRefusal; 7] = [
+    pub const ALL: [HiveJoinRefusal; 8] = [
         Self::ReplicaDisabled,
         Self::ArchiveDisabled,
         Self::SecondaryOrg,
         Self::Purged,
         Self::StaleFence,
         Self::Quota,
+        Self::NotPrepared,
         Self::Other,
     ];
 }
@@ -894,6 +912,13 @@ pub mod promote_limits {
     /// `WS_RX_DEADLINE` and `OFFLINE_GRACE` in `roomlerd`: a test there holds
     /// this to their sum.
     pub const UNREACHABLE_SECS: u64 = 80 + 120 + 30;
+
+    /// FR-90 P2f-1a — how long a device admits a teleport's join after its
+    /// teleport prepare passed: the join comes right behind the prepare's
+    /// answer, and again at each connection until the device answers it.
+    /// ⚠️ The server's wait for the target's copy (`hive.promote_join_secs`)
+    /// must stay under it, or a join re-sent late is refused `not_prepared`.
+    pub const TELEPORT_ADMISSION_SECS: u64 = 30 * 60;
 }
 
 /// FR-90 P2e-3 — why a primary did not drain a session, carried in
@@ -1177,6 +1202,7 @@ mod tests {
                 "purged",
                 "stale_fence",
                 "quota",
+                "not_prepared",
                 "other"
             ]
         );
@@ -1207,7 +1233,7 @@ mod tests {
     #[test]
     fn replica_roles_are_locked_and_an_unknown_one_is_unnamed() {
         let words: Vec<&str> = HiveReplicaRole::ALL.iter().map(|r| r.as_str()).collect();
-        assert_eq!(words, ["archive", "owner", "primary"]);
+        assert_eq!(words, ["archive", "owner", "primary", "teleport"]);
         for r in HiveReplicaRole::ALL {
             assert_eq!(
                 serde_json::to_value(r).unwrap(),
@@ -1222,6 +1248,7 @@ mod tests {
         let r = |s: &str| serde_json::from_str::<R>(s).unwrap().role;
         assert_eq!(r(r#"{"role":"archive"}"#), Some(HiveReplicaRole::Archive));
         assert_eq!(r(r#"{"role":"primary"}"#), Some(HiveReplicaRole::Primary));
+        assert_eq!(r(r#"{"role":"teleport"}"#), Some(HiveReplicaRole::Teleport));
         assert_eq!(r(r#"{"role":"witness"}"#), None);
         assert_eq!(r(r#"{"role":2}"#), None);
         assert_eq!(r("{}"), None);
