@@ -187,6 +187,13 @@ pub enum StoreError {
         floor: u64,
         fence: u64,
     },
+    /// P2e-5: more events of a kind than the caller would hold.
+    #[error("session {session} holds more than {limit} {kind} events")]
+    TooMany {
+        session: String,
+        kind: String,
+        limit: usize,
+    },
 }
 
 /// One full-text match.
@@ -698,6 +705,52 @@ impl Store {
         }))
     }
 
+    /// FR-90 P2e-5 — every event of `session` whose kind is `kind`, oldest
+    /// first: a moved session's checkpoint chain, which its new primary
+    /// materializes. More than `limit` is refused whole, never a chain cut
+    /// short.
+    pub fn of_kind(
+        &self,
+        session: &str,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, fence, ts_ms, prev_hash, event_json FROM events
+             WHERE session = ?1 AND kind = ?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let past = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
+        let rows = stmt.query_map(params![session, kind, past], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, fence, ts_ms, prev, event_json) = row?;
+            if out.len() == limit {
+                return Err(StoreError::TooMany {
+                    session: session.to_string(),
+                    kind: kind.to_string(),
+                    limit,
+                });
+            }
+            out.push(EventEnvelope {
+                session: session.to_string(),
+                seq: seq as u64,
+                fence: fence as u64,
+                ts_ms,
+                prev_hash: to_hash(&prev, session, seq as u64)?,
+                event_json,
+            });
+        }
+        Ok(out)
+    }
+
     /// Events of `session` after `after_seq`, oldest first, at most `limit`.
     pub fn page(
         &self,
@@ -1096,6 +1149,39 @@ mod tests {
         );
         assert_eq!(s.last_of_kind("s2", "note").unwrap().unwrap().seq, 1);
         assert!(s.last_of_kind("s1", "checkpoint").unwrap().is_none());
+    }
+
+    /// FR-90 P2e-5 — every event of a kind, oldest first and the session's
+    /// own; more than the caller would hold is refused whole.
+    #[test]
+    fn every_event_of_a_kind_comes_oldest_first_and_too_many_is_refused() {
+        let mut s = Store::open_in_memory().unwrap();
+        let note = |t: &str| TranscriptEvent::Note { text: t.into() };
+        let mut tip = None;
+        for (i, e) in [note("n1"), ev("a"), note("n2"), ev("b"), note("n3")]
+            .iter()
+            .enumerate()
+        {
+            let env = EventEnvelope::next("s1", tip, 1, i as i64, e);
+            tip = Some(s.append(&env).unwrap());
+        }
+        s.append(&EventEnvelope::next("s2", None, 1, 0, &note("theirs")))
+            .unwrap();
+        let notes = s.of_kind("s1", "note", 10).unwrap();
+        assert_eq!(notes.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 3, 5]);
+        assert_eq!(
+            TranscriptEvent::from_json(&notes[0].event_json),
+            Some(note("n1"))
+        );
+        assert_eq!(s.of_kind("s1", "note", 3).unwrap().len(), 3, "the limit");
+        assert!(
+            matches!(
+                s.of_kind("s1", "note", 2),
+                Err(StoreError::TooMany { limit: 2, .. })
+            ),
+            "never a chain cut short"
+        );
+        assert!(s.of_kind("s1", "checkpoint", 10).unwrap().is_empty());
     }
 
     #[test]
