@@ -257,6 +257,7 @@ async fn decide(
         replicaset: None,
         promotion: None,
         fences: Vec::new(),
+        moved: None,
     };
     state.sessions.create(&session).await.map_err(|e| {
         warn!(session = %sid, %e, "hive: an adopted session was not recorded");
