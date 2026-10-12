@@ -63,13 +63,16 @@ services:
     networks: [roomler]
 
   # MinIO's own images (minio/minio, minio/mc) are gone from Docker Hub, so a clean `pull` failed
-  # here (#2034). Chainguard builds MinIO from source for amd64 and arm64; the digest pins the
-  # build this file was tested with (RELEASE.2026-09-22T19-25-18Z). Its image carries `mc` and a
+  # here (#2034). Chainguard builds MinIO from source for amd64 and arm64; this is its
+  # RELEASE.2026-09-22T19-25-18Z build, copied byte-for-byte to our GHCR (the same digest as
+  # cgr.dev/chainguard/minio) so it cannot disappear with a free tier. MinIO is AGPL-3.0: the
+  # source is github.com/minio/minio at commit df34868a88cc8c396807e04a7e220810b321bdaa. The
+  # hosted service runs this image too. It carries `mc` and a
   # shell, so it also serves `minio-init` below. It runs as root because every existing
   # `minio_data` volume was written by the root-run upstream image; Chainguard's default user
   # (65532) cannot write those.
   minio:
-    image: cgr.dev/chainguard/minio:latest@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
+    image: ghcr.io/gjovanov/minio:RELEASE.2026-09-22T19-25-18Z@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
     user: "0:0"
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -88,7 +91,7 @@ services:
   # One-shot: create the bucket the API expects. Without it the first file
   # upload fails with a NoSuchBucket that reads like an auth problem.
   minio-init:
-    image: cgr.dev/chainguard/minio:latest@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
+    image: ghcr.io/gjovanov/minio:RELEASE.2026-09-22T19-25-18Z@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
     user: "0:0"
     depends_on:
       minio: { condition: service_healthy }
