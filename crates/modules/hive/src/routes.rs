@@ -468,6 +468,7 @@ pub async fn start(
         replicaset,
         promotion: None,
         fences: Vec::new(),
+        moved: None,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.

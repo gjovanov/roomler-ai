@@ -2847,16 +2847,17 @@ async fn the_promotions_compare_and_sets_move_the_lease_once() {
             hash: hash("ab"),
         }),
         unreachable_from: false,
+        prior: None,
     };
     let (one, two) = (promotion(), promotion());
     assert!(
-        dao.begin_promotion(s.tenant_id, s.owner_id, sid, &one)
+        dao.begin_promotion(s.tenant_id, s.owner_id, sid, &one, false)
             .await
             .unwrap(),
         "the first begins"
     );
     assert!(
-        !dao.begin_promotion(s.tenant_id, s.owner_id, sid, &two)
+        !dao.begin_promotion(s.tenant_id, s.owner_id, sid, &two, false)
             .await
             .unwrap(),
         "the second finds the first in flight"
@@ -3562,6 +3563,296 @@ async fn a_move_away_from_an_unreachable_primary_refuses_what_it_cannot_trust() 
     .map(|(o, r)| (o.to_string(), r.to_string()))
     .collect();
     assert_eq!(audit, want);
+}
+
+/// FR-90 P2e-6b — the session's record as if it were made `secs` ago.
+async fn made_ago(app: &TestApp, sid: &str, secs: i64) {
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(sid).unwrap() },
+            doc! { "$set": {
+                "created_at": bson::DateTime::from_millis(
+                    bson::DateTime::now().timestamp_millis() - secs * 1000,
+                ),
+            } },
+        )
+        .await
+        .unwrap();
+}
+
+/// Promote `m`'s session to its old primary, A, which answers the prepare
+/// with `answer`'s fields: the caller's answer and A's prepare.
+async fn promote_back_to_a(app: &TestApp, m: &mut Moving, answer: Value) -> (u16, Value, Value) {
+    let (tid, admin, sid, to) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.a.agent_id.clone(),
+    );
+    let caller = post_promote(app, &tid, &admin, &sid, &to, None);
+    // A refusal at the route asks nothing of A: no prepare, and the caller's
+    // answer says why.
+    let target = async {
+        let Some(prep) = read_until(&mut m.a.ws, "rc:hive.prepare").await else {
+            return Value::Null;
+        };
+        let mut ack = json!({"t": "rc:hive.prepare_ack", "session_id": sid,
+                             "fence": prep["fence"], "account": "dev"});
+        if let Value::Object(extra) = answer {
+            for (k, v) in extra {
+                ack[k] = v;
+            }
+        }
+        send(&mut m.a.ws, ack).await;
+        prep
+    };
+    let ((code, body), prep) = tokio::join!(caller, target);
+    (code, body, prep)
+}
+
+/// The `rc:hive.move` among `frames`.
+fn move_of(frames: &[Value]) -> &Value {
+    frames
+        .iter()
+        .find(|f| f["t"] == "rc:hive.move")
+        .expect("a move")
+}
+
+/// Moved to B, which hears its start and never answers it; A, demoted, takes
+/// its member's copy at fence 2; B gone, and unreachable for 230 s.
+async fn moved_to_a_silent_b(app: &TestApp, m: &mut Moving) {
+    use roomler_ai_remote_control::hive::promote_limits::UNREACHABLE_SECS;
+    let (tid, admin, sid, a_id, b_id) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.a.agent_id.clone(),
+        m.b.agent_id.clone(),
+    );
+    moved(app, m).await;
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 2}),
+    )
+    .await;
+    wait_member(
+        app,
+        &tid,
+        &admin,
+        &sid,
+        &a_id,
+        "A joined at fence 2",
+        |mm| mm["state"] == "joined",
+    )
+    .await;
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(app, &m.seeded, &b_id).await;
+    heard_last(app, &b_id, UNREACHABLE_SECS + 1).await;
+}
+
+/// FR-90 P2e-6b — a move's target that never answers its start. Back however
+/// late, it is sent that start again: the redelivery window bounds a
+/// session's FIRST start only, and this session was made long before its
+/// move. Once it is unreachable, the owner moves the session on, as from any
+/// unreachable primary, to a member at its own tip with no drain: the move
+/// that sent the start is replaced. Back again, the silent device is demoted
+/// and given nothing to run.
+#[tokio::test]
+async fn a_target_that_never_answered_is_waited_out_then_moved_on() {
+    use roomler_ai_remote_control::hive::promote_limits::UNREACHABLE_SECS;
+    let app = promote_app().await;
+    let mut m = promotable(&app, "silent", 0, PROMOTES).await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    let (a_id, b_id) = (m.a.agent_id.clone(), m.b.agent_id.clone());
+    moved_to_a_silent_b(&app, &mut m).await;
+
+    // Back, eleven minutes after the session was made: the start again.
+    made_ago(&app, &sid, 11 * 60).await;
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
+    let again = frames_within(&mut m.b.ws, Duration::from_secs(3)).await;
+    let of = |kind: &str| again.iter().find(|f| f["t"] == kind);
+    assert_eq!(
+        (
+            of("rc:hive.move").and_then(|f| f["from_device_id"].as_str()),
+            of("rc:hive.start").and_then(|f| f["fence"].as_u64())
+        ),
+        (Some(a_id.as_str()), Some(2)),
+        "a moved start is sent again, however late its device comes back: {again:?}"
+    );
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &b_id).await;
+
+    // Just gone: the move to B is still under way.
+    let (_, body) = post_promote(&app, &tid, &admin, &sid, &a_id, None).await;
+    assert_eq!(
+        body["reason"], "primary_offline",
+        "a target gone for less than 230 s is waited for: {body}"
+    );
+    heard_last(&app, &b_id, UNREACHABLE_SECS + 1).await;
+
+    let (code, body, prep) = promote_back_to_a(&app, &mut m, ready_at(1, 5, "ab")).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body["outcome"], "promoting",
+        "the owner moves on from a target that never answered: {body}"
+    );
+    assert_eq!(prep["fence"], 3, "{prep}");
+    let a_frames = frames_until(
+        &mut m.a.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let join = join_of(&a_frames);
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(3), Some("primary"))
+    );
+    assert_eq!(
+        join["fences"],
+        json!([
+            {"fence": 1, "seq": 5, "hash": hash("ab")},
+            {"fence": 2, "seq": 5, "hash": hash("ab")},
+        ]),
+        "B's fence ended where it began: it ran nothing"
+    );
+    assert_eq!(move_of(&a_frames)["from_device_id"], b_id.as_str());
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_i64("fence").unwrap(), 3);
+    wait_note(&app, &m, "cannot be reached").await;
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 3, "account": "dev"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "done", |s| {
+        !s.contains_key("promotion") && s.get_datetime("accepted_at").is_ok()
+    })
+    .await;
+
+    // B, back once more: demoted, and nothing to run.
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.manifest", "sessions": [{"session_id": sid, "fence": 2}]}),
+    )
+    .await;
+    let mut heard = heard_until(&mut m.b.ws, &["rc:hive.demote"]).await;
+    heard.extend(frames_within(&mut m.b.ws, Duration::from_millis(500)).await);
+    assert!(
+        !heard
+            .iter()
+            .any(|f| f["t"] == "rc:hive.start" || f["t"] == "rc:hive.lease"),
+        "nothing to run for a session that moved on: {heard:?}"
+    );
+    let audit: Vec<(String, String)> = promote_audit(&app, &sid).await;
+    let want: Vec<(String, String)> = [
+        ("sent", ""),
+        ("moved", ""),
+        ("refused", "primary_offline"),
+        ("sent", ""),
+        ("moved", ""),
+        ("done", ""),
+    ]
+    .iter()
+    .map(|(o, r)| (o.to_string(), r.to_string()))
+    .collect();
+    assert_eq!(audit, want);
+}
+
+/// FR-90 P2e-6b — a move on from a target that never answered can fail: its
+/// member refuses the prepare, or the start. Either way the silent device is
+/// owed its start, and that start still comes from where the first move took
+/// the session, so that back, the device takes it over from its own copy.
+#[tokio::test]
+async fn a_failed_move_on_keeps_where_the_silent_targets_start_came_from() {
+    use roomler_ai_remote_control::hive::promote_limits::UNREACHABLE_SECS;
+    let app = promote_app().await;
+    let mut m = promotable(&app, "silentkeep", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    let (a_id, b_id) = (m.a.agent_id.clone(), m.b.agent_id.clone());
+    moved_to_a_silent_b(&app, &mut m).await;
+
+    // A cannot run it: the move on fails, and the session waits on B.
+    let (code, body, _) = promote_back_to_a(&app, &mut m, json!({"refused": "no_account"})).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("no_account")),
+        "{body}"
+    );
+    let s = stored(&app, &sid).await;
+    assert_eq!(
+        (
+            s.get_i64("fence").unwrap(),
+            s.get_document("location")
+                .unwrap()
+                .get_object_id("device_id")
+                .unwrap()
+                .to_hex()
+        ),
+        (2, b_id.clone())
+    );
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
+    let again = frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    assert_eq!(
+        move_of(&again)["from_device_id"],
+        a_id.as_str(),
+        "the start a silent target is owed comes from where the first move took it: {again:?}"
+    );
+    m.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &b_id).await;
+    heard_last(&app, &b_id, UNREACHABLE_SECS + 1).await;
+
+    // A is ready, then cannot take the session over: the lease moves back to
+    // B, at fence 4, B back by then.
+    let (code, body, _) = promote_back_to_a(&app, &mut m, ready_at(1, 5, "ab")).await;
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("promoting")),
+        "{body}"
+    );
+    read_until(&mut m.a.ws, "rc:hive.start")
+        .await
+        .expect("A's moved start");
+    m.b.ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
+    wait_agent_online(&app, &m.seeded, &b_id).await;
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 3,
+               "refused": "launch_failed", "detail": "no claude"}),
+    )
+    .await;
+    let s = wait_stored(&app, &sid, "moved back to B", |s| {
+        s.get_i64("fence").ok() == Some(4) && !s.contains_key("promotion")
+    })
+    .await;
+    assert_eq!(
+        s.get_document("moved")
+            .and_then(|m| m.get_document("from"))
+            .and_then(|f| f.get_object_id("device_id"))
+            .map(|id| id.to_hex())
+            .ok(),
+        Some(a_id.clone()),
+        "the record keeps where the silent target's start came from: {s:?}"
+    );
+    let back = frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    assert_eq!(
+        (
+            move_of(&back)["from_device_id"].as_str(),
+            back.last().unwrap()["fence"].as_u64()
+        ),
+        (Some(a_id.as_str()), Some(4)),
+        "the start back comes from where the first move took the session: {back:?}"
+    );
 }
 
 /// FR-90 P2e-3 — the route's gates, each refusal in its own word and

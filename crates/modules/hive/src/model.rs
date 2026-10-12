@@ -183,6 +183,23 @@ pub struct AgentSession {
     /// P2e-5's joins and store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fences: Vec<FenceMark>,
+    /// FR-90 P2e-6b — where the start the session's device holds now came
+    /// from, as its `rc:hive.move` says: set at every move of the lease, and
+    /// read when that start is sent again. A device takes a session from
+    /// anywhere else over from its own copy, and one from itself back as it
+    /// left it, so this must outlive the promotion that made the move: a
+    /// move on from a device that never answered can fail, and that device
+    /// still needs the start it was owed. Absent before P2e-6b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MovedStart>,
+}
+
+/// FR-90 P2e-6b — where a moved start came from, by whom, and when.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MovedStart {
+    pub from: SessionLocation,
+    pub by: ObjectId,
+    pub at: DateTime,
 }
 
 /// FR-90 P2e-3 — the last event of a fence a promotion superseded. BSON has
@@ -271,6 +288,12 @@ pub struct Promotion {
     /// promotion that drains, every one before P2e-6a.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unreachable_from: bool,
+    /// FR-90 P2e-6b — for a move on from a device that never answered its
+    /// moved start: where that start came from. A start this move's member
+    /// refuses moves the lease back to that device, which then still needs
+    /// to take the session over from its copy: its start says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior: Option<MovedStart>,
 }
 
 impl Promotion {
@@ -801,6 +824,7 @@ mod tests {
             replicaset: None,
             promotion: None,
             fences: Vec::new(),
+            moved: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
@@ -946,6 +970,7 @@ mod tests {
                 hash: "ab".repeat(32),
             }),
             unreachable_from: false,
+            prior: None,
         };
         assert!(p.in_flight(now));
         assert!(
