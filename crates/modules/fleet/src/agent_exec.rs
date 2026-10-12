@@ -31,8 +31,10 @@
 //!
 //! ## Privilege
 //!
-//! Commands inherit the daemon's identity: SYSTEM under a perMachine Windows
-//! install, root under systemd. Enabling gate 3 on a device is granting root
+//! Commands inherit the daemon's identity: root under systemd; on Windows the
+//! console-session worker's, which is the signed-in user on an attended
+//! install and SYSTEM in SystemContext mode (FR-94 makes SYSTEM the default).
+//! Enabling gate 3 on a device is granting root
 //! on it, and the admin UI says so in those words.
 
 use axum::{

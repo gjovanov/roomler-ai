@@ -59,9 +59,10 @@
           label="Accept remote commands (exec_enabled)"
         />
         <div class="text-caption text-medium-emphasis mb-1 ml-1">
-          Commands run as the daemon — <strong>SYSTEM</strong> on Windows,
-          <strong>root</strong> under systemd. Takes effect immediately on the
-          device; no restart.
+          Commands run as the daemon: <strong>root</strong> under systemd; on
+          Windows the <strong>signed-in user</strong> (an attended install) or
+          <strong>SYSTEM</strong> (SystemContext mode). Takes effect immediately
+          on the device; no restart.
         </div>
         <div v-if="!mayGrantExec" class="text-caption text-error mb-4 ml-1">
           You need the <strong>EXEC_DEVICE</strong> permission to change this.
