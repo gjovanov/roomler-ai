@@ -1274,10 +1274,11 @@ pub enum Request {
     /// FR-92 P10 — the person at the console turns keep busy ON (the tray's
     /// "Start keep busy", `roomler keep-busy on`). Unlike status and off,
     /// this is gated on the peer ([`ClientPeer::may_start_keep_busy`]): root
-    /// never, session 0 never, another session never. The server itself has
-    /// no "on" (FR-92 §7). ⚠️ The gate decides who is NAMED; it is not a wall
-    /// against `roomler exec`, which runs in the console session on Windows
-    /// and passes it (FR-92 §3g). Returns [`Response::KeepBusy`].
+    /// never, SYSTEM never (P10b), session 0 never, another session never.
+    /// The server itself has no "on" (FR-92 §7). ⚠️ The gate decides who is
+    /// NAMED; it is not a wall against `roomler exec`, which on an attended
+    /// Windows install runs as the person and passes it (FR-92 §3g). Returns
+    /// [`Response::KeepBusy`].
     KeepBusyOn {
         #[serde(default)]
         opts: KeepBusyStartOpts,
@@ -1935,6 +1936,11 @@ pub struct ClientPeer {
     pub session_id: Option<u32>,
     /// Unix: the client's uid.
     pub uid: Option<u32>,
+    /// Windows (FR-92 P10b): does the client process run as a service
+    /// account — SYSTEM, LocalService or NetworkService? Read from its token
+    /// at accept time. `None` when it could not be read, and always `None` off
+    /// Windows.
+    pub system_account: Option<bool>,
 }
 
 impl ClientPeer {
@@ -1943,6 +1949,7 @@ impl ClientPeer {
     pub const UNKNOWN: ClientPeer = ClientPeer {
         session_id: None,
         uid: None,
+        system_account: None,
     };
 
     /// Is this peer the person at the console? Windows: its session is the
@@ -1973,20 +1980,39 @@ impl ClientPeer {
 /// `roomler exec` arrives there — so with it, a plain
 /// `roomler exec <host> -- roomler keep-busy on` would start synthetic input
 /// under the person's name.
-/// - **Windows**: the active console session, and never session 0 (services).
+/// - **Windows**: the active console session, never session 0 (services),
+///   and (P10b) **never a service account** — SYSTEM, LocalService or
+///   NetworkService — nor a peer whose account could not be read.
 /// - **A per-user daemon's own socket** (macOS GUI worker, Linux user
 ///   daemon): its owner, who is the person.
 /// - **The person socket of a Linux system install** ([`Scope::Person`]):
 ///   its ACL admits only the person it was made for.
 /// - Anything unknown: no.
 ///
-/// ⚠️ **Not a wall against `roomler exec`.** On Windows exec runs in the
-/// worker that holds the agent socket, and that worker lives in the console
-/// session — as the signed-in user (an attended install), or as SYSTEM
-/// (SystemContext mode) — so an exec passes the session test and is named "the person
-/// at this computer" (measured on 0.4.129, FR-92 §9 row 43). On Unix root can
-/// `sudo -u` the person. Nothing a local gate sees tells them apart: what an
-/// exec caller may do on a device is the owner's `exec_enabled`, not this.
+/// **SYSTEM is Windows' root** (P10b). A SystemContext-mode worker runs as
+/// SYSTEM *inside* the console session, and `roomler exec` runs as that
+/// worker, so before P10b an exec there passed the session test. The account
+/// comes from the client's token, read by the listener at accept time
+/// ([`ClientPeer::system_account`]), never from anything the client says.
+/// The pipe is served by the worker, so what it can read depends on what the
+/// worker is:
+/// - **An attended install, an admin** (the user's elevated token): the
+///   person's tray and CLI are the same user, so their tokens open and read
+///   as a user. A SYSTEM client usually opens too and reads as SYSTEM.
+/// - **An attended install, a standard user** (a filtered token): the
+///   person's own processes open. A SYSTEM process usually does not, and an
+///   account that cannot be read is a refusal, so SYSTEM is refused either
+///   way.
+/// - **SystemContext mode** (the worker is SYSTEM): every client opens. The
+///   person reads as a user; an exec runs as the worker, reads as SYSTEM, and
+///   is refused.
+///
+/// ⚠️ **Not a wall against `roomler exec`.** On an attended install exec runs
+/// as the signed-in user, in the console session, so it passes and is named
+/// "the person at this computer" (measured on 0.4.129, FR-92 §9 row 43). On
+/// Unix root can `sudo -u` the person. Nothing a local gate sees tells them
+/// apart: what an exec caller may do on a device is the owner's
+/// `exec_enabled`, not this. Which identity exec should have is #2021.
 pub fn peer_may_start_keep_busy(
     peer: &ClientPeer,
     scope: Scope,
@@ -1997,7 +2023,9 @@ pub fn peer_may_start_keep_busy(
         return false;
     }
     if let (Some(p), Some(c)) = (peer.session_id, console_session) {
-        return p == c && p != 0;
+        // P10b — `Some(false)` only: SYSTEM and its kin never, and an
+        // account that could not be read never either (fail closed).
+        return p == c && p != 0 && peer.system_account == Some(false);
     }
     match scope {
         Scope::Person => peer.uid.is_some(),
@@ -2050,24 +2078,110 @@ fn own_uid() -> Option<u32> {
     }
 }
 
-/// The session id of the client on the far end of a server pipe handle.
+/// Who is on the far end of a server pipe handle, from the OS: the client
+/// process's session and (FR-92 P10b) whether it runs as a service account.
+/// Whatever cannot be read stays `None`, which every gate reads as "no".
 #[cfg(windows)]
-fn pipe_client_session(handle: std::os::windows::io::RawHandle) -> Option<u32> {
+fn pipe_client_peer(handle: std::os::windows::io::RawHandle) -> ClientPeer {
     use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
-    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     let mut pid = 0u32;
     // SAFETY: `handle` is a live server-end pipe handle owned by the caller for
-    // the duration of this call; both out-params are valid u32s.
-    unsafe {
-        if GetNamedPipeClientProcessId(handle as _, &mut pid) == 0 {
-            return None;
-        }
-        let mut session = 0u32;
-        if ProcessIdToSessionId(pid, &mut session) == 0 {
-            return None;
-        }
-        Some(session)
+    // the duration of this call; the out-param is a valid u32.
+    if unsafe { GetNamedPipeClientProcessId(handle as _, &mut pid) } == 0 {
+        return ClientPeer::UNKNOWN;
     }
+    ClientPeer {
+        session_id: process_session(pid),
+        uid: None,
+        system_account: process_is_service_account(pid),
+    }
+}
+
+/// The session process `pid` runs in.
+#[cfg(windows)]
+fn process_session(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut session = 0u32;
+    // SAFETY: a plain query by pid; the out-param is a valid u32.
+    (unsafe { ProcessIdToSessionId(pid, &mut session) } != 0).then_some(session)
+}
+
+/// FR-92 P10b — does process `pid` run as SYSTEM, LocalService or
+/// NetworkService? `None` when its token cannot be opened or read, which the
+/// keep-busy gate treats as a refusal.
+///
+/// The token is opened by pid rather than through `ImpersonateNamedPipeClient`
+/// because the peer is captured at accept time, before a byte is read, and a
+/// pipe server can impersonate only after it has read from the client.
+#[cfg(windows)]
+fn process_is_service_account(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: a query-only open by pid; the handle is closed below, once.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `process` is the live handle opened above; `token` is a valid
+    // out-param.
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0;
+    // SAFETY: closes the process handle opened above, exactly once.
+    unsafe { CloseHandle(process) };
+    if !opened {
+        return None;
+    }
+    let verdict = token_is_service_account(token);
+    // SAFETY: closes the token opened above, exactly once.
+    unsafe { CloseHandle(token) };
+    verdict
+}
+
+/// Whether `token`'s user is a service account ([`sid_is_service_account`]).
+/// `None` when the token's user cannot be read.
+#[cfg(windows)]
+fn token_is_service_account(token: windows_sys::Win32::Foundation::HANDLE) -> Option<bool> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+    // A TOKEN_USER and the SID it points into. A SID is at most 68 bytes
+    // (SECURITY_MAX_SID_SIZE), so 256 bytes is ample; u64 keeps the
+    // structure's pointer-sized field aligned.
+    let mut buf = [0u64; 32];
+    let mut len = 0u32;
+    // SAFETY: `token` is a live token handle with TOKEN_QUERY; `buf` is
+    // writable for the length passed and aligned for TOKEN_USER.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(&buf) as u32,
+            &mut len,
+        )
+    } != 0;
+    if !ok {
+        return None;
+    }
+    // SAFETY: on success `buf` begins with a TOKEN_USER whose SID points into
+    // `buf`, which outlives this read.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    Some(sid_is_service_account(sid))
+}
+
+/// FR-92 P10b — SYSTEM (S-1-5-18), LocalService (S-1-5-19) or NetworkService
+/// (S-1-5-20): the accounts services run as, and Windows' counterparts of
+/// root. A person never signs in as one.
+#[cfg(windows)]
+fn sid_is_service_account(sid: windows_sys::Win32::Security::PSID) -> bool {
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinLocalServiceSid, WinLocalSystemSid, WinNetworkServiceSid,
+    };
+    [WinLocalSystemSid, WinLocalServiceSid, WinNetworkServiceSid]
+        .into_iter()
+        // SAFETY: `sid` is a valid SID for the duration of this call.
+        .any(|kind| unsafe { IsWellKnownSid(sid, kind) } != 0)
 }
 
 /// The overlay runtime's live view of the mesh, republished on a
@@ -2398,7 +2512,8 @@ fn not_the_console_user() -> Response {
 fn not_the_person_for_keep_busy() -> Response {
     Response::Error {
         message: "only the person at this device's console can turn keep busy on here — \
-                  not root, not a background service, not another session (anyone may stop it)"
+                  not root or SYSTEM, not a background service, not another session \
+                  (anyone may stop it)"
             .into(),
     }
 }
@@ -2687,9 +2802,11 @@ where
                 Ok(Request::KeepBusyStatus) => state.keep_busy_status().await,
                 Ok(Request::KeepBusyOff) => state.keep_busy_off().await,
                 // P10 — turning it ON is the console person's alone: root
-                // never (how `roomler exec` arrives on Unix), session 0 never.
-                // ⚠️ Not a wall against exec on Windows, where it runs in the
-                // console session (FR-92 §3g).
+                // never (how `roomler exec` arrives on Unix), session 0 never,
+                // and (P10b) SYSTEM never — how exec arrives on a Windows
+                // host in SystemContext mode. ⚠️ Not a wall against exec on an
+                // attended Windows install, where it runs as the person
+                // (FR-92 §3g).
                 Ok(Request::KeepBusyOn { .. }) if !peer.may_start_keep_busy(scope) => {
                     not_the_person_for_keep_busy()
                 }
@@ -3127,13 +3244,11 @@ async fn accept_pipe(
                         }
                     }
                     let st = state.clone();
-                    // FR-85 — who connected, from the OS, before a byte is read.
+                    // FR-85 — who connected, from the OS, before a byte is read
+                    // (P10b: and as which account).
                     let peer = {
                         use std::os::windows::io::AsRawHandle;
-                        ClientPeer {
-                            session_id: pipe_client_session(connected.as_raw_handle()),
-                            uid: None,
-                        }
+                        pipe_client_peer(connected.as_raw_handle())
                     };
                     tokio::spawn(async move {
                         if let Err(e) = serve_connection_as(connected, &*st, peer).await {
@@ -3309,6 +3424,7 @@ async fn accept_unix(
                     let peer = ClientPeer {
                         session_id: None,
                         uid: stream.peer_cred().ok().map(|c| c.uid()),
+                        system_account: None,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = serve_connection_as(stream, &*st, peer).await {
@@ -3421,6 +3537,7 @@ pub async fn serve_person_socket(
                     let peer = ClientPeer {
                         session_id: None,
                         uid: stream.peer_cred().ok().map(|c| c.uid()),
+                        system_account: None,
                     };
                     if !person_peer_ok(&peer, owner_uid) {
                         tracing::warn!(
@@ -5971,10 +6088,12 @@ mod tests {
         let win = |s| ClientPeer {
             session_id: Some(s),
             uid: None,
+            system_account: None,
         };
         let unix = |u| ClientPeer {
             session_id: None,
             uid: Some(u),
+            system_account: None,
         };
         // Windows: the peer's session must be the active console session.
         assert!(peer_is_console_user(&win(1), Some(1), None));
@@ -6001,21 +6120,46 @@ mod tests {
 
     /// FR-92 P10 — who may turn keep busy ON. Root never: it is how
     /// `roomler exec` arrives on Unix, and [`peer_is_console_user`] would let
-    /// it through.
+    /// it through. P10b — SYSTEM never either, nor a Windows peer whose
+    /// account could not be read.
     #[test]
     fn the_keep_busy_start_decision_table() {
+        // A Windows peer, as a person (a user account read from its token).
         let win = |s| ClientPeer {
             session_id: Some(s),
             uid: None,
+            system_account: Some(false),
+        };
+        let win_as = |s, system_account| ClientPeer {
+            session_id: Some(s),
+            uid: None,
+            system_account,
         };
         let unix = |u| ClientPeer {
             session_id: None,
             uid: Some(u),
+            system_account: None,
         };
         let full = Scope::Full;
         let person = Scope::Person;
         // Windows: the active console session only; session 0 never.
         assert!(peer_may_start_keep_busy(&win(1), full, Some(1), None));
+        // P10b — SYSTEM (and LocalService / NetworkService) never, even inside
+        // the console session: that is how `roomler exec` arrives on a host in
+        // SystemContext mode. The console-user gate would let it through.
+        assert!(
+            !peer_may_start_keep_busy(&win_as(1, Some(true)), full, Some(1), None),
+            "SYSTEM in the console session"
+        );
+        assert!(
+            peer_is_console_user(&win_as(1, Some(true)), Some(1), None),
+            "the gate this one tightens"
+        );
+        // P10b — an account the listener could not read is a refusal.
+        assert!(
+            !peer_may_start_keep_busy(&win_as(1, None), full, Some(1), None),
+            "an unreadable account"
+        );
         assert!(
             !peer_may_start_keep_busy(&win(2), full, Some(1), None),
             "an RDP session"
@@ -6093,11 +6237,13 @@ mod tests {
         let root = ClientPeer {
             session_id: None,
             uid: Some(0),
+            system_account: None,
         };
         for peer in [root, ClientPeer::UNKNOWN] {
             let r = ask(peer, r#"{"t":"keep_busy_on","d":{}}"#).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("turn keep busy on")),
+                matches!(&r, Response::Error { message }
+                    if message.contains("turn keep busy on") && message.contains("root or SYSTEM")),
                 "{peer:?} → {r:?}"
             );
             assert!(matches!(
@@ -6114,6 +6260,7 @@ mod tests {
         let me = ClientPeer {
             session_id: None,
             uid: own_uid(),
+            system_account: None,
         };
         if me.uid == Some(0) {
             return; // a root test runner IS root: the case above covers it
@@ -6126,6 +6273,71 @@ mod tests {
             .await,
             Response::KeepBusy(_)
         ));
+    }
+
+    /// FR-92 P10b — the accounts the Windows keep-busy gate refuses, by SID:
+    /// SYSTEM, LocalService and NetworkService, and nothing a person signs in
+    /// as.
+    #[cfg(windows)]
+    #[test]
+    fn service_account_sids_are_system_and_its_kin() {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, WELL_KNOWN_SID_TYPE, WinBuiltinUsersSid, WinInteractiveSid,
+            WinLocalServiceSid, WinLocalSystemSid, WinNetworkServiceSid, WinWorldSid,
+        };
+        let is_service = |kind: WELL_KNOWN_SID_TYPE| {
+            let mut buf = [0u64; 16];
+            let mut len = std::mem::size_of_val(&buf) as u32;
+            // SAFETY: `buf` is writable for `len` bytes; these well-known SIDs
+            // need no domain SID.
+            let ok = unsafe {
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            };
+            assert_ne!(ok, 0, "CreateWellKnownSid({kind})");
+            sid_is_service_account(buf.as_mut_ptr().cast())
+        };
+        assert!(is_service(WinLocalSystemSid), "SYSTEM");
+        assert!(is_service(WinLocalServiceSid), "LocalService");
+        assert!(is_service(WinNetworkServiceSid), "NetworkService");
+        assert!(!is_service(WinWorldSid), "Everyone");
+        assert!(!is_service(WinBuiltinUsersSid), r"BUILTIN\Users");
+        assert!(!is_service(WinInteractiveSid), "INTERACTIVE");
+    }
+
+    /// FR-92 P10b — the probe the pipe listener runs at accept time, against a
+    /// real pipe: a client this test process opens is read from the OS as this
+    /// process — its session, and a person's account. CI runs the tests as an
+    /// admin user, not as SYSTEM, and so does a developer.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_pipe_client_is_read_from_its_token() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(r"\\.\pipe\roomler-test-p10b-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let _client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        assert!(peer.session_id.is_some(), "{peer:?}");
+        assert_eq!(
+            peer.session_id,
+            process_session(std::process::id()),
+            "the client's session is this process's"
+        );
+        assert_eq!(peer.uid, None);
+        assert_eq!(
+            peer.system_account,
+            Some(false),
+            "a person's token, read: {peer:?}"
+        );
     }
 
     #[test]
@@ -6329,6 +6541,7 @@ mod tests {
         let as_uid = |uid: Option<u32>| ClientPeer {
             session_id: None,
             uid,
+            system_account: None,
         };
         assert!(person_peer_ok(&as_uid(Some(1000)), 1000));
         assert!(person_peer_ok(&as_uid(Some(0)), 1000));
@@ -6466,10 +6679,12 @@ mod tests {
         let root = ClientPeer {
             session_id: None,
             uid: Some(0),
+            system_account: None,
         };
         let someone = ClientPeer {
             session_id: None,
             uid: Some(1000),
+            system_account: None,
         };
         for (peer, holds) in [(root, true), (someone, false), (ClientPeer::UNKNOWN, false)] {
             let state = std::sync::Arc::new(HoldMock::default());
@@ -6564,6 +6779,7 @@ mod tests {
         let me = ClientPeer {
             session_id: console_session_id(),
             uid: own_uid(),
+            system_account: None,
         };
         if me.is_console_user() {
             let r = ask(
@@ -6637,6 +6853,7 @@ mod tests {
         let me = ClientPeer {
             session_id: console_session_id(),
             uid: own_uid(),
+            system_account: None,
         };
         if !me.is_console_user() {
             // A Windows host with no active console session (some CI runners):
