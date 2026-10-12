@@ -70,6 +70,8 @@ import {
   nextStallAction,
   nextStallTicks,
   isDeadAir,
+  agentIsWaiting,
+  RC_MEDIA_WAITING_GRACE_MS,
   classifyDegraded,
   RC_REHOME_MAX_REDIALS,
   rehomeRetryDecision,
@@ -2004,6 +2006,27 @@ describe('parseControlInbound', () => {
       reach: { reach: 'some_future_value', reason: '' },
     })
     expect(parseControlInbound('{"t":"rc:input-reach"}')).toBeNull()
+  })
+
+  // FR-93 P2d-2 — the agent's wire shape (peer.rs `media_waiting_payload`,
+  // locked there): a duration in ms, never a time of day.
+  it('parses rc:media-waiting, keeping an unknown `for` and a missing hint', () => {
+    expect(
+      parseControlInbound(
+        '{"t":"rc:media-waiting","for":"person_at_screen","waits_ms":117250,"hint":"asked to share"}',
+      ),
+    ).toEqual({ kind: 'media_waiting', for: 'person_at_screen', waitsMs: 117250, hint: 'asked to share' })
+    expect(parseControlInbound('{"t":"rc:media-waiting","for":"some_future_wait","waits_ms":0}')).toEqual({
+      kind: 'media_waiting',
+      for: 'some_future_wait',
+      waitsMs: 0,
+      hint: '',
+    })
+    // No duration, or a nonsense one, is not a wait the watchdog can honour.
+    expect(parseControlInbound('{"t":"rc:media-waiting","for":"person_at_screen"}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:media-waiting","for":"person_at_screen","waits_ms":-5}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:media-waiting","for":"person_at_screen","waits_ms":"120000"}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:media-waiting","waits_ms":1000}')).toBeNull()
   })
 
   it('returns null for non-string input', () => {
@@ -4056,6 +4079,32 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
   it('a stall count held at zero shows no media_stalled badge', () => {
     const stall = nextStallTicks(RC_STALL_FAIL_TICKS, false, true)
     expect(classifyDegraded({ pcState: 'connected', wsConnected: true, stallTicks: stall })).toBe(null)
+  })
+
+  // FR-93 P2d-2 — the agent said it waits for the person at the screen.
+  it('a wait is honoured until its deadline plus the grace, and not after', () => {
+    const w = { for: 'person_at_screen', deadlineMs: 1_000_000, hint: '' }
+    expect(agentIsWaiting(null, 0)).toBe(false)
+    expect(agentIsWaiting(w, 999_999)).toBe(true)
+    expect(agentIsWaiting(w, 1_000_000 + RC_MEDIA_WAITING_GRACE_MS - 1)).toBe(true)
+    expect(agentIsWaiting(w, 1_000_000 + RC_MEDIA_WAITING_GRACE_MS)).toBe(false)
+  })
+
+  it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {
+    const w = { for: 'person_at_screen', deadlineMs: 120_000, hint: '' }
+    let stall = 0
+    const actions: string[] = []
+    for (let s = 0; s < 120; s++) {
+      stall = nextStallTicks(stall, false, agentIsWaiting(w, s * 1000))
+      actions.push(nextStallAction(stall))
+    }
+    expect(actions.every((a) => a === 'none')).toBe(true)
+    // Past the deadline and the grace, a silent session counts again (the control).
+    for (let s = 120 + RC_MEDIA_WAITING_GRACE_MS / 1000; s < 120 + RC_MEDIA_WAITING_GRACE_MS / 1000 + 30; s++) {
+      stall = nextStallTicks(stall, false, agentIsWaiting(w, s * 1000))
+      actions.push(nextStallAction(stall))
+    }
+    expect(actions).toContain('reconnect')
   })
 
   it('a session that said why it has no frames is not dead air', () => {

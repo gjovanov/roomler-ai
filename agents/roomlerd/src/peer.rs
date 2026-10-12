@@ -2291,7 +2291,12 @@ async fn media_pump(
         target_fps,
         "media pump starting"
     );
-    let mut capturer = capture::open_default_async(target_fps, downscale).await;
+    let mut capturer = capture::open_default_async(
+        target_fps,
+        downscale,
+        media_waiting_hook(session_id, control_dc.clone()),
+    )
+    .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -2480,7 +2485,12 @@ async fn media_pump(
                 // twice a second forever.
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(target_fps, downscale).await;
+                capturer = capture::open_default_async(
+                    target_fps,
+                    downscale,
+                    media_waiting_hook(session_id, control_dc.clone()),
+                )
+                .await;
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized
@@ -2722,7 +2732,12 @@ async fn media_pump(
                     );
                     target_fps = new_fps;
                     frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
-                    capturer = capture::open_default_async(target_fps, downscale).await;
+                    capturer = capture::open_default_async(
+                        target_fps,
+                        downscale,
+                        media_waiting_hook(session_id, control_dc.clone()),
+                    )
+                    .await;
                 }
 
                 // rc.38 — when auto-downscale changes target_resolution
@@ -3341,7 +3356,12 @@ async fn media_pump_vp9_444_dc(
         target_fps,
         "VP9-444 DC pump starting"
     );
-    let mut capturer = capture::open_default_async(target_fps, downscale).await;
+    let mut capturer = capture::open_default_async(
+        target_fps,
+        downscale,
+        media_waiting_hook(session_id, control_dc.clone()),
+    )
+    .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -3863,7 +3883,12 @@ async fn media_pump_vp9_444_dc(
                 // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(target_fps, downscale).await;
+                capturer = capture::open_default_async(
+                    target_fps,
+                    downscale,
+                    media_waiting_hook(session_id, control_dc.clone()),
+                )
+                .await;
                 encoder = None;
                 encoder_dims = None;
                 continue;
@@ -4854,6 +4879,79 @@ fn spawn_capture_unavailable_notice(
     });
 }
 
+/// FR-93 P2d-2 — `rc:media-waiting`: this session's capture is waiting for the
+/// person at the screen to answer a dialog (the desktop portal's "share your
+/// screen"), and the dialog gives up in `waits_ms`. Without it the viewer saw
+/// a blank canvas and re-created the session every 10 s, so the session the
+/// person finally answered for was rarely the one on screen.
+///
+/// A duration, not a time of day, so the viewer reads it on its own clock.
+/// `for` names what is awaited: one value today, and an unknown one is kept by
+/// the viewer, like an unknown FR-80 code.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn media_waiting_payload(wait: crate::capture::OpenWait) -> String {
+    format!(
+        r#"{{"t":"rc:media-waiting","for":"person_at_screen","waits_ms":{},"hint":"{MEDIA_WAITING_HINT}"}}"#,
+        wait.gives_up_in.as_millis(),
+    )
+}
+
+/// What the viewer shows under "waiting for the person at the screen". A
+/// literal, so it carries no quote or backslash to escape.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const MEDIA_WAITING_HINT: &str = "The person at this computer is being asked to share their screen. \
+     The picture starts as soon as they choose to share it.";
+
+/// FR-93 P2d-2 — the hook a pump hands its capture open
+/// ([`crate::capture::open_default_async`]): if the open parks on a request for
+/// the person at the screen, tell the controller, retrying until the control
+/// channel takes it. `ROOMLERD_MEDIA_WAITING=0` turns the notice off.
+///
+/// The hook fires on the blocking pool, so it holds the runtime's handle
+/// rather than relying on a context that thread may not have entered.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn media_waiting_hook(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+) -> crate::capture::OnOpenWait {
+    if !tunnel_core::env::flag("MEDIA_WAITING", true) {
+        return Box::new(|_| {});
+    }
+    let runtime = tokio::runtime::Handle::current();
+    Box::new(move |wait| {
+        const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let payload = media_waiting_payload(wait);
+        info!(
+            %session_id,
+            gives_up_in_s = wait.gives_up_in.as_secs(),
+            "capture: waiting for the person at the screen to answer the portal dialog; telling the controller"
+        );
+        runtime.spawn(async move {
+            // Bounded by the dialog's own deadline too: past it, the notice
+            // would describe a wait that is already over.
+            let deadline = DEADLINE.min(wait.gives_up_in);
+            if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
+            {
+                warn!(
+                    %session_id,
+                    "media-waiting notice never reached the controller before the dialog's deadline"
+                );
+            }
+        });
+    })
+}
+
 /// Retry one control-DC message until it is sent or `deadline` passes. The
 /// channel usually opens AFTER capture (and seconds late on a relay), so a
 /// one-shot send would be lost. `true` once it went out.
@@ -5290,7 +5388,12 @@ async fn media_pump_ffmpeg_dc(
         slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
-    let mut capturer = capture::open_default_async(target_fps, downscale).await;
+    let mut capturer = capture::open_default_async(
+        target_fps,
+        downscale,
+        media_waiting_hook(session_id, control_dc.clone()),
+    )
+    .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -6179,7 +6282,12 @@ async fn media_pump_ffmpeg_dc(
                             // old pacing), then force the encoder rebuild;
                             // its first frame is a key-flagged IDR so the
                             // viewer resyncs cleanly.
-                            capturer = capture::open_default_async(target_fps, downscale).await;
+                            capturer = capture::open_default_async(
+                                target_fps,
+                                downscale,
+                                media_waiting_hook(session_id, control_dc.clone()),
+                            )
+                            .await;
                             encoder = None;
                             encoder_dims = None;
                         }
@@ -6735,7 +6843,12 @@ async fn media_pump_ffmpeg_dc(
                 // pumps, under the same bounded backoff.
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(target_fps, downscale).await;
+                capturer = capture::open_default_async(
+                    target_fps,
+                    downscale,
+                    media_waiting_hook(session_id, control_dc.clone()),
+                )
+                .await;
                 continue;
             }
         };
@@ -11397,6 +11510,24 @@ mod codec_cap_tests {
     /// vocabulary is a compatibility surface: a renamed code does not fail,
     /// it changes what an operator reads on the screen that exists to
     /// explain the failure.
+    /// FR-93 P2d-2 — `rc:media-waiting` is parsed by the viewer
+    /// (`parseControlInbound`): the field names are the contract, and
+    /// `waits_ms` is a duration in whole milliseconds, never a time of day.
+    #[test]
+    fn media_waiting_payload_wire_shape() {
+        let payload = super::media_waiting_payload(crate::capture::OpenWait {
+            gives_up_in: std::time::Duration::from_millis(117_250),
+        });
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(v["t"], "rc:media-waiting", "{payload}");
+        assert_eq!(v["for"], "person_at_screen", "{payload}");
+        assert_eq!(v["waits_ms"], 117_250, "{payload}");
+        assert!(
+            v["hint"].as_str().is_some_and(|h| !h.is_empty()),
+            "{payload}"
+        );
+    }
+
     #[test]
     fn capture_unavailable_payload_wire_shape() {
         use crate::capture::{CaptureUnavailable, CaptureUnavailableCode};

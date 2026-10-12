@@ -1264,13 +1264,24 @@ pub fn open_default(target_fps: u32, downscale: DownscalePolicy) -> Box<dyn Scre
 /// droppable while it waits: a capture that opens after its session is gone is
 /// dropped as it arrives. Elsewhere every open is quick, so it stays inline,
 /// byte for byte.
+///
+/// P2d-2 — `on_wait` is called at most once, from the blocking pool, if the
+/// open parks on a request for the person at the screen (the portal's dialog),
+/// so the pump can tell the controller instead of streaming silence. An open
+/// that asks nobody never calls it.
 pub async fn open_default_async(
     target_fps: u32,
     downscale: DownscalePolicy,
+    on_wait: OnOpenWait,
 ) -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "linux")]
     {
-        match tokio::task::spawn_blocking(move || open_default(target_fps, downscale)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _hook = ParkHook::install(on_wait);
+            open_default(target_fps, downscale)
+        })
+        .await
+        {
             Ok(capturer) => capturer,
             Err(e) => {
                 tracing::warn!(error = %e, "capture: the open did not finish (it panicked, or the runtime is stopping)");
@@ -1283,7 +1294,61 @@ pub async fn open_default_async(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // No open here waits for a person: there is no portal off Linux.
+        drop(on_wait);
         open_default(target_fps, downscale)
+    }
+}
+
+/// FR-93 P2d-2 — an open that is waiting for the person at the screen, as the
+/// controller is told it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenWait {
+    /// How long until the request gives up on its own. A duration rather than
+    /// a time of day, so the viewer reads it on its own clock.
+    pub gives_up_in: std::time::Duration,
+}
+
+/// What a pump hands [`open_default_async`]: called at most once, if and when
+/// its open parks on a request for the person at the screen.
+pub type OnOpenWait = Box<dyn FnOnce(OpenWait) + Send + 'static>;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// The hook of the open running on THIS blocking thread. Only [`ParkHook`]
+    /// sets it, and its drop clears it, so a pooled thread never carries one
+    /// into the next open, not even after a panic.
+    static PARK_HOOK: std::cell::RefCell<Option<OnOpenWait>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds an open's [`OnOpenWait`] for as long as that open runs on this thread.
+#[cfg(target_os = "linux")]
+struct ParkHook;
+
+#[cfg(target_os = "linux")]
+impl ParkHook {
+    fn install(hook: OnOpenWait) -> Self {
+        PARK_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        Self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ParkHook {
+    fn drop(&mut self) {
+        PARK_HOOK.with(|h| h.borrow_mut().take());
+    }
+}
+
+/// FR-93 P2d-2 — the portal broker's word that the open on this thread has
+/// parked on a request for the person at the screen. Fires that open's hook,
+/// once. A thread with no hook (the recorder, a probe, a test) does nothing.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+pub(crate) fn tell_open_waiting(wait: OpenWait) {
+    if let Some(hook) = PARK_HOOK.with(|h| h.borrow_mut().take()) {
+        hook(wait);
     }
 }
 
