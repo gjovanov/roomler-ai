@@ -2629,9 +2629,14 @@ impl Supervisor {
             }
             // P2d-3b — then each copy it holds asks for its stream, once the
             // server has heard where each one ends. Only while its owner lets
-            // it hold copies at all.
-            if me.cfg.replica && me.follows_at_connect() {
-                me.follow_all().await;
+            // it hold copies at all; P2f-1b — else only the copies of the
+            // teleports it was prepared for.
+            if me.follows_at_connect() {
+                if me.cfg.replica {
+                    me.follow_all().await;
+                } else {
+                    me.follow_teleports().await;
+                }
             }
         });
     }

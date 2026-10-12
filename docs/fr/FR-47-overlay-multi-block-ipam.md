@@ -30,7 +30,7 @@ Two properties, stated as the acceptance bar rather than as slogans:
 
 There is no `ROOMLER__OVERLAY__*` key in the prod configmap
 (`k8s/base/configmap-roomler2-config.yaml` in the deploy repo), so the shipped default
-`blocks_enabled: false` applies (`crates/config/src/settings.rs:65`, `:690`). Every
+`blocks_enabled: false` applies (`crates/config/src/settings.rs:65`, `:704`). Every
 organization created today lands on the shared `100.64.0.0/10` with its cursor seeded at 1.
 
 The two legacy rows above are therefore **not merely un-migrated — they overlap right now**.

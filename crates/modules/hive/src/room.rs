@@ -112,6 +112,18 @@ pub(crate) fn moving_note(p: &Promotion, by: &str) -> String {
     )
 }
 
+/// FR-90 P2f-1 — "teleporting": who moves it, where to, and that the device
+/// takes its copy first while the session runs on where it is.
+pub(crate) fn teleporting_note(p: &Promotion, by: &str) -> String {
+    format!(
+        "🔀 **{}** is moving the session to {}, which holds no copy of it yet — {} takes a copy first, and the session runs on {} meanwhile",
+        md_escape(by),
+        name_label(&p.to_name),
+        name_label(&p.to_name),
+        name_label(&p.from.device_name)
+    )
+}
+
 /// FR-90 P2e-6a — the move away from a primary that cannot be reached: the
 /// session goes on from the member's copy, and what the primary did after
 /// that copy ends is not in it.
@@ -767,6 +779,7 @@ mod tests {
             drained: None,
             unreachable_from: false,
             prior: None,
+            teleport: false,
         };
         let moving = moving_note(&p, "Alice");
         assert_eq!(

@@ -179,7 +179,7 @@ becomes a typed rejection so the arm can say *which* refusal it was; the log tex
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:642`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:648`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions

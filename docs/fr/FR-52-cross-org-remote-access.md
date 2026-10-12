@@ -240,7 +240,7 @@ P5, do not assume.**
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
 `is_overlay_relay_ip` (`crates/remote_control/src/hub.rs:58`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:1167` hands it to the agent as a
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:1176` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.

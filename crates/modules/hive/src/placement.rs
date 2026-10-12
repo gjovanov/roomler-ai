@@ -90,6 +90,10 @@ pub enum MemberRole {
     Archive,
     /// One of the session owner's own devices.
     Owner,
+    /// FR-90 P2f-1 — a teleport's target: no placement chooses it. It takes
+    /// the copy it will run, and becomes the primary at the move; a teleport
+    /// that fails before the move lets it go (`leaving`).
+    Teleport,
 }
 
 impl MemberRole {
@@ -99,6 +103,7 @@ impl MemberRole {
             Self::Primary => "primary",
             Self::Archive => "archive",
             Self::Owner => "owner",
+            Self::Teleport => "teleport",
         }
     }
 }
@@ -470,11 +475,18 @@ async fn replace_one(
         .filter_map(DeviceFacts::of)
         .filter(|d| Some(d.id) != gone)
         .collect();
+    // P2f-1 — the target of a teleport in flight is the teleport's: placement
+    // neither counts it nor lets it go. One left from a teleport that is over
+    // is any member: not chosen, it leaves.
+    let teleporting = s
+        .promotion
+        .as_ref()
+        .filter(|p| p.teleport && p.in_flight(bson::DateTime::now()))
+        .map(|p| p.to);
     let others = || {
-        current
-            .members
-            .iter()
-            .filter(|m| m.role != MemberRole::Primary.as_str())
+        current.members.iter().filter(move |m| {
+            m.role != MemberRole::Primary.as_str() && Some(m.device_id) != teleporting
+        })
     };
     // Active members first, then the leaving: one leaving still holds its
     // copy, so taking it back moves less than taking a stranger.
@@ -719,8 +731,14 @@ mod tests {
     #[test]
     fn the_words_are_locked() {
         assert_eq!(
-            [MemberRole::Primary, MemberRole::Archive, MemberRole::Owner].map(MemberRole::as_str),
-            ["primary", "archive", "owner"]
+            [
+                MemberRole::Primary,
+                MemberRole::Archive,
+                MemberRole::Owner,
+                MemberRole::Teleport
+            ]
+            .map(MemberRole::as_str),
+            ["primary", "archive", "owner", "teleport"]
         );
         assert_eq!(
             [Short::Adopted, Short::Restricted, Short::NoDevice].map(Short::as_str),
