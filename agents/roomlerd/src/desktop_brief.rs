@@ -91,13 +91,14 @@ mod pick {
 
 /// Is `next` the same desktop as `prev`, all but the input reach?
 ///
-/// ⚠️ The reach is the one field that costs something to read: it connects to
-/// the X server, and GNOME starts Xwayland **on demand** when a client
-/// connects, so reading it every refresh could keep starting an Xwayland on an
-/// idle per-user desktop. It is read again only when the rest of the brief
-/// changed (a login, a logout, the greeter, a different arm). A reach that
-/// changes on its own is seen at the next of those. The per-session
-/// `rc:input-reach` is read fresh and stays the authority.
+/// The reach is the one field that costs something to read: it talks to the X
+/// server (and, on a Wayland desktop, only to an Xwayland already running:
+/// GNOME starts one on demand for any client that connects, see
+/// `reach::predicted`). So it is read again only when the rest of the brief
+/// changed (a login, a logout, the greeter, a different arm), which also
+/// spares the server a re-announce every time an on-demand Xwayland comes or
+/// goes. A reach that changes on its own is seen at the next of those. The
+/// per-session `rc:input-reach` is read fresh and stays the authority.
 #[cfg(target_os = "linux")]
 fn same_desktop(prev: &DesktopBrief, next: &DesktopBrief) -> bool {
     prev.session == next.session
@@ -135,7 +136,7 @@ mod linux {
         };
         next.input_reach = match prev {
             Some(p) if super::same_desktop(p, &next) => p.input_reach.clone(),
-            _ => crate::input::reach::predicted(portal_input)
+            _ => crate::input::reach::predicted(portal_input, next.kind == "wayland")
                 .reach
                 .wire()
                 .to_string(),

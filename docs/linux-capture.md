@@ -244,7 +244,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `type` | `wayland` · `x11` · `tty` · `none` | that session's type |
 | `desktop` | `gnome`, `KDE`, … (absent when logind names none) | logind's `Desktop` |
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
-| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:232`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ Read again only when another field changed. The verdict connects to the X server, and GNOME starts Xwayland **on demand** when a client connects, so a read every refresh could keep starting one on an idle desktop. The per-session `rc:input-reach` stays the authority |
+| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:232`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, and the first P2b candidate's read did exactly that on an idle GNOME 50 desktop (no Xwayland before, one after, kept). So on a Wayland desktop it connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
 `capture_arm` is `capture::planned_arm` (`capture/mod.rs:744`), a pure function
 that walks `open_with`'s own order (`:1270`). The two sit together in one file

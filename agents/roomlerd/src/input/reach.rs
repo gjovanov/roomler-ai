@@ -228,14 +228,31 @@ pub fn current() -> InputReach {
 /// brief. The portal's input route registers only as a portal capture opens,
 /// so outside a session it is predicted: `portal_input` says the planned arm
 /// would open one (a portal or mutter arm with `portal_input` on).
+///
+/// ⚠️ `wayland_session`: there the X server is Xwayland, and GNOME starts it
+/// **on demand** when a client connects, so a read that connects is itself
+/// what starts one. Measured on GNOME 50: no Xwayland before, and the first
+/// brief's read started one that stayed. On a Wayland desktop the brief
+/// therefore connects only to an Xwayland already running (found in `/proc`),
+/// and with none it reads "no X server". An X11 session cannot exist without
+/// its server, so there connecting starts nothing.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn predicted(portal_input: bool) -> InputReach {
-    let mut facts = gather();
+pub fn predicted(portal_input: bool, wayland_session: bool) -> InputReach {
+    let mut facts = gather_with(if wayland_session {
+        x_server_if_running
+    } else {
+        x_server
+    });
     facts.portal_route |= portal_input;
     decide(&facts)
 }
 
 fn gather() -> Facts {
+    gather_with(x_server)
+}
+
+/// [`gather`], with the X server read by `x`.
+fn gather_with(x: fn() -> XServer) -> Facts {
     #[cfg(target_os = "windows")]
     let platform = Platform::Windows;
     #[cfg(target_os = "macos")]
@@ -264,8 +281,40 @@ fn gather() -> Facts {
         uinput_on,
         uinput_ok,
         enigo_built: cfg!(feature = "enigo-input"),
-        x: x_server(),
+        x: x(),
     }
+}
+
+/// [`x_server`], but only when an Xwayland already serves `DISPLAY`: never the
+/// connection that starts one (see [`predicted`]).
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn x_server_if_running() -> XServer {
+    let running = std::env::var("DISPLAY")
+        .ok()
+        .as_deref()
+        .and_then(display_number)
+        .is_some_and(xwayland_serves);
+    if running { x_server() } else { XServer::Absent }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+fn x_server_if_running() -> XServer {
+    XServer::Absent
+}
+
+/// Is an Xwayland process serving display `:number`? Read from `/proc` (its
+/// `comm` and command line, which a sandboxed daemon may read), never by
+/// connecting.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+fn xwayland_serves(number: &str) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    procs.flatten().any(|p| {
+        let path = p.path();
+        std::fs::read_to_string(path.join("comm")).is_ok_and(|c| c.trim() == "Xwayland")
+            && std::fs::read(path.join("cmdline")).is_ok_and(|c| cmdline_serves(&c, number))
+    })
 }
 
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
