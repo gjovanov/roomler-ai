@@ -1669,6 +1669,15 @@ fn rpc_caps() -> Vec<String> {
     // org's Hive frames are refused there either way.
     #[cfg(hive_host)]
     caps.push(RpcCap::HiveLease);
+    // FR-90 P2e-5c — and takes part in a promotion at either end: as the
+    // primary it drains (`rc:hive.drain`), as the member it prepares
+    // (`rc:hive.prepare`) and takes the session over from its copy at the
+    // move (`rc:hive.move`), and its joins take where each superseded fence
+    // ended (P2e-5b). A property of the BUILD, like `hive-lease`: the device
+    // still refuses a drain or a prepare its own gates do not pass, in its
+    // own words, and a secondary org's connection refuses both.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HivePromote);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

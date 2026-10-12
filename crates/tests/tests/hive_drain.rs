@@ -5,9 +5,11 @@
 //! is its own binary for the same reason: the device's Hive supervisor is
 //! process-global).
 //!
-//! No build advertises `hive-promote` yet, so the route refuses every
-//! promotion. The server's steps are therefore seeded on the record, and each
-//! frame goes over the device's control connection, as that step sends it.
+//! Each step is seeded on the record and its frame sent over the device's
+//! control connection, as that step sends it, so one device answers each
+//! step on its own, including the ones a real promotion never asks of it in
+//! this order. A promotion the route starts, between two real devices, is
+//! `hive_promote.rs` (P2e-5c).
 //! What the test reads is the server's own: the record, and the room its
 //! handler of the device's answer wrote to, and the device's answers to
 //! prompts over the owner's viewer peer.

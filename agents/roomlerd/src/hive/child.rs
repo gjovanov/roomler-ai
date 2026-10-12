@@ -179,3 +179,24 @@ where
 pub(super) async fn nothing(_: ChildStdin) -> Fed {
     Fed::Done
 }
+
+/// A test's run of a script it has just written, again while that script is
+/// busy (`ETXTBSY`): a thread of the same test binary that forked while the
+/// script was still open for writing holds it so until its own child execs,
+/// and an exec meanwhile is refused. Production runs its own binary, never a
+/// script it has just written, so only a test meets it.
+#[cfg(test)]
+pub(super) async fn unbusy<T, Fut>(mut run: impl FnMut() -> Fut) -> Result<T, String>
+where
+    Fut: Future<Output = Result<T, String>>,
+{
+    for _ in 0..100 {
+        match run().await {
+            Err(e) if e.contains("Text file busy") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            done => return done,
+        }
+    }
+    run().await
+}
