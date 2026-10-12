@@ -576,6 +576,20 @@ sequenceDiagram
 | nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1267`, `Request::land` `:182` |
 | mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:45` |
 
+**Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
+`portal_capture` on and no restore token. One viewer opens three sessions in about 60 s with nobody at the
+screen, and the viewer's own watchdog re-creates each one. A sampler on the guest counts the live
+`portal-helper` processes; each is one pending request and one dialog.
+
+| | 0.4.130, the release (two runs) | P2d-1 (two runs) |
+|---|---|---|
+| requests raised by the burst | 4 in 30 s, all 4 dialogs stacked | 1 |
+| most helpers alive at once | 4 | 1 |
+| the third session | sat at `awaiting_consent`, never answered | connected within 1 s |
+| the daemon | no log line for 83–86 s, then `watchdog-of-watchdog: … forcing exit(2)` and a systemd restart, both runs | never restarted, logging throughout |
+| the person answers while the viewer waits | — | the capture 1.6 s after the click, the picture in the viewer, one request in all, no restore token |
+| the person answers after the viewer's last session ended | — | dropped: no pump took it. The restore token it left opened the viewer's next session with no dialog |
+
 ⚠️ **The viewer half is still owed** (P2d-2). The viewer still re-creates its
 session every 10 s while no frames arrive. Each new session now joins the same
 request instead of raising a dialog, but the person at the viewer sees a blank
