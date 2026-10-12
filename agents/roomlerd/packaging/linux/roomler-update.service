@@ -23,7 +23,38 @@ Documentation=https://roomler.ai/
 After=network-online.target
 Wants=network-online.target
 
+# No start limit. roomler-update.path's PathExists= is LEVEL-triggered, so a
+# wake that lands during a run restarts the service the instant it ends.
+# systemd's default start limit (5 starts in 10 s) is a CLIFF — measured on
+# systemd 255, six touches of the wake file in 10 s left roomler-update.path
+# `failed (unit-start-limit-hit)` until a reboot or `systemctl reset-failed`,
+# and a single `mkdir` at the wake path did the same in ~2 s. A local user
+# could wedge the updater that way. The helper spaces its own runs instead
+# (updater.rs UPDATE_HELPER_MIN_GAP, 60 s), so this never fires in normal use;
+# it is the belt that keeps the path unit alive under a hostile burst.
+StartLimitIntervalSec=0
+
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/roomlerd update-helper
 Environment=RUST_LOG=info
+# The helper sleeps up to 60 s (its run-spacing gate) and may then download for
+# up to 10 min, so its start must not be read as a hang. A oneshot already
+# defaults to no start timeout (measured: TimeoutStartUSec=infinity); set it so
+# a drop-in DefaultTimeoutStartSec cannot change that. A wedged apt/dpkg is no
+# worse here than on the in-process updater, which runs the same commands with
+# no timeout.
+TimeoutStartSec=infinity
+# A helper that fails BEFORE its gate (a binary that will not exec — 203/EXEC —
+# or a panic in startup) would otherwise re-trigger at job-queue speed and hit
+# roomler-update.path's OWN trigger limit (200 in 2 s), which also fails the
+# path unit until a reboot. In auto-restart the service is not inactive, so the
+# path unit holds. A failed INSTALL retries once after 60 s, into the 5-min
+# install cooldown, and stops. Allowed for oneshot (only always/on-success are
+# refused). Measured on systemd 255: with this, an exec-failing helper leaves
+# the path unit `active (waiting)` and auto-restarts; without it the path unit
+# failed in ~2 s.
+Restart=on-failure
+RestartSec=60s
+# ⚠️ Never PrivateTmp=: it would hide /var/tmp too, and the wake file could
+# never be consumed — the path unit would re-trigger forever.

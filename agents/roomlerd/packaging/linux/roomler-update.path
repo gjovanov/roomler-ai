@@ -4,11 +4,18 @@
 # instead of installing. /var/tmp is sticky and world-writable ON PURPOSE: the
 # file is a WAKE, and its content is never read. Whoever writes it can cause an
 # update CHECK as root, never choose what gets installed: the helper resolves
-# and verifies the release itself, and its install-storm cooldown bounds spam.
-# The helper deletes the file first thing, which re-arms this unit.
+# and verifies the release itself. The helper spaces its runs ≥60 s apart
+# (updater.rs UPDATE_HELPER_MIN_GAP, launchd's ThrottleInterval twin), so a
+# flood of touches costs at most one check a minute and never fails a unit. The
+# helper consumes the file first thing — unlinking a planted symlink without
+# following it, moving a planted directory aside — which re-arms this unit.
 Description=Roomler update helper — a check on demand
 
 [Path]
+# PathExists= (level-triggered), NOT PathChanged=: a wake that arrives WHILE the
+# service runs is honoured after it ends (systemd stops watching a path while
+# the unit it triggers is running, so an edge would be missed). The helper's own
+# 60 s gate bounds how often that re-fire does real work.
 PathExists=/var/tmp/roomler-update-check
 Unit=roomler-update.service
 
