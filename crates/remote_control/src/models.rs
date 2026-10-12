@@ -312,6 +312,13 @@ pub struct AgentCaps {
     /// pre-P3 reader sees nothing new.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub probe_cached: bool,
+    /// FR-93 P2b — the desktop this Linux device would show a controller now,
+    /// and what would capture it. Lets the server count Wayland hosts and the
+    /// arm serving each, which an exec sweep cannot (it reaches only what is
+    /// online). Live, unlike the probed fields above: re-announced on the
+    /// heartbeat when it changes. `None` off Linux and from older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<DesktopBrief>,
 }
 
 /// FR-77 — one encoder (codec × backend) and the chroma formats it produced
@@ -1089,6 +1096,34 @@ impl ExecPolicy {
     pub fn allows_shell(&self, shell: &str) -> bool {
         self.shells.is_empty() || self.shells.iter().any(|s| s.eq_ignore_ascii_case(shell))
     }
+}
+
+/// FR-93 P2b — a Linux device's desktop, as its daemon sees it. A CLAIM by
+/// the device, counted by the server, never enforced on. Strings, not enums,
+/// for the additive-wire reason: a newer agent's arm or session class must
+/// reach an older server as a word it can count, not a parse failure.
+///
+/// `capture_arm` is the arm a session opened now would try first, in the
+/// cascade's own order. The arm a session actually used rides that
+/// session's `rc:video-info`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DesktopBrief {
+    /// logind's class for the session a controller would see: `user` ·
+    /// `greeter` · `lock-screen` · …, or `none` (nobody at a seat).
+    pub session: String,
+    /// `wayland` · `x11` · `tty` · `none`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The session's desktop as logind names it (`gnome`, `KDE`, …), when it
+    /// names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<String>,
+    /// `mutter` · `drm` · `portal` · `x11` · `none` (nothing would capture: a
+    /// Wayland desktop with no arm switched on, or no desktop at all).
+    pub capture_arm: String,
+    /// `full` · `xwayland_only` · `none`: how far a controller's input would
+    /// reach (the `rc:input-reach` words).
+    pub input_reach: String,
 }
 
 /// FR-92 P5b — what a device says about its keep busy, on every heartbeat.
@@ -5274,6 +5309,66 @@ mod tests {
         let wire = serde_json::to_string(&caps).unwrap();
         let back: AgentCaps = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.video_cells, caps.video_cells);
+    }
+
+    /// FR-93 P2b — the desktop brief's wire shape: `type` on the wire (the
+    /// spec's word), an absent desktop name and an absent brief both stay off
+    /// it, and words this build has never heard of still parse.
+    #[test]
+    fn desktop_brief_wire_shape_is_locked_and_additive() {
+        let brief = DesktopBrief {
+            session: "user".into(),
+            kind: "wayland".into(),
+            desktop: Some("gnome".into()),
+            capture_arm: "mutter".into(),
+            input_reach: "full".into(),
+        };
+        let caps = AgentCaps {
+            desktop: Some(brief.clone()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            wire["desktop"],
+            serde_json::json!({
+                "session": "user",
+                "type": "wayland",
+                "desktop": "gnome",
+                "capture_arm": "mutter",
+                "input_reach": "full",
+            })
+        );
+        let back: AgentCaps = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.desktop, Some(brief));
+
+        // No desktop name: the key stays off the wire.
+        let nameless = DesktopBrief {
+            session: "none".into(),
+            kind: "none".into(),
+            desktop: None,
+            capture_arm: "none".into(),
+            input_reach: "none".into(),
+        };
+        let wire = serde_json::to_string(&nameless).unwrap();
+        assert!(!wire.contains("\"desktop\""), "{wire}");
+
+        // No brief at all (off Linux, older agents): nothing on the wire, and
+        // an older agent's caps parse to `None`.
+        let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
+        assert!(!wire.contains("desktop"), "{wire}");
+        let old: AgentCaps = serde_json::from_str(
+            r#"{"hw_encoders":[],"codecs":["h264"],"has_input_permission":true,"supports_clipboard":false,"supports_file_transfer":false,"max_simultaneous_sessions":1}"#,
+        )
+        .unwrap();
+        assert!(old.desktop.is_none());
+
+        // A newer agent's words parse as words.
+        let future: DesktopBrief = serde_json::from_str(
+            r#"{"session":"remote","type":"mir","capture_arm":"pipewire-direct","input_reach":"partial","extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(future.capture_arm, "pipewire-direct");
+        assert_eq!(future.kind, "mir");
     }
 
     #[test]
