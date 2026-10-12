@@ -3670,15 +3670,12 @@ async fn a_target_that_never_answered_is_waited_out_then_moved_on() {
     // Back, eleven minutes after the session was made: the start again.
     made_ago(&app, &sid, 11 * 60).await;
     m.b.ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
-    let again = frames_until(
-        &mut m.b.ws,
-        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
-    )
-    .await;
+    let again = frames_within(&mut m.b.ws, Duration::from_secs(3)).await;
+    let of = |kind: &str| again.iter().find(|f| f["t"] == kind);
     assert_eq!(
         (
-            move_of(&again)["from_device_id"].as_str(),
-            again.last().unwrap()["fence"].as_u64()
+            of("rc:hive.move").and_then(|f| f["from_device_id"].as_str()),
+            of("rc:hive.start").and_then(|f| f["fence"].as_u64())
         ),
         (Some(a_id.as_str()), Some(2)),
         "a moved start is sent again, however late its device comes back: {again:?}"
