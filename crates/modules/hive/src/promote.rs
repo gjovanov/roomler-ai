@@ -630,6 +630,7 @@ pub async fn promote(
         user_id: s.owner_id,
         user_email: user.email,
         caller: user.display_name,
+        teleport: false,
     };
     if let Err(e) = state.fleet.rc_hub.push_hive_promote(target, tid, msg) {
         // Gone, or reconnected as a build that takes no part, between the
