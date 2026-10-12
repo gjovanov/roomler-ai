@@ -717,10 +717,13 @@ pub enum SpawnDecision {
 ///   worker. Used so the swap-on-controller-connect arm doesn't
 ///   keep flapping back and forth: once we're SystemContext, stay
 ///   SystemContext while the controller is around.
-/// * `keep_stream_alive` — true iff a controller is currently
-///   connected to *some* worker on this host (signal comes from
-///   `system_context::peer_presence::is_signaled` in the supervisor
-///   loop).
+/// * `keep_stream_alive` — named for its M3 meaning, "a controller is
+///   connected to *some* worker on this host". ⚠️ Since 0.3.0-rc.7 the
+///   supervisor loop passes `peer_presence_is_signaled()`, which is
+///   `ROOMLERD_ENABLE_SYSTEM_SWAP` and nothing else. So in production a
+///   SystemContext-mode host is SYSTEM from cold start, an attended host
+///   stays user-context, and the "swap" rows below never fire because a
+///   controller connected.
 /// * `last_active_session` — most recent `Some(active)` the
 ///   supervisor observed. Used only by the `(None, _) if
 ///   keep_stream_alive` branch as the target session id for the
@@ -1485,17 +1488,16 @@ pub fn run(
             }
         }
 
-        // Decide whether to spawn. The `keep_stream_alive` argument
-        // comes from the `system_context::peer_presence` marker file
-        // — true iff the worker has reported a `Connected` peer in
-        // the last `PRESENCE_MAX_AGE` (15 s). This is the M3 A1
-        // signal that drives the user-context → SYSTEM-context
-        // worker swap.
+        // Decide whether to spawn. ⚠️ `keep_stream_alive` is NOT
+        // controller presence: since 0.3.0-rc.7 it is
+        // `ROOMLERD_ENABLE_SYSTEM_SWAP`, and the `peer_presence` marker
+        // is observability only (see `peer_presence_is_signaled`). So
+        // a SystemContext-mode host runs a SYSTEM worker from cold
+        // start and an attended host a user-context one; a controller
+        // connecting swaps neither.
         //
-        // Under builds without the `system-context` feature the
-        // marker file is never written (the worker's signal hooks
-        // are gated to the same feature) so `is_signaled` returns
-        // false and `decide_spawn` collapses to its pre-M3
+        // Under builds without the `system-context` feature it is
+        // always false and `decide_spawn` collapses to its pre-M3
         // behaviour.
         let active = active_console_session_id();
         if let Some(s) = active {

@@ -260,8 +260,9 @@ stateDiagram-v2
     is how `roomler exec` arrives there.
   - ⚠️ **Not a wall against `roomler exec`** (§9 row 43, 0.4.129). On Windows exec runs in the worker
     that holds the agent socket (`RunAs::Daemon` is the worker's identity), and that worker lives in
-    the console session: the signed-in user's elevated token while no controller is connected,
-    SYSTEM in that session while one is (`decide_spawn`, `win_service/supervisor.rs` L743). So
+    the console session: the signed-in user's elevated token on an attended install, SYSTEM in that
+    session in SystemContext mode (`ROOMLERD_ENABLE_SYSTEM_SWAP`). A controller connecting changes
+    neither. So
     `roomler exec <win> -- roomler keep-busy on` passes the session test and is named "the person at
     this computer". On Unix exec arrives as root and is refused, but root can `sudo -u` the person
     (row 42 did exactly that, to stand in for the person). No local gate can be that wall: an exec
@@ -571,6 +572,7 @@ AC3 and AC5 were reworded on the operator's go (2026-10-11, "proceed per your re
   button-up at (0,0), and dispatch moves first. So a session that closes mid-drag throws the cursor
   into the top-left corner, a hot corner on GNOME and macOS (`arbiter.rs` L109-118,
   `enigo_backend.rs` L128-138).
-- **Found in P10's field test, filed separately:** #2021. On Windows, Fleet RPC runs as the
-  signed-in user in the console session, not SYSTEM, because the worker holds the agent socket.
-  The docs, the CLI help and the admin UI all say SYSTEM.
+- **Found in P10's field test, filed separately:** #2021. On Windows, Fleet RPC runs as the worker,
+  because the worker holds the agent socket. That is the signed-in user on an attended install, or
+  SYSTEM in the console session in SystemContext mode, never session 0. The docs, the CLI help and
+  the admin UI all say SYSTEM.

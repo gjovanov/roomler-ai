@@ -415,8 +415,8 @@ flowchart TD
 - ⚠️ **Not a wall against `roomler exec`** (measured on 0.4.129, FR-92 §9
   row 43). On Windows, exec runs in the worker that holds the agent socket,
   and that worker lives in the console session: as the signed-in user (their
-  elevated token) while no controller is connected, and as SYSTEM in that
-  session while one is (`decide_spawn`, `win_service/supervisor.rs` L743). So
+  elevated token) on an attended install, and as SYSTEM in that session in
+  SystemContext mode (`ROOMLERD_ENABLE_SYSTEM_SWAP`). So
   `roomler exec <win> -- roomler keep-busy on` passes the session test, and
   the start is named "the person at this computer". On Unix exec arrives as
   root and is refused, but root can `sudo -u` the person. No local gate can

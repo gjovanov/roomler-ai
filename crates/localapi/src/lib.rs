@@ -1982,8 +1982,8 @@ impl ClientPeer {
 ///
 /// ⚠️ **Not a wall against `roomler exec`.** On Windows exec runs in the
 /// worker that holds the agent socket, and that worker lives in the console
-/// session — as the signed-in user, or as SYSTEM while a controller is
-/// connected — so an exec passes the session test and is named "the person
+/// session — as the signed-in user (an attended install), or as SYSTEM
+/// (SystemContext mode) — so an exec passes the session test and is named "the person
 /// at this computer" (measured on 0.4.129, FR-92 §9 row 43). On Unix root can
 /// `sudo -u` the person. Nothing a local gate sees tells them apart: what an
 /// exec caller may do on a device is the owner's `exec_enabled`, not this.
