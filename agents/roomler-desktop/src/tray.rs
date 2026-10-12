@@ -234,25 +234,65 @@ fn spawn_keep_busy_watch<R: Runtime>(item: MenuItem<R>) {
 /// with the product defaults (P10); anything on stops it.
 fn toggle_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
-        let outcome: std::io::Result<roomler_localapi::KeepBusyInfo> = async {
+        let outcome: std::io::Result<(bool, roomler_localapi::KeepBusyInfo)> = async {
             let mut c = roomler_localapi::connect().await?;
-            if c.keep_busy_status().await?.on {
-                c.keep_busy_off().await
+            let stopping = c.keep_busy_status().await?.on;
+            let s = if stopping {
+                c.keep_busy_off().await?
             } else {
-                c.keep_busy_on(Default::default()).await
-            }
+                c.keep_busy_on(Default::default()).await?
+            };
+            Ok((stopping, s))
         }
         .await;
-        match outcome {
-            Ok(s) if !s.on && s.reason.is_some() => tracing::warn!(
-                reason = s.reason.as_deref().unwrap_or("-"),
+        let (stopping, s) = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(%e, "tray: could not toggle keep busy");
+                return;
+            }
+        };
+        let reason = s.reason.as_deref().unwrap_or("-");
+        match keep_busy_click(stopping, &s) {
+            KeepBusyClick::Stopped => tracing::info!(reason, "tray: keep busy stopped"),
+            KeepBusyClick::DidNotStop => tracing::warn!(
+                phase = %s.phase,
+                reason,
+                "tray: keep busy did not stop"
+            ),
+            KeepBusyClick::Started => tracing::info!(phase = %s.phase, "tray: keep busy started"),
+            KeepBusyClick::DidNotStart => tracing::warn!(
+                phase = %s.phase,
+                reason,
                 sentence = s.sentence.as_deref().unwrap_or("-"),
                 "tray: keep busy did not start"
             ),
-            Ok(s) => tracing::info!(on = s.on, phase = %s.phase, "tray: keep busy toggled"),
-            Err(e) => tracing::warn!(%e, "tray: could not toggle keep busy"),
         }
     });
+}
+
+/// FR-92 — what a click on the keep-busy item did, named by the action
+/// taken. Reading it off the answer's shape alone logged every successful
+/// Stop as "did not start": a stop answers `on: false` WITH a reason
+/// (`stopped_locally`), exactly like a refused start (field, row 49).
+#[derive(Debug, PartialEq, Eq)]
+enum KeepBusyClick {
+    Stopped,
+    DidNotStop,
+    Started,
+    /// Refused (`on: false`), or accepted but unable to move the pointer
+    /// (`phase: unavailable`, e.g. `no_permission` on a Mac without the
+    /// Accessibility grant, which answers `on: true`).
+    DidNotStart,
+}
+
+fn keep_busy_click(stopping: bool, s: &roomler_localapi::KeepBusyInfo) -> KeepBusyClick {
+    match (stopping, s.on) {
+        (true, false) => KeepBusyClick::Stopped,
+        (true, true) => KeepBusyClick::DidNotStop,
+        (false, true) if s.phase != "unavailable" => KeepBusyClick::Started,
+        (false, _) => KeepBusyClick::DidNotStart,
+    }
 }
 
 /// FR-85 — the configured tray's icon while nothing records: the menu-bar
@@ -571,6 +611,43 @@ mod tests {
         assert_eq!(
             keep_busy_labels(Some(&roomler_localapi::KeepBusyInfo::unavailable())),
             ("Keep busy: unavailable".into(), false)
+        );
+    }
+
+    /// FR-92 field row 49 — a click is named by what it did. A successful
+    /// Stop answers `on: false` with `reason: stopped_locally`, the same shape
+    /// as a refused Start, and used to be logged as "did not start".
+    #[test]
+    fn a_keep_busy_click_is_named_by_the_action_taken() {
+        let stopped = roomler_localapi::KeepBusyInfo {
+            available: true,
+            on: false,
+            phase: "off".into(),
+            reason: Some("stopped_locally".into()),
+            ..Default::default()
+        };
+        assert_eq!(keep_busy_click(true, &stopped), KeepBusyClick::Stopped);
+        // The same answer to a Start is a refusal.
+        assert_eq!(keep_busy_click(false, &stopped), KeepBusyClick::DidNotStart);
+        let running = roomler_localapi::KeepBusyInfo {
+            available: true,
+            on: true,
+            phase: "running".into(),
+            ..Default::default()
+        };
+        assert_eq!(keep_busy_click(false, &running), KeepBusyClick::Started);
+        assert_eq!(keep_busy_click(true, &running), KeepBusyClick::DidNotStop);
+        // Accepted but unable to move the pointer (a Mac without the
+        // Accessibility grant answers `on: true`, `phase: unavailable`).
+        let no_permission = roomler_localapi::KeepBusyInfo {
+            on: true,
+            phase: "unavailable".into(),
+            reason: Some("no_permission".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_busy_click(false, &no_permission),
+            KeepBusyClick::DidNotStart
         );
     }
 
