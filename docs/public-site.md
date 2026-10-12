@@ -118,8 +118,12 @@ revalidated on every load (`expires -1`, §5), and it is what moves a reader to 
   `apple-touch-icon.png`, the manifest and its icons), because browsers ask for
   `/favicon.ico` and `/apple-touch-icon.png` on their own. ⚠️ Those names fall under the same
   year-long `immutable` rule, so a returning visitor keeps an old icon after its bytes change.
-  `favicon.svg` is linked as `/favicon.svg?v=2` from both `ui/index.html` and
-  `theme/shell.ts`; bump the `v` in both when the file changes.
+  Every link to one of them carries a `?v=`, and a file whose bytes change bumps its `v` wherever
+  it is linked. Since the second logo (2026-10-12): `favicon.svg?v=3`; `favicon.ico`,
+  `apple-touch-icon.png` and the manifest's four icons `?v=2` (`ui/index.html`,
+  `theme/shell.ts`, `ui/public/site.webmanifest`); the social card `?v=2` (`OG_IMAGE` in
+  `site.ts`, the blog card in `build.ts`, the SPA's og/twitter tags); `logo.svg?v=2` (the
+  JSON-LD Organization logo). The manifest itself is not under the rule, so its link has none.
 - `LEGACY_UNHASHED_ASSETS` ([`site.ts:38`](../ui/docs/site.ts)), when on, also publishes each
   file under its old plain name, for HTML a browser cached before revalidation began. Pre-FR-87
   HTML carried no `Cache-Control` at all, so a browser could hold it under heuristic caching

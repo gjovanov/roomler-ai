@@ -83,8 +83,9 @@ describe('--blog-only, the published post (AC1)', () => {
     for (const f of html) {
       const text = readFileSync(join(LANE, f), 'utf8')
       expect(text.includes('/docs/assets/'), `${f} names /docs/assets/`).toBe(false)
-      // `&` ends a name too: the feed carries its HTML escaped (`…svg&quot;`).
-      for (const m of text.matchAll(/\/blog\/assets\/([^"'\s)<&]+)/g)) named.add(m[1]!)
+      // `&` ends a name too: the feed carries its HTML escaped (`…svg&quot;`). So does `?`: a
+      // `?v=` busts a cache and names the same file (the social card's, docs/public-site.md §3).
+      for (const m of text.matchAll(/\/blog\/assets\/([^"'\s)<&?]+)/g)) named.add(m[1]!)
     }
     expect(named.size).toBeGreaterThanOrEqual(5)
     for (const name of named) {
