@@ -677,6 +677,14 @@ pub(crate) fn end_for_device(state: &HiveState, device: ObjectId, reason: &str) 
     )
 }
 
+/// FR-90 P2e-3 — the session's lease moved: every stream of it ends, the
+/// old primary's to its members above all. A member follows the new primary
+/// once it has answered its join at the new fence, and nothing the old one
+/// still sends can reach it on a grant the server ended.
+pub(crate) fn end_for_session(state: &HiveState, session_id: ObjectId, reason: &str) -> usize {
+    end_where(state, |_, g| g.session_id == session_id, reason)
+}
+
 /// A member placement let go (`leaving`): its streams of that session end
 /// at once, not at their grant's end. A tag taken off must stop the copy
 /// following, whatever it still holds until the purge.

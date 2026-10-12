@@ -55,8 +55,8 @@ use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
     hive::{
-        HiveJoinRefusal, HiveManifestEntry, HiveRefusal, HiveReplicaManifestEntry, HiveRunState,
-        HiveTurnStatus, hive_limits,
+        HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HiveRefusal,
+        HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
     },
     signaling::{ClientMsg, ServerMsg},
 };
@@ -117,6 +117,23 @@ enum Report {
     /// P2c-3 — every session the device holds a copy of
     /// (`rc:hive.replica.manifest`).
     ReplicaManifest(Vec<HiveReplicaManifestEntry>),
+    /// P2e-3 — a member's answer to a promotion's prepare
+    /// (`rc:hive.prepare_ack`).
+    PrepareAck {
+        session_id: ObjectId,
+        fence: u64,
+        refused: Option<HiveRefusal>,
+        detail: Option<String>,
+    },
+    /// P2e-3 — a primary's answer to a promotion's drain (`rc:hive.drained`).
+    Drained {
+        session_id: ObjectId,
+        fence: u64,
+        seq: Option<u64>,
+        hash: Option<String>,
+        refused: Option<HiveDrainRefusal>,
+        detail: Option<String>,
+    },
     /// P2d — a stream frame (`rc:hive.replica.want` · `ready` ·
     /// `candidate` · `close`), from a connection advertising `hive-stream`.
     Stream(ClientMsg),
@@ -257,6 +274,35 @@ impl AgentMsgHandler for HiveAgentSocket {
                 checkpoint,
             }),
             ClientMsg::HiveReplicaManifest { sessions } => Report::ReplicaManifest(sessions),
+            // P2e-3 — applied only to the promotion waiting on THIS device,
+            // at the fence it named: the record is the gate.
+            ClientMsg::HivePrepareAck {
+                session_id,
+                fence,
+                refused,
+                account: _,
+                detail,
+            } => Report::PrepareAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            },
+            ClientMsg::HiveDrained {
+                session_id,
+                fence,
+                seq,
+                hash,
+                refused,
+                detail,
+            } => Report::Drained {
+                session_id,
+                fence,
+                seq,
+                hash,
+                refused,
+                detail,
+            },
             // P2d — read only from a connection that advertises
             // `hive-stream`: a build that does not carry streams has nothing
             // to say about one. Checked here, against THIS connection.
@@ -372,6 +418,24 @@ async fn apply_reports(
                 detail,
             } => {
                 let detail = clamp_words(detail, hive_limits::MAX_DETAIL_LEN);
+                // P2e-3 — a moved start the member refused is the
+                // promotion's to answer: the lease moves back, and the
+                // session is NOT refused. Never one at the first fence, which
+                // no promotion starts: those cost no read.
+                if let Some(word) = refused
+                    && fence > 1
+                    && crate::promote::on_start_refused(
+                        state,
+                        session_id,
+                        device_id,
+                        fence,
+                        word,
+                        detail.clone(),
+                    )
+                    .await
+                {
+                    continue;
+                }
                 let applied = match refused {
                     None => {
                         let account = clamp_words(account, MAX_ACCOUNT_LEN);
@@ -396,8 +460,19 @@ async fn apply_reports(
                         );
                         // AFTER the write: the woken caller re-reads the record.
                         state.start_acks.deliver(session_id, device_id);
-                        // And say so in the session's room (P0d).
-                        if let Ok(Some(s)) = state.sessions.find(session_id).await {
+                        // P2e-3 — a moved start's acceptance ends its
+                        // promotion, and the promotion's note says it moved.
+                        let moved = refused.is_none()
+                            && fence > 1
+                            && crate::promote::on_launched(state, session_id, device_id, fence)
+                                .await;
+                        // And say so in the session's room (P0d) — for a
+                        // first start: one at a later fence is a move's, or a
+                        // move back's, whose notes are the promotion's.
+                        if let Ok(Some(s)) = state.sessions.find(session_id).await
+                            && !moved
+                            && (refused.is_some() || s.fence <= 1)
+                        {
                             let text = match refused {
                                 None => room::started_note(&s),
                                 Some(_) => room::refused_note(&s),
@@ -458,6 +533,14 @@ async fn apply_reports(
                 match applied {
                     Ok(true) => {
                         debug!(session = %session_id, state = run.as_str(), "hive: session state");
+                        // P2e-3 — the moved start's run state is the member's
+                        // word that it runs it: the promotion is done, even
+                        // should the start's answer be lost.
+                        // At the first fence, which no promotion starts, it
+                        // costs no read.
+                        if run != HiveRunState::Ended && fence > 1 {
+                            crate::promote::on_launched(state, session_id, device_id, fence).await;
+                        }
                         if run == HiveRunState::Ended
                             && let Ok(Some(s)) = state.sessions.find(session_id).await
                         {
@@ -563,6 +646,28 @@ async fn apply_reports(
             Report::Tip(tip) => crate::replica::on_tip(state, device_id, tip).await,
             Report::ReplicaManifest(sessions) => {
                 crate::replica::on_manifest(state, device_id, sessions).await
+            }
+            Report::PrepareAck {
+                session_id,
+                fence,
+                refused,
+                detail,
+            } => {
+                crate::promote::on_prepare_ack(state, device_id, session_id, fence, refused, detail)
+                    .await
+            }
+            Report::Drained {
+                session_id,
+                fence,
+                seq,
+                hash,
+                refused,
+                detail,
+            } => {
+                crate::promote::on_drained(
+                    state, device_id, session_id, fence, seq, hash, refused, detail,
+                )
+                .await
             }
             Report::Adopt(offer) => crate::adopt::offer(state, tenant_id, device_id, offer).await,
             Report::View(msg) => crate::view::on_device_frame(state, device_id, msg).await,
@@ -689,6 +794,9 @@ fn tell_to_stop(
 ///   otherwise wait for one that never comes;
 /// - held here at the fence the list names, and leased: `rc:hive.lease`, on
 ///   the connection that sent the list and no other (P2e-2, [`crate::lease`]).
+///   Not while a promotion drains the device (P2e-3): the word would lift
+///   the drain while the lease is in motion. A promotion past its deadline
+///   is failed first, and the word goes.
 ///
 /// One held here at another fence is the device's own to settle: a start at
 /// the newer fence supersedes it there (P2e-1).
@@ -723,8 +831,11 @@ async fn answer_manifest(
             tell_to_stop(state, s, sid, device_id, fence);
             continue;
         }
+        // P2e-3 — none while the device is drained for a move: the lease is
+        // in motion, and the word would lift the drain.
         if u64::try_from(s.fence).ok() == Some(fence)
             && crate::replica::replicated(s)
+            && !crate::promote::withholds_word(state, s).await
             && let Some(conn) = conn.upgrade()
         {
             crate::lease::push_on(state, tenant_id, device_id, &conn, sid, fence);
@@ -904,7 +1015,19 @@ pub(crate) async fn reconcile_on_connect(
                     warn!(session = %sid, "hive: start not re-sent — its owner could not be read");
                     continue;
                 };
-                // P1e — its core memory first, the same frozen snapshot the
+                // P2e-3 — a start past the first fence is a move's, or a move
+                // back's: the device hears its join as the primary and the
+                // record's `rc:hive.move` first, as when it was first sent,
+                // and resumes the conversation.
+                let moved = s.fence > 1;
+                if moved {
+                    let (from, by) = match &s.promotion {
+                        Some(p) if p.to == device_id => (p.from.clone(), p.by),
+                        _ => (s.location.clone(), s.owner_id),
+                    };
+                    crate::promote::before_start(state, &s, &from, by).await;
+                }
+                // P1e — its core memory next, the same frozen snapshot the
                 // first start carried; a device without `hive-memory` gets
                 // none, as it got none then.
                 match state.brain.snapshot_of(sid).await {
@@ -942,7 +1065,7 @@ pub(crate) async fn reconcile_on_connect(
                     user_id: s.owner_id,
                     user_email: owner.email,
                     caller: owner.display_name,
-                    resume: false,
+                    resume: moved,
                     replicated,
                     lease,
                 };

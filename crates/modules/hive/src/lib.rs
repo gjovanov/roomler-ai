@@ -59,6 +59,7 @@ pub mod model;
 pub mod participants;
 pub mod placement;
 pub mod policy;
+pub mod promote;
 pub mod replica;
 pub mod room;
 pub mod routes;
@@ -103,6 +104,11 @@ pub struct HiveState {
     pub stream_limiter: Arc<RateLimiter>,
     /// P2c — the replicaset's server switch (`hive.replicaset`, default off).
     pub replicaset: bool,
+    /// P2e-3 — the promote routes waiting for a member's prepare answer
+    /// (pod-local).
+    pub prepare_acks: Arc<promote::PrepareAcks>,
+    /// P2e-3 — how long each step of a promotion may take.
+    pub promote_bounds: promote::Bounds,
 }
 
 impl std::ops::Deref for HiveState {
@@ -146,6 +152,8 @@ impl Module for HiveState {
             stream_grants: Arc::new(stream::StreamGrants::new()),
             stream_limiter: Arc::new(RateLimiter::new()),
             replicaset: settings.hive.replicaset,
+            prepare_acks: Arc::new(promote::PrepareAcks::new()),
+            promote_bounds: promote::Bounds::of(&settings.hive),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -178,6 +186,8 @@ impl Module for HiveState {
             .route("/", get(routes::list).post(routes::start))
             .route("/{session_id}", get(routes::get_one))
             .route("/{session_id}/stop", post(routes::stop))
+            // P2e-3 — its owner moves it to a member of its replicaset.
+            .route("/{session_id}/promote", post(promote::promote))
             // P1c — who besides the owner takes part, and how.
             .route("/{session_id}/participant", get(participants::list))
             .route(

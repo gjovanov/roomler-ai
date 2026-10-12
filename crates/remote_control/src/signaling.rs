@@ -951,6 +951,73 @@ pub enum ClientMsg {
         reason: String,
     },
 
+    /// FR-90 P2e-3 — the member's answer to [`ServerMsg::HivePrepare`]:
+    /// whether every start gate lets the session run here, as the device is
+    /// configured now. Sent on EVERY outcome, refusals included, in the
+    /// start's words: each names a different gate with a different fix.
+    ///
+    /// ⚠️ The server applies it only to the promotion it is preparing on THIS
+    /// device, at the fence it named; session ids are ObjectIds, structured,
+    /// not secret.
+    #[serde(rename = "rc:hive.prepare_ack")]
+    HivePrepareAck {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Echo of the prepare's `fence`.
+        fence: u64,
+        /// Absent = ready. Present = refused, decoded leniently — see
+        /// [`crate::hive::HiveRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveRefusal>,
+        /// When ready, the local account the device would run the session as.
+        /// A claim by the device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// A few words for the owner. Capped by the device, re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// FR-90 P2e-3 — the primary's answer to [`ServerMsg::HiveDrain`]: it
+    /// takes no new prompt, its turn has ended, its open approvals are
+    /// withdrawn and its last checkpoint taken, and its copy of the session
+    /// ends at `seq`, whose event's hash is `hash`. The lease moves only once
+    /// the member it moves to holds that same tip.
+    ///
+    /// ⚠️ NUMBERS AND HASHES ONLY, and the field set is LOCKED by test. The
+    /// server applies it only to the promotion draining THIS device, at the
+    /// fence it named.
+    #[serde(rename = "rc:hive.drained")]
+    HiveDrained {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Echo of the drain's `fence`.
+        fence: u64,
+        /// The last event the copy holds, when drained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        /// That event's hash, as [`crate::hive::is_hash_hex`] reads it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        /// Absent = drained. Present = not drained, decoded leniently — see
+        /// [`crate::hive::HiveDrainRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::hive::drain_refusal_lenient"
+        )]
+        refused: Option<crate::hive::HiveDrainRefusal>,
+        /// A few words for the owner. Capped by the device, re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// FR-90 P0d-2 — the device's answer to [`ServerMsg::HiveViewGrant`]:
     /// whether it will serve this viewer. The server tells the browser to
     /// dial only after an answer without `refused` (FR-83).
@@ -1736,6 +1803,8 @@ impl ClientMsg {
             ClientMsg::HiveReplicaReady { .. } => "rc:hive.replica.ready",
             ClientMsg::HiveReplicaCandidate { .. } => "rc:hive.replica.candidate",
             ClientMsg::HiveReplicaClose { .. } => "rc:hive.replica.close",
+            ClientMsg::HivePrepareAck { .. } => "rc:hive.prepare_ack",
+            ClientMsg::HiveDrained { .. } => "rc:hive.drained",
             ClientMsg::HiveViewGrantAck { .. } => "rc:hive.view.grant_ack",
             ClientMsg::HiveViewAnswer { .. } => "rc:hive.view.answer",
             ClientMsg::HiveViewIce { .. } => "rc:hive.view.ice",
@@ -1840,6 +1909,8 @@ impl ClientMsg {
             | ClientMsg::HiveReplicaReady { .. }
             | ClientMsg::HiveReplicaCandidate { .. }
             | ClientMsg::HiveReplicaClose { .. }
+            | ClientMsg::HivePrepareAck { .. }
+            | ClientMsg::HiveDrained { .. }
             | ClientMsg::HiveViewGrantAck { .. }
             | ClientMsg::HiveViewAnswer { .. }
             | ClientMsg::HiveViewIce { .. }
@@ -1880,6 +1951,8 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:hive.replica.ready", Owner::Hive),
     ("rc:hive.replica.candidate", Owner::Hive),
     ("rc:hive.replica.close", Owner::Hive),
+    ("rc:hive.prepare_ack", Owner::Hive),
+    ("rc:hive.drained", Owner::Hive),
     ("rc:hive.view.grant_ack", Owner::Hive),
     ("rc:hive.view.answer", Owner::Hive),
     ("rc:hive.view.ice", Owner::Hive),
@@ -3214,9 +3287,87 @@ pub enum ServerMsg {
         /// The fence the session's lease is at now.
         fence: u64,
         /// Why, in a word, for the device's log: `not_location` (it reported
-        /// a session held elsewhere).
+        /// a session held elsewhere), `promoted` (it moved to another device).
         #[serde(default)]
         reason: String,
+    },
+
+    /// FR-90 P2e-3 — a promotion's first step, to the member the session
+    /// moves to: apply every start gate, as the device is configured now, and
+    /// answer [`ClientMsg::HivePrepareAck`]. Nothing launches and nothing
+    /// moves: the lease is still on the primary, and the start comes later,
+    /// at `fence`, once this member's copy holds what the primary drained.
+    /// The prepare holds nothing on the device beyond its answer. Pushed only
+    /// to a connection advertising [`crate::models::RpcCap::HivePromote`].
+    ///
+    /// ⚠️ Metadata only, as [`Self::HiveStart`]: the field set is locked by
+    /// test.
+    #[serde(rename = "rc:hive.prepare")]
+    HivePrepare {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence the start will carry: the session's current one, plus
+        /// one.
+        fence: u64,
+        harness: String,
+        harness_session: String,
+        /// The folder the session will run in, as the owner typed it or as
+        /// the record holds it.
+        folder: String,
+        /// The session's owner, the person it will run for: the key the
+        /// device's `hive_accounts` maps through.
+        #[serde(with = "oid_hex")]
+        user_id: ObjectId,
+        /// The owner's address, only if their account proved it, as
+        /// [`Self::HiveStart`] carries it.
+        user_email: String,
+        /// Display name, for the device's log.
+        caller: String,
+    },
+
+    /// FR-90 P2e-3 — the session's lease is about to leave this device, its
+    /// primary: take no new prompt, let the running turn end (cut it
+    /// [`crate::hive::promote_limits::DRAIN_TURN_CUT_SECS`] after this
+    /// frame), withdraw the open approvals, take a last checkpoint, and answer
+    /// [`ClientMsg::HiveDrained`] with the tip the copy then ends at. A later
+    /// [`Self::HiveLease`] at the same fence lifts the drain: the lease
+    /// stayed. [`Self::HiveDemote`] ends the run: it moved. Pushed only to a
+    /// connection advertising [`crate::models::RpcCap::HivePromote`].
+    #[serde(rename = "rc:hive.drain")]
+    HiveDrain {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence the device runs the session at.
+        fence: u64,
+    },
+
+    /// FR-90 P2e-3 — the record's word for the run that starts at `fence`,
+    /// sent immediately before that run's [`Self::HiveStart`]: how many turns
+    /// the session has had, where it ran before, and who moved it, when. The
+    /// device counts turns on from `turns`, and composes its resume note
+    /// from the rest (P2e-7). Pushed only to a connection advertising
+    /// [`crate::models::RpcCap::HivePromote`].
+    ///
+    /// ⚠️ Metadata the record holds, and the field set is locked by test.
+    #[serde(rename = "rc:hive.move")]
+    HiveMove {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The newest turn the session's room has a stub for.
+        turns: u32,
+        /// Where it ran before this start: the device, its name and the
+        /// folder. On a move back after a refused start, the device itself.
+        #[serde(with = "oid_hex")]
+        from_device_id: ObjectId,
+        from_device_name: String,
+        from_folder: String,
+        /// Who moved it: the session's owner.
+        #[serde(with = "oid_hex")]
+        moved_by: ObjectId,
+        moved_by_name: String,
+        /// When the lease moved, as the server's clock read it (Unix ms).
+        moved_at_ms: u64,
     },
 
     /// FR-90 P1e — a session's core memory, rendered from the org's brain at
@@ -4641,6 +4792,154 @@ mod tests {
             serde_json::from_value::<ServerMsg>(bare).unwrap(),
             ServerMsg::HiveDemote { fence: 4, reason, .. } if reason.is_empty()
         ));
+    }
+
+    /// FR-90 P2e-3 — WIRE LOCK on the promotion's three server frames:
+    /// metadata and numbers only, every field named, nothing a prompt or a
+    /// transcript line could ride in.
+    #[test]
+    fn hive_promotion_frames_wire_shape_is_locked() {
+        let (sid, uid, from) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let prepare = ServerMsg::HivePrepare {
+            session_id: sid,
+            fence: 2,
+            harness: "claude-code".into(),
+            harness_session: "u-1".into(),
+            folder: "/srv/app".into(),
+            user_id: uid,
+            user_email: "a@example.com".into(),
+            caller: "Alice".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&prepare).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.prepare", "session_id": sid.to_hex(), "fence": 2,
+                "harness": "claude-code", "harness_session": "u-1", "folder": "/srv/app",
+                "user_id": uid.to_hex(), "user_email": "a@example.com", "caller": "Alice"
+            })
+        );
+        let drain = ServerMsg::HiveDrain {
+            session_id: sid,
+            fence: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&drain).unwrap(),
+            serde_json::json!({"t": "rc:hive.drain", "session_id": sid.to_hex(), "fence": 1})
+        );
+        let mv = ServerMsg::HiveMove {
+            session_id: sid,
+            fence: 2,
+            turns: 7,
+            from_device_id: from,
+            from_device_name: "mars".into(),
+            from_folder: "/srv/app".into(),
+            moved_by: uid,
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_760_000_000_000,
+        };
+        let v = serde_json::to_value(&mv).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:hive.move", "session_id": sid.to_hex(), "fence": 2, "turns": 7,
+                "from_device_id": from.to_hex(), "from_device_name": "mars",
+                "from_folder": "/srv/app", "moved_by": uid.to_hex(),
+                "moved_by_name": "Alice", "moved_at_ms": 1_760_000_000_000_u64
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::HiveMove {
+                turns: 7,
+                fence: 2,
+                ..
+            }
+        ));
+    }
+
+    /// FR-90 P2e-3 — "ready" and "drained" are the ABSENCE of `refused`, and
+    /// an unknown word is still a refusal: never a member ready to run what it
+    /// said no to, never a primary drained that did not drain.
+    #[test]
+    fn hive_prepare_ack_and_drained_wire_shape_and_lenient_refusal() {
+        use crate::hive::{HiveDrainRefusal, HiveRefusal};
+
+        let sid = ObjectId::new();
+        let ready = ClientMsg::HivePrepareAck {
+            session_id: sid,
+            fence: 2,
+            refused: None,
+            account: Some("dev".into()),
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&ready).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.prepare_ack", "session_id": sid.to_hex(), "fence": 2,
+                "account": "dev"
+            })
+        );
+        let refused: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:hive.prepare_ack", "session_id": sid.to_hex(), "fence": 2,
+            "refused": "some_gate_from_2027"
+        }))
+        .unwrap();
+        assert!(matches!(
+            refused,
+            ClientMsg::HivePrepareAck {
+                refused: Some(HiveRefusal::Other),
+                ..
+            }
+        ));
+
+        let hash = "ab".repeat(32);
+        let drained = ClientMsg::HiveDrained {
+            session_id: sid,
+            fence: 1,
+            seq: Some(41),
+            hash: Some(hash.clone()),
+            refused: None,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&drained).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.drained", "session_id": sid.to_hex(), "fence": 1,
+                "seq": 41, "hash": hash
+            })
+        );
+        let not: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:hive.drained", "session_id": sid.to_hex(), "fence": 1,
+            "refused": "not_running"
+        }))
+        .unwrap();
+        assert!(matches!(
+            not,
+            ClientMsg::HiveDrained {
+                refused: Some(HiveDrainRefusal::NotRunning),
+                seq: None,
+                hash: None,
+                ..
+            }
+        ));
+        let unknown: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:hive.drained", "session_id": sid.to_hex(), "fence": 1,
+            "seq": 41, "hash": "ab".repeat(32), "refused": "busy_later"
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                unknown,
+                ClientMsg::HiveDrained {
+                    refused: Some(HiveDrainRefusal::Other),
+                    ..
+                }
+            ),
+            "an unknown word is a refusal, whatever tip came with it"
+        );
+        for m in [&ready, &drained] {
+            assert_eq!(m.namespace(), Owner::Hive);
+        }
     }
 
     /// FR-90 — "accepted" is the ABSENCE of `refused`, as for FR-83's grant
