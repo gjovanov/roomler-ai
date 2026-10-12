@@ -4332,13 +4332,26 @@ async fn handle_server_msg(
             }
         }
 
-        // FR-90 P2e-3 — a promotion's frames. No build advertises
-        // `hive-promote` yet (the drain is P2e-4, the prepare and the move
-        // P2e-5), so no server sends them; one that did gets no answer, and
-        // its promotion fails at its bound with nothing moved.
-        ServerMsg::HivePrepare { session_id, .. }
-        | ServerMsg::HiveDrain { session_id, .. }
-        | ServerMsg::HiveMove { session_id, .. } => {
+        // FR-90 P2e-4 — the session's lease is about to leave this device: no
+        // new prompt, the running turn ends or is cut, a last checkpoint, and
+        // `rc:hive.drained` back on THIS connection with where the copy ends.
+        // Taken up before the next frame is read, so a lease word right
+        // behind it lifts it.
+        ServerMsg::HiveDrain { session_id, fence } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_drain(session_id, fence, ctx.is_primary, outbound_tx.clone());
+            #[cfg(not(hive_host))]
+            {
+                let _ = fence;
+                debug!(session = %session_id, "rc:hive.drain ignored — this build does not run agent sessions");
+            }
+        }
+
+        // FR-90 P2e-3 — the member's frames of a promotion. No build
+        // advertises `hive-promote` yet (the prepare and the move are P2e-5),
+        // so no server sends them; one that did gets no answer, and its
+        // promotion fails at its bound with nothing moved.
+        ServerMsg::HivePrepare { session_id, .. } | ServerMsg::HiveMove { session_id, .. } => {
             debug!(session = %session_id, "a promotion frame ignored — this build takes no part in moving sessions");
         }
 

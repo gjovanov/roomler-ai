@@ -176,8 +176,15 @@ impl Pending {
         self.lock().remove(id);
     }
 
+    /// FR-90 P2e-4 — withdraw `id`: its call sees the answer channel close,
+    /// tells the harness so, and the session hears it ended `withdrawn`. An
+    /// approval that opens while the session drains for a move.
+    pub(crate) fn withdraw(&self, id: &str) {
+        self.forget(id);
+    }
+
     /// Withdraw every open approval: their calls see the answer channel close.
-    fn withdraw_all(&self) {
+    pub(crate) fn withdraw_all(&self) {
         self.lock().clear();
     }
 }
