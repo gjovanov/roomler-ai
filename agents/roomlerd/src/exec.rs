@@ -36,10 +36,14 @@
 //!
 //! ## Privilege
 //!
-//! On a perMachine Windows install the daemon runs as SYSTEM; under systemd,
-//! as root. Commands inherit that. This is deliberate — `Get-NetFirewallRule`,
-//! `netsh`, route tables and service state are exactly what remote diagnosis
-//! needs — and is surfaced in the admin UI's opt-in copy rather than hidden.
+//! Under systemd the daemon runs as root, and commands inherit that. On
+//! Windows they inherit the console-session WORKER's identity, because the
+//! worker holds the agent socket: the signed-in user on an attended install
+//! (their elevated token if they are an admin), SYSTEM in SystemContext mode.
+//! FR-94 (#2035) makes SYSTEM the default. Root/SYSTEM is the intent and it is
+//! deliberate — `Get-NetFirewallRule`, `netsh`, route tables and service state
+//! are exactly what remote diagnosis needs — and is surfaced in the admin UI's
+//! opt-in copy rather than hidden.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -733,7 +737,9 @@ pub fn deliver_response(request_id: &str, outcome: ExecOutcome) -> bool {
 /// asked for and why it could not be done.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RunAs {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's own identity — root under systemd; on Windows the
+    /// console-session worker's (the signed-in user on an attended install,
+    /// SYSTEM in SystemContext mode; FR-94).
     #[default]
     Daemon,
     /// A named local account. Unix only: Windows has no way to become an
