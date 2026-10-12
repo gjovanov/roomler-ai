@@ -105,7 +105,7 @@ impl Git {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
     pub(crate) fn under(ceiling: &Path) -> Self {
         Self {
             ceiling: Some(ceiling.to_path_buf()),
