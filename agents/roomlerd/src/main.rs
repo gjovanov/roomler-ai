@@ -1111,6 +1111,15 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // FR-90 P2e-7 — `roomlerd hive-resume-note <file>`: a Hive session's
+    // `SessionStart` hook, run by Claude Code as the session's account. It
+    // prints the resume note the daemon left for a session moved here, if
+    // there is one. None of the setup below is its.
+    #[cfg(hive_host)]
+    if let Some(file) = roomlerd::hive::note_args() {
+        std::process::exit(roomlerd::hive::note_main(&file));
+    }
+
     // FR-90 P2b-3a — `roomlerd hive-checkpoint <request>`: a session's
     // checkpoint, which the daemon runs AS THE SESSION'S ACCOUNT at a turn's
     // end; it writes the checkpoint to stdout. None of the setup below is its.

@@ -328,6 +328,20 @@ async fn heard_last(app: &TestApp, agent_id: &str, secs: u64) {
         .unwrap();
 }
 
+/// FR-90 P2e-7 — the resume note `dir`'s device left for `sid`, and the
+/// `SessionStart` hook its settings carry: what Claude Code would be told as
+/// it resumes there. Empty: none left.
+fn resume_note_of(dir: &Path, sid: &str) -> (String, Value) {
+    let run = dir.join("run").join(sid);
+    let note =
+        std::fs::read_to_string(run.join(roomlerd::hive::RESUME_NOTE_FILE)).unwrap_or_default();
+    let settings: Value = std::fs::read_to_string(run.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    (note, settings["hooks"]["SessionStart"][0].clone())
+}
+
 /// Whether the process `pid` names is still there.
 fn alive(pid: &str) -> bool {
     Path::new("/proc").join(pid.trim()).exists()
@@ -449,6 +463,16 @@ async fn scenario() {
         Some(WORK),
         "the folder came with the session"
     );
+    // P2e-7 — and told it moved: the note left for its `SessionStart` hook,
+    // which its settings carry.
+    let (note, hook) = resume_note_of(&b_dir, &sid);
+    assert!(
+        note.contains("moved to this device by")
+            && note.contains("It ran on hive-promote-a, in ")
+            && note.contains("Paths in earlier turns under "),
+        "B's resume note: {note:?}"
+    );
+    assert_eq!(hook["matcher"], "resume", "{hook}");
     let mut on_b = view(&mut ws, &sid).await;
     on_b.send(json!({"op": "hello"})).await;
     let hello = on_b.recv_op("hello").await;
@@ -593,6 +617,13 @@ async fn scenario() {
         !other.join("notes.md").exists(),
         "nor put the session there"
     );
+    // P2e-7 — the lease back is no move from elsewhere: B is told nothing,
+    // and the note its own move left is gone.
+    assert_eq!(
+        resume_note_of(&b_dir, &sid).0,
+        "",
+        "no resume note on a move back"
+    );
     let mut on_b = view(&mut ws, &sid).await;
     on_b.send(json!({"op": "hello"})).await;
     let hello = on_b.recv_op("hello").await;
@@ -704,6 +735,12 @@ async fn scenario() {
             .as_deref(),
         Some(WORK),
         "the folder came with the session, from A's copy"
+    );
+    // P2e-7 — A was told it moved, from B.
+    let (note, _) = resume_note_of(&a_dir, &sid);
+    assert!(
+        note.contains("It ran on hive-promote-b, in "),
+        "A's resume note: {note:?}"
     );
     let mut on_a = view(&mut ws, &sid).await;
     on_a.send(json!({"op": "hello"})).await;
