@@ -4363,6 +4363,7 @@ async fn handle_server_msg(
                     may_prompt,
                     user_email,
                     driving_refused: None,
+                    copy: false,
                     ttl_secs,
                 },
                 ctx.is_primary,

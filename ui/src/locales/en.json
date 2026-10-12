@@ -268,6 +268,7 @@
       "askFailed": "The prompt did not reach the agent.",
       "readOnly": "You can read this session and talk in its room. Only its drivers can prompt the agent.",
       "adoptedReadOnly": "This session runs in a terminal on its device, so it is read-only here: nobody prompts it from Roomler.",
+      "copyReadOnly": "You are reading a copy another device holds, because the device that runs this session cannot serve it now. It is read-only: only that device takes prompts.",
       "drivingRefused": "You drive this session, but its device does not let you act there: {why}",
       "approval": {
         "asks": "{tool} needs approval to run",

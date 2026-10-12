@@ -1814,6 +1814,16 @@ impl Hub {
         self.send_to_agent(agent_id, msg)
     }
 
+    /// FR-90 P2d-5 — whether the device's CURRENT connection on this pod may
+    /// serve a viewer from a copy it holds: it advertises `hive-view` and
+    /// `hive-replica` both, in `tenant_id`. Not online here, or another
+    /// tenant's, is `false`, as [`Self::push_hive_view`] would answer it.
+    pub fn agent_serves_copies(&self, agent_id: ObjectId, tenant_id: ObjectId) -> bool {
+        self.inner.agents.get(&agent_id).is_some_and(|a| {
+            a.tenant_id == tenant_id && a.supports_hive_view && a.supports_hive_replica
+        })
+    }
+
     /// FR-90 P2c-3 — record whether this connection holds copies
     /// (`hive-replica`), right after registration.
     pub fn set_agent_hive_replica_support(&self, agent_id: ObjectId, supports: bool) {
