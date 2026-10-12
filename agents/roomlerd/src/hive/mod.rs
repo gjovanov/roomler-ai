@@ -86,6 +86,7 @@ pub mod gates;
 mod hosted;
 mod lines;
 mod materializer;
+mod packer;
 mod procs;
 mod resume_note;
 mod sidecar;
@@ -98,6 +99,7 @@ mod workspace;
 
 pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
 pub use materializer::{MATERIALIZE_SUBCOMMAND, materialize_args, materialize_main};
+pub use packer::{PACK_SUBCOMMAND, pack_args, pack_main};
 pub use resume_note::{
     NOTE_FILE as RESUME_NOTE_FILE, RESUME_NOTE_SUBCOMMAND, note_args, note_main,
 };

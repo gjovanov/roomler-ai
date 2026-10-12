@@ -1137,6 +1137,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(roomlerd::hive::materialize_main());
     }
 
+    // FR-90 P2f-2a — `roomlerd hive-pack <request>`: git's have and want for
+    // a session's workspace AS THE ACCOUNT — which commits its folder's
+    // repository holds, or a pack thin against them. Written to stdout.
+    #[cfg(hive_host)]
+    if let Some(request) = roomlerd::hive::pack_args() {
+        std::process::exit(roomlerd::hive::pack_main(&request));
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.

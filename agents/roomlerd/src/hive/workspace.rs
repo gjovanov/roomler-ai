@@ -254,7 +254,7 @@ fn take(
         cmd(git, folder, Some(&repo), None).args(["update-ref", &reference, &commit]),
         "update-ref",
     )?;
-    let pack = pack_objects(git, folder, &repo, &commit, parent.as_deref())?;
+    let pack = pack_objects(git, folder, &repo, &commit, parent.as_slice())?;
     let (chunks, blobs) = chunk_bytes(&pack);
     Ok(Outcome::Taken {
         snap: WorkspaceSnap {
@@ -386,6 +386,14 @@ fn within_new_limits(git: &Git, folder: &Path, repo: &Repo, index: &Path) -> Res
 
 /// The repository `folder` is in, or its shadow in `state_dir`.
 fn find_repo(git: &Git, folder: &Path, state_dir: &Path) -> Result<Repo, String> {
+    match own_repo(git, folder)? {
+        Some(repo) => Ok(repo),
+        None => shadow(git, folder, state_dir),
+    }
+}
+
+/// The repository `folder` is in, if it is in one's work tree.
+fn own_repo(git: &Git, folder: &Path) -> Result<Option<Repo>, String> {
     let inside = cmd(git, folder, None, None)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
@@ -400,18 +408,18 @@ fn find_repo(git: &Git, folder: &Path, state_dir: &Path) -> Result<Repo, String>
             cmd(git, folder, None, None).args(["rev-parse", "--show-prefix"]),
             "rev-parse --show-prefix",
         )?;
-        return Ok(Repo {
+        return Ok(Some(Repo {
             kind: RepoKind::Own,
             git_dir: PathBuf::from(git_dir),
             work_tree: None,
             prefix,
-        });
+        }));
     }
     if inside.status.success() {
         // `false`: inside a repository's git directory, not its work tree.
         return Err("the folder is inside a repository's git directory".into());
     }
-    shadow(git, folder, state_dir)
+    Ok(None)
 }
 
 /// The shadow repository of a folder in no repository: `<state_dir>/shadow.git`,
@@ -462,12 +470,14 @@ fn write_tree(git: &Git, folder: &Path, repo: &Repo, index: &Path) -> Result<Str
 
 /// The pack that carries `commit`: thin against `base` when there is one,
 /// whole otherwise. Refused when it grows past [`MAX_PACK`].
+/// `commit`'s objects but those `not` reaches: the last checkpoint's commit,
+/// or (P2f-2a) the haves and their trees.
 fn pack_objects(
     git: &Git,
     folder: &Path,
     repo: &Repo,
     commit: &str,
-    base: Option<&str>,
+    not: &[String],
 ) -> Result<Vec<u8>, String> {
     let mut c = cmd(git, folder, Some(repo), None);
     c.args(["pack-objects", "--revs", "--thin", "--stdout", "-q"])
@@ -476,8 +486,8 @@ fn pack_objects(
         .stderr(Stdio::piped());
     let mut child = c.spawn().map_err(spawn_err)?;
     let mut revs = format!("{commit}\n");
-    if let Some(base) = base {
-        revs.push_str(&format!("^{base}\n"));
+    for rev in not {
+        revs.push_str(&format!("^{rev}\n"));
     }
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -523,6 +533,158 @@ fn pack_objects(
         return Err(format!("git pack-objects failed: {}", tail(&said)));
     }
     Ok(pack)
+}
+
+// ─── P2f-2a: a pack against what a repository already holds ────────────────
+
+/// FR-90 P2f-2a — the most commits a pack is asked to be thin against (git's
+/// haves): the person's `HEAD` where the checkpoint was taken, the target's
+/// own, a few of its branches. A request naming more is refused whole.
+pub(crate) const MAX_HAVES: usize = 16;
+
+/// FR-90 P2f-2a — an object id as git prints one: 40 lowercase hex digits
+/// (SHA-1) or 64 (SHA-256). A commit another device names is held to it
+/// before any git sees it, so no revision syntax (`HEAD~1`, `--all`, `^x`)
+/// ever reaches one.
+pub(crate) fn is_object_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `ids`, held to [`is_object_id`] and [`MAX_HAVES`].
+fn object_ids(ids: &[String]) -> Result<(), String> {
+    if ids.len() > MAX_HAVES {
+        return Err(format!(
+            "{} commits named, more than {MAX_HAVES}",
+            ids.len()
+        ));
+    }
+    match ids.iter().find(|id| !is_object_id(id)) {
+        Some(bad) => Err(format!("{bad:?} is not a commit id")),
+        None => Ok(()),
+    }
+}
+
+/// Which of `candidates` `repo` holds as commits, in their order and each
+/// once: one `git cat-file --batch-check` for all of them.
+fn held_commits(
+    git: &Git,
+    cwd: &Path,
+    repo: &Repo,
+    candidates: &[String],
+) -> Result<Vec<String>, String> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut c = cmd(git, cwd, Some(repo), None);
+    c.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(spawn_err)?;
+    let input: String = candidates.iter().map(|id| format!("{id}\n")).collect();
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|e| format!("writing to git cat-file: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for git cat-file: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git cat-file failed: {}", tail(&out.stderr)));
+    }
+    let answers = String::from_utf8_lossy(&out.stdout);
+    let mut held: Vec<String> = Vec::new();
+    for (id, line) in candidates.iter().zip(answers.lines()) {
+        let mut words = line.split_whitespace();
+        let named = words.next() == Some(id.as_str());
+        if named && words.next() == Some("commit") && !held.contains(id) {
+            held.push(id.clone());
+        }
+    }
+    Ok(held)
+}
+
+/// The repository a folder's checkpoints go to ([`find_repo`]), and where its
+/// git runs, or `None` where `find_repo` would make a shadow: a folder that is
+/// missing, or in no repository and with no shadow yet. Makes nothing.
+fn existing_repo(git: &Git, folder: &Path, state_dir: &Path) -> Result<Option<Repo>, String> {
+    match std::fs::symlink_metadata(folder) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory of its own",
+                folder.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", folder.display())),
+    }
+    if let Some(repo) = own_repo(git, folder)? {
+        return Ok(Some(repo));
+    }
+    let git_dir = state_dir.join("shadow.git");
+    if !git_dir.join("HEAD").is_file() {
+        return Ok(None);
+    }
+    Ok(Some(Repo {
+        kind: RepoKind::Shadow,
+        git_dir,
+        work_tree: Some(folder.to_path_buf()),
+        prefix: String::new(),
+    }))
+}
+
+/// FR-90 P2f-2a — the pack that brings `commit` into a repository holding
+/// `haves`, made from the session's own repository (the folder's, or its
+/// shadow): thin against the ones of `haves` this repository holds itself,
+/// and whole when it holds none. Those come back with it: the pack is of use
+/// only where every one of them is held.
+pub(crate) fn pack_against(
+    git: &Git,
+    folder: &Path,
+    state_dir: &Path,
+    commit: &str,
+    haves: &[String],
+) -> Result<(Vec<u8>, Vec<String>), String> {
+    if !is_object_id(commit) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    object_ids(haves)?;
+    let repo = existing_repo(git, folder, state_dir)?
+        .ok_or("the session's repository is not on this device")?;
+    if held_commits(git, folder, &repo, &[commit.to_string()])?.is_empty() {
+        return Err(format!("the session's repository holds no commit {commit}"));
+    }
+    let against = held_commits(git, folder, &repo, haves)?;
+    // ⚠️ Each have's tree as well as the commit. `--revs` leaves out what a
+    // negative commit reaches only on the edge, a parent of what is packed;
+    // a session's first checkpoint has no parent, so its pack against the
+    // person's `HEAD` alone would still hold the whole tree.
+    let not: Vec<String> = against
+        .iter()
+        .flat_map(|h| [h.clone(), format!("{h}^{{tree}}")])
+        .collect();
+    let pack = pack_objects(git, folder, &repo, commit, &not)?;
+    Ok((pack, against))
+}
+
+/// FR-90 P2f-2a — which of `candidates` a materialize into `folder` would
+/// find held already: by the folder's own repository, or by the session's
+/// shadow in `state_dir` when one is there. A folder that is missing, or in
+/// no repository and with no shadow yet, holds none. Unlike [`place_for`] it
+/// makes nothing: it is asked before the copy is taken.
+pub(crate) fn holds(
+    git: &Git,
+    folder: &Path,
+    state_dir: &Path,
+    candidates: &[String],
+) -> Result<Vec<String>, String> {
+    object_ids(candidates)?;
+    match existing_repo(git, folder, state_dir)? {
+        Some(repo) => held_commits(git, folder, &repo, candidates),
+        None => Ok(Vec::new()),
+    }
 }
 
 // ─── P2b-4b: the reverse — a checkpoint's workspace put into a folder ───────
@@ -643,6 +805,13 @@ pub(crate) fn index_pack(
         return Err("git index-pack stopped reading the pack".into());
     }
     Ok(())
+}
+
+/// FR-90 P2f-2a — which of `ids` the place's repository holds already: a
+/// substitute's pack is of use only where every commit it is thin against is.
+pub(crate) fn place_holds(git: &Git, place: &Place, ids: &[String]) -> Result<Vec<String>, String> {
+    object_ids(ids)?;
+    held_commits(git, place.cwd(), &place.repo, ids)
 }
 
 /// The tree `commit` holds, as git hashed it from what the packs brought:
@@ -1410,6 +1579,190 @@ mod tests {
             person(&dst, &["rev-parse", &format!("refs/hive/{SID}/head")]),
             snap.commit
         );
+    }
+
+    /// Text that compresses poorly: a pack holding it is not mistaken for one
+    /// that does not.
+    fn noise(seed: u64, lines: usize) -> String {
+        let mut x = seed;
+        (0..lines)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                format!("{x:016x}\n")
+            })
+            .collect()
+    }
+
+    /// How many objects a pack says it holds: its header's third word.
+    fn objects_in(pack: &[u8]) -> u32 {
+        assert_eq!(&pack[..4], b"PACK", "a pack");
+        u32::from_be_bytes(pack[8..12].try_into().unwrap())
+    }
+
+    /// P2f-2a — a pack against the clone's `HEAD` holds only what the session
+    /// changed: a large file it never touched stays out, the pack is a
+    /// fraction of the whole one, and put into the clone it still gives the
+    /// checkpoint's tree back.
+    #[test]
+    fn a_pack_against_a_clones_head_holds_only_the_sessions_changes() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let src = tmp.path();
+        write(src, "big.txt", &noise(7, 20_000));
+        person(src, &["add", "-A"]);
+        person(src, &["commit", "-q", "-m", "big"]);
+        let head = person(src, &["rev-parse", "HEAD"]);
+        write(src, "a.txt", "one, changed\n");
+        write(src, "b.txt", "new\n");
+        let src_state = tempfile::tempdir().unwrap();
+        let git = Git::on_path();
+        let (snap, whole) = taken(checkpoint(&git, src, src_state.path(), SID, 1, 1, None));
+        assert_eq!(snap.head.as_deref(), Some(head.as_str()));
+        assert!(snap.base.is_none(), "the first checkpoint's pack is whole");
+        let whole = whole.concat();
+
+        let unknown = "0".repeat(40);
+        let (thin, against) = pack_against(
+            &git,
+            src,
+            src_state.path(),
+            &snap.commit,
+            &[unknown, head.clone()],
+        )
+        .unwrap();
+        assert_eq!(against, vec![head.clone()], "against what it holds, only");
+        // The commit, its tree and the two files the session wrote; the whole
+        // pack has `.gitignore` and `big.txt` too.
+        assert_eq!((objects_in(&thin), objects_in(&whole)), (4, 6));
+        assert!(
+            thin.len() * 50 < whole.len(),
+            "thin {} bytes, whole {}",
+            thin.len(),
+            whole.len()
+        );
+
+        // `--no-local`: a clone from a path otherwise takes the whole object
+        // store, the checkpoint's commit with it, which no clone from a
+        // remote does.
+        let parent = tempfile::tempdir().unwrap();
+        person(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                &src.display().to_string(),
+                "clone",
+            ],
+        );
+        let dst = parent.path().join("clone");
+        let dst_state = tempfile::tempdir().unwrap();
+        assert_eq!(
+            holds(
+                &git,
+                &dst,
+                dst_state.path(),
+                &[snap.commit.clone(), head.clone()]
+            )
+            .unwrap(),
+            vec![head],
+            "the clone holds the person's HEAD, not the checkpoint"
+        );
+        let kind = materialize_into(&git, &dst, dst_state.path(), &[&thin], &snap).unwrap();
+        assert_eq!(kind, RepoKind::Own);
+        assert_eq!(work_files(&dst), work_files(src));
+    }
+
+    /// P2f-2a — against nothing the session's repository holds, the pack is
+    /// whole: it brings the checkpoint into a folder that holds nothing.
+    #[test]
+    fn a_pack_against_nothing_held_is_whole() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let src = tmp.path();
+        write(src, "a.txt", "one, changed\n");
+        let src_state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let git = Git::under(root.path());
+        let (snap, _) = taken(checkpoint(&git, src, src_state.path(), SID, 1, 1, None));
+        let (pack, against) =
+            pack_against(&git, src, src_state.path(), &snap.commit, &["f".repeat(40)]).unwrap();
+        assert!(against.is_empty(), "{against:?}");
+        let dst = root.path().join("dst");
+        let kind =
+            materialize_into(&git, &dst, &root.path().join("dst-state"), &[&pack], &snap).unwrap();
+        assert_eq!(kind, RepoKind::Shadow);
+        assert_eq!(work_files(&dst), work_files(src));
+    }
+
+    /// P2f-2a — `holds` names only the commits the folder's repository holds,
+    /// in the order asked and each once; a missing folder, or one in no
+    /// repository with no shadow yet, holds none and gets none made; and a
+    /// name that is not a commit id is refused before any git sees it.
+    #[test]
+    fn holds_names_only_held_commits_makes_nothing_and_refuses_what_is_no_id() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let tmp = repo_with_a_commit();
+        let dir = tmp.path();
+        let head = person(dir, &["rev-parse", "HEAD"]);
+        let tree = person(dir, &["rev-parse", "HEAD^{tree}"]);
+        let state = tempfile::tempdir().unwrap();
+        let git = Git::on_path();
+        let asked = ["1".repeat(40), head.clone(), head.clone(), tree];
+        assert_eq!(
+            holds(&git, dir, state.path(), &asked).unwrap(),
+            vec![head.clone()],
+            "a tree is no commit, and each is named once"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let under = Git::under(root.path());
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_state = root.path().join("plain-state");
+        assert!(
+            holds(&under, &plain, &plain_state, std::slice::from_ref(&head))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!plain_state.exists(), "no shadow made");
+        let missing = root.path().join("missing");
+        assert!(
+            holds(&under, &missing, &plain_state, std::slice::from_ref(&head))
+                .unwrap()
+                .is_empty()
+        );
+
+        for bad in [
+            "HEAD".to_string(),
+            "--all".to_string(),
+            "A".repeat(40),
+            format!("^{}", &head[..39]),
+            head[..39].to_string(),
+        ] {
+            match holds(&git, dir, state.path(), std::slice::from_ref(&bad)) {
+                Err(e) => assert!(e.contains("is not a commit id"), "{bad}: {e}"),
+                Ok(held) => panic!("{bad:?} was taken as a commit id: {held:?}"),
+            }
+        }
+        let many = vec![head.clone(); MAX_HAVES + 1];
+        assert!(
+            holds(&git, dir, state.path(), &many)
+                .unwrap_err()
+                .contains("more than")
+        );
+        let err = pack_against(&git, dir, state.path(), "HEAD", &[]).unwrap_err();
+        assert!(err.contains("is not a commit id"), "{err}");
+        let err = pack_against(&git, dir, state.path(), &"2".repeat(40), &[]).unwrap_err();
+        assert!(err.contains("holds no commit"), "{err}");
     }
 
     /// P2b-4b — a folder inside a repository takes back only its own subtree;
