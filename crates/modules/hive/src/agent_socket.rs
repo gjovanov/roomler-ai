@@ -48,7 +48,7 @@
 //! none either, and runs none of them: reconcile ends them as an empty
 //! manifest would ([`reconcile_on_connect`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use bson::{DateTime, doc, oid::ObjectId};
@@ -337,8 +337,13 @@ impl AgentSocketLifecycle for HiveAgentSocket {
             } else {
                 end_unserved(&state, tenant_id, device_id).await;
             }
+            // P2e-2 — the reports are read with the connection held WEAKLY: a
+            // manifest is answered on the connection that sent it, and a held
+            // sender would keep a closed or displaced connection's channel
+            // open as long as its reports are read.
+            let weak = conn.downgrade();
             drop(conn);
-            apply_reports(&state, tenant_id, device_id, rx).await;
+            apply_reports(&state, tenant_id, device_id, rx, weak).await;
         });
     }
 
@@ -348,12 +353,14 @@ impl AgentSocketLifecycle for HiveAgentSocket {
     }
 }
 
-/// Apply one connection's reports, in order, until it closes.
+/// Apply one connection's reports, in order, until it closes. `conn` is that
+/// connection's sender in the hub, held weakly.
 async fn apply_reports(
     state: &HiveState,
     tenant_id: ObjectId,
     device_id: ObjectId,
     mut rx: mpsc::Receiver<Report>,
+    conn: mpsc::WeakSender<ServerMsg>,
 ) {
     while let Some(report) = rx.recv().await {
         match report {
@@ -542,6 +549,7 @@ async fn apply_reports(
             }
             Report::Manifest(sessions) => {
                 end_what_the_device_does_not_run(state, tenant_id, device_id, &sessions).await;
+                answer_manifest(state, tenant_id, device_id, &sessions, &conn).await;
             }
             Report::JoinAck {
                 session_id,
@@ -571,10 +579,8 @@ async fn apply_reports(
 /// replay — and nothing else would ever say so (finding 7). Ended here, with
 /// its room told and its open approvals withdrawn. An oversized list is not
 /// a device's, and changes nothing: the safe direction. A connection without
-/// `hive` gets the empty list from [`reconcile_on_connect`].
-///
-/// P2e-1 — and a session the list names that the record holds on ANOTHER
-/// device is answered with `rc:hive.demote` ([`demote_if_elsewhere`]).
+/// `hive` gets the empty list from [`reconcile_on_connect`]. What the list
+/// names is answered by [`answer_manifest`].
 async fn end_what_the_device_does_not_run(
     state: &HiveState,
     tenant_id: ObjectId,
@@ -593,27 +599,6 @@ async fn end_what_the_device_does_not_run(
             return;
         }
     };
-    // P2e-1 — a session the list names that is held elsewhere: an old
-    // primary that came back still running it is told it no longer holds it.
-    // One read for all of them, of this organization's sessions only.
-    let ours: HashSet<ObjectId> = held.iter().filter_map(|s| s.id).collect();
-    let others: Vec<ObjectId> = runs
-        .iter()
-        .map(|(sid, _)| *sid)
-        .filter(|sid| !ours.contains(sid))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    match state.sessions.find_many_in_tenant(tenant_id, &others).await {
-        Ok(named) => {
-            for s in &named {
-                demote_if_elsewhere(state, tenant_id, device_id, s);
-            }
-        }
-        Err(e) => {
-            warn!(device = %device_id, %e, "hive: the sessions a manifest names were not read")
-        }
-    }
     for s in held {
         let Some(sid) = s.id else { continue };
         if runs.contains(&(sid, u64::try_from(s.fence).unwrap_or_default())) {
@@ -667,10 +652,22 @@ async fn stop_if_over(
     if !s.status.is_terminal() {
         return;
     }
+    tell_to_stop(state, &s, session_id, device_id, fence);
+}
+
+/// Tell `device_id` to stop `s`, which is over, at `fence`: the fence it
+/// says it holds the session at.
+fn tell_to_stop(
+    state: &HiveState,
+    s: &crate::model::AgentSession,
+    session_id: ObjectId,
+    device_id: ObjectId,
+    fence: u64,
+) {
     let msg = ServerMsg::HiveStop {
         session_id,
         fence,
-        reason: s.end_reason.unwrap_or_else(|| "ended".to_string()),
+        reason: s.end_reason.clone().unwrap_or_else(|| "ended".to_string()),
     };
     match state.fleet.rc_hub.push_hive(device_id, s.tenant_id, msg) {
         Ok(()) => info!(
@@ -679,6 +676,58 @@ async fn stop_if_over(
         ),
         Err(e) => {
             debug!(session = %session_id, %e, "hive: a stop for a session that is over was not sent")
+        }
+    }
+}
+
+/// FR-90 P2e — every session the device's manifest names is answered from
+/// its record, in one read of this organization's sessions:
+/// - held on ANOTHER device: `rc:hive.demote`, at the record's fence (P2e-1,
+///   [`demote_if_elsewhere`]);
+/// - over: `rc:hive.stop`, as for any report of a session that is over. A
+///   leased session the device holds back for the word (P2e-2) would
+///   otherwise wait for one that never comes;
+/// - held here at the fence the list names, and leased: `rc:hive.lease`, on
+///   the connection that sent the list and no other (P2e-2, [`crate::lease`]).
+///
+/// One held here at another fence is the device's own to settle: a start at
+/// the newer fence supersedes it there (P2e-1).
+async fn answer_manifest(
+    state: &HiveState,
+    tenant_id: ObjectId,
+    device_id: ObjectId,
+    manifest: &[HiveManifestEntry],
+    conn: &mpsc::WeakSender<ServerMsg>,
+) {
+    if manifest.is_empty() || manifest.len() > hive_limits::MAX_MANIFEST {
+        return;
+    }
+    let named: HashMap<ObjectId, u64> = manifest.iter().map(|e| (e.session_id, e.fence)).collect();
+    let ids: Vec<ObjectId> = named.keys().copied().collect();
+    let sessions = match state.sessions.find_many_in_tenant(tenant_id, &ids).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(device = %device_id, %e, "hive: the sessions a manifest names were not read");
+            return;
+        }
+    };
+    for s in &sessions {
+        let Some(sid) = s.id else { continue };
+        let Some(&fence) = named.get(&sid) else {
+            continue;
+        };
+        if demote_if_elsewhere(state, tenant_id, device_id, s) {
+            continue;
+        }
+        if s.status.is_terminal() {
+            tell_to_stop(state, s, sid, device_id, fence);
+            continue;
+        }
+        if u64::try_from(s.fence).ok() == Some(fence)
+            && crate::replica::replicated(s)
+            && let Some(conn) = conn.upgrade()
+        {
+            crate::lease::push_on(state, tenant_id, device_id, &conn, sid, fence);
         }
     }
 }
@@ -873,6 +922,17 @@ pub(crate) async fn reconcile_on_connect(
                 }
                 // Idempotent on the device by session id + fence: one that
                 // launched it and lost only the answer says `accepted` again.
+                // P2c-4 — and replicated only while the switch is on: a
+                // session placed while it was on runs alone once it is off,
+                // as every session did in P1. P2e-2 — leased with it, on a
+                // connection that holds a lease to the server's word.
+                let replicated = state.replicaset && crate::replica::replicated(&s);
+                let lease = replicated
+                    && state
+                        .fleet
+                        .rc_hub
+                        .agent_supports_hive_lease_on(device_id, conn)
+                        == Some(true);
                 let msg = ServerMsg::HiveStart {
                     session_id: sid,
                     harness: s.harness.id.clone(),
@@ -883,10 +943,8 @@ pub(crate) async fn reconcile_on_connect(
                     user_email: owner.email,
                     caller: owner.display_name,
                     resume: false,
-                    // P2c-4 — and replicated only while the switch is on: a
-                    // session placed while it was on runs alone once it is
-                    // off, as every session did in P1.
-                    replicated: state.replicaset && crate::replica::replicated(&s),
+                    replicated,
+                    lease,
                 };
                 match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
                     Ok(()) => {
