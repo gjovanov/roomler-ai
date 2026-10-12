@@ -224,6 +224,17 @@ pub fn current() -> InputReach {
     decide(&gather())
 }
 
+/// FR-93 P2b — the verdict a session opened now would get, for the desktop
+/// brief. The portal's input route registers only as a portal capture opens,
+/// so outside a session it is predicted: `portal_input` says the planned arm
+/// would open one (a portal or mutter arm with `portal_input` on).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn predicted(portal_input: bool) -> InputReach {
+    let mut facts = gather();
+    facts.portal_route |= portal_input;
+    decide(&facts)
+}
+
 fn gather() -> Facts {
     #[cfg(target_os = "windows")]
     let platform = Platform::Windows;

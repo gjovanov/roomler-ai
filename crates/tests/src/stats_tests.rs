@@ -661,6 +661,128 @@ async fn tenant_calls_series_reads_rollups() {
     assert!(body["totals"]["calls"].is_number());
 }
 
+// ── FR-93 P2b — Linux desktops and the arm serving each (AC13) ──────────
+
+#[tokio::test]
+async fn desktops_are_counted_by_type_and_arm_per_org_and_fleet_wide() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let seeded = app.seed_tenant("statsdesk").await;
+    let other = app.seed_tenant("statsdesk2").await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let other_tid = ObjectId::parse_str(&other.tenant_id).unwrap();
+    let brief = |kind: &str, arm: &str| {
+        doc! {
+            "session": "user", "type": kind, "capture_arm": arm, "input_reach": "none",
+        }
+    };
+    let agents = app.state.db.collection::<Document>("agents");
+    let rows = [
+        // (tenant, name, presence, desktop brief, deleted)
+        (
+            tid,
+            "gnome-user",
+            "online",
+            Some(brief("wayland", "mutter")),
+            false,
+        ),
+        (
+            tid,
+            "kde-user",
+            "offline",
+            Some(brief("wayland", "none")),
+            false,
+        ),
+        (tid, "xorg", "online", Some(brief("x11", "x11")), false),
+        // Never sent a brief (Windows, an older agent): not counted.
+        (tid, "windows", "online", None, false),
+        // Removed: not counted.
+        (
+            tid,
+            "gone",
+            "online",
+            Some(brief("wayland", "mutter")),
+            true,
+        ),
+        // Another org: in the fleet-wide count only.
+        (
+            other_tid,
+            "elsewhere",
+            "online",
+            Some(brief("wayland", "mutter")),
+            false,
+        ),
+    ];
+    for (tenant, name, presence, desktop, deleted) in rows {
+        let mut caps = doc! { "codecs": ["h264"] };
+        if let Some(d) = desktop {
+            caps.insert("desktop", d);
+        }
+        let deleted_at = if deleted {
+            bson::Bson::DateTime(bson::DateTime::now())
+        } else {
+            bson::Bson::Null
+        };
+        agents
+            .insert_one(doc! {
+                "_id": ObjectId::new(), "tenant_id": tenant, "name": name,
+                // The plain unique {tenant_id, machine_id} index (see the
+                // uptime test below): every row needs its own.
+                "machine_id": format!("machine-{name}"),
+                "last_presence": presence,
+                "capabilities": caps,
+                "deleted_at": deleted_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{}/stats/overview", seeded.tenant_id),
+            &seeded.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["desktops"],
+        serde_json::json!([
+            { "type": "wayland", "capture_arm": "mutter", "total": 1, "online": 1 },
+            { "type": "wayland", "capture_arm": "none", "total": 1, "online": 0 },
+            { "type": "x11", "capture_arm": "x11", "total": 1, "online": 1 },
+        ]),
+        "{body}"
+    );
+
+    let tokens = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+    let r = app
+        .auth_get("/api/admin/stats/orgs", &tokens.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let mutter = body["desktops"]
+        .as_array()
+        .expect("desktops array")
+        .iter()
+        .find(|d| d["type"] == "wayland" && d["capture_arm"] == "mutter")
+        .cloned()
+        .expect("a wayland/mutter row");
+    // Both orgs' GNOME devices, never the removed one.
+    assert_eq!(mutter["total"], serde_json::json!(2), "{body}");
+}
+
 // ── Stats follow-up — uptime strips from the presence ledger ────────────
 
 #[tokio::test]

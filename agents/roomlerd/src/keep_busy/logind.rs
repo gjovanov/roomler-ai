@@ -20,7 +20,7 @@ use std::process::Command;
 
 /// The properties [`show`] asks for — and nothing else, so a systemd that
 /// adds one changes nothing here.
-const PROPS: [&str; 7] = [
+const PROPS: [&str; 8] = [
     "Id",
     "User",
     "Class",
@@ -28,6 +28,7 @@ const PROPS: [&str; 7] = [
     "LockedHint",
     "Display",
     "Type",
+    "Desktop",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,9 @@ pub struct Session {
     pub display: Option<String>,
     /// `x11`, `wayland`, `tty`, …
     pub kind: String,
+    /// FR-93 P2b — the session's desktop as logind names it (`gnome`, `KDE`,
+    /// `gdm-greeter`, …); empty becomes `None`.
+    pub desktop: Option<String>,
 }
 
 impl Session {
@@ -68,6 +72,7 @@ pub fn parse_show(text: &str) -> Option<Session> {
         locked: field("LockedHint") == Some("yes"),
         display: field("Display").map(str::to_string),
         kind: field("Type").unwrap_or_default().to_string(),
+        desktop: field("Desktop").map(str::to_string),
     })
 }
 
@@ -180,6 +185,7 @@ mod tests {
                 locked: false,
                 display: Some(":0".into()),
                 kind: "x11".into(),
+                desktop: None,
             }
         );
         assert!(s.is_user());
@@ -190,6 +196,11 @@ mod tests {
         assert_eq!(wl.display, None);
         assert_eq!(parse_show("User=1000\nClass=user\n"), None, "no id");
         assert_eq!(parse_show("Id=c1\nUser=gdm\n"), None, "no numeric user");
+        // FR-93 P2b — logind's desktop name, and an empty one is none.
+        let gnome = parse_show(&format!("{GNOME_X11}Desktop=gnome\n")).unwrap();
+        assert_eq!(gnome.desktop.as_deref(), Some("gnome"));
+        let nameless = parse_show(&format!("{GNOME_X11}Desktop=\n")).unwrap();
+        assert_eq!(nameless.desktop, None);
     }
 
     /// `LockedHint=yesterday` is not `yes`, and a key that merely starts
@@ -221,6 +232,7 @@ mod tests {
             locked: false,
             display: Some(":1".into()),
             kind: "x11".into(),
+            desktop: Some("gdm-greeter".into()),
         };
         let all = vec![greeter.clone(), user.clone()];
         assert_eq!(pick(&all, Some(":0.0")), Some(&user));

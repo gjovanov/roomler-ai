@@ -3803,6 +3803,10 @@ async fn run_cmd(
         .chain(cfg.orgs.iter().map(|o| o.tenant_id.clone()))
         .collect();
     roomlerd::keep_busy::start(cfg.keep_busy_enabled, enrolled_tenants);
+    // FR-93 P2b — the desktop brief's refresher (Linux; nothing elsewhere), so
+    // the first hello can carry it. It reads logind on its own thread; the
+    // signalling loop only ever reads its cache.
+    roomlerd::desktop_brief::start();
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(daemon_state);
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
