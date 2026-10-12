@@ -203,9 +203,10 @@ async fn scenario() {
         deadline: in_two_minutes,
         drained: None,
         unreachable_from: false,
+        prior: None,
     };
     assert!(
-        dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &promotion)
+        dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &promotion, false)
             .await
             .unwrap(),
         "the promotion begins on the record"
@@ -286,7 +287,7 @@ async fn scenario() {
         ..promotion.clone()
     };
     assert!(
-        dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &preparing)
+        dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &preparing, false)
             .await
             .unwrap(),
         "the prepare's promotion begins"

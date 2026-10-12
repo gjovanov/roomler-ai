@@ -394,6 +394,7 @@ mod tests {
             }),
             promotion: None,
             fences: Vec::new(),
+            moved: None,
         }
     }
 

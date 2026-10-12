@@ -54,7 +54,7 @@ use tracing::{debug, info, warn};
 
 use crate::HiveState;
 use crate::model::{
-    AgentSession, DrainedTip, MemberState, Promotion, PromotionState, SessionLocation,
+    AgentSession, DrainedTip, MemberState, MovedStart, Promotion, PromotionState, SessionLocation,
     SessionOrigin, SessionStatus, SessionView,
 };
 use crate::placement::MemberRole;
@@ -382,18 +382,29 @@ async fn authorize(
     if !permissions::has(perms, permissions::HIVE_RUN) {
         return Ok(Err(PromoteDenyReason::NoPermission));
     }
-    let launched = s.accepted_at.is_some() || SessionStatus::LAUNCHED.contains(&s.status);
+    // P2e-6b — a session waiting on a moved start its device never answered
+    // runs nowhere yet. It is moved on as from any unreachable primary, and
+    // only once that device is unreachable (below); the move that sent the
+    // start is then replaced, in flight or not.
+    let unanswered = unanswered_move(s);
+    let launched =
+        s.accepted_at.is_some() || SessionStatus::LAUNCHED.contains(&s.status) || unanswered;
     if !SessionStatus::REPORTABLE.contains(&s.status)
         || !launched
         || s.origin == SessionOrigin::Adopted
     {
         return Ok(Err(PromoteDenyReason::NotRunning));
     }
-    if s.promotion
+    let moving = s
+        .promotion
         .as_ref()
-        .is_some_and(|p| p.in_flight(DateTime::now()))
-    {
-        return Ok(Err(PromoteDenyReason::InProgress));
+        .filter(|p| p.in_flight(DateTime::now()));
+    if let Some(p) = moving {
+        let replaceable =
+            unanswered && p.state == PromotionState::Moving && p.to == s.location.device_id;
+        if !replaceable {
+            return Ok(Err(PromoteDenyReason::InProgress));
+        }
     }
     // P2e-5b — a move keeps where one fence ended and a move back a second,
     // and a device takes a join naming at most MAX_FENCE_MARKS of them: one
@@ -416,6 +427,15 @@ async fn authorize(
     // P2e-6a — an unreachable primary is waited out, then moved away from
     // with no drain, to the member that holds the most.
     let reach = match hub.agent_supports_hive_promote(s.location.device_id, tid) {
+        // P2e-6b — online, a device that has not answered its start may yet:
+        // the move that sent it is still under way, or the device runs nothing.
+        Some(_) if unanswered => {
+            return Ok(Err(if moving.is_some() {
+                PromoteDenyReason::InProgress
+            } else {
+                PromoteDenyReason::NotRunning
+            }));
+        }
         Some(true) => Reach::Online,
         Some(false) => return Ok(Err(PromoteDenyReason::PrimaryUnsupported)),
         None => {
@@ -451,6 +471,28 @@ async fn authorize(
         return Ok(Err(PromoteDenyReason::RateLimited));
     }
     Ok(Ok(reach))
+}
+
+/// FR-90 P2e-6b — whether `s` waits on a moved start its device never
+/// answered: past the first fence, starting there, never accepted, and no
+/// run state reported (one that lands before the answer counts as launched).
+fn unanswered_move(s: &AgentSession) -> bool {
+    s.fence > 1 && s.status == SessionStatus::Starting && s.accepted_at.is_none()
+}
+
+/// FR-90 P2e-6b — where the start `s` waits on came from: kept on the record
+/// since P2e-6b, read from the move that sent it on a record from before.
+fn prior_of(s: &AgentSession) -> Option<MovedStart> {
+    s.moved.clone().or_else(|| {
+        s.promotion
+            .as_ref()
+            .filter(|p| p.state == PromotionState::Moving && p.to == s.location.device_id)
+            .map(|p| MovedStart {
+                from: p.from.clone(),
+                by: p.by,
+                at: p.started_at,
+            })
+    })
 }
 
 /// Whether one more promotion could leave `s` with more fences' ends than a
@@ -532,6 +574,7 @@ pub async fn promote(
         }
     };
     let to_role = member_role(&s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into());
+    let unanswered = unanswered_move(&s);
     // Read before the promotion begins: nothing after it may fail on the way
     // to the push, or the promotion would wait out its bound for nothing.
     let user = state.users.base.find_by_id(s.owner_id).await?;
@@ -550,10 +593,11 @@ pub async fn promote(
         deadline: deadline_after(state.promote_bounds.prepare),
         drained: None,
         unreachable_from: reach == Reach::Unreachable,
+        prior: unanswered.then(|| prior_of(&s)).flatten(),
     };
     if !state
         .sessions
-        .begin_promotion(tid, auth.user_id, sid, &p)
+        .begin_promotion(tid, auth.user_id, sid, &p, unanswered)
         .await?
     {
         // Another tab's promotion won, or the session moved on meanwhile.
@@ -1467,8 +1511,13 @@ pub(crate) async fn on_start_refused(
     let why = Failure::PrepareRefused { word, detail }.why(&p);
     room::note(state, &s, room::move_failed_note(&p, &why)).await;
     send_member_joins(state, &s);
-    let here = s.location.clone();
-    send_start(state, &s, &here, p.by).await;
+    // P2e-6b — from the device itself, back as it left it; or, for one that
+    // never answered the start it was moved, from where that start came.
+    let (from, by) = s
+        .moved
+        .clone()
+        .map_or((s.location.clone(), p.by), |m| (m.from, m.by));
+    send_start(state, &s, &from, by).await;
     true
 }
 
@@ -1556,6 +1605,7 @@ mod tests {
                 hash: fill.repeat(64 / fill.len()),
             }),
             unreachable_from: false,
+            prior: None,
         };
         let member = |device_id, role: &str, tip| ReplicaMember {
             device_id,
@@ -1603,6 +1653,7 @@ mod tests {
             }),
             promotion: Some(p.clone()),
             fences: Vec::new(),
+            moved: None,
         };
         (s, p)
     }
@@ -1782,6 +1833,52 @@ mod tests {
             "at the end, another event"
         );
         assert!(!within_ends(&s, 1, 8, &"ee".repeat(32)), "past it: cut off");
+    }
+
+    /// P2e-6b — a session waiting on a moved start its device never
+    /// answered: past the first fence, starting, never accepted, and no run
+    /// state reported. Where that start came from: the record's own word,
+    /// else the move that sent it, on a record from before P2e-6b.
+    #[test]
+    fn a_moved_start_never_answered_is_known_and_so_is_where_it_came_from() {
+        let (mut s, p) = syncing(None, None);
+        assert!(!unanswered_move(&s), "running");
+        s.fence = 2;
+        s.status = SessionStatus::Starting;
+        s.accepted_at = None;
+        assert!(unanswered_move(&s), "a moved start, unanswered");
+        s.fence = 1;
+        assert!(!unanswered_move(&s), "a first start is no move");
+        s.fence = 2;
+        s.status = SessionStatus::Idle;
+        assert!(!unanswered_move(&s), "a run state reported: it launched");
+        s.status = SessionStatus::Starting;
+        s.accepted_at = Some(DateTime::now());
+        assert!(!unanswered_move(&s), "answered");
+        s.accepted_at = None;
+
+        s.location.device_id = p.to;
+        let mut moving = p.clone();
+        moving.state = PromotionState::Moving;
+        s.promotion = Some(moving);
+        assert_eq!(
+            prior_of(&s).map(|m| m.from.device_id),
+            Some(p.from.device_id),
+            "a record from before P2e-6b: the move's"
+        );
+        let kept = MovedStart {
+            from: SessionLocation {
+                device_id: ObjectId::new(),
+                ..p.from.clone()
+            },
+            by: p.by,
+            at: DateTime::now(),
+        };
+        s.moved = Some(kept.clone());
+        assert_eq!(prior_of(&s), Some(kept), "the record's own word first");
+        s.moved = None;
+        s.promotion = None;
+        assert_eq!(prior_of(&s), None);
     }
 
     /// The member's role, only as a joined member, never the primary's row.

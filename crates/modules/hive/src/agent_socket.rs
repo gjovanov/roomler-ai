@@ -1004,8 +1004,14 @@ pub(crate) async fn reconcile_on_connect(
                 }
             }
             SessionStatus::Starting => {
+                // P2e-3 — a start past the first fence is a move's, or a move
+                // back's. P2e-6b — and it is sent again however late its
+                // device comes back: the window bounds a session's FIRST
+                // start, whose caller has gone. A moved session's conversation
+                // lives on, and its record was made long before the move.
+                let moved = s.fence > 1;
                 let age_ms = now_ms.saturating_sub(s.created_at.timestamp_millis());
-                if age_ms > hive_limits::START_REDELIVERY_WINDOW_SECS * 1000 {
+                if !moved && age_ms > hive_limits::START_REDELIVERY_WINDOW_SECS * 1000 {
                     if let Ok(true) = state
                         .sessions
                         .mark_lost(
@@ -1022,14 +1028,14 @@ pub(crate) async fn reconcile_on_connect(
                     warn!(session = %sid, "hive: start not re-sent — its owner could not be read");
                     continue;
                 };
-                // P2e-3 — a start past the first fence is a move's, or a move
-                // back's: the device hears its join as the primary and the
-                // record's `rc:hive.move` first, as when it was first sent,
-                // and resumes the conversation.
-                let moved = s.fence > 1;
+                // The device hears its join as the primary and the record's
+                // `rc:hive.move` first, as when it was first sent, and resumes
+                // the conversation. P2e-6b — from where the record says the
+                // start came; a record from before it, from its move's.
                 if moved {
-                    let (from, by) = match &s.promotion {
-                        Some(p) if p.to == device_id => (p.from.clone(), p.by),
+                    let (from, by) = match (&s.moved, &s.promotion) {
+                        (Some(m), _) => (m.from.clone(), m.by),
+                        (None, Some(p)) if p.to == device_id => (p.from.clone(), p.by),
                         _ => (s.location.clone(), s.owner_id),
                     };
                     crate::promote::before_start(state, &s, &from, by).await;
