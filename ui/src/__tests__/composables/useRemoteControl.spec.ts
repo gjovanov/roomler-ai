@@ -120,6 +120,7 @@ import {
   displayScale,
   resolutionOverrideHint,
   codecLabelFromDecoderConfig,
+  captureArmLabel,
 } from '@/composables/useRemoteControl'
 import {
   computeRenderTarget,
@@ -3180,6 +3181,48 @@ describe('P7 — HEVC Rext 4:4:4 codec string', () => {
     // Same Annex-B no-description contract as the worker's default
     // hev1.1.6.L153.B0; profile_idc 4 + the Rext compat flag + Level 5.1.
     expect(HEVC_REXT_CODEC_STRING).toBe('hev1.4.10.L153.B0')
+  })
+})
+
+// FR-93 P2 — the Linux capture arm rides two trailing optional keys
+// (`capture_arm`, `attended`), and the capture pill names it.
+describe('rc:video-info capture_arm (FR-93 P2)', () => {
+  const head = '{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"direct","native_w":1280,"native_h":800,"viewers":1'
+
+  it('parses capture_arm and attended, and leaves both absent otherwise', () => {
+    const mutter = parseControlInbound(`${head},"capture_arm":"mutter","attended":false}`)
+    expect(mutter?.kind).toBe('video_info')
+    if (mutter?.kind === 'video_info') {
+      expect(mutter.info.capture_arm).toBe('mutter')
+      expect(mutter.info.attended).toBe(false)
+    }
+    const portal = parseControlInbound(`${head},"capture_arm":"portal","attended":true}`)
+    if (portal?.kind === 'video_info') {
+      expect(portal.info.attended).toBe(true)
+    }
+    // Windows, macOS and older agents send neither key: the parsed info
+    // carries neither, so there is no pill at all.
+    const plain = parseControlInbound(`${head}}`)
+    expect(plain?.kind).toBe('video_info')
+    if (plain?.kind === 'video_info') {
+      expect('capture_arm' in plain.info).toBe(false)
+      expect('attended' in plain.info).toBe(false)
+    }
+  })
+
+  it('names the arm, and says whether anyone at the screen was asked', () => {
+    const vi = (capture_arm: string, attended: boolean) => ({
+      codec: 'vp9', encoder: 'libvpx', hardware: false, chroma: 'yuv444', transport: 'direct',
+      native_w: 1280, native_h: 800, viewers: 1, capture_arm, attended,
+    })
+    expect(captureArmLabel(vi('mutter', false))).toBe('GNOME screencast · asks nobody')
+    expect(captureArmLabel(vi('drm', false))).toBe('DRM scanout · asks nobody')
+    expect(captureArmLabel(vi('portal', true))).toBe('desktop portal · allowed at the screen')
+    expect(captureArmLabel(vi('x11', false))).toBe('X11')
+    // A newer agent's arm is shown by its own name, never dropped.
+    expect(captureArmLabel(vi('pipewire-direct', false))).toBe('pipewire-direct · asks nobody')
+    expect(captureArmLabel(null)).toBe('')
+    expect(captureArmLabel({ ...vi('x11', false), capture_arm: undefined })).toBe('')
   })
 })
 
