@@ -38,7 +38,21 @@ pub fn start() {
                 .spawn(|| {
                     loop {
                         let brief = linux::gather();
-                        *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(brief);
+                        let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+                        // Said once per change, so the journal shows what the
+                        // hello and the heartbeat carry.
+                        if latest.as_ref() != Some(&brief) {
+                            tracing::info!(
+                                session = %brief.session,
+                                kind = %brief.kind,
+                                desktop = brief.desktop.as_deref().unwrap_or("-"),
+                                capture_arm = %brief.capture_arm,
+                                input_reach = %brief.input_reach,
+                                "desktop brief (FR-93 P2b)"
+                            );
+                        }
+                        *latest = Some(brief);
+                        drop(latest);
                         std::thread::sleep(REFRESH);
                     }
                 });
