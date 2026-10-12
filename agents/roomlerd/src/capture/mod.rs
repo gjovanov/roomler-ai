@@ -390,6 +390,45 @@ pub trait ScreenCapture: Send {
     fn recorded_pointer(&mut self) -> pointer::RecordedPointer {
         pointer::RecordedPointer::Absent
     }
+
+    /// FR-93 P2 — which Linux arm is serving this session, for the controller
+    /// (`rc:video-info` `capture_arm`, and `attended`). `None` wherever there
+    /// is no choice worth naming: Windows, macOS, a capturer with no pixels.
+    fn arm(&self) -> Option<CaptureArm> {
+        None
+    }
+}
+
+/// FR-93 P2 — the backends a Linux session can be served by. They differ in
+/// what the controller should know: DRM and mutter capture without asking
+/// anyone, the portal asked the person at the screen, and X11 is the
+/// pre-Wayland path.
+///
+/// ⚠️ The wire spellings are a compatibility surface, like every `rc:*`
+/// string: renaming one does not fail loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureArm {
+    Drm,
+    Mutter,
+    Portal,
+    X11,
+}
+
+impl CaptureArm {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Drm => "drm",
+            Self::Mutter => "mutter",
+            Self::Portal => "portal",
+            Self::X11 => "x11",
+        }
+    }
+
+    /// Did a person at the screen have to allow this capture? Only the portal
+    /// asks.
+    pub fn attended(self) -> bool {
+        matches!(self, Self::Portal)
+    }
 }
 
 /// P8a — re-project tracked damage through a downscale. Per-EDGE
@@ -552,6 +591,162 @@ fn running_as_root() -> bool {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn wayland_aware() -> bool {
     tunnel_core::env::flag("WAYLAND_AWARE", true)
+}
+
+/// FR-93 P2 kill switch (`ROOMLERD_WAYLAND_AUTO` / `wayland_auto`), default
+/// ON. `false` gives back 0.4.128's cascade: a per-user daemon in a Wayland
+/// session captures only what a key switches on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wayland_auto() -> bool {
+    tunnel_core::env::flag("WAYLAND_AUTO", true)
+}
+
+/// FR-93 P2 — the keys that choose Linux capture by hand. With any one of them
+/// set, to anything, the operator owns the cascade and it runs exactly as it
+/// did before P2: `drm_capture = false` removes that arm, `= true` forces it.
+/// `window_capture` counts too. It means something only to the portal, so an
+/// operator who set it has a portal in mind.
+#[cfg(target_os = "linux")]
+const CAPTURE_KEYS: [&str; 4] = [
+    "DRM_CAPTURE",
+    "PORTAL_CAPTURE",
+    "MUTTER_CAPTURE",
+    "WINDOW_CAPTURE",
+];
+
+#[cfg(target_os = "linux")]
+fn capture_keys_set() -> bool {
+    CAPTURE_KEYS
+        .iter()
+        .any(|k| tunnel_core::env::node_env(k).is_some())
+}
+
+/// FR-93 P2 — where this daemon's own user is, as far as the automatic arm
+/// cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum OwnSession {
+    /// Signed in to an active Wayland session.
+    Wayland,
+    /// Anything else: X11, only a tty, nobody signed in, no logind to ask.
+    Other,
+}
+
+/// FR-93 P2 (decision D1) — what the cascade may switch on by itself.
+///
+/// ⚠️ **mutter only, and the portal stays opt-in.** D1 asked for "the portal
+/// elsewhere" too, and the lab showed why the attended path cannot go
+/// automatic as it stands (KDE, 2026-10-11):
+/// - The viewer's media watchdog re-creates a session that shows no frames
+///   for 10 s, and every new session opens its own portal request. The person
+///   at the screen gets a new "Share screen with" dialog every 10–20 s.
+/// - A late answer to a stale dialog starts a capture for a session that is
+///   already gone.
+/// - Each pending open parks a runtime worker for up to `HANDSHAKE_DEADLINE`.
+///
+/// mutter asks nobody and opens in milliseconds, so none of this reaches it.
+/// The portal goes automatic once the attended flow exists: a "waiting for
+/// the person at the screen" notice the watchdog honours, one pending request
+/// per host, an open that parks no worker (FR-93 P2d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+enum WaylandPlan {
+    /// The cascade as it was before P2.
+    AsConfigured,
+    /// A per-user daemon in its own Wayland session, with no capture key set:
+    /// try mutter, whether or not the screen is locked. What a locked session
+    /// shows is mutter's to decide; this lab has not measured it.
+    Auto,
+}
+
+/// D1 as a pure function. Cheap checks first: `session` runs loginctl, so it
+/// is asked only when everything else allows auto.
+///
+/// - `root`: D1's system half stays opt-in until a desktop companion ships for
+///   non-Debian hosts, so a root daemon never switches an arm on by itself.
+/// - `keys_set`: an explicit capture key always wins.
+/// - `virtual_desktop`: the daemon's own Xvfb is what it captures.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wayland_plan(
+    aware: bool,
+    auto: bool,
+    root: bool,
+    keys_set: bool,
+    virtual_desktop: bool,
+    session: impl FnOnce() -> OwnSession,
+) -> WaylandPlan {
+    if !aware || !auto || root || keys_set || virtual_desktop {
+        return WaylandPlan::AsConfigured;
+    }
+    match session() {
+        OwnSession::Wayland => WaylandPlan::Auto,
+        OwnSession::Other => WaylandPlan::AsConfigured,
+    }
+}
+
+/// This daemon's user's active Wayland session, from logind. A user can have
+/// several sessions (an SSH login beside the desktop); only an active
+/// graphical one of class `user` counts, never a greeter.
+#[cfg(target_os = "linux")]
+fn own_session() -> OwnSession {
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    crate::keep_busy::logind::sessions()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|s| s.uid == uid && s.is_user() && s.active && s.kind == "wayland")
+        })
+        .map(|_| OwnSession::Wayland)
+        .unwrap_or(OwnSession::Other)
+}
+
+/// FR-93 P2 — what the automatic mutter arm came to.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+enum AutoMutter {
+    Opened(Box<dyn ScreenCapture>),
+    /// mutter does not answer on this session's bus: not GNOME. Nothing was
+    /// switched on, so the cascade runs on unchanged, and a Wayland desktop
+    /// still reports `wayland_not_enabled`, whose hint names `portal_capture`.
+    NotGnome(String),
+    /// mutter answered, and its screencast still failed. An arm that switched
+    /// itself on failed, so the controller reads `backend_error` with this
+    /// reason, never "switch it on" (P1c's rule for an arm the operator
+    /// switched on).
+    Failed(String),
+}
+
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+fn open_auto_mutter(target_fps: u32) -> AutoMutter {
+    use portal::backend::{PortalCapture, PortalOpen};
+    if let Err(why) = portal::mutter::available() {
+        return AutoMutter::NotGnome(why);
+    }
+    // Input over the portal stays opt-in exactly as before: a WithInput grant
+    // is a separate dialog, and not yet field-proven to land (FR-45 P4).
+    let opts = PortalOpen {
+        mutter: true,
+        input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        window: false,
+    };
+    match PortalCapture::open_with(target_fps, opts) {
+        Ok(c) => {
+            tracing::warn!(
+                width = c.width(),
+                height = c.height(),
+                "capture: backend=portal via org.gnome.Mutter.ScreenCast, AUTOMATIC (FR-93 D1: a \
+                 per-user Wayland session with no capture key set). It asks nobody. \
+                 ROOMLERD_WAYLAND_AUTO=0, or any capture key, switches it off"
+            );
+            AutoMutter::Opened(Box::new(c))
+        }
+        Err(e) => AutoMutter::Failed(format!(
+            "mutter capture switched itself on (a per-user GNOME session with no capture key \
+             set), and its screencast could not open: {e:#}"
+        )),
+    }
 }
 
 /// FR-93 — what to call "every arm failed" on Linux, as a pure function.
@@ -1092,6 +1287,38 @@ fn open_with(
     #[cfg(target_os = "linux")]
     #[allow(unused_mut, unused_variables)] // assigned/read only in featured builds
     let mut wayland_arm_error: Option<String> = None;
+
+    // FR-93 P2 (decision D1): a per-user daemon in its own Wayland session,
+    // with no capture key set, switches mutter on by itself: GNOME's own
+    // screencast, no dialog, the unattended peer of DRM. The portal stays
+    // opt-in (see `WaylandPlan`). Everything else (root, a key set, X11, nobody
+    // signed in, the kill switch) runs the cascade below as before. With no key
+    // set, the DRM and portal arms below are off anyway.
+    #[cfg(target_os = "linux")]
+    #[allow(unused_variables)] // read only with portal-capture
+    let plan = wayland_plan(
+        wayland_aware(),
+        wayland_auto(),
+        running_as_root(),
+        capture_keys_set(),
+        crate::virtual_desktop::requested(),
+        own_session,
+    );
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    if plan == WaylandPlan::Auto {
+        match open_auto_mutter(_target_fps) {
+            AutoMutter::Opened(c) => return c,
+            AutoMutter::NotGnome(why) => tracing::info!(
+                %why,
+                "capture: no automatic arm on this desktop (FR-93 P2 is mutter only); the portal \
+                 stays opt-in (portal_capture)"
+            ),
+            AutoMutter::Failed(detail) => {
+                tracing::warn!(%detail, "capture: the automatic mutter arm failed (FR-93 P2)");
+                wayland_arm_error = Some(detail);
+            }
+        }
+    }
 
     #[cfg(all(target_os = "linux", feature = "drm-capture"))]
     {
@@ -1679,6 +1906,108 @@ mod wayland_reason_tests {
         assert!(user.contains("mutter_capture"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
         assert!(!user.contains("drm_capture"), "{user}");
+    }
+}
+
+/// FR-93 P2 — decision D1 as a table. Pure: the session is a closure, so no
+/// test touches the environment or logind (that would race every other test
+/// in the binary). The order of the cheap checks is part of the contract: a
+/// daemon that may not go automatic never runs loginctl.
+#[cfg(test)]
+mod wayland_auto_tests {
+    use super::{OwnSession, WaylandPlan, wayland_plan};
+
+    fn session(s: OwnSession) -> impl FnOnce() -> OwnSession {
+        move || s
+    }
+
+    fn session_unasked() -> impl FnOnce() -> OwnSession {
+        || -> OwnSession { panic!("logind was asked, and this answer does not depend on it") }
+    }
+
+    /// D1's per-user half: a Wayland session of its own and no key set. The
+    /// one automatic arm is mutter (see `WaylandPlan` for why the portal stays
+    /// opt-in).
+    #[test]
+    fn a_per_user_daemon_in_its_own_wayland_session_goes_automatic() {
+        assert_eq!(
+            wayland_plan(
+                true,
+                true,
+                false,
+                false,
+                false,
+                session(OwnSession::Wayland)
+            ),
+            WaylandPlan::Auto
+        );
+    }
+
+    /// D1's system half: DRM and uinput stay opt-in on a root install.
+    #[test]
+    fn a_root_daemon_never_switches_an_arm_on_by_itself() {
+        assert_eq!(
+            wayland_plan(true, true, true, false, false, session_unasked()),
+            WaylandPlan::AsConfigured
+        );
+    }
+
+    /// Any capture key, to any value, hands the cascade back to the operator.
+    #[test]
+    fn an_explicit_key_always_wins() {
+        assert_eq!(
+            wayland_plan(true, true, false, true, false, session_unasked()),
+            WaylandPlan::AsConfigured
+        );
+    }
+
+    /// Both kill switches give back the cascade before P2, byte for byte.
+    #[test]
+    fn either_kill_switch_gives_back_the_old_cascade() {
+        assert_eq!(
+            wayland_plan(true, false, false, false, false, session_unasked()),
+            WaylandPlan::AsConfigured,
+            "wayland_auto = false"
+        );
+        assert_eq!(
+            wayland_plan(false, true, false, false, false, session_unasked()),
+            WaylandPlan::AsConfigured,
+            "wayland_aware = false"
+        );
+    }
+
+    /// The daemon's own Xvfb is what it captures, Wayland session or not.
+    #[test]
+    fn a_virtual_desktop_is_never_replaced() {
+        assert_eq!(
+            wayland_plan(true, true, false, false, true, session_unasked()),
+            WaylandPlan::AsConfigured
+        );
+    }
+
+    /// X11 keeps FR-29's numbers: auto applies only where logind says Wayland.
+    #[test]
+    fn x11_or_nobody_signed_in_is_not_automatic() {
+        assert_eq!(
+            wayland_plan(true, true, false, false, false, session(OwnSession::Other)),
+            WaylandPlan::AsConfigured
+        );
+    }
+
+    /// "Any capture key takes the choice back" holds only if every key in the
+    /// list reaches `node_env` from the config. A name that is not bridged
+    /// would be a `roomler config set` that the cascade never sees, and auto
+    /// would stay on under an operator who switched it off.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_capture_key_is_a_bridged_config_key() {
+        let bridged: Vec<&str> = crate::config::env_bridge_bools(&crate::config::test_fixture())
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for key in super::CAPTURE_KEYS.iter().chain(["WAYLAND_AUTO"].iter()) {
+            assert!(bridged.contains(key), "{key} is not in env_bridge_bools");
+        }
     }
 }
 

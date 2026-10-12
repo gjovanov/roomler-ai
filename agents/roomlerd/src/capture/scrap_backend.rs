@@ -556,6 +556,12 @@ impl ScreenCapture for ScrapCapture {
             RecordedPointer::Absent
         }
     }
+
+    /// FR-93 P2 — on Linux this is the X11 arm. The other platforms have no
+    /// arm worth naming to the controller.
+    fn arm(&self) -> Option<super::CaptureArm> {
+        cfg!(target_os = "linux").then_some(super::CaptureArm::X11)
+    }
 }
 
 #[cfg(test)]
