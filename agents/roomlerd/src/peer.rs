@@ -1573,6 +1573,10 @@ impl Drop for AgentPeer {
                 tracing::info!(session = %session_id, "display-match: restored on peer drop (owner)");
             }
         });
+        // #2024 — the session's encoder is freed as its pump drops, but glibc
+        // keeps the pages in the arenas of the threads that freed them; a trim
+        // a few seconds later gives them back (~110 MB a session, measured).
+        crate::mem_trim::after_session_ended();
     }
 }
 

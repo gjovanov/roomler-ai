@@ -1329,6 +1329,78 @@ instead of waiting for the far end to reset it; and redial before a slow peer
 close. Its kill switch, risks and fail-first are in
 `docs/fr/FR-22-time-to-first-frame.md`.
 
+### 12.2 Memory after a session ends (#2024)
+
+A session is expensive while it runs: the libvpx VP9 4:4:4 encoder alone holds a
+49 MB token buffer and a pool of 5 MB frames at 1280×800, and the capture, the
+peer and the DataChannels add their own. All of it is **freed** when the session
+ends. What used to stay behind is what **glibc** keeps of it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as signalling loop
+    participant P as AgentPeer
+    participant M as media pump task
+    participant E as rc-enc thread
+    participant T as mem-trim thread
+    S->>P: rc:terminate → close()
+    P->>M: stop_serving(): abort
+    M-->>M: future dropped (the send task exits: "channel closed")
+    M->>E: EncoderHandle dropped → channel closed, join
+    E-->>E: Vp9Encoder dropped → vpx_codec_destroy
+    S->>P: drop
+    P->>T: mem_trim::after_session_ended()
+    Note over T: 5 s with no further session end
+    T->>T: malloc_trim(0) → "mem-trim: handed … back to the OS"
+```
+
+Each thread allocates from a glibc arena of its own (up to eight per core), and
+every session encodes on **new** threads (`rc-enc-*`, libvpx's workers, the
+capture worker). Freed memory stays mapped in the arena it came from, so each
+session can strand its buffers in a different one. Measured on a 4-core KDE
+system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
+`malloc_stats()`:
+
+| idle after | RSS | anon RSS | glibc holds | **in use** | arenas |
+|---|---|---|---|---|---|
+| fresh daemon | 51 MB | 12 MB | 10 MB | **7.3 MB** | 12 |
+| session 1 | 100 MB | 53 MB | 59 MB | **8.9 MB** | 32 |
+| session 2 | 204 MB | 157 MB | 177 MB | **9.1 MB** | 32 |
+| session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
+| one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
+
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1579`) asks for a trim, and
+`agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
+`mem-trim` thread, **5 s after the last session ended**. The delay lets the
+encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions
+ending together cost one trim. A trim takes each arena's lock in turn and nobody
+waits for it. "glibc holds" does not fall after a trim, because the pages are
+released with `MADV_DONTNEED` while the arena keeps the address space. RSS is the
+number that falls.
+
+| | |
+|---|---|
+| Where | Linux/glibc only (`malloc_trim` is a glibc extension). Windows and macOS were not measured |
+| Kill switch | `ROOMLERD_MEM_TRIM=0` |
+| Field signal | `mem-trim: handed the memory finished sessions freed back to the OS (#2024)` with `rss_before_mb`, `rss_after_mb`, `elapsed_ms` |
+
+⚠️ **RSS is not the heap.** Read what is *in use* before calling anything a leak:
+`sudo gdb -p "$(systemctl show -p MainPID --value roomlerd)" -batch -ex 'call (void) malloc_stats()'`
+prints every arena's system and in-use bytes on the daemon's stderr, which is
+`journalctl -u roomlerd`. A climbing RSS over a flat in-use is retention, and a
+trim answers it. A climbing in-use is a leak, and a trim hides nothing of it.
+
+⚠️ **A wrong turn worth keeping.** heaptrack's "leaked at exit" listing read as
+one encoder kept per session, and the issue was filed that way. The sizes say
+otherwise: the 49.41 MB at `vpx_codec_enc_init_ver` is **exactly one** token
+buffer (50 × 80 macroblocks × (16·16·3 + 4) tokens × 16 B), and the 3.07 MB of
+plane buffers is one encoder's Y, U and V. Neither is one per session. A local
+probe then dropped encoders through every runtime call the pump makes
+(`set_bitrate`, `set_max_quantizer`, runtime `cpu-used`, keyframes) and got back
+every byte (0 KB per encoder in `mallinfo2`). The debug journal showed each pump
+dropped 8 ms after its terminate.
+
 ## 13. Testing strategy
 
 Reuse the existing 114 Rust integration test conventions plus Playwright E2E specs. New harness pieces:
