@@ -343,6 +343,9 @@ pub struct SettingsSpec {
     pub sandbox_proxy: Option<SandboxProxy>,
     /// Paths the model's Read tool must not open, beyond the defaults.
     pub extra_read_denies: Vec<String>,
+    /// FR-90 P2e-7 — the command a `SessionStart` hook runs on a resume: it
+    /// prints the resume note when the daemon left one, and nothing else.
+    pub session_start_hook: Option<String>,
 }
 
 /// Where the sandbox sends sandboxed commands' traffic.
@@ -367,6 +370,16 @@ impl SettingsSpec {
         }
         if let Some(dir) = &self.auto_memory_directory {
             doc["autoMemoryDirectory"] = json!(dir.to_string_lossy());
+        }
+        // P2e-7 — on a resume only (`source: "resume"`): a first start has
+        // nothing to be told, and a hook that prints nothing adds nothing.
+        if let Some(command) = &self.session_start_hook {
+            doc["hooks"] = json!({
+                "SessionStart": [{
+                    "matcher": "resume",
+                    "hooks": [{"type": "command", "command": command}],
+                }],
+            });
         }
         // A sandboxed command is auto-approved by default
         // (`autoAllowBashIfSandboxed`), whatever the permission mode — so a
@@ -603,8 +616,19 @@ mod tests {
                 socks_port: 47002,
             }),
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
+            session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
         }
         .to_json();
+        // P2e-7 — the resume note's hook: on a resume only.
+        assert_eq!(
+            doc["hooks"],
+            json!({"SessionStart": [{
+                "matcher": "resume",
+                "hooks": [{"type": "command",
+                           "command": "'/usr/bin/roomlerd' hive-resume-note '/run/n'"}],
+            }]}),
+            "the hook runs on a resume only"
+        );
         assert_eq!(doc["apiKeyHelper"], "roomler hive token --session 6f1c");
         let deny = doc["permissions"]["deny"].as_array().unwrap();
         assert!(deny.iter().any(|d| d == "Read(//proc/**)"));
@@ -620,8 +644,10 @@ mod tests {
             auto_memory_directory: None,
             sandbox_proxy: None,
             extra_read_denies: vec![],
+            session_start_hook: None,
         }
         .to_json();
+        assert!(bare.get("hooks").is_none(), "no hook, no hooks key");
         assert_eq!(
             bare["sandbox"],
             json!({"autoAllowBashIfSandboxed": false}),
