@@ -1766,6 +1766,7 @@ impl Supervisor {
                 harness_pid: None,
                 harness_started: None,
                 replicated: true,
+                lease: false,
             },
         );
     }
