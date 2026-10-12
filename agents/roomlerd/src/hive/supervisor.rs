@@ -371,8 +371,9 @@ pub struct Supervisor {
     derp_for_tests: Mutex<Option<Option<tunnel_core::transport::derp::DerpTunnelHandle>>>,
     /// P2b-3b — how a test's sessions take their checkpoints (in-process,
     /// failing, never finishing); a device always runs `hive-checkpoint` as
-    /// the account.
-    #[cfg(test)]
+    /// the account. P2d-6: an integration test's device too
+    /// ([`init_as_daemon`]), in-process.
+    #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
     checkpoint_runner: Option<super::checkpointer::Runner>,
     /// P2d-3b — whether a connection starts following every copy held, as
     /// a device's does; a test that drives the follow itself turns it off,
@@ -726,7 +727,7 @@ pub fn init_as_daemon(
     if unsafe { libc::geteuid() } == 0 {
         return Err("the test launcher never runs sessions as root".into());
     }
-    let sup = Supervisor::new(
+    let mut sup = Supervisor::new(
         HiveConfig::from_agent(cfg),
         runtime.to_path_buf(),
         Launcher::AsDaemon {
@@ -735,6 +736,15 @@ pub fn init_as_daemon(
         StoreHandle::spawn(Some(store)),
         Hosted::load(store.with_file_name(HOSTED_FILE), &cfg.agent_id),
     );
+    // P2d-6 — this process's binary is a test's, which knows no
+    // `hive-checkpoint`: a replicated session's checkpoints are taken in
+    // process, through the same frames and checks, git's discovery stopping
+    // at the test's own directory.
+    sup.checkpoint_runner = Some(super::checkpointer::Runner::InProcess {
+        ceiling: store
+            .parent()
+            .map_or_else(|| runtime.to_path_buf(), Path::to_path_buf),
+    });
     SUPERVISOR
         .set(Arc::new(sup))
         .map_err(|_| "a supervisor is already set up in this process".to_string())
@@ -928,7 +938,7 @@ impl Supervisor {
             follows: Mutex::new(follow::Follows::default()),
             #[cfg(test)]
             derp_for_tests: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
             checkpoint_runner: None,
             #[cfg(test)]
             follow_at_connect: true,
@@ -937,7 +947,7 @@ impl Supervisor {
 
     /// P2b-3b — how this daemon's sessions take their checkpoints.
     fn checkpoint_runner(&self) -> super::checkpointer::Runner {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
         if let Some(run) = &self.checkpoint_runner {
             return run.clone();
         }

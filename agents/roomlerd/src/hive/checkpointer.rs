@@ -316,8 +316,10 @@ pub(crate) enum Runner {
     /// binary is the test harness and not `roomlerd`. Git's discovery stops at
     /// `ceiling`, so a repository around the test's temp directory is never
     /// written to.
-    /// The supervisor's tests are Unix's; so is every test runner.
-    #[cfg(all(test, unix))]
+    /// The supervisor's tests are Unix's; so is every test runner. An
+    /// integration test's device takes it too (`hive-test-launcher`, P2d-6):
+    /// its binary is a test's, which knows no `hive-checkpoint`.
+    #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
     InProcess { ceiling: PathBuf },
     /// Every checkpoint fails, for this reason (tests).
     #[cfg(all(test, unix))]
@@ -476,7 +478,7 @@ impl Checkpoints {
 
     async fn take(&self, req: &Request) -> Result<(Checkpoint, Vec<Vec<u8>>), String> {
         match &self.run {
-            #[cfg(all(test, unix))]
+            #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
             Runner::InProcess { ceiling } => {
                 let (cp, blobs) = produce(req, &Git::under(ceiling))?;
                 let mut bytes = Vec::new();
