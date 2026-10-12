@@ -299,7 +299,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2598`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2607`,
 `virtual_desktop.rs:528`) starts Xvfb at `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION`
 (default `1920x1080`) with the window manager named by
 `ROOMLERD_VIRTUAL_DESKTOP_WM` (default `openbox`) and the comma-separated
