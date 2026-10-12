@@ -45,4 +45,7 @@ features = [
     # session, compared with the active console session.
     "Win32_System_Pipes",           # GetNamedPipeClientProcessId
     "Win32_System_RemoteDesktop",   # ProcessIdToSessionId, WTSGetActiveConsoleSessionId
+    # FR-92 P10b — and which account it runs as: its token's user, so a
+    # SYSTEM / LocalService / NetworkService client can be told from a person.
+    "Win32_System_Threading",       # OpenProcess, OpenProcessToken
 ]

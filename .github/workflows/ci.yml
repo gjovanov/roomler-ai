@@ -1179,6 +1179,17 @@ jobs:
       # carries yet, so this is the only place their code is linted.
       - name: Clippy roomlerd (overlay-l3 + ssh-server + hive, incl. tests)
         run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive --tests -- -D warnings
+      # FR-92 P10b — the LocalAPI crate's Windows half ran in NO lane: its
+      # tests run on Linux, where every `#[cfg(windows)]` test compiles out,
+      # and tunnel-core's clippy above builds only its library. That half is
+      # the named pipe the person's tray and CLI dial, the peer read from the
+      # OS at accept time, and (P10b) the token probe that refuses a SYSTEM
+      # caller keep busy's On.
+      - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomler-localapi --all-targets -- -D warnings
+          cargo test -p roomler-localapi --lib
       # FR-90 P1i — a Windows session's launcher: a process started SUSPENDED
       # into a Job Object, with the session's variables over the user's
       # environment; ending or closing the job ending what it started; the
