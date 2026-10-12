@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129; field-verified (§9), macOS and 24 h of EDR included. P10b (SYSTEM never starts it) merged, riding the next release. Owed: the tray's Start in the field, `no_permission` on a release, and P10b on a SystemContext-mode host
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129; field-verified (§9), macOS and 24 h of EDR included. P10b (SYSTEM never starts it) merged, riding the next release. P10b (SYSTEM never starts it) is in **0.4.130** (2026-10-12). The tray's Start and Stop, and `no_permission`, are field-verified on both platforms (rows 46–48). Owed: P10b on a SystemContext-mode host, then the close
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -531,6 +531,16 @@ production SPA, as above.
 | 44 | **AC8: 24 h of EDR** | the corporate laptop (Microsoft Defender Antivirus plus Defender for Endpoint), 10-11 07:00Z to 10-12 07:00Z, read at 07:18Z | **The engines were on**, which a quiet result needs before it counts: `AMServiceEnabled`, `RealTimeProtectionEnabled`, `BehaviorMonitorEnabled` and `IoavProtectionEnabled` all true, `AMRunningMode=Normal`, `Sense` and `WinDefend` running. **0 detections.** **0** malware (1006/1007/1015/1116–1119), ASR (1121/1122), controlled-folder (1123/1124) or network-protection (1125/1126) events. None of the window's 166 Operational events names roomler, and the log reaches back to 10-01. The binaries went from 0.4.125 to 0.4.126 (14:30Z) and on to 0.4.129 (01:36Z), each installed by the agent's own updater and scanned on access. **Caveats:** keep busy itself was off until 18:02:46Z, when it was turned on from the viewer (`circle`). After each overnight restart it was restored "waiting for an unlocked session", because the laptop was locked. So it injected input from 18:03Z until the lock (at most ~3.5 h), and again in the morning. Alerts that exist only in Defender for Endpoint's cloud portal can't be seen from the device. Taken as met, and ticked at the close with these caveats (operator, 2026-10-12) |
 | 45 | **AC14's tray half: the state read** | the Win11 PC on 0.4.129 (an attended install) | The companion's tray picked up both Ons from row 43 within 3 s: `tray: keep busy is on pattern=subtle set_by="the person at this computer"` at 23:27:53Z (the CLI's On, 23:27:50Z) and at 23:29:35Z (the exec's, 23:29:33Z). That is the state behind its "Stop keep busy (Subtle · …)" label. The **Start** click itself is still owed |
 
+**The visit, 2026-10-12**: the operator at both machines, both on 0.4.129. Results are read from each
+machine's own logs, the companion's and the agent's.
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 46 | **AC14's tray half on Windows** | the Win11 PC (an attended install) | **First attempt:** Start from the tray at 11:05:31Z (`tray: keep busy toggled on=true phase=running`), and it circled. The **Stop** click left no trace. The handler logs every click it gets (toggled, did not start, could not toggle), and none appeared. Keep busy stayed on, only paused by the person's own hand ("Paused: someone is using this computer"), and was stopped from the CLI at 11:06:59Z. **Slow retry:** Start at 15:35:05Z, then Stop at 15:35:29Z, which took (`stopped_locally`) ✅. Why the first Stop never reached the handler is unexplained. Either a click landed off the item while keep busy still moved the pointer (it pauses ~0.8 s after the first local input, row 5), or the pause on the person's own input read as a stop |
+| 47 | **AC14's tray half on a supervised Mac** | the MacBook | Start from the menu bar at 12:31:27Z. The companion logged `tray: keep busy toggled on=true phase=running`, and the **GUI worker** logged `keep-busy: turned on session=None set_by=the person at this computer` and `localapi: keep busy turned on at this computer`: the person's own socket reaches the worker. It paused on the click itself (`user_active`, local) and ran again 31 s later. Stop from the menu bar at 18:23:17Z (`turned off reason="stopped_locally"`) ✅. In between, at 18:22:44Z, a viewer's switch set it again, relabelled with the viewer's name |
+| 48 | **Row 37's fix on a release** (#1991) | the MacBook | With `roomlerd` switched off under Device Control & Data Access by the operator and the GUI worker restarted (new in 5 s), the person's `roomler keep-busy on` answered `phase: unavailable`, **`reason: no_permission`**: "Unavailable: the agent is not allowed to control the pointer here (macOS: Accessibility)." On 0.4.126 the same cell said `unsupported` (row 37) ✅. The worker logged `enigo init failed — input injection disabled`, and a connected viewer was told its input would not reach the desktop. **A finding:** before that On, `status` said `available: true`. The missing grant only shows when an On probes, so the tray offers a Start that will answer `no_permission`. After the re-grant and a restart (new in 9 s): "Screen Recording + Accessibility both granted", the worker announced `["screen-capture", "input"]`, and the reconnected viewer had input ✅ |
+| 49 | **A misleading tray log line** (fixed with these rows) | both | A successful **Stop** from the tray logged `WARN tray: keep busy did not start reason="stopped_locally"` (15:35:29Z on the PC, 18:23:17Z on the Mac). The outcome match didn't know which way it had toggled. It now logs by the action taken: `stopped`, `started`, or `did not start` only for an On that was refused |
+
 Wrong turns, recorded so nobody repeats them:
 - **On Windows, `roomler exec` is not SYSTEM in session 0.** P10's gate was designed on that belief,
   which `docs/fleet-rpc.md` stated. Exec runs in the worker that holds the agent socket, inside the
@@ -559,13 +569,10 @@ Wrong turns, recorded so nobody repeats them:
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
 Still owed:
-- **Row 37's fix on a release** (#1991, in 0.4.127): with `roomlerd`'s grant switched off at the Mac
-  and the worker restarted, keep busy says `no_permission`. Row 36's fix is confirmed (row 39).
-- **The tray's "Start keep busy" click** (AC14's tray half), in the field, on both platforms. The CLI
-  half is rows 42–43, and the tray's state read is row 45.
-- **P10b on a release**: on a Windows host in SystemContext mode, `roomler exec … roomler keep-busy
-  on` is refused, naming SYSTEM, while the person's own tray and CLI still start it. 0.4.129 (no
-  P10b) admits that exec, which is the negative control to record first.
+- **P10b on a release** (in 0.4.130, released 2026-10-12). On a Windows host in SystemContext mode,
+  `roomler exec … roomler keep-busy on` must be refused, naming SYSTEM, while the person's own tray
+  and CLI still start it. 0.4.129 (no P10b) admits that exec, and that is the negative control to
+  record first. On an attended install, check the person's On still passes the new account check.
 
 Proven so far:
 - macOS: rows 30–37.
@@ -573,6 +580,8 @@ Proven so far:
 - P10 for the person, on a supervised Mac and on Windows: rows 42–43.
 - AC8's 24 h of EDR on the corporate laptop: row 44 (ticked at the close, with its caveats).
 - The tray reads the state on Windows: row 45.
+- The tray's Start and Stop on Windows and on a supervised Mac, and row 37's fix on a release: rows
+  46–48.
 - AC11 and AC12, on prod: rows 25–26.
 - AC4's self-update, and AC9/AC13 on the released 0.4.126: rows 28–29.
 
