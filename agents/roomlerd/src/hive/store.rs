@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use roomler_hive_node::store::{Membership, SearchHit, Store, StoreError};
-use roomler_hive_node::{ChainTip, EventEnvelope, TranscriptEvent};
+use roomler_hive_node::{ChainTip, EventEnvelope, FenceEnd, TranscriptEvent};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
 
@@ -142,11 +142,13 @@ enum Member {
         limit: usize,
         reply: Reply<Vec<SearchHit>>,
     },
-    /// P2c-3 — hold a session as a member, at a fence.
+    /// P2c-3 — hold a session as a member, at a fence; P2e-5b — and keep
+    /// where each fence a promotion superseded ended.
     Join {
         session: String,
         role: &'static str,
         fence: u64,
+        ends: Vec<FenceEnd>,
         reply: Reply<u64>,
     },
     /// P2c-3 — every session held as a member.
@@ -499,20 +501,39 @@ impl StoreHandle {
     /// FR-90 P2c-3 — hold `session` as a member placed in `role`, at
     /// `fence`: the floor rises to it in the same transaction
     /// (`Store::join`). Refused for a purged session, and below the floor.
-    pub(crate) async fn join(
+    ///
+    /// P2e-5b — with `ends`, where each fence a promotion superseded ended,
+    /// kept in that same transaction: below the floor, such a fence's events
+    /// are still taken up to there. A join names the ones the server holds.
+    pub(crate) async fn join_with_ends(
         &self,
         session: &str,
         role: &'static str,
         fence: u64,
+        ends: Vec<FenceEnd>,
     ) -> Result<u64, WriterError> {
         let session = session.to_string();
         self.ask(|reply| Member::Join {
             session,
             role,
             fence,
+            ends,
             reply,
         })
         .await
+    }
+
+    /// A join that names no fence's end: a session no promotion has moved.
+    /// ⚠️ Tests only — a device's join takes the server's ends, every time
+    /// ([`Self::join_with_ends`]).
+    #[cfg(test)]
+    pub(crate) async fn join(
+        &self,
+        session: &str,
+        role: &'static str,
+        fence: u64,
+    ) -> Result<u64, WriterError> {
+        self.join_with_ends(session, role, fence, Vec::new()).await
     }
 
     /// FR-90 P2c-3 — every session this device holds as a member.
@@ -725,9 +746,10 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
             session,
             role,
             fence,
+            ends,
             reply,
         } => {
-            let _ = reply.send(store.join(&session, role, fence));
+            let _ = reply.send(store.join(&session, role, fence, &ends));
         }
         Member::Memberships { reply } => {
             let _ = reply.send(store.memberships());

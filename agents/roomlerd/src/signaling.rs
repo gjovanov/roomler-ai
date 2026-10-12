@@ -4569,22 +4569,27 @@ async fn handle_server_msg(
             session_id,
             fence,
             role,
+            fences,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_replica_join(
                 session_id,
                 fence,
                 role,
+                fences,
                 ctx.is_primary,
                 outbound_tx.clone(),
             );
             // No answer from this build: it does not advertise
             // `hive-replica`, so no server sends it a join.
             #[cfg(not(hive_host))]
-            debug!(
-                session = %session_id, fence, ?role,
-                "rc:hive.replica.join ignored — this build holds no copies"
-            );
+            {
+                let _ = fences;
+                debug!(
+                    session = %session_id, fence, ?role,
+                    "rc:hive.replica.join ignored — this build holds no copies"
+                );
+            }
         }
 
         // FR-90 P2d — serve a stream of a session this device holds to one

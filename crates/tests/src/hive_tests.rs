@@ -2966,13 +2966,34 @@ async fn moved(app: &TestApp, m: &mut Moving) {
         .expect("told to drain");
     send(&mut m.a.ws, drained(&sid, 5, "ab")).await;
     send(&mut m.b.ws, tip_at(&sid, 1, 5, "ab")).await;
-    frames_until(
+    let to = frames_until(
         &mut m.b.ws,
         &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
     )
     .await;
     // Its demote, and its join as a member at the new fence.
-    frames_until(&mut m.a.ws, &["rc:hive.demote", "rc:hive.replica.join"]).await;
+    let from = frames_until(&mut m.a.ws, &["rc:hive.demote", "rc:hive.replica.join"]).await;
+    // P2e-5b — and each join at the new fence names where fence 1 ended, the
+    // drained tip: a member's floor is above every event the session had.
+    let ended = json!([{"fence": 1, "seq": 5, "hash": hash("ab")}]);
+    assert_eq!(
+        join_of(&to)["fences"],
+        ended,
+        "the member's, as the primary"
+    );
+    assert_eq!(
+        join_of(&from)["fences"],
+        ended,
+        "the old primary's, as a member"
+    );
+}
+
+/// The join among `frames`.
+fn join_of(frames: &[Value]) -> &Value {
+    frames
+        .iter()
+        .find(|f| f["t"] == "rc:hive.replica.join")
+        .expect("a join")
 }
 
 /// FR-90 P2e-3 — a start the member refuses after the lease moved moves it
@@ -3012,6 +3033,13 @@ async fn a_moved_start_the_member_refuses_moves_the_lease_back() {
         "{a_frames:?}"
     );
     assert_eq!(a_frames[0]["role"], "primary");
+    // P2e-5b — fence 1 ended at the drained tip, and the member's fence 2
+    // ended where it began: it ran nothing.
+    let ended = json!([
+        {"fence": 1, "seq": 5, "hash": hash("ab")},
+        {"fence": 2, "seq": 5, "hash": hash("ab")},
+    ]);
+    assert_eq!(a_frames[0]["fences"], ended, "the old primary's join");
     assert_eq!(a_frames[1]["from_device_id"], m.a.agent_id.as_str());
     assert_eq!(a_frames[2]["resume"], true);
     let join = read_until(&mut m.b.ws, "rc:hive.replica.join")
@@ -3021,6 +3049,7 @@ async fn a_moved_start_the_member_refuses_moves_the_lease_back() {
         (join["fence"].as_u64(), join["role"].as_str()),
         (Some(3), Some("owner"))
     );
+    assert_eq!(join["fences"], ended, "and the member's");
 
     let s = stored(&app, &sid).await;
     assert_eq!(
@@ -3149,6 +3178,30 @@ async fn a_promotion_is_refused_by_the_gate_it_failed() {
     };
 
     refused(&try_to(m.a.agent_id.clone()).await, "already_primary");
+    // P2e-5b — moved as often as one join can say: one more move, and its
+    // move back, would leave a join naming more ends than a device takes.
+    let marks = |n: usize| -> Vec<Document> {
+        (1..=n as i64)
+            .map(|f| doc! { "fence": f, "seq": 1_i64, "hash": hash("ab") })
+            .collect()
+    };
+    let set_marks = |n: usize| {
+        let (app, sid) = (&app, sid.clone());
+        async move {
+            app.db
+                .collection::<Document>("agent_sessions")
+                .update_one(
+                    doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+                    doc! { "$set": { "fences": marks(n) } },
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let max = roomler_ai_remote_control::hive::replica_limits::MAX_FENCE_MARKS;
+    set_marks(max - 1).await;
+    refused(&try_to(m.more[0].agent_id.clone()).await, "moved_too_often");
+    set_marks(0).await;
     // The owner's own device that holds copies, enrolled after the start: no
     // member.
     let stranger = device(&app, &m.seeded, "mach-promotegate-x", PROMOTES).await;
@@ -3221,6 +3274,7 @@ async fn a_promotion_is_refused_by_the_gate_it_failed() {
         .collect();
     for want in [
         "already_primary",
+        "moved_too_often",
         "not_a_member",
         "device_unsupported",
         "primary_offline",

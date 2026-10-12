@@ -3138,6 +3138,14 @@ pub enum ServerMsg {
         /// cannot name, decoded leniently: it refuses (`other`).
         #[serde(default, deserialize_with = "crate::hive::replica_role_lenient")]
         role: Option<crate::hive::HiveReplicaRole>,
+        /// FR-90 P2e-5b — where each fence a promotion superseded ended, the
+        /// record's `fences`: below its floor, the copy still takes each such
+        /// fence's events up to its mark, so a member that joins after a move,
+        /// or was behind at it, syncs the whole history. At most
+        /// [`crate::hive::replica_limits::MAX_FENCE_MARKS`]; an older daemon
+        /// ignores it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fences: Vec<crate::hive::HiveFenceMark>,
     },
 
     /// FR-90 P2d — serve a stream of a session this device holds to one of
@@ -4338,20 +4346,60 @@ mod tests {
     /// it instead of dropping it unanswered.
     #[test]
     fn hive_replica_join_wire_shape_is_locked() {
-        use crate::hive::HiveReplicaRole;
+        use crate::hive::{HiveFenceMark, HiveReplicaRole};
 
         let sid = ObjectId::new();
         let m = ServerMsg::HiveReplicaJoin {
             session_id: sid,
             fence: 2,
             role: Some(HiveReplicaRole::Archive),
+            fences: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&m).unwrap(),
             serde_json::json!({
                 "t": "rc:hive.replica.join", "session_id": sid.to_hex(), "fence": 2,
                 "role": "archive"
-            })
+            }),
+            "a session no promotion moved carries no marks, as before P2e-5b"
+        );
+        // P2e-5b — where each superseded fence ended, numbers and a hash.
+        let hash = "ab".repeat(32);
+        let marked = ServerMsg::HiveReplicaJoin {
+            session_id: sid,
+            fence: 3,
+            role: Some(HiveReplicaRole::Owner),
+            fences: vec![
+                HiveFenceMark {
+                    fence: 1,
+                    seq: 40,
+                    hash: hash.clone(),
+                },
+                HiveFenceMark {
+                    fence: 2,
+                    seq: 55,
+                    hash: hash.clone(),
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.replica.join", "session_id": sid.to_hex(), "fence": 3,
+                "role": "owner",
+                "fences": [
+                    {"fence": 1, "seq": 40, "hash": hash},
+                    {"fence": 2, "seq": 55, "hash": hash}
+                ]
+            }),
+            "a moved session's join names where each fence ended"
+        );
+        let back: ServerMsg =
+            serde_json::from_value(serde_json::to_value(&marked).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&marked).unwrap(),
+            "the marks come back as they went"
         );
         let unknown = serde_json::json!({
             "t": "rc:hive.replica.join", "session_id": sid.to_hex(), "fence": 2, "role": "witness"

@@ -740,18 +740,22 @@ pub fn stream_enabled() -> bool {
 
 /// FR-90 P2c-3 — `rc:hive.replica.join`: answered with
 /// `rc:hive.replica.join_ack` on the connection it came on, after the
-/// device's own gates ([`replica`]).
+/// device's own gates ([`replica`]). P2e-5b — with `fences`, where each fence
+/// a promotion superseded ended, which a member's store keeps with the join.
 pub fn handle_replica_join(
     session_id: ObjectId,
     fence: u64,
     role: Option<roomler_ai_remote_control::hive::HiveReplicaRole>,
+    fences: Vec<roomler_ai_remote_control::hive::HiveFenceMark>,
     is_primary: bool,
     tx: mpsc::Sender<ClientMsg>,
 ) {
     tokio::spawn(async move {
         let (refused, detail) = match global() {
             Some(sup) => {
-                let answer = sup.answer_join(is_primary, session_id, fence, role).await;
+                let answer = sup
+                    .answer_join(is_primary, session_id, fence, role, &fences)
+                    .await;
                 // P2d-3b — a copy now held asks for its stream.
                 let member = role.is_some_and(|r| {
                     r != roomler_ai_remote_control::hive::HiveReplicaRole::Primary
@@ -5800,30 +5804,36 @@ done
 
         let primary = Some(HiveReplicaRole::Primary);
         assert_eq!(
-            r.sup.answer_join(false, sid, 1, primary).await.0,
+            r.sup.answer_join(false, sid, 1, primary, &[]).await.0,
             Some(HiveJoinRefusal::SecondaryOrg)
         );
         assert_eq!(
-            r.sup.answer_join(true, ObjectId::new(), 1, primary).await.0,
+            r.sup
+                .answer_join(true, ObjectId::new(), 1, primary, &[])
+                .await
+                .0,
             Some(HiveJoinRefusal::Other),
             "a session this device does not run"
         );
         assert_eq!(
-            r.sup.answer_join(true, sid, 2, primary).await.0,
+            r.sup.answer_join(true, sid, 2, primary, &[]).await.0,
             Some(HiveJoinRefusal::Other),
             "a fence past the one it runs"
         );
         assert_eq!(
-            r.sup.answer_join(true, sid, 0, primary).await.0,
+            r.sup.answer_join(true, sid, 0, primary, &[]).await.0,
             Some(HiveJoinRefusal::StaleFence),
             "a fence before the one it runs"
         );
         assert!(!runs_replicated(&r, sid), "a refused join turns nothing on");
         assert!(!hosted_on_disk(&r)[0].replicated);
 
-        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
         assert_eq!(
-            r.sup.answer_join(true, sid, 1, primary).await,
+            r.sup.answer_join(true, sid, 1, primary, &[]).await,
+            (None, None)
+        );
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary, &[]).await,
             (None, None),
             "idempotent"
         );
@@ -5874,7 +5884,10 @@ done
         assert!(r.sup.start(o, true).await.refused.is_none());
         assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
         let primary = Some(HiveReplicaRole::Primary);
-        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary, &[]).await,
+            (None, None)
+        );
         go_down(&r, sid).await;
         restart(&mut r, |_| {});
         let (_, manifest) = until_manifest(&mut r).await;
@@ -5895,7 +5908,10 @@ done
         host(&r, sid, |_| {});
         next_daemon(&mut r, |_| {});
         let primary = Some(HiveReplicaRole::Primary);
-        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary, &[]).await,
+            (None, None)
+        );
         assert!(hosted_on_disk(&r)[0].replicated);
         connect(&mut r);
         let (_, manifest) = until_manifest(&mut r).await;
@@ -5921,7 +5937,10 @@ done
         next_daemon(&mut r, |_| {});
         assert!(!o.replicated, "the order as the resume read it");
         let primary = Some(HiveReplicaRole::Primary);
-        assert_eq!(r.sup.answer_join(true, sid, 1, primary).await, (None, None));
+        assert_eq!(
+            r.sup.answer_join(true, sid, 1, primary, &[]).await,
+            (None, None)
+        );
         assert!(!r.sup.holds_live(sid), "not live yet");
         assert_eq!(r.sup.start(o, true).await, Answer::accepted("dev"));
         assert!(runs_replicated(&r, sid), "the join is kept");
