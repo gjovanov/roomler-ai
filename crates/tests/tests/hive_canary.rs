@@ -28,15 +28,33 @@
 //! canary reached the server — a crashing harness's stderr tail rode the
 //! `ended` detail into the session record and the room's ended note. The
 //! negative controls are in the FR-90 step log.
+//!
+//! # Two devices (P2d-6)
+//!
+//! With the replicaset on, each session is placed on a second device that
+//! holds copies, and every canary must reach ITS store too, over the replica
+//! stream (P2d-3), while the server carries the stream's signalling and the
+//! member's tips. The member is a process of its own, because a process
+//! holds one supervisor: this test binary again, asked to be a device by
+//! [`member_device_process`], which an ordinary run passes at once. Its
+//! store is read after it is gone.
+//!
+//! ⚠️ The stream rides `direct` here, on loopback: the tests build carries
+//! no overlay, so neither device has a DERP connection, and no stream frame
+//! crosses the server's `/derp`. That the `derp` rung carries ciphertext
+//! only is held by the device's own tests (P2d-2c); the server's relay, in
+//! the field run (P2k).
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
 use futures::TryStreamExt;
+use roomler_ai_tests::fixtures::seed::SeededTenant;
 use roomler_ai_tests::fixtures::test_app::TestApp;
 use serde_json::{Value, json};
 use tracing::field::{Field, Visit};
@@ -230,6 +248,102 @@ fn what_a_session_says_reaches_its_device_and_nothing_the_server_keeps() {
     }
 }
 
+/// P2d-6 — set to the member's directory when the scenario starts this
+/// binary as the member device.
+const MEMBER_ENV: &str = "HIVE_CANARY_MEMBER";
+
+/// P2d-6 — the member device's process: this binary again, a device that
+/// holds copies (`hive_replica`, agent sessions off), from the config the
+/// scenario enrolled and saved in its directory, until its stdin closes. An
+/// ordinary run passes it at once.
+#[test]
+fn member_device_process() {
+    let Ok(dir) = std::env::var(MEMBER_ENV) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let joined = std::thread::Builder::new()
+        .name("hive-canary-member".into())
+        .stack_size(16 << 20)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let cfg =
+                    roomlerd::config::load(&dir.join("config.toml")).expect("the member's config");
+                roomlerd::hive::init_as_daemon(
+                    &cfg,
+                    &dir.join("hive.db"),
+                    &dir.join("run"),
+                    &dir.join("home"),
+                )
+                .expect("the member's launcher");
+                let (stop, stop_rx) = tokio::sync::watch::channel(false);
+                let device = spawn_device(cfg, stop_rx);
+                // Until the scenario closes our stdin.
+                let _ = tokio::task::spawn_blocking(|| {
+                    let mut sink = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+                })
+                .await;
+                let _ = stop.send(true);
+                let _ = tokio::time::timeout(Duration::from_secs(10), device).await;
+            });
+        })
+        .unwrap()
+        .join();
+    if let Err(panic) = joined {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// P2d-6 — where the primary's store ends `sid`, as a viewer hears it: the
+/// test never opens a store a running device writes.
+async fn primary_tip(ws: &mut UserWs, sid: &str) -> Option<u64> {
+    let mut b = view(ws, sid).await;
+    b.send(json!({"op": "hello"})).await;
+    let tip = b.recv_op("hello").await["tip"].as_u64();
+    b.close(ws).await;
+    tip
+}
+
+/// P2d-6 — whether `member`'s copy of `sid`, as the server last heard it,
+/// ends at `want`, the primary's tip, within [`WAIT`].
+async fn member_caught_up(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    sid: &str,
+    member: &str,
+    want: Option<u64>,
+) -> bool {
+    let deadline = Instant::now() + WAIT;
+    while want.is_some() && Instant::now() < deadline {
+        let s = session(app, seeded, sid).await;
+        let has = s["replicaset"]["members"]
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["device_id"] == member))
+            .and_then(|m| m["tip"]["seq"].as_u64());
+        if has == want {
+            return true;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    false
+}
+
+/// P2d-6 — every event of `sid` the store at `db` holds, its JSON as kept.
+fn copy_of(db: &Path, sid: &str) -> String {
+    let store = roomler_hive_node::store::Store::open(db).expect("the member's store");
+    let events = store.page(sid, 0, 100_000).expect("the member's copy");
+    events
+        .iter()
+        .map(|e| e.event_json.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn scenario(watch: Watch) {
     let prompt_canary = random("canaryprompt");
     let tool_canary = random("canarytool");
@@ -251,8 +365,10 @@ async fn scenario(watch: Watch) {
 
     // The API's per-IP limiter is not what this test is about, and its 429
     // would end a run before the server's side is searched.
+    // P2d-6 — the replicaset on: each session is placed on the member too.
     let app = TestApp::spawn_with_settings(|s| {
         s.modules.hive = true;
+        s.hive.replicaset = true;
         s.app.rate_limit_per_sec = 1_000;
         s.app.rate_limit_burst = 10_000;
     })
@@ -295,6 +411,30 @@ async fn scenario(watch: Watch) {
     let (stop_device, stop_rx) = tokio::sync::watch::channel(false);
     let device_task = spawn_device(cfg, stop_rx);
     wait_online(&app, &seeded, &device).await;
+
+    // P2d-6 — the member: a device that holds copies, in a process of its
+    // own, online before the first session so placement takes it.
+    let member_dir = dir.path().join("member");
+    std::fs::create_dir_all(member_dir.join("home")).unwrap();
+    let mut member_cfg = enrol(&app, &seeded, "hive-canary-member").await;
+    member_cfg.hive_replica = true;
+    let member = member_cfg.agent_id.clone();
+    roomlerd::config::save(&member_dir.join("config.toml"), &member_cfg)
+        .expect("the member's config");
+    let mut member_process = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "member_device_process",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MEMBER_ENV, &member_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the member's process");
+    wait_online(&app, &seeded, &member).await;
     let mut ws = UserWs::open(&app, &seeded.admin.access_token).await;
 
     // ── Session 1: a prompt over the peer, and a tool's output ──────────────
@@ -409,6 +549,16 @@ async fn scenario(watch: Watch) {
         .await;
     let ended2 = reached(&app, &seeded, &sid2, "ended").await;
     b2.close(&mut ws).await;
+
+    // P2d-6 — the member follows both sessions to their ends, over the
+    // stream, while the primary is still up to serve them; then it goes.
+    let want1 = primary_tip(&mut ws, &sid1).await;
+    let want2 = primary_tip(&mut ws, &sid2).await;
+    let caught1 = member_caught_up(&app, &seeded, &sid1, &member, want1).await;
+    let caught2 = member_caught_up(&app, &seeded, &sid2, &member, want2).await;
+    drop(member_process.stdin.take());
+    let member_exit = tokio::time::timeout(Duration::from_secs(20), member_process.wait()).await;
+
     let _ = stop_device.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), device_task).await;
 
@@ -562,4 +712,39 @@ async fn scenario(watch: Watch) {
         s2["detail"].as_str().is_some_and(|d| d.contains("code 3")),
         "the server knows HOW it ended: {s2}"
     );
+
+    // ── The member's side (P2d-6): every canary in its copy too ─────────────
+    assert!(
+        matches!(&member_exit, Ok(Ok(s)) if s.success()),
+        "the member's process ended cleanly: {member_exit:?}"
+    );
+    assert!(
+        caught1 && caught2,
+        "the member's copies reached the primary's tips: session 1 {caught1}, session 2 {caught2}"
+    );
+    let member_db = member_dir.join("hive.db");
+    let (copy1, copy2) = (copy_of(&member_db, &sid1), copy_of(&member_db, &sid2));
+    // A replicated session checkpoints at each turn's end, and a member
+    // applies a checkpoint only once it holds every blob it names: its
+    // checkpoint is the blobs' crossing too.
+    assert!(
+        copy1.contains("\"kind\":\"checkpoint\""),
+        "a checkpoint reached the member: {copy1}"
+    );
+    assert!(
+        !copy1.contains("was not taken"),
+        "and every checkpoint was taken: {copy1}"
+    );
+    for (what, canary, copy) in [
+        ("the prompt", &prompt_canary, &copy1),
+        ("the tool's output", &tool_canary, &copy1),
+        ("what an approval would run", &approval_canary, &copy1),
+        ("what a driver told the model", &deny_canary, &copy1),
+        ("the harness's stderr", &stderr_canary, &copy2),
+    ] {
+        assert!(
+            copy.contains(canary.as_str()),
+            "the member's copy holds {what}"
+        );
+    }
 }
