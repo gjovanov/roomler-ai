@@ -590,18 +590,47 @@ screen, and the viewer's own watchdog re-creates each one. A sampler on the gues
 | the person answers while the viewer waits | — | the capture 1.6 s after the click, the picture in the viewer, one request in all, no restore token |
 | the person answers after the viewer's last session ended | — | dropped: no pump took it. The restore token it left opened the viewer's next session with no dialog |
 
-⚠️ **The viewer half is still owed** (P2d-2). The viewer still re-creates its
-session every 10 s while no frames arrive. Each new session now joins the same
-request instead of raising a dialog, but the person at the viewer sees a blank
-canvas, not "waiting for the person at the screen". A request nobody answers
-ends at its own 120 s deadline, and the next session raises one dialog again: at
-most one dialog per two minutes, where it was one every 10–20 s.
-
 ⚠️ Two controllers opening the same host at once: the older one is superseded,
 not served, and reads the reason as a `backend_error`. A pump registers its shared
 pipeline (P5, `media_share`) only once its capture has opened, so while the
 request is pending the second viewer has nothing to join. That is acceptable for
 a path where one person at the screen allows one share, but it is a known edge.
+
+### 4.7 The viewer is told, and waits (FR-93 P2d-2)
+
+P2d-1 left the viewer guessing. It still re-created its session every 10 s
+while no frames arrived. Each new session joined the one request, so no second
+dialog appeared, but the canvas stayed blank. An answer that came while the
+viewer sat in its re-create back-off reached a session already gone. The
+picture then came from the restore token, one session later (§4.6's last row).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as viewer
+    participant P as the session's pump
+    participant K as broker
+    P->>K: open (blocking pool, with the pump's hook)
+    Note over K: 2 s and still parked (a restore token answers sooner, with no dialog)
+    K-->>P: the hook: the request gives up in N ms
+    P->>V: rc:media-waiting {for: person_at_screen, waits_ms, hint} (control DC, retried)
+    Note over V: "Waiting for the person at the screen to share it."<br/>the watchdog counts no stall until the deadline
+    K-->>P: the person shared: the capture
+    P->>V: frames; the first one clears the notice
+```
+
+| | what | where |
+|---|---|---|
+| the hook | `capture::open_default_async` takes an `OnOpenWait`, held for the open's blocking thread by `ParkHook`, which clears it on drop, so a pooled thread never carries one into the next open, not even after a panic | `capture/mod.rs` (`ParkHook`, `tell_open_waiting`) |
+| when it fires | a waiter still parked `TELL_AFTER` (2 s) in fires it once, with the **request's** start, so a session that joins a pending request is told that dialog's deadline, not one counted from its own join | `portal/pending.rs` (`Request::wait`, `TELL_AFTER`) |
+| the message | `rc:media-waiting {"for":"person_at_screen","waits_ms":N,"hint":…}`, retried until the control channel takes it, and never past the dialog's own deadline. A duration, not a time of day, so the viewer reads it on its own clock | `peer.rs` (`media_waiting_payload`, `media_waiting_hook`) |
+| the viewer | the deadline is set at receipt. Until it passes, plus a 10 s grace (`RC_MEDIA_WAITING_GRACE_MS`), the watchdog counts no stall and re-creates nothing. A session that ends while waiting is not dead air | `useRemoteControl.ts` (`agentIsWaiting`, the watchdog tick, `isDeadAir`) |
+| what clears it | the first frame; `rc:media-unavailable` (the wait ended without an answer, and that message says why); a new connect | the same |
+| kill switch | `ROOMLERD_MEDIA_WAITING=0` sends nothing, and the viewer behaves as before P2d-2. An older viewer ignores the message (an unknown `t`) | `peer.rs` |
+
+⚠️ A request nobody answers still ends at its own 120 s deadline. The viewer
+then shows the reason, and only a new connect raises another dialog: at most one
+per two minutes, where it was one every 10–20 s before P2d-1.
 
 ## 5. The mutter arm (FR-45 P5) — the unattended sibling
 
