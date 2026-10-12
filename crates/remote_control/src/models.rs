@@ -710,6 +710,20 @@ pub enum RpcCap {
     /// `hive` would wait out every bound of a promotion and leave the
     /// primary drained. Equality-matched, locked by test.
     HivePromote,
+    /// FR-90 P2f-1a — the agent takes part in a teleport, a move to a device
+    /// that holds no copy of the session yet, at either end: as the target,
+    /// a `rc:hive.prepare` with `teleport` passes every start gate but the
+    /// copy, and admits that one session's `teleport` join whatever its
+    /// owner's `hive_replica`; as the primary, a join in the primary's role
+    /// takes the session's first checkpoint at once when no turn runs, and
+    /// says where its copy ends either way. A build property, like
+    /// `hive-promote`: the device still refuses what its own gates refuse.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
+    /// refuses a teleport's prepare for want of a copy, and its primary says
+    /// nothing at a join, so a server that read it out of `hive` would wait
+    /// out a teleport's every bound. Equality-matched, locked by test.
+    HiveTeleport,
 }
 
 impl RpcCap {
@@ -739,11 +753,12 @@ impl RpcCap {
             Self::HiveStream => "hive-stream",
             Self::HiveLease => "hive-lease",
             Self::HivePromote => "hive-promote",
+            Self::HiveTeleport => "hive-teleport",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 18] = [
+    pub const ALL: [RpcCap; 19] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -762,6 +777,7 @@ impl RpcCap {
         Self::HiveStream,
         Self::HiveLease,
         Self::HivePromote,
+        Self::HiveTeleport,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4767,6 +4783,7 @@ mod tests {
         assert_eq!(RpcCap::HiveStream.wire(), "hive-stream");
         assert_eq!(RpcCap::HiveLease.wire(), "hive-lease");
         assert_eq!(RpcCap::HivePromote.wire(), "hive-promote");
+        assert_eq!(RpcCap::HiveTeleport.wire(), "hive-teleport");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4784,7 +4801,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 11] = [
+        const KNOWN: [(RpcCap, RpcCap); 12] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4814,6 +4831,9 @@ mod tests {
             // FR-90 P2e-3 — nor "takes part in a promotion". Locked by
             // `hive_promote_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HivePromote),
+            // FR-90 P2f-1a — nor "takes part in a teleport". Locked by
+            // `hive_teleport_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveTeleport),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5192,6 +5212,36 @@ mod tests {
         assert!(!promotes.has_rpc(RpcCap::HiveLease));
         assert_eq!(RpcCap::from_wire("hive-promote"), Some(RpcCap::HivePromote));
         assert!(RpcCap::from_wire("hive-promotes").is_none());
+    }
+
+    /// FR-90 P2f-1a — taking part in a teleport is a promise of its own: an
+    /// agent that takes part in a promotion (P2e-3) refuses a teleport's
+    /// prepare for want of a copy, and its primary says nothing at a join, so
+    /// a server that read the one out of the other would wait out a
+    /// teleport's every bound.
+    #[test]
+    fn hive_teleport_is_a_promise_of_its_own() {
+        let promotes = AgentCaps {
+            rpc: vec![
+                "hive".into(),
+                "hive-stream".into(),
+                "hive-lease".into(),
+                "hive-promote".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(!promotes.has_rpc(RpcCap::HiveTeleport));
+        let teleports = AgentCaps {
+            rpc: vec!["hive".into(), "hive-teleport".into()],
+            ..Default::default()
+        };
+        assert!(teleports.has_rpc(RpcCap::HiveTeleport));
+        assert!(!teleports.has_rpc(RpcCap::HivePromote));
+        assert_eq!(
+            RpcCap::from_wire("hive-teleport"),
+            Some(RpcCap::HiveTeleport)
+        );
+        assert!(RpcCap::from_wire("hive-teleports").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

@@ -136,6 +136,12 @@ const MEMORY_PENDING: usize = 64;
 /// its re-send on connect), as it does core memory.
 const MOVE_WAIT: Duration = MEMORY_WAIT;
 const MOVE_PENDING: usize = MEMORY_PENDING;
+/// P2f-1a — how long a teleport's prepare admits its session's join, and
+/// how many teleports a device is prepared for at once: the join follows the
+/// prepare's answer, and comes again at each connection until it is
+/// answered. A later prepare of the same session replaces its admission.
+const TELEPORT_ADMISSION: Duration = Duration::from_secs(promote_limits::TELEPORT_ADMISSION_SECS);
+const TELEPORTS_PENDING: usize = MEMORY_PENDING;
 /// P2e-5 — the most checkpoints a moved session's copy is put in place from:
 /// a history only grows, so its chunks span every checkpoint since it began.
 /// A longer chain is refused whole, never put in place cut short.
@@ -324,6 +330,10 @@ enum Input {
     /// P2e-4 — the server's word at the run's fence: the lease stayed, and
     /// the prompts held by the drain begin.
     Undrain,
+    /// P2f-1a — a primary's join turned the running session replicated: its
+    /// first checkpoint now when no turn runs, and where its copy ends told
+    /// either way ([`checkpoint_now`]).
+    Replicated,
 }
 
 /// P2e-4 — how a drain ended, as the session's task tells it.
@@ -484,6 +494,10 @@ pub struct Supervisor {
     memory: Mutex<HashMap<(ObjectId, u64), (CoreMemory, Instant)>>,
     /// P2e-5 — moves waiting for their start, by (session, fence).
     moves: Mutex<HashMap<(ObjectId, u64), (Moved, Instant)>>,
+    /// P2f-1a — teleports this device was prepared for, by session: the
+    /// fence the prepare named (the start's), and when it passed. What admits
+    /// that session's join in the teleport's role ([`Self::teleport_admitted`]).
+    teleports: Mutex<HashMap<ObjectId, (u64, Instant)>>,
     /// P2e-5 — this device's own enrollment, which tells a move back (the
     /// session comes back where its state is) from a move here.
     agent_id: Option<ObjectId>,
@@ -564,11 +578,19 @@ pub fn handle_move(m: Moved, is_primary: bool) {
 
 /// FR-90 P2e-5 — `rc:hive.prepare`: could this device take the session over
 /// ([`Supervisor::prepare`])? Answered with `rc:hive.prepare_ack` on `tx`, the
-/// connection it came on.
-pub fn handle_prepare(order: StartOrder, is_primary: bool, tx: mpsc::Sender<ClientMsg>) {
+/// connection it came on. P2f-1a — a teleport's: could it run the session,
+/// once it holds the copy it takes next ([`Supervisor::prepare_teleport`])?
+pub fn handle_prepare(
+    order: StartOrder,
+    teleport: bool,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
     let sup = global();
     tokio::spawn(async move {
         let (answer, tip) = match sup {
+            // No tip: the copy is still to come.
+            Some(sup) if teleport => (sup.prepare_teleport(&order, is_primary).await, None),
             Some(sup) => sup.prepare_with_tip(&order, is_primary).await,
             None => (
                 Answer::refused(
@@ -1250,6 +1272,7 @@ impl Supervisor {
             going_down: AtomicBool::new(false),
             memory: Mutex::new(HashMap::new()),
             moves: Mutex::new(HashMap::new()),
+            teleports: Mutex::new(HashMap::new()),
             agent_id: None,
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
@@ -1361,6 +1384,62 @@ impl Supervisor {
     /// after. A device that does not know its own id puts the copy in place.
     fn moved_from_elsewhere(&self, m: &Moved) -> bool {
         self.agent_id != Some(m.from_device_id)
+    }
+
+    /// P2f-1a — a teleport's prepare passed for `session`, naming the start's
+    /// `fence`: its join is admitted for [`TELEPORT_ADMISSION`]. A later
+    /// prepare of the same session replaces it; past
+    /// [`TELEPORTS_PENDING`], the oldest goes.
+    fn admit_teleport(&self, session: ObjectId, fence: u64) {
+        let mut held = self.teleports.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|_, (_, at)| at.elapsed() < TELEPORT_ADMISSION);
+        if held.len() >= TELEPORTS_PENDING
+            && !held.contains_key(&session)
+            && let Some(oldest) = held.iter().min_by_key(|(_, (_, at))| *at).map(|(s, _)| *s)
+        {
+            held.remove(&oldest);
+        }
+        info!(session = %session, fence, "hive: prepared for a teleport — its join is admitted");
+        held.insert(session, (fence, Instant::now()));
+    }
+
+    /// P2f-1a — whether a join of `session` at `fence` in the teleport's role
+    /// follows a teleport's prepare that passed here: one that named the
+    /// start's fence, one past the join's (the record's fence, before the
+    /// move), within [`TELEPORT_ADMISSION`]. A join nobody prepared this
+    /// device for is no teleport's: whether it may RUN the session is the
+    /// prepare's to ask.
+    fn teleport_admitted(&self, session: ObjectId, fence: u64) -> bool {
+        self.teleports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .is_some_and(|(prepared, at)| {
+                fence.checked_add(1) == Some(*prepared) && at.elapsed() < TELEPORT_ADMISSION
+            })
+    }
+
+    /// P2f-1a — whether this device is prepared for a teleport now: it holds
+    /// that copy to tell the server about, whatever its owner's
+    /// `hive_replica` says ([`Self::reports_copies`]).
+    fn prepared_for_teleport(&self) -> bool {
+        self.teleports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|(_, at)| at.elapsed() < TELEPORT_ADMISSION)
+    }
+
+    /// P2f-1a — the session launched here at `fence`: a teleport prepared at
+    /// that fence or before is done with.
+    fn forget_teleport(&self, session: ObjectId, fence: u64) {
+        let mut held = self.teleports.lock().unwrap_or_else(|e| e.into_inner());
+        if held
+            .get(&session)
+            .is_some_and(|(prepared, _)| *prepared <= fence)
+        {
+            held.remove(&session);
+        }
     }
 
     /// P1e — the core memory that came for this start, once.
@@ -1646,6 +1725,7 @@ impl Supervisor {
                 if moved.is_some() {
                     self.forget_move(order.session_id, order.fence);
                 }
+                self.forget_teleport(order.session_id, order.fence);
                 Answer::accepted(&account)
             }
             Err((r, detail)) => Answer::refused(r, detail),
@@ -1807,6 +1887,36 @@ impl Supervisor {
     /// launched, no word kept. And the copy: this device holds the session's
     /// checkpoints, which a moved start is put in place from.
     pub(crate) async fn prepare(self: &Arc<Self>, order: &StartOrder, is_primary: bool) -> Answer {
+        self.prepare_as(order, is_primary, false).await
+    }
+
+    /// FR-90 P2f-1a — `rc:hive.prepare` with `teleport`: could this device
+    /// run the session at `order.fence`, once it holds the copy it takes
+    /// next? Every gate [`Self::prepare`] applies but the copy. One that
+    /// passes admits that session's join in the teleport's role for
+    /// [`TELEPORT_ADMISSION`] ([`Self::teleport_admitted`]), whatever the
+    /// owner's `hive_replica`: the gates that let a device RUN a session are
+    /// these, and a device that runs it holds its copy anyway.
+    pub(crate) async fn prepare_teleport(
+        self: &Arc<Self>,
+        order: &StartOrder,
+        is_primary: bool,
+    ) -> Answer {
+        let answer = self.prepare_as(order, is_primary, true).await;
+        if answer.refused.is_none() {
+            self.admit_teleport(order.session_id, order.fence);
+        }
+        answer
+    }
+
+    /// [`Self::prepare`], and for a teleport ([`Self::prepare_teleport`])
+    /// without the copy: it is still to come.
+    async fn prepare_as(
+        self: &Arc<Self>,
+        order: &StartOrder,
+        is_primary: bool,
+        teleport: bool,
+    ) -> Answer {
         if !is_primary {
             return Answer::refused(
                 HiveRefusal::HiveDisabled,
@@ -1875,18 +1985,21 @@ impl Supervisor {
             Ok(s) => s.clone(),
             Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e.clone()),
         };
-        match store
-            .last_of_kind(&order.session_id.to_hex(), "checkpoint")
-            .await
-        {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Answer::refused(
-                    HiveRefusal::Other,
-                    "this device holds no copy of the session to take it over from",
-                );
+        // P2f-1a — a teleport's copy comes after its prepare.
+        if !teleport {
+            match store
+                .last_of_kind(&order.session_id.to_hex(), "checkpoint")
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Answer::refused(
+                        HiveRefusal::Other,
+                        "this device holds no copy of the session to take it over from",
+                    );
+                }
+                Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e),
             }
-            Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e),
         }
         if matches!(self.launcher, Launcher::AsMappedAccount)
             && let Err((r, detail)) =
@@ -4794,6 +4907,12 @@ async fn run(
                 }
                 Some(Input::Drain { reply }) => task.begin_drain(reply),
                 Some(Input::Undrain) => task.undrain().await,
+                Some(Input::Replicated) => {
+                    if let Err(reason) = checkpoint_now(&mut task, &mut input).await {
+                        stopped = Some(reason);
+                        break;
+                    }
+                }
                 // The supervisor let go of the session: end it.
                 None => {
                     stopped = Some("supervisor".into());
@@ -4905,6 +5024,9 @@ async fn checkpoint_or_stop(
                             info!(session = %task.session, fence = task.fence, "hive: the drain is lifted");
                         }
                     }
+                    // P2f-1a — the checkpoint under way is the one it asks
+                    // for, and its tip is told once it is kept.
+                    Some(Input::Replicated) => {}
                     None => return Err("supervisor".into()),
                 },
             }
@@ -4924,6 +5046,36 @@ async fn checkpoint_or_stop(
             Ok(Checkpointed::Failed)
         }
     }
+}
+
+/// FR-90 P2f-1a — a primary's join turned the running session replicated
+/// ([`Input::Replicated`]). With no turn running, no checkpoint due and no
+/// drain under way, its first checkpoint is taken now, and a member that
+/// joins holds the session's files without waiting for its next turn to end;
+/// otherwise that turn's end, or the drain, takes it. Where its copy ends is
+/// told either way: a teleport waits for its target's copy to get there
+/// before it drains the session. `Err(reason)` when stopped.
+async fn checkpoint_now(
+    task: &mut Task<'_>,
+    input: &mut mpsc::Receiver<Input>,
+) -> Result<(), String> {
+    if task.current.is_some() || task.checkpoint_due || task.drain.is_some() {
+        task.sup.report_tip(task.session).await;
+        return Ok(());
+    }
+    match checkpoint_or_stop(task, input).await? {
+        // Its tip was told as it was kept. A drain that began meanwhile
+        // takes it for its own, as it takes a turn's end's.
+        Checkpointed::Kept => {
+            if let Some(d) = task.drain.as_mut() {
+                d.kept = true;
+            }
+        }
+        Checkpointed::Failed => task.sup.report_tip(task.session).await,
+        Checkpointed::NotStarted => {}
+    }
+    task.next_prompt().await;
+    Ok(())
 }
 
 /// P2e-4 — the drain ends, with no turn left to wait for: a replicated
@@ -5900,12 +6052,50 @@ done
             .is_some_and(|l| l.replicated.load(Ordering::SeqCst))
     }
 
+    /// The checkpoints the rig's store holds for `sid`: (number, turn).
+    fn checkpoints_of(r: &Rig, sid: ObjectId) -> Vec<(u64, u32)> {
+        r.store
+            .events(&sid.to_hex())
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Checkpoint(c) => Some((c.n, c.turn)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// FR-90 P2f-1a — the next `rc:hive.replica.tip` for `sid` within 10 s,
+    /// as the newest checkpoint it names (`Some(None)`: a tip naming none);
+    /// `None` when no tip came, for the test's own assertion to say so.
+    async fn tip_told(
+        r: &mut Rig,
+        sid: ObjectId,
+    ) -> Option<Option<roomler_ai_remote_control::hive::HiveCheckpointMark>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, r.reports.recv())
+                .await
+                .ok()??;
+            if let ClientMsg::HiveReplicaTip {
+                session_id,
+                checkpoint,
+                ..
+            } = msg
+                && session_id == sid
+            {
+                return Some(checkpoint);
+            }
+        }
+    }
+
     /// P2c-4 — a session that started alone takes no checkpoint until its
-    /// primary's join; from the next turn's end it does, and says where its
-    /// copy ends. Its record keeps it for a restart, and the copies the
-    /// device reports include it. The join is idempotent; at another fence,
-    /// for a session the device does not run, or on a secondary org's
-    /// connection, it is refused and turns nothing on.
+    /// primary's join. P2f-1a — the join takes the first one at once, the
+    /// session idle, and says where its copy ends with it; a join again takes
+    /// none, and says where its copy ends; from then on each turn's end takes
+    /// one. Its record keeps it for a restart, and the copies the device
+    /// reports include it. At another fence, for a session the device does
+    /// not run, or on a secondary org's connection, the join is refused and
+    /// turns nothing on.
     #[tokio::test]
     async fn a_primarys_join_turns_checkpoints_on_for_a_session_already_running() {
         use super::super::checkpointer::Runner;
@@ -5925,16 +6115,7 @@ done
         let sid = o.session_id;
         assert!(r.sup.start(o, true).await.refused.is_none());
         assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
-        let checkpoints = |r: &Rig| {
-            r.store
-                .events(&sid.to_hex())
-                .iter()
-                .filter_map(|e| match e {
-                    TranscriptEvent::Checkpoint(c) => Some((c.n, c.turn)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
+        let checkpoints = |r: &Rig| checkpoints_of(r, sid);
         r.sup.prompt(sid, None, "alone".into()).unwrap();
         until_idle(&mut r, sid).await;
         assert!(checkpoints(&r).is_empty(), "alone: no checkpoint");
@@ -5970,11 +6151,27 @@ done
             r.sup.answer_join(true, sid, 1, primary, &[]).await,
             (None, None)
         );
+        let told = tip_told(&mut r, sid).await;
+        assert_eq!(
+            checkpoints(&r),
+            [(1, 1)],
+            "at once, no turn running: after the turn that ran alone"
+        );
+        assert!(
+            matches!(told, Some(Some(_))),
+            "and where its copy ends, that checkpoint with it: {told:?}"
+        );
         assert_eq!(
             r.sup.answer_join(true, sid, 1, primary, &[]).await,
             (None, None),
             "idempotent"
         );
+        assert_eq!(
+            tip_told(&mut r, sid).await,
+            told,
+            "a join again says where the copy ends"
+        );
+        assert_eq!(checkpoints(&r), [(1, 1)], "and takes no checkpoint");
         assert!(runs_replicated(&r, sid));
         assert!(r.sup.reports_copies());
         assert!(hosted_on_disk(&r)[0].replicated, "kept for a restart");
@@ -5987,8 +6184,8 @@ done
         let seen = until_idle(&mut r, sid).await;
         assert_eq!(
             checkpoints(&r),
-            [(1, 2)],
-            "the next turn's end, numbered from 1"
+            [(1, 1), (2, 2)],
+            "and each turn's end from then on"
         );
         assert!(
             seen.iter().any(|m| matches!(m,
@@ -6067,12 +6264,56 @@ done
         );
     }
 
+    /// FR-90 P2f-1a — a primary's join while a turn runs takes no checkpoint
+    /// in the middle of it: it says at once where the copy ends, and the
+    /// turn's end takes the first checkpoint.
+    #[tokio::test]
+    async fn a_primarys_join_while_a_turn_runs_says_where_the_copy_ends_and_its_end_checkpoints() {
+        use roomler_ai_remote_control::hive::HiveReplicaRole;
+        let mut r = moving_rig(ObjectId::new(), 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, None, "hold on".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(
+            r.sup
+                .answer_join(true, sid, 1, Some(HiveReplicaRole::Primary), &[])
+                .await,
+            (None, None)
+        );
+        assert_eq!(
+            tip_told(&mut r, sid).await,
+            Some(None),
+            "where the copy ends, at once, and no checkpoint in it yet"
+        );
+        assert!(checkpoints_of(&r, sid).is_empty(), "none mid-turn");
+        std::fs::write(r.root.path().join("work").join(".release"), "").unwrap();
+        let seen = until_idle(&mut r, sid).await;
+        assert_eq!(
+            checkpoints_of(&r, sid),
+            [(1, 1)],
+            "the turn's end takes the first"
+        );
+        assert!(
+            seen.iter().any(|m| matches!(m,
+                ClientMsg::HiveReplicaTip { session_id, checkpoint: Some(_), .. }
+                    if *session_id == sid)),
+            "and says where the copy ends with it: {seen:?}"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
     /// P2c-4 — a primary's join holds across the restart after it: the next
     /// daemon resumes the session replicated, from its record.
     #[tokio::test]
     async fn a_primarys_join_holds_across_a_restart() {
         use roomler_ai_remote_control::hive::HiveReplicaRole;
-        let mut r = rig(true, 4);
+        // P2f-1a — the join checkpoints the idle session at once: in this
+        // process, as the rig's own sessions do.
+        let mut r = moving_rig(ObjectId::new(), 4);
         let o = order(&r);
         let sid = o.session_id;
         assert!(r.sup.start(o, true).await.refused.is_none());
@@ -9294,6 +9535,132 @@ done
         assert!(r.sup.runs_at(bid, 1), "the prepare stopped nothing");
         r.sup.stop(bid, 1, "owner".into());
         until_ended(&mut r, bid).await;
+    }
+
+    /// FR-90 P2f-1a — a teleport's prepare asks every gate a promotion's asks
+    /// but the copy, which the device takes after it. One that passes admits
+    /// that session's join in the teleport's role, whatever the owner's
+    /// `hive_replica` (off in the rig): at the record's fence, the one before
+    /// the start's the prepare named, and for that session only, until the
+    /// session launches here or the admission runs out. A refused prepare
+    /// admits nothing, and neither does a promotion's. A device prepared for a
+    /// teleport tells the server about the copy it takes.
+    #[tokio::test]
+    async fn a_teleports_prepare_asks_every_gate_but_the_copy_and_admits_its_join() {
+        use roomler_ai_remote_control::hive::{HiveJoinRefusal, HiveReplicaRole};
+        let r = moving_rig(ObjectId::new(), 1);
+        let teleport = Some(HiveReplicaRole::Teleport);
+        let o = at_fence(&order(&r), 2);
+        let sid = o.session_id;
+        let join = |session: ObjectId, fence: u64, role: Option<HiveReplicaRole>, is_primary| {
+            let sup = Arc::clone(&r.sup);
+            async move {
+                sup.answer_join(is_primary, session, fence, role, &[])
+                    .await
+                    .0
+            }
+        };
+        assert_eq!(
+            r.sup.prepare(&o, true).await,
+            Answer::refused(
+                HiveRefusal::Other,
+                "this device holds no copy of the session to take it over from"
+            ),
+            "a promotion's prepare needs the copy"
+        );
+        assert_eq!(
+            join(sid, 1, teleport, true).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "and admits nothing"
+        );
+
+        assert_eq!(
+            r.sup.prepare_teleport(&o, false).await.refused,
+            Some(HiveRefusal::HiveDisabled),
+            "a secondary org's"
+        );
+        let mut stranger = o.clone();
+        stranger.user_id = ObjectId::new();
+        stranger.user_email = "stranger@example.com".into();
+        assert_eq!(
+            r.sup.prepare_teleport(&stranger, true).await.refused,
+            Some(HiveRefusal::NoAccount)
+        );
+        let mut elsewhere = o.clone();
+        elsewhere.folder = "/etc".into();
+        assert_eq!(
+            r.sup.prepare_teleport(&elsewhere, true).await.refused,
+            Some(HiveRefusal::FolderNotAllowed)
+        );
+        assert_eq!(
+            join(sid, 1, teleport, true).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "a refused prepare admits nothing"
+        );
+        assert!(!r.sup.reports_copies());
+
+        assert_eq!(
+            r.sup.prepare_teleport(&o, true).await,
+            Answer::accepted("dev"),
+            "no copy needed"
+        );
+        assert_eq!(
+            join(sid, 2, teleport, true).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "the join comes at the record's fence, not the start's"
+        );
+        assert_eq!(
+            join(ObjectId::new(), 1, teleport, true).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "another session"
+        );
+        assert_eq!(
+            join(sid, 1, Some(HiveReplicaRole::Owner), true).await,
+            Some(HiveJoinRefusal::ReplicaDisabled),
+            "the prepare admits the teleport's role only"
+        );
+        assert_eq!(
+            join(sid, 1, teleport, false).await,
+            Some(HiveJoinRefusal::SecondaryOrg)
+        );
+        assert_eq!(
+            join(sid, 1, teleport, true).await,
+            None,
+            "admitted: it takes the copy it will run"
+        );
+        assert_eq!(
+            join(sid, 1, teleport, true).await,
+            None,
+            "a join re-sent at a connection is admitted too"
+        );
+        assert!(
+            r.sup.reports_copies(),
+            "it tells the server about the copy it takes"
+        );
+        assert_eq!(store_memberships(&r).await, [sid.to_hex()]);
+        assert_eq!(r.store.floor(&sid.to_hex()).await.unwrap(), Some(1));
+
+        // The session launched here at the prepare's fence: done with.
+        r.sup.forget_teleport(sid, 1);
+        assert_eq!(join(sid, 1, teleport, true).await, None, "an older launch");
+        r.sup.forget_teleport(sid, 2);
+        assert_eq!(
+            join(sid, 1, teleport, true).await,
+            Some(HiveJoinRefusal::NotPrepared),
+            "launched at the prepare's fence"
+        );
+        // And an admission past its time admits nothing.
+        if let Some(long_ago) =
+            Instant::now().checked_sub(TELEPORT_ADMISSION + Duration::from_secs(1))
+        {
+            r.sup.teleports.lock().unwrap().insert(sid, (2, long_ago));
+            assert_eq!(
+                join(sid, 1, teleport, true).await,
+                Some(HiveJoinRefusal::NotPrepared),
+                "run out"
+            );
+            assert!(!r.sup.reports_copies(), "and nothing to tell");
+        }
     }
 }
 
