@@ -440,8 +440,12 @@ async fn a_device_of_an_organization_no_longer_served_is_told_to_stop() {
     assert_eq!(order["session_id"], sid);
     assert_eq!(order["reason"], "hive_not_enabled");
 
-    let s = stored(&app, &sid).await;
-    assert_eq!(s.get_str("status").unwrap(), "ended");
+    // The stop goes before the record is written (`hooks::end_and_tell`), so
+    // the device can hear it first: the record is waited for, not read once.
+    let s = wait_stored(&app, &sid, "ended for the unserved org", |s| {
+        s.get_str("status") == Ok("ended")
+    })
+    .await;
     assert_eq!(s.get_str("end_reason").unwrap(), "hive_not_enabled");
     let (code, _) = get_session(&app, &tid, &token, &sid).await;
     assert_eq!(code, 404, "an unserved org's session cannot be read");
@@ -2178,6 +2182,1050 @@ async fn a_session_that_gains_its_first_member_is_leased_from_then_on() {
         (word["session_id"].as_str(), word["fence"].as_u64()),
         (Some(sid.as_str()), Some(1))
     );
+}
+
+// ─── P2e-3 — promotion ─────────────────────────────────────────────────────
+
+/// What a build that takes part in a promotion advertises, at either end: it
+/// runs sessions, holds copies, carries streams and holds leases.
+const PROMOTES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+];
+
+/// [`replicaset_app`] with each step of a promotion bound to 4 s, so a step
+/// that runs out does so within a test, with room for a loaded runner.
+async fn promote_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+        s.hive.promote_prepare_secs = 4;
+        s.hive.promote_drain_secs = 4;
+        s.hive.promote_sync_secs = 4;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// A replicated session running on `a` at fence 1, whose members `b` and
+/// `more` took their copies.
+struct Moving {
+    tid: String,
+    admin: String,
+    admin_id: String,
+    sid: String,
+    a: Device,
+    b: Device,
+    more: Vec<Device>,
+    seeded: SeededTenant,
+}
+
+/// [`Moving`]: the primary advertises [`PROMOTES`], `b` advertises
+/// `b_caps`, every other member [`PROMOTES`].
+async fn promotable(app: &TestApp, tag: &str, more: usize, b_caps: &[&str]) -> Moving {
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let min = 2 + u32::try_from(more).unwrap();
+    let (code, p) = put_policy(app, &tid, &admin, &policy_min(min, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), PROMOTES).await;
+    let mut b = device(app, &seeded, &format!("mach-{tag}-b"), b_caps).await;
+    let mut others = Vec::new();
+    for i in 0..more {
+        others.push(device(app, &seeded, &format!("mach-{tag}-m{i}"), PROMOTES).await);
+    }
+    let (s, frame) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
+    assert_eq!(frame["replicated"], true, "{frame}");
+    let sid = s["id"].as_str().unwrap().to_string();
+    for m in std::iter::once(&mut b).chain(others.iter_mut()) {
+        let join = read_until(&mut m.ws, "rc:hive.replica.join")
+            .await
+            .expect("the member's join");
+        assert_eq!(join["fence"], 1, "{join}");
+        send(
+            &mut m.ws,
+            json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+        )
+        .await;
+        let id = m.agent_id.clone();
+        wait_member(app, &tid, &admin, &sid, &id, "joined", |m| {
+            m["state"] == "joined"
+        })
+        .await;
+    }
+    Moving {
+        tid,
+        admin,
+        admin_id: seeded.admin.id.clone(),
+        sid,
+        a,
+        b,
+        more: others,
+        seeded,
+    }
+}
+
+async fn post_promote(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    device: &str,
+    folder: Option<&str>,
+) -> (u16, Value) {
+    let mut body = json!({ "device_id": device });
+    if let Some(f) = folder {
+        body["folder"] = json!(f);
+    }
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/hive/session/{sid}/promote"),
+            token,
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// Promote `m`'s session to `b`, which answers the prepare `answer` (`None`
+/// = ready): the route's answer and the prepare `b` received.
+async fn promote_answered(app: &TestApp, m: &mut Moving, answer: Option<Value>) -> (Value, Value) {
+    let (tid, admin, sid, to) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+    let caller = post_promote(app, &tid, &admin, &sid, &to, None);
+    let target = async {
+        let prep = read_until(&mut m.b.ws, "rc:hive.prepare")
+            .await
+            .expect("the member is asked to prepare");
+        let mut ack = json!({"t": "rc:hive.prepare_ack", "session_id": sid,
+                             "fence": prep["fence"], "account": "dev"});
+        if let Some(Value::Object(extra)) = answer {
+            for (k, v) in extra {
+                ack[k] = v;
+            }
+        }
+        send(&mut m.b.ws, ack).await;
+        prep
+    };
+    let ((code, body), prep) = tokio::join!(caller, target);
+    assert_eq!(code, 200, "{body}");
+    (body, prep)
+}
+
+/// [`promote_answered`], ready: the primary is draining.
+async fn prepared(app: &TestApp, m: &mut Moving) -> (Value, Value) {
+    let (body, prep) = promote_answered(app, m, None).await;
+    assert_eq!(body["outcome"], "promoting", "{body}");
+    (body, prep)
+}
+
+fn drained(sid: &str, seq: u64, fill: &str) -> Value {
+    json!({"t": "rc:hive.drained", "session_id": sid, "fence": 1, "seq": seq, "hash": hash(fill)})
+}
+
+fn tip_at(sid: &str, fence: u64, seq: u64, fill: &str) -> Value {
+    json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": fence, "seq": seq,
+           "hash": hash(fill)})
+}
+
+fn promotion_state(s: &Document) -> Option<&str> {
+    s.get_document("promotion").ok()?.get_str("state").ok()
+}
+
+/// Poll the stored session until `pred` holds.
+async fn wait_stored(
+    app: &TestApp,
+    sid: &str,
+    what: &str,
+    pred: impl Fn(&Document) -> bool,
+) -> Document {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let s = stored(app, sid).await;
+        if pred(&s) {
+            return s;
+        }
+        assert!(Instant::now() < deadline, "{what}: {s:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The frames `ws` receives whose `t` is among `kinds`, in the order they
+/// arrive, until each kind has come once.
+async fn frames_until(ws: &mut AgentWs, kinds: &[&str]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if kinds
+            .iter()
+            .all(|k| out.iter().any(|f| f["t"].as_str() == Some(k)))
+        {
+            return out;
+        }
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && kinds.iter().any(|k| v["t"].as_str() == Some(k))
+                {
+                    out.push(v);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    panic!("not every one of {kinds:?} arrived: {out:?}");
+}
+
+/// The stored member `device` of `s`: its role and its state.
+fn stored_member(s: &Document, device: &str) -> (String, String) {
+    let id = ObjectId::parse_str(device).unwrap();
+    s.get_document("replicaset")
+        .unwrap()
+        .get_array("members")
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.as_document())
+        .find(|m| m.get_object_id("device_id").ok() == Some(id))
+        .map(|m| {
+            (
+                m.get_str("role").unwrap_or("").to_string(),
+                m.get_str("state").unwrap_or("pending").to_string(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The lease word, given back once a step ran out: longer than
+/// `read_until`'s five seconds, which a bound and a loaded runner can pass.
+async fn word_back(ws: &mut AgentWs) -> Option<Value> {
+    arrives(ws, "rc:hive.lease", Duration::from_secs(15)).await
+}
+
+/// The `promote` audit rows of `sid`, in order: (outcome, reason).
+async fn promote_audit(app: &TestApp, sid: &str) -> Vec<(String, String)> {
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "session_id": ObjectId::parse_str(sid).unwrap(), "action": "promote" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        out.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+        ));
+    }
+    out
+}
+
+/// The notes in `sid`'s room whose text contains `needle`.
+async fn notes_with(app: &TestApp, m: &Moving, needle: &str) -> Vec<String> {
+    let room = stored(app, &m.sid)
+        .await
+        .get_object_id("room_id")
+        .unwrap()
+        .to_hex();
+    room_messages(app, &m.tid, &m.admin, &room)
+        .await
+        .1
+        .iter()
+        .filter_map(|i| i["content"].as_str())
+        .filter(|c| c.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poll until the room holds a note containing `needle`; every such note.
+async fn wait_note(app: &TestApp, m: &Moving, needle: &str) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let found = notes_with(app, m, needle).await;
+        if !found.is_empty() {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no note with {needle:?} in the room"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// FR-90 P2e-3 — the whole move, with fake devices at both ends. The member
+/// is asked to prepare before anything moves; once it is ready the primary
+/// is told to drain, and its manifest gets no lease word meanwhile; the
+/// lease moves only once the member's OWN tip is the drained one. Then the
+/// old primary is demoted at the new fence and joined as a member, every
+/// other member is joined at the new fence, and the member hears its join as
+/// the primary, the record's move and the start, as a resume, in that order.
+/// Its acceptance ends the promotion; the room says who moved it where, and
+/// the new primary's manifest is answered with the word at the new fence.
+#[tokio::test]
+async fn a_promotion_moves_the_lease_once_the_members_copy_holds_the_drained_tip() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promote", 1, PROMOTES).await;
+    let sid = m.sid.clone();
+
+    let (body, prep) = prepared(&app, &mut m).await;
+    assert_eq!(
+        (
+            prep["fence"].as_u64(),
+            prep["folder"].as_str(),
+            prep["user_id"].as_str()
+        ),
+        (Some(2), Some("/srv/promote"), Some(m.admin_id.as_str())),
+        "{prep}"
+    );
+    assert_eq!(prep["harness_session"], body["session"]["harness_session"]);
+    assert_eq!(body["session"]["promotion"]["state"], "draining", "{body}");
+    assert_eq!(body["session"]["fence"], 1, "nothing moved yet");
+
+    let drain = read_until(&mut m.a.ws, "rc:hive.drain")
+        .await
+        .expect("the primary is told to drain");
+    assert_eq!(
+        (drain["session_id"].as_str(), drain["fence"].as_u64()),
+        (Some(sid.as_str()), Some(1))
+    );
+    send(&mut m.a.ws, manifest_of(&sid)).await;
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.lease", Duration::from_millis(600)).await,
+        "no word while it drains for the move"
+    );
+
+    send(&mut m.a.ws, drained(&sid, 5, "ab")).await;
+    wait_stored(&app, &sid, "syncing", |s| {
+        promotion_state(s) == Some("syncing")
+    })
+    .await;
+    // The primary's own tip at the drained one says nothing of the member's
+    // copy; the member behind it moves nothing.
+    send(&mut m.a.ws, tip_at(&sid, 1, 5, "ab")).await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 4, "cd")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = stored(&app, &sid).await;
+    assert_eq!(
+        (s.get_i64("fence").unwrap(), promotion_state(&s)),
+        (1, Some("syncing")),
+        "the member is behind: the lease stays"
+    );
+    send(&mut m.b.ws, tip_at(&sid, 1, 5, "ab")).await;
+
+    // Another member: joined at the new fence.
+    let join = read_until(&mut m.more[0].ws, "rc:hive.replica.join")
+        .await
+        .expect("another member is joined at the new fence");
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(2), Some("owner"))
+    );
+    // The old primary: demoted at the new fence, then — read in order, so a
+    // join that came first would be passed over — joined as a member.
+    let demote = read_until(&mut m.a.ws, "rc:hive.demote")
+        .await
+        .expect("the old primary is demoted at the new fence");
+    assert_eq!(
+        (demote["fence"].as_u64(), demote["reason"].as_str()),
+        (Some(2), Some("promoted"))
+    );
+    let a_join = read_until(&mut m.a.ws, "rc:hive.replica.join")
+        .await
+        .expect("the owner's own device that holds copies stays a member");
+    assert_eq!(
+        (a_join["fence"].as_u64(), a_join["role"].as_str()),
+        (Some(2), Some("owner"))
+    );
+    // The member: its join as the primary, the move, then the start.
+    let b_frames = frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let kinds: Vec<&str> = b_frames.iter().map(|f| f["t"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+        "the floor before the move, the move before the start"
+    );
+    let (j, mv, st) = (&b_frames[0], &b_frames[1], &b_frames[2]);
+    assert_eq!(
+        (j["fence"].as_u64(), j["role"].as_str()),
+        (Some(2), Some("primary"))
+    );
+    assert_eq!(
+        (
+            mv["fence"].as_u64(),
+            mv["turns"].as_u64(),
+            mv["from_device_id"].as_str(),
+            mv["from_folder"].as_str(),
+            mv["moved_by"].as_str(),
+        ),
+        (
+            Some(2),
+            Some(0),
+            Some(m.a.agent_id.as_str()),
+            Some("/srv/promote"),
+            Some(m.admin_id.as_str()),
+        ),
+        "{mv}"
+    );
+    assert_eq!(
+        (
+            st["fence"].as_u64(),
+            st["resume"].as_bool(),
+            st["replicated"].as_bool(),
+            st["lease"].as_bool(),
+            st["folder"].as_str()
+        ),
+        (
+            Some(2),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some("/srv/promote")
+        ),
+        "a resume, leased: {st}"
+    );
+
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_i64("fence").unwrap(), 2);
+    let loc = s.get_document("location").unwrap();
+    assert_eq!(
+        loc.get_object_id("device_id").unwrap().to_hex(),
+        m.b.agent_id
+    );
+    assert_eq!(s.get_str("status").unwrap(), "starting");
+    assert!(s.get("accepted_at").is_none(), "unanswered, as a start is");
+    assert_eq!(promotion_state(&s), Some("moving"));
+    let fences = s.get_array("fences").expect("where fence 1 ended");
+    assert_eq!(fences.len(), 1, "{fences:?}");
+    let f = fences[0].as_document().unwrap();
+    assert_eq!(
+        (
+            f.get_i64("fence").unwrap(),
+            f.get_i64("seq").unwrap(),
+            f.get_str("hash").unwrap()
+        ),
+        (1, 5, hash("ab").as_str()),
+        "the drained tip"
+    );
+    let role = |d: &str| stored_member(&s, d);
+    assert_eq!(role(&m.b.agent_id), ("primary".into(), "pending".into()));
+    assert_eq!(role(&m.a.agent_id), ("owner".into(), "pending".into()));
+    assert_eq!(
+        role(&m.more[0].agent_id),
+        ("owner".into(), "pending".into())
+    );
+
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2, "account": "dev"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "done", |s| {
+        !s.contains_key("promotion") && s.get_datetime("accepted_at").is_ok()
+    })
+    .await;
+    let moved = wait_note(&app, &m, "🔀 Moved from").await;
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert!(moved[0].contains("as **dev**"), "{}", moved[0]);
+    assert_eq!(
+        notes_with(&app, &m, "is moving the session to").await.len(),
+        1
+    );
+    assert_eq!(
+        notes_with(&app, &m, "Started on").await.len(),
+        1,
+        "the first start's note only: a moved start's is the move's"
+    );
+
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.manifest", "sessions": [{"session_id": sid, "fence": 2}]}),
+    )
+    .await;
+    let word = read_until(&mut m.b.ws, "rc:hive.lease")
+        .await
+        .expect("the new primary's manifest is answered with the word");
+    assert_eq!(word["fence"], 2);
+    assert_eq!(
+        promote_audit(&app, &sid).await,
+        [
+            ("sent".to_string(), String::new()),
+            ("moved".to_string(), String::new()),
+            ("done".to_string(), String::new()),
+        ]
+    );
+}
+
+/// FR-90 P2e-3 — a member that cannot run the session says so to the
+/// prepare, and that is the caller's answer, in the start's words: nothing
+/// moves, the primary is never told to drain, and the room says why.
+#[tokio::test]
+async fn a_member_that_cannot_run_it_answers_the_caller_and_nothing_moves() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promoterefuse", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    let (body, _) = promote_answered(
+        &app,
+        &mut m,
+        Some(json!({"refused": "no_account", "detail": "no *entry*"})),
+    )
+    .await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("no_account")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("maps no local account"),
+        "{body}"
+    );
+    assert!(body["session"].get("promotion").is_none(), "{body}");
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(600)).await,
+        "the primary is never told to drain"
+    );
+    let s = stored(&app, &sid).await;
+    assert_eq!(s.get_i64("fence").unwrap(), 1);
+    assert!(!s.contains_key("promotion"));
+    let note = wait_note(&app, &m, "did not happen").await;
+    assert!(note[0].contains("maps no local account"), "{}", note[0]);
+    assert!(note[0].contains(r"(no \*entry\*)"), "escaped: {}", note[0]);
+    assert_eq!(
+        promote_audit(&app, &sid).await,
+        [
+            ("sent".to_string(), String::new()),
+            ("failed".to_string(), "no_account".to_string()),
+        ]
+    );
+}
+
+/// FR-90 P2e-3 — a primary that does not drain keeps the session, and is
+/// given its lease word back, which lifts the drain: one that says it does
+/// not run it, one whose answer names no readable tip, and one that never
+/// answers, each in the room's own words.
+#[tokio::test]
+async fn a_primary_that_does_not_drain_keeps_the_session_and_its_word() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promotedrain", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    let cases: [(Option<Value>, &str, &str); 3] = [
+        (
+            Some(
+                json!({"t": "rc:hive.drained", "session_id": sid, "fence": 1,
+                        "refused": "not_running"}),
+            ),
+            "drain_not_running",
+            "does not run the session",
+        ),
+        (
+            Some(
+                json!({"t": "rc:hive.drained", "session_id": sid, "fence": 1,
+                        "seq": 5, "hash": "AB".repeat(32)}),
+            ),
+            "drain_unreadable",
+            "could not be read",
+        ),
+        (None, "drain_timeout", "did not finish its turn"),
+    ];
+    for (answer, reason, words) in cases {
+        prepared(&app, &mut m).await;
+        read_until(&mut m.a.ws, "rc:hive.drain")
+            .await
+            .expect("told to drain");
+        if let Some(a) = answer {
+            send(&mut m.a.ws, a).await;
+        }
+        let word = word_back(&mut m.a.ws)
+            .await
+            .unwrap_or_else(|| panic!("{reason}: the primary is given its word back"));
+        assert_eq!(word["fence"], 1, "{reason}");
+        let s = wait_stored(&app, &sid, reason, |s| !s.contains_key("promotion")).await;
+        assert_eq!(s.get_i64("fence").unwrap(), 1, "{reason}");
+        assert_eq!(
+            s.get_document("location")
+                .unwrap()
+                .get_object_id("device_id")
+                .unwrap()
+                .to_hex(),
+            m.a.agent_id,
+            "{reason}"
+        );
+        // The note is posted after the audit row: once it is there, so is
+        // the row.
+        wait_note(&app, &m, words).await;
+        assert_eq!(
+            promote_audit(&app, &sid).await.last().cloned(),
+            Some(("failed".to_string(), reason.to_string()))
+        );
+    }
+
+    // A session stopped while its primary drains: the promotion fails at its
+    // bound with no word, since nothing holds a lease to give back, and with
+    // no note of its own: the stop's end is the room's.
+    prepared(&app, &mut m).await;
+    read_until(&mut m.a.ws, "rc:hive.drain")
+        .await
+        .expect("told to drain");
+    let (code, _) = stop(&app, &m.tid, &m.admin, &sid).await;
+    assert_eq!(code, 200);
+    read_until(&mut m.a.ws, "rc:hive.stop")
+        .await
+        .expect("the stop");
+    wait_stored(&app, &sid, "the drain's bound", |s| {
+        !s.contains_key("promotion")
+    })
+    .await;
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.lease", Duration::from_millis(500)).await,
+        "no word for a session being stopped"
+    );
+    assert_eq!(
+        notes_with(&app, &m, "did not happen").await.len(),
+        3,
+        "the three moves above, not this one"
+    );
+}
+
+/// FR-90 P2e-3 — the compare-and-sets, raced at the store, where two
+/// browsers racing past the route's gate cannot be timed from outside: of two
+/// promotions begun on one session the second begins nothing; the lease
+/// moves once, and never for a promotion that is not the record's; a move
+/// back applies once, to the fence after the member's.
+#[tokio::test]
+async fn the_promotions_compare_and_sets_move_the_lease_once() {
+    use roomler_ai_mod_hive::dao::AgentSessionDao;
+    use roomler_ai_mod_hive::model::{DrainedTip, MemberState, Promotion, PromotionState};
+    let app = promote_app().await;
+    let m = promotable(&app, "promotecas", 0, PROMOTES).await;
+    let dao = AgentSessionDao::new(&app.db);
+    let sid = ObjectId::parse_str(&m.sid).unwrap();
+    let s = dao.find(sid).await.unwrap().unwrap();
+    let to = ObjectId::parse_str(&m.b.agent_id).unwrap();
+    let in_a_minute =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() + 60_000);
+    let promotion = || Promotion {
+        id: ObjectId::new(),
+        to,
+        to_name: m.b.machine.clone(),
+        to_role: "owner".into(),
+        folder: s.location.folder.clone(),
+        from: s.location.clone(),
+        from_fence: s.fence,
+        by: s.owner_id,
+        state: PromotionState::Syncing,
+        started_at: bson::DateTime::now(),
+        deadline: in_a_minute,
+        drained: Some(DrainedTip {
+            seq: 5,
+            hash: hash("ab"),
+        }),
+    };
+    let (one, two) = (promotion(), promotion());
+    assert!(
+        dao.begin_promotion(s.tenant_id, s.owner_id, sid, &one)
+            .await
+            .unwrap(),
+        "the first begins"
+    );
+    assert!(
+        !dao.begin_promotion(s.tenant_id, s.owner_id, sid, &two)
+            .await
+            .unwrap(),
+        "the second finds the first in flight"
+    );
+    assert!(
+        !dao.move_lease(sid, &two, "owner", MemberState::Pending, in_a_minute)
+            .await
+            .unwrap(),
+        "a promotion that is not the record's moves nothing"
+    );
+    assert!(
+        dao.move_lease(sid, &one, "owner", MemberState::Pending, in_a_minute)
+            .await
+            .unwrap(),
+        "the record's moves it"
+    );
+    assert!(
+        !dao.move_lease(sid, &one, "owner", MemberState::Pending, in_a_minute)
+            .await
+            .unwrap(),
+        "once"
+    );
+    let moved = dao.find(sid).await.unwrap().unwrap();
+    assert_eq!((moved.fence, moved.location.device_id), (2, to));
+    assert_eq!(
+        moved.promotion.as_ref().map(|p| p.state),
+        Some(PromotionState::Moving)
+    );
+    let mark = |fence| roomler_ai_mod_hive::model::FenceMark {
+        fence,
+        seq: 5,
+        hash: hash("ab"),
+    };
+    assert_eq!(
+        moved.fences,
+        [mark(1)],
+        "the fence it superseded ends at the drained tip"
+    );
+    assert!(dao.move_lease_back(sid, &one).await.unwrap(), "back");
+    assert!(!dao.move_lease_back(sid, &one).await.unwrap(), "once");
+    let back = dao.find(sid).await.unwrap().unwrap();
+    assert_eq!(
+        (back.fence, back.location.device_id),
+        (3, s.location.device_id),
+        "to the fence after the member's"
+    );
+    assert!(back.promotion.is_none());
+    assert_eq!(
+        back.fences,
+        [mark(1), mark(2)],
+        "the member's fence ends where it began: it ran nothing"
+    );
+}
+
+/// FR-90 P2e-3 — the lease moves only on the member's copy reaching the
+/// drained tip exactly. Another event at its seq is a copy that is not the
+/// primary's: failed at once. A copy that never catches up fails at the
+/// sync's bound. Either way the primary keeps the session and its word.
+#[tokio::test]
+async fn a_copy_that_does_not_reach_the_drained_tip_moves_nothing() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promotesync", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    let (tid, admin, b_id) = (m.tid.clone(), m.admin.clone(), m.b.agent_id.clone());
+    for (seq, fill, reason, words) in [
+        (5, "cd", "diverged", "is not the one"),
+        (4, "ab", "sync_timeout", "did not catch up in time"),
+    ] {
+        // The member's tip first, kept, and only then the promotion and its
+        // drain: the two connections' reports apply in no order between them,
+        // and nothing slow may sit inside a bounded step.
+        send(&mut m.b.ws, tip_at(&sid, 1, seq, fill)).await;
+        wait_member(&app, &tid, &admin, &sid, &b_id, "the member's tip", |mm| {
+            mm["tip"]["seq"] == seq && mm["tip"]["hash"] == hash(fill)
+        })
+        .await;
+        prepared(&app, &mut m).await;
+        read_until(&mut m.a.ws, "rc:hive.drain")
+            .await
+            .expect("told to drain");
+        send(&mut m.a.ws, drained(&sid, 5, "ab")).await;
+        let word = word_back(&mut m.a.ws)
+            .await
+            .unwrap_or_else(|| panic!("{reason}: the word back"));
+        assert_eq!(word["fence"], 1);
+        let s = wait_stored(&app, &sid, reason, |s| !s.contains_key("promotion")).await;
+        assert_eq!(s.get_i64("fence").unwrap(), 1, "{reason}: nothing moved");
+        // The note after the audit row, as above.
+        wait_note(&app, &m, words).await;
+        assert_eq!(
+            promote_audit(&app, &sid).await.last().cloned(),
+            Some(("failed".to_string(), reason.to_string()))
+        );
+        assert!(
+            !device_hears(&mut m.b.ws, "rc:hive.start", Duration::from_millis(300)).await,
+            "{reason}: the member is never started"
+        );
+    }
+}
+
+/// Run a promotion of `m` up to the move: prepared, drained at `{5, ab}`,
+/// the member's tip there; then drain the frames each side hears at it.
+async fn moved(app: &TestApp, m: &mut Moving) {
+    let sid = m.sid.clone();
+    prepared(app, m).await;
+    read_until(&mut m.a.ws, "rc:hive.drain")
+        .await
+        .expect("told to drain");
+    send(&mut m.a.ws, drained(&sid, 5, "ab")).await;
+    send(&mut m.b.ws, tip_at(&sid, 1, 5, "ab")).await;
+    frames_until(
+        &mut m.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    // Its demote, and its join as a member at the new fence.
+    frames_until(&mut m.a.ws, &["rc:hive.demote", "rc:hive.replica.join"]).await;
+}
+
+/// FR-90 P2e-3 — a start the member refuses after the lease moved moves it
+/// back, to the fence after the member's: the session is NOT refused. The old
+/// primary is its primary again and hears its join, the move and the start,
+/// as a resume; the member is a member again, joined at the new fence; the
+/// room says why. Its acceptance there posts no second start note.
+#[tokio::test]
+async fn a_moved_start_the_member_refuses_moves_the_lease_back() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promoteback", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    moved(&app, &mut m).await;
+    send(
+        &mut m.b.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2,
+               "refused": "launch_failed", "detail": "no claude"}),
+    )
+    .await;
+
+    let a_frames = frames_until(
+        &mut m.a.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let back: Vec<(&str, Option<u64>)> = a_frames
+        .iter()
+        .map(|f| (f["t"].as_str().unwrap(), f["fence"].as_u64()))
+        .collect();
+    assert_eq!(
+        back,
+        [
+            ("rc:hive.replica.join", Some(3)),
+            ("rc:hive.move", Some(3)),
+            ("rc:hive.start", Some(3)),
+        ],
+        "{a_frames:?}"
+    );
+    assert_eq!(a_frames[0]["role"], "primary");
+    assert_eq!(a_frames[1]["from_device_id"], m.a.agent_id.as_str());
+    assert_eq!(a_frames[2]["resume"], true);
+    let join = read_until(&mut m.b.ws, "rc:hive.replica.join")
+        .await
+        .expect("the member is joined again at the new fence");
+    assert_eq!(
+        (join["fence"].as_u64(), join["role"].as_str()),
+        (Some(3), Some("owner"))
+    );
+
+    let s = stored(&app, &sid).await;
+    assert_eq!(
+        s.get_i64("fence").unwrap(),
+        3,
+        "never a fence handed out once"
+    );
+    assert_eq!(
+        s.get_document("location")
+            .unwrap()
+            .get_object_id("device_id")
+            .unwrap()
+            .to_hex(),
+        m.a.agent_id
+    );
+    assert_eq!(s.get_str("status").unwrap(), "starting", "not refused");
+    assert!(!s.contains_key("promotion"));
+    assert_eq!(
+        stored_member(&s, &m.a.agent_id),
+        ("primary".into(), "pending".into())
+    );
+    assert_eq!(
+        stored_member(&s, &m.b.agent_id),
+        ("owner".into(), "pending".into())
+    );
+    let note = wait_note(&app, &m, "did not happen").await;
+    assert!(
+        note[0].contains("could not start the agent harness"),
+        "{}",
+        note[0]
+    );
+    assert_eq!(
+        promote_audit(&app, &sid).await.last().cloned(),
+        Some(("moved_back".to_string(), "launch_failed".to_string()))
+    );
+
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 3, "account": "dev"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "accepted at fence 3", |s| {
+        s.get_datetime("accepted_at").is_ok()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        notes_with(&app, &m, "Started on").await.len(),
+        1,
+        "a move back posts no second start note: its note is the move's"
+    );
+}
+
+/// FR-90 P2e-3 — a member that reconnects before it answered the moved
+/// start hears, on its new connection, its join as the primary, the move and
+/// the start again, as a resume; its answer there ends the promotion.
+#[tokio::test]
+async fn a_member_back_before_it_answered_hears_the_join_the_move_and_the_start_again() {
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promoteagain", 0, PROMOTES).await;
+    let sid = m.sid.clone();
+    moved(&app, &mut m).await;
+    m.b.ws.close(None).await.unwrap();
+    let mut ws = connect(&app, &m.b.token, &m.b.machine, PROMOTES).await;
+    let again = frames_until(
+        &mut ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let kinds: Vec<&str> = again.iter().map(|f| f["t"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"]
+    );
+    assert_eq!(again[0]["role"], "primary");
+    assert_eq!(again[1]["from_device_id"], m.a.agent_id.as_str());
+    assert_eq!(
+        (again[2]["fence"].as_u64(), again[2]["resume"].as_bool()),
+        (Some(2), Some(true)),
+        "the re-sent start resumes"
+    );
+    send(
+        &mut ws,
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 2, "account": "dev"}),
+    )
+    .await;
+    wait_stored(&app, &sid, "done", |s| !s.contains_key("promotion")).await;
+    wait_note(&app, &m, "🔀 Moved from").await;
+}
+
+/// FR-90 P2e-3 — the route's gates, each refusal in its own word and
+/// audited: with the replicaset off the route is not there; a session is
+/// promoted by its owner only; never to the device it runs on, nor to one
+/// that holds no copy, nor between devices that do not both take part in a
+/// promotion, nor to one offline; never a session that is not running; and
+/// of two promotions raced, one moves on.
+#[tokio::test]
+async fn a_promotion_is_refused_by_the_gate_it_failed() {
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("promoteoff").await;
+    let (code, _) = post_promote(
+        &off,
+        &seeded.tenant_id,
+        &seeded.admin.access_token,
+        &ObjectId::new().to_hex(),
+        &ObjectId::new().to_hex(),
+        None,
+    )
+    .await;
+    assert_eq!(code, 404, "with the replicaset off the route is not there");
+
+    let app = promote_app().await;
+    let mut m = promotable(&app, "promotegate", 1, HOLDS_COPIES).await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    let try_to = |device: String| {
+        let (app, tid, admin, sid) = (&app, tid.clone(), admin.clone(), sid.clone());
+        async move { post_promote(app, &tid, &admin, &sid, &device, None).await.1 }
+    };
+    let refused = |body: &Value, why: &str| {
+        assert_eq!(
+            (body["outcome"].as_str(), body["reason"].as_str()),
+            (Some("refused"), Some(why)),
+            "{body}"
+        );
+        assert!(body["message"].as_str().is_some_and(|t| !t.is_empty()));
+    };
+
+    refused(&try_to(m.a.agent_id.clone()).await, "already_primary");
+    // The owner's own device that holds copies, enrolled after the start: no
+    // member.
+    let stranger = device(&app, &m.seeded, "mach-promotegate-x", PROMOTES).await;
+    refused(&try_to(stranger.agent_id.clone()).await, "not_a_member");
+    // A member whose build takes no part in a promotion.
+    refused(&try_to(m.b.agent_id.clone()).await, "device_unsupported");
+
+    // Someone else in the org: the session is not theirs to see.
+    let (code, _) = post_promote(
+        &app,
+        &tid,
+        &m.seeded.member.access_token,
+        &sid,
+        &m.more[0].agent_id,
+        None,
+    )
+    .await;
+    assert_eq!(code, 404, "another member's read of the id is a 404");
+
+    // Two promotions raced: one goes on, the other is told one is under way.
+    // The member never answers, so the one that went on fails at the
+    // prepare's bound, and its caller hears that.
+    let to = m.more[0].agent_id.clone();
+    let (one, two) = tokio::join!(try_to(to.clone()), try_to(to.clone()));
+    let mut reasons = [
+        one["reason"].as_str().unwrap_or("").to_string(),
+        two["reason"].as_str().unwrap_or("").to_string(),
+    ];
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        ["prepare_timeout", "promotion_in_progress"],
+        "{one} {two}"
+    );
+    assert_eq!(
+        frames_within(&mut m.more[0].ws, Duration::from_millis(500))
+            .await
+            .iter()
+            .filter(|f| f["t"] == "rc:hive.prepare")
+            .count(),
+        1,
+        "one prepare"
+    );
+    let s = stored(&app, &sid).await;
+    assert!(!s.contains_key("promotion"), "{s:?}");
+    assert_eq!(s.get_i64("fence").unwrap(), 1);
+
+    // The primary offline; then the member offline too, which is the gate
+    // asked first.
+    m.a.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.a.agent_id).await;
+    refused(&try_to(m.more[0].agent_id.clone()).await, "primary_offline");
+    m.more[0].ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.more[0].agent_id).await;
+    refused(&try_to(m.more[0].agent_id.clone()).await, "device_offline");
+
+    // A session that is not running.
+    let (code, _) = stop(&app, &tid, &admin, &sid).await;
+    assert_eq!(code, 200);
+    refused(
+        &try_to(m.more[0].agent_id.clone()).await,
+        "session_not_running",
+    );
+
+    let reasons: Vec<String> = promote_audit(&app, &sid)
+        .await
+        .into_iter()
+        .filter(|(o, _)| o == "refused")
+        .map(|(_, r)| r)
+        .collect();
+    for want in [
+        "already_primary",
+        "not_a_member",
+        "device_unsupported",
+        "primary_offline",
+        "device_offline",
+        "promotion_in_progress",
+        "session_not_running",
+    ] {
+        assert!(reasons.iter().any(|r| r == want), "{want}: {reasons:?}");
+    }
 }
 
 // ─── P0d-2b — the viewer peer's signalling ─────────────────────────────────

@@ -169,6 +169,108 @@ pub struct AgentSession {
     /// session, which is never placed until it is a managed one (P2f).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replicaset: Option<Replicaset>,
+    /// FR-90 P2e-3 — the promotion in flight, while its owner moves it to one
+    /// of its members ([`crate::promote`]). Absent once it is done or has
+    /// failed: the room says which, and the record says where it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<Promotion>,
+    /// FR-90 P2e-3 — where each fence a promotion superseded ended: its last
+    /// event, as the drained primary reported it, oldest first. The
+    /// session's history keeps those fences' events up to there, and a member
+    /// whose floor rose past one still needs them: one behind the drained tip
+    /// at the move, one that joins later (spec §3b, "Open for P2e"). Kept here
+    /// at the move, the one moment the server holds it; what reads it is
+    /// P2e-5's joins and store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fences: Vec<FenceMark>,
+}
+
+/// FR-90 P2e-3 — the last event of a fence a promotion superseded. BSON has
+/// no unsigned integer, so the numbers are stored signed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FenceMark {
+    pub fence: i64,
+    pub seq: i64,
+    pub hash: String,
+}
+
+/// FR-90 P2e-3 — where a promotion is. Every step is a compare-and-set on the
+/// state it leaves, so a frame that arrives twice, late, or on another pod
+/// moves it once.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionState {
+    /// The member it moves to was sent `rc:hive.prepare`, and has not said
+    /// it is ready.
+    Preparing,
+    /// The member is ready; the primary was sent `rc:hive.drain`.
+    Draining,
+    /// The primary drained; the member's copy is to reach the drained tip.
+    Syncing,
+    /// The lease moved: the member was sent the start, and has not run it.
+    Moving,
+}
+
+impl PromotionState {
+    /// The spelling in the database and the API. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Draining => "draining",
+            Self::Syncing => "syncing",
+            Self::Moving => "moving",
+        }
+    }
+
+    /// Before the lease moves: a failure here leaves the session where it
+    /// was.
+    pub const BEFORE_THE_MOVE: [PromotionState; 3] =
+        [Self::Preparing, Self::Draining, Self::Syncing];
+}
+
+/// FR-90 P2e-3 — the tip a drained primary's copy ends at. BSON has no
+/// unsigned integer, so `seq` is stored signed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DrainedTip {
+    pub seq: i64,
+    pub hash: String,
+}
+
+/// FR-90 P2e-3 — a promotion in flight (`agent_sessions.promotion`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Promotion {
+    pub id: ObjectId,
+    /// The member it moves to, and its name for the room.
+    pub to: ObjectId,
+    #[serde(default)]
+    pub to_name: String,
+    /// The member's role before it, restored should its start be refused.
+    pub to_role: String,
+    /// The folder it will run in there.
+    pub folder: String,
+    /// Where it ran, and at which fence: the lease moves back here should the
+    /// member refuse the start.
+    pub from: SessionLocation,
+    pub from_fence: i64,
+    /// Who moved it: the session's owner.
+    pub by: ObjectId,
+    pub state: PromotionState,
+    pub started_at: DateTime,
+    /// When the state it is in runs out. Before the move, a promotion past it
+    /// has failed, whether or not the pod that started it is still there to
+    /// say so; in `moving`, it may be replaced once past it.
+    pub deadline: DateTime,
+    /// The primary's word on where its copy ends, once it drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drained: Option<DrainedTip>,
+}
+
+impl Promotion {
+    /// Whether it still holds the session: not past its deadline, whatever
+    /// its state.
+    pub fn in_flight(&self, now: DateTime) -> bool {
+        now < self.deadline
+    }
 }
 
 /// FR-90 P2c-2b — where a session's copies go: its primary first, then the
@@ -377,6 +479,41 @@ pub struct SessionView {
     /// P2c-2b — where its copies go. Absent: placed nowhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicaset: Option<ReplicasetView>,
+    /// P2e-3 — the promotion in flight. Absent: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<PromotionView>,
+}
+
+/// [`Promotion`] as the API answers it.
+#[derive(Serialize, Debug, Clone)]
+pub struct PromotionView {
+    pub id: String,
+    pub to: String,
+    pub to_name: String,
+    pub folder: String,
+    pub from: String,
+    pub from_fence: i64,
+    pub by: String,
+    pub state: PromotionState,
+    pub started_at: String,
+    pub deadline: String,
+}
+
+impl From<&Promotion> for PromotionView {
+    fn from(p: &Promotion) -> Self {
+        Self {
+            id: p.id.to_hex(),
+            to: p.to.to_hex(),
+            to_name: p.to_name.clone(),
+            folder: p.folder.clone(),
+            from: p.from.device_id.to_hex(),
+            from_fence: p.from_fence,
+            by: p.by.to_hex(),
+            state: p.state,
+            started_at: rfc3339(p.started_at),
+            deadline: rfc3339(p.deadline),
+        }
+    }
 }
 
 /// [`Replicaset`] as the API answers it.
@@ -481,6 +618,7 @@ impl From<&AgentSession> for SessionView {
             brain_rev: s.brain_rev,
             origin: s.origin,
             replicaset: s.replicaset.as_ref().map(ReplicasetView::from),
+            promotion: s.promotion.as_ref().map(PromotionView::from),
         }
     }
 }
@@ -653,6 +791,8 @@ mod tests {
             brain_rev: None,
             origin: SessionOrigin::Started,
             replicaset: None,
+            promotion: None,
+            fences: Vec::new(),
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");
@@ -740,6 +880,76 @@ mod tests {
             SessionOrigin::Adopted,
             "and the UI is told"
         );
+    }
+
+    /// FR-90 P2e-3 — the promotion's words are locked and are what serde
+    /// stores; a record before P2e-3 has none and stores none; the view
+    /// renders its times as strings.
+    #[test]
+    fn a_promotion_is_stored_in_its_words_and_absent_before_p2e3() {
+        let all = [
+            PromotionState::Preparing,
+            PromotionState::Draining,
+            PromotionState::Syncing,
+            PromotionState::Moving,
+        ];
+        assert_eq!(
+            all.map(PromotionState::as_str),
+            ["preparing", "draining", "syncing", "moving"]
+        );
+        for s in all {
+            assert_eq!(
+                bson::to_bson(&s).unwrap(),
+                bson::Bson::String(s.as_str().into())
+            );
+        }
+        assert!(!PromotionState::BEFORE_THE_MOVE.contains(&PromotionState::Moving));
+
+        let raw = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "owner_id": ObjectId::new(),
+            "title": "t",
+            "harness": { "id": "claude-code", "session": "u" },
+            "location": { "device_id": ObjectId::new(), "folder": "/src" },
+            "status": "idle",
+            "fence": 1_i64,
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut s: AgentSession = bson::from_document(raw).expect("a record before P2e-3 reads");
+        assert!(s.promotion.is_none());
+        assert!(!bson::to_document(&s).unwrap().contains_key("promotion"));
+
+        let now = DateTime::now();
+        let p = Promotion {
+            id: ObjectId::new(),
+            to: ObjectId::new(),
+            to_name: "venus".into(),
+            to_role: "owner".into(),
+            folder: "/src".into(),
+            from: s.location.clone(),
+            from_fence: 1,
+            by: s.owner_id,
+            state: PromotionState::Syncing,
+            started_at: now,
+            deadline: DateTime::from_millis(now.timestamp_millis() + 1000),
+            drained: Some(DrainedTip {
+                seq: 9,
+                hash: "ab".repeat(32),
+            }),
+        };
+        assert!(p.in_flight(now));
+        assert!(
+            !p.in_flight(p.deadline),
+            "past its deadline it holds nothing"
+        );
+        s.promotion = Some(p.clone());
+        let back: AgentSession = bson::from_document(bson::to_document(&s).unwrap()).unwrap();
+        assert_eq!(back.promotion, Some(p.clone()));
+        let v = serde_json::to_value(SessionView::from(&s)).unwrap();
+        assert_eq!(v["promotion"]["state"], "syncing", "{v}");
+        assert!(v["promotion"]["deadline"].is_string(), "{v}");
+        assert_eq!(v["promotion"]["to"], p.to.to_hex());
     }
 
     /// FR-90 P2c-3 — the member words are locked, and a member placed before

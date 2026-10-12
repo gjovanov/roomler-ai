@@ -54,7 +54,7 @@ pub struct Settings {
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct HiveSettings {
     /// The organizations agent sessions serve, as comma-separated ids
     /// (`ROOMLER__HIVE__TENANTS=<id>,<id>`). Empty — the default — or `*` is
@@ -81,6 +81,45 @@ pub struct HiveSettings {
     /// replicaset, so a roll that ships it exposes nothing.
     #[serde(default)]
     pub replicaset: bool,
+    /// FR-90 P2e-3 — how long a promotion waits for the member it moves to
+    /// to answer its prepare (`ROOMLER__HIVE__PROMOTE_PREPARE_SECS`).
+    #[serde(default = "hive_default_promote_prepare_secs")]
+    pub promote_prepare_secs: u64,
+    /// FR-90 P2e-3 — how long it waits for the primary's `rc:hive.drained`.
+    /// ⚠️ Longer than the device's turn cut
+    /// (`hive::promote_limits::DRAIN_TURN_CUT_SECS`, 60 s), and a margin for
+    /// the last checkpoint: a shorter one fails every drain of a long turn.
+    #[serde(default = "hive_default_promote_drain_secs")]
+    pub promote_drain_secs: u64,
+    /// FR-90 P2e-3 — how long it waits for the member's copy to reach the
+    /// drained tip. A slow carrier (the DERP floor, a laptop on a corporate
+    /// network) is where an operator lengthens it.
+    #[serde(default = "hive_default_promote_sync_secs")]
+    pub promote_sync_secs: u64,
+}
+
+fn hive_default_promote_prepare_secs() -> u64 {
+    30
+}
+
+fn hive_default_promote_drain_secs() -> u64 {
+    75
+}
+
+fn hive_default_promote_sync_secs() -> u64 {
+    120
+}
+
+impl Default for HiveSettings {
+    fn default() -> Self {
+        Self {
+            tenants: String::new(),
+            replicaset: false,
+            promote_prepare_secs: hive_default_promote_prepare_secs(),
+            promote_drain_secs: hive_default_promote_drain_secs(),
+            promote_sync_secs: hive_default_promote_sync_secs(),
+        }
+    }
 }
 
 /// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.

@@ -160,6 +160,9 @@ pub async fn handle_agent_socket(
     // FR-90 P2e-2 — and holds a leased session to the server's word on each
     // connection. `hive` is its prefix too.
     let holds_hive_leases = caps.has_rpc(RpcCap::HiveLease);
+    // FR-90 P2e-3 — and takes part in a promotion, at either end. `hive` is
+    // its prefix too.
+    let takes_hive_promotions = caps.has_rpc(RpcCap::HivePromote);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -198,6 +201,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_lease_support(agent_id, holds_hive_leases);
+    state
+        .rc_hub
+        .set_agent_hive_promote_support(agent_id, takes_hive_promotions);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

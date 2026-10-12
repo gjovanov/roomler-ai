@@ -633,6 +633,19 @@ pub(crate) async fn end_session_grants_of(
     end_taken(state, gone, reason, true).await
 }
 
+/// FR-90 P2e-3 — end every grant on ONE session, whoever holds it and
+/// whichever device serves it: the session moved, so a driver's grant toward
+/// the old primary reaches no harness, and every view is opened afresh
+/// toward where the session runs now.
+pub(crate) async fn end_grants_of_session(
+    state: &HiveState,
+    session_id: ObjectId,
+    reason: &str,
+) -> usize {
+    let gone = state.view_grants.take_where(|g| g.session_id != session_id);
+    end_taken(state, gone, reason, true).await
+}
+
 async fn end_taken(
     state: &HiveState,
     gone: Vec<(ObjectId, Grant)>,

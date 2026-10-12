@@ -697,6 +697,19 @@ pub enum RpcCap {
     /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2e-2
     /// runs what it hosts on its own word. Equality-matched, locked by test.
     HiveLease,
+    /// FR-90 P2e-3 — the agent takes part in a promotion at either end: as
+    /// the member a session moves to, it answers `rc:hive.prepare` with
+    /// `rc:hive.prepare_ack` and runs the move (`rc:hive.move`, then the
+    /// start); as the primary it moves from, it answers `rc:hive.drain` with
+    /// `rc:hive.drained`, and a later `rc:hive.lease` at the same fence lifts
+    /// the drain. The server promotes only between two connections that
+    /// advertise it.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
+    /// drops every one of those frames, so a server that read it out of
+    /// `hive` would wait out every bound of a promotion and leave the
+    /// primary drained. Equality-matched, locked by test.
+    HivePromote,
 }
 
 impl RpcCap {
@@ -725,11 +738,12 @@ impl RpcCap {
             Self::HiveArchive => "hive-archive",
             Self::HiveStream => "hive-stream",
             Self::HiveLease => "hive-lease",
+            Self::HivePromote => "hive-promote",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 17] = [
+    pub const ALL: [RpcCap; 18] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -747,6 +761,7 @@ impl RpcCap {
         Self::HiveArchive,
         Self::HiveStream,
         Self::HiveLease,
+        Self::HivePromote,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4751,6 +4766,7 @@ mod tests {
         assert_eq!(RpcCap::HiveArchive.wire(), "hive-archive");
         assert_eq!(RpcCap::HiveStream.wire(), "hive-stream");
         assert_eq!(RpcCap::HiveLease.wire(), "hive-lease");
+        assert_eq!(RpcCap::HivePromote.wire(), "hive-promote");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4768,7 +4784,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 10] = [
+        const KNOWN: [(RpcCap, RpcCap); 11] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4795,6 +4811,9 @@ mod tests {
             // FR-90 P2e-2 — nor "holds a leased session to the server's
             // word". Locked by `hive_lease_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveLease),
+            // FR-90 P2e-3 — nor "takes part in a promotion". Locked by
+            // `hive_promote_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HivePromote),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5147,6 +5166,32 @@ mod tests {
         assert!(!leased.has_rpc(RpcCap::HiveStream));
         assert_eq!(RpcCap::from_wire("hive-lease"), Some(RpcCap::HiveLease));
         assert!(RpcCap::from_wire("hive-leases").is_none());
+    }
+
+    /// FR-90 P2e-3 — taking part in a promotion is a promise of its own: an
+    /// agent that holds leases (P2e-2) answers no prepare and no drain, and a
+    /// server that read the one out of the other would leave a primary
+    /// drained until every bound ran out.
+    #[test]
+    fn hive_promote_is_a_promise_of_its_own() {
+        let leased = AgentCaps {
+            rpc: vec![
+                "hive".into(),
+                "hive-replica".into(),
+                "hive-stream".into(),
+                "hive-lease".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(!leased.has_rpc(RpcCap::HivePromote));
+        let promotes = AgentCaps {
+            rpc: vec!["hive".into(), "hive-promote".into()],
+            ..Default::default()
+        };
+        assert!(promotes.has_rpc(RpcCap::HivePromote));
+        assert!(!promotes.has_rpc(RpcCap::HiveLease));
+        assert_eq!(RpcCap::from_wire("hive-promote"), Some(RpcCap::HivePromote));
+        assert!(RpcCap::from_wire("hive-promotes").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

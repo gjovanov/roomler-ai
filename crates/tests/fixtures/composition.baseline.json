@@ -437,6 +437,10 @@
       "methods": "DELETE,PUT"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/promote",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/stop",
       "methods": "POST"
     },
@@ -3966,6 +3970,8 @@
     "rc:hive.replica.ready",
     "rc:hive.replica.candidate",
     "rc:hive.replica.close",
+    "rc:hive.prepare_ack",
+    "rc:hive.drained",
     "rc:hive.view.grant_ack",
     "rc:hive.view.answer",
     "rc:hive.view.ice",
@@ -4063,6 +4069,9 @@
     "rc:hive.stop",
     "rc:hive.lease",
     "rc:hive.demote",
+    "rc:hive.prepare",
+    "rc:hive.drain",
+    "rc:hive.move",
     "rc:hive.memory",
     "rc:hive.adopt_ack",
     "rc:hive.view.grant",
@@ -4083,7 +4092,9 @@
     "rc:consent.pending": "fleet",
     "rc:hive.adopt": "hive",
     "rc:hive.approval": "hive",
+    "rc:hive.drained": "hive",
     "rc:hive.manifest": "hive",
+    "rc:hive.prepare_ack": "hive",
     "rc:hive.replica.candidate": "hive",
     "rc:hive.replica.close": "hive",
     "rc:hive.replica.join_ack": "hive",
