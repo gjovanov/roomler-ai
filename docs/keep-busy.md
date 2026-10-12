@@ -22,13 +22,15 @@
 > | P8 | the org's **default pattern** (§12) |
 > | P9 | **GNOME on Wayland**, and GNOME on Xorg under a root daemon, through uinput ([§2](#a-blind-host-gnome-through-uinput)) |
 > | P10 | a **local On**: the tray's "Start keep busy" and `roomler keep-busy on`, for the person at the computer only (§9) |
+> | P10b | **SYSTEM never** starts it: on Windows the pipe listener reads the client's account from its token (§9) |
 >
 > Any other Wayland desktop is detected and reported unavailable, with its reason.
 >
 > It is turned on from a remote-desktop session that holds input, or (P10) by
 > the person at the computer. There is no server "on". ⚠️ `roomler exec` is not
-> kept out everywhere: on Windows it runs in the person's session, and its
-> `roomler keep-busy on` passes the local gate (§9).
+> kept out everywhere: on an attended Windows install it runs as the person, and
+> its `roomler keep-busy on` passes the local gate. Root and (P10b) SYSTEM are
+> refused (§9).
 
 Keep busy moves a device's pointer in a pattern so the computer stays
 **active**: no screensaver, no idle lock, no "Away" in Teams or Slack.
@@ -394,8 +396,9 @@ does not spawn `loginctl` forever.
 | **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
 
 **Who may turn it ON here (P10).** Whoever stands where the person does: the
-console session on Windows, the person's own uid elsewhere, and never root.
-`ClientPeer::may_start_keep_busy` (`crates/localapi`) answers per endpoint:
+console session on Windows, the person's own uid elsewhere. Never root, and
+(P10b) never SYSTEM. `ClientPeer::may_start_keep_busy` (`crates/localapi`)
+answers per endpoint:
 
 ```mermaid
 flowchart TD
@@ -403,8 +406,11 @@ flowchart TD
   R -- yes --> X[refused: sudo, and roomler exec on Unix]
   R -- no --> W{Windows peer?}
   W -- yes --> S{the active console session, and not session 0?}
-  S -- yes --> OK[the engine starts it: set_by = the person at this computer]
   S -- no --> X2[refused: an RDP guest, a service in session 0]
+  S -- yes --> A{"the token's account (P10b)"}
+  A -- "a person" --> OK[the engine starts it: set_by = the person at this computer]
+  A -- "SYSTEM, LocalService, NetworkService" --> X4[refused: roomler exec in SystemContext mode]
+  A -- "could not be read" --> X5[refused: fail closed]
   W -- no --> E{which endpoint?}
   E -- a per-user daemon's socket --> O{the socket's owner?}
   O -- yes --> OK
@@ -412,20 +418,30 @@ flowchart TD
   E -- the person socket of a system install --> OK
 ```
 
+- **SYSTEM never** (P10b, `crates/localapi` `pipe_client_peer`). At accept
+  time, before a byte is read, the pipe listener reads the client's account
+  from its token: `GetNamedPipeClientProcessId`, then `OpenProcess` and
+  `OpenProcessToken`, then `IsWellKnownSid` against SYSTEM, LocalService and
+  NetworkService. It never takes the account from anything the client says,
+  and an account it cannot read is a refusal. The person's tray and CLI run as
+  the person, and the worker serving the pipe can always read its own user's
+  token. In SystemContext mode the worker is SYSTEM, so it can read every
+  client's token.
 - ⚠️ **Not a wall against `roomler exec`** (measured on 0.4.129, FR-92 §9
   row 43). On Windows, exec runs in the worker that holds the agent socket,
   and that worker lives in the console session: as the signed-in user (their
   elevated token) on an attended install, and as SYSTEM in that session in
-  SystemContext mode (`ROOMLERD_ENABLE_SYSTEM_SWAP`). So
-  `roomler exec <win> -- roomler keep-busy on` passes the session test, and
-  the start is named "the person at this computer". On Unix exec arrives as
-  root and is refused, but root can `sudo -u` the person. No local gate can
-  tell them apart: an exec caller could as well write the person's
-  `keep-busy.json`, or run an input loop of its own. A device that allows exec
-  has given its exec callers more than keep busy. Its boundary against them is
-  the owner's `exec_enabled` ([fleet-rpc.md](fleet-rpc.md)), and the open
-  question is only how an exec-started On is named (FR-92 §6). Exec's
-  identity on Windows is #2021.
+  SystemContext mode (`ROOMLERD_ENABLE_SYSTEM_SWAP`). P10b refuses the
+  SystemContext case. On an attended install,
+  `roomler exec <win> -- roomler keep-busy on` still passes, and the start is
+  named "the person at this computer". On Unix exec arrives as root and is
+  refused, but root can `sudo -u` the person. No local gate can tell them
+  apart: an exec caller could as well write the person's `keep-busy.json`, or
+  run an input loop of its own. A device that allows exec has given its exec
+  callers more than keep busy. Its boundary against them is the owner's
+  `exec_enabled` ([fleet-rpc.md](fleet-rpc.md)). Exec's identity on Windows is
+  #2021. Once exec runs as SYSTEM there, the same check refuses it everywhere
+  (FR-92 §6).
 - **Not the recording verbs' gate**: on Unix that one lets root through, and
   root is how `roomler exec` arrives there. With it, a plain
   `roomler exec <host> -- roomler keep-busy on` would start keep busy under the

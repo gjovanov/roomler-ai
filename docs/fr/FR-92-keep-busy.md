@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129; field-verified (§9), macOS included. Owed: 24 h of EDR (10-12 07:00Z), the tray's Start in the field, `no_permission` on a release, and a decision on how an On started through `roomler exec` is named (§6)
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129; field-verified (§9), macOS and 24 h of EDR included. P10b (SYSTEM never starts it) merged, riding the next release. Owed: the tray's Start in the field, `no_permission` on a release, and P10b on a SystemContext-mode host
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -34,9 +34,10 @@ disconnects, self-updates and reboots.
 3. **Host side:** a companion tray item ("Keep busy is on · Stop") and `roomler keep-busy status|off`.
    - **Amended 2026-10-11** (operator, "i want an On in roomler-desktop too"): the person at the
      computer can also turn it on, from the tray ("Start keep busy") and with `roomler keep-busy on`.
-     This is P10. Only that person's place may do it: never root, a service or another session. The
-     server itself still has no "on" (§7). That gate decides who is named; it is not a wall against
-     `roomler exec`, which on Windows runs in the console session and passes it (§3g, §9 row 43).
+     This is P10. Only that person's place may do it: never root, SYSTEM (P10b), a service or another
+     session. The server itself still has no "on" (§7). That gate decides who is named. It is not a
+     wall against `roomler exec`, which on an attended Windows install runs as the person and passes
+     it (§3g, §9 row 43).
 
 ## 2. Evidence (master `83aede0bd`, 2026-10-10)
 
@@ -258,6 +259,13 @@ stateDiagram-v2
   - a Linux system install's person socket: its person;
   - **root never**. The console-user gate the recording verbs use lets root through on Unix, and root
     is how `roomler exec` arrives there.
+  - **SYSTEM never** (P10b, operator 2026-10-12), nor LocalService or NetworkService: Windows' root.
+    The pipe listener reads the client's account from its token at accept time
+    (`pipe_client_peer` → `GetNamedPipeClientProcessId` → `OpenProcessToken` →
+    `IsWellKnownSid`), never from what the client says. A Windows peer whose account cannot be read is
+    refused. This closes `roomler exec` on a host in SystemContext mode, where exec runs as SYSTEM
+    *inside* the console session. It also refuses structurally any later exec that runs as SYSTEM
+    (#2021). The person's tray and CLI run as the person, whose token the worker can always read.
   - ⚠️ **Not a wall against `roomler exec`** (§9 row 43, 0.4.129). On Windows exec runs in the worker
     that holds the agent socket (`RunAs::Daemon` is the worker's identity), and that worker lives in
     the console session: the signed-in user's elevated token on an attended install, SYSTEM in that
@@ -268,8 +276,8 @@ stateDiagram-v2
     (row 42 did exactly that, to stand in for the person). No local gate can be that wall: an exec
     caller could as well write the person's `keep-busy.json`, or run an input loop of its own. What
     an exec caller may do is the owner's `exec_enabled`. Not an escalation, then, but the naming is
-    wrong for such a start — §6. Which identity exec has on Windows, and whether it should keep it,
-    is #2021.
+    wrong for such a start. Since P10b that holds only on an **attended** install, where exec runs as
+    the signed-in user. Which identity exec should have on Windows is #2021 (§6).
   - `opts` are the viewer's wire names (pattern, size, speed, `resume_after_s`, `auto_off_min`),
     checked by the viewer's own parser (`wire::parse_set`); absent means the product default.
   - The start names `"the person at this computer"` as who turned it on: the person's account name
@@ -325,6 +333,7 @@ stateDiagram-v2
 | P8 | **The default pattern**: circle stays the product default; `TenantSettings.keep_busy_default_pattern` lets an org choose another, validated by **equality** against the agent's 13 wire names, `null` clears, absent leaves alone; the settings `GET` becomes readable by any member so the viewer can pre-select it (`PUT` stays `MANAGE_TENANT`). No agent and no wire change: the menu pre-selects the org default only where the person has no remembered choice; a fetch failure means circle | unset the default (= circle) | #1977 open |
 | P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | #1978, merged `b2b715a50` |
 | P10 | **A local On** (operator, 2026-10-11). The person at the computer turns it on from the tray's "Start keep busy" or with `roomler keep-busy on [--pattern …]`. LocalAPI `KeepBusyOn`, gated to the console person: never root (`roomler exec` on Unix), never session 0, never relayed by a supervised Mac's root daemon. It names "the person at this computer". The server still has no "on". ⚠️ On Windows a `roomler exec` runs in the console session and passes the gate (§3g) | `keep_busy_enabled = false` and an org deny refuse it, as they refuse a viewer's | #2009, merged `63461d575`; released in **0.4.129** |
+| P10b | **SYSTEM never** (operator, 2026-10-12, §6). The Windows pipe listener reads the client's account from its token at accept time (`ClientPeer::system_account`). SYSTEM, LocalService, NetworkService, or an account that cannot be read, are refused keep busy's On, wherever they run. That closes `roomler exec` in SystemContext mode. No environment marker. Plus a Windows CI step for the LocalAPI crate, whose Windows tests ran in no lane | `keep_busy_enabled = false` and an org deny, as for P10; no switch of its own (a refusal, and only of SYSTEM) | this PR; rides the next release |
 
 ## 5. Acceptance criteria
 
@@ -355,9 +364,10 @@ stateDiagram-v2
   clock a helper can read).
 - [ ] **AC14 (P10):** the person at the computer turns it on from the tray's "Start keep busy", and
   with `roomler keep-busy on` (any pattern, checked by the viewer's parser), on Windows and on a
-  supervised Mac. Every connected viewer shows "turned on by the person at this computer".
-  `roomler exec … roomler keep-busy on` (root/SYSTEM) is refused. The owner's switch and an org deny
-  refuse a local start as they refuse a viewer's.
+  supervised Mac. Every connected viewer shows "turned on by the person at this computer". A root or
+  SYSTEM caller is refused (reworded 2026-10-12, operator). On an attended Windows install,
+  `roomler exec` runs as the signed-in user and is admitted until #2021 decides exec's identity. The
+  owner's switch and an org deny refuse a local start as they refuse a viewer's.
 - [ ] **AC13 (P9):** on GNOME on Wayland, through a system install with uinput on, keep busy runs:
   the negative control (OFF ⇒ GNOME locks at its idle delay) recorded first, then ON ⇒ no lock and
   Mutter's idle clock under 2 s, and a local key pauses it within 1 s.
@@ -377,18 +387,21 @@ stateDiagram-v2
 
 - **Whether the arbiter should stop caching a `NoopInjector`.** That would harden RC input as well, but
   it changes RC behaviour and needs its own test and field check.
-- **How an On started through `roomler exec` is named** (§3g, §9 row 43). On Windows it passes the
-  local gate today and is named "the person at this computer". It cannot be *prevented* (§3g), so
-  the choice is only between:
-  - **(a) Leave it, and say so.** This is what the docs now say. AC14's exec clause becomes "a root
-    caller is refused", which is true everywhere.
-  - **(b) Mark it.** The daemon puts a marker in every exec and SSH child's environment, and an
-    On from a marked process is refused, or named "`roomler exec`". It's a courtesy that keeps the
-    honest path honest, never a wall: `env -u`, a detached task or `sudo` drop the marker.
-    Recommended, because the viewers and the org's history would otherwise credit the person with
-    a remote admin's action.
-
-  Until this is decided, AC14's exec clause is **not met on Windows**.
+**Resolved 2026-10-12 (operator: "do per recommendation and proceed"):**
+- *How an On started through `roomler exec` is handled* (§3g, §9 row 43). The decision is an
+  **identity check now, #2021's FR later, and no marker**.
+  - P10b refuses SYSTEM, LocalService and NetworkService, read from the client's token, so an exec
+    on a host in SystemContext mode is refused today. Once #2021 runs exec as SYSTEM, the same
+    check refuses it everywhere, structurally.
+  - The marker considered here (an environment variable in every exec and SSH child) was dropped.
+    It's a courtesy anyone can strip, it touches three spawn paths, and it becomes dead weight
+    once #2021 lands. Revisit it only if #2021 decides that exec stays as the signed-in user.
+  - AC14's exec clause now reads "a root or SYSTEM caller is refused". On an attended Windows
+    install, exec runs as the person and is admitted until #2021 lands. The harm in the meantime
+    is low: it takes `EXEC_DEVICE` plus the owner's `exec_enabled`, and the server audits the
+    caller and the command.
+- *AC8's EDR clause* (§9 row 44): the operator takes the 24 h local reading as met, ticked at the
+  close with its caveats.
 
 **Resolved 2026-10-11 (operator: "do permanent history, default pattern and wayland support"):**
 - *The default pattern* — circle stays the product default; an org may choose another (P8,
@@ -410,9 +423,10 @@ stateDiagram-v2
 - **A server "on".** A server-side enable would be the only server-forgeable input path in the
   product, so there is none. The only ways to turn it on are a consented, `INPUT`-granted session
   and, since P10, the person at the computer. `roomler exec` is refused for that start where it
-  arrives as root (Unix). On Windows it runs inside the console session, in the worker, and passes
-  (§3g, measured on 0.4.129). There it already holds every power a mouse jiggler needs, and the
-  device owner's `exec_enabled` is the gate.
+  arrives as root (Unix) or, since P10b, as SYSTEM (Windows in SystemContext mode). On an attended
+  Windows install it runs inside the console session as the signed-in user, and passes (§3g,
+  measured on 0.4.129). There it already holds every power a mouse jiggler needs, and the device
+  owner's `exec_enabled` is the gate. #2021 decides exec's identity.
 - Work-hour schedules.
 - A per-device admin deny in `AccessPolicy`.
 
@@ -509,6 +523,14 @@ production SPA, as above.
 | 42 | **AC14 on a supervised Mac** | the MacBook on 0.4.129 | **As root** (what `roomler exec` runs): `roomler keep-busy on` was **refused**: "only the person at this device's console can turn keep busy on here — …". **As the person** (`sudo -u <person> roomler keep-busy on --pattern subtle`, through exec): `on`, `running`, `set_by` "the person at this computer". Root `status` then read the same state from the worker (row 39's relay), and `off` stopped it ✅ |
 | 43 | **AC14 on Windows** | the Win11 PC on 0.4.129, a user-context worker | **In the person's own shell** (console session 1, 23:27:50Z): `roomler keep-busy on --pattern subtle` gave `running`, `set_by` "the person at this computer". `status` read it, and `off` gave `stopped_locally`, "Turned off at this computer." ✅. **Through `roomler exec`** (23:29:33Z) ❌, against AC14 as written and against what this spec and the refusal message said: the same `on` started it, named "the person at this computer". The exec ran as the signed-in user, in session 1, at **High** integrity. The worker that holds the agent socket (`roomlerd run --supervisor scm`) runs as that user in the console session, and exec runs as the worker (#2021). Not an escalation, since an exec caller already runs anything as that identity, but the claim was false. The docs and the message now say what the gate does; the naming is open (§6) |
 
+**After the window, 2026-10-12**: the corporate laptop's 24 h EDR reading, taken on the device through
+`roomler exec`, and the tray on the Win11 PC.
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 44 | **AC8: 24 h of EDR** | the corporate laptop (Microsoft Defender Antivirus plus Defender for Endpoint), 10-11 07:00Z to 10-12 07:00Z, read at 07:18Z | **The engines were on**, which a quiet result needs before it counts: `AMServiceEnabled`, `RealTimeProtectionEnabled`, `BehaviorMonitorEnabled` and `IoavProtectionEnabled` all true, `AMRunningMode=Normal`, `Sense` and `WinDefend` running. **0 detections.** **0** malware (1006/1007/1015/1116–1119), ASR (1121/1122), controlled-folder (1123/1124) or network-protection (1125/1126) events. None of the window's 166 Operational events names roomler, and the log reaches back to 10-01. The binaries went from 0.4.125 to 0.4.126 (14:30Z) and on to 0.4.129 (01:36Z), each installed by the agent's own updater and scanned on access. **Caveats:** keep busy itself was off until 18:02:46Z, when it was turned on from the viewer (`circle`). After each overnight restart it was restored "waiting for an unlocked session", because the laptop was locked. So it injected input from 18:03Z until the lock (at most ~3.5 h), and again in the morning. Alerts that exist only in Defender for Endpoint's cloud portal can't be seen from the device. Taken as met, and ticked at the close with these caveats (operator, 2026-10-12) |
+| 45 | **AC14's tray half: the state read** | the Win11 PC on 0.4.129 (an attended install) | The companion's tray picked up both Ons from row 43 within 3 s: `tray: keep busy is on pattern=subtle set_by="the person at this computer"` at 23:27:53Z (the CLI's On, 23:27:50Z) and at 23:29:35Z (the exec's, 23:29:33Z). That is the state behind its "Stop keep busy (Subtle · …)" label. The **Start** click itself is still owed |
+
 Wrong turns, recorded so nobody repeats them:
 - **On Windows, `roomler exec` is not SYSTEM in session 0.** P10's gate was designed on that belief,
   which `docs/fleet-rpc.md` stated. Exec runs in the worker that holds the agent socket, inside the
@@ -537,21 +559,20 @@ Wrong turns, recorded so nobody repeats them:
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
 Still owed:
-- **24 h of EDR on the corporate laptop (AC8).** Microsoft Defender Antivirus plus Defender for
-  Endpoint (`Sense`). The window opened at 07:00Z on 10-11 with 0.4.125; the laptop self-updated
-  to 0.4.126 at 14:30Z. At 14:39Z there were 0 detections and 0 Defender events since 07:00Z. The
-  window closes at 07:00Z on 10-12.
 - **Row 37's fix on a release** (#1991, in 0.4.127): with `roomlerd`'s grant switched off at the Mac
   and the worker restarted, keep busy says `no_permission`. Row 36's fix is confirmed (row 39).
-- **The tray's "Start keep busy"** (AC14's tray half), in the field, on both platforms. The CLI half
-  is rows 42–43.
-- **§6's decision on an On started through `roomler exec`.** Until then AC14's exec clause is not
-  met on Windows.
+- **The tray's "Start keep busy" click** (AC14's tray half), in the field, on both platforms. The CLI
+  half is rows 42–43, and the tray's state read is row 45.
+- **P10b on a release**: on a Windows host in SystemContext mode, `roomler exec … roomler keep-busy
+  on` is refused, naming SYSTEM, while the person's own tray and CLI still start it. 0.4.129 (no
+  P10b) admits that exec, which is the negative control to record first.
 
 Proven so far:
 - macOS: rows 30–37.
 - The releases 0.4.127 and 0.4.129, and the root CLI on a supervised Mac (#1991): rows 38–41.
 - P10 for the person, on a supervised Mac and on Windows: rows 42–43.
+- AC8's 24 h of EDR on the corporate laptop: row 44 (ticked at the close, with its caveats).
+- The tray reads the state on Windows: row 45.
 - AC11 and AC12, on prod: rows 25–26.
 - AC4's self-update, and AC9/AC13 on the released 0.4.126: rows 28–29.
 
