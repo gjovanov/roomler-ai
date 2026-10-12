@@ -456,6 +456,135 @@ fn recent_update_attempt_at(marker_path: &std::path::Path, cooldown: Duration) -
     elapsed < cooldown
 }
 
+// ── FR-96 (#2055): the root update helper's run-spacing gate ─────────
+// The Linux helper is woken by a world-writable wake path, so a local user can
+// fire it as fast as they like. launchd throttles the macOS helper with
+// `ThrottleInterval=60`; systemd's path unit has no equivalent that spaces
+// rather than FAILS (its start/trigger limits are cliffs — see the unit file).
+// So the helper spaces its OWN runs: a stamp in root's log dir, and a sleep for
+// the remainder of the gap at the start of each run.
+
+/// The least time between two update-helper runs — launchd's `ThrottleInterval`
+/// (`com.roomler.update.plist`), made explicit for systemd. Locked to the plist
+/// by `update_helper_min_gap_matches_launchd_throttle_interval`.
+#[cfg(target_os = "linux")]
+const UPDATE_HELPER_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// The helper's run-spacing stamp, beside `update-attempt` in the root-owned
+/// log dir. Only root can write it, so no local user can shorten the gap.
+#[cfg(target_os = "linux")]
+fn update_helper_gate_marker_path() -> Option<PathBuf> {
+    crate::logging::log_dir().map(|d| d.join("update-helper-run"))
+}
+
+/// How long this run must wait so runs are ≥ `min_gap` apart: the remainder of
+/// the gap since `last`, or zero once it has passed.
+///
+/// ⚠️ No last run (`None`) or one in the FUTURE (a clock stepped back) means
+/// the FULL gap — a missing or nonsensical stamp can only SLOW the helper,
+/// never let it spin.
+#[cfg(target_os = "linux")]
+fn helper_gate_wait(
+    last: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    min_gap: Duration,
+) -> Duration {
+    match last {
+        Some(last) => match now.duration_since(last) {
+            Ok(elapsed) => min_gap.saturating_sub(elapsed),
+            Err(_) => min_gap, // `last` is in the future
+        },
+        None => min_gap,
+    }
+}
+
+/// [`helper_gate_wait`] reading the stamp's mtime. ANY error reading it (absent,
+/// unreadable, a non-directory in the path) yields the full gap — fail-safe.
+#[cfg(target_os = "linux")]
+fn helper_gate_wait_at(
+    stamp: &std::path::Path,
+    now: std::time::SystemTime,
+    min_gap: Duration,
+) -> Duration {
+    let last = std::fs::metadata(stamp).and_then(|m| m.modified()).ok();
+    helper_gate_wait(last, now, min_gap)
+}
+
+/// Record that the helper ran now, for the next run's [`helper_gate_wait`].
+/// Best-effort like [`record_update_attempt`]; the caller logs a failure and
+/// then the next run simply waits the full gap, which is safe.
+#[cfg(target_os = "linux")]
+fn stamp_helper_gate(stamp: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(stamp, format!("{}\n", chrono::Utc::now().to_rfc3339()))
+}
+
+/// What consuming the wake file did (FR-96), for the log line and the tests.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum WakeConsumed {
+    /// Nothing was there.
+    Nothing,
+    /// A plain file — or a symlink, unlinked NOT followed — was removed.
+    Removed,
+    /// Something `unlink` refused (a planted directory) was moved aside into a
+    /// fresh root-owned dir and removed there. `cleanup` is any error removing
+    /// that dir afterwards; the move itself succeeded.
+    MovedAside { cleanup: Option<std::io::Error> },
+    /// The entry could be neither unlinked nor moved aside — e.g. a mount point
+    /// (`EBUSY`) a local user planted with `fusermount3`. Logged; the helper
+    /// continues. The wake path stays, so the service re-fires each gap, but
+    /// the unit-level `StartLimitIntervalSec=0` + `Restart=` keep the PATH unit
+    /// from failing.
+    Stuck(std::io::Error),
+}
+
+/// Consume the wake file so `roomler-update.path`'s `PathExists=` turns false
+/// and the unit returns to waiting.
+///
+/// `remove_file` never follows a symlink, so a planted link is unlinked, not
+/// dereferenced. Anything `unlink` refuses — a planted DIRECTORY — is `rename`d
+/// into a FRESH root-owned dir beside it (mkdtemp, so a local user cannot
+/// pre-plant its name: a guessable `<wake>.<pid>` sibling could be planted
+/// non-empty to make the rename fail) and removed there.
+///
+/// ⚠️ Why move-aside rather than leave it: `PathExists=` is level-triggered, so
+/// an entry left at the path re-triggers the service the instant it ends — and
+/// a helper that exits fast enough would hit the path unit's own trigger limit
+/// and fail it. A local user must not be able to do that by planting one
+/// directory.
+#[cfg(target_os = "linux")]
+fn consume_wake(wake: &std::path::Path) -> WakeConsumed {
+    match std::fs::remove_file(wake) {
+        Ok(()) => return WakeConsumed::Removed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WakeConsumed::Nothing,
+        Err(_) => {} // not an unlinkable file (a planted dir) — move it aside
+    }
+    let parent = wake
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/var/tmp"));
+    let aside = match tempfile::Builder::new()
+        .prefix(".roomler-update-check.aside.")
+        .tempdir_in(parent)
+    {
+        Ok(d) => d,
+        Err(e) => return WakeConsumed::Stuck(e),
+    };
+    match std::fs::rename(wake, aside.path().join("planted")) {
+        Ok(()) => {
+            let dir = aside.keep(); // ours to remove now; don't double-remove on Drop
+            WakeConsumed::MovedAside {
+                cleanup: std::fs::remove_dir_all(&dir).err(),
+            }
+        }
+        // A mount point (EBUSY) or a race: `aside` drops and cleans itself (it
+        // is empty); the entry stays, bounded by the unit-level guards above.
+        Err(e) => WakeConsumed::Stuck(e),
+    }
+}
+
 /// #1683 — how long after an installer was spawned a service stop is read as
 /// **the installer's own stop**, not an operator's or the OS's.
 ///
@@ -1007,6 +1136,126 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
     releases.into_iter().next()
 }
 
+/// Name prefix of a private per-download staging directory. A cleanup
+/// recognises its own by this prefix and removes nothing else.
+#[cfg(target_os = "linux")]
+const STAGING_DIR_PREFIX: &str = "roomlerd-update.";
+
+/// Where a just-downloaded installer is staged before it runs.
+///
+/// ⚠️ Linux: a FRESH private directory per download (mkdtemp — a random name,
+/// created 0700 then relaxed to 0755, owned by the caller). NEVER the old fixed
+/// `/tmp/roomlerd-update/<asset>`: `/tmp` is sticky but a SUBDIRECTORY of it is
+/// not, so any local user could `mkdir /tmp/roomlerd-update` first (and own
+/// it), then — in the window between this download's in-memory signature check
+/// and the installer's own read of the PATH (`apt-get install <path>`,
+/// `tar -xzf <path>`) — `rename` an attacker package over the genuine one,
+/// making root install arbitrary code (dpkg maintainer scripts run as root).
+/// A directory nobody else owns closes it: a non-owner cannot create, rename
+/// or unlink inside it. 0755 (not 0700) so apt's `_apt` sandbox user can read
+/// the `.deb` — else apt warns and falls back to an unsandboxed-root install
+/// anyway, but the warning is noise we can avoid. FR-96 security review (#2055).
+#[cfg(target_os = "linux")]
+fn stage_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let td = tempfile::Builder::new()
+        .prefix(STAGING_DIR_PREFIX)
+        .tempdir_in(std::env::temp_dir())?;
+    // mkdtemp created it 0700 and ours; relax to exactly 0755 with an explicit
+    // chmod (bypassing umask) now that it exists and only we can reach it.
+    std::fs::set_permissions(td.path(), std::fs::Permissions::from_mode(0o755))?;
+    Ok(td.keep())
+}
+
+/// macOS/Windows: the per-user (macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)`) or
+/// SYSTEM (Windows `GetTempPath2`) temp dir is already a trust boundary, and a
+/// fixed name is needed on Windows where the companion refresh re-downloads the
+/// same asset name across calls — so the historical shared dir is kept.
+#[cfg(not(target_os = "linux"))]
+fn stage_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("roomlerd-update");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Write the downloaded installer to its staging path.
+///
+/// ⚠️ Linux: `O_CREAT|O_EXCL` (`create_new`) — refuse to write through anything
+/// already at the name rather than follow a symlink or truncate a planted file.
+/// Belt to [`stage_dir`]'s braces (the fresh private dir already means nobody
+/// else can plant here); kept because the cost is one flag and what is written
+/// runs as root.
+#[cfg(target_os = "linux")]
+fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+/// macOS/Windows: the shared staging dir reuses a file name per release (the
+/// Windows companion refresh re-downloads the same name), so a create-or-
+/// truncate is what the repeated download needs.
+#[cfg(not(target_os = "linux"))]
+fn write_installer(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Whether `dir` is one of our private staging directories, by name
+/// (`STAGING_DIR_PREFIX` + mkdtemp's random suffix) and location (directly in
+/// `temp_dir()`). Name-and-place only, on purpose: the guard's job is to stop a
+/// cleanup touching a path that is NOT ours — the old fixed `roomlerd-update`
+/// (no trailing dot, so excluded) from a pre-fix build, or a wizard-supplied
+/// installer elsewhere.
+#[cfg(target_os = "linux")]
+fn is_staging_dir(dir: &std::path::Path) -> bool {
+    dir.parent() == Some(std::env::temp_dir().as_path())
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(STAGING_DIR_PREFIX))
+}
+
+/// Remove the private staging directory that holds `installer_path`, if it is
+/// one of ours. Best-effort: a failure is logged, never fatal. `remove_dir_all`
+/// does not follow symlinks (std ≥ 1.58.1); in a 0755 dir nobody else could
+/// have planted one anyway.
+#[cfg(target_os = "linux")]
+fn discard_staging(installer_path: &std::path::Path) {
+    let Some(dir) = installer_path.parent() else {
+        return;
+    };
+    if !is_staging_dir(dir) {
+        return;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "update: could not remove the private staging dir"
+        ),
+    }
+}
+
+/// Discard a staged download that will not be installed (a failed verification,
+/// or the debug dry-run). Linux: the whole private dir (it holds only this
+/// file). Elsewhere: the file alone — the staging dir is shared across
+/// downloads.
+fn discard_download(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    {
+        discard_staging(path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Download an asset to a temp file and return the path. Verifies the
 /// downloaded size against the asset metadata + the minimum plausible
 /// size so we don't run a ~200 byte HTML error page as an installer.
@@ -1057,10 +1306,9 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             "no digest field on asset; falling through to size floor only"
         );
     }
-    let dir = std::env::temp_dir().join("roomlerd-update");
-    std::fs::create_dir_all(&dir).context("creating temp update dir")?;
+    let dir = stage_dir().context("creating the staging dir")?;
     let path = dir.join(&asset.name);
-    std::fs::write(&path, &bytes).context("writing installer to disk")?;
+    write_installer(&path, &bytes).context("writing installer to disk")?;
 
     // Publisher check — the anchor the serving channel cannot forge. Whatever
     // is on disk here is about to run as SYSTEM, so it must be attributable to
@@ -1082,7 +1330,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 tracing::info!(asset = %asset.name, %signer, "installer signature verified");
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                discard_download(&path);
                 bail!(
                     "refusing to install {}: {e}. The download was discarded and this \
                      agent keeps its current version.",
@@ -1134,7 +1382,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                discard_download(&path);
                 bail!(
                     "refusing to install {}: {e:#}. The download was discarded and this \
                      agent keeps its current version.",
@@ -1171,7 +1419,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             tracing::info!(asset = %asset.name, reason = %e, "no artifact-version binding available");
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&path);
+            discard_download(&path);
             bail!(
                 "refusing to install {}: {e}. The download was discarded and this \
                  agent keeps its current version.",
@@ -1804,6 +2052,10 @@ const TARBALL_REQUIRED: &[&str] = &["usr/bin/roomlerd", "usr/bin/roomler"];
 const TARBALL_INSTALL_IF_ABSENT: &[&str] = &[
     "usr/lib/systemd/system/roomlerd.service",
     "usr/lib/systemd/user/roomler.service",
+    // FR-96 — the update half of a per-user install.
+    "usr/lib/systemd/system/roomler-update.service",
+    "usr/lib/systemd/system/roomler-update.timer",
+    "usr/lib/systemd/system/roomler-update.path",
     // RETIRED-NAME-ANCHOR: a path INSIDE the shipped .deb; moving it needs the
     // package layout to move with it. docs/fr/FR-21
     "usr/share/doc/roomler-agent/README.Debian",
@@ -1993,11 +2245,19 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         let path_str = installer_path.to_string_lossy().into_owned();
         // SAFETY: `geteuid` is always-succeeding and takes no arguments.
         let euid = unsafe { libc::geteuid() };
-        if path_str.ends_with(".tar.gz") {
+        let result = if path_str.ends_with(".tar.gz") {
             install_tarball_linux(euid, installer_path)
         } else {
             run_linux_install_candidates(euid, &path_str)
-        }
+        };
+        // FR-96 review — the installer file has now been consumed (apt/dpkg
+        // read it, the tarball was extracted and placed), and on Linux no
+        // watcher ever re-runs it (that path is Windows-only, post_install.rs).
+        // Remove our private per-download staging dir — ours alone, guarded by
+        // the prefix so a wizard-supplied path outside temp_dir() is untouched.
+        // Without this a fresh mkdtemp dir per download would accrete in /tmp.
+        discard_staging(installer_path);
+        result
     }
     #[cfg(target_os = "macos")]
     {
@@ -2451,6 +2711,10 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
                     "auto-updater: DRY RUN — would spawn the installer now; nothing installed"
                 );
                 hold_agent_prompts(false);
+                // FR-96 review — the dry run downloaded but will not install, so
+                // nothing else will clean the private staging dir up.
+                #[cfg(target_os = "linux")]
+                discard_staging(&installer_path);
                 return false;
             }
             tracing::warn!(
@@ -2704,13 +2968,33 @@ fn schedule_transport_retry(
 /// writes it can cause an update CHECK, never choose what gets installed.
 pub const MACOS_UPDATE_TRIGGER: &str = "/private/var/tmp/roomler-update-check";
 
+/// FR-96 — the Linux twin of [`MACOS_UPDATE_TRIGGER`], watched by
+/// `roomler-update.path`. The same rules for the same reasons: a WAKE whose
+/// content is never read.
+pub const LINUX_UPDATE_TRIGGER: &str = "/var/tmp/roomler-update-check";
+
+/// The wake file this platform's root update helper watches.
+pub fn update_trigger_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        MACOS_UPDATE_TRIGGER
+    } else {
+        LINUX_UPDATE_TRIGGER
+    }
+}
+
 /// Touch the update-helper wake file. Portable (plain fs) so the forwarder
 /// type-checks on every platform; only ever called on macOS at runtime.
 ///
 /// O_NOFOLLOW + O_EXCL-free create: /var/tmp is sticky, another local user
 /// could have planted a symlink at this exact name — refuse to write
 /// through it rather than clobber whatever it points at with our bytes.
-pub fn macos_queue_update_check() -> std::io::Result<()> {
+pub fn queue_update_check() -> std::io::Result<()> {
+    queue_update_check_at(std::path::Path::new(update_trigger_path()))
+}
+
+/// [`queue_update_check`] against an explicit path, so the `O_NOFOLLOW` rule
+/// can be exercised without touching the real `/var/tmp`.
+pub(crate) fn queue_update_check_at(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -2719,7 +3003,7 @@ pub fn macos_queue_update_check() -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut f = opts.open(MACOS_UPDATE_TRIGGER)?;
+    let mut f = opts.open(path)?;
     // Timestamp only — human courtesy for whoever cats the file. The helper
     // never reads it (see the const doc: content is not trusted).
     writeln!(f, "{}", chrono::Utc::now().to_rfc3339())
@@ -2758,7 +3042,7 @@ async fn macos_forward_triggers(
                 // mention of the legacy paths. FR-46 P5a moved the live strings below to
                 // /var/log/roomler and /etc/roomler; the legacy /var/log/roomler-agent and
                 // /etc/roomler-agent are migrated by the .pkg postinstall. docs/fr/FR-46
-                match macos_queue_update_check() {
+                match queue_update_check() {
                     Ok(()) => tracing::info!(
                         trigger = MACOS_UPDATE_TRIGGER,
                         "rc:agent.update queued for the root update helper (com.roomler.update); \
@@ -2823,33 +3107,95 @@ pub(crate) async fn hold_daemon_for_install(socket: PathBuf, ceiling: Duration) 
     }
 }
 
-/// `roomlerd update-helper` — the body of `com.roomler.update`.
+/// `roomlerd update-helper` — the body of `com.roomler.update` on macOS, and
+/// of `roomler-update.service` on Linux (FR-96).
 ///
 /// Root-only, single-shot: consume the wake file, honour the opt-out marker
-/// and the install-storm cooldown, then check → download → verify →
-/// `installer -pkg … -target /` **waiting** on it (unlike every agent-side
-/// spawn there is nothing here the pkg replaces-and-restarts, so waiting is
-/// safe and gives us the real exit code). The pkg's postinstall restarts
-/// the agent halves; this process just reports and exits.
-#[cfg(target_os = "macos")]
+/// and the install-storm cooldown, then check → download → verify → install,
+/// **waiting** on the install (unlike every agent-side spawn there is nothing
+/// here the install replaces-and-restarts, so waiting is safe and gives the
+/// real outcome).
+/// - macOS: `installer -pkg … -target /`, whose postinstall restarts the agent
+///   halves.
+/// - Linux: the root ladder the in-process updater uses on a system install
+///   (`apt-get`/`dpkg`, or the tarball's own placement). A per-user daemon runs
+///   the new binary from its next restart.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub async fn run_update_helper() -> anyhow::Result<()> {
-    use anyhow::{Context, bail};
+    use anyhow::bail;
 
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
         bail!(
-            "update-helper must run as root (launchd system domain); euid={euid}. \
-             This subcommand is the body of com.roomler.update — it is not meant \
-             to be run by hand except as `sudo roomlerd update-helper`."
+            "update-helper must run as root (launchd's system domain on macOS, \
+             roomler-update.service on Linux); euid={euid}. It is the body of that \
+             unit, not meant to be run by hand except as `sudo roomlerd update-helper`."
         );
     }
 
-    // Consume the wake file FIRST, unconditionally, content unread —
-    // `remove_file` does not follow symlinks, so a planted link is deleted,
-    // never dereferenced. Removing before the gates means a wake that loses
-    // to the cooldown doesn't re-fire the WatchPaths job in a tight loop.
-    let _ = std::fs::remove_file(MACOS_UPDATE_TRIGGER);
+    // Consume the wake file FIRST, unconditionally, content unread, before any
+    // gate below — so a wake that loses to the cooldown does not re-fire the
+    // job, and a `systemctl stop` during the Linux gate's sleep finds the file
+    // already gone and does not re-trigger the path unit.
+    #[cfg(target_os = "macos")]
+    {
+        // launchd WatchPaths is edge-triggered and ThrottleInterval spaces
+        // relaunches, so macOS needs no in-helper gate. `remove_file` never
+        // follows a symlink, so a planted link is unlinked, not dereferenced.
+        let _ = std::fs::remove_file(update_trigger_path());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match consume_wake(std::path::Path::new(LINUX_UPDATE_TRIGGER)) {
+            WakeConsumed::Nothing | WakeConsumed::Removed => {}
+            WakeConsumed::MovedAside { cleanup: None } => tracing::warn!(
+                "update-helper: a non-file was planted at the wake path; moved aside and removed"
+            ),
+            WakeConsumed::MovedAside { cleanup: Some(e) } => tracing::warn!(
+                error = %e,
+                "update-helper: moved a planted wake-path entry aside but could not remove it"
+            ),
+            WakeConsumed::Stuck(e) => tracing::warn!(
+                error = %e,
+                path = LINUX_UPDATE_TRIGGER,
+                "update-helper: could not consume the wake path (a mount point planted there?); \
+                 continuing — the path unit does not fail, the helper re-runs each gap"
+            ),
+        }
+
+        // launchd's ThrottleInterval twin: space runs ≥ UPDATE_HELPER_MIN_GAP
+        // apart whatever a local user does to the wake path. BEFORE the opt-out
+        // and cooldown early-exits below — else an opted-out or cooled-down host
+        // would return in milliseconds per wake, and a re-touching user is back
+        // at the path unit's trigger limit. A broken or absent stamp means the
+        // FULL gap (fail-safe: it can only slow us, never let us spin).
+        let now = std::time::SystemTime::now();
+        let wait = match update_helper_gate_marker_path() {
+            Some(stamp) => helper_gate_wait_at(&stamp, now, UPDATE_HELPER_MIN_GAP),
+            None => {
+                tracing::warn!(
+                    "update-helper: no log dir for the run-spacing stamp; waiting the full gap"
+                );
+                UPDATE_HELPER_MIN_GAP
+            }
+        };
+        if !wait.is_zero() {
+            tracing::info!(
+                wait_secs = wait.as_secs(),
+                "update-helper: spacing this run from the last (ThrottleInterval twin)"
+            );
+            tokio::time::sleep(wait).await;
+        }
+        if let Some(stamp) = update_helper_gate_marker_path()
+            && let Err(e) = stamp_helper_gate(&stamp)
+        {
+            tracing::warn!(
+                error = %e,
+                "update-helper: could not write the run-spacing stamp; the next run waits the full gap"
+            );
+        }
+    }
 
     // The operator's opt-out. postinstall removes the launchd unit when this
     // marker is set, but a loaded job can linger until reboot (it must not
@@ -2894,62 +3240,125 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
             current,
             latest,
             installer_path,
-        } => {
-            // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent
-            // sessions, and the install restarts it with every harness: hold
-            // it for its running turns first, as the in-process updater does
-            // on Linux. The hold ends when `hold` is dropped, right after the
-            // installer returns; a failed install takes prompts again.
-            let hold =
-                hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING)
-                    .await;
-            match &hold {
-                InstallHold::Held {
-                    waited_secs, cut, ..
-                } => tracing::info!(
-                    waited_secs,
-                    cut,
-                    "update-helper: the daemon holds for its agent turns"
-                ),
-                InstallHold::Without(why) => {
-                    tracing::info!(%why, "update-helper: installing without a hold")
-                }
-            }
-            record_update_attempt();
-            tracing::warn!(
-                %current,
-                %latest,
-                pkg = %installer_path.display(),
-                "update-helper: installing (installer -pkg … -target /)"
-            );
-            let status = std::process::Command::new("installer")
-                .args(["-pkg"])
-                .arg(&installer_path)
-                .args(["-target", "/"])
-                .status()
-                .context("running installer(8)");
-            drop(hold);
-            let status = status?;
-            if !status.success() {
-                // Same operator sentinel act_on_outcome raises: a failed
-                // install is otherwise invisible — the fleet version simply
-                // never moves.
-                let _ = crate::notify::raise_attention_machine_aware(&format!(
-                    "Self-update to {latest} failed (installer exited {status}) and this \
-                     Mac is still on {current}. See /var/log/install.log."
-                ));
-                bail!(
-                    "installer(8) exited {status} installing {latest}; this Mac stays on \
-                     {current}. Details: /var/log/install.log"
-                );
-            }
-            tracing::info!(
-                %latest,
-                "update-helper: installed — postinstall re-bootstrapped the agent halves"
-            );
-            Ok(())
+        } => install_from_helper(current, latest, installer_path).await,
+    }
+}
+
+/// The macOS helper's install: hold the root daemon, then `installer(8)`.
+#[cfg(target_os = "macos")]
+async fn install_from_helper(
+    current: String,
+    latest: String,
+    installer_path: PathBuf,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+    // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent sessions, and
+    // the install restarts it with every harness: hold it for its running
+    // turns first, as the in-process updater does on Linux. The hold ends
+    // when `hold` is dropped, right after the installer returns; a failed
+    // install takes prompts again.
+    let hold =
+        hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING).await;
+    match &hold {
+        InstallHold::Held {
+            waited_secs, cut, ..
+        } => tracing::info!(
+            waited_secs,
+            cut,
+            "update-helper: the daemon holds for its agent turns"
+        ),
+        InstallHold::Without(why) => {
+            tracing::info!(%why, "update-helper: installing without a hold")
         }
     }
+    record_update_attempt();
+    tracing::warn!(
+        %current,
+        %latest,
+        pkg = %installer_path.display(),
+        "update-helper: installing (installer -pkg … -target /)"
+    );
+    let status = std::process::Command::new("installer")
+        .args(["-pkg"])
+        .arg(&installer_path)
+        .args(["-target", "/"])
+        .status()
+        .context("running installer(8)");
+    drop(hold);
+    let status = status?;
+    if !status.success() {
+        // Same operator sentinel act_on_outcome raises: a failed install is
+        // otherwise invisible — the fleet version simply never moves.
+        let _ = crate::notify::raise_attention_machine_aware(&format!(
+            "Self-update to {latest} failed (installer exited {status}) and this \
+             Mac is still on {current}. See /var/log/install.log."
+        ));
+        bail!(
+            "installer(8) exited {status} installing {latest}; this Mac stays on \
+             {current}. Details: /var/log/install.log"
+        );
+    }
+    tracing::info!(
+        %latest,
+        "update-helper: installed — postinstall re-bootstrapped the agent halves"
+    );
+    Ok(())
+}
+
+/// FR-96 — the Linux helper's install: the ROOT ladder the in-process updater
+/// uses on a system install (`apt-get`/`dpkg` for the `.deb`, the tarball's own
+/// placement), waited on, then the new binary asked its version.
+///
+/// No hold: the daemon this serves runs as the user, and is not restarted by
+/// the install at all. It runs the new binary from its next restart (P2 asks
+/// it to restart once idle).
+#[cfg(target_os = "linux")]
+async fn install_from_helper(
+    current: String,
+    latest: String,
+    installer_path: PathBuf,
+) -> anyhow::Result<()> {
+    use anyhow::bail;
+    record_update_attempt();
+    tracing::warn!(
+        %current,
+        %latest,
+        package = %installer_path.display(),
+        "update-helper: installing as root"
+    );
+    // Both arms of the Linux install finish before they return (a `.deb` is
+    // waited on, the tarball is placed in-process), so the outcome is known.
+    let path = installer_path.clone();
+    let installed = tokio::task::spawn_blocking(move || spawn_installer_for_flavour_inner(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("the install did not finish: {e}"))
+        .and_then(|r| r);
+    if let Err(e) = installed {
+        let _ = crate::notify::raise_attention_machine_aware(&format!(
+            "Self-update to {latest} failed ({e:#}) and this machine is still on {current}."
+        ));
+        bail!("installing {latest} failed: {e:#}; this machine stays on {current}");
+    }
+    // What a per-user daemon will run next: the installed binary itself.
+    let version = std::process::Command::new("/usr/bin/roomlerd")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match version {
+        Some(v) if crate::post_install::version_matches(&v, &latest) => tracing::info!(
+            %latest,
+            installed = %v,
+            "update-helper: installed and verified — a per-user daemon runs it from its next restart"
+        ),
+        other => tracing::warn!(
+            %latest,
+            installed = ?other,
+            "update-helper: installed, but /usr/bin/roomlerd does not report the release it was given"
+        ),
+    }
+    Ok(())
 }
 
 // RETIRED-NAME-ANCHOR-BEGIN
@@ -3550,6 +3959,385 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(name.ends_with(".pkg"));
         let _ = name; // silence unused warning on non-matched targets
+    }
+
+    // ── FR-96: the Linux update half ─────────────────────────────────
+
+    /// The path unit must watch exactly the file the helper consumes and the
+    /// per-user daemon touches. Three copies of one string; drift between them
+    /// would leave every wake unheard, with nothing failing anywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_update_units_watch_the_helper_wake_file() {
+        assert_eq!(update_trigger_path(), LINUX_UPDATE_TRIGGER);
+        let path_unit = include_str!("../packaging/linux/roomler-update.path");
+        let watch = format!("PathExists={LINUX_UPDATE_TRIGGER}");
+        assert!(
+            path_unit.lines().any(|l| l.trim() == watch.as_str()),
+            "roomler-update.path must watch {LINUX_UPDATE_TRIGGER}"
+        );
+        assert!(
+            path_unit
+                .lines()
+                .any(|l| l.trim() == "Unit=roomler-update.service")
+        );
+        let service = include_str!("../packaging/linux/roomler-update.service");
+        assert!(service.lines().any(|l| l.trim() == "Type=oneshot"));
+        assert!(
+            service
+                .lines()
+                .any(|l| l.trim() == "ExecStart=/usr/bin/roomlerd update-helper"),
+            "roomler-update.service must run the helper"
+        );
+        // Woken by its timer and its path, never enabled on its own.
+        assert!(!service.contains("[Install]"));
+        // FR-96 review — the guards that keep a local user from wedging the
+        // path unit (a touch burst, or an exec-failing helper). See the unit
+        // comments for the measured cliffs these remove.
+        assert!(
+            service
+                .lines()
+                .any(|l| l.trim() == "StartLimitIntervalSec=0"),
+            "the service must disable the start limit"
+        );
+        assert!(
+            service.lines().any(|l| l.trim() == "Restart=on-failure"),
+            "an exec-failing helper must auto-restart, not fail the path unit"
+        );
+        assert!(service.lines().any(|l| l.trim() == "RestartSec=60s"));
+        assert!(
+            !service
+                .lines()
+                .any(|l| l.trim_start().starts_with("PrivateTmp")),
+            "PrivateTmp as a directive would hide /var/tmp; the wake could never be consumed \
+             (the comment naming it is fine)"
+        );
+        let timer = include_str!("../packaging/linux/roomler-update.timer");
+        assert!(timer.lines().any(|l| l.trim() == "OnUnitActiveSec=6h"));
+        assert!(timer.lines().any(|l| l.trim() == "WantedBy=timers.target"));
+    }
+
+    /// Every unit ships in both packages, and the tarball installs each only
+    /// where absent, so an operator's edit survives an upgrade.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_update_units_ship_in_the_deb_and_the_tarball() {
+        let cargo = include_str!("../Cargo.toml");
+        let stage = include_str!("../../../scripts/stage-linux-tarball.sh");
+        // The stage script installs all three in one loop line — assert once,
+        // not per unit (it does not vary with `unit`).
+        assert!(
+            stage.contains("roomler-update.service roomler-update.timer roomler-update.path"),
+            "the tarball stage must ship the three update units"
+        );
+        for unit in [
+            "roomler-update.service",
+            "roomler-update.timer",
+            "roomler-update.path",
+        ] {
+            let dest = format!("usr/lib/systemd/system/{unit}");
+            assert!(
+                cargo.contains(&format!(r#"["packaging/linux/{unit}", "{dest}", "644"]"#)),
+                "the .deb assets must ship {unit}"
+            );
+            assert!(
+                TARBALL_INSTALL_IF_ABSENT.contains(&dest.as_str()),
+                "the tarball installs {unit} only where absent"
+            );
+        }
+    }
+
+    /// The helper is root's alone. Run as anyone else it refuses before it
+    /// touches the wake file, the network or the install.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_update_helper_refuses_to_run_as_anyone_but_root() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // A root runner would go on to the network; the refusal is the
+            // only thing under test here.
+            return;
+        }
+        let err = run_update_helper().await.expect_err("must refuse non-root");
+        assert!(
+            err.to_string().contains("must run as root"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
+    // ── FR-96 security review (#2055): the private staging dir ───────
+
+    /// Every download gets its own directory, 0755 and owned by the caller, so
+    /// no other local user can swap the installer between its verification and
+    /// the installer's own read of the path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_dir_is_fresh_private_and_ours() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let a = stage_dir().expect("stage_dir a");
+        let b = stage_dir().expect("stage_dir b");
+        assert_ne!(a, b, "each download gets a fresh directory");
+        for d in [&a, &b] {
+            assert!(
+                is_staging_dir(d),
+                "our own dir is recognised: {}",
+                d.display()
+            );
+            let meta = std::fs::metadata(d).expect("stat");
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o755,
+                "staging dir is 0755"
+            );
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            assert_eq!(
+                meta.uid(),
+                unsafe { libc::geteuid() },
+                "owned by the caller"
+            );
+        }
+        assert!(
+            !is_staging_dir(std::env::temp_dir().as_path()),
+            "temp_dir itself is not one of ours"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The write refuses anything already at the name — a planted symlink
+    /// (never followed) or a planted file (never truncated).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_installer_refuses_a_planted_symlink_and_a_planted_file() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A symlink at the target: refused, and NOT written through.
+        let canary = tmp.path().join("canary");
+        std::fs::write(&canary, b"original").expect("canary");
+        let link = tmp.path().join("installer-link");
+        std::os::unix::fs::symlink(&canary, &link).expect("symlink");
+        let err = write_installer(&link, b"payload").expect_err("must refuse a symlink");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"original",
+            "the symlink target was not written through"
+        );
+        // A plain file at the target: refused, NOT truncated.
+        let existing = tmp.path().join("installer");
+        std::fs::write(&existing, b"existing").expect("existing");
+        let err = write_installer(&existing, b"payload").expect_err("must refuse an existing file");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"existing",
+            "not truncated"
+        );
+    }
+
+    /// Cleanup removes our own staging dir whole, and refuses to touch anything
+    /// that is not ours (a wrong-prefix sibling, a path outside temp_dir()).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discard_staging_removes_only_our_own_dir() {
+        // Our own dir, with the installer in it: removed whole.
+        let ours = stage_dir().expect("stage_dir");
+        let installer = ours.join("roomlerd-0.4.0-x86_64-unknown-linux-gnu.deb");
+        std::fs::write(&installer, b"x").expect("write installer");
+        discard_staging(&installer);
+        assert!(!ours.exists(), "our own staging dir is removed");
+
+        // A sibling in temp_dir() with a DIFFERENT prefix: left alone.
+        let not_ours = tempfile::Builder::new()
+            .prefix("not-ours.")
+            .tempdir_in(std::env::temp_dir())
+            .expect("not-ours dir");
+        let other = not_ours.path().join("foo.deb");
+        std::fs::write(&other, b"y").expect("write other");
+        discard_staging(&other);
+        assert!(other.exists(), "a dir that is not ours is left alone");
+
+        // A path whose parent is not a staging dir at all: a no-op, no panic.
+        discard_staging(std::path::Path::new("/usr/bin/roomlerd"));
+    }
+
+    // ── FR-96 security review (#2055): the run-spacing gate ──────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_gate_wait_is_the_remainder_of_the_gap() {
+        let now = std::time::SystemTime::now();
+        let last = now - Duration::from_secs(20);
+        assert_eq!(
+            helper_gate_wait(Some(last), now, Duration::from_secs(60)),
+            Duration::from_secs(40)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_gate_wait_is_zero_after_the_gap() {
+        let now = std::time::SystemTime::now();
+        let last = now - Duration::from_secs(61);
+        assert_eq!(
+            helper_gate_wait(Some(last), now, Duration::from_secs(60)),
+            Duration::ZERO
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_gate_wait_is_the_full_gap_with_no_stamp() {
+        let now = std::time::SystemTime::now();
+        assert_eq!(
+            helper_gate_wait(None, now, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A stamp in the future (the clock stepped back) must not disable the gap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_gate_wait_is_the_full_gap_for_a_future_stamp() {
+        let now = std::time::SystemTime::now();
+        let last = now + Duration::from_secs(5);
+        assert_eq!(
+            helper_gate_wait(Some(last), now, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A fresh stamp waits ≈ the gap; an unreadable one waits the FULL gap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_gate_wait_at_reads_the_stamp_and_fails_safe_when_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stamp = tmp.path().join("update-helper-run");
+        stamp_helper_gate(&stamp).expect("write stamp");
+        let now = std::time::SystemTime::now();
+        let wait = helper_gate_wait_at(&stamp, now, Duration::from_secs(60));
+        assert!(
+            wait > Duration::from_secs(55) && wait <= Duration::from_secs(60),
+            "a fresh stamp waits ~the gap, got {wait:?}"
+        );
+        // A stamp PATH that lies under a regular file (ENOTDIR on metadata):
+        // the full gap, never zero.
+        let a_file = tmp.path().join("afile");
+        std::fs::write(&a_file, b"x").expect("write file");
+        let bogus = a_file.join("update-helper-run");
+        assert_eq!(
+            helper_gate_wait_at(&bogus, now, Duration::from_secs(60)),
+            Duration::from_secs(60),
+            "an unreadable stamp must wait the full gap"
+        );
+    }
+
+    /// The Linux gate must equal launchd's ThrottleInterval, so the two update
+    /// halves cannot drift to different cadences unseen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_helper_min_gap_matches_launchd_throttle_interval() {
+        assert_eq!(UPDATE_HELPER_MIN_GAP, Duration::from_secs(60));
+        let plist = include_str!("../packaging/macos/com.roomler.update.plist");
+        assert!(
+            plist.contains("<key>ThrottleInterval</key>"),
+            "the plist still carries the twin"
+        );
+        assert!(
+            plist.contains("<integer>60</integer>"),
+            "ThrottleInterval is 60 s"
+        );
+    }
+
+    // ── FR-96 security review (#2055): consuming the wake ────────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consume_wake_removes_a_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wake = tmp.path().join("wake");
+        std::fs::write(&wake, b"ts").expect("write");
+        assert!(matches!(consume_wake(&wake), WakeConsumed::Removed));
+        assert!(!wake.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consume_wake_is_quiet_when_nothing_is_there() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            consume_wake(&tmp.path().join("absent")),
+            WakeConsumed::Nothing
+        ));
+    }
+
+    /// A symlink planted at the wake path is unlinked, never followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consume_wake_unlinks_a_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canary = tmp.path().join("canary");
+        std::fs::write(&canary, b"keep").expect("canary");
+        let wake = tmp.path().join("wake");
+        std::os::unix::fs::symlink(&canary, &wake).expect("symlink");
+        assert!(matches!(consume_wake(&wake), WakeConsumed::Removed));
+        assert!(!wake.exists(), "the link is gone");
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"keep",
+            "the symlink target was not followed"
+        );
+    }
+
+    /// A directory planted at the wake path (what unlink refuses, and what left
+    /// in place would re-trigger the path unit forever) is moved aside and
+    /// removed, leaving nothing behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consume_wake_moves_a_planted_directory_aside_and_removes_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wake = tmp.path().join("wake");
+        std::fs::create_dir(&wake).expect("mkdir wake");
+        std::fs::write(wake.join("x"), b"planted").expect("file in planted dir");
+        match consume_wake(&wake) {
+            WakeConsumed::MovedAside { cleanup } => {
+                assert!(cleanup.is_none(), "removed cleanly: {cleanup:?}")
+            }
+            other => panic!("expected MovedAside, got {other:?}"),
+        }
+        assert!(!wake.exists(), "the planted directory is gone");
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".roomler-update-check.aside.")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "no aside dir left behind");
+    }
+
+    /// `queue_update_check` refuses to write through a planted symlink
+    /// (`O_NOFOLLOW`) — a per-user daemon must not be tricked into clobbering
+    /// an arbitrary file through the sticky /var/tmp name.
+    #[cfg(unix)]
+    #[test]
+    fn queue_update_check_refuses_a_planted_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canary = tmp.path().join("canary");
+        std::fs::write(&canary, b"keep").expect("canary");
+        let link = tmp.path().join("wake");
+        std::os::unix::fs::symlink(&canary, &link).expect("symlink");
+        assert!(
+            queue_update_check_at(&link).is_err(),
+            "writing must refuse a symlink at the wake path"
+        );
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"keep",
+            "the symlink target was not written through"
+        );
     }
 
     // ── Linux .deb install candidates ───────────────────────────────

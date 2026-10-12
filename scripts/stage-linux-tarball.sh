@@ -52,6 +52,10 @@ fi
 # an upgrade must never revert a unit the operator edited.
 install -D -m644 "$pkg/packaging/linux/roomlerd.service" "$root/usr/lib/systemd/system/roomlerd.service"
 install -D -m644 "$pkg/packaging/linux/roomler.service"  "$root/usr/lib/systemd/user/roomler.service"
+# FR-96 — the update half of a per-user install (disabled until install.sh enables it).
+for u in roomler-update.service roomler-update.timer roomler-update.path; do
+    install -D -m644 "$pkg/packaging/linux/$u" "$root/usr/lib/systemd/system/$u"
+done
 install -D -m644 "$pkg/packaging/linux/README.Debian"    "$root/usr/share/doc/roomler-agent/README.Debian"
 
 # ⚠️ Files only, owned by root in the archive. A plain `tar czf` of the tree

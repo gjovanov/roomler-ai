@@ -1,0 +1,14 @@
+[Unit]
+# FR-96 — the periodic wake of roomler-update.service: the twin of the macOS
+# helper's RunAtLoad (OnBootSec) and StartInterval 21600 (OnUnitActiveSec).
+# The interval is the ceiling for a missed push; a pushed rc:agent.update
+# reaches the helper at once, through roomler-update.path.
+Description=Roomler update helper — periodic check
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

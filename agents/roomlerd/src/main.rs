@@ -242,12 +242,13 @@ enum Command {
     /// ⚠️ Blocks while a person answers the consent dialog.
     #[command(hide = true, name = "portal-session")]
     PortalSession,
-    /// (internal, macOS) The body of the `com.roomler.update` LaunchDaemon:
-    /// consume the wake file, then check → download → verify → run
-    /// `installer -pkg … -target /` as root, waiting on it. Root-only and
-    /// single-shot; the pkg's postinstall restarts the agent halves.
-    /// Hidden: launchd is the caller — by hand it is
-    /// `sudo roomlerd update-helper`, and running it non-root only
+    /// (internal, macOS and Linux) The body of the `com.roomler.update`
+    /// LaunchDaemon and of the Linux `roomler-update.service` (FR-96): consume
+    /// the wake file, then check → download → verify → install as root,
+    /// waiting on it (`installer -pkg … -target /` on macOS, whose postinstall
+    /// restarts the agent halves; `apt-get`/`dpkg` or the tarball on Linux).
+    /// Root-only and single-shot. Hidden: launchd or systemd is the caller — by
+    /// hand it is `sudo roomlerd update-helper`, and running it non-root only
     /// prints the refusal.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
@@ -1454,15 +1455,18 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::UpdateHelper => {
-            #[cfg(target_os = "macos")]
+            // FR-96 — Linux has the update half too: `roomler-update.service`
+            // runs this for a per-user install.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 updater::run_update_helper().await
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 anyhow::bail!(
-                    "update-helper is the macOS com.roomler.update LaunchDaemon body; \
-                     this platform's updater runs inside the agent itself"
+                    "update-helper is the body of the macOS com.roomler.update LaunchDaemon \
+                     and of the Linux roomler-update.service; this platform's updater runs \
+                     inside the agent itself"
                 )
             }
         }
@@ -4846,7 +4850,7 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
         // real macOS paths fixed by the launchd plists, which are pinned to the frozen
         // .app bundle name (D5). They sit inside a string literal, so the anchor is on
         // the statement. docs/fr/FR-21
-        return match updater::macos_queue_update_check() {
+        return match updater::queue_update_check() {
             Ok(()) => {
                 println!(
                     "Queued for the root update helper (com.roomler.update).\n\

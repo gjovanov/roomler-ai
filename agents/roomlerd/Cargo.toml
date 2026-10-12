@@ -345,6 +345,13 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["damage", "screensaver", "randr"], optional = true }
 
+# FR-96 security review (#2055) — the root update helper stages each download in
+# a FRESH private directory (mkdtemp) instead of a fixed world-creatable name in
+# /tmp, and moves a planted wake-file entry aside into one. Linux-only: the
+# staging + consume code is `#[cfg(target_os = "linux")]`. Already a dev-dep
+# below and in the lockfile, so this adds no new dependency tree.
+tempfile = { workspace = true }
+
 # FR-36 P1 — DRM/KMS scanout capture (`drm-capture`). MIT, and its whole tree
 # (drm-ffi / drm-sys / drm-fourcc) is MIT too, so it is clean under FR-24's
 # no-AGPL-in-a-shipped-agent rule. drm-sys builds from `linux-raw-sys` with NO
@@ -869,6 +876,13 @@ assets = [
     # Nothing enables it — the .deb ships no maintainer scripts, so it is inert
     # until an operator opts in (`install.sh --role daemon --system`).
     ["packaging/linux/roomlerd.service", "usr/lib/systemd/system/roomlerd.service", "644"],
+    # FR-96 — the update half of a per-user install: a root, one-shot
+    # `roomlerd update-helper`, woken by its timer and by the wake file a
+    # per-user daemon touches. Shipped disabled, like everything here:
+    # install.sh enables the timer and the path for a per-user install only.
+    ["packaging/linux/roomler-update.service", "usr/lib/systemd/system/roomler-update.service", "644"],
+    ["packaging/linux/roomler-update.timer", "usr/lib/systemd/system/roomler-update.timer", "644"],
+    ["packaging/linux/roomler-update.path", "usr/lib/systemd/system/roomler-update.path", "644"],
     ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
 ]
 
