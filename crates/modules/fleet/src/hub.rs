@@ -1723,12 +1723,13 @@ impl Hub {
             .map(|a| a.supports_hive)
     }
 
-    /// FR-90 — push a Hive frame (`rc:hive.start` / `rc:hive.stop`) to a
-    /// device, checked in the lookup that sends it so a reconnect cannot fall
-    /// between the check and the push: offline (or another tenant's —
-    /// reported identically, so org A cannot tell org B's devices from absent
-    /// ones) is [`Error::AgentOffline`]; a connection that did not advertise
-    /// `hive` is [`Error::ExecUnsupported`] and receives nothing.
+    /// FR-90 — push a Hive frame (`rc:hive.start` / `rc:hive.stop` /
+    /// `rc:hive.demote`) to a device, checked in the lookup that sends it so a
+    /// reconnect cannot fall between the check and the push: offline (or
+    /// another tenant's — reported identically, so org A cannot tell org B's
+    /// devices from absent ones) is [`Error::AgentOffline`]; a connection that
+    /// did not advertise `hive` is [`Error::ExecUnsupported`] and receives
+    /// nothing.
     pub fn push_hive(&self, agent_id: ObjectId, tenant_id: ObjectId, msg: ServerMsg) -> Result<()> {
         {
             let entry = self

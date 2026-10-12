@@ -21,6 +21,18 @@
 //! Reports go to the primary connection that is up NOW, and the latest of each
 //! is replayed when a connection comes up, because a report sent into a dying
 //! socket is lost and the server would otherwise show a stale state forever.
+//!
+//! # The fence (P2e-1)
+//!
+//! A session's lease is a fence, and the server's word on it only grows. A
+//! start at an older fence than the run here is a stale frame, refused. A
+//! start at a newer one, or `rc:hive.demote`, means the run here belongs to
+//! the past: it is FENCED (its model calls, prompts and approval answers are
+//! refused from that moment) and stopped, and a start waits until its task
+//! has let go before it launches, so two harnesses never run on one history.
+//! Whatever a run removes when it ends — its live entry, its hosted record —
+//! it removes only at its own fence, so an old run's end never takes the new
+//! run's with it.
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -50,7 +62,7 @@ use roomler_node_core::config::AgentConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// P1i-2 — on Windows a harness is a [`crate::hive_win::HarnessChild`]: started
 /// into its Job Object as the console user, with the part of tokio's `Child`
@@ -122,6 +134,11 @@ const MAX_LINE: usize = 8 * 1024 * 1024;
 /// How long a stopped harness gets between SIGTERM and SIGKILL, and an
 /// exiting one before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// P2e-1 — how long a start at a newer fence waits for the run it stops to
+/// let go: a stop's whole path, both graces and the stderr tail's 2 s, with
+/// room to spare. Past it the start is refused, and nothing launches beside
+/// a harness that is still there.
+const SUPERSEDE_WAIT: Duration = Duration::from_secs(2 * STOP_GRACE.as_secs() + 5);
 /// How much of a failed harness's stderr its transcript note keeps — on the
 /// device; the `ended` detail, which the server stores, never carries it.
 const STDERR_TAIL: usize = 400;
@@ -243,6 +260,14 @@ struct Live {
     /// reads it at each turn's end, so a primary's join turns it on while the
     /// session runs.
     replicated: Arc<AtomicBool>,
+    /// P2e-1 — a newer fence took the session (a start at one here, or
+    /// `rc:hive.demote`): its model calls, prompts and approval answers are
+    /// refused from now on, not once its harness has gone.
+    fenced: bool,
+    /// P2e-1 — changes once, closing, when the session's task has let go of
+    /// it (`finish` or `let_go` returned): what a start at a newer fence
+    /// waits for before it launches.
+    gone: watch::Receiver<()>,
 }
 
 /// What a launch hands the session task.
@@ -884,6 +909,23 @@ pub fn handle_stop(session_id: ObjectId, fence: u64, reason: String, is_primary:
     }
 }
 
+/// FR-90 P2e-1 — `rc:hive.demote`: the session's lease is at `fence` on
+/// another device ([`Supervisor::demote`]). The primary enrollment's only,
+/// like every Hive frame; from a task of its own, since the store's floor is
+/// raised first.
+pub fn handle_demote(session_id: ObjectId, fence: u64, reason: String, is_primary: bool) {
+    if !is_primary {
+        warn!(session = %session_id, "hive: rc:hive.demote ignored — not the primary enrollment");
+        return;
+    }
+    match global() {
+        Some(sup) => {
+            tokio::spawn(async move { sup.demote(session_id, fence, &reason).await });
+        }
+        None => debug!(session = %session_id, "hive: rc:hive.demote with no supervisor"),
+    }
+}
+
 /// The primary enrollment's control WS came up: send reports there from now
 /// on, and replay the latest of each — a report sent into the socket that
 /// just died never arrived.
@@ -1057,7 +1099,7 @@ impl Supervisor {
                 // P1d-2 — a session refused here does not run here: nothing
                 // of it is left to resume.
                 if !self.holds_live(order.session_id) {
-                    self.hosted_remove(order.session_id);
+                    self.hosted_forget(order.session_id, order.fence);
                 }
             }
         }
@@ -1087,6 +1129,33 @@ impl Supervisor {
         // whose answer was lost.
         if let Some(account) = self.running(order.session_id, order.fence) {
             return Answer::accepted(&account);
+        }
+        // P2e-1 — the lease is a fence. A start older than the run here is a
+        // stale frame; a newer one means that run belongs to the past, and it
+        // stops before anything else is decided: whatever the gates below
+        // say, the server has moved on from it. Two harnesses never run on
+        // one history (§3d), so nothing launches until it has let go.
+        if let Some((held, fenced)) = self.live_fence(order.session_id) {
+            if held > order.fence {
+                return Answer::refused(
+                    HiveRefusal::Other,
+                    format!("this device runs the session at a newer fence ({held})"),
+                );
+            }
+            // The run at this very fence was fenced out by a newer one's
+            // word: a start for it is as stale.
+            if fenced && held == order.fence {
+                return Answer::refused(
+                    HiveRefusal::Other,
+                    format!("a newer fence took the session from this device (fence {held})"),
+                );
+            }
+            if let Err(e) = self
+                .supersede(order.session_id, order.fence, "superseded")
+                .await
+            {
+                return Answer::refused(HiveRefusal::LaunchFailed, e);
+            }
         }
         // P1d-1 — the daemon is about to restart for an update: a session
         // launched now would be cut at once.
@@ -1212,12 +1281,23 @@ impl Supervisor {
         }
     }
 
-    /// The account a live session runs as, when it runs at `fence`.
+    /// The account a live session runs as, when it runs at `fence` and no
+    /// newer fence has taken it (P2e-1).
     fn running(&self, session: ObjectId, fence: u64) -> Option<String> {
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         live.get(&session)
-            .filter(|l| l.fence == fence)
+            .filter(|l| l.fence == fence && !l.fenced)
             .map(|l| l.account.clone())
+    }
+
+    /// P2e-1 — the fence `session` runs at here, and whether a newer one has
+    /// fenced that run out.
+    fn live_fence(&self, session: ObjectId) -> Option<(u64, bool)> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|l| (l.fence, l.fenced))
     }
 
     /// Feed a prompt to a running session. The viewer peer (P0d-2) is what
@@ -1243,10 +1323,15 @@ impl Supervisor {
         }
         let (input, waiting) = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            live.get(&session)
-                .map(|l| (l.input.clone(), Arc::clone(&l.waiting)))
-        }
-        .ok_or("no such session on this device")?;
+            match live.get(&session) {
+                None => return Err("no such session on this device".into()),
+                // P2e-1 — a newer fence took it: no turn begins here.
+                Some(l) if l.fenced => {
+                    return Err("the session has moved on from this device".into());
+                }
+                Some(l) => (l.input.clone(), Arc::clone(&l.waiting)),
+            }
+        };
         // A place is taken BEFORE the send, atomically, so two callers cannot
         // both have the last one.
         if waiting
@@ -1279,20 +1364,33 @@ impl Supervisor {
                     info!(session = %session, held = l.fence, fence, "hive: stop for an older fence ignored");
                     return;
                 }
-                Some(l) => Some(l.input.clone()),
+                Some(l) => Some((l.input.clone(), l.fence)),
                 None => None,
             }
         };
         match input {
-            Some(tx) => {
+            Some((tx, held)) => {
                 if tx.try_send(Input::Stop { reason }).is_err() {
                     warn!(session = %session, "hive: stop could not reach the session task");
+                }
+                // P2e-1 — an OLDER run: the server has moved past it, and
+                // nothing here runs the fence the stop names (a start at it
+                // may be waiting for this very run to let go). Said so now,
+                // as for any session not run here; a launch that comes after
+                // is answered with a stop when it reports in.
+                if held < fence {
+                    self.report(
+                        session,
+                        fence,
+                        HiveRunState::Ended,
+                        Some("not running on this device".into()),
+                    );
                 }
             }
             // P1d-2 — hosted by the previous daemon and not resumed yet: it
             // ends here, without a launch.
             None if self.take_from_resume(session, fence) => {
-                self.hosted_remove(session);
+                self.hosted_forget(session, fence);
                 self.report(
                     session,
                     fence,
@@ -1300,12 +1398,18 @@ impl Supervisor {
                     Some(format!("stopped ({reason}) before it resumed")),
                 );
             }
-            None => self.report(
-                session,
-                fence,
-                HiveRunState::Ended,
-                Some("not running on this device".into()),
-            ),
+            None => {
+                // P2e-1 — and a resume that took it from the queue and waits
+                // for the start lock now finds it forgotten (`resume`): the
+                // stop came first.
+                self.hosted_forget(session, fence);
+                self.report(
+                    session,
+                    fence,
+                    HiveRunState::Ended,
+                    Some("not running on this device".into()),
+                );
+            }
         }
     }
 
@@ -1317,6 +1421,86 @@ impl Supervisor {
         let before = q.len();
         q.retain(|h| !(h.session == sid && h.fence <= fence));
         q.len() != before
+    }
+
+    /// P2e-1 — `rc:hive.demote`: the session's lease is at `fence`, on
+    /// another device. The store's fence floor for it rises to `fence`
+    /// first, so whatever a run here still writes is refused as it is on
+    /// every member; then the run here at an older fence is fenced out and
+    /// stopped, and what the device hosts forgets the session, so neither a
+    /// restart nor a resume still waiting launches it (`resume` reads the
+    /// record again under the start lock). The copy in the store stays:
+    /// whether the device goes on holding one is its owner's `hive_replica`
+    /// and the server's join.
+    ///
+    /// Under the start lock, so neither a resume nor a start in flight
+    /// launches the session again behind the demote's back.
+    pub(crate) async fn demote(&self, session: ObjectId, fence: u64, reason: &str) {
+        let _serial = self.start_lock.lock().await;
+        if let Ok(store) = &self.store
+            && let Err(e) = store.raise_floor(&session.to_hex(), fence).await
+        {
+            debug!(session = %session, fence, %e, "hive: a demote's fence floor was not raised");
+        }
+        let ran = self
+            .fence_out(session, fence, "demoted")
+            .map(|(held, _)| held);
+        // What is older than the lease's fence, and only that: a session
+        // that came back is not this demote's.
+        if let Some(older) = fence.checked_sub(1) {
+            self.hosted_forget(session, older);
+        }
+        info!(
+            session = %session, fence, reason, ran = ?ran,
+            "hive: demoted — the session is held at a newer fence elsewhere"
+        );
+    }
+
+    /// P2e-1 — fence out the run of `session` here at a fence older than
+    /// `fence`, and tell it to stop: from now on its model calls, prompts
+    /// and approval answers are refused. Its fence, and what closes once its
+    /// task has let go; `None` when no such run is here.
+    fn fence_out(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        why: &str,
+    ) -> Option<(u64, watch::Receiver<()>)> {
+        let (held, input, gone, already) = {
+            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            let l = live.get_mut(&session).filter(|l| l.fence < fence)?;
+            let already = std::mem::replace(&mut l.fenced, true);
+            (l.fence, l.input.clone(), l.gone.clone(), already)
+        };
+        if !already {
+            info!(session = %session, held, fence, why, "hive: a newer fence took the session — its run here stops");
+            let reason = format!("{why}: the session is at fence {fence}");
+            if input.try_send(Input::Stop { reason }).is_err() {
+                debug!(session = %session, "hive: the fenced run's task takes no more input");
+            }
+        }
+        Some((held, gone))
+    }
+
+    /// P2e-1 — before a start at `fence` launches: the run here at an older
+    /// fence is fenced out and stopped, and the start waits until its task
+    /// has let go of the session. `Err` when it has not within
+    /// [`SUPERSEDE_WAIT`].
+    async fn supersede(&self, session: ObjectId, fence: u64, why: &str) -> Result<(), String> {
+        let Some((held, mut gone)) = self.fence_out(session, fence, why) else {
+            return Ok(());
+        };
+        // Nothing ever sends on it: it changes only by closing.
+        match tokio::time::timeout(SUPERSEDE_WAIT, gone.changed()).await {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                warn!(session = %session, held, fence, "hive: the run a newer fence took did not let go");
+                Err(format!(
+                    "the session's run at fence {held} did not stop within {} s",
+                    SUPERSEDE_WAIT.as_secs()
+                ))
+            }
+        }
     }
 
     pub(crate) fn connected(self: &Arc<Self>, tx: mpsc::Sender<ClientMsg>) {
@@ -1486,6 +1670,16 @@ impl Supervisor {
         if self.holds_live(session) {
             return;
         }
+        // P2e-1 — taken from the queue before the lock: a demote that won
+        // the lock meanwhile forgot the session here, and it is not resumed.
+        // (Nothing is reported: its run is the new primary's now.)
+        if self
+            .hosted_get(session)
+            .is_none_or(|cur| cur.fence != h.fence)
+        {
+            info!(session = %session, fence = h.fence, "hive: a hosted session was forgotten before it resumed — not resumed");
+            return;
+        }
         let now = unix_now();
         let quick = match h.resumed_at {
             Some(at) if now.saturating_sub(at) < RESUME_STABLE.as_secs() => h.quick_resumes + 1,
@@ -1551,7 +1745,7 @@ impl Supervisor {
     /// ended with why.
     fn not_resumed(&self, session: ObjectId, fence: u64, why: String) {
         info!(session = %session, %why, "hive: a hosted session was not resumed");
-        self.hosted_remove(session);
+        self.hosted_forget(session, fence);
         self.report(
             session,
             fence,
@@ -1576,24 +1770,28 @@ impl Supervisor {
     /// lost twice — once on the wire, and again because the next daemon
     /// would find nothing left to report (field, 2026-10-08: an approval the
     /// teardown withdrew stayed "needed" on the server).
-    fn hosted_update(&self, session: ObjectId, f: impl FnOnce(&mut HostedSession)) {
+    ///
+    /// P2e-1 — a run's own record only, at its `fence`.
+    fn hosted_update(&self, session: ObjectId, fence: u64, f: impl FnOnce(&mut HostedSession)) {
         if self.going_down() {
             return;
         }
         self.hosted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .update(&session.to_hex(), f);
+            .update_at(&session.to_hex(), fence, f);
     }
 
-    fn hosted_remove(&self, session: ObjectId) {
+    /// Forget what the device hosts of `session` at `fence` or an older one
+    /// (P2e-1): never a newer run's record.
+    fn hosted_forget(&self, session: ObjectId, fence: u64) {
         if self.going_down() {
             return;
         }
         self.hosted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&session.to_hex());
+            .remove_upto(&session.to_hex(), fence);
     }
 
     /// P1d-2 — the daemon is stopping (see the module-level
@@ -1785,13 +1983,18 @@ impl Supervisor {
         decision: toolbelt::Decision,
         by: Author,
     ) -> Result<(), String> {
-        let pending = self
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&session)
-            .map(|l| Arc::clone(&l.approvals))
-            .ok_or("no such session on this device")?;
+        let pending = {
+            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            match live.get(&session) {
+                None => return Err("no such session on this device".into()),
+                // P2e-1 — a newer fence took it: its approvals are no longer
+                // this device's to answer.
+                Some(l) if l.fenced => {
+                    return Err("the session has moved on from this device".into());
+                }
+                Some(l) => Arc::clone(&l.approvals),
+            }
+        };
         if pending.answer(approval, toolbelt::Answer { decision, by }) {
             Ok(())
         } else {
@@ -1952,14 +2155,20 @@ impl Supervisor {
         if let Some(token) = token {
             self.tokens.revoke(token);
         }
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&session);
+        self.unlive(session, fence);
         // P1d-2 — over, so nothing to resume.
-        self.hosted_remove(session);
-        info!(session = %session, %detail, "hive: session ended");
+        self.hosted_forget(session, fence);
+        info!(session = %session, fence, %detail, "hive: session ended");
         self.report(session, fence, HiveRunState::Ended, Some(detail));
+    }
+
+    /// P2e-1 — the run of `session` at `fence` is no longer live here; one at
+    /// another fence is not this run's to take.
+    fn unlive(&self, session: ObjectId, fence: u64) {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if live.get(&session).is_some_and(|l| l.fence == fence) {
+            live.remove(&session);
+        }
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
@@ -2023,7 +2232,7 @@ impl Supervisor {
                 text: format!("{}.", words.join("; ")),
             },
         );
-        self.hosted_update(session, |h| {
+        self.hosted_update(session, fence, |h| {
             h.running = None;
             h.approvals.clear();
         });
@@ -2032,15 +2241,12 @@ impl Supervisor {
     /// P1d-2 — the session's harness went down with the daemon: let go of
     /// it here and say nothing, exactly as a daemon killed outright would.
     /// What the device hosts keeps it, and the next daemon resumes it.
-    fn let_go(&self, session: ObjectId, token: Option<&str>) {
+    fn let_go(&self, session: ObjectId, fence: u64, token: Option<&str>) {
         if let Some(token) = token {
             self.tokens.revoke(token);
         }
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&session);
-        info!(session = %session, "hive: the session went down with the daemon — kept for the next start");
+        self.unlive(session, fence);
+        info!(session = %session, fence, "hive: the session went down with the daemon — kept for the next start");
     }
 
     fn launch(
@@ -2083,6 +2289,8 @@ impl Supervisor {
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
         let replicated = Arc::new(AtomicBool::new(order.replicated));
+        // P2e-1 — dropped by the session's task once it has let go.
+        let (gone_tx, gone) = watch::channel(());
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
             order.session_id,
             Live {
@@ -2094,10 +2302,12 @@ impl Supervisor {
                 approvals: toolbelt.pending(),
                 pid,
                 replicated: Arc::clone(&replicated),
+                fenced: false,
+                gone,
             },
         );
         if prior.is_some() {
-            self.hosted_update(order.session_id, |h| {
+            self.hosted_update(order.session_id, order.fence, |h| {
                 h.harness_pid = pid;
                 h.harness_started = started.clone();
                 // P2c-4 — a primary's join that came while this resumed:
@@ -2161,8 +2371,11 @@ impl Supervisor {
             };
             match run(&sup, session, fence, child, inputs, store, resumed).await {
                 Some(detail) => sup.finish(session, fence, token.as_deref(), detail),
-                None => sup.let_go(session, token.as_deref()),
+                None => sup.let_go(session, fence, token.as_deref()),
             }
+            // P2e-1 — only now: a start at a newer fence launches once this
+            // run has removed all it will.
+            drop(gone_tx);
         });
         Ok(())
     }
@@ -2902,7 +3115,8 @@ impl Task<'_> {
 
     fn save_open_approvals(&self) {
         let open = self.open_approvals.clone();
-        self.sup.hosted_update(self.session, |h| h.approvals = open);
+        self.sup
+            .hosted_update(self.session, self.fence, |h| h.approvals = open);
     }
 
     /// The session is ending with approvals still open: each is recorded as
@@ -2979,7 +3193,7 @@ impl Task<'_> {
         let prompted_by = author.as_ref().map(|a| a.user_id);
         // P1d-2 — the turn's number is on disk before its stub goes out.
         let n = self.count;
-        self.sup.hosted_update(self.session, |h| {
+        self.sup.hosted_update(self.session, self.fence, |h| {
             h.turns = n;
             h.running = Some(RunningTurn {
                 turn: n,
@@ -3047,7 +3261,8 @@ impl Task<'_> {
             // P1d-2 — over before its stub says so: the server edits a stub
             // to whatever comes last, so a resume must never report a turn
             // that finished as cut.
-            self.sup.hosted_update(self.session, |h| h.running = None);
+            self.sup
+                .hosted_update(self.session, self.fence, |h| h.running = None);
             self.turn_report(status, duration_ms, cost_usd);
             self.current = None;
             // P2b-3b — a replicated session's checkpoint: at the turn's end,
@@ -5987,6 +6202,370 @@ done
         assert!(!config_claude_md(&r, sid).exists());
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+
+    // ─── P2e-1 — the fence on the device ────────────────────────────────
+
+    /// The next state reported for `session`, with its fence.
+    async fn next_state_at(r: &mut Rig, session: ObjectId) -> (u64, HiveRunState, Option<String>) {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), r.reports.recv())
+                .await
+                .expect("a state report within 10 s")
+                .expect("the reporter is open");
+            if let ClientMsg::HiveState {
+                session_id,
+                fence,
+                state: Some(s),
+                detail,
+            } = msg
+                && session_id == session
+            {
+                return (fence, s, detail);
+            }
+        }
+    }
+
+    /// `o`, at `fence`.
+    fn at_fence(o: &StartOrder, fence: u64) -> StartOrder {
+        StartOrder { fence, ..o.clone() }
+    }
+
+    /// Reports of the rig's daemon, without a connection's resume: for a
+    /// test that drives the resume itself.
+    fn listen_only(r: &mut Rig) {
+        let (tx, reports) = mpsc::channel(64);
+        *r.sup.reporter.lock().unwrap() = Some(tx);
+        r.reports = reports;
+    }
+
+    /// P2e-1 — a start at a newer fence on a device that runs an older one
+    /// stops that run FIRST: its harness is gone before the start is
+    /// answered, its `ended` comes before the new run's `idle`, and the new
+    /// run takes up the history the old one left. Only the new run is live,
+    /// and what the device hosts is the new run's.
+    #[tokio::test]
+    async fn a_start_at_a_newer_fence_stops_the_older_run_first() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert_eq!(r.sup.start(o.clone(), true).await, Answer::accepted("dev"));
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Idle, None)
+        );
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let first = fake_pid(&r).await;
+        let _ = std::fs::remove_file(r.root.path().join("work").join(".pid"));
+        forget_argv(&r);
+
+        assert_eq!(
+            r.sup.start(at_fence(&o, 2), true).await,
+            Answer::accepted("dev")
+        );
+        assert!(
+            !super::super::procs::group_alive(first),
+            "the fence-1 harness is gone before the fence-2 start is answered"
+        );
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (
+                1,
+                HiveRunState::Ended,
+                Some("stopped (superseded: the session is at fence 2)".into())
+            ),
+            "the old run's end comes first"
+        );
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (2, HiveRunState::Idle, None)
+        );
+        assert!(
+            next_argv(&r).await.iter().any(|a| a == "--resume"),
+            "the new run takes up the history the old one left"
+        );
+        assert_ne!(fake_pid(&r).await, first);
+        assert!(r.sup.runs_at(sid, 2) && !r.sup.runs_at(sid, 1));
+        assert_eq!(r.sup.live_count(), 1);
+        let on_disk = hosted_on_disk(&r);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(
+            on_disk[0].fence, 2,
+            "what the device hosts is the new run's"
+        );
+
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-1 — a start older than the run here is a stale frame: refused,
+    /// and the run here goes on untouched.
+    #[tokio::test]
+    async fn a_start_older_than_the_run_here_is_refused_and_moves_nothing() {
+        let mut r = rig(true, 4);
+        let o = at_fence(&order(&r), 2);
+        let sid = o.session_id;
+        assert!(r.sup.start(o.clone(), true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (2, HiveRunState::Idle, None)
+        );
+        let pid = fake_pid(&r).await;
+
+        let stale = r.sup.start(at_fence(&o, 1), true).await;
+        assert_eq!(stale.refused, Some(HiveRefusal::Other), "{stale:?}");
+        assert!(
+            stale
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("a newer fence (2)")),
+            "{stale:?}"
+        );
+        assert!(
+            super::super::procs::group_alive(pid),
+            "the run here goes on"
+        );
+        assert!(r.sup.runs_at(sid, 2));
+        assert_eq!(hosted_on_disk(&r)[0].fence, 2);
+
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-1 — what a run removes when it ends, it removes at its own fence:
+    /// an old run's end, or its going down with the daemon, takes nothing of
+    /// a newer run's (not its live entry, so not its model access, and not
+    /// what the device hosts of it), and an old run's write to what the
+    /// device hosts lands nowhere.
+    #[tokio::test]
+    async fn an_old_runs_end_takes_nothing_of_a_newer_runs() {
+        let mut r = rig(true, 4);
+        let o = at_fence(&order(&r), 2);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (2, HiveRunState::Idle, None)
+        );
+
+        r.sup.finish(sid, 1, None, "an old run ended".into());
+        assert!(r.sup.runs_at(sid, 2), "the new run is still live");
+        assert_eq!(hosted_on_disk(&r).len(), 1, "and still hosted");
+        r.sup.let_go(sid, 1, None);
+        assert!(
+            r.sup.runs_at(sid, 2),
+            "an old run going down with the daemon lets go of nothing newer"
+        );
+        r.sup.hosted_update(sid, 1, |h| h.turns = 99);
+        assert_eq!(
+            hosted_on_disk(&r)[0].turns,
+            0,
+            "an old run writes nothing of the new run's"
+        );
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Ended, Some("an old run ended".into()))
+        );
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (2, HiveRunState::Running, None),
+            "and the new run takes its prompt"
+        );
+
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-1 — `rc:hive.demote`: the run at an older fence is fenced out
+    /// the moment the demote is handled, before its harness has gone (its
+    /// model calls, through the sidecar's gate, its prompts and its approval
+    /// answers are refused), then it ends. The store's floor is the lease's
+    /// fence, so a late write of the run's is refused there, and what the
+    /// device hosts forgets it, so the next daemon resumes nothing.
+    #[tokio::test]
+    async fn a_demote_fences_the_run_out_at_once_and_nothing_resumes_it() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Idle, None)
+        );
+        assert!(r.sup.runs_at(sid, 1));
+
+        r.sup.demote(sid, 2, "not_location").await;
+        // Nothing has yielded to the session's task since (one thread): the
+        // run is still here, fenced.
+        assert!(r.sup.holds_live(sid), "the run has not let go yet");
+        assert!(
+            !r.sup.runs_at(sid, 1),
+            "its model calls are refused at once"
+        );
+        assert_eq!(
+            r.sup.prompt(sid, dev(&r), "more".into()),
+            Err("the session has moved on from this device".into())
+        );
+        assert_eq!(
+            r.sup
+                .answer_approval(sid, "a1", toolbelt::Decision::Allow, dev(&r).unwrap()),
+            Err("the session has moved on from this device".into())
+        );
+        assert!(hosted_on_disk(&r).is_empty(), "the device forgets it");
+        assert_eq!(r.store.floor(&sid.to_hex()).await.unwrap(), Some(2));
+
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (
+                1,
+                HiveRunState::Ended,
+                Some("stopped (demoted: the session is at fence 2)".into())
+            )
+        );
+        let before = r.store.events(&sid.to_hex()).len();
+        r.store.append(
+            &sid.to_hex(),
+            1,
+            TranscriptEvent::Note {
+                text: "late".into(),
+            },
+        );
+        assert_eq!(
+            r.store.events(&sid.to_hex()).len(),
+            before,
+            "a late write at fence 1 is refused"
+        );
+
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert!(manifest.is_empty(), "nothing resumed: {manifest:?}");
+        assert!(!r.sup.holds_live(sid));
+    }
+
+    /// P2e-1 — a demote names the fence the lease is at now: a run here at
+    /// that fence or a newer one is the session come back, not the
+    /// demote's.
+    #[tokio::test]
+    async fn a_demote_for_a_fence_this_device_moved_past_changes_nothing() {
+        let mut r = rig(true, 4);
+        let o = at_fence(&order(&r), 3);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (3, HiveRunState::Idle, None)
+        );
+        for fence in [2, 3] {
+            r.sup.demote(sid, fence, "not_location").await;
+            assert!(r.sup.runs_at(sid, 3), "a demote at fence {fence}");
+            assert_eq!(hosted_on_disk(&r)[0].fence, 3);
+        }
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (3, HiveRunState::Running, None)
+        );
+        r.sup.stop(sid, 3, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-1 — a session waiting to resume when a demote comes is not
+    /// resumed, including by a resume that had already taken it from the
+    /// queue and was waiting for the start lock.
+    #[tokio::test]
+    async fn a_demote_reaches_a_session_still_to_resume() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |_| {});
+        next_daemon(&mut r, |_| {});
+        r.sup.demote(sid, 2, "not_location").await;
+        assert!(hosted_on_disk(&r).is_empty());
+        connect(&mut r);
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert!(
+            manifest.is_empty(),
+            "a demoted session waiting to resume is not resumed: {manifest:?}"
+        );
+        assert!(!r.sup.holds_live(sid));
+
+        // The race: the resume holds the record it took from the queue.
+        let other = ObjectId::new();
+        host(&r, other, |_| {});
+        next_daemon(&mut r, |_| {});
+        let taken = r
+            .sup
+            .to_resume
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("waiting to resume");
+        r.sup.demote(other, 2, "not_location").await;
+        r.sup.resume(taken).await;
+        assert!(!r.sup.holds_live(other), "a demoted session never resumes");
+    }
+
+    /// P2e-1 — a stop for a newer fence than the run here: that run is past
+    /// and ends, and the device says at once that it does not run the fence
+    /// the stop names. A start at it may be waiting for this very run to let
+    /// go; its launch is answered with a stop when it reports in.
+    #[tokio::test]
+    async fn a_stop_for_a_newer_fence_ends_the_older_run_and_says_so() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Idle, None)
+        );
+        r.sup.stop(sid, 2, "owner".into());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (
+                2,
+                HiveRunState::Ended,
+                Some("not running on this device".into())
+            )
+        );
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Ended, Some("stopped (owner)".into()))
+        );
+        assert!(!r.sup.holds_live(sid));
+        assert!(hosted_on_disk(&r).is_empty());
+    }
+
+    /// P2e-1 — a stop that reaches a session a resume has taken from the
+    /// queue, but not launched yet, wins: the resume finds it forgotten.
+    #[tokio::test]
+    async fn a_stop_that_comes_first_wins_over_a_resume_in_flight() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |_| {});
+        next_daemon(&mut r, |_| {});
+        listen_only(&mut r);
+        let taken = r
+            .sup
+            .to_resume
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("waiting to resume");
+        r.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (
+                1,
+                HiveRunState::Ended,
+                Some("not running on this device".into())
+            )
+        );
+        r.sup.resume(taken).await;
+        assert!(!r.sup.holds_live(sid), "the stop came first");
+        assert!(hosted_on_disk(&r).is_empty());
     }
 }
 
