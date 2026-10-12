@@ -80,6 +80,9 @@ sequenceDiagram
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:2705`, `macos_queue_update_check` `:2713-2726` |
 | `roomlerd update-helper` on Linux | new | the `Command::UpdateHelper` arm, macOS-only today (`main.rs:1447-1459`) |
 | `roomler-update.{service,timer,path}` | new | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:840-873`) and the tarball (`scripts/stage-linux-tarball.sh:53-55`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:1804-1810`) |
+| the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
+| the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
+| consuming the wake: a symlink unlinked NOT followed, a planted directory moved aside into a fresh root-owned dir | new | `consume_wake` (`updater.rs`) |
 
 The three units are the systemd twins of the macOS plist's wake sources
 (`agents/roomlerd/packaging/macos/com.roomler.update.plist`):
@@ -123,6 +126,22 @@ After a successful install, the helper asks every per-user daemon on the host to
 - **Install for a system install.** That host has one owner already.
 - **Restart a daemon mid-session.**
 - **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:2839-2846`).
+- **Stage a download at a fixed or shared name** (security review, finding 1). `/tmp` is sticky but a
+  *subdirectory* of it is not, so the old fixed `/tmp/roomlerd-update/<asset>` let any local user own the
+  directory, wait for root's verified `.deb` to land, and `rename` an attacker package over it in the window
+  before `apt-get install <path>` / `tar -xzf <path>` re-read the path — root then installs it (dpkg maintainer
+  scripts run as root). Each download now goes to a FRESH private directory (mkdtemp, 0755, owned by the caller;
+  `O_EXCL` write), which a non-owner cannot create, rename or unlink inside. The verified bytes are the installed
+  bytes. macOS (per-user `_CS_DARWIN_USER_TEMP_DIR`) and Windows (SYSTEM `GetTempPath2`) keep the shared dir;
+  Windows 10's `C:\Windows\Temp` has the same shape and is a separate follow-up.
+- **Let a wake storm or a planted entry FAIL the units** (security review, finding 2). `PathExists=` is
+  level-triggered and the service had systemd's default start limit (5/10 s), so a local user could permanently
+  fail `roomler-update.path` with a touch burst or one `mkdir` at the wake path — a pushed update then silently
+  degrades to the 6 h timer. The helper now spaces its own runs ≥60 s (`UPDATE_HELPER_MIN_GAP`, launchd's
+  `ThrottleInterval` twin), consumes a planted entry (a symlink unlinked unfollowed, a directory moved aside),
+  and the unit carries `StartLimitIntervalSec=0` + `Restart=on-failure`/`RestartSec=60s` so neither a burst nor an
+  exec-failing helper can fail the path unit. Never `PrivateTmp=` — it would hide `/var/tmp` and the wake could
+  never be consumed.
 
 ## 4. Phases
 
@@ -149,11 +168,16 @@ next depends on it.
   are not enabled.
 - [ ] **AC5**: `/etc/roomler/disable-auto-update` stops the helper, and removing it resumes updates (a round
   trip, like `installer-smoke.yml`'s macOS one at `:1203-1252`).
-- [ ] **AC6**: the wake file is advisory only. Its content is never read, and a symlink planted at its path is not
-  followed (unit tests, plus one lab check).
+- [ ] **AC6**: the wake file is advisory only. Its content is never read; a symlink planted at its path is
+  unlinked, not followed; a directory planted there is moved aside and removed; and a burst of touches (or a
+  planted entry) leaves `roomler-update.path` `active (waiting)`, never `failed` (unit tests, plus one lab check).
 - [ ] **AC7**: `ROOMLERD_UPDATE_HELPER=0` gives back today's behaviour exactly.
 - [ ] **AC8**: Docs: `docs/linux-self-update.md`, `docs/installation.md` and `README.Debian` updated in the house
   style (a mermaid diagram, tables, `file:line` anchors), and the `docs/README.md` index row.
+- [ ] **AC9** (security review, #2055): the download is staged in a fresh private directory — a new 0755
+  caller-owned dir per download, the write refuses a planted symlink (not followed) or file (not truncated), and
+  the dir is removed once the installer has read it (unit tests, plus one lab check: during an install
+  `/tmp/roomlerd-update.*` is `root root` 0755 and a pre-existing `/tmp/roomlerd-update/` is untouched).
 
 ## 6. Open decisions (operator)
 
@@ -175,3 +199,6 @@ next depends on it.
 | date | build | host | result |
 |---|---|---|---|
 | 2026-10-12 | 0.4.128 → 0.4.130 | the FR-93 lab's KDE guest (Fedora 44, per-user, tarball) | 🔴 refused: *"the tarball install needs root (euid 1000)"* (#2046). The other three lab guests took 0.4.130 through their own updaters |
+| 2026-10-12 | P1 branch | systemd 255 (WSL), the units' exact directives | 🔴→🟢 security-review finding 2 reproduced and fixed. RED (default start limit): 6 touches of the wake file in 10 s, or one `mkdir` at it, left the path unit `failed (unit-start-limit-hit)`; a wake 15 s later was not consumed. GREEN (`StartLimitIntervalSec=0` + `Restart=on-failure`/`RestartSec`): an 8-touch burst left the path unit `active` and the service `Result=success`; an exec-failing helper (`/nonexistent`) left the path unit `active` and the service `auto-restart`, never `failed`. A bare `Type=oneshot` shows `TimeoutStartUSec=infinity`, so the 60 s gate + download is not a start timeout |
+| 2026-10-12 | P1 branch | WSL, `cargo test -p roomlerd --lib updater::` | 🟢 90 tests (76 pre-existing + 14 new): the private staging dir (fresh/0755/owned, `O_EXCL` refuses a planted symlink and file, cleanup removes only our own dir), the gate arithmetic + its equality to the plist's `ThrottleInterval`, and `consume_wake` (file / nothing / symlink-unfollowed / planted-dir-moved-aside). `--features full,…` clippy (`ci.yml:341`) and default `--all-targets` clippy clean |
+| *owed before merge* | a candidate below the latest release | the FR-93 lab's Fedora KDE per-user (tarball) guest | the end-to-end lab check behind AC6/AC9: units enabled by hand, a touch burst + a planted directory + a planted symlink leave the path unit `active (waiting)`, and an install stages at `root root` 0755 leaving a pre-existing `/tmp/roomlerd-update/` untouched |

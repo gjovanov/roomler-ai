@@ -222,8 +222,8 @@ sequenceDiagram
     W-->>P: PathExists
     Note over P: the timer fires too: 5 min after boot, then every 6 h
     P->>U: start roomler-update.service
-    U->>U: consume the wake file; the opt-out; the cooldown
-    U->>U: check_once, then download_asset (the pinned release key)
+    U->>U: consume/move-aside the wake; space ≥60 s from the last run; the opt-out; the cooldown
+    U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key)
     U->>U: install as root: apt-get / dpkg, or the tarball
     Note over D: runs the new binary from its next restart (P2 asks it, once idle)
 ```
@@ -252,6 +252,51 @@ sequenceDiagram
   by the helper itself.
 - **Root only.** The helper refuses any other uid before it touches the wake
   file, the network or the install.
+
+### A hostile local user cannot subvert the root helper (security review, #2055)
+
+The helper runs as root and is woken by a world-writable path, so its two
+exposures to an unprivileged local user were closed before P1 shipped.
+
+- ⚠️ **The download is staged where nobody else can reach it.** `/tmp` is sticky
+  but a *subdirectory* of it is not, so the old fixed `/tmp/roomlerd-update/<asset>`
+  let any user own the directory, wait for root's verified `.deb` to land, and
+  `rename` an attacker package over it before `apt-get install <path>` /
+  `tar -xzf <path>` re-read the path — root would then install it (dpkg maintainer
+  scripts run as root). Each download now goes to a FRESH private directory
+  (mkdtemp, 0755, owned by the caller; the write is `O_EXCL`), which a non-owner
+  cannot create, rename or unlink inside, and it is removed once the installer has
+  read it (`stage_dir`, `write_installer`, `discard_staging`, `updater.rs`). **The
+  verified bytes are the installed bytes.** macOS (per-user
+  `_CS_DARWIN_USER_TEMP_DIR`) and Windows (SYSTEM `GetTempPath2`) keep the shared
+  dir; Windows 10's `C:\Windows\Temp` has the same shape and is a separate
+  follow-up.
+- ⚠️ **A wake storm costs one check a minute and fails nothing.** `PathExists=` is
+  level-triggered and the service had systemd's default start limit (5/10 s), so —
+  measured on systemd 255 — six touches in 10 s, or a single `mkdir` at the wake
+  path, left `roomler-update.path` `failed (unit-start-limit-hit)` until reboot,
+  and a pushed update then silently degraded to the 6 h timer. The helper now
+  spaces its own runs ≥60 s (`UPDATE_HELPER_MIN_GAP`, launchd's `ThrottleInterval`
+  twin, `updater.rs`); the service carries `StartLimitIntervalSec=0` and
+  `Restart=on-failure`/`RestartSec=60s` (a helper that fails *before* its gate —
+  203/EXEC, a startup panic — would otherwise hit the path unit's own 200/2 s
+  trigger limit, which also fails it); and `consume_wake` unlinks a planted symlink
+  without following it and moves a planted directory aside into a fresh root-owned
+  dir. Never `PrivateTmp=` — it would hide `/var/tmp` and the wake could never be
+  consumed.
+
+| what a local user does to `/var/tmp/roomler-update-check` | what it costs |
+|---|---|
+| touches it in a tight loop | ≤ one root check per minute (the 60 s gate); no unit ever fails |
+| plants a symlink there | unlinked, never followed; the target is untouched |
+| plants a directory there | moved aside into a fresh root-owned dir and removed; the path re-arms |
+| plants a mount point there (`fusermount3`) | logged; the helper re-runs once per gap, the path unit stays `active` — same bounded residual as macOS (macFUSE) |
+| owns a pre-fix `/tmp/roomlerd-update/` | never touched (the guard matches only the `roomler-update.` mkdtemp prefix) |
+
+Even at its worst, a user who makes every check find "a newer release" is bounded
+by the 5-minute install cooldown to one verified ~100 MB download per 5 minutes,
+and can never choose *what* is installed — the helper resolves and verifies the
+release itself.
 
 The phases:
 
