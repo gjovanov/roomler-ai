@@ -734,6 +734,34 @@ export interface RcVideoInfo {
   /** FR-70 P1 — a short human detail for `cap_reason`, e.g.
    *  `'remembered 200 kbps'` for the slow-link profile. */
   cap_detail?: string
+  /** FR-93 P2 — the Linux arm serving this session: `'drm'`, `'mutter'`,
+   *  `'portal'` or `'x11'`. Absent from Windows, macOS and older agents. */
+  capture_arm?: string
+  /** FR-93 P2 — did a person at the screen have to allow this capture?
+   *  `true` only for the portal. Present exactly when `capture_arm` is. */
+  attended?: boolean
+}
+
+/** FR-93 P2 (FR-45 AC8 option b) — the capture pill: which Linux arm serves
+ *  this session, and whether anyone at the screen was asked. DRM and mutter
+ *  capture without asking, so the operator should be able to see that they
+ *  did. `''` when the agent did not say (Windows, macOS, older agents).
+ *  Unknown arms from a newer agent are shown as they are named: the rule for
+ *  every additive wire string. */
+export function captureArmLabel(vi: RcVideoInfo | null | undefined): string {
+  const arm = vi?.capture_arm
+  if (!arm) return ''
+  const name = arm === 'drm'
+    ? 'DRM scanout'
+    : arm === 'mutter'
+      ? 'GNOME screencast'
+      : arm === 'portal'
+        ? 'desktop portal'
+        : arm === 'x11'
+          ? 'X11'
+          : arm
+  if (arm === 'x11') return name
+  return `${name} · ${vi?.attended ? 'allowed at the screen' : 'asks nobody'}`
 }
 
 /** FR-70 P1 — the resolution pill's annotation for a stream encoded below
@@ -1069,6 +1097,10 @@ export function parseControlInbound(data: unknown): RcControlInbound {
                 ? { cap_detail: obj.cap_detail }
                 : {}),
             }
+          : {}),
+        // FR-93 P2 — optional; only a Linux agent names its arm.
+        ...(typeof obj.capture_arm === 'string' && obj.capture_arm.length > 0
+          ? { capture_arm: obj.capture_arm, attended: obj.attended === true }
           : {}),
       },
     }
