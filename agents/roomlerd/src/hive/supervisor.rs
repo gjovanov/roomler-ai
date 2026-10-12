@@ -46,8 +46,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveManifestEntry, HiveRefusal, HiveRunState,
-    HiveTurnStatus, hive_limits,
+    HARNESS_CLAUDE_CODE, HiveApprovalStatus, HiveDrainRefusal, HiveManifestEntry, HiveRefusal,
+    HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 #[cfg(unix)]
@@ -148,6 +148,35 @@ const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// for a session the device runs or hosts, so this bounds a server that sends
 /// more than any device holds.
 const MAX_LEASE_WORDS: usize = 256;
+/// P2e-4 — how long a drained session's running turn goes on before it is
+/// cut: the wire's bound, which the server waits for and a margin more.
+const DRAIN_CUT: Duration = Duration::from_secs(promote_limits::DRAIN_TURN_CUT_SECS);
+/// P2e-4 — how long a cut turn is given to end once the harness was told to
+/// stop it. Past it the drain is refused, and the turn runs on.
+const DRAIN_CUT_GRACE: Duration = Duration::from_secs(10);
+/// P2e-4 — beyond the cut and its grace, how long a drain waits for its
+/// session's answer: the last checkpoint.
+const DRAIN_CHECKPOINT_WAIT: Duration = Duration::from_secs(50);
+
+/// P2e-4 — when a drained session's running turn is cut, how long it is
+/// given to end then, and how long the drain waits beyond both for its last
+/// checkpoint (shorter in the tests).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainTiming {
+    pub cut: Duration,
+    pub grace: Duration,
+    pub checkpoint: Duration,
+}
+
+impl Default for DrainTiming {
+    fn default() -> Self {
+        Self {
+            cut: DRAIN_CUT,
+            grace: DRAIN_CUT_GRACE,
+            checkpoint: DRAIN_CHECKPOINT_WAIT,
+        }
+    }
+}
 /// How much of a failed harness's stderr its transcript note keeps — on the
 /// device; the `ended` detail, which the server stores, never carries it.
 const STDERR_TAIL: usize = 400;
@@ -253,6 +282,32 @@ enum Input {
     Stop {
         reason: String,
     },
+    /// P2e-4 — the session's lease is about to leave this device: no prompt
+    /// begins, the running turn ends or is cut, the open approvals are
+    /// withdrawn, a last checkpoint is taken, and `reply` hears where the
+    /// copy ends.
+    Drain {
+        reply: tokio::sync::oneshot::Sender<Drained>,
+    },
+    /// P2e-4 — the server's word at the run's fence: the lease stayed, and
+    /// the prompts held by the drain begin.
+    Undrain,
+}
+
+/// P2e-4 — how a drain ended, as the session's task tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Drained {
+    /// Quiet: the copy ends at `seq`, whose event's hash is `hash` (hex).
+    At { seq: u64, hash: String },
+    /// Not drained, and why: the session goes on as before.
+    Not(String),
+}
+
+/// P2e-4 — a drain the session's task has taken up: its answer to come,
+/// and the task's inputs, to lift it should the answer not come in time.
+pub(crate) struct PendingDrain {
+    answer: tokio::sync::oneshot::Receiver<Drained>,
+    input: mpsc::Sender<Input>,
 }
 
 struct Live {
@@ -286,6 +341,9 @@ struct Live {
     /// server's word on the new connection. From its start, or from the
     /// first word while it runs.
     lease: bool,
+    /// P2e-4 — drained for a move: no new prompt is taken. The server's word
+    /// at this fence lifts it; a demote ends the run.
+    draining: bool,
 }
 
 /// What a launch hands the session task.
@@ -418,6 +476,8 @@ pub struct Supervisor {
     awaiting_word: Mutex<HashMap<ObjectId, HostedSession>>,
     /// P2e-2 — how long a leased run's model call waits for the word.
     lease_wait: Duration,
+    /// P2e-4 — a drain's bounds: the cut, its grace, the checkpoint's wait.
+    drain_timing: DrainTiming,
     /// P2d-2c — a test's own DERP mux in place of the primary org's (`Some`),
     /// so one test stands a source and a member on two muxes wired to each
     /// other; `Some(None)` for none at all, whatever another test registered.
@@ -966,6 +1026,70 @@ pub fn handle_lease(
     }
 }
 
+/// FR-90 P2e-4 — `rc:hive.drain`: the session's lease is about to leave this
+/// device ([`Supervisor::begin_drain`]), answered with `rc:hive.drained` on
+/// `tx`, the connection it came on. The primary enrollment's only, like
+/// every Hive frame: a secondary org's is refused.
+pub fn handle_drain(
+    session_id: ObjectId,
+    fence: u64,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    drain_with(global(), session_id, fence, is_primary, tx);
+}
+
+/// [`handle_drain`] on `sup`, the daemon's supervisor when it has one.
+fn drain_with(
+    sup: Option<Arc<Supervisor>>,
+    session_id: ObjectId,
+    fence: u64,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    // Taken up HERE, in the order the frames came: a word that comes right
+    // behind the drain must reach the session after it, or it would lift
+    // nothing and the drain would hold the session for ever.
+    let begun = match sup {
+        Some(sup) if is_primary => match sup.begin_drain(session_id, fence) {
+            Ok(answer) => Ok((sup, answer)),
+            Err(refused) => Err(refused),
+        },
+        Some(_) => Err((
+            HiveDrainRefusal::Other,
+            "agent sessions run only for this device's primary organization".into(),
+        )),
+        None => Err((
+            HiveDrainRefusal::NotRunning,
+            "agent sessions are not set up on this device".into(),
+        )),
+    };
+    tokio::spawn(async move {
+        let answer = match begun {
+            Ok((sup, answer)) => sup.drained(session_id, fence, answer).await,
+            Err((word, why)) => drained_refused(session_id, fence, word, &why),
+        };
+        let _ = tx.send(answer).await;
+    });
+}
+
+/// FR-90 P2e-4 — `rc:hive.drained` saying no, and why.
+fn drained_refused(
+    session_id: ObjectId,
+    fence: u64,
+    word: HiveDrainRefusal,
+    why: &str,
+) -> ClientMsg {
+    ClientMsg::HiveDrained {
+        session_id,
+        fence,
+        seq: None,
+        hash: None,
+        refused: Some(word),
+        detail: Some(why.to_string()),
+    }
+}
+
 /// FR-90 P2e-1 — `rc:hive.demote`: the session's lease is at `fence` on
 /// another device ([`Supervisor::demote`]). The primary enrollment's only,
 /// like every Hive frame; from a task of its own, since the store's floor is
@@ -1039,6 +1163,7 @@ impl Supervisor {
             lease_heard: tokio::sync::Notify::new(),
             awaiting_word: Mutex::new(HashMap::new()),
             lease_wait: LEASE_WAIT,
+            drain_timing: DrainTiming::default(),
             #[cfg(test)]
             derp_for_tests: Mutex::new(None),
             #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
@@ -1402,6 +1527,13 @@ impl Supervisor {
                 Some(l) if l.fenced => {
                     return Err("the session has moved on from this device".into());
                 }
+                // P2e-4 — drained for a move: no turn begins either, until
+                // the move is off.
+                Some(l) if l.draining => {
+                    return Err(
+                        "the session is moving to another device — ask again in a minute".into(),
+                    );
+                }
                 Some(l) => (l.input.clone(), Arc::clone(&l.waiting)),
             }
         };
@@ -1504,6 +1636,107 @@ impl Supervisor {
             held_back.remove(&session);
         }
         queued || waited
+    }
+
+    /// P2e-4 — `rc:hive.drain`: the session's lease is about to leave this
+    /// device. The run here at `fence` takes no new prompt from now on, its
+    /// running turn ends or is cut, its open approvals are withdrawn and a
+    /// last checkpoint is taken; the answer says where the copy ends. The
+    /// run stays up, idle: the server's word at this fence lifts the drain
+    /// (the lease stayed), a demote ends the run (it moved). A drain that
+    /// cannot finish is refused, and lifted: the session goes on as before.
+    ///
+    /// Taken up at once, in the order the frames came ([`handle_drain`]):
+    /// the session's task reads its inputs in order, so a word that came
+    /// after the drain lifts it. `Err` is the refusal: its word and why.
+    pub(crate) fn begin_drain(
+        &self,
+        session: ObjectId,
+        fence: u64,
+    ) -> Result<PendingDrain, (HiveDrainRefusal, String)> {
+        use HiveDrainRefusal::{NotRunning, Other};
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let l = match live.get_mut(&session) {
+            Some(l) if l.fence == fence && !l.fenced => l,
+            Some(l) if l.fence == fence => {
+                return Err((
+                    NotRunning,
+                    "the session has moved on from this device".into(),
+                ));
+            }
+            Some(l) => {
+                let why = format!("this device runs the session at fence {}", l.fence);
+                return Err((NotRunning, why));
+            }
+            None => return Err((NotRunning, "this device does not run the session".into())),
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if l.input.try_send(Input::Drain { reply }).is_err() {
+            return Err((Other, "the session is not taking anything now".into()));
+        }
+        l.draining = true;
+        Ok(PendingDrain {
+            answer,
+            input: l.input.clone(),
+        })
+    }
+
+    /// P2e-4 — the answer to a drain [`Self::begin_drain`] took up, as
+    /// `rc:hive.drained` says it.
+    pub(crate) async fn drained(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        pending: PendingDrain,
+    ) -> ClientMsg {
+        use HiveDrainRefusal::{NotRunning, Other};
+        let t = self.drain_timing;
+        let bound = t.cut + t.grace + t.checkpoint;
+        let answer = match tokio::time::timeout(bound, pending.answer).await {
+            Ok(Ok(a)) => Ok(a),
+            Ok(Err(_)) => Err((NotRunning, "the session ended before it drained")),
+            // Lifted, so a drain that finishes later holds nothing back.
+            Err(_) => {
+                let _ = pending.input.try_send(Input::Undrain);
+                Err((Other, "the drain did not finish in time"))
+            }
+        };
+        match answer {
+            Ok(Drained::At { seq, hash }) => {
+                info!(session = %session, fence, seq, "hive: drained for a move");
+                ClientMsg::HiveDrained {
+                    session_id: session,
+                    fence,
+                    seq: Some(seq),
+                    hash: Some(hash),
+                    refused: None,
+                    detail: None,
+                }
+            }
+            Ok(Drained::Not(why)) => {
+                self.lift_drain(session, fence);
+                info!(session = %session, fence, %why, "hive: not drained");
+                drained_refused(session, fence, Other, &why)
+            }
+            Err((word, why)) => {
+                self.lift_drain(session, fence);
+                info!(session = %session, fence, why, "hive: not drained");
+                drained_refused(session, fence, word, why)
+            }
+        }
+    }
+
+    /// P2e-4 — the run at `fence` takes prompts again.
+    fn lift_drain(&self, session: ObjectId, fence: u64) {
+        if let Some(l) = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&session)
+            .filter(|l| l.fence == fence)
+        {
+            l.draining = false;
+        }
     }
 
     /// P2e-1 — `rc:hive.demote`: the session's lease is at `fence`, on
@@ -1630,18 +1863,25 @@ impl Supervisor {
         if !self.record_word(session, fence, tx) {
             return;
         }
-        let marked = {
+        let (marked, undrain) = {
             let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             match live.get_mut(&session) {
                 Some(l) if l.fence == fence && !l.fenced => {
                     l.lease = true;
-                    true
+                    // P2e-4 — drained for a move that is off: the lease
+                    // stayed here, and the run takes prompts again.
+                    let undrain = std::mem::take(&mut l.draining).then(|| l.input.clone());
+                    (true, undrain)
                 }
-                _ => false,
+                _ => (false, None),
             }
         };
         if marked {
             self.hosted_update(session, fence, |h| h.lease = true);
+        }
+        if let Some(input) = undrain {
+            info!(session = %session, fence, "hive: the server's word — the drain is lifted");
+            let _ = input.try_send(Input::Undrain);
         }
         // Held back for this very word: it launches now, through every gate
         // a resume passes.
@@ -2386,6 +2626,14 @@ impl Supervisor {
         self
     }
 
+    /// Tests only: a drain that cuts its running turn, and gives up on the
+    /// cut, in a test's lifetime.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_drain_timing(mut self, timing: DrainTiming) -> Self {
+        self.drain_timing = timing;
+        self
+    }
+
     /// Tests only: an approval that expires in a test's lifetime.
     #[cfg(all(test, unix))]
     pub(crate) fn with_approval_timing(mut self, timing: toolbelt::Timing) -> Self {
@@ -2576,6 +2824,7 @@ impl Supervisor {
                 fenced: false,
                 gone,
                 lease,
+                draining: false,
             },
         );
         if prior.is_some() {
@@ -3304,6 +3553,108 @@ struct Task<'a> {
     /// run loop takes it ([`checkpoint_or_stop`]) before the next prompt
     /// begins.
     checkpoint_due: bool,
+    /// P2e-4 — the drain under way, or done ([`Input::Drain`]).
+    drain: Option<Draining>,
+    /// P2e-4 — the toolbelt's open approvals, which a drain withdraws.
+    pending: Arc<toolbelt::Pending>,
+    /// P2e-4 — when a drain cuts the running turn, and the grace after.
+    drain_timing: DrainTiming,
+}
+
+/// P2e-4 — a drain under way, or done, in its session's task.
+struct Draining {
+    /// Those waiting for its answer: a drain asked again meanwhile waits for
+    /// the same one.
+    replies: Vec<tokio::sync::oneshot::Sender<Drained>>,
+    /// When the running turn is cut, should it not have ended by then.
+    cut_at: tokio::time::Instant,
+    /// When a cut turn's grace runs out, once the harness was told to stop
+    /// it.
+    gives_up_at: Option<tokio::time::Instant>,
+    /// A checkpoint was kept since the drain began, with no turn after it:
+    /// the turn's end's, which the drain's last one would only repeat.
+    kept: bool,
+    /// The answer, once given: a drain asked again is answered with it.
+    answer: Option<Drained>,
+}
+
+/// P2e-4 — how a checkpoint went, for the drain that needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpointed {
+    Kept,
+    /// Not taken; the transcript says why, on the device.
+    Failed,
+    /// Not started: the daemon is stopping.
+    NotStarted,
+}
+
+/// P2e-4 — a drain begins in `drain`, or joins the one under way. The open
+/// approvals are withdrawn at once: a turn waiting on one could not end. On
+/// fields, not the task, so the checkpoint's wait can take one up too.
+fn take_up_drain(
+    drain: &mut Option<Draining>,
+    pending: &toolbelt::Pending,
+    timing: DrainTiming,
+    reply: tokio::sync::oneshot::Sender<Drained>,
+) {
+    if let Some(d) = drain.as_mut() {
+        match &d.answer {
+            Some(a) => {
+                let _ = reply.send(a.clone());
+            }
+            None => d.replies.push(reply),
+        }
+        return;
+    }
+    *drain = Some(Draining {
+        replies: vec![reply],
+        cut_at: tokio::time::Instant::now() + timing.cut,
+        gives_up_at: None,
+        kept: false,
+        answer: None,
+    });
+    pending.withdraw_all();
+}
+
+/// P2e-4 — the lease stayed: the drain in `drain` is over, and whoever still
+/// waits for its answer hears that it did not drain. `true` when one was.
+fn lift_drain(drain: &mut Option<Draining>) -> bool {
+    let Some(d) = drain.take() else {
+        return false;
+    };
+    for reply in d.replies {
+        let _ = reply.send(Drained::Not("the lease stayed on this device".into()));
+    }
+    true
+}
+
+/// P2e-4 — how Claude Code marks the end of a turn it was told to stop, as
+/// a user message: `[Request interrupted by user]`, or `… for tool use]`
+/// during a tool's run.
+const INTERRUPTED_MARKER: &str = "[Request interrupted by user";
+
+/// P2e-4 — Claude Code's own interrupt for the running turn, as a line of
+/// its stream-json input: the control request its SDK sends. Measured on
+/// 2.1.280: the model call in flight is aborted at once, a `control_response`
+/// answers it, then the [`INTERRUPTED_MARKER`] and the turn's `result`
+/// (`error_during_execution`), and the same process takes the next prompt.
+fn interrupt_line(turn: u32) -> String {
+    let mut line = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("hive-drain-{turn}"),
+        "request": { "subtype": "interrupt" },
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// P2e-4 — sleep until `at`; never, without one.
+async fn until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// What a session task is fed, and the count of prompts it holds.
@@ -3374,6 +3725,9 @@ impl Task<'_> {
         if opened {
             self.save_open_approvals();
         }
+        // P2e-4 — one that opens while the session drains is withdrawn at
+        // once, as those open when the drain began were: the turn must end.
+        let withdraw = (opened && self.drain.is_some()).then(|| id.clone());
         self.store.append(&self.sid, self.fence, event);
         self.report_approval(id, status, answered_by);
         if !opened {
@@ -3384,6 +3738,9 @@ impl Task<'_> {
             .sup
             .approvals
             .send((self.session, self.open_approvals.clone()));
+        if let Some(id) = withdraw {
+            self.pending.withdraw(&id);
+        }
     }
 
     fn save_open_approvals(&self) {
@@ -3428,7 +3785,9 @@ impl Task<'_> {
     }
 
     async fn prompt(&mut self, author: Option<Author>, text: String) {
-        if self.current.is_some() || self.checkpoint_due {
+        // P2e-4 — and none begins while the session drains for a move: one
+        // admitted just before the drain waits for it to be lifted.
+        if self.current.is_some() || self.checkpoint_due || self.drain.is_some() {
             self.queued.push_back((author, text));
             return;
         }
@@ -3437,6 +3796,11 @@ impl Task<'_> {
 
     /// The next prompt waiting begins; with none, the session settles.
     async fn next_prompt(&mut self) {
+        // P2e-4 — held while the session drains for a move.
+        if self.drain.is_some() {
+            self.settle_state();
+            return;
+        }
         match self.queued.pop_front() {
             Some((author, text)) => self.begin(author, text).await,
             None => self.settle_state(),
@@ -3493,6 +3857,15 @@ impl Task<'_> {
     /// Record one event; a `result` closes the turn and lets the next queued
     /// prompt in.
     async fn on_event(&mut self, mut ev: TranscriptEvent) {
+        // P2e-4 — Claude Code says a turn it was told to stop was
+        // interrupted "by user" (measured, 2.1.280): a drain cut it, and
+        // the note before it says so.
+        if self.cut()
+            && matches!(&ev, TranscriptEvent::UserMessage { author: None, text }
+                if text.starts_with(INTERRUPTED_MARKER))
+        {
+            return;
+        }
         if matches!(ev, TranscriptEvent::ToolUse { .. })
             && let Some(c) = self.current.as_mut()
         {
@@ -3525,7 +3898,11 @@ impl Task<'_> {
         if let Some((ok, duration_ms, cost_usd)) = end
             && self.current.is_some()
         {
-            let status = if ok {
+            // P2e-4 — a turn a drain cut ends as one, whatever its result
+            // says about the interrupt.
+            let status = if self.cut() {
+                HiveTurnStatus::Interrupted
+            } else if ok {
                 HiveTurnStatus::Ok
             } else {
                 HiveTurnStatus::Error
@@ -3548,6 +3925,107 @@ impl Task<'_> {
                 self.next_prompt().await;
             }
         }
+    }
+
+    /// P2e-4 — a drain begins, or joins the one under way.
+    fn begin_drain(&mut self, reply: tokio::sync::oneshot::Sender<Drained>) {
+        if self.drain.is_none() {
+            info!(
+                session = %self.session, fence = self.fence,
+                running = self.current.is_some(), "hive: draining for a move"
+            );
+        }
+        take_up_drain(&mut self.drain, &self.pending, self.drain_timing, reply);
+    }
+
+    /// P2e-4 — the lease stayed: the prompts the drain held begin.
+    async fn undrain(&mut self) {
+        if !lift_drain(&mut self.drain) {
+            return;
+        }
+        info!(session = %self.session, fence = self.fence, "hive: the drain is lifted");
+        if self.current.is_none() && !self.checkpoint_due {
+            self.next_prompt().await;
+        }
+    }
+
+    /// P2e-4 — whether the drain may end: it has not answered, no turn runs
+    /// and no checkpoint is due.
+    fn drain_ready(&self) -> bool {
+        self.drain.as_ref().is_some_and(|d| d.answer.is_none())
+            && self.current.is_none()
+            && !self.checkpoint_due
+    }
+
+    /// P2e-4 — the drain's answer, to everyone waiting for it. One that did
+    /// not drain lifts it: the session goes on as before.
+    fn answer_drain(&mut self, answer: Drained) {
+        let Some(d) = self.drain.as_mut() else {
+            return;
+        };
+        for reply in d.replies.drain(..) {
+            let _ = reply.send(answer.clone());
+        }
+        match answer {
+            Drained::Not(_) => self.drain = None,
+            at @ Drained::At { .. } => d.answer = Some(at),
+        }
+    }
+
+    /// P2e-4 — when the drain acts next on the running turn: the cut, then
+    /// the end of its grace. `None` while no turn runs, or once it answered.
+    fn drain_deadline(&self) -> Option<tokio::time::Instant> {
+        let d = self.drain.as_ref()?;
+        if d.answer.is_some() || self.current.is_none() {
+            return None;
+        }
+        Some(d.gives_up_at.unwrap_or(d.cut_at))
+    }
+
+    /// P2e-4 — the drain's deadline came with the turn still running: cut
+    /// it, with Claude Code's own interrupt; past the grace, the drain is
+    /// refused and the turn runs on.
+    async fn on_drain_deadline(&mut self) {
+        let Some(gives_up_at) = self.drain.as_ref().map(|d| d.gives_up_at) else {
+            return;
+        };
+        if self.current.is_none() {
+            return;
+        }
+        if gives_up_at.is_some() {
+            warn!(session = %self.session, turn = self.count, "hive: the cut turn did not stop — not drained");
+            self.answer_drain(Drained::Not(
+                "the running turn did not stop when it was told to".into(),
+            ));
+            return;
+        }
+        let grace = tokio::time::Instant::now() + self.drain_timing.grace;
+        if let Some(d) = self.drain.as_mut() {
+            d.gives_up_at = Some(grace);
+        }
+        info!(session = %self.session, turn = self.count, "hive: the running turn is cut for a move");
+        self.store.append(
+            &self.sid,
+            self.fence,
+            TranscriptEvent::Note {
+                text: format!(
+                    "Turn {} is cut: the session is moving to another device.",
+                    self.count
+                ),
+            },
+        );
+        let line = interrupt_line(self.count);
+        let Some(w) = self.stdin.as_mut() else {
+            return;
+        };
+        if w.write_all(line.as_bytes()).await.is_err() || w.flush().await.is_err() {
+            warn!(session = %self.session, "hive: the harness did not take the interrupt");
+        }
+    }
+
+    /// P2e-4 — whether a drain cut the running turn.
+    fn cut(&self) -> bool {
+        self.drain.as_ref().is_some_and(|d| d.gives_up_at.is_some())
     }
 
     /// A turn the harness never finished — a stop, an exit, a crash.
@@ -3667,12 +4145,23 @@ async fn run(
         checkpoints,
         replicated,
         checkpoint_due: false,
+        drain: None,
+        pending: toolbelt.pending(),
+        drain_timing: sup.drain_timing,
     };
     let mut lines = LineReader::new(BufReader::new(stdout), MAX_LINE);
     let limits = Limits::default();
     let mut stopped: Option<String> = None;
 
     'session: loop {
+        // P2e-4 — a drain with no turn left to wait for ends here: the last
+        // checkpoint, then the store's tip.
+        if task.drain_ready()
+            && let Err(reason) = finish_drain(&mut task, &mut input).await
+        {
+            stopped = Some(reason);
+            break;
+        }
         tokio::select! {
             // Biased to stdout: whatever the harness already printed is
             // recorded before the next prompt goes in, so the transcript's
@@ -3690,11 +4179,19 @@ async fn run(
                             for ev in parsed.record {
                                 task.on_event(ev).await;
                                 if std::mem::take(&mut task.checkpoint_due) {
-                                    if let Some(reason) =
-                                        checkpoint_or_stop(&mut task, &mut input).await
-                                    {
-                                        stopped = Some(reason);
-                                        break 'session;
+                                    match checkpoint_or_stop(&mut task, &mut input).await {
+                                        Err(reason) => {
+                                            stopped = Some(reason);
+                                            break 'session;
+                                        }
+                                        // P2e-4 — the turn a drain waited
+                                        // for: its checkpoint is the drain's.
+                                        Ok(Checkpointed::Kept) => {
+                                            if let Some(d) = task.drain.as_mut() {
+                                                d.kept = true;
+                                            }
+                                        }
+                                        Ok(_) => {}
                                     }
                                     task.next_prompt().await;
                                 }
@@ -3728,12 +4225,17 @@ async fn run(
                     stopped = Some(reason);
                     break;
                 }
+                Some(Input::Drain { reply }) => task.begin_drain(reply),
+                Some(Input::Undrain) => task.undrain().await,
                 // The supervisor let go of the session: end it.
                 None => {
                     stopped = Some("supervisor".into());
                     break;
                 }
             },
+            // P2e-4 — last: a turn's `result` that is already there ends it
+            // before its cut does.
+            () = until(task.drain_deadline()) => task.on_drain_deadline().await,
         }
     }
 
@@ -3795,19 +4297,22 @@ async fn run(
 /// session still listening: a prompt that arrives meanwhile waits behind it,
 /// and a stop is a stop. A stop abandons the checkpoint — its child's whole
 /// group is ended, and no checkpoint is recorded — and the next one takes
-/// everything since the last one kept. `Some(reason)` when stopped.
+/// everything since the last one kept. `Err(reason)` when stopped.
 ///
 /// ⚠️ A daemon going down says nothing (P1d-2): the child goes down with it
 /// (systemd signals the whole cgroup at once), and the next daemon's next
 /// checkpoint takes what this one would have. So none is started once the
 /// daemon is stopping, and one that failed is said in the transcript only
 /// when the daemon did not go down with it.
+///
+/// P2e-4 — a drain that comes meanwhile is taken up, and a lift heard: the
+/// turn is over either way, and the caller sees the drain as it is now.
 async fn checkpoint_or_stop(
     task: &mut Task<'_>,
     input: &mut mpsc::Receiver<Input>,
-) -> Option<String> {
+) -> Result<Checkpointed, String> {
     if task.sup.going_down() {
-        return None;
+        return Ok(Checkpointed::NotStarted);
     }
     let taken = {
         let c = &mut task.checkpoints;
@@ -3821,23 +4326,83 @@ async fn checkpoint_or_stop(
                 taken = &mut taking => break taken,
                 cmd = input.recv() => match cmd {
                     Some(Input::Prompt { author, text }) => task.queued.push_back((author, text)),
-                    Some(Input::Stop { reason }) => return Some(reason),
-                    None => return Some("supervisor".into()),
+                    Some(Input::Stop { reason }) => return Err(reason),
+                    Some(Input::Drain { reply }) => {
+                        if task.drain.is_none() {
+                            info!(session = %task.session, fence = task.fence, "hive: draining for a move, at a checkpoint");
+                        }
+                        take_up_drain(&mut task.drain, &task.pending, task.drain_timing, reply);
+                    }
+                    Some(Input::Undrain) => {
+                        if lift_drain(&mut task.drain) {
+                            info!(session = %task.session, fence = task.fence, "hive: the drain is lifted");
+                        }
+                    }
+                    None => return Err("supervisor".into()),
                 },
             }
         }
     };
     match taken {
         // P2c-3 — kept: the server hears where the copy ends now.
-        Ok(()) => task.sup.report_tip(task.session).await,
+        Ok(()) => {
+            task.sup.report_tip(task.session).await;
+            Ok(Checkpointed::Kept)
+        }
         Err(failed) => {
             if !task.sup.went_down_with_daemon().await {
                 task.checkpoints
                     .say(&task.store, &task.sid, task.fence, failed);
             }
+            Ok(Checkpointed::Failed)
         }
     }
-    None
+}
+
+/// P2e-4 — the drain ends, with no turn left to wait for: a replicated
+/// session's last checkpoint (one its last turn's end kept since the drain
+/// began will do), then the store's tip, which the server holds the member's
+/// copy to. A checkpoint that is not taken is not drained: the member's copy
+/// would not hold the files as the session left them. One that is lifted
+/// meanwhile lets its held prompts begin. `Err(reason)` when stopped.
+///
+/// ⚠️ Nothing is written to the session's events after its tip is read, until
+/// the drain is lifted or the run ends: the lease moves only once the
+/// member's copy ends exactly there.
+async fn finish_drain(
+    task: &mut Task<'_>,
+    input: &mut mpsc::Receiver<Input>,
+) -> Result<(), String> {
+    let kept = task.drain.as_ref().is_some_and(|d| d.kept);
+    let taken = if task.replicated.load(Ordering::SeqCst) && !kept {
+        checkpoint_or_stop(task, input).await?
+    } else {
+        Checkpointed::Kept
+    };
+    if task.drain.is_none() {
+        task.next_prompt().await;
+        return Ok(());
+    }
+    let answer = match taken {
+        Checkpointed::Kept => match replica::tip_of(&task.store, task.session).await {
+            Some(tip) => Drained::At {
+                seq: tip.seq,
+                hash: tip.hash,
+            },
+            None => Drained::Not("the session's copy could not be read".into()),
+        },
+        Checkpointed::Failed => Drained::Not("the last checkpoint was not taken".into()),
+        Checkpointed::NotStarted => Drained::Not("this device is restarting".into()),
+    };
+    let drained = matches!(answer, Drained::At { .. });
+    if drained {
+        info!(session = %task.session, fence = task.fence, "hive: drained — the session waits for the move");
+    }
+    task.answer_drain(answer);
+    if !drained {
+        task.next_prompt().await;
+    }
+    Ok(())
 }
 
 /// Seconds since the epoch, for what the device hosts.
@@ -4047,6 +4612,13 @@ pub(crate) mod tests {
     /// exists, `--resume` for one without. `recall` answers with how many
     /// prompts its history holds, so a test sees what a resumed process
     /// remembers.
+    ///
+    /// P2e-4 — like Claude Code it takes a `control_request` on stdin and
+    /// answers it with a `control_response`, never as a prompt. `CUTME` runs
+    /// until its interrupt comes, then ends the turn as Claude Code 2.1.280
+    /// does (measured): the response, the interrupted marker as a user
+    /// message, a `result` that is an error. `DEAFME` reads its interrupt
+    /// and holds on regardless, until the folder holds a `.release` file.
     pub(crate) const FAKE_HARNESS: &str = r#"#!/bin/sh
 [ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ] && cp "$CLAUDE_CONFIG_DIR/CLAUDE.md" "$PWD/.claude_md"
 [ -f "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" ] && cp "$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/memory/MEMORY.md" "$PWD/.memory_md"
@@ -4068,6 +4640,11 @@ first=1
 spent=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$PWD/.stdin"
+  case "$line" in
+    *'"type":"control_request"'*)
+      echo '{"type":"control_response","response":{"subtype":"success"}}'
+      continue ;;
+  esac
   mkdir -p "${hist%/*}" && printf '%s\n' "$line" >> "$hist"
   case "$line" in
     *crash*) echo "boom" >&2; exit 3 ;;
@@ -4082,9 +4659,18 @@ while IFS= read -r line; do
     echo '{"type":"system","subtype":"init","session_id":"fake","model":"m","cwd":"'"$PWD"'","tools":[]}'
     first=0
   fi
+  ok=1
   case "$line" in
     *slow*) sleep 1 ;;
     *hold*) while [ ! -e "$PWD/.release" ]; do sleep 0.05; done; rm -f "$PWD/.release" ;;
+    *CUTME*)
+      IFS= read -r ctl; printf '%s\n' "$ctl" >> "$PWD/.stdin"
+      echo '{"type":"control_response","response":{"subtype":"success"}}'
+      echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
+      ok=0 ;;
+    *DEAFME*)
+      IFS= read -r ctl; printf '%s\n' "$ctl" >> "$PWD/.stdin"
+      while [ ! -e "$PWD/.release" ]; do sleep 0.05; done; rm -f "$PWD/.release" ;;
   esac
   case "$line" in
     *tool*)
@@ -4092,10 +4678,14 @@ while IFS= read -r line; do
       echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]}}'
       ;;
   esac
-  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from the fake"}]}}'
   spent=$((spent + 25))
   cost=$(printf '%d.%02d' $((spent / 100)) $((spent % 100)))
-  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":'"$cost"'}'
+  if [ "$ok" = 1 ]; then
+    echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from the fake"}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":'"$cost"'}'
+  else
+    echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"duration_ms":5,"total_cost_usd":'"$cost"'}'
+  fi
 done
 "#;
 
@@ -7028,6 +7618,543 @@ done
         assert!(!r.sup.has_word(stranger, 1), "not ours: not kept");
         r.sup.stop(sid, 1, "owner".into());
         until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — what a prompt hears while its session drains.
+    const MOVING: &str = "the session is moving to another device — ask again in a minute";
+
+    /// P2e-4 — `rc:hive.drain` for `sid` at `fence`, from the primary
+    /// enrollment, as the dispatch hands it over: taken up at once, and
+    /// answered on a connection of its own.
+    fn drain(r: &Rig, sid: ObjectId, fence: u64) -> mpsc::Receiver<ClientMsg> {
+        drain_as(r, sid, fence, true)
+    }
+
+    fn drain_as(r: &Rig, sid: ObjectId, fence: u64, is_primary: bool) -> mpsc::Receiver<ClientMsg> {
+        let (tx, rx) = mpsc::channel(1);
+        drain_with(Some(Arc::clone(&r.sup)), sid, fence, is_primary, tx);
+        rx
+    }
+
+    /// P2e-4 — a drain's answer: where the copy ends, or the refusal and its
+    /// words.
+    async fn answered(
+        mut rx: mpsc::Receiver<ClientMsg>,
+    ) -> Result<(u64, String), (HiveDrainRefusal, String)> {
+        let msg = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("a drain answered within 20 s")
+            .expect("one answer");
+        match msg {
+            ClientMsg::HiveDrained {
+                seq: Some(seq),
+                hash: Some(hash),
+                refused: None,
+                detail: None,
+                ..
+            } => Ok((seq, hash)),
+            ClientMsg::HiveDrained {
+                seq: None,
+                hash: None,
+                refused: Some(word),
+                detail,
+                ..
+            } => Err((word, detail.unwrap_or_default())),
+            other => panic!("not a drain's answer: {other:?}"),
+        }
+    }
+
+    /// P2e-4 — not answered yet.
+    fn unanswered(rx: &mut mpsc::Receiver<ClientMsg>) -> bool {
+        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty))
+    }
+
+    /// P2e-4 — the store's tip for `sid`, as `rc:hive.drained` says it.
+    async fn store_tip(r: &Rig, sid: ObjectId) -> (u64, String) {
+        let t = r
+            .store
+            .chain_tip(&sid.to_hex())
+            .await
+            .unwrap()
+            .expect("the session has events");
+        (t.seq, hex::encode(t.hash))
+    }
+
+    /// P2e-4 — every line the fake harness read on stdin.
+    fn harness_stdin(r: &Rig) -> String {
+        std::fs::read_to_string(r.root.path().join("work").join(".stdin")).unwrap_or_default()
+    }
+
+    /// P2e-4 — the turn reports up to `sid`'s next `idle`, as (turn, status).
+    async fn turns_until_idle(r: &mut Rig, sid: ObjectId) -> Vec<(u32, HiveTurnStatus)> {
+        let (turns, _, _) = reports_until(r, sid, HiveRunState::Idle).await;
+        turns.iter().map(|t| (t.turn, t.status)).collect()
+    }
+
+    /// P2e-4 — a rig whose drains cut a turn after `cut`, give it `grace`, and
+    /// wait `checkpoint` beyond both.
+    fn drain_rig(cut: u64, grace: u64, checkpoint: u64) -> Rig {
+        rig_with(
+            true,
+            4,
+            |_| {},
+            |s| {
+                s.with_drain_timing(DrainTiming {
+                    cut: Duration::from_millis(cut),
+                    grace: Duration::from_millis(grace),
+                    checkpoint: Duration::from_millis(checkpoint),
+                })
+            },
+        )
+    }
+
+    /// P2e-4 — a session started on `r`, idle.
+    async fn started(r: &mut Rig) -> ObjectId {
+        let o = order(r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(r, sid).await.0, HiveRunState::Idle);
+        sid
+    }
+
+    /// P2e-4 — an idle session drains at once, at its store's own tip. From
+    /// then on it takes no prompt and writes nothing more to its events, so
+    /// the member's copy can end exactly there; the server's word at its
+    /// fence says the lease stayed, and prompts are taken again.
+    #[tokio::test]
+    async fn an_idle_session_drains_at_its_tip_and_takes_no_prompt_until_the_word() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "say hello".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+
+        let tip = answered(drain(&r, sid, 1)).await.expect("drained");
+        assert_eq!(tip, store_tip(&r, sid).await, "the store's own tip");
+        assert_eq!(
+            r.sup.prompt(sid, dev(&r), "more".into()),
+            Err(MOVING.into())
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(store_tip(&r, sid).await, tip, "nothing written after it");
+
+        r.sup.take_lease(sid, 1, &latest(&r));
+        r.sup.prompt(sid, dev(&r), "again".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(harness_stdin(&r).contains("again"), "the word let it in");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a drain waits for the running turn to end on its own, and holds
+    /// back the prompt that waited behind it: the answer is the tip as the
+    /// turn left it. The server's word then lets the held prompt in.
+    #[tokio::test]
+    async fn a_drain_waits_for_the_running_turn_and_holds_the_prompt_behind_it() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        r.sup.prompt(sid, dev(&r), "second".into()).unwrap();
+
+        let mut answer = drain(&r, sid, 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(unanswered(&mut answer), "the turn still runs");
+        release(&r);
+        let tip = answered(answer).await.expect("drained");
+        assert_eq!(tip, store_tip(&r, sid).await);
+        assert_eq!(
+            turns_until_idle(&mut r, sid).await,
+            [(1, HiveTurnStatus::Ok)],
+            "it ended on its own, and nothing began after it"
+        );
+        assert!(!harness_stdin(&r).contains("second"), "held by the drain");
+
+        r.sup.take_lease(sid, 1, &latest(&r));
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(harness_stdin(&r).contains("second"), "the word let it in");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a turn still running at the cut is interrupted as Claude
+    /// Code's own SDK interrupts one, over its stream-json input: the
+    /// transcript says why first, the turn is reported interrupted, and the
+    /// drain answers once it ended. The move's demote then ends the run.
+    #[tokio::test]
+    async fn a_turn_still_running_at_the_cut_is_interrupted_and_reported_so() {
+        let mut r = drain_rig(300, 5_000, 5_000);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "CUTME".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+
+        let tip = answered(drain(&r, sid, 1)).await.expect("drained");
+        assert_eq!(tip, store_tip(&r, sid).await);
+        let sent: Vec<serde_json::Value> = harness_stdin(&r)
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let interrupt = sent
+            .iter()
+            .find(|v| v["type"] == "control_request")
+            .expect("the interrupt reached the harness");
+        assert_eq!(
+            *interrupt,
+            json!({"type": "control_request", "request_id": "hive-drain-1",
+                "request": {"subtype": "interrupt"}})
+        );
+        assert_eq!(
+            turns_until_idle(&mut r, sid).await,
+            [(1, HiveTurnStatus::Interrupted)]
+        );
+        let events = r.store.events(&sid.to_hex());
+        let note = events.iter().position(|e| {
+            matches!(e, TranscriptEvent::Note { text }
+                if text == "Turn 1 is cut: the session is moving to another device.")
+        });
+        let end = events
+            .iter()
+            .position(|e| matches!(e, TranscriptEvent::Turn { ok: false, .. }));
+        assert!(
+            note.is_some() && note < end,
+            "the cut is said before the turn's end: {:?}",
+            events.iter().map(TranscriptEvent::kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TranscriptEvent::UserMessage { text, .. }
+                if text.starts_with(INTERRUPTED_MARKER))),
+            "no one interrupted it but the drain, which the note says"
+        );
+
+        r.sup.demote(sid, 2, "not_location").await;
+        assert_eq!(
+            until_ended(&mut r, sid).await.as_deref(),
+            Some("stopped (demoted: the session is at fence 2)")
+        );
+    }
+
+    /// P2e-4 — a cut turn that does not stop within its grace is not drained:
+    /// the drain is refused and lifted, the turn runs on and ends as it would
+    /// have, and a prompt is taken again at once.
+    #[tokio::test]
+    async fn a_cut_turn_that_does_not_stop_is_not_drained_and_runs_on() {
+        let mut r = drain_rig(200, 300, 5_000);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "DEAFME".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+
+        assert_eq!(
+            answered(drain(&r, sid, 1)).await,
+            Err((
+                HiveDrainRefusal::Other,
+                "the running turn did not stop when it was told to".into()
+            ))
+        );
+        assert!(harness_stdin(&r).contains("control_request"), "it was told");
+        r.sup.prompt(sid, dev(&r), "after".into()).unwrap();
+        release(&r);
+        assert_eq!(
+            turns_until_idle(&mut r, sid).await,
+            [
+                (1, HiveTurnStatus::Ok),
+                (2, HiveTurnStatus::Running),
+                (2, HiveTurnStatus::Ok)
+            ],
+            "not reported cut: it was not drained"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — the drain withdraws the session's open approvals at once, and
+    /// one that opens while it waits: a turn waiting on a person could not
+    /// end. The harness hears each withdrawn; the transcript says so.
+    #[tokio::test]
+    async fn a_drain_withdraws_the_open_approvals_so_the_turn_can_end() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        let mut first = harness_asks(&r, sid, 2, "make").await;
+        let asked = until_awaiting(&mut r, sid).await;
+
+        let answer = drain(&r, sid, 1);
+        let withdrawn = json!({"behavior": "deny",
+            "message": "This approval was withdrawn before anyone answered."});
+        let soon = Duration::from_secs(5);
+        let verdict = tokio::time::timeout(soon, first.verdict(2))
+            .await
+            .expect("the drain withdrew the approval open when it began");
+        assert_eq!(verdict, withdrawn);
+        let mut second = harness_asks(&r, sid, 3, "make install").await;
+        let verdict = tokio::time::timeout(soon, second.verdict(3))
+            .await
+            .expect("the drain withdrew the approval asked while it drained");
+        assert_eq!(verdict, withdrawn);
+        release(&r);
+        answered(answer).await.expect("drained");
+
+        let ended: Vec<(String, String)> = approval_events(&r, sid)
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::ApprovalResolved { id, outcome, .. } => Some((id, outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended.len(), 2, "{ended:?}");
+        assert_eq!(ended[0].0, asked);
+        assert!(
+            ended.iter().all(|(_, o)| o == approval_outcome::WITHDRAWN),
+            "{ended:?}"
+        );
+        assert!(r.sup.pending_approvals(sid).is_empty());
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a drain for a run this device does not have at that fence is
+    /// refused `not_running` and drains nothing; so is one for a run a newer
+    /// fence took; and a secondary org's is refused like every Hive frame of
+    /// its.
+    #[tokio::test]
+    async fn a_drain_for_a_run_not_here_or_from_a_secondary_org_is_refused() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        assert_eq!(
+            answered(drain(&r, ObjectId::new(), 1)).await,
+            Err((
+                HiveDrainRefusal::NotRunning,
+                "this device does not run the session".into()
+            ))
+        );
+        assert_eq!(
+            answered(drain(&r, sid, 2)).await,
+            Err((
+                HiveDrainRefusal::NotRunning,
+                "this device runs the session at fence 1".into()
+            ))
+        );
+        assert_eq!(
+            answered(drain_as(&r, sid, 1, false)).await,
+            Err((
+                HiveDrainRefusal::Other,
+                "agent sessions run only for this device's primary organization".into()
+            ))
+        );
+        r.sup.prompt(sid, dev(&r), "still here".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+
+        r.sup.demote(sid, 2, "not_location").await;
+        // Before anything yields: the run is still here, fenced.
+        assert_eq!(
+            answered(drain(&r, sid, 1)).await,
+            Err((
+                HiveDrainRefusal::NotRunning,
+                "the session has moved on from this device".into()
+            ))
+        );
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a replicated session's drain ends at a checkpoint, so the
+    /// member's copy holds the files as the session left them: one taken for
+    /// the drain when it found the session idle; the last turn's own when it
+    /// waited for that turn, and never one more. The tip is that
+    /// checkpoint's event.
+    #[tokio::test]
+    async fn a_replicated_session_drains_at_its_last_checkpoint() {
+        use super::super::checkpointer::Runner;
+        let (mut r, sid) = replicated_on(Runner::InProcess {
+            ceiling: PathBuf::from("/tmp"),
+        })
+        .await;
+        let checkpoints = |r: &Rig| -> Vec<u64> {
+            r.store
+                .events(&sid.to_hex())
+                .iter()
+                .filter_map(|e| match e {
+                    TranscriptEvent::Checkpoint(c) => Some(c.n),
+                    _ => None,
+                })
+                .collect()
+        };
+        r.sup.prompt(sid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert_eq!(checkpoints(&r), [1]);
+
+        let tip = answered(drain(&r, sid, 1)).await.expect("drained");
+        assert_eq!(checkpoints(&r), [1, 2], "the drain's own");
+        assert_eq!(tip, store_tip(&r, sid).await);
+        assert!(
+            matches!(r.store.events(&sid.to_hex()).last(),
+                Some(TranscriptEvent::Checkpoint(c)) if c.n == 2),
+            "the tip is the checkpoint"
+        );
+
+        r.sup.take_lease(sid, 1, &latest(&r));
+        r.sup.prompt(sid, None, "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        let answer = drain(&r, sid, 1);
+        release(&r);
+        let tip = answered(answer).await.expect("drained");
+        assert_eq!(checkpoints(&r), [1, 2, 3], "the turn's own, and no other");
+        assert_eq!(tip, store_tip(&r, sid).await);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a drain whose last checkpoint is not taken is not drained:
+    /// the member's copy would not hold the files as the session left them.
+    /// Why stays in the transcript, on the device; the session goes on.
+    #[tokio::test]
+    async fn a_drain_whose_last_checkpoint_fails_is_not_drained() {
+        use super::super::checkpointer::Runner;
+        let (mut r, sid) = replicated_on(Runner::Failing("the disk is full")).await;
+        assert_eq!(
+            answered(drain(&r, sid, 1)).await,
+            Err((
+                HiveDrainRefusal::Other,
+                "the last checkpoint was not taken".into()
+            ))
+        );
+        assert!(
+            notes(&r, sid).contains(&"Checkpoint 1 was not taken: the disk is full".to_string()),
+            "{:?}",
+            notes(&r, sid)
+        );
+        r.sup.prompt(sid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a drain asked again, while the first waits or once it was
+    /// answered, is answered with the same tip.
+    #[tokio::test]
+    async fn a_drain_asked_again_is_answered_with_the_same_tip() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        let (a, b) = (drain(&r, sid, 1), drain(&r, sid, 1));
+        release(&r);
+        let a = answered(a).await.expect("drained");
+        assert_eq!(answered(b).await, Ok(a.clone()), "the one under way");
+        assert_eq!(
+            answered(drain(&r, sid, 1)).await,
+            Ok(a),
+            "the one it already gave"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — the server's word at the run's fence right behind the drain
+    /// lifts it, even before the session's task took the drain up: the
+    /// dispatch takes a drain up as its frame comes, so the word reaches the
+    /// session after it. The drain is refused, the turn runs on, and a prompt
+    /// is taken again.
+    #[tokio::test]
+    async fn the_word_right_behind_a_drain_lifts_it() {
+        let mut r = rig(true, 4);
+        let sid = started(&mut r).await;
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        let answer = drain(&r, sid, 1);
+        // Before anything yields (one thread): the session's task has not
+        // read the drain yet.
+        r.sup.take_lease(sid, 1, &latest(&r));
+        r.sup.prompt(sid, dev(&r), "after".into()).unwrap();
+        // The turn ends before the answer is read: a drain still on would
+        // answer with the tip once it did.
+        release(&r);
+        assert_eq!(
+            answered(answer).await,
+            Err((
+                HiveDrainRefusal::Other,
+                "the lease stayed on this device".into()
+            ))
+        );
+        assert_eq!(
+            turns_until_idle(&mut r, sid).await,
+            [
+                (1, HiveTurnStatus::Ok),
+                (2, HiveTurnStatus::Running),
+                (2, HiveTurnStatus::Ok)
+            ]
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-4 — a drain that does not finish within its bound is refused and
+    /// lifted: a checkpoint that never ends holds the session's next prompt
+    /// back, never the session.
+    #[tokio::test]
+    async fn a_drain_that_does_not_finish_in_time_is_refused_and_lifted() {
+        use super::super::checkpointer::Runner;
+        let mut r = rig_with(
+            true,
+            4,
+            |_| {},
+            |mut s| {
+                s.checkpoint_runner = Some(Runner::Hangs);
+                s.with_drain_timing(DrainTiming {
+                    cut: Duration::from_millis(100),
+                    grace: Duration::from_millis(100),
+                    checkpoint: Duration::from_millis(300),
+                })
+            },
+        );
+        let mut o = order(&r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+
+        assert_eq!(
+            answered(drain(&r, sid, 1)).await,
+            Err((
+                HiveDrainRefusal::Other,
+                "the drain did not finish in time".into()
+            ))
+        );
+        assert!(
+            r.sup.prompt(sid, dev(&r), "later".into()).is_ok(),
+            "lifted: prompts are taken again"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !harness_stdin(&r).contains("later"),
+            "behind the checkpoint"
+        );
+        r.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            until_ended(&mut r, sid).await.as_deref(),
+            Some("stopped (owner)")
+        );
+    }
+
+    /// P2e-4 — the interrupt is Claude Code's own control request, on one
+    /// line of its stream-json input.
+    #[test]
+    fn the_interrupt_is_claude_codes_own_control_request() {
+        let line = interrupt_line(3);
+        assert!(line.ends_with('\n'));
+        assert!(!line.trim_end().contains('\n'), "one line");
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "control_request", "request_id": "hive-drain-3",
+                "request": {"subtype": "interrupt"}})
+        );
     }
 }
 

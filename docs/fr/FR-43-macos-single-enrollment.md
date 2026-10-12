@@ -30,7 +30,7 @@ the same `run` subcommand — the split is context, not code.
 **Windows does not need two because a SYSTEM process can reach the interactive desktop.**
 `agents/roomlerd/src/win_service/desktop.rs:1-16` documents the mechanism (a thread
 attaches to `winsta0\Default` / `winsta0\Winlogon` and captures/injects there), and
-`supervisor.rs:236` (`spawn_in_session`) + `:662` (`decide_spawn`) is the shape: the SCM
+`supervisor.rs:265` (`spawn_in_session`) + `:722` (`decide_spawn`) is the shape: the SCM
 service supervises, the agent proper runs in a session. macOS has **no `SetThreadDesktop`
 equivalent** — a session-0 daemon cannot borrow the console user's WindowServer, at all.
 That is the whole asymmetry.
