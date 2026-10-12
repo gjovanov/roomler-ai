@@ -37,7 +37,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
-use crate::chain::{ChainError, ChainTip, EventEnvelope, check_next_with_floor};
+use crate::chain::{ChainError, ChainTip, EventEnvelope, FenceEnd, check_next_with_ends};
 use crate::event::TranscriptEvent;
 
 /// The schema this build writes. A newer file is refused rather than written
@@ -116,6 +116,18 @@ const P2C_TABLES: &str = "CREATE TABLE IF NOT EXISTS memberships (
                  role      TEXT    NOT NULL,
                  fence     INTEGER NOT NULL,
                  joined_ms INTEGER NOT NULL
+             ) WITHOUT ROWID;";
+
+/// FR-90 P2e-5b: where each fence a promotion superseded ended, as the
+/// server's joins carry it. Below the floor, that fence's events are still
+/// taken up to there. New and made only when missing, like P2a's tables, so
+/// `user_version` stays 1 and a daemon before P2e-5b opens the file.
+const P2E_TABLES: &str = "CREATE TABLE IF NOT EXISTS fence_ends (
+                 session TEXT    NOT NULL,
+                 fence   INTEGER NOT NULL,
+                 seq     INTEGER NOT NULL,
+                 hash    BLOB    NOT NULL,
+                 PRIMARY KEY (session, fence)
              ) WITHOUT ROWID;";
 
 /// FR-90 P2c-3 — one session this device holds a copy of as a member.
@@ -241,6 +253,7 @@ impl Store {
         conn.execute_batch(P0A_TABLES)?;
         conn.execute_batch(P2A_TABLES)?;
         conn.execute_batch(P2C_TABLES)?;
+        conn.execute_batch(P2E_TABLES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -251,7 +264,20 @@ impl Store {
     /// below the floor is refused ([`StoreError::StaleJoin`]), as is one for
     /// a purged session. A later join moves the role and fence, and keeps
     /// when the first was made. Returns the floor.
-    pub fn join(&mut self, session: &str, role: &str, fence: u64) -> Result<u64, StoreError> {
+    ///
+    /// P2e-5b — and where each fence a promotion superseded ended (`ends`),
+    /// in the same transaction, so no event finds the floor risen without
+    /// them: below the floor, such a fence's events are still taken up to
+    /// there ([`check_next_with_ends`]). They are kept, never dropped by a
+    /// later join: a fence's end never changes once it is superseded, and a
+    /// join from a server that names none takes none away.
+    pub fn join(
+        &mut self,
+        session: &str,
+        role: &str,
+        fence: u64,
+        ends: &[FenceEnd],
+    ) -> Result<u64, StoreError> {
         let tx = self.conn.transaction()?;
         if Self::purged_in(&tx, session)? {
             return Err(StoreError::Purged {
@@ -277,8 +303,72 @@ impl Store {
              ON CONFLICT(session) DO UPDATE SET role = ?2, fence = ?3",
             params![session, role, fence as i64, now_ms()],
         )?;
+        for end in ends {
+            tx.execute(
+                "INSERT INTO fence_ends (session, fence, seq, hash) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session, fence) DO UPDATE SET seq = ?3, hash = ?4",
+                params![
+                    session,
+                    end.fence as i64,
+                    end.seq as i64,
+                    end.hash.as_slice()
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(fence)
+    }
+
+    /// FR-90 P2e-5b: where each fence a promotion superseded ended, for
+    /// `session`, oldest fence first.
+    pub fn fence_ends(&self, session: &str) -> Result<Vec<FenceEnd>, StoreError> {
+        Self::fence_ends_in(&self.conn, session)
+    }
+
+    fn fence_ends_in(conn: &Connection, session: &str) -> Result<Vec<FenceEnd>, StoreError> {
+        let mut stmt = conn
+            .prepare("SELECT fence, seq, hash FROM fence_ends WHERE session = ?1 ORDER BY fence")?;
+        let rows = stmt.query_map(params![session], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (fence, seq, hash) = row?;
+            out.push(FenceEnd {
+                fence: fence as u64,
+                seq: seq as u64,
+                hash: to_hash(&hash, session, seq as u64)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The end of `fence` alone: the one an event of that fence is checked
+    /// against, read by its key, so an apply never reads them all.
+    fn fence_end_in(
+        conn: &Connection,
+        session: &str,
+        fence: u64,
+    ) -> Result<Option<FenceEnd>, StoreError> {
+        let row: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT seq, hash FROM fence_ends WHERE session = ?1 AND fence = ?2",
+                params![session, fence as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(seq, hash)| {
+            Ok(FenceEnd {
+                fence,
+                seq: seq as u64,
+                hash: to_hash(&hash, session, seq as u64)?,
+            })
+        })
+        .transpose()
     }
 
     /// FR-90 P2c-3: every session this device holds as a member, by id.
@@ -382,7 +472,8 @@ impl Store {
         }
         let tip = Self::tip_in(&tx, &env.session)?;
         let floor = Self::floor_in(&tx, &env.session)?;
-        check_next_with_floor(tip, floor, env)?;
+        let end = Self::fence_end_in(&tx, &env.session, env.fence)?;
+        check_next_with_ends(tip, floor, end.as_slice(), env)?;
         let next = env.tip();
         Self::insert(&tx, env, &next)?;
         tx.commit()?;
@@ -925,6 +1016,10 @@ impl Store {
         )?;
         tx.execute("DELETE FROM tips WHERE session = ?1", params![session])?;
         tx.execute("DELETE FROM floors WHERE session = ?1", params![session])?;
+        tx.execute(
+            "DELETE FROM fence_ends WHERE session = ?1",
+            params![session],
+        )?;
         tx.execute(
             "DELETE FROM memberships WHERE session = ?1",
             params![session],
@@ -1897,7 +1992,7 @@ mod tests {
             append_all(&mut s, "s2", 1, &["purgeword"]);
             s.purge("s2").unwrap();
             // P2c-3 — and a membership.
-            s.join("s3", "owner", 1).unwrap();
+            s.join("s3", "owner", 1, &[]).unwrap();
         }
 
         // The rolled-back daemon.
@@ -2005,7 +2100,7 @@ mod tests {
     #[test]
     fn a_join_raises_the_floor_and_records_the_membership() {
         let mut s = Store::open_in_memory().unwrap();
-        assert_eq!(s.join("s1", "owner", 2).unwrap(), 2);
+        assert_eq!(s.join("s1", "owner", 2, &[]).unwrap(), 2);
         assert_eq!(s.floor("s1").unwrap(), Some(2));
         let first = s.memberships().unwrap();
         assert_eq!(
@@ -2018,7 +2113,7 @@ mod tests {
         // From the join on, an event of an older fence is refused here.
         let old = EventEnvelope::next("s1", None, 1, 0, &ev("from fence one"));
         assert!(s.apply(&old).is_err(), "fence 1 is below the floor");
-        assert_eq!(s.join("s1", "archive", 3).unwrap(), 3);
+        assert_eq!(s.join("s1", "archive", 3, &[]).unwrap(), 3);
         let again = s.memberships().unwrap();
         assert_eq!(
             (again[0].role.as_str(), again[0].fence, again[0].joined_ms),
@@ -2034,7 +2129,7 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.raise_floor("s1", 4).unwrap();
         assert!(matches!(
-            s.join("s1", "owner", 3),
+            s.join("s1", "owner", 3, &[]),
             Err(StoreError::StaleJoin {
                 floor: 4,
                 fence: 3,
@@ -2043,13 +2138,76 @@ mod tests {
         ));
         assert!(s.memberships().unwrap().is_empty());
         assert_eq!(s.floor("s1").unwrap(), Some(4), "the floor never falls");
-        s.join("s2", "owner", 1).unwrap();
+        s.join("s2", "owner", 1, &[]).unwrap();
         s.purge("s2").unwrap();
         assert!(s.memberships().unwrap().is_empty(), "a purge ends it");
         assert!(matches!(
-            s.join("s2", "owner", 2),
+            s.join("s2", "owner", 2, &[]),
             Err(StoreError::Purged { .. })
         ));
         assert!(s.size_bytes().unwrap() > 0);
+    }
+
+    /// FR-90 P2e-5b — a member that joins after a move syncs the history
+    /// below its floor: the join keeps where fence 1 ended, and fence 1's
+    /// events are taken up to there, then the new fence's. A later join that
+    /// names no end takes none away; a purge does.
+    #[test]
+    fn a_join_after_a_move_takes_the_old_fences_history_up_to_its_end() {
+        // The history as the primaries wrote it: three events at fence 1,
+        // then the promoted primary's at fence 2.
+        let mut src = Store::open_in_memory().unwrap();
+        append_all(&mut src, "s1", 1, &["one", "two", "three"]);
+        let end_tip = src.tip("s1").unwrap().unwrap();
+        append_all(&mut src, "s1", 2, &["four"]);
+        let history = src.page("s1", 0, 100).unwrap();
+
+        let end = FenceEnd {
+            fence: 1,
+            seq: end_tip.seq,
+            hash: end_tip.hash,
+        };
+        let mut m = Store::open_in_memory().unwrap();
+        m.join("s1", "owner", 2, &[]).unwrap();
+        assert!(
+            matches!(
+                m.apply(&history[0]),
+                Err(StoreError::Chain(ChainError::StaleFence {
+                    current: 2,
+                    got: 1
+                }))
+            ),
+            "before P2e-5b: the history below the floor, refused for good"
+        );
+        m.join("s1", "owner", 2, &[end]).unwrap();
+        assert_eq!(
+            m.fence_ends("s1").unwrap(),
+            [end],
+            "the join keeps fence 1's end"
+        );
+        for env in &history {
+            m.apply(env).unwrap_or_else(|e| {
+                panic!("below the floor, up to fence 1's end: seq {}: {e}", env.seq)
+            });
+        }
+        assert_eq!(m.tip("s1").unwrap(), src.tip("s1").unwrap(), "all of it");
+
+        // An old primary's late write past where its fence ended: refused.
+        let mut behind = Store::open_in_memory().unwrap();
+        behind.join("s1", "owner", 2, &[end]).unwrap();
+        for env in &history[..3] {
+            behind.apply(env).unwrap();
+        }
+        let late = EventEnvelope::next("s1", behind.tip("s1").unwrap(), 1, 9, &ev("late"));
+        assert!(matches!(
+            behind.apply(&late),
+            Err(StoreError::Chain(ChainError::StaleFence { .. }))
+        ));
+
+        // A join that names no end keeps the ones held; a purge drops them.
+        m.join("s1", "archive", 3, &[]).unwrap();
+        assert_eq!(m.fence_ends("s1").unwrap(), [end], "never taken away");
+        m.purge("s1").unwrap();
+        assert!(m.fence_ends("s1").unwrap().is_empty(), "a purge drops them");
     }
 }

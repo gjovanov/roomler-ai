@@ -25,7 +25,8 @@
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::{
     hive::{
-        HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole, is_hash_hex, replica_limits,
+        HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole, is_hash_hex,
+        replica_limits,
     },
     signaling::ServerMsg,
 };
@@ -110,22 +111,30 @@ pub(crate) fn freshest_copy(
         .map(|m| m.device_id)
 }
 
-/// Push one join. `false` = it did not leave: the device is not connected
-/// here, or this connection does not take it (a member's that holds no
-/// copies, a primary's that runs no Hive). It stays owed either way, and goes
-/// when a connection that takes it asks.
+/// Push one join, at the record's fence. `false` = it did not leave: the
+/// device is not connected here, or this connection does not take it (a
+/// member's that holds no copies, a primary's that runs no Hive). It stays
+/// owed either way, and goes when a connection that takes it asks.
+///
+/// P2e-5b — it carries the record's `fences`, every time: a member that joins
+/// after a move holds a floor above every event the session had, and takes
+/// them only up to where each superseded fence ended. Taking the RECORD, not
+/// its fields, is what keeps a new caller from sending a join without them.
 pub(crate) fn push_join(
     state: &HiveState,
-    tenant_id: ObjectId,
+    s: &AgentSession,
     device_id: ObjectId,
-    session_id: ObjectId,
-    fence: u64,
     role: HiveReplicaRole,
 ) -> bool {
+    let Some(session_id) = s.id else {
+        return false;
+    };
+    let tenant_id = s.tenant_id;
     let msg = ServerMsg::HiveReplicaJoin {
         session_id,
-        fence,
+        fence: u64::try_from(s.fence).unwrap_or_default(),
         role: Some(role),
+        fences: fence_marks(s),
     };
     let hub = &state.fleet.rc_hub;
     let pushed = if role == HiveReplicaRole::Primary {
@@ -148,6 +157,23 @@ pub(crate) fn push_join(
     }
 }
 
+/// P2e-5b — the record's `fences` as a join carries them, oldest first. A
+/// mark no promotion could have written (a negative number) is left out,
+/// never sent wrapped: that fence's events are then refused below the
+/// floor, as every one was before P2e-5b.
+pub(crate) fn fence_marks(s: &AgentSession) -> Vec<HiveFenceMark> {
+    s.fences
+        .iter()
+        .filter_map(|m| {
+            Some(HiveFenceMark {
+                fence: u64::try_from(m.fence).ok()?,
+                seq: u64::try_from(m.seq).ok()?,
+                hash: m.hash.clone(),
+            })
+        })
+        .collect()
+}
+
 /// The primary accepted the session's start: send each member placement
 /// chose its join. Before that the session may never run, and a member would
 /// hold a copy of nothing.
@@ -160,9 +186,8 @@ pub(crate) async fn send_joins(state: &HiveState, session_id: ObjectId) {
             return;
         }
     };
-    let fence = u64::try_from(s.fence).unwrap_or_default();
     for (device_id, role) in pending(&s) {
-        push_join(state, s.tenant_id, device_id, session_id, fence, role);
+        push_join(state, &s, device_id, role);
     }
 }
 
@@ -186,16 +211,7 @@ pub(crate) async fn reconcile_joins(
         {
             Ok(sessions) => {
                 for s in sessions {
-                    let Some(sid) = s.id else { continue };
-                    let fence = u64::try_from(s.fence).unwrap_or_default();
-                    push_join(
-                        state,
-                        tenant_id,
-                        device_id,
-                        sid,
-                        fence,
-                        HiveReplicaRole::Primary,
-                    );
+                    push_join(state, &s, device_id, HiveReplicaRole::Primary);
                 }
             }
             Err(e) => {
@@ -214,11 +230,9 @@ pub(crate) async fn reconcile_joins(
         }
     };
     for s in sessions {
-        let Some(sid) = s.id else { continue };
-        let fence = u64::try_from(s.fence).unwrap_or_default();
         for (member, role) in pending(&s) {
             if member == device_id {
-                push_join(state, tenant_id, device_id, sid, fence, role);
+                push_join(state, &s, device_id, role);
             }
         }
     }
@@ -550,5 +564,36 @@ mod tests {
         // placed before P2c-3 has no state, and reads as pending.
         let alone = session(vec![member(MemberRole::Primary, MemberState::Pending)]);
         assert!(pending(&alone).is_empty());
+    }
+
+    /// P2e-5b — a join carries the record's `fences` as they stand, oldest
+    /// first, and leaves out a mark no promotion could have written rather
+    /// than send it wrapped.
+    #[test]
+    fn a_join_carries_the_records_fence_ends() {
+        let mut s = session(vec![member(MemberRole::Primary, MemberState::Joined)]);
+        assert!(fence_marks(&s).is_empty(), "never moved: none");
+        let mark = |fence, seq| crate::model::FenceMark {
+            fence,
+            seq,
+            hash: format!("{fence:02x}").repeat(32),
+        };
+        s.fences = vec![mark(1, 5), mark(2, 9), mark(-3, 9), mark(4, -1)];
+        assert_eq!(
+            fence_marks(&s),
+            [
+                HiveFenceMark {
+                    fence: 1,
+                    seq: 5,
+                    hash: "01".repeat(32),
+                },
+                HiveFenceMark {
+                    fence: 2,
+                    seq: 9,
+                    hash: "02".repeat(32),
+                },
+            ],
+            "a mark no promotion could have written is left out"
+        );
     }
 }
