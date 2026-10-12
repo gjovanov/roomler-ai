@@ -244,7 +244,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `type` | `wayland` · `x11` · `tty` · `none` | that session's type |
 | `desktop` | `gnome`, `KDE`, … (absent when logind names none) | logind's `Desktop` |
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
-| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:232`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on |
+| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:232`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ Read again only when another field changed. The verdict connects to the X server, and GNOME starts Xwayland **on demand** when a client connects, so a read every refresh could keep starting one on an idle desktop. The per-session `rc:input-reach` stays the authority |
 
 `capture_arm` is `capture::planned_arm` (`capture/mod.rs:744`), a pure function
 that walks `open_with`'s own order (`:1270`). The two sit together in one file
@@ -689,7 +689,7 @@ defect — the capture arms only expose it by being knobs.
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:943`) and the cascade; the FR-80 failure classifier (`:830`); FR-93's verdicts: `linux_no_pixels_code` (`:567`), `xwayland_verdict` (`:616`), the Xwayland guard (`:1159`) and its socket-only probe (`x_server_query` `:705`), the hints (`wayland_hint` `:519`, `wayland_not_enabled_detail` `:601`) |
-| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:65`); `planned_arm` / `arm_facts` live beside the cascade in `capture/mod.rs` (`:744`, `:765`) |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:80`); `planned_arm` / `arm_facts` live beside the cascade in `capture/mod.rs` (`:744`, `:765`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:107`, `primary` `:243`) |

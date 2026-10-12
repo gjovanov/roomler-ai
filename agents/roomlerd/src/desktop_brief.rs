@@ -37,7 +37,8 @@ pub fn start() {
                 .name("desktop-brief".into())
                 .spawn(|| {
                     loop {
-                        let brief = linux::gather();
+                        let prev = current();
+                        let brief = linux::gather(prev.as_ref());
                         let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
                         // Said once per change, so the journal shows what the
                         // hello and the heartbeat carry.
@@ -88,13 +89,32 @@ mod pick {
     }
 }
 
+/// Is `next` the same desktop as `prev`, all but the input reach?
+///
+/// ⚠️ The reach is the one field that costs something to read: it connects to
+/// the X server, and GNOME starts Xwayland **on demand** when a client
+/// connects, so reading it every refresh could keep starting an Xwayland on an
+/// idle per-user desktop. It is read again only when the rest of the brief
+/// changed (a login, a logout, the greeter, a different arm). A reach that
+/// changes on its own is seen at the next of those. The per-session
+/// `rc:input-reach` is read fresh and stays the authority.
+#[cfg(target_os = "linux")]
+fn same_desktop(prev: &DesktopBrief, next: &DesktopBrief) -> bool {
+    prev.session == next.session
+        && prev.kind == next.kind
+        && prev.desktop == next.desktop
+        && prev.capture_arm == next.capture_arm
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::pick::seen_session;
     use crate::capture::{CaptureArm, arm_facts, planned_arm};
     use roomler_ai_remote_control::models::DesktopBrief;
 
-    pub(super) fn gather() -> DesktopBrief {
+    /// The brief now. `prev` (the last one) lends its input reach when nothing
+    /// else changed: see [`super::same_desktop`].
+    pub(super) fn gather(prev: Option<&DesktopBrief>) -> DesktopBrief {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let uid = unsafe { libc::geteuid() };
         let root = uid == 0;
@@ -106,23 +126,61 @@ mod linux {
         let arm = planned_arm(&arm_facts(sessions.as_deref(), root, uid, kind == "x11"));
         let portal_input = matches!(arm, Some(CaptureArm::Portal | CaptureArm::Mutter))
             && tunnel_core::env::flag("PORTAL_INPUT", false);
-        DesktopBrief {
+        let mut next = DesktopBrief {
             session: seen.map_or("none", |s| s.class.as_str()).to_string(),
             kind,
             desktop: seen.and_then(|s| s.desktop.clone()),
             capture_arm: arm.map_or("none", CaptureArm::wire).to_string(),
-            input_reach: crate::input::reach::predicted(portal_input)
+            input_reach: String::new(),
+        };
+        next.input_reach = match prev {
+            Some(p) if super::same_desktop(p, &next) => p.input_reach.clone(),
+            _ => crate::input::reach::predicted(portal_input)
                 .reach
                 .wire()
                 .to_string(),
-        }
+        };
+        next
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::pick::seen_session;
+    use super::same_desktop;
     use crate::keep_busy::logind::Session;
+    use roomler_ai_remote_control::models::DesktopBrief;
+
+    fn brief(session: &str, arm: &str, reach: &str) -> DesktopBrief {
+        DesktopBrief {
+            session: session.into(),
+            kind: "wayland".into(),
+            desktop: Some("gnome".into()),
+            capture_arm: arm.into(),
+            input_reach: reach.into(),
+        }
+    }
+
+    /// The X probe behind the reach runs only when the desktop changed: an
+    /// unchanged desktop keeps its reach, whatever the new read would say.
+    #[test]
+    fn the_reach_is_reread_only_when_the_desktop_changed() {
+        let prev = brief("user", "mutter", "xwayland_only");
+        assert!(same_desktop(&prev, &brief("user", "mutter", "")));
+        assert!(
+            !same_desktop(&prev, &brief("greeter", "mutter", "")),
+            "a logout"
+        );
+        assert!(
+            !same_desktop(&prev, &brief("user", "none", "")),
+            "another arm"
+        );
+        let other_desktop = DesktopBrief {
+            desktop: Some("KDE".into()),
+            ..brief("user", "mutter", "")
+        };
+        assert!(!same_desktop(&prev, &other_desktop));
+    }
 
     fn s(id: &str, uid: u32, class: &str, active: bool, kind: &str) -> Session {
         Session {
