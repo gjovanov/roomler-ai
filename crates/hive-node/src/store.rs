@@ -134,7 +134,8 @@ const P2E_TABLES: &str = "CREATE TABLE IF NOT EXISTS fence_ends (
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     pub session: String,
-    /// The role it was placed in: `archive` or `owner`.
+    /// The role it was placed in: `archive` or `owner`; FR-90 P2f-1a,
+    /// `teleport` for a copy taken to run the session here.
     pub role: String,
     /// The fence of the newest join.
     pub fence: u64,
