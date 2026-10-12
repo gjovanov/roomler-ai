@@ -4061,6 +4061,7 @@
     "rc:hive.replica.refused",
     "rc:hive.replica.close",
     "rc:hive.stop",
+    "rc:hive.demote",
     "rc:hive.memory",
     "rc:hive.adopt_ack",
     "rc:hive.view.grant",

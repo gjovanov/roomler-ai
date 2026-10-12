@@ -3172,6 +3172,28 @@ pub enum ServerMsg {
         reason: String,
     },
 
+    /// FR-90 P2e-1 — this device no longer holds the session: its lease is
+    /// at `fence` now, on another device. A run of it here at an OLDER fence
+    /// ends: its model calls, prompts and approval answers at once, its
+    /// harness as a stop ends it. The device's fence floor for the session
+    /// rises to `fence`, so what that run still writes is refused there as
+    /// on every member, and what the device hosts forgets the session, so no
+    /// restart resumes it. A run at `fence` or newer is not this frame's: the
+    /// session came back. Whether the device then holds a copy is its own
+    /// `hive_replica` and the server's join. Nothing answers it: the run's
+    /// `ended` goes at its own, older fence, which the server ignores.
+    #[serde(rename = "rc:hive.demote")]
+    HiveDemote {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// The fence the session's lease is at now.
+        fence: u64,
+        /// Why, in a word, for the device's log: `not_location` (it reported
+        /// a session held elsewhere).
+        #[serde(default)]
+        reason: String,
+    },
+
     /// FR-90 P1e — a session's core memory, rendered from the org's brain at
     /// the revision the session pinned when it was created, and sent
     /// IMMEDIATELY BEFORE its [`ServerMsg::HiveStart`] (and before that
@@ -4524,6 +4546,31 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(bare).unwrap(),
             ServerMsg::HiveStop { fence: 3, .. }
+        ));
+    }
+
+    /// FR-90 P2e-1 — the demote names the fence the lease is at NOW, not the
+    /// one the device ran: the device ends what it runs below it.
+    #[test]
+    fn hive_demote_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let m = ServerMsg::HiveDemote {
+            session_id: sid,
+            fence: 4,
+            reason: "not_location".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({
+                "t": "rc:hive.demote", "session_id": sid.to_hex(), "fence": 4,
+                "reason": "not_location"
+            })
+        );
+        let bare =
+            serde_json::json!({"t": "rc:hive.demote", "session_id": sid.to_hex(), "fence": 4});
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(bare).unwrap(),
+            ServerMsg::HiveDemote { fence: 4, reason, .. } if reason.is_empty()
         ));
     }
 

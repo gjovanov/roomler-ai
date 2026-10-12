@@ -1901,6 +1901,117 @@ async fn removing_a_device_ends_its_sessions() {
     assert_eq!(s["end_reason"], "device_removed");
 }
 
+// ─── P2e-1 — a report from a device that is no longer the location ─────────
+
+/// Move a session's record to `device` at `fence`, as a promotion's lease
+/// CAS will (P2e-3): the record alone, nobody told.
+async fn move_record(app: &TestApp, sid: &str, device: &str, fence: i64) {
+    let moved = app
+        .db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(sid).unwrap() },
+            doc! { "$set": {
+                "location.device_id": ObjectId::parse_str(device).unwrap(),
+                "fence": fence,
+            } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.modified_count, 1, "the record moved");
+}
+
+/// FR-90 P2e-1 — a device that reports a session the record holds on
+/// another device (its run state, a turn, an approval, its manifest, a late
+/// answer to the start) is told it no longer holds it: `rc:hive.demote`, at
+/// the RECORD's fence. The record does not move. The holder is told
+/// nothing, even at an older fence of its own, and neither is another
+/// organization's device that names the session.
+#[tokio::test]
+async fn a_device_that_reports_a_session_held_elsewhere_is_demoted() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivedemote").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut old = device(&app, &seeded, "hive-old", RUNS_HIVE).await;
+    let mut holder = device(&app, &seeded, "hive-holder", RUNS_HIVE).await;
+    let theirs = app.seed_tenant("hivedemote2").await;
+    let mut foreign = device(&app, &theirs, "hive-foreign", RUNS_HIVE).await;
+    let sid = started_session(&app, &tid, &token, &mut old).await;
+    send(
+        &mut old.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+    )
+    .await;
+    wait_status(&app, &tid, &token, &sid, "idle").await;
+
+    move_record(&app, &sid, &holder.agent_id, 2).await;
+
+    let reports = [
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "running"}),
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 1, "status": "running"}),
+        json!({"t": "rc:hive.approval", "session_id": sid, "fence": 1,
+               "approval_id": "a1", "turn": 1, "status": "open"}),
+        json!({"t": "rc:hive.manifest", "sessions": [{"session_id": sid, "fence": 1}]}),
+        json!({"t": "rc:hive.start_ack", "session_id": sid, "fence": 1, "account": "dev"}),
+    ];
+    for report in reports {
+        send(&mut old.ws, report.clone()).await;
+        let demote = read_until(&mut old.ws, "rc:hive.demote")
+            .await
+            .unwrap_or_else(|| panic!("no demote for {report}"));
+        assert_eq!(demote["session_id"], sid, "{report}");
+        assert_eq!(demote["fence"], 2, "the record's fence: {report}");
+        assert_eq!(demote["reason"], "not_location", "{report}");
+    }
+
+    // The holder, at its own fence and at an older one: nothing.
+    for fence in [2, 1] {
+        send(
+            &mut holder.ws,
+            json!({"t": "rc:hive.state", "session_id": sid, "fence": fence, "state": "idle"}),
+        )
+        .await;
+    }
+    assert!(
+        !device_hears(&mut holder.ws, "rc:hive.demote", Duration::from_millis(800)).await,
+        "the holder is not demoted"
+    );
+    // Another organization's device naming the session: nothing either.
+    send(
+        &mut foreign.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "running"}),
+    )
+    .await;
+    send(
+        &mut foreign.ws,
+        json!({"t": "rc:hive.manifest", "sessions": [{"session_id": sid, "fence": 1}]}),
+    )
+    .await;
+    assert!(
+        !device_hears(
+            &mut foreign.ws,
+            "rc:hive.demote",
+            Duration::from_millis(800)
+        )
+        .await,
+        "another organization's device is told nothing"
+    );
+
+    let s = stored(&app, &sid).await;
+    assert_eq!(
+        s.get_document("location")
+            .unwrap()
+            .get_object_id("device_id")
+            .unwrap()
+            .to_hex(),
+        holder.agent_id,
+        "the record does not move"
+    );
+    assert_eq!(s.get_i64("fence").unwrap(), 2);
+    assert_eq!(s.get_str("status").unwrap(), "idle");
+}
+
 // ─── P0d-2b — the viewer peer's signalling ─────────────────────────────────
 
 /// A build that runs sessions AND serves them to a browser.

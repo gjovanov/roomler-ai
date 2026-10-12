@@ -195,10 +195,40 @@ impl Hosted {
         }
     }
 
+    /// FR-90 P2e-1 — [`Self::update`], only while `session`'s record is at
+    /// `fence`: a run writes its own record, never a newer run's.
+    pub(crate) fn update_at(
+        &mut self,
+        session: &str,
+        fence: u64,
+        f: impl FnOnce(&mut HostedSession),
+    ) {
+        if let Some(e) = self
+            .sessions
+            .iter_mut()
+            .find(|e| e.session == session && e.fence == fence)
+        {
+            f(e);
+            self.save();
+        }
+    }
+
     /// Forget `session`: it ended, or will not resume.
     pub(crate) fn remove(&mut self, session: &str) {
         let before = self.sessions.len();
         self.sessions.retain(|e| e.session != session);
+        if self.sessions.len() != before {
+            self.save();
+        }
+    }
+
+    /// FR-90 P2e-1 — forget `session` while its record is at `fence` or an
+    /// older one: what a run removes is its own, and a newer run's record is
+    /// never an older run's to take.
+    pub(crate) fn remove_upto(&mut self, session: &str, fence: u64) {
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|e| !(e.session == session && e.fence <= fence));
         if self.sessions.len() != before {
             self.save();
         }
