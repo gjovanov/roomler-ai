@@ -16,13 +16,22 @@
 //! | a stream ended `caught_up`: the copy holds all of a session that is over | nothing more: parked |
 //! | refused `not_a_member` or `stale_fence`; the server's close `member_left` or `device_removed` | stopped, until the next join |
 //!
+//! P2d-4 — **renewals.** A grant lives `ttl_secs` (10 min). At half its life
+//! the member asks for the session again, from the top of the ladder, beside
+//! the stream it follows, and climbs down a rung for that renewal as for any
+//! ask. The renewal's stream is followed beside the old one; once it answers,
+//! it is the stream followed and the old one is let go (`renewed`), so a copy
+//! is never without a stream at its grant's end (make-before-break). A
+//! renewal that finds no rung leaves the old stream to carry on to its end,
+//! and the follow asks again then.
+//!
 //! ⚠️ **Never ratchet.** A rung that carried is not remembered: every new
-//! ask starts from `direct` again, so a member that fell to `derp` is back on
-//! a direct path at the first ask that finds one.
+//! ask, and every renewal, starts from `direct` again, so a member that fell
+//! to `derp` is back on a direct path at the first ask that finds one.
 //!
 //! ⚠️ At most [`MAX_FOLLOWING`] sessions are asked for or followed at once,
-//! as many as the stream lets a member follow; the rest wait their turn, in
-//! order. A device holds copies of every session its owner ran, most of them
+//! each with its renewal beside it at most, as many streams as a member
+//! follows; the rest wait their turn, in order. A device holds copies of every session its owner ran, most of them
 //! over, and a session over that the copy holds whole is let be, so the
 //! slots go to the sessions that move.
 //!
@@ -71,7 +80,7 @@ const WAIT_RATE: Duration = if cfg!(test) {
 };
 /// How long an ask waits for its answer before it is taken for `no_answer`:
 /// the server's own wait for the source (30 s), and some.
-const WANT_TIMEOUT: Duration = if cfg!(test) {
+pub(super) const WANT_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(5)
 } else {
     Duration::from_secs(45)
@@ -107,6 +116,46 @@ struct Follow {
     /// Moved on at every change of phase, so a timer or an answer meant for
     /// an earlier one finds this has moved on and does nothing.
     generation: u64,
+    /// P2d-4 — the renewal of the stream followed, beside it. Only while
+    /// one is followed: every other phase is entered through
+    /// [`Supervisor::next`], which lets it go.
+    renewal: Option<Renewal>,
+    /// P2d-4 — renewal asks so far: each one's own generation.
+    renewals: u64,
+}
+
+/// P2d-4 — the renewal of a stream followed: asked for at half its grant's
+/// life, from the top of the ladder, while the old stream carries on;
+/// followed once its own stream answers, and the old one let go then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Renewal {
+    /// The rung it asks on, into [`Supervisor::ladder`].
+    rung: usize,
+    /// Which ask it is: a timeout meant for an earlier one moves nothing.
+    generation: u64,
+    state: Renewing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Renewing {
+    /// Asked on this rung.
+    Wanting(HiveStreamPath),
+    /// Its dial came: this grant's stream, followed once it answers.
+    Dialed { grant: ObjectId, ttl_secs: u32 },
+}
+
+impl Follow {
+    fn new(fence: u64) -> Self {
+        Self {
+            fence,
+            rung: 0,
+            misses: 0,
+            phase: Phase::Waiting,
+            generation: 0,
+            renewal: None,
+            renewals: 0,
+        }
+    }
 }
 
 /// Every session followed, and those waiting for a slot, in order.
@@ -124,6 +173,13 @@ impl Follows {
             .filter(|f| matches!(f.phase, Phase::Wanting(_) | Phase::Following(_)))
             .count()
     }
+}
+
+/// Whose ask an answer is.
+enum Asked {
+    Follow,
+    /// P2d-4.
+    Renewal,
 }
 
 /// What to do next.
@@ -210,7 +266,8 @@ impl Supervisor {
     /// At the primary organization's connection: every session held as a
     /// member is followed. One followed, queued or waiting already is left
     /// as it is; one asked for is asked again (its answer would have come on
-    /// the connection that went); one parked or stopped stays so.
+    /// the connection that went), and so is a renewal asked for (P2d-4); one
+    /// parked or stopped stays so.
     pub(super) async fn follow_all(self: &Arc<Self>) {
         let Ok(store) = &self.store else {
             return;
@@ -219,34 +276,46 @@ impl Supervisor {
             Ok(m) => m,
             Err(e) => return warn!(%e, "hive: the memberships could not be read to follow them"),
         };
+        enum Again {
+            Follow,
+            Renewal(HiveStreamPath, u64, u64),
+        }
         for m in held {
             let Ok(session) = ObjectId::parse_str(&m.session) else {
                 continue;
             };
-            let ask = {
+            let again = {
                 let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
                 match follows.map.get_mut(&session) {
                     None => {
-                        follows.map.insert(
-                            session,
-                            Follow {
-                                fence: m.fence,
-                                rung: 0,
-                                misses: 0,
-                                phase: Phase::Waiting,
-                                generation: 0,
-                            },
-                        );
-                        true
+                        follows.map.insert(session, Follow::new(m.fence));
+                        Some(Again::Follow)
                     }
                     Some(f) => {
                         f.fence = f.fence.max(m.fence);
-                        matches!(f.phase, Phase::Wanting(_))
+                        match (f.phase, f.renewal.map(|r| r.state)) {
+                            (Phase::Wanting(_), _) => Some(Again::Follow),
+                            (Phase::Following(_), Some(Renewing::Wanting(path))) => {
+                                // A new generation: the ask that went with the
+                                // connection times out moving nothing.
+                                f.renewals += 1;
+                                let generation = f.renewals;
+                                if let Some(r) = f.renewal.as_mut() {
+                                    r.generation = generation;
+                                }
+                                Some(Again::Renewal(path, f.fence, generation))
+                            }
+                            _ => None,
+                        }
                     }
                 }
             };
-            if ask {
-                self.ask(session);
+            match again {
+                Some(Again::Follow) => self.ask(session),
+                Some(Again::Renewal(path, fence, generation)) => {
+                    self.send_renewal(session, fence, path, generation)
+                }
+                None => {}
             }
         }
     }
@@ -257,13 +326,7 @@ impl Supervisor {
     pub(super) fn follow_joined(self: &Arc<Self>, session: ObjectId, fence: u64) {
         let ask = {
             let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
-            let f = follows.map.entry(session).or_insert(Follow {
-                fence,
-                rung: 0,
-                misses: 0,
-                phase: Phase::Waiting,
-                generation: 0,
-            });
+            let f = follows.map.entry(session).or_insert(Follow::new(fence));
             f.fence = f.fence.max(fence);
             match f.phase {
                 Phase::Wanting(_) | Phase::Following(_) | Phase::Queued => false,
@@ -374,7 +437,8 @@ impl Supervisor {
     }
 
     /// `rc:hive.replica.refused`, for the ask in flight on `path` at
-    /// `fence`; one for any other moves nothing.
+    /// `fence`: the follow's own, or its renewal's (P2d-4). One for any other
+    /// moves nothing.
     pub(super) fn on_refused(
         self: &Arc<Self>,
         session: ObjectId,
@@ -382,49 +446,269 @@ impl Supervisor {
         path: Option<HiveStreamPath>,
         reason: Option<HiveStreamRefusal>,
     ) {
-        let current = self
+        let asked = self
             .follows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map
             .get(&session)
-            .is_some_and(|f| {
-                f.fence == fence && path.is_some_and(|p| f.phase == Phase::Wanting(p))
+            .filter(|f| f.fence == fence)
+            .and_then(|f| match (f.phase, f.renewal.map(|r| r.state)) {
+                (Phase::Wanting(p), _) if path == Some(p) => Some(Asked::Follow),
+                (Phase::Following(_), Some(Renewing::Wanting(p))) if path == Some(p) => {
+                    Some(Asked::Renewal)
+                }
+                _ => None,
             });
-        if !current {
-            return debug!(session = %session, "hive: a refusal for no ask in flight — ignored");
+        match asked {
+            Some(Asked::Follow) => self.next(session, after_refusal(reason)),
+            Some(Asked::Renewal) => self.renewal_next(session, after_refusal(reason)),
+            None => debug!(session = %session, "hive: a refusal for no ask in flight — ignored"),
         }
-        self.next(session, after_refusal(reason));
     }
 
-    /// A dial came for `session`: it is followed, on `grant_id`'s stream.
-    pub(super) fn on_dialed(&self, session: ObjectId, grant_id: ObjectId) {
-        let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = follows.map.get_mut(&session) {
-            f.generation += 1;
-            f.phase = Phase::Following(grant_id);
-            follows.queue.retain(|s| *s != session);
+    /// A dial came for `session`. While a stream of it is followed, the dial
+    /// is that stream's renewal (P2d-4), or one that came late: it is
+    /// followed beside it and takes its place once it answers
+    /// ([`Self::on_answered`]). A renewal dialed already is let go for it
+    /// (`replaced`), as the server's third grant replaces its oldest: the
+    /// newest is the one to follow. Otherwise the session is followed on
+    /// `grant_id`'s stream, renewed at half its grant's life.
+    pub(super) fn on_dialed(
+        self: &Arc<Self>,
+        session: ObjectId,
+        grant_id: ObjectId,
+        ttl_secs: u32,
+    ) {
+        enum Dialed {
+            Followed(u64),
+            Renewal(Option<ObjectId>),
+        }
+        let dialed = {
+            let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = follows.map.get_mut(&session) else {
+                return;
+            };
+            if f.phase == Phase::Following(grant_id) {
+                // A replay of the dial followed: renewed as it was.
+                return;
+            }
+            if let Phase::Following(_) = f.phase {
+                let replaced = match f.renewal.map(|r| r.state) {
+                    Some(Renewing::Dialed { grant, .. }) if grant != grant_id => Some(grant),
+                    _ => None,
+                };
+                let (rung, generation) = match f.renewal {
+                    Some(r) => (r.rung, r.generation),
+                    None => {
+                        f.renewals += 1;
+                        (0, f.renewals)
+                    }
+                };
+                f.renewal = Some(Renewal {
+                    rung,
+                    generation,
+                    state: Renewing::Dialed {
+                        grant: grant_id,
+                        ttl_secs,
+                    },
+                });
+                Dialed::Renewal(replaced)
+            } else {
+                f.generation += 1;
+                f.phase = Phase::Following(grant_id);
+                f.renewal = None;
+                let generation = f.generation;
+                follows.queue.retain(|s| *s != session);
+                Dialed::Followed(generation)
+            }
+        };
+        match dialed {
+            Dialed::Followed(generation) => {
+                self.renew_later(session, grant_id, generation, ttl_secs)
+            }
+            Dialed::Renewal(Some(older)) => self.end_stream(older, "replaced"),
+            Dialed::Renewal(None) => {}
+        }
+    }
+
+    /// P2d-4 — a member stream of `session` got past its opening exchange.
+    /// When it is the renewal's, it is the stream followed from now on, and
+    /// the one it renews is let go (`renewed`): make-before-break.
+    pub(super) fn on_answered(self: &Arc<Self>, session: ObjectId, grant_id: ObjectId) {
+        let renewed = {
+            let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = follows.map.get_mut(&session) else {
+                return;
+            };
+            match (f.phase, f.renewal) {
+                (
+                    Phase::Following(old),
+                    Some(Renewal {
+                        rung,
+                        state: Renewing::Dialed { grant, ttl_secs },
+                        ..
+                    }),
+                ) if grant == grant_id => {
+                    f.generation += 1;
+                    f.phase = Phase::Following(grant_id);
+                    f.rung = rung;
+                    f.renewal = None;
+                    Some((old, f.generation, ttl_secs))
+                }
+                _ => None,
+            }
+        };
+        if let Some((old, generation, ttl_secs)) = renewed {
+            info!(session = %session, old = %old, new = %grant_id, "hive: a stream renewed — the old one let go");
+            self.end_stream(old, "renewed");
+            self.renew_later(session, grant_id, generation, ttl_secs);
+        }
+    }
+
+    /// P2d-4 — at half `grant_id`'s life, its renewal, if it is still the
+    /// stream followed (`generation`) and nothing renews it yet.
+    fn renew_later(
+        self: &Arc<Self>,
+        session: ObjectId,
+        grant_id: ObjectId,
+        generation: u64,
+        ttl_secs: u32,
+    ) {
+        let half = Duration::from_millis(u64::from(ttl_secs) * 500);
+        let sup = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(half).await;
+            sup.renew(session, grant_id, generation);
+        });
+    }
+
+    /// P2d-4 — ask for `session`'s stream again from the top of the ladder,
+    /// beside `grant_id`'s, which carries on until the new one does. Never
+    /// ratchet: a member that fell to `derp` asks for `direct` first at every
+    /// renewal.
+    fn renew(self: &Arc<Self>, session: ObjectId, grant_id: ObjectId, generation: u64) {
+        let ladder = self.ladder();
+        let asked = {
+            let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = follows.map.get_mut(&session) else {
+                return;
+            };
+            if f.generation != generation
+                || f.phase != Phase::Following(grant_id)
+                || f.renewal.is_some()
+            {
+                return;
+            }
+            f.renewals += 1;
+            let path = ladder[0];
+            f.renewal = Some(Renewal {
+                rung: 0,
+                generation: f.renewals,
+                state: Renewing::Wanting(path),
+            });
+            (path, f.fence, f.renewals)
+        };
+        let (path, fence, generation) = asked;
+        info!(session = %session, grant = %grant_id, "hive: renewing a stream at half its grant's life");
+        self.send_renewal(session, fence, path, generation);
+    }
+
+    /// P2d-4 — a renewal's ask, `generation`, and its timeout: no answer at
+    /// all is taken for one the source never gave, as the follow's own.
+    fn send_renewal(
+        self: &Arc<Self>,
+        session: ObjectId,
+        fence: u64,
+        path: HiveStreamPath,
+        generation: u64,
+    ) {
+        let sup = Arc::clone(self);
+        tokio::spawn(async move {
+            sup.send_want(session, fence, path).await;
+            tokio::time::sleep(WANT_TIMEOUT).await;
+            let unanswered = sup
+                .follows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map
+                .get(&session)
+                .and_then(|f| f.renewal)
+                .is_some_and(|r| {
+                    r.generation == generation && matches!(r.state, Renewing::Wanting(_))
+                });
+            if unanswered {
+                debug!(session = %session, path = path.as_str(), "hive: a renewal's ask went unanswered");
+                sup.renewal_next(session, Next::Down);
+            }
+        });
+    }
+
+    /// P2d-4 — a renewal's answer. A rung that does not carry: the next one
+    /// down, while there is one. Anything else: no renewal this time. The
+    /// stream followed carries on to its end either way, and the follow
+    /// asks again then.
+    fn renewal_next(self: &Arc<Self>, session: ObjectId, next: Next) {
+        let ladder = self.ladder();
+        let again = {
+            let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = follows.map.get_mut(&session) else {
+                return;
+            };
+            let Some(r) = f.renewal.as_mut() else {
+                return;
+            };
+            if next == Next::Down && r.rung + 1 < ladder.len() {
+                f.renewals += 1;
+                r.rung += 1;
+                r.generation = f.renewals;
+                r.state = Renewing::Wanting(ladder[r.rung]);
+                Some((ladder[r.rung], f.fence, r.generation))
+            } else {
+                f.renewal = None;
+                None
+            }
+        };
+        match again {
+            Some((path, fence, generation)) => self.send_renewal(session, fence, path, generation),
+            None => {
+                info!(session = %session, ?next, "hive: no renewal this time — the stream followed carries on to its end")
+            }
         }
     }
 
     /// A dial this device turned away before following it (`busy`, a rung
-    /// this build cannot name): the answer to the ask in flight, if one is.
+    /// this build cannot name): the answer to the ask in flight, the
+    /// follow's or its renewal's, if one is.
     pub(super) fn on_dial_dropped(self: &Arc<Self>, session: ObjectId, reason: &str) {
-        let asking = self
+        let asked = self
             .follows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map
             .get(&session)
-            .is_some_and(|f| matches!(f.phase, Phase::Wanting(_)));
-        if asking {
-            self.next(session, after_stream(reason, false));
+            .and_then(|f| match (f.phase, f.renewal.map(|r| r.state)) {
+                (Phase::Wanting(_), _) => Some(Asked::Follow),
+                (Phase::Following(_), Some(Renewing::Wanting(_))) => Some(Asked::Renewal),
+                _ => None,
+            });
+        match asked {
+            Some(Asked::Follow) => self.next(session, after_stream(reason, false)),
+            Some(Asked::Renewal) => self.renewal_next(session, after_stream(reason, false)),
+            None => {}
         }
     }
 
     /// A member stream of `session` ended, in `reason`, past its opening
-    /// exchange (`answered`) or not. One that is not the stream followed (an
-    /// older one, beside the renewal that replaced it) moves nothing.
+    /// exchange (`answered`) or not.
+    ///
+    /// | The stream | Next |
+    /// |---|---|
+    /// | the one followed, its renewal dialed | the renewal is the stream followed (P2d-4) |
+    /// | the one followed, its end one that lets the session be (parked, stopped) | the renewal's stream, if dialed, is let go too |
+    /// | the one followed, no renewal dialed | the follow moves on |
+    /// | the renewal's, before it answered | the renewal's answer |
+    /// | any other (an older one, let go for its renewal) | nothing |
     pub(super) fn on_stream_over(
         self: &Arc<Self>,
         session: ObjectId,
@@ -432,15 +716,54 @@ impl Supervisor {
         reason: &str,
         answered: bool,
     ) {
-        let followed = self
-            .follows
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map
-            .get(&session)
-            .is_some_and(|f| f.phase == Phase::Following(grant_id));
-        if followed {
-            self.next(session, after_stream(reason, answered));
+        enum Ended {
+            HandedOver(ObjectId, u64, u32),
+            Followed(Option<ObjectId>),
+            Renewal,
+        }
+        let next = after_stream(reason, answered);
+        let over = {
+            let mut follows = self.follows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = follows.map.get_mut(&session) else {
+                return;
+            };
+            let dialed = match f.renewal {
+                Some(Renewal {
+                    rung,
+                    state: Renewing::Dialed { grant, ttl_secs },
+                    ..
+                }) => Some((rung, grant, ttl_secs)),
+                _ => None,
+            };
+            match (f.phase, dialed) {
+                (Phase::Following(g), Some((rung, grant, ttl_secs)))
+                    if g == grant_id && !matches!(next, Next::Park | Next::Stop) =>
+                {
+                    f.generation += 1;
+                    f.phase = Phase::Following(grant);
+                    f.rung = rung;
+                    f.renewal = None;
+                    Ended::HandedOver(grant, f.generation, ttl_secs)
+                }
+                (Phase::Following(g), dialed) if g == grant_id => {
+                    Ended::Followed(dialed.map(|(_, grant, _)| grant))
+                }
+                (Phase::Following(_), Some((_, grant, _))) if grant == grant_id => Ended::Renewal,
+                _ => return,
+            }
+        };
+        match over {
+            Ended::HandedOver(grant, generation, ttl_secs) => {
+                info!(session = %session, old = %grant_id, new = %grant, %reason, "hive: a stream ended — its renewal follows on");
+                self.renew_later(session, grant, generation, ttl_secs);
+            }
+            Ended::Followed(renewal) => {
+                if let Some(grant) = renewal {
+                    self.end_stream(grant, reason);
+                }
+                self.next(session, next);
+            }
+            Ended::Renewal => self.renewal_next(session, next),
         }
     }
 
@@ -455,8 +778,11 @@ impl Supervisor {
             };
             f.generation += 1;
             // Out of its stream or its ask either way: the slot is free
-            // until the next ask takes it.
+            // until the next ask takes it. A renewal asked for goes with it
+            // (P2d-4): its answer, should it come, is taken for the next
+            // ask's.
             f.phase = Phase::Waiting;
+            f.renewal = None;
             let (ask_now, wait) = match next {
                 Next::Again => {
                     f.rung = 0;
@@ -537,6 +863,19 @@ impl Supervisor {
             .map
             .get(&session)
             .map(|f| f.phase)
+    }
+
+    /// P2d-4 — what renews the stream followed of `session` now, if
+    /// anything does: the renewal's rung, and how far it is.
+    #[cfg(all(test, unix))]
+    pub(super) fn follow_renewal(&self, session: ObjectId) -> Option<(usize, Renewing)> {
+        self.follows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .get(&session)
+            .and_then(|f| f.renewal)
+            .map(|r| (r.rung, r.state))
     }
 }
 

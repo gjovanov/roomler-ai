@@ -1720,7 +1720,7 @@ sequenceDiagram
 |---|---|---|
 | `hello {v, tip, live}` | the member's tip is in the source's chain (genesis, for an empty copy): its copy is a prefix, and the stream goes on from there. `live` and `diverged`'s `tip` came with P2d-3b | [`stream.rs:340`](../crates/hive-node/src/stream.rs#L340) |
 | `diverged {at, tip, live}` | the member's tip is not in the chain, or is past its end: `at` is the newest of the member's checkpoints the source holds too, else genesis | the same |
-| `refused {reason}` | a version it does not speak (`version`), a session it does not hold (`not_held`), a hello for another session or fence than the grant's (`wrong_session`, `wrong_fence`): the token proves the grant, and the hello must be for it; a first frame that is not a hello (`not_a_hello`) | the same, and [`supervisor/stream.rs:949`](../agents/roomlerd/src/hive/supervisor/stream.rs#L949) |
+| `refused {reason}` | a version it does not speak (`version`), a session it does not hold (`not_held`), a hello for another session or fence than the grant's (`wrong_session`, `wrong_fence`): the token proves the grant, and the hello must be for it; a first frame that is not a hello (`not_a_hello`) | the same, and [`supervisor/stream.rs:954`](../agents/roomlerd/src/hive/supervisor/stream.rs#L954) |
 
 The devices' own checks, before anything is dialed:
 
@@ -1730,13 +1730,13 @@ The devices' own checks, before anything is dialed:
 | source | `ready` refused `path_unavailable` | a rung this build cannot name |
 | source | `ready` refused `not_held` | its store holds nothing of the session, or is closed |
 | source | `ready` refused `busy` | it serves 32 streams already |
-| member | `close`: `secondary_org`, `path_unavailable`, `not_a_member` | a secondary org's dial, another rung, or a session it never joined, by its own store's record ([`supervisor/stream.rs:1190`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1190)) |
+| member | `close`: `secondary_org`, `path_unavailable`, `not_a_member` | a secondary org's dial, another rung, or a session it never joined, by its own store's record ([`supervisor/stream.rs:1197`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1197)) |
 | member | `close` `no_address` | a dial naming no address a source could hold: the unspecified address, port 0, multicast, broadcast ([`remote_control/src/hive.rs:709`](../crates/remote_control/src/hive.rs#L709)) |
 | source | `close` `auth_failed` | a connection that presents another token |
 | source | `close` `bad_frame` | a frame that announces more than 1 MiB, or is not a message |
 
 ⚠️ **STUN is asked on the very socket QUIC then serves on**
-([`supervisor/stream.rs:243`](../agents/roomlerd/src/hive/supervisor/stream.rs#L243)),
+([`supervisor/stream.rs:248`](../agents/roomlerd/src/hive/supervisor/stream.rs#L248)),
 so the reflexive address the member dials is the NAT mapping QUIC uses; a second
 socket would hold a different one. No hole is punched: as on the tunnel's direct path,
 the member dials, and a NAT that admits nothing it did not ask for falls to the `relay`
@@ -1798,9 +1798,9 @@ sequenceDiagram
 
 | Step | Side | Why |
 |---|---|---|
-| the grant registered before its endpoint is built ([`supervisor/stream.rs:678`](../agents/roomlerd/src/hive/supervisor/stream.rs#L678)) | source | the server gives up on a source silent for 30 s and ignores a later `ready`, and an allocation was measured at ~20 s on a UDP-hostile network (#1761). Registered only once built, an endpoint the server had already forgotten waited out its grant. Now a `close` aborts the setup wherever it is, and an allocation dropped mid-flight frees its socket (FR-48) |
-| the member's allocation on the source's worker ([`supervisor/stream.rs:1567`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1567)) | member | its first url is `turn:<the source's relayed IP>:<the grant's UDP port>`: two allocations on one coturn worker relay to each other, across workers they may not (the tunnel client's `setup_quic_over_relay`). The granted urls follow, should that one not answer |
-| the candidate ([`supervisor/stream.rs:887`](../agents/roomlerd/src/hive/supervisor/stream.rs#L887)) | member, then source | the source is the QUIC server and never sends first, so without a permission for the member's relayed address its TURN server drops the member's opening Initials. A candidate that arrives before the allocation lands is held, 16 at most, and permitted once it does, before the `ready` |
+| the grant registered before its endpoint is built ([`supervisor/stream.rs:683`](../agents/roomlerd/src/hive/supervisor/stream.rs#L683)) | source | the server gives up on a source silent for 30 s and ignores a later `ready`, and an allocation was measured at ~20 s on a UDP-hostile network (#1761). Registered only once built, an endpoint the server had already forgotten waited out its grant. Now a `close` aborts the setup wherever it is, and an allocation dropped mid-flight frees its socket (FR-48) |
+| the member's allocation on the source's worker ([`supervisor/stream.rs:1578`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1578)) | member | its first url is `turn:<the source's relayed IP>:<the grant's UDP port>`: two allocations on one coturn worker relay to each other, across workers they may not (the tunnel client's `setup_quic_over_relay`). The granted urls follow, should that one not answer |
+| the candidate ([`supervisor/stream.rs:892`](../agents/roomlerd/src/hive/supervisor/stream.rs#L892)) | member, then source | the source is the QUIC server and never sends first, so without a permission for the member's relayed address its TURN server drops the member's opening Initials. A candidate that arrives before the allocation lands is held, 16 at most, and permitted once it does, before the `ready` |
 | the member's own permission | member | one datagram to each of the source's addresses before its first Initial, as the tunnel's client sends; the TURN client would install the permission on that first send anyway, so this only spares the first Initial a race. 300 ms to settle, then the dial |
 
 | Answered with | When |
@@ -1851,8 +1851,8 @@ sequenceDiagram
 |---|---|---|
 | a route per stream, by the grant's id | `DerpMux::hive_conn_for` ([`derp.rs:521`](../crates/tunnel-core/src/transport/derp.rs#L521)) | the tunnel's route is one per peer and the last caller takes it: on it, a stream would take a `quic-derp-v1` tunnel's route between the same two devices, and a second stream between the pair (another session, a renewal) the first's |
 | the framing: `RMHIVE01` (8 bytes), the grant's id (12), the packet | `DerpConn::send_to`; split first in `DerpMux::deliver` ([`derp.rs:596`](../crates/tunnel-core/src/transport/derp.rs#L596)) | WireGuard's header never opens on the magic and disco's is another; a QUIC packet that does is a 2^-64 event. A frame for a tag nobody holds is dropped and counted (`hive_drops`), never reported `Unrouted`, which sends the overlay after a WireGuard peer |
-| the source's endpoint | `derp_endpoint` ([`supervisor/stream.rs:273`](../agents/roomlerd/src/hive/supervisor/stream.rs#L273)) | `ready` names its own key and no address |
-| the member's client | `member_derp` ([`supervisor/stream.rs:1537`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1537)) | it dials the route's synthetic peer address; the `no_address` check does not apply on this rung |
+| the source's endpoint | `derp_endpoint` ([`supervisor/stream.rs:278`](../agents/roomlerd/src/hive/supervisor/stream.rs#L278)) | `ready` names its own key and no address |
+| the member's client | `member_derp` ([`supervisor/stream.rs:1548`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1548)) | it dials the route's synthetic peer address; the `no_address` check does not apply on this rung |
 
 | Answered with | When |
 |---|---|
@@ -1903,15 +1903,15 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The source subscribes to its store's feed first, then reads the store from the member's tip | an event appended in between is in one or the other, and the cursor drops what is in both, as the viewer's `follow` does | [`supervisor/stream.rs:1025`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1025) |
+| The source subscribes to its store's feed first, then reads the store from the member's tip | an event appended in between is in one or the other, and the cursor drops what is in both, as the viewer's `follow` does | [`supervisor/stream.rs:1030`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1030) |
 | A member asks for blobs; a source never pushes one | a blob pushed ahead of its event reaches the member before it can know the name, so it could hold the blob to none, and a source could fill its disk; a blob it could not read at once would fill the connection's flow-control window under the data that frees it | [`stream.rs:27`](../crates/hive-node/src/stream.rs#L27) |
-| The blobs an event names are kept before the event is applied | a copy never holds a checkpoint without its files: an ack, a tip report and a hello all speak for the blobs too | [`supervisor/stream.rs:1374`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1374) |
-| A wave of blobs is asked for only once this device's blob budget holds it, and all of its streams are read at once | a stream left waiting for another fills the connection's flow-control window under it, and the one waited for can then never arrive | [`supervisor/stream.rs:1413`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1413), [`supervisor/stream.rs:561`](../agents/roomlerd/src/hive/supervisor/stream.rs#L561) |
+| The blobs an event names are kept before the event is applied | a copy never holds a checkpoint without its files: an ack, a tip report and a hello all speak for the blobs too | [`supervisor/stream.rs:1385`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1385) |
+| A wave of blobs is asked for only once this device's blob budget holds it, and all of its streams are read at once | a stream left waiting for another fills the connection's flow-control window under it, and the one waited for can then never arrive | [`supervisor/stream.rs:1424`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1424), [`supervisor/stream.rs:566`](../agents/roomlerd/src/hive/supervisor/stream.rs#L566) |
 | An event held already, the same `seq` hashed the same, is taken as held | a renewal comes up beside the stream it replaces, and both carry the same events | [`store.rs:352`](../crates/hive-node/src/store.rs#L352) |
-| On `diverged`, only an older fence's tail is set aside, and only past a point the member named | the one rewrite the store allows; a source's word alone never moves a copy back | [`supervisor/stream.rs:617`](../agents/roomlerd/src/hive/supervisor/stream.rs#L617) |
-| A source sends no more than 4 MiB of events past the last ack, and checks each ack against what it sent | what a member that stopped reading leaves unread stays well under the window its blobs need beside it | [`supervisor/stream.rs:429`](../agents/roomlerd/src/hive/supervisor/stream.rs#L429), [`supervisor/stream.rs:513`](../agents/roomlerd/src/hive/supervisor/stream.rs#L513) |
-| The member reports its tip at most every 5 s while its copy moves, and when the stream ends | the server learns each member's freshness from the member itself (spec §3b), without a write per event | [`supervisor/stream.rs:1482`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1482) |
-| What a member holds in memory is bounded across every stream it follows: 64 MiB of events and 16 MiB of blobs, each taken before it is read | 32 sources must not each make it hold their largest at once | [`supervisor/stream.rs:112`](../agents/roomlerd/src/hive/supervisor/stream.rs#L112) |
+| On `diverged`, only an older fence's tail is set aside, and only past a point the member named | the one rewrite the store allows; a source's word alone never moves a copy back | [`supervisor/stream.rs:622`](../agents/roomlerd/src/hive/supervisor/stream.rs#L622) |
+| A source sends no more than 4 MiB of events past the last ack, and checks each ack against what it sent | what a member that stopped reading leaves unread stays well under the window its blobs need beside it | [`supervisor/stream.rs:434`](../agents/roomlerd/src/hive/supervisor/stream.rs#L434), [`supervisor/stream.rs:518`](../agents/roomlerd/src/hive/supervisor/stream.rs#L518) |
+| The member reports its tip at most every 5 s while its copy moves, and when the stream ends | the server learns each member's freshness from the member itself (spec §3b), without a write per event | [`supervisor/stream.rs:1493`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1493) |
+| What a member holds in memory is bounded across every stream it follows: 64 MiB of events and 16 MiB of blobs, each taken before it is read | 32 sources must not each make it hold their largest at once | [`supervisor/stream.rs:117`](../agents/roomlerd/src/hive/supervisor/stream.rs#L117) |
 
 The words a stream ends in, as the server hears them in `rc:hive.replica.close`:
 
@@ -1938,7 +1938,7 @@ two then disagree at the current fence. The member keeps its copy and ends the s
 manifest (16 MiB), a stream-json line (8 MiB) and an adopted session's line (4 MiB), must
 stay under the stream's 32 MiB, and each memory budget must hold the largest thing it
 counts. Both are compile-time assertions
-([`supervisor/stream.rs:121`](../agents/roomlerd/src/hive/supervisor/stream.rs#L121)): a producer raised
+([`supervisor/stream.rs:126`](../agents/roomlerd/src/hive/supervisor/stream.rs#L126)): a producer raised
 past the limit fails the build, not a copy in the field.
 
 ⚠️ **Not advertised in P2d-3a.** That build did not advertise `hive-stream`, so no grant
@@ -1972,7 +1972,7 @@ stateDiagram-v2
 
 | Answer | Next | Where |
 |---|---|---|
-| refused `path_unavailable` or `no_answer`; a stream that never got past its opening exchange (`unreachable`, `no_turn`, `allocate_failed`, `no_derp`, `auth_failed`, …) | the next rung down, at once; past the bottom, a wait, then the top | [`supervisor/follow.rs:147`](../agents/roomlerd/src/hive/supervisor/follow.rs#L147), [`supervisor/follow.rs:160`](../agents/roomlerd/src/hive/supervisor/follow.rs#L160) |
+| refused `path_unavailable` or `no_answer`; a stream that never got past its opening exchange (`unreachable`, `no_turn`, `allocate_failed`, `no_derp`, `auth_failed`, …) | the next rung down, at once; past the bottom, a wait, then the top | [`supervisor/follow.rs:203`](../agents/roomlerd/src/hive/supervisor/follow.rs#L203), [`supervisor/follow.rs:216`](../agents/roomlerd/src/hive/supervisor/follow.rs#L216) |
 | refused `source_offline`, `busy`, `rate_limited`, or a word this build cannot read; a stream that ended for its data | a wait, then the same rung | the same |
 | refused `source_unsupported` or `not_held`; a stream ended `diverged_at_floor` | a long wait (30 min) | the same |
 | a stream that carried and ended (`expired`, the source let go) | at once, from the top | the same |
@@ -1984,10 +1984,10 @@ source do not all ask again at once; a stream that carried starts them over.
 
 | Rule | Why | Where |
 |---|---|---|
-| Every new ask starts from `direct`; only a rung that did not carry is climbed down | never ratchet: a member that fell to `derp` is back on a direct path at the first ask that finds one | [`supervisor/follow.rs:449`](../agents/roomlerd/src/hive/supervisor/follow.rs#L449) |
-| A source says whether the session is live there, as it runs there or its hosted record will resume it; a member caught up with one that is over lets the stream go (`caught_up`), and the session is parked | a device holds copies of every session its owner ran, most of them over; the slots go to the sessions that move | [`supervisor/stream.rs:1511`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1511), [`supervisor/stream.rs:1273`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1273) |
-| At most 32 asked for or followed at once, the rest queued in order and given the first slot freed | as many as the stream lets a member follow | [`supervisor/follow.rs:512`](../agents/roomlerd/src/hive/supervisor/follow.rs#L512) |
-| A dial is followed only while the owner lets the device hold copies (`hive_replica`) | the gate that survives a compromised server: without it, a server could have a device go on taking a session its owner said it should no longer hold | [`supervisor/stream.rs:1138`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1138) |
+| Every new ask starts from `direct`; only a rung that did not carry is climbed down | never ratchet: a member that fell to `derp` is back on a direct path at the first ask that finds one | [`supervisor/follow.rs:772`](../agents/roomlerd/src/hive/supervisor/follow.rs#L772) |
+| A source says whether the session is live there, as it runs there or its hosted record will resume it; a member caught up with one that is over lets the stream go (`caught_up`), and the session is parked | a device holds copies of every session its owner ran, most of them over; the slots go to the sessions that move | [`supervisor/stream.rs:1522`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1522), [`supervisor/stream.rs:1284`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1284) |
+| At most 32 asked for or followed at once, the rest queued in order and given the first slot freed | as many as the stream lets a member follow | [`supervisor/follow.rs:838`](../agents/roomlerd/src/hive/supervisor/follow.rs#L838) |
+| A dial is followed only while the owner lets the device hold copies (`hive_replica`) | the gate that survives a compromised server: without it, a server could have a device go on taking a session its owner said it should no longer hold | [`supervisor/stream.rs:1143`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1143) |
 | Only the primary organization's connection asks | a device holds copies for its primary organization alone (P2c-3) | [`supervisor.rs:1395`](../agents/roomlerd/src/hive/supervisor.rs#L1395) |
 | `hive-stream` is advertised while the store is open, whatever the owner says of holding copies | a primary serves its own sessions' members (P2c-4) | [`agents/roomlerd/src/encode/caps.rs:1657`](../agents/roomlerd/src/encode/caps.rs#L1657) |
 
@@ -1995,12 +1995,62 @@ source do not all ask again at once; a stream that carried starts them over.
 A copy whose session is over and that it holds whole lets its stream go at the opening
 exchange, since the source's tip is the copy's own.
 
-⚠️ **No renewal yet.** A stream ends with its grant (10 min), and is asked for again from
-the top: a few seconds without one. P2d-4 renews at half-life and keeps the old
-connection until the new one carries.
+⚠️ **No renewal in P2d-3b.** A stream ended with its grant (10 min) and was asked for
+again from the top: a few seconds without one. P2d-4 renews at half-life and keeps the
+old connection until the new one carries (below).
 
-The rest of P2 is next (spec §3b and §4): the rest of the carrier and the stream (P2d-4
-to P2d-6), promotion and fencing (P2e), teleport and fork (P2f), purges and retention
+### P2d-4: renewals
+
+A grant lives 10 minutes. P2d-4 keeps a copy's stream going past that. At half a
+grant's life the member asks for the session again, from the top of the ladder, and
+follows the renewal's stream beside the old one. Once the new stream gets past its
+opening exchange, it is the one followed and the old one is let go (`renewed`). A
+copy is never without a stream at its grant's end (make-before-break).
+
+```mermaid
+sequenceDiagram
+    participant M as member
+    participant S as server
+    participant P as source
+    Note over M,P: M follows grant g1 (10 min)
+    M->>S: rc:hive.replica.want, at 5 min, from direct
+    S->>P: rc:hive.replica.grant g2
+    P->>S: rc:hive.replica.ready
+    S->>M: rc:hive.replica.dial g2
+    M->>P: g2: token, hello, beside g1
+    P->>M: g2: hello or diverged
+    Note over M: g2 answered: followed from here
+    M->>S: rc:hive.replica.close g1, renewed
+    S->>P: rc:hive.replica.close g1, renewed
+```
+
+| Rule | Why | Where |
+|---|---|---|
+| The renewal is asked for at half the grant's life, on `direct` whatever rung the stream it renews is on, and climbs down a rung on its own answers | never ratchet: a member that fell to `derp` is back on a direct path at the first renewal that finds one | [`supervisor/follow.rs:571`](../agents/roomlerd/src/hive/supervisor/follow.rs#L571), [`supervisor/follow.rs:590`](../agents/roomlerd/src/hive/supervisor/follow.rs#L590) |
+| The old stream is let go once the new one answers its opening exchange, before the new one sets anything aside | a rung that answered carries, the ladder's own test (P2d-3b); the old stream stops applying events before a `diverged` answer moves the copy's tail | [`supervisor/follow.rs:538`](../agents/roomlerd/src/hive/supervisor/follow.rs#L538), [`supervisor/stream.rs:1274`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1274) |
+| A renewal that finds no rung, or hears "not now", is dropped. The stream followed carries on to its end, and the follow asks again from the top then | the old stream still carries, and the next ask is at most minutes away | [`supervisor/follow.rs:651`](../agents/roomlerd/src/hive/supervisor/follow.rs#L651) |
+| The stream followed that ends with its renewal dialed hands over to it, and a rung down from there is a rung down from the renewal's. An end that lets the session be (`caught_up`, `member_left`) lets the renewal's stream go too | no gap when the old stream ends before the new one answered; a session parked or stopped holds no stream | [`supervisor/follow.rs:712`](../agents/roomlerd/src/hive/supervisor/follow.rs#L712) |
+| A dial while a stream is followed is that stream's renewal, a late one included. A newer one replaces a renewal dialed already (`replaced`) | a member holds at most two streams of a session, as the server holds at most two grants of it, a third replacing the oldest | [`supervisor/follow.rs:477`](../agents/roomlerd/src/hive/supervisor/follow.rs#L477) |
+| A renewal asked for when the connection went is asked for again on the next one, on its rung. Each of its asks times out on its own clock | its answer would have come on the connection that went; a timeout must not move an ask the renewal moved on from | [`supervisor/follow.rs:271`](../agents/roomlerd/src/hive/supervisor/follow.rs#L271), [`supervisor/follow.rs:619`](../agents/roomlerd/src/hive/supervisor/follow.rs#L619) |
+| A member follows at most 64 streams: 32 sessions, each with its renewal beside it | the follow's slots are 32; a renewal must not be turned away `busy` by the stream it renews | [`supervisor/stream.rs:102`](../agents/roomlerd/src/hive/supervisor/stream.rs#L102) |
+
+⚠️ **The old stream is let go from outside its task.** The task is aborted, which
+drops its QUIC connection, its socket and, on `relay`, its allocation
+([`supervisor/stream.rs:1673`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1673)). The server
+is told `renewed`, and tells the source. A test holds the source's side of the old
+stream to end with the member's word rather than its own clock.
+
+⚠️ **A refusal names no ask.** `rc:hive.replica.refused` carries the session, the fence
+and the rung. A renewal's refusal that arrives after the stream followed has ended is
+taken for the follow's next ask on that rung. That costs one rung climbed down for
+nothing, never a stream, as does an answer that arrives after its ask timed out
+(P2d-3b).
+
+⚠️ **In the field** once a release carries it, where the server's `hive.replicaset` is
+on (off by default).
+
+The rest of P2 is next (spec §3b and §4): the rest of the carrier and the stream (P2d-5
+and P2d-6), promotion and fencing (P2e), teleport and fork (P2f), purges and retention
 (P2g), the archive replica image (P2h), full-text search on archive replicas (P2i), the
 UI (P2j) and the field run (P2k). Its server switch is `hive.replicaset` and its device
 switch `hive_replica`, both off by default.
@@ -2014,7 +2064,7 @@ switch `hive_replica`, both off by default.
 | the wire: frames, refusal words, limits | [`crates/remote_control/src/hive.rs`](../crates/remote_control/src/hive.rs); the `rc:hive.*` variants in [`signaling.rs`](../crates/remote_control/src/signaling.rs) (`ClientMsg` `:655`–`:865`, `ServerMsg` `:2821`–`:3000`); `RpcCap::Hive`, `HiveView`, `HiveMemory` and `HiveAdopt` in [`models.rs`](../crates/remote_control/src/models.rs) `:626`–`:655`, matched by equality, since `hive` is a prefix of the other three |
 | the server module | [`crates/modules/hive/src/`](../crates/modules/hive/src/): `lib.rs` (the module, routes, indexes), `routes.rs` (start, list, get, stop), `agent_socket.rs` (reports, reconcile, the manifest), `view.rs` (grants and their signalling), `participants.rs`, `access.rs`, `room.rs`, `dao.rs`, `hooks.rs` (removals), `scope.rs` (`hive.tenants`), `adopt.rs`, `brain.rs`, `policy.rs` (the replica policy), `placement.rs` (who holds a session's copies), `replica.rs` (joins, answers and tips), `stream.rs` (the replica stream's grants) |
 | the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs`, `launch.rs`, `roots.rs`, `checkpoint.rs`, `stream.rs` (the replica stream's messages, their framing and limits, and its opening exchange) |
-| the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the session task, the resume), `supervisor/adopt.rs`, `supervisor/replica.rs` (the join's gates, the primary's join, tips), `supervisor/stream.rs` (the replica stream: its endpoints and dials on the direct, relay and derp rungs, then its events, blobs and acks), `supervisor/follow.rs` (the member's wants: the ladder, the waits, the sessions parked), `toolbelt.rs`, `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
+| the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the session task, the resume), `supervisor/adopt.rs`, `supervisor/replica.rs` (the join's gates, the primary's join, tips), `supervisor/stream.rs` (the replica stream: its endpoints and dials on the direct, relay and derp rungs, then its events, blobs and acks), `supervisor/follow.rs` (the member's wants: the ladder, the waits, the sessions parked, the renewals), `toolbelt.rs`, `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
 | what builds it | the `hive` feature, and `cfg(hive_host)` on Linux, macOS and Windows ([`build.rs:52`](../agents/roomlerd/build.rs#L52)); the capabilities in [`caps.rs:1619`](../agents/roomlerd/src/encode/caps.rs#L1619) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
