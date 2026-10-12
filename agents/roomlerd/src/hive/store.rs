@@ -63,6 +63,13 @@ enum Cmd {
         kind: &'static str,
         reply: oneshot::Sender<Result<Option<EventEnvelope>, String>>,
     },
+    /// FR-90 P2e-5 — every event of a session of a kind, oldest first.
+    OfKind {
+        session: String,
+        kind: &'static str,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<EventEnvelope>, String>>,
+    },
     /// FR-90 P2a.
     #[cfg_attr(not(test), allow(dead_code))]
     Member(Member),
@@ -265,6 +272,27 @@ impl StoreHandle {
             .send(Cmd::LastOfKind {
                 session: session.to_string(),
                 kind,
+                reply,
+            })
+            .map_err(|_| "the replica store is closed".to_string())?;
+        rx.await
+            .map_err(|_| "the replica store did not answer".to_string())?
+    }
+
+    /// FR-90 P2e-5 — every event of `session` of `kind`, oldest first; more
+    /// than `limit` is refused whole.
+    pub(crate) async fn of_kind(
+        &self,
+        session: &str,
+        kind: &'static str,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::OfKind {
+                session: session.to_string(),
+                kind,
+                limit,
                 reply,
             })
             .map_err(|_| "the replica store is closed".to_string())?;
@@ -587,6 +615,17 @@ fn writer(
                     .last_of_kind(&session, kind)
                     .map_err(|e| format!("reading the replica store: {e}"));
                 let _ = reply.send(last);
+            }
+            Cmd::OfKind {
+                session,
+                kind,
+                limit,
+                reply,
+            } => {
+                let all = store
+                    .of_kind(&session, kind, limit)
+                    .map_err(|e| format!("reading the replica store: {e}"));
+                let _ = reply.send(all);
             }
             Cmd::Tip { session, reply } => {
                 let _ = reply.send(store.tip(&session).ok().flatten().map(|t| t.seq));
