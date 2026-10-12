@@ -4412,7 +4412,9 @@ async fn handle_server_msg(
                 by = %moved_by_name, "the session moves to this device"
             );
             // P2e-7 — where it came from and who moved it, for the resume
-            // note.
+            // note. A build without Hive keeps none of it.
+            #[cfg(not(hive_host))]
+            let _ = (&from_folder, moved_at_ms);
             #[cfg(hive_host)]
             crate::hive::handle_move(
                 crate::hive::Moved {

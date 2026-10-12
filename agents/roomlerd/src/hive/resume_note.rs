@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P2e-7 — the resume note: what a session moved to this device is told,
 //! once, as it resumes here (design §6.6, spec §3b "The resume note").
