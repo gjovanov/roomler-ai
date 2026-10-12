@@ -13,10 +13,10 @@
 //!
 //! | State | Entered when | Leaves when | Past its bound |
 //! |---|---|---|---|
-//! | `preparing` | the owner promotes: `rc:hive.prepare` to the member | the member's `rc:hive.prepare_ack` | failed, nothing moved |
+//! | `preparing` | the owner promotes: `rc:hive.prepare` to the member | the member's `rc:hive.prepare_ack`; away from an unreachable primary, a ready one goes straight to `syncing` at the member's own tip (P2e-6a) | failed, nothing moved |
 //! | `draining` | the member is ready: `rc:hive.drain` to the primary | the primary's `rc:hive.drained` | failed; the primary gets its lease word back |
 //! | `syncing` | the primary drained, at `{seq, hash}` | the member's own tip equals it: the lease moves | failed, as above |
-//! | `moving` | the lease moved: join, `rc:hive.move`, `rc:hive.start` to the member | its start's answer | nothing moves back on silence (P2e-6) |
+//! | `moving` | the lease moved: join, `rc:hive.move`, `rc:hive.start` to the member | its start's answer | nothing moves back on silence (P2e-6b) |
 //!
 //! | Rule | Why |
 //! |---|---|
@@ -26,6 +26,8 @@
 //! | a failure before the move gives the primary its lease word back (`rc:hive.lease` at its fence) | the word lifts the drain: the lease stayed |
 //! | a start refused after the move moves the lease back, to `fence + 2` | a fence handed out once is never handed out again |
 //! | the room carries every outcome, in its words | FR-83: a move that cannot happen says so, with the gate that said no |
+//! | P2e-6a — a primary with no connection and no heartbeat for [`UNREACHABLE_SECS`], whose last build holds a leased session to the word, is moved away from with no drain, to the member that holds the most, at that member's own tip | it cannot drain; its sidecar stopped calling the model by then, and back, it runs nothing before it is demoted. What it wrote past that tip is set aside when it follows the new primary (P2d-3) |
+//! | P2e-6a — a primary that did not drain in time keeps its socket | a link that carries one way only is closed already, by the device's receive deadline or the server's reaper; a slow drain on a healthy link (the device may take 120 s, the server waits 75 s) must not cost the device a reconnect |
 
 use std::time::Duration;
 
@@ -39,8 +41,10 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{
-        HiveDrainRefusal, HiveRefusal, HiveReplicaRole, hive_limits, is_hash_hex, replica_limits,
+        HiveCopyTip, HiveDrainRefusal, HiveRefusal, HiveReplicaRole, hive_limits, is_hash_hex,
+        promote_limits::UNREACHABLE_SECS, replica_limits,
     },
+    models::{Agent, RpcCap},
     signaling::ServerMsg,
 };
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -114,6 +118,7 @@ pub enum PromoteDenyReason {
     InProgress,
     MovedTooOften,
     NotAMember,
+    NotFreshest,
     AlreadyPrimary,
     DeviceOffline,
     DeviceUnsupported,
@@ -132,6 +137,7 @@ impl PromoteDenyReason {
             Self::InProgress => "promotion_in_progress",
             Self::MovedTooOften => "moved_too_often",
             Self::NotAMember => "not_a_member",
+            Self::NotFreshest => "not_freshest",
             Self::AlreadyPrimary => "already_primary",
             Self::DeviceOffline => "device_offline",
             Self::DeviceUnsupported => "device_unsupported",
@@ -162,13 +168,18 @@ impl PromoteDenyReason {
                 "the device holds no copy of the session: only a member of its replicaset \
                  that took its copy can run it"
             }
+            Self::NotFreshest => {
+                "the device the session runs on is unreachable, and another member holds more \
+                 of the session than that device: move it to the member that holds the most"
+            }
             Self::AlreadyPrimary => "the session runs on that device already",
             Self::DeviceOffline => "the device is offline",
             Self::DeviceUnsupported => {
                 "the device's agent does not take part in moving sessions — update it"
             }
             Self::PrimaryOffline => {
-                "the device the session runs on is offline, so it cannot hand the session over"
+                "the device the session runs on is offline, so it cannot hand the session over; \
+                 once it has been unreachable for 230 s, the session can be moved away from it"
             }
             Self::PrimaryUnsupported => {
                 "the device the session runs on does not take part in moving sessions — update it"
@@ -177,13 +188,14 @@ impl PromoteDenyReason {
         }
     }
 
-    pub const ALL: [PromoteDenyReason; 12] = [
+    pub const ALL: [PromoteDenyReason; 13] = [
         Self::OrgArchived,
         Self::NoPermission,
         Self::NotRunning,
         Self::InProgress,
         Self::MovedTooOften,
         Self::NotAMember,
+        Self::NotFreshest,
         Self::AlreadyPrimary,
         Self::DeviceOffline,
         Self::DeviceUnsupported,
@@ -275,14 +287,92 @@ impl PrepareAcks {
     }
 }
 
+/// P2e-6a — where the session's primary is, as a promotion needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Online here, and taking part in a promotion: it drains.
+    Online,
+    /// Unreachable for [`UNREACHABLE_SECS`]: no drain is asked of it.
+    Unreachable,
+}
+
+/// P2e-6a — whether `row`'s device may be moved away from with no drain:
+/// not heard from for [`UNREACHABLE_SECS`], and a build that, when it comes
+/// back, holds a leased session to the server's word (`hive-lease` in what it
+/// last advertised), so it calls the model for nothing before its demote.
+/// `last_seen_at` is the moment the server stopped talking to it: an Offline
+/// mark stamps it (a teardown, the read loop's reaper, a shutdown), and a
+/// heartbeat, every 30 s on any pod, re-asserts Online over it.
+fn unreachable_reach(row: &Agent, now: DateTime) -> Result<Reach, PromoteDenyReason> {
+    let silent_ms = now.timestamp_millis() - row.last_seen_at.timestamp_millis();
+    if silent_ms < i64::try_from(UNREACHABLE_SECS * 1000).unwrap_or(i64::MAX) {
+        return Err(PromoteDenyReason::PrimaryOffline);
+    }
+    if !row.capabilities.has_rpc(RpcCap::HiveLease) {
+        return Err(PromoteDenyReason::PrimaryUnsupported);
+    }
+    Ok(Reach::Unreachable)
+}
+
+/// P2e-6a — the joined member, other than `target` and the primary, whose
+/// copy the server last heard holds more of the session's chain than a copy
+/// that ends at `(fence, seq)` ([`on_chain`]), if one does.
+fn fresher_than(s: &AgentSession, target: ObjectId, fence: i64, seq: i64) -> Option<ObjectId> {
+    let holds = on_chain(s, fence, seq);
+    s.replicaset.as_ref()?.members.iter().find_map(|m| {
+        let t = m.tip.as_ref()?;
+        (m.device_id != target
+            && m.device_id != s.location.device_id
+            && m.role != MemberRole::Primary.as_str()
+            && m.state == MemberState::Joined
+            && on_chain(s, t.fence, t.seq) > holds)
+            .then_some(m.device_id)
+    })
+}
+
+/// P2e-6a — how much of the session's chain a copy that ends at
+/// `(fence, seq)` holds, as a `seq`: every copy's chain is the one the record
+/// knows, up to where each older fence ended, so the `seq` orders them. Past
+/// an end is a tail a move away from an unreachable primary cut off, which
+/// the copy sets aside once it follows the session again (P2d-3): it counts
+/// for nothing. Never `(fence, seq)` compared whole: an empty copy says
+/// `seq` 0 at the fence it joined at, the newest of all.
+fn on_chain(s: &AgentSession, fence: i64, seq: i64) -> i64 {
+    s.fences
+        .iter()
+        .find(|m| m.fence == fence)
+        .map_or(seq, |end| seq.min(end.seq))
+}
+
+/// P2e-6a — whether a copy that ends at `(fence, seq, hash)` ends on the
+/// session's chain: at or before where its fence ended, and at the end
+/// itself, on the same event. The lease never moves to a copy past an end:
+/// the next fence would begin on a tail the record cut off.
+fn within_ends(s: &AgentSession, fence: i64, seq: i64, hash: &str) -> bool {
+    s.fences
+        .iter()
+        .find(|m| m.fence == fence)
+        .is_none_or(|end| seq < end.seq || (seq == end.seq && hash == end.hash))
+}
+
+/// The member's own last report of where its copy ends, `(0, 0)` without one.
+fn reported(s: &AgentSession, device: ObjectId) -> (i64, i64) {
+    s.replicaset
+        .as_ref()
+        .and_then(|r| r.members.iter().find(|m| m.device_id == device))
+        .and_then(|m| m.tip.as_ref())
+        .map_or((0, 0), |t| (t.fence, t.seq))
+}
+
 /// Gates 4 on, past the session and the device lookups. The outer `Result`
-/// is the infrastructure, the inner one the policy — as the start's.
+/// is the infrastructure, the inner one the policy — as the start's. P2e-6a —
+/// and where the primary is.
 async fn authorize(
     state: &HiveState,
     s: &AgentSession,
     target: ObjectId,
     user_id: ObjectId,
-) -> Result<Result<(), PromoteDenyReason>, ApiError> {
+) -> Result<Result<Reach, PromoteDenyReason>, ApiError> {
     let tid = s.tenant_id;
     let tenant = state.tenants.base.find_by_id(tid).await?;
     if tenant.is_archived {
@@ -323,11 +413,35 @@ async fn authorize(
         Some(false) => return Ok(Err(PromoteDenyReason::DeviceUnsupported)),
         Some(true) => {}
     }
-    // An unreachable primary is waited out (P2e-6): until then, never.
-    match hub.agent_supports_hive_promote(s.location.device_id, tid) {
-        None => return Ok(Err(PromoteDenyReason::PrimaryOffline)),
+    // P2e-6a — an unreachable primary is waited out, then moved away from
+    // with no drain, to the member that holds the most.
+    let reach = match hub.agent_supports_hive_promote(s.location.device_id, tid) {
+        Some(true) => Reach::Online,
         Some(false) => return Ok(Err(PromoteDenyReason::PrimaryUnsupported)),
-        Some(true) => {}
+        None => {
+            let row = match state
+                .fleet
+                .agents
+                .find_live_in_tenant(tid, s.location.device_id)
+                .await
+            {
+                Ok(row) => row,
+                Err(roomler_ai_services::dao::base::DaoError::NotFound) => {
+                    return Ok(Err(PromoteDenyReason::PrimaryOffline));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match unreachable_reach(&row, DateTime::now()) {
+                Ok(reach) => reach,
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+    };
+    if reach == Reach::Unreachable {
+        let (fence, seq) = reported(s, target);
+        if fresher_than(s, target, fence, seq).is_some() {
+            return Ok(Err(PromoteDenyReason::NotFreshest));
+        }
     }
     // LAST: only a promotion that would reach the member spends a token.
     if !state
@@ -336,7 +450,7 @@ async fn authorize(
     {
         return Ok(Err(PromoteDenyReason::RateLimited));
     }
-    Ok(Ok(()))
+    Ok(Ok(reach))
 }
 
 /// Whether one more promotion could leave `s` with more fences' ends than a
@@ -400,20 +514,23 @@ pub async fn promote(
     // LIVE in this org: a removed or foreign device answers like a bogus one.
     let device = state.fleet.agents.find_live_in_tenant(tid, target).await?;
 
-    if let Err(reason) = authorize(&state, &s, target, auth.user_id).await? {
-        info!(
-            tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
-            reason = reason.as_str(), "hive: promotion refused"
-        );
-        audit(&s, auth.user_id, target, "refused", Some(reason.as_str()))
-            .write(&state)
-            .await;
-        return Ok(Json(PromoteResponse::refused(
-            reason.as_str(),
-            reason.message().to_string(),
-            &s,
-        )));
-    }
+    let reach = match authorize(&state, &s, target, auth.user_id).await? {
+        Ok(reach) => reach,
+        Err(reason) => {
+            info!(
+                tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
+                reason = reason.as_str(), "hive: promotion refused"
+            );
+            audit(&s, auth.user_id, target, "refused", Some(reason.as_str()))
+                .write(&state)
+                .await;
+            return Ok(Json(PromoteResponse::refused(
+                reason.as_str(),
+                reason.message().to_string(),
+                &s,
+            )));
+        }
+    };
     let to_role = member_role(&s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into());
     // Read before the promotion begins: nothing after it may fail on the way
     // to the push, or the promotion would wait out its bound for nothing.
@@ -432,6 +549,7 @@ pub async fn promote(
         started_at: now,
         deadline: deadline_after(state.promote_bounds.prepare),
         drained: None,
+        unreachable_from: reach == Reach::Unreachable,
     };
     if !state
         .sessions
@@ -552,6 +670,19 @@ pub(crate) enum Failure {
     PrimaryGone,
     /// The member no longer holds a joined copy.
     MemberLeft,
+    /// P2e-6a — the member said it was ready without saying where its copy
+    /// ends: a build from before P2e-6a, which a promotion away from an
+    /// unreachable primary cannot move the lease to.
+    NoCopyTip,
+    /// P2e-6a — another member's copy, as last heard, ends past the
+    /// member's own: moving to it would lose what only that one holds.
+    NotFreshest,
+    /// P2e-6a — the unreachable primary was heard from again before the
+    /// lease moved.
+    PrimaryBack,
+    /// P2e-6a — the member's copy ends past where an older fence ended:
+    /// it holds a tail a move cut off, which it has not set aside yet.
+    CutOff,
 }
 
 impl Failure {
@@ -572,6 +703,10 @@ impl Failure {
             Self::Diverged => "diverged",
             Self::PrimaryGone => "primary_offline",
             Self::MemberLeft => "member_left",
+            Self::NoCopyTip => "no_copy_tip",
+            Self::NotFreshest => "not_freshest",
+            Self::PrimaryBack => "primary_back",
+            Self::CutOff => "cut_off",
         }
     }
 
@@ -609,6 +744,15 @@ impl Failure {
             Self::Diverged => format!("the copy on {to} is not the one {from} holds"),
             Self::PrimaryGone => format!("{from} could not be reached"),
             Self::MemberLeft => format!("{to} no longer holds a copy of the session"),
+            Self::NoCopyTip => {
+                format!("{to} did not say where its copy ends: its agent needs an update")
+            }
+            Self::NotFreshest => format!("another member holds more of the session than {to}"),
+            Self::PrimaryBack => format!("{from} came back before the session moved: try again"),
+            Self::CutOff => format!(
+                "the copy on {to} holds events an earlier move left out; it sets them aside \
+                 once it follows the session again"
+            ),
         }
     }
 }
@@ -736,6 +880,7 @@ pub(crate) async fn on_prepare_ack(
     fence: u64,
     refused: Option<HiveRefusal>,
     detail: Option<String>,
+    tip: Option<HiveCopyTip>,
 ) {
     let s = match state.sessions.find(session_id).await {
         Ok(Some(s)) => s,
@@ -762,6 +907,11 @@ pub(crate) async fn on_prepare_ack(
             true,
         )
         .await;
+    }
+    // P2e-6a — away from a primary that was unreachable: no drain. One
+    // heard from again meanwhile drains after all.
+    if p.unreachable_from && !primary_heard_from(state, &s, &p).await {
+        return move_from_unreachable(state, &s, &p, device_id, tip).await;
     }
     match state
         .sessions
@@ -800,6 +950,110 @@ pub(crate) async fn on_prepare_ack(
     info!(session = %session_id, to = %device_id, "hive: the member is ready — the primary drains");
     let by = display_name(state, p.by).await;
     room::note(state, &s, room::moving_note(&p, &by)).await;
+    state
+        .prepare_acks
+        .deliver(p.id, device_id, PrepareAnswer::Ready);
+}
+
+/// P2e-6a — whether the promotion's primary has been heard from since it
+/// was found unreachable: online on this pod, or its row's `last_seen_at` too
+/// recent for it to be unreachable. A connection on any pod refreshes that
+/// field (its hello, before the connection is registered, and every
+/// heartbeat), so one on another pod is seen too.
+async fn primary_heard_from(state: &HiveState, s: &AgentSession, p: &Promotion) -> bool {
+    if state
+        .fleet
+        .rc_hub
+        .agent_supports_hive_promote(p.from.device_id, s.tenant_id)
+        .is_some()
+    {
+        return true;
+    }
+    match state
+        .fleet
+        .agents
+        .find_live_in_tenant(s.tenant_id, p.from.device_id)
+        .await
+    {
+        Ok(row) => unreachable_reach(&row, DateTime::now()).is_err(),
+        // Removed meanwhile: it is never heard from again.
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => false,
+        Err(e) => {
+            warn!(session = ?s.id, %e, "hive: the primary's row was not read — taken as heard from");
+            true
+        }
+    }
+}
+
+/// P2e-6a — the member is ready, and the primary has been unreachable for
+/// [`UNREACHABLE_SECS`]: no drain. The lease moves to where the member says
+/// its copy ends, which must be readable and no older than any other
+/// member's, as last heard. Syncing first, its `drained` that tip, so a
+/// primary that reconnects from here on is given no word; then the primary
+/// is asked about once more, and one heard from meanwhile fails the
+/// promotion and is given its word back.
+async fn move_from_unreachable(
+    state: &HiveState,
+    s: &AgentSession,
+    p: &Promotion,
+    device_id: ObjectId,
+    tip: Option<HiveCopyTip>,
+) {
+    let Some(sid) = s.id else { return };
+    let tip = tip.and_then(|t| {
+        let fence = i64::try_from(t.fence).ok()?;
+        let seq = i64::try_from(t.seq).ok()?;
+        (is_hash_hex(&t.hash) && fence <= p.from_fence).then_some((fence, seq, t.hash))
+    });
+    let Some((fence, seq, hash)) = tip else {
+        return fail(state, sid, p, Failure::NoCopyTip, true).await;
+    };
+    if !within_ends(s, fence, seq, &hash) {
+        return fail(state, sid, p, Failure::CutOff, true).await;
+    }
+    if fresher_than(s, device_id, fence, seq).is_some() {
+        return fail(state, sid, p, Failure::NotFreshest, true).await;
+    }
+    match state
+        .sessions
+        .advance_promotion(
+            sid,
+            p.id,
+            PromotionState::Preparing,
+            PromotionState::Syncing,
+            deadline_after(state.promote_bounds.sync),
+            doc! { "promotion.drained": { "seq": seq, "hash": &hash } },
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            return warn!(session = %sid, %e, "hive: a promotion did not take its next step");
+        }
+    }
+    let now = match state.sessions.find(sid).await {
+        Ok(Some(now)) => now,
+        _ => return warn!(session = %sid, "hive: a promotion's record was not read back"),
+    };
+    let Some(syncing) = now
+        .promotion
+        .clone()
+        .filter(|q| q.id == p.id && q.state == PromotionState::Syncing)
+    else {
+        return;
+    };
+    if primary_heard_from(state, &now, &syncing).await {
+        return fail(state, sid, &syncing, Failure::PrimaryBack, true).await;
+    }
+    info!(
+        session = %sid, to = %device_id, seq,
+        "hive: the member is ready and the primary unreachable — the lease moves to the member's copy"
+    );
+    let by = display_name(state, p.by).await;
+    room::note(state, &now, room::moving_unreachable_note(&syncing, &by)).await;
+    move_lease(state, &now, &syncing).await;
+    // After the move: a move that failed answered the route itself.
     state
         .prepare_acks
         .deliver(p.id, device_id, PrepareAnswer::Ready);
@@ -1301,6 +1555,7 @@ mod tests {
                 seq,
                 hash: fill.repeat(64 / fill.len()),
             }),
+            unreachable_from: false,
         };
         let member = |device_id, role: &str, tip| ReplicaMember {
             device_id,
@@ -1402,6 +1657,133 @@ mod tests {
         );
     }
 
+    /// An agent row as the fleet keeps it, last heard from `silent_ms` before
+    /// `now`, its last hello advertising `rpc`.
+    fn row(now: DateTime, silent_ms: i64, rpc: &[RpcCap]) -> Agent {
+        let mut a: Agent = serde_json::from_str(
+            r#"{
+                "tenant_id":"000000000000000000000001",
+                "owner_user_id":"000000000000000000000002",
+                "name":"mars","machine_id":"m","os":"linux",
+                "agent_version":"0.4.131","agent_token_hash":"",
+                "status":"offline","last_seen_at":{"$date":{"$numberLong":"0"}},
+                "created_at":{"$date":{"$numberLong":"0"}},
+                "updated_at":{"$date":{"$numberLong":"0"}},
+                "deleted_at":null
+            }"#,
+        )
+        .unwrap();
+        a.last_seen_at = DateTime::from_millis(now.timestamp_millis() - silent_ms);
+        a.capabilities.rpc = rpc.iter().map(|c| c.wire().to_string()).collect();
+        a
+    }
+
+    /// P2e-6a — a primary is moved away from with no drain only once the
+    /// server has heard nothing from it for UNREACHABLE_SECS, by when its own
+    /// clock stopped its model calls, and only if its build, back, runs the
+    /// session to the server's word: one before P2e-2 would run it again on
+    /// reconnect, before it hears it was demoted.
+    #[test]
+    fn a_primary_is_moved_away_from_only_once_it_is_unreachable() {
+        let now = DateTime::now();
+        let wait = i64::try_from(UNREACHABLE_SECS * 1000).unwrap();
+        let leased = [RpcCap::Hive, RpcCap::HiveLease, RpcCap::HivePromote];
+        assert_eq!(
+            unreachable_reach(&row(now, wait - 1, &leased), now),
+            Err(PromoteDenyReason::PrimaryOffline),
+            "a millisecond short: its clock may still let it call the model"
+        );
+        assert_eq!(
+            unreachable_reach(&row(now, wait, &leased), now),
+            Ok(Reach::Unreachable)
+        );
+        assert_eq!(
+            unreachable_reach(&row(now, wait, &[RpcCap::Hive, RpcCap::HiveReplica]), now),
+            Err(PromoteDenyReason::PrimaryUnsupported),
+            "no word to wait for: back, it would run the session at once"
+        );
+        assert!(
+            PromoteDenyReason::PrimaryOffline
+                .message()
+                .contains(&format!("{UNREACHABLE_SECS} s")),
+            "the refusal names the wait"
+        );
+    }
+
+    /// P2e-6a — away from an unreachable primary, the lease moves only to
+    /// the member that holds the most of the session's chain, as last heard;
+    /// a tail past where an older fence ended counts for nothing, and an
+    /// empty copy is the least, whatever fence it joined at.
+    #[test]
+    fn away_from_an_unreachable_primary_only_to_the_member_that_holds_the_most() {
+        let (mut s, p) = syncing(Some(tip(9, "ab")), None);
+        let c = ObjectId::new();
+        let mut third = s.replicaset.as_ref().unwrap().members[1].clone();
+        third.device_id = c;
+        third.tip = Some(tip(8, "cd"));
+        s.replicaset.as_mut().unwrap().members.push(third);
+        let set_c = |s: &mut AgentSession, fence: i64, seq: i64| {
+            let m = &mut s.replicaset.as_mut().unwrap().members[2];
+            m.tip.as_mut().unwrap().fence = fence;
+            m.tip.as_mut().unwrap().seq = seq;
+        };
+        assert_eq!(fresher_than(&s, p.to, 1, 9), None, "it holds the most");
+        s.replicaset.as_mut().unwrap().members[0].tip = Some(tip(20, "ff"));
+        assert_eq!(
+            fresher_than(&s, p.to, 1, 9),
+            None,
+            "the primary's own copy is what is lost, never a reason to refuse"
+        );
+        set_c(&mut s, 1, 10);
+        assert_eq!(fresher_than(&s, p.to, 1, 9), Some(c), "another holds more");
+        s.replicaset.as_mut().unwrap().members[2].state = MemberState::Pending;
+        assert_eq!(
+            fresher_than(&s, p.to, 1, 9),
+            None,
+            "only a joined copy counts"
+        );
+        s.replicaset.as_mut().unwrap().members[2].state = MemberState::Joined;
+        // An empty copy at a newer fence: seq 0, the least.
+        set_c(&mut s, 2, 0);
+        assert_eq!(
+            fresher_than(&s, p.to, 1, 9),
+            None,
+            "an empty copy holds nothing"
+        );
+        // Fence 1 ended at 7: c's 1..=10 is cut off past 7, and b's 9 is too.
+        s.fences.push(crate::model::FenceMark {
+            fence: 1,
+            seq: 7,
+            hash: "ee".repeat(32),
+        });
+        set_c(&mut s, 1, 10);
+        assert_eq!(on_chain(&s, 1, 10), 7, "fence 1 counts up to its end");
+        assert_eq!(on_chain(&s, 2, 8), 8, "the current fence has no end");
+        assert_eq!(
+            fresher_than(&s, p.to, 1, 9),
+            None,
+            "both hold fence 1 up to its end"
+        );
+        set_c(&mut s, 2, 8);
+        assert_eq!(
+            fresher_than(&s, p.to, 1, 9),
+            Some(c),
+            "past the end, on the chain"
+        );
+        // Where the lease may move: never past an end, at it only on its event.
+        assert!(within_ends(&s, 2, 30, "ab"), "the current fence");
+        assert!(within_ends(&s, 1, 6, "ab"), "behind the end");
+        assert!(
+            within_ends(&s, 1, 7, &"ee".repeat(32)),
+            "at the end, its event"
+        );
+        assert!(
+            !within_ends(&s, 1, 7, &"ab".repeat(32)),
+            "at the end, another event"
+        );
+        assert!(!within_ends(&s, 1, 8, &"ee".repeat(32)), "past it: cut off");
+    }
+
     /// The member's role, only as a joined member, never the primary's row.
     #[test]
     fn only_a_joined_member_can_be_promoted_to() {
@@ -1465,6 +1847,10 @@ mod tests {
             Failure::Diverged,
             Failure::PrimaryGone,
             Failure::MemberLeft,
+            Failure::NoCopyTip,
+            Failure::NotFreshest,
+            Failure::PrimaryBack,
+            Failure::CutOff,
         ];
         let mut words: Vec<&str> = all.iter().map(Failure::reason).collect();
         words.sort_unstable();

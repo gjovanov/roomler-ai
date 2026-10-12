@@ -202,6 +202,7 @@ async fn scenario() {
         started_at: bson::DateTime::now(),
         deadline: in_two_minutes,
         drained: None,
+        unreachable_from: false,
     };
     assert!(
         dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &promotion)

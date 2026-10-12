@@ -32,8 +32,8 @@
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::hive::{
-    HiveCheckpointMark, HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry, HiveReplicaRole,
-    is_hash_hex, replica_limits,
+    HiveCheckpointMark, HiveCopyTip, HiveFenceMark, HiveJoinRefusal, HiveReplicaManifestEntry,
+    HiveReplicaRole, is_hash_hex, replica_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::store::StoreError;
@@ -427,6 +427,20 @@ impl Supervisor {
             }
         }
         out
+    }
+
+    /// P2e-6a — where this device's copy of `session` ends, as
+    /// `rc:hive.prepare_ack` names it: what a promotion away from an
+    /// unreachable primary moves the lease to.
+    pub(super) async fn copy_tip(&self, session: ObjectId) -> Option<HiveCopyTip> {
+        let Ok(store) = &self.store else {
+            return None;
+        };
+        tip_of(store, session).await.map(|t| HiveCopyTip {
+            fence: t.fence,
+            seq: t.seq,
+            hash: t.hash,
+        })
     }
 
     /// A replicated session's checkpoint was kept: tell the server where its
