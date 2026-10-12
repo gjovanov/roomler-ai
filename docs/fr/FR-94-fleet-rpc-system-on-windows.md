@@ -231,6 +231,7 @@ Field-verification log:
 
 | # | Cell | Host | Result |
 |---|---|---|---|
+| 1 | **(b): SystemContext mode's exec identity** | vmtest `win11/installer/system`, 0.4.129 and 0.4.131, 2026-10-12 (FR-92 §9 rows 50–51) | Exec through `POST …/agent/{id}/exec` printed `NT AUTHORITY\SYSTEM`, **session 1**, on both versions. That is SYSTEM in the console session, as the code says: the worker is a winlogon-token SYSTEM process, and Fleet RPC runs as the worker. (a), (c) and (d) are still to run |
 
 ## 11. Related
 
