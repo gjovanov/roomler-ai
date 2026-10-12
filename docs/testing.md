@@ -56,6 +56,14 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 > thread-default subscriber around a current-thread runtime, so they see
 > every task of the server and the device without `RUST_LOG`.
 >
+> **Since P2d-6 it starts a second device, a member, as a child process: the
+> same binary**, running its `member_device_process` test with
+> `HIVE_CANARY_MEMBER` set, a no-op in an ordinary run (so it counts one
+> passed test). A `[[bin]]` could not do it: binaries get no
+> dev-dependencies, and the test launcher is one on purpose. Under that
+> feature a device takes its checkpoints in process, because the binary is a
+> test's and knows no `hive-checkpoint`.
+>
 > **`tests/hive_drivers.rs` is a third, for the same reason** (FR-90 P1c-2b,
 > AC6): a reader's message in the session's room and a prompt over their own
 > viewer peer must reach no harness, while the owner's and a named driver's

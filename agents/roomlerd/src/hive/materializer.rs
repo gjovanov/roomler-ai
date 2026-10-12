@@ -328,7 +328,9 @@ impl Sink for tokio::sync::mpsc::Sender<Vec<u8>> {
     }
 }
 
-#[cfg(test)]
+/// The in-process runner's: tests, and an integration test's device
+/// (`hive-test-launcher`, P2d-6).
+#[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
 impl Sink for Vec<u8> {
     async fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.extend_from_slice(bytes);
@@ -440,7 +442,7 @@ pub(crate) async fn materialize(
                     .await
             }
         }
-        #[cfg(all(test, unix))]
+        #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
         Runner::InProcess { ceiling } => {
             let mut bytes = Vec::new();
             write_frames(&mut bytes, &target, &planned, blobs)
