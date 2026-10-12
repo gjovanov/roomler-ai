@@ -4241,6 +4241,7 @@ async fn handle_server_msg(
             caller,
             resume,
             replicated,
+            lease,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_start(
@@ -4257,6 +4258,9 @@ async fn handle_server_msg(
                     // P2c-3 — the server placed members besides this device:
                     // checkpoint each turn's end (P2b-3b).
                     replicated,
+                    // P2e-2 — and hold it to the server's word on each
+                    // connection from now on.
+                    lease,
                 },
                 ctx.is_primary,
                 outbound_tx.clone(),
@@ -4274,6 +4278,7 @@ async fn handle_server_msg(
                     &user_email,
                     resume,
                     replicated,
+                    lease,
                 );
                 warn!(
                     session = %session_id, %caller,
@@ -4295,6 +4300,19 @@ async fn handle_server_msg(
             {
                 let _ = (fence, &reason);
                 debug!(session = %session_id, "rc:hive.stop ignored — this build does not run agent sessions");
+            }
+        }
+
+        // FR-90 P2e-2 — the server's word, on THIS connection, that this
+        // device holds the session at that fence: a leased run calls the model
+        // again, and a leased session it hosted launches.
+        ServerMsg::HiveLease { session_id, fence } => {
+            #[cfg(hive_host)]
+            crate::hive::handle_lease(session_id, fence, ctx.is_primary, outbound_tx.clone());
+            #[cfg(not(hive_host))]
+            {
+                let _ = fence;
+                debug!(session = %session_id, "rc:hive.lease ignored — this build does not run agent sessions");
             }
         }
 

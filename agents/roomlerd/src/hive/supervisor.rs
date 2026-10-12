@@ -139,6 +139,15 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// room to spare. Past it the start is refused, and nothing launches beside
 /// a harness that is still there.
 const SUPERSEDE_WAIT: Duration = Duration::from_secs(2 * STOP_GRACE.as_secs() + 5);
+/// P2e-2 — how long a leased run's model call waits for the server's word
+/// on a new connection before it is refused: the word answers the device's
+/// manifest, about a round trip after the connection is up, so this covers a
+/// slow resume before the manifest too. Claude Code retries the refusal.
+const LEASE_WAIT: Duration = Duration::from_secs(30);
+/// P2e-2 — the server's words this daemon keeps at once. A word is kept only
+/// for a session the device runs or hosts, so this bounds a server that sends
+/// more than any device holds.
+const MAX_LEASE_WORDS: usize = 256;
 /// How much of a failed harness's stderr its transcript note keeps — on the
 /// device; the `ended` detail, which the server stores, never carries it.
 const STDERR_TAIL: usize = 400;
@@ -182,6 +191,11 @@ pub struct StartOrder {
     /// replicated (its start's `replicated`, or a resume of one). P2c-4: a
     /// primary's join turns it on later, while the session runs.
     pub replicated: bool,
+    /// P2e-2 — the session is leased: after a restart or a reconnect it runs,
+    /// and calls the model, only on the server's word on that connection
+    /// (`rc:hive.lease`). A start that says so is that word for its own
+    /// connection.
+    pub lease: bool,
 }
 
 /// FR-90 P1e — a session's core memory, as `rc:hive.memory` carries it.
@@ -268,6 +282,10 @@ struct Live {
     /// it (`finish` or `let_go` returned): what a start at a newer fence
     /// waits for before it launches.
     gone: watch::Receiver<()>,
+    /// P2e-2 — leased: after a reconnect its model calls wait for the
+    /// server's word on the new connection. From its start, or from the
+    /// first word while it runs.
+    lease: bool,
 }
 
 /// What a launch hands the session task.
@@ -389,6 +407,17 @@ pub struct Supervisor {
     /// P2d-3b — what this device does about each session it holds a copy of
     /// as a member: the ask in flight, the stream followed, the wait.
     follows: Mutex<follow::Follows>,
+    /// P2e-2 — the server's word for each leased session it holds here, by
+    /// (session, fence): the connection it came on, held weakly. It counts
+    /// only while that connection is the latest one (`reporter`).
+    lease_words: Mutex<HashMap<(ObjectId, u64), mpsc::WeakSender<ClientMsg>>>,
+    /// P2e-2 — wakes a model call waiting for its session's word.
+    lease_heard: tokio::sync::Notify,
+    /// P2e-2 — leased sessions the previous daemon hosted, held back for the
+    /// server's word on a connection of this one, by session.
+    awaiting_word: Mutex<HashMap<ObjectId, HostedSession>>,
+    /// P2e-2 — how long a leased run's model call waits for the word.
+    lease_wait: Duration,
     /// P2d-2c — a test's own DERP mux in place of the primary org's (`Some`),
     /// so one test stands a source and a member on two muxes wired to each
     /// other; `Some(None)` for none at all, whatever another test registered.
@@ -878,7 +907,15 @@ pub fn handle_start(order: StartOrder, is_primary: bool, tx: mpsc::Sender<Client
     tokio::spawn(async move {
         let (session_id, fence) = (order.session_id, order.fence);
         let answer = match global() {
-            Some(sup) => sup.start(order, is_primary).await,
+            Some(sup) => {
+                // P2e-2 — a leased start is the server's word on this
+                // connection, kept before the launch: its first model call
+                // must not wait for another.
+                if order.lease && is_primary {
+                    sup.record_word(session_id, fence, &tx);
+                }
+                sup.start(order, is_primary).await
+            }
             None => Answer::refused(
                 HiveRefusal::HiveDisabled,
                 "agent sessions are not set up on this daemon",
@@ -906,6 +943,26 @@ pub fn handle_stop(session_id: ObjectId, fence: u64, reason: String, is_primary:
     match global() {
         Some(sup) => sup.stop(session_id, fence, reason),
         None => debug!(session = %session_id, "hive: rc:hive.stop with no supervisor"),
+    }
+}
+
+/// FR-90 P2e-2 — `rc:hive.lease`: the server's word, on `tx`, the connection
+/// it came on, that this device holds `session_id` at `fence`
+/// ([`Supervisor::take_lease`]). The primary enrollment's only, like every
+/// Hive frame.
+pub fn handle_lease(
+    session_id: ObjectId,
+    fence: u64,
+    is_primary: bool,
+    tx: mpsc::Sender<ClientMsg>,
+) {
+    if !is_primary {
+        warn!(session = %session_id, "hive: rc:hive.lease ignored — not the primary enrollment");
+        return;
+    }
+    match global() {
+        Some(sup) => sup.take_lease(session_id, fence, &tx),
+        None => debug!(session = %session_id, "hive: rc:hive.lease with no supervisor"),
     }
 }
 
@@ -978,6 +1035,10 @@ impl Supervisor {
             replica_events: tokio::sync::Semaphore::new(stream::EVENT_BUDGET),
             replica_blobs: tokio::sync::Semaphore::new(stream::BLOB_BUDGET),
             follows: Mutex::new(follow::Follows::default()),
+            lease_words: Mutex::new(HashMap::new()),
+            lease_heard: tokio::sync::Notify::new(),
+            awaiting_word: Mutex::new(HashMap::new()),
+            lease_wait: LEASE_WAIT,
             #[cfg(test)]
             derp_for_tests: Mutex::new(None),
             #[cfg(any(test, all(unix, feature = "hive-test-launcher")))]
@@ -1155,6 +1216,18 @@ impl Supervisor {
                 .await
             {
                 return Answer::refused(HiveRefusal::LaunchFailed, e);
+            }
+        }
+        // P2e-2 — a start supersedes a resume held back for the server's word:
+        // at its own fence the start IS the word, and launches the session
+        // itself; at a newer one, the held-back run belongs to the past.
+        {
+            let mut held_back = self.awaiting_word.lock().unwrap_or_else(|e| e.into_inner());
+            if held_back
+                .get(&order.session_id)
+                .is_some_and(|h| h.fence <= order.fence)
+            {
+                held_back.remove(&order.session_id);
             }
         }
         // P1d-1 — the daemon is about to restart for an update: a session
@@ -1415,12 +1488,22 @@ impl Supervisor {
 
     /// P1d-2 — take `session` out of what waits to resume, when it waits
     /// there at `fence` or an older one.
+    ///
+    /// P2e-2 — or out of what is held back for the server's word.
     fn take_from_resume(&self, session: ObjectId, fence: u64) -> bool {
         let sid = session.to_hex();
-        let mut q = self.to_resume.lock().unwrap_or_else(|e| e.into_inner());
-        let before = q.len();
-        q.retain(|h| !(h.session == sid && h.fence <= fence));
-        q.len() != before
+        let queued = {
+            let mut q = self.to_resume.lock().unwrap_or_else(|e| e.into_inner());
+            let before = q.len();
+            q.retain(|h| !(h.session == sid && h.fence <= fence));
+            q.len() != before
+        };
+        let mut held_back = self.awaiting_word.lock().unwrap_or_else(|e| e.into_inner());
+        let waited = held_back.get(&session).is_some_and(|h| h.fence <= fence);
+        if waited {
+            held_back.remove(&session);
+        }
+        queued || waited
     }
 
     /// P2e-1 — `rc:hive.demote`: the session's lease is at `fence`, on
@@ -1450,6 +1533,18 @@ impl Supervisor {
         if let Some(older) = fence.checked_sub(1) {
             self.hosted_forget(session, older);
         }
+        // P2e-2 — nor does one held back for the word at an older fence ever
+        // launch, and the words for those fences are void.
+        {
+            let mut held_back = self.awaiting_word.lock().unwrap_or_else(|e| e.into_inner());
+            if held_back.get(&session).is_some_and(|h| h.fence < fence) {
+                held_back.remove(&session);
+            }
+        }
+        self.lease_words
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(s, f), _| !(*s == session && *f < fence));
         info!(
             session = %session, fence, reason, ran = ?ran,
             "hive: demoted — the session is held at a newer fence elsewhere"
@@ -1501,6 +1596,140 @@ impl Supervisor {
                 ))
             }
         }
+    }
+
+    /// P2e-2 — `rc:hive.lease`: the server says on `tx` that this device holds
+    /// `session` at `fence`. The word is kept for that connection; a run here
+    /// at that fence is leased from now on (the first word makes it so, as a
+    /// start's `lease` does), and its model calls go again; a leased session
+    /// held back for the word launches. A word for a session this device
+    /// neither runs nor hosts is not kept.
+    pub(crate) fn take_lease(
+        self: &Arc<Self>,
+        session: ObjectId,
+        fence: u64,
+        tx: &mpsc::Sender<ClientMsg>,
+    ) {
+        let sid = session.to_hex();
+        let held_back = self
+            .awaiting_word
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&session);
+        let queued = self
+            .to_resume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|h| h.session == sid);
+        if !(self.holds_live(session) || held_back || queued || self.hosted_get(session).is_some())
+        {
+            debug!(session = %session, fence, "hive: a lease word for a session this device does not hold — not kept");
+            return;
+        }
+        if !self.record_word(session, fence, tx) {
+            return;
+        }
+        let marked = {
+            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            match live.get_mut(&session) {
+                Some(l) if l.fence == fence && !l.fenced => {
+                    l.lease = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if marked {
+            self.hosted_update(session, fence, |h| h.lease = true);
+        }
+        // Held back for this very word: it launches now, through every gate
+        // a resume passes.
+        let resume = {
+            let mut held_back = self.awaiting_word.lock().unwrap_or_else(|e| e.into_inner());
+            if held_back.get(&session).is_some_and(|h| h.fence == fence) {
+                held_back.remove(&session)
+            } else {
+                None
+            }
+        };
+        if let Some(h) = resume {
+            info!(session = %session, fence, "hive: the server's word came — the leased session resumes");
+            let me = Arc::clone(self);
+            tokio::spawn(async move { me.resume(h).await });
+        }
+    }
+
+    /// P2e-2 — keep the server's word for `session` at `fence`, said on `tx`,
+    /// and wake whatever waits for it. A newer fence's word voids an older
+    /// one's. Only a word on the latest connection is kept: one that comes
+    /// late on an older connection must never take the place of the latest
+    /// one's. (A connection is the latest before it reads its first frame:
+    /// `on_connected` runs before the read loop.) `false` = not kept.
+    pub(crate) fn record_word(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        tx: &mpsc::Sender<ClientMsg>,
+    ) -> bool {
+        let latest = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.same_channel(tx));
+        if !latest {
+            debug!(session = %session, fence, "hive: a lease word on a connection that is not the latest — not kept");
+            return false;
+        }
+        {
+            let mut words = self.lease_words.lock().unwrap_or_else(|e| e.into_inner());
+            words.retain(|(s, f), _| !(*s == session && *f < fence));
+            if words.len() >= MAX_LEASE_WORDS && !words.contains_key(&(session, fence)) {
+                warn!(session = %session, "hive: too many lease words kept — this one is not");
+                return false;
+            }
+            words.insert((session, fence), tx.downgrade());
+        }
+        self.lease_heard.notify_waiters();
+        true
+    }
+
+    /// P2e-2 — whether the server has said, on the connection that is the
+    /// latest one now, that this device holds `session` at `fence`. A word on
+    /// an older connection counts for nothing.
+    pub(crate) fn has_word(&self, session: ObjectId, fence: u64) -> bool {
+        let Some(latest) = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return false;
+        };
+        self.lease_words
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(session, fence))
+            .and_then(mpsc::WeakSender::upgrade)
+            .is_some_and(|said_on| said_on.same_channel(&latest))
+    }
+
+    /// P2e-2 — whether the run of `session` here at `fence` is leased.
+    pub(crate) fn leased(&self, session: ObjectId, fence: u64) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .is_some_and(|l| l.fence == fence && l.lease)
+    }
+
+    pub(crate) fn lease_heard(&self) -> &tokio::sync::Notify {
+        &self.lease_heard
+    }
+
+    pub(crate) fn lease_wait(&self) -> Duration {
+        self.lease_wait
     }
 
     pub(crate) fn connected(self: &Arc<Self>, tx: mpsc::Sender<ClientMsg>) {
@@ -1611,6 +1840,19 @@ impl Supervisor {
                 .into_iter()
                 .map(|(session_id, fence)| HiveManifestEntry { session_id, fence }),
         );
+        // P2e-2 — and the leased sessions held back for the server's word:
+        // the server answers each with the word, a demote or a stop, and ends
+        // none of them as not run here.
+        m.extend(
+            self.awaiting_word
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(session_id, h)| HiveManifestEntry {
+                    session_id: *session_id,
+                    fence: h.fence,
+                }),
+        );
         m
     }
 
@@ -1680,6 +1922,19 @@ impl Supervisor {
             info!(session = %session, fence = h.fence, "hive: a hosted session was forgotten before it resumed — not resumed");
             return;
         }
+        // P2e-2 — a leased session launches only on the server's word on
+        // this connection. Until it comes it is held back, and listed in the
+        // manifest, which the server answers with the word, a demote or a
+        // stop. Checked and held under one lock: a word that lands meanwhile
+        // finds it held back (`take_lease`) and launches it.
+        if h.lease {
+            let mut held_back = self.awaiting_word.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.has_word(session, h.fence) {
+                info!(session = %session, fence = h.fence, "hive: a leased session waits for the server's word before it resumes");
+                held_back.insert(session, h);
+                return;
+            }
+        }
         let now = unix_now();
         let quick = match h.resumed_at {
             Some(at) if now.saturating_sub(at) < RESUME_STABLE.as_secs() => h.quick_resumes + 1,
@@ -1730,6 +1985,7 @@ impl Supervisor {
             // Decided by the history on disk, as for every launch.
             resume: false,
             replicated: h.replicated,
+            lease: h.lease,
         };
         let answer = self.start_locked(order, true).await;
         if answer.refused.is_some() {
@@ -2122,6 +2378,14 @@ impl Supervisor {
         self
     }
 
+    /// Tests only: a leased run's model call that gives up on the word in a
+    /// test's lifetime.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_lease_wait(mut self, wait: Duration) -> Self {
+        self.lease_wait = wait;
+        self
+    }
+
     /// Tests only: an approval that expires in a test's lifetime.
     #[cfg(all(test, unix))]
     pub(crate) fn with_approval_timing(mut self, timing: toolbelt::Timing) -> Self {
@@ -2158,6 +2422,11 @@ impl Supervisor {
         self.unlive(session, fence);
         // P1d-2 — over, so nothing to resume.
         self.hosted_forget(session, fence);
+        // P2e-2 — and its word goes with it.
+        self.lease_words
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(session, fence));
         info!(session = %session, fence, %detail, "hive: session ended");
         self.report(session, fence, HiveRunState::Ended, Some(detail));
     }
@@ -2289,6 +2558,8 @@ impl Supervisor {
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let waiting = Arc::new(AtomicUsize::new(0));
         let replicated = Arc::new(AtomicBool::new(order.replicated));
+        // P2e-2 — leased by its start, or by what the device hosted of it.
+        let lease = order.lease || prior.as_ref().is_some_and(|h| h.lease);
         // P2e-1 — dropped by the session's task once it has let go.
         let (gone_tx, gone) = watch::channel(());
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -2304,6 +2575,7 @@ impl Supervisor {
                 replicated: Arc::clone(&replicated),
                 fenced: false,
                 gone,
+                lease,
             },
         );
         if prior.is_some() {
@@ -2346,6 +2618,7 @@ impl Supervisor {
                     // P2c-4 — the live flag, read under the record's lock:
                     // a primary's join that found no record yet set it.
                     replicated: replicated.load(Ordering::SeqCst),
+                    lease,
                 });
                 None
             }
@@ -4012,6 +4285,7 @@ done
             harness_pid: None,
             harness_started: None,
             replicated: false,
+            lease: false,
         };
         f(&mut h);
         Hosted::load(r.root.path().join(HOSTED_FILE), TEST_AGENT).put(h);
@@ -4061,6 +4335,7 @@ done
             caller: "Dev".into(),
             resume: false,
             replicated: false,
+            lease: false,
         }
     }
 
@@ -5741,6 +6016,7 @@ done
             harness_pid: Some(pid),
             harness_started: Some("an earlier process".into()),
             replicated: false,
+            lease: false,
         };
         reap_leftover(&h).await;
         h.harness_started = None;
@@ -6566,6 +6842,192 @@ done
         r.sup.resume(taken).await;
         assert!(!r.sup.holds_live(sid), "the stop came first");
         assert!(hosted_on_disk(&r).is_empty());
+    }
+
+    // ─── P2e-2 — the server's word ──────────────────────────────────────
+
+    /// The rig's connection that is the latest now.
+    pub(crate) fn latest(r: &Rig) -> mpsc::Sender<ClientMsg> {
+        r.sup
+            .reporter
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a connection")
+    }
+
+    /// Until the session is live here, at most 10 s.
+    async fn until_live(r: &Rig, sid: ObjectId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !r.sup.holds_live(sid) {
+            assert!(Instant::now() < deadline, "the session never launched");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P2e-2 — a leased session the previous daemon hosted launches only on
+    /// the server's word, on the connection up now: held back meanwhile, and
+    /// listed in the manifest so the server answers it. A word on an older
+    /// connection launches nothing.
+    #[tokio::test]
+    async fn a_leased_session_resumes_after_a_restart_only_on_the_servers_word() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |h| h.lease = true);
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)], "held back, and listed");
+        assert!(!r.sup.holds_live(sid), "not launched before the word");
+
+        let (older, _gone) = mpsc::channel(1);
+        r.sup.take_lease(sid, 1, &older);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !r.sup.holds_live(sid),
+            "a word on another connection launches nothing"
+        );
+
+        let now = latest(&r);
+        r.sup.take_lease(sid, 1, &now);
+        until_live(&r, sid).await;
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Idle, None)
+        );
+        assert!(r.sup.leased(sid, 1), "and it stays leased");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-2 — the word can come before the resume has held the session
+    /// back: the resume then finds it and launches at once.
+    #[tokio::test]
+    async fn a_word_that_comes_before_the_resume_launches_the_session_at_once() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |h| h.lease = true);
+        next_daemon(&mut r, |_| {});
+        let (tx, reports) = mpsc::channel(64);
+        r.reports = reports;
+        r.sup.connected(tx.clone());
+        // Before anything yields (one thread): the connection's resume has
+        // not run yet, and the session still waits in its queue.
+        r.sup.take_lease(sid, 1, &tx);
+        assert!(r.sup.has_word(sid, 1), "kept: the session is the device's");
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest, [(sid, 1)]);
+        assert!(r.sup.holds_live(sid), "launched on the word it already had");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-2 — a session that is not leased resumes as in P1, without a word.
+    #[tokio::test]
+    async fn a_session_that_is_not_leased_resumes_without_a_word() {
+        let mut r = rig(true, 4);
+        let sid = ObjectId::new();
+        host(&r, sid, |_| {});
+        restart(&mut r, |_| {});
+        until_manifest(&mut r).await;
+        assert!(r.sup.holds_live(sid));
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-2 — a session held back for the word is ended by a stop, and a
+    /// demote forgets it: a word that comes after launches neither.
+    #[tokio::test]
+    async fn a_stop_or_a_demote_ends_a_session_held_back_for_the_word() {
+        let mut r = rig(true, 4);
+        let (stopped, demoted) = (ObjectId::new(), ObjectId::new());
+        host(&r, stopped, |h| h.lease = true);
+        host(&r, demoted, |h| h.lease = true);
+        restart(&mut r, |_| {});
+        let (_, manifest) = until_manifest(&mut r).await;
+        assert_eq!(manifest.len(), 2, "{manifest:?}");
+
+        r.sup.stop(stopped, 1, "owner".into());
+        assert_eq!(
+            next_state_at(&mut r, stopped).await,
+            (
+                1,
+                HiveRunState::Ended,
+                Some("stopped (owner) before it resumed".into())
+            )
+        );
+        r.sup.demote(demoted, 2, "not_location").await;
+        assert!(
+            !r.sup.manifest().iter().any(|e| e.session_id == demoted),
+            "a demoted session is held back no more"
+        );
+        assert!(hosted_on_disk(&r).is_empty(), "both forgotten");
+
+        let now = latest(&r);
+        r.sup.take_lease(stopped, 1, &now);
+        r.sup.take_lease(demoted, 1, &now);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!r.sup.holds_live(stopped) && !r.sup.holds_live(demoted));
+        assert!(r.sup.manifest().is_empty(), "neither is held back any more");
+    }
+
+    /// P2e-2 — a start at the fence of a session held back for the word is
+    /// that word: it launches the session, whose record it resumes.
+    #[tokio::test]
+    async fn a_start_at_its_fence_launches_a_session_held_back_for_the_word() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        host(&r, sid, |h| h.lease = true);
+        restart(&mut r, |_| {});
+        until_manifest(&mut r).await;
+        assert!(!r.sup.holds_live(sid));
+
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert!(r.sup.holds_live(sid));
+        let listed: Vec<(ObjectId, u64)> = r
+            .sup
+            .manifest()
+            .iter()
+            .map(|e| (e.session_id, e.fence))
+            .collect();
+        assert_eq!(listed, [(sid, 1)], "live, and no longer held back");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-2 — the first word for a running session makes it leased, here
+    /// and in what the device hosts; a word for a session this device
+    /// neither runs nor hosts is not kept.
+    #[tokio::test]
+    async fn the_first_word_leases_a_running_session_and_no_other_is_kept() {
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(
+            next_state_at(&mut r, sid).await,
+            (1, HiveRunState::Idle, None)
+        );
+        assert!(!r.sup.leased(sid, 1));
+        let now = latest(&r);
+        r.sup.take_lease(sid, 1, &now);
+        assert!(r.sup.leased(sid, 1));
+        assert!(r.sup.has_word(sid, 1));
+        assert!(hosted_on_disk(&r)[0].lease, "a restart keeps it leased");
+        // A late word on an older connection takes nothing from the latest
+        // one's.
+        let (older, _gone) = mpsc::channel(1);
+        r.sup.take_lease(sid, 1, &older);
+        assert!(
+            r.sup.has_word(sid, 1),
+            "a late word on an older connection displaced the latest one's"
+        );
+
+        let stranger = ObjectId::new();
+        r.sup.take_lease(stranger, 1, &now);
+        assert!(!r.sup.has_word(stranger, 1), "not ours: not kept");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
     }
 }
 

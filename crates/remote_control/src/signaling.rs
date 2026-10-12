@@ -3031,6 +3031,15 @@ pub enum ServerMsg {
         /// its members then hold no checkpoint.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         replicated: bool,
+        /// FR-90 P2e-2 — the session is leased: after a restart or a
+        /// reconnect the device runs it, and lets it call the model, only
+        /// once the server has said on THAT connection that it still holds it
+        /// ([`ServerMsg::HiveLease`]). The start is that word for its own
+        /// connection. Sent only to a connection advertising
+        /// [`crate::models::RpcCap::HiveLease`], for a session the record
+        /// holds as replicated; absent, the device keeps P1's behaviour.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        lease: bool,
     },
 
     /// FR-90 P2c-3 — hold a copy of a session: placement chose this device
@@ -3170,6 +3179,22 @@ pub enum ServerMsg {
         /// `device_removed`, `tenant_archived`.
         #[serde(default)]
         reason: String,
+    },
+
+    /// FR-90 P2e-2 — the server's word that this device holds the session at
+    /// `fence`, said on THIS connection: a leased run here may call the
+    /// model again after a reconnect, and a leased session it hosted
+    /// launches after a restart. A word on an older connection counts for
+    /// nothing once a newer one is up, so it is said again on every
+    /// connection, in answer to the device's manifest. The first word for a
+    /// session also makes it leased from then on, as a start's `lease` does.
+    /// Pushed only to a connection advertising
+    /// [`crate::models::RpcCap::HiveLease`]; nothing answers it.
+    #[serde(rename = "rc:hive.lease")]
+    HiveLease {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
     },
 
     /// FR-90 P2e-1 — this device no longer holds the session: its lease is
@@ -4068,6 +4093,7 @@ mod tests {
             caller: "Dev".into(),
             resume: false,
             replicated: false,
+            lease: false,
         };
         let v = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -4107,8 +4133,51 @@ mod tests {
             serde_json::from_value::<ServerMsg>(replicated).unwrap(),
             ServerMsg::HiveStart {
                 replicated: true,
+                lease: false,
                 ..
             }
+        ));
+        // P2e-2 — and a leased one says that too, and only then.
+        let leased = ServerMsg::HiveStart {
+            session_id: sid,
+            harness: crate::hive::HARNESS_CLAUDE_CODE.into(),
+            harness_session: "0b9e3c7e-6a43-4a43-9d63-2d1b0d1c2f10".into(),
+            fence: 1,
+            folder: "/home/dev/src/app".into(),
+            user_id: uid,
+            user_email: "dev@example.com".into(),
+            caller: "Dev".into(),
+            resume: false,
+            replicated: true,
+            lease: true,
+        };
+        let v = serde_json::to_value(&leased).unwrap();
+        assert_eq!(
+            (v["replicated"].clone(), v["lease"].clone()),
+            (true.into(), true.into())
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::HiveStart { lease: true, .. }
+        ));
+    }
+
+    /// FR-90 P2e-2 — the lease word's field set is locked: which session, at
+    /// which fence. It carries no content, and nothing answers it.
+    #[test]
+    fn hive_lease_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let m = ServerMsg::HiveLease {
+            session_id: sid,
+            fence: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({"t": "rc:hive.lease", "session_id": sid.to_hex(), "fence": 3})
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(serde_json::to_value(&m).unwrap()).unwrap(),
+            ServerMsg::HiveLease { fence: 3, .. }
         ));
     }
 

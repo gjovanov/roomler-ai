@@ -458,6 +458,11 @@ async fn replace_one(
             HiveReplicaRole::Primary,
         );
     }
+    // P2e-2 — and leased from its first member on: its device holds it to the
+    // server's word from its next connection, not from the one after that.
+    if moved && !told && runs {
+        crate::lease::push(state, s.tenant_id, s.location.device_id, sid, fence);
+    }
     for m in others().filter(|m| m.state != MemberState::Leaving) {
         if !chosen.iter().any(|(d, _)| *d == m.device_id)
             && state.sessions.mark_leaving(sid, m.device_id).await?
