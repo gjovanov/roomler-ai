@@ -39,6 +39,9 @@ pub mod input;
 pub mod input_route;
 /// FR-45 P5 — `org.gnome.Mutter.ScreenCast` direct, no portal. ⚠️ UNATTENDED.
 pub mod mutter;
+/// FR-93 P2d — one attended portal request per host, handed to the newest
+/// session.
+pub mod pending;
 /// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
 pub mod pipewire;
 /// FR-45 P3b — SPA POD serialisation, so a format can be negotiated.

@@ -1,9 +1,10 @@
 # FR-93: Linux Wayland out of the box — a stock desktop install is seen, driven and told, and a lab proves it
 
 **Issue:** [#1972](https://github.com/gjovanov/roomler-ai/issues/1972) · **Status:** P1 merged 2026-10-11 and
-field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. P2a (mutter only, #2019) and P2c (#2020)
-merged 2026-10-12, P2a lab-verified; P2b (the desktop brief and the server's count) built 2026-10-12. P2d is an
-operator decision. The operator approved the plan and P0 (the
+field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. P2a (mutter only, #2019), P2b (the
+desktop brief and the server's count, #2028) and P2c (#2020) shipped in **0.4.130** (2026-10-12), with the server
+promoted. P2d is decided (operator, 2026-10-12): the portal waits for it. P2d-1, the agent half, is lab-verified
+(#2043). The operator approved the plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
 **Anchors:** master `8098ebbe3`, fleet 0.4.124 (0.4.125 bumped, not yet released) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput),
@@ -364,8 +365,9 @@ always had, and that automatic use would put in front of every KDE user:
   sharing indicator on.
 - Each pending open parks a runtime worker for up to 120 s.
 
-That is now **P2d** (the table below), and an **operator decision**: whether the portal half of D1 waits for
-P2d, as built, or ships as it is. Two choices the flowchart leaves open:
+That is now **P2d** (the table below). ✅ **Decided 2026-10-12 (operator): the portal waits for P2d.** Its agent
+half (P2d-1, `linux-capture.md` §4.6) is built first, because it also fixes the explicit `portal_capture` path that
+has all three problems today. The flip (P2d-3) waits for P2b's counts. Two choices the flowchart leaves open:
 
 - **"Any capture key" means set to anything.** `drm_capture`, `portal_capture`, `mutter_capture` and
   `window_capture` count, so `portal_capture = false` keeps the portal off as before. A virtual desktop also
@@ -462,7 +464,10 @@ bridge for text and images in the lab before deciding.
 | **P1** | honest failure (§4.2), #1945, the GEM-handle fix (§4.4a), `capture-smoke` reads config | `ROOMLERD_WAYLAND_AWARE=0` | lab, vmtest `default` cells | S–M |
 | **P2** | the auto-cascade (§4.3) + the wire (§4.9) | `ROOMLERD_WAYLAND_AUTO=0`; explicit keys | lab ×2, vmtest, Asahi | M |
 | ↳ P2a | the per-user automatic arm, **mutter** (D1), and `rc:video-info` `capture_arm` + `attended` | `wayland_auto`; any capture key | lab: GNOME per-user red/green, KDE per-user unchanged, GNOME system unchanged | S |
-| ↳ P2d | the attended portal flow, then the portal goes automatic (D1's "elsewhere"): a "waiting for the person at the screen" notice the viewer's watchdog honours, one pending request per host, an open that parks no worker, a late answer for a dead session dropped | `wayland_auto`; any capture key | lab: KDE per-user, first use with nobody at the screen | M |
+| ↳ P2d | the attended portal flow, then the portal goes automatic (D1's "elsewhere") | `wayland_auto`; any capture key | lab: KDE per-user, first use with nobody at the screen | M |
+| ↳↳ P2d-1 | the agent half (`linux-capture.md` §4.6): one pending request per host, handed to the newest session; an open that holds no runtime worker; a late answer for a dead session dropped. It fixes the explicit `portal_capture` path as it stands | — (behaviour-preserving for a request that is answered) | ✅ lab, KDE per-user, `portal_capture`, nobody answering. **🔴 0.4.130** (two runs): 4 dialogs stacked in 30 s, then the runtime starved and the watchdog forced an exit. **P2d-1** (two runs): 1 request and 1 helper; the daemon stayed up. An answer reached the live session in 1.6 s with one request in all, and an answer after the last session left was dropped | S |
+| ↳↳ P2d-2 | the viewer half: a "waiting for the person at the screen" notice the media watchdog honours, instead of a blank canvas and a session re-created every 10 s | additive wire | lab, after a promote | S |
+| ↳↳ P2d-3 | the flip: the portal goes automatic where mutter is absent, sized by P2b's counts (operator, 2026-10-12) | `wayland_auto` | lab, then the fleet | S |
 | ↳ P2b | the hello's `desktop` object, and the server's count of Wayland hosts and the arm serving each (AC13) | additive wire | lab, then the fleet | S |
 | ↳ P2c | the viewer names the arm and whether it asked (FR-45 AC8 option b) | — | lab, after a promote | S |
 | **P3** | DRM hardening (§4.4 b–f) | `ROOMLERD_DRM_CURSOR=0`, `ROOMLERD_DRM_IDLE_SKIP=0` | lab, Asahi | M |
@@ -627,6 +632,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-12 | `wlab-gnome-sys` | 0.4.130, its own updater | AC2 (re-worded): no keys, then `drm_capture` + `uinput` | ✅ `wayland_not_enabled` + the root hint, never "headless"; with the keys `lit=89.8 %` / `95.3 %`, canvas ≈ `virsh screenshot`. Step log 43 |
 | 2026-10-12 | `wlab-gnome` | 0.4.130, its own updater | AC1: no keys | ⏳ `lit=90–100 %`, mutter AUTOMATIC; the probe draws no counter, so freshness is unmeasured and AC1 stays open. Step log 43 |
 | 2026-10-12 | prod, the vmtest org | `hosted-20261012-d31e3c7` + 0.4.130 devices | AC13: the overview's `desktops` | ✅ `wayland/drm ×2`, `wayland/mutter ×1`, matching the three guests. Step log 43 |
+| 2026-10-12 | `wlab-kde` (4 cores) | 0.4.130, then P2d-1 `bbb065e` | P2d-1: one viewer, three sessions in ~60 s plus the viewer's watchdog, nobody answering; then an answer (`linux-capture.md` §4.6) | 🔴 0.4.130 ×2: 4 requests, 4 helpers alive at once, the third session never answered, then `watchdog-of-watchdog … forcing exit(2)`. ✅ P2d-1 ×2: 1 request, 1 helper, `NRestarts=0`. ✅ An answer while a session waits: the capture 1.6 s later, one request in all. ✅ An answer after the last session left: dropped. Step log 46 |
 
 ## 12. Related
 
