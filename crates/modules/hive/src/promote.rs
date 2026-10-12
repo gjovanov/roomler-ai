@@ -38,7 +38,9 @@ use dashmap::DashMap;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
-    hive::{HiveDrainRefusal, HiveRefusal, HiveReplicaRole, hive_limits, is_hash_hex},
+    hive::{
+        HiveDrainRefusal, HiveRefusal, HiveReplicaRole, hive_limits, is_hash_hex, replica_limits,
+    },
     signaling::ServerMsg,
 };
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -110,6 +112,7 @@ pub enum PromoteDenyReason {
     NoPermission,
     NotRunning,
     InProgress,
+    MovedTooOften,
     NotAMember,
     AlreadyPrimary,
     DeviceOffline,
@@ -127,6 +130,7 @@ impl PromoteDenyReason {
             Self::NoPermission => "no_permission",
             Self::NotRunning => "session_not_running",
             Self::InProgress => "promotion_in_progress",
+            Self::MovedTooOften => "moved_too_often",
             Self::NotAMember => "not_a_member",
             Self::AlreadyPrimary => "already_primary",
             Self::DeviceOffline => "device_offline",
@@ -150,6 +154,10 @@ impl PromoteDenyReason {
                  or adopted from a terminal"
             }
             Self::InProgress => "the session is being moved already",
+            Self::MovedTooOften => {
+                "the session has moved as many times as one session can; \
+                 a new session can be moved again"
+            }
             Self::NotAMember => {
                 "the device holds no copy of the session: only a member of its replicaset \
                  that took its copy can run it"
@@ -169,11 +177,12 @@ impl PromoteDenyReason {
         }
     }
 
-    pub const ALL: [PromoteDenyReason; 11] = [
+    pub const ALL: [PromoteDenyReason; 12] = [
         Self::OrgArchived,
         Self::NoPermission,
         Self::NotRunning,
         Self::InProgress,
+        Self::MovedTooOften,
         Self::NotAMember,
         Self::AlreadyPrimary,
         Self::DeviceOffline,
@@ -296,6 +305,12 @@ async fn authorize(
     {
         return Ok(Err(PromoteDenyReason::InProgress));
     }
+    // P2e-5b — a move keeps where one fence ended and a move back a second,
+    // and a device takes a join naming at most MAX_FENCE_MARKS of them: one
+    // more, and no member could ever join the session again.
+    if moved_too_often(s) {
+        return Ok(Err(PromoteDenyReason::MovedTooOften));
+    }
     if target == s.location.device_id {
         return Ok(Err(PromoteDenyReason::AlreadyPrimary));
     }
@@ -322,6 +337,13 @@ async fn authorize(
         return Ok(Err(PromoteDenyReason::RateLimited));
     }
     Ok(Ok(()))
+}
+
+/// Whether one more promotion could leave `s` with more fences' ends than a
+/// device takes in one join ([`replica_limits::MAX_FENCE_MARKS`]): a move
+/// keeps one, and the move back a refused start makes keeps a second.
+fn moved_too_often(s: &AgentSession) -> bool {
+    s.fences.len() + 2 > replica_limits::MAX_FENCE_MARKS
 }
 
 /// The role `device` holds a copy of `s` in, as a member that took it:
@@ -993,16 +1015,15 @@ async fn changed(state: &HiveState, session_id: ObjectId, p: &Promotion) {
 /// Every member owed its join at the session's fence: each in its role, the
 /// primary's own left to [`send_start`].
 fn send_member_joins(state: &HiveState, s: &AgentSession) {
-    let (Some(sid), Some(r)) = (s.id, s.replicaset.as_ref()) else {
+    let Some(r) = s.replicaset.as_ref() else {
         return;
     };
-    let fence = u64::try_from(s.fence).unwrap_or_default();
     for m in &r.members {
         if m.state != MemberState::Pending || m.role == MemberRole::Primary.as_str() {
             continue;
         }
         if let Some(role) = crate::replica::wire_role(&m.role) {
-            crate::replica::push_join(state, s.tenant_id, m.device_id, sid, fence, role);
+            crate::replica::push_join(state, s, m.device_id, role);
         }
     }
 }
@@ -1028,14 +1049,7 @@ pub(crate) async fn before_start(
         })
     });
     if owed {
-        crate::replica::push_join(
-            state,
-            s.tenant_id,
-            device,
-            sid,
-            fence,
-            HiveReplicaRole::Primary,
-        );
+        crate::replica::push_join(state, s, device, HiveReplicaRole::Primary);
     }
     let mv = ServerMsg::HiveMove {
         session_id: sid,
@@ -1358,6 +1372,28 @@ mod tests {
         assert_eq!(sync_of(&s, &p), Sync::Diverged, "past the drained tip");
         let (s, p) = syncing(Some(tip(9, "ab")), None);
         assert_eq!(sync_of(&s, &p), Sync::Behind, "nothing drained yet");
+    }
+
+    /// P2e-5b — a promotion that could leave the session naming more fences'
+    /// ends than a device takes in one join is refused before it begins: a
+    /// move keeps one end, and the move back of a refused start a second.
+    #[test]
+    fn a_session_is_not_moved_past_the_ends_a_join_can_carry() {
+        let max = replica_limits::MAX_FENCE_MARKS;
+        let (mut s, _) = syncing(None, None);
+        let mark = |fence: usize| crate::model::FenceMark {
+            fence: fence as i64,
+            seq: 1,
+            hash: "ab".repeat(32),
+        };
+        assert!(!moved_too_often(&s), "never moved");
+        s.fences = (1..=max - 2).map(mark).collect();
+        assert!(!moved_too_often(&s), "room for a move and its move back");
+        s.fences.push(mark(max - 1));
+        assert!(
+            moved_too_often(&s),
+            "a move back would leave a join naming one end too many"
+        );
     }
 
     /// The member's role, only as a joined member, never the primary's row.
