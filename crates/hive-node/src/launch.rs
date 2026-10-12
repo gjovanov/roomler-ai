@@ -104,15 +104,35 @@ pub enum LaunchError {
     NotAbsolute { what: &'static str, path: PathBuf },
 }
 
+/// `CLAUDE_CONFIG_DIR` for a session whose state directory is `state_dir`:
+/// [`LaunchSpec::config_dir`], before a spec exists (FR-90 P2e-5: a moved
+/// session's copy is put there before its harness is launched).
+pub fn config_dir_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("claude")
+}
+
+/// Where Claude Code keeps harness session `session`'s history under
+/// `config_dir`: [`LaunchSpec::history_path`], before a spec exists.
+pub fn history_path_in(config_dir: &Path, session: &str) -> PathBuf {
+    config_dir
+        .join("projects")
+        .join(project_dir_name_of(session))
+        .join(format!("{session}.jsonl"))
+}
+
+fn project_dir_name_of(session: &str) -> String {
+    format!("hive-{session}")
+}
+
 impl LaunchSpec {
     /// `CLAUDE_CONFIG_DIR` for this session.
     pub fn config_dir(&self) -> PathBuf {
-        self.state_dir.join("claude")
+        config_dir_in(&self.state_dir)
     }
 
     /// `CLAUDE_CODE_PROJECT_DIR_NAME` — the pinned project directory name.
     pub fn project_dir_name(&self) -> String {
-        format!("hive-{}", self.session)
+        project_dir_name_of(&self.session)
     }
 
     /// Where Claude Code keeps this session's own history, written from its
@@ -122,10 +142,7 @@ impl LaunchSpec {
     /// history exists, "No conversation found" for a resume without one
     /// (2.1.293, probed 2026-10-08).
     pub fn history_path(&self) -> PathBuf {
-        self.config_dir()
-            .join("projects")
-            .join(self.project_dir_name())
-            .join(format!("{}.jsonl", self.session))
+        history_path_in(&self.config_dir(), &self.session)
     }
 
     /// Where Claude Code keeps this session's auto-memory, under the pinned

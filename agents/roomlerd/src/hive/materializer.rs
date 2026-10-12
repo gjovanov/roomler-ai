@@ -33,10 +33,6 @@
 //! nothing outside it is touched — a login (`.credentials.json`), the
 //! harness's own state, the settings the daemon writes elsewhere.
 
-// P2e (promotion) is the daemon side's first caller; until then only its
-// tests are. The child side is live: `main.rs` dispatches to it.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
