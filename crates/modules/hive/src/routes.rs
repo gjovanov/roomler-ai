@@ -466,6 +466,8 @@ pub async fn start(
         brain_rev: memory.as_ref().map(|m| m.brain_rev),
         origin: SessionOrigin::Started,
         replicaset,
+        promotion: None,
+        fences: Vec::new(),
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.

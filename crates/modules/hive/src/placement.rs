@@ -143,14 +143,9 @@ fn carries(tags: &[String], tag: &str) -> bool {
     tags.iter().any(|t| same_tag(t, tag))
 }
 
-/// The members of a session's replicaset, by the rules (module docs).
-pub fn place(
-    rules: &ReplicasetRules,
-    archive_devices: &[ObjectId],
-    session: &SessionFacts<'_>,
-    devices: &[DeviceFacts],
-) -> Placement {
-    // What it already carries, then every policy tag its primary carries.
+/// The restricted tags a session carries: what it carries already, then
+/// every policy tag its primary carries, each once.
+fn restricted_of(rules: &ReplicasetRules, session: &SessionFacts<'_>) -> Vec<String> {
     let mut restricted: Vec<String> = Vec::new();
     let from_policy = rules
         .restricted_tags
@@ -161,6 +156,103 @@ pub fn place(
             restricted.push(t.clone());
         }
     }
+    restricted
+}
+
+/// FR-90 P2e-3 — the role `d` may hold a copy of the session in, by the same
+/// rules as [`place`] but for one device and without `min` or `max`: an
+/// archive replica the policy designates and that offers itself, while
+/// `archive` is on; else one of the owner's own devices; else none. It must
+/// offer to hold copies, be no ephemeral device and not the primary, and
+/// carry every restricted tag. What a promotion asks of the primary it
+/// moves from: one that may hold a copy stays a member, so moving back is a
+/// promotion; one that may not leaves, and its copy goes with the purge.
+pub fn eligible_role(
+    rules: &ReplicasetRules,
+    archive_devices: &[ObjectId],
+    session: &SessionFacts<'_>,
+    d: &DeviceFacts,
+) -> Option<MemberRole> {
+    if d.id == session.primary || !d.replica || d.ephemeral {
+        return None;
+    }
+    let restricted = restricted_of(rules, session);
+    if !restricted.iter().all(|t| carries(&d.tags, t)) {
+        return None;
+    }
+    if rules.archive && d.archive && archive_devices.contains(&d.id) {
+        return Some(MemberRole::Archive);
+    }
+    let owners = rules.prefer.iter().any(|p| p == OWNER_DEVICES)
+        && d.owner_user_id == session.owner
+        && d.enrolled_by == Some(session.owner);
+    owners.then_some(MemberRole::Owner)
+}
+
+/// FR-90 P2e-3 — what the primary a session moves from becomes once its
+/// lease is at `new_primary`: a member in the role [`eligible_role`] gives
+/// it, owed its join at the new fence, or `leaving` (listed as `owner`, the
+/// role it would hold) when it may hold no copy — its stored row, its owner
+/// or its tags say so, or it was removed.
+pub(crate) async fn old_primary_role(
+    state: &HiveState,
+    s: &crate::model::AgentSession,
+    new_primary: ObjectId,
+) -> DaoResult<(MemberRole, MemberState)> {
+    let leaving = (MemberRole::Owner, MemberState::Leaving);
+    let policy = state
+        .policies
+        .get(s.tenant_id)
+        .await?
+        .unwrap_or_else(|| HivePolicy::defaults(s.tenant_id));
+    let fleet = &state.fleet.agents;
+    let old = match fleet
+        .find_live_in_tenant(s.tenant_id, s.location.device_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => return Ok(leaving),
+        Err(e) => return Err(e),
+    };
+    let new = fleet.find_live_in_tenant(s.tenant_id, new_primary).await?;
+    let Some(facts) = DeviceFacts::of(&old) else {
+        return Ok(leaving);
+    };
+    let restricted = s
+        .replicaset
+        .as_ref()
+        .map(|r| r.restricted_tags.clone())
+        .unwrap_or_default();
+    let session = SessionFacts {
+        owner: s.owner_id,
+        primary: new_primary,
+        primary_tags: &new.tags,
+        origin: s.origin,
+        restricted: &restricted,
+        current: &[],
+    };
+    Ok(
+        match eligible_role(
+            &policy.replicaset,
+            &policy.archive_devices,
+            &session,
+            &facts,
+        ) {
+            Some(role) => (role, MemberState::Pending),
+            None => leaving,
+        },
+    )
+}
+
+/// The members of a session's replicaset, by the rules (module docs).
+pub fn place(
+    rules: &ReplicasetRules,
+    archive_devices: &[ObjectId],
+    session: &SessionFacts<'_>,
+    devices: &[DeviceFacts],
+) -> Placement {
+    // What it already carries, then every policy tag its primary carries.
+    let restricted = restricted_of(rules, session);
     let min = rules.min as usize;
     let max = rules.max as usize;
     let mut members = vec![(session.primary, MemberRole::Primary)];
@@ -899,6 +991,67 @@ mod tests {
             ids(&place(&rules(2, 2), &archives, &s, &f.devices)),
             [(f.primary, "primary"), (a2, "archive")],
             "the archive it holds, before the one the policy lists first"
+        );
+    }
+
+    /// FR-90 P2e-3 — the role the old primary keeps, by placement's rules
+    /// for one device and without `min`: the owner's own device that offers
+    /// is a member though `min` is met; a designated archive is an archive;
+    /// a device that does not offer, an ephemeral one, someone else's, the
+    /// new primary itself and one missing a restricted tag keep none.
+    #[test]
+    fn the_old_primary_keeps_a_role_only_where_placement_would_give_one() {
+        let mut f = Fleet::new();
+        let old = f.owners(1);
+        let s = f.session();
+        let one = rules(1, 4);
+        let role = |f: &Fleet, d: ObjectId, archives: &[ObjectId], s: &SessionFacts<'_>| {
+            let dev = f.devices.iter().find(|x| x.id == d).unwrap();
+            eligible_role(&one, archives, s, dev)
+        };
+        assert_eq!(
+            role(&f, old, &[], &s),
+            Some(MemberRole::Owner),
+            "min 1 is met by the new primary alone, and the copy stays anyway"
+        );
+        f.device(old).archive = true;
+        assert_eq!(role(&f, old, &[old], &s), Some(MemberRole::Archive));
+        let mut off = rules(1, 4);
+        off.archive = false;
+        let dev = f.devices.iter().find(|x| x.id == old).unwrap().clone();
+        assert_eq!(
+            eligible_role(&off, &[old], &s, &dev),
+            Some(MemberRole::Owner),
+            "archive off: the owner's own"
+        );
+
+        f.device(old).replica = false;
+        assert_eq!(role(&f, old, &[], &s), None, "it does not offer");
+        f.device(old).replica = true;
+        f.device(old).ephemeral = true;
+        assert_eq!(role(&f, old, &[], &s), None, "ephemeral");
+        f.device(old).ephemeral = false;
+        f.device(old).owner_user_id = ObjectId::new();
+        assert_eq!(role(&f, old, &[], &s), None, "someone else's");
+        f.device(old).owner_user_id = f.owner;
+
+        let as_primary = SessionFacts {
+            primary: old,
+            ..f.session()
+        };
+        assert_eq!(role(&f, old, &[], &as_primary), None, "the primary itself");
+
+        let carried = vec!["pci".to_string()];
+        let restricted = SessionFacts {
+            restricted: &carried,
+            ..f.session()
+        };
+        assert_eq!(role(&f, old, &[], &restricted), None, "a restricted tag");
+        f.device(old).tags = vec!["PCI".into()];
+        assert_eq!(
+            role(&f, old, &[], &restricted),
+            Some(MemberRole::Owner),
+            "carried, in any case"
         );
     }
 }
