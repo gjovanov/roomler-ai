@@ -188,6 +188,8 @@ impl Module for HiveState {
             .route("/{session_id}/stop", post(routes::stop))
             // P2e-3 — its owner moves it to a member of its replicaset.
             .route("/{session_id}/promote", post(promote::promote))
+            // P2f-1 — or to a device that holds no copy of it.
+            .route("/{session_id}/teleport", post(promote::teleport))
             // P1c — who besides the owner takes part, and how.
             .route("/{session_id}/participant", get(participants::list))
             .route(

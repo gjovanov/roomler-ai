@@ -326,6 +326,31 @@ impl Supervisor {
         }
     }
 
+    /// FR-90 P2f-1b — at the primary organization's connection, on a device
+    /// whose owner holds no copies: only the copies of the teleports it was
+    /// prepared for (P2f-1a) are followed, each at the fence its join named.
+    /// Every other copy it holds is left as it is: a leftover of a teleport
+    /// that is over, which the purge takes (P2g).
+    pub(super) async fn follow_teleports(self: &Arc<Self>) {
+        let Ok(store) = &self.store else {
+            return;
+        };
+        let held = match store.memberships().await {
+            Ok(m) => m,
+            Err(e) => {
+                return warn!(%e, "hive: the memberships could not be read to follow a teleport's");
+            }
+        };
+        for m in held {
+            let Ok(session) = ObjectId::parse_str(&m.session) else {
+                continue;
+            };
+            if self.teleport_admitted(session, m.fence) {
+                self.follow_joined(session, m.fence);
+            }
+        }
+    }
+
     /// A join this device passed as a member, at `fence`: the session is
     /// followed from the top, whatever it was doing, unless it is followed
     /// or asked for already, which the new fence goes to.

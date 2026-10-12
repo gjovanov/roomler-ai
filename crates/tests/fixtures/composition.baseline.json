@@ -445,6 +445,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/teleport",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/invite",
       "methods": "GET,HEAD,POST"
     },
