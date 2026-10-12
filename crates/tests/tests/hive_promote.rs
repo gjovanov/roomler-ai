@@ -242,6 +242,30 @@ async fn until_session(
     }
 }
 
+/// `device`'s own row once it answered its join as the primary. The device
+/// takes that join and the start behind it up in tasks of their own
+/// (`handle_replica_join`, `handle_start`), so its answer may reach the
+/// server after the start's: a session read idle on its new primary says
+/// nothing yet of the primary's row. Once it moved on from `pending`, that
+/// is the device's answer.
+async fn answered_as_primary(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    sid: &str,
+    device: &str,
+) -> Value {
+    let s = until_session(
+        app,
+        seeded,
+        sid,
+        LONG,
+        &format!("{device} never answered its join as the primary"),
+        |s| member(s, device).is_some_and(|m| m["role"] == "primary" && m["state"] != "pending"),
+    )
+    .await;
+    member(&s, device).cloned().unwrap_or_default()
+}
+
 /// Where the primary's store ends `sid`, as a viewer hears it.
 async fn primary_tip(ws: &mut UserWs, sid: &str) -> u64 {
     let mut b = view(ws, sid).await;
@@ -464,7 +488,7 @@ async fn scenario() {
     assert_eq!(moved["folder"], b_work.display().to_string(), "{moved}");
     // B heard its join as the primary before its start (§3b: the target's
     // floor rises with its join, before it writes), and holds the session.
-    let row = member(&moved, &b).cloned().unwrap_or_default();
+    let row = answered_as_primary(&app, &seeded, &sid, &b).await;
     assert_eq!(
         (row["role"].as_str(), row["state"].as_str()),
         (Some("primary"), Some("joined")),
@@ -602,7 +626,7 @@ async fn scenario() {
     std::fs::write(other.join("theirs.txt"), "someone's own work\n").unwrap();
     let answer = promote(&app, &tid, &owner, &sid, &a, &other).await;
     assert_eq!(answer["outcome"], "promoting", "A is ready: {answer}");
-    let back = until_session(
+    until_session(
         &app,
         &seeded,
         &sid,
@@ -616,7 +640,7 @@ async fn scenario() {
         },
     )
     .await;
-    let row = member(&back, &b).cloned().unwrap_or_default();
+    let row = answered_as_primary(&app, &seeded, &sid, &b).await;
     assert_eq!(
         (row["role"].as_str(), row["state"].as_str()),
         (Some("primary"), Some("joined")),
