@@ -286,10 +286,15 @@ pub(crate) async fn on_tip(state: &HiveState, device_id: ObjectId, tip: HiveRepl
         .member_tip(tip.session_id, device_id, &stored)
         .await
     {
-        Ok(true) => debug!(
-            session = %tip.session_id, device = %device_id, seq = stored.seq,
-            "hive: a member's tip"
-        ),
+        Ok(true) => {
+            debug!(
+                session = %tip.session_id, device = %device_id, seq = stored.seq,
+                "hive: a member's tip"
+            );
+            // P2e-3 — the promotion moving the session to this member, if
+            // one is syncing, may move the lease now.
+            crate::promote::on_tip(state, tip.session_id, device_id).await;
+        }
         Ok(false) => debug!(
             session = %tip.session_id, device = %device_id,
             "hive: a tip from a device the session does not hold as a member"
@@ -373,6 +378,8 @@ mod tests {
                 short: None,
                 placed_at: now,
             }),
+            promotion: None,
+            fences: Vec::new(),
         }
     }
 

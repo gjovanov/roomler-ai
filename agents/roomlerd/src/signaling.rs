@@ -4332,6 +4332,16 @@ async fn handle_server_msg(
             }
         }
 
+        // FR-90 P2e-3 — a promotion's frames. No build advertises
+        // `hive-promote` yet (the drain is P2e-4, the prepare and the move
+        // P2e-5), so no server sends them; one that did gets no answer, and
+        // its promotion fails at its bound with nothing moved.
+        ServerMsg::HivePrepare { session_id, .. }
+        | ServerMsg::HiveDrain { session_id, .. }
+        | ServerMsg::HiveMove { session_id, .. } => {
+            debug!(session = %session_id, "a promotion frame ignored — this build takes no part in moving sessions");
+        }
+
         // FR-90 P1e — a session's core memory, just ahead of its start. Kept
         // for that start's launch; whether the session sees it is the
         // device's own `hive_core_memory`.

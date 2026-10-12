@@ -20,7 +20,7 @@ use roomler_core::notify::{NotifyParams, PushTo};
 use tracing::{debug, warn};
 
 use crate::HiveState;
-use crate::model::{AgentApproval, AgentSession, TurnStub};
+use crate::model::{AgentApproval, AgentSession, Promotion, TurnStub};
 
 /// The module id rooms and stubs are bound to.
 pub(crate) const MODULE: &str = "hive";
@@ -88,11 +88,54 @@ pub(crate) async fn note_ended(state: &HiveState, sid: ObjectId) {
 }
 
 fn device_label(s: &AgentSession) -> String {
-    if s.location.device_name.is_empty() {
+    name_label(&s.location.device_name)
+}
+
+/// A device's name as a note shows it: bold and escaped, or "the device"
+/// when the record holds none.
+pub(crate) fn name_label(name: &str) -> String {
+    if name.is_empty() {
         "the device".to_string()
     } else {
-        format!("**{}**", md_escape(&s.location.device_name))
+        format!("**{}**", md_escape(name))
     }
+}
+
+/// FR-90 P2e-3 — "moving": who moves it, where to, and that the primary
+/// takes no new prompt meanwhile.
+pub(crate) fn moving_note(p: &Promotion, by: &str) -> String {
+    format!(
+        "🔀 **{}** is moving the session to {} — {} takes no new prompt meanwhile",
+        md_escape(by),
+        name_label(&p.to_name),
+        name_label(&p.from.device_name)
+    )
+}
+
+/// FR-90 P2e-3 — "moved": from where, to where, by whom, in which folder,
+/// and as whom the device says it runs now. `s` is the record after the move.
+pub(crate) fn moved_note(s: &AgentSession, p: &Promotion, by: &str) -> String {
+    let mut t = format!(
+        "🔀 Moved from {} to {} by **{}**, in {}",
+        name_label(&p.from.device_name),
+        device_label(s),
+        md_escape(by),
+        md_escape(&s.location.folder)
+    );
+    if let Some(account) = &s.location.account {
+        t.push_str(&format!(" as **{}**", md_escape(account)));
+    }
+    t
+}
+
+/// FR-90 P2e-3 — the move did not happen: why, and where the session
+/// continues. `why` is composed by the caller, its names already escaped.
+pub(crate) fn move_failed_note(p: &Promotion, why: &str) -> String {
+    format!(
+        "⛔ The move to {} did not happen: {why}. The session continues on {}",
+        name_label(&p.to_name),
+        name_label(&p.from.device_name)
+    )
 }
 
 /// "Started" — where, and as whom the device says it runs.
@@ -679,6 +722,87 @@ mod tests {
             approval_text(Withdrawn, Some(1), None),
             "🔐 **Approval** · turn 1 — ⏹ withdrawn"
         );
+    }
+
+    /// FR-90 P2e-3 — a promotion's notes name the devices and the person as
+    /// text, never as markdown, and say where the session continues.
+    #[test]
+    fn a_promotions_notes_say_where_it_goes_and_cannot_inject_markdown() {
+        use crate::model::{
+            HarnessRef, PromotionState, SessionLocation, SessionOrigin, SessionStatus,
+        };
+        let now = DateTime::now();
+        let from = SessionLocation {
+            device_id: ObjectId::new(),
+            device_name: "mars".into(),
+            folder: "/srv/app".into(),
+            account: None,
+        };
+        let p = Promotion {
+            id: ObjectId::new(),
+            to: ObjectId::new(),
+            to_name: "[venus](javascript:1)".into(),
+            to_role: "owner".into(),
+            folder: "/home/a/app".into(),
+            from: from.clone(),
+            from_fence: 1,
+            by: ObjectId::new(),
+            state: PromotionState::Draining,
+            started_at: now,
+            deadline: now,
+            drained: None,
+        };
+        let moving = moving_note(&p, "Alice");
+        assert_eq!(
+            moving,
+            r"🔀 **Alice** is moving the session to **\[venus\]\(javascript:1\)** — **mars** takes no new prompt meanwhile"
+        );
+        let s = AgentSession {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            owner_id: p.by,
+            drivers: Vec::new(),
+            title: "t".into(),
+            room_id: None,
+            last_turn: None,
+            harness: HarnessRef {
+                id: "claude-code".into(),
+                session: "u".into(),
+            },
+            location: SessionLocation {
+                device_id: p.to,
+                device_name: "venus".into(),
+                folder: "/home/a/app".into(),
+                account: Some("alice".into()),
+            },
+            status: SessionStatus::Idle,
+            fence: 2,
+            accepted_at: Some(now),
+            refusal: None,
+            end_reason: None,
+            detail: None,
+            created_at: now,
+            updated_at: now,
+            ended_at: None,
+            brain_rev: None,
+            origin: SessionOrigin::Started,
+            replicaset: None,
+            promotion: None,
+            fences: Vec::new(),
+        };
+        assert_eq!(
+            moved_note(&s, &p, "Alice"),
+            r"🔀 Moved from **mars** to **venus** by **Alice**, in /home/a/app as **alice**"
+        );
+        assert_eq!(
+            move_failed_note(&p, "its copy did not catch up in time"),
+            r"⛔ The move to **\[venus\]\(javascript:1\)** did not happen: its copy did not catch up in time. The session continues on **mars**"
+        );
+        let nameless = Promotion {
+            to_name: String::new(),
+            ..p
+        };
+        assert!(move_failed_note(&nameless, "x").starts_with("⛔ The move to the device"));
     }
 
     #[test]

@@ -851,6 +851,66 @@ where
     ))
 }
 
+/// FR-90 P2e-3 — bounds on a promotion's frames (`rc:hive.prepare` · `drain`
+/// · `drained` · `move`), read by both ends.
+pub mod promote_limits {
+    /// How long a drained primary lets the running turn go on before it cuts
+    /// it. The server waits this long for `rc:hive.drained`, and a margin for
+    /// the last checkpoint after it.
+    pub const DRAIN_TURN_CUT_SECS: u64 = 60;
+}
+
+/// FR-90 P2e-3 — why a primary did not drain a session, carried in
+/// `rc:hive.drained`. Absent = drained: it takes no new prompt, its turn has
+/// ended, and its copy ends at the tip the frame names. Each word names a
+/// different cause, so none is folded into another.
+///
+/// ⚠️ Decoded LENIENTLY ([`drain_refusal_lenient`]): an unknown word is
+/// [`Self::Other`], still a refusal. It must never land on "drained": that
+/// would move the lease off a primary whose copy may end past the tip the
+/// server waits for.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveDrainRefusal {
+    /// The device does not run the session at the drain's fence.
+    NotRunning,
+    /// A word this build does not know.
+    Other,
+}
+
+impl HiveDrainRefusal {
+    /// The spelling on the wire, in the audit and in the room. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRunning => "not_running",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every word this build knows.
+    pub const ALL: [HiveDrainRefusal; 2] = [Self::NotRunning, Self::Other];
+}
+
+/// Lenient decoder for `rc:hive.drained`'s `refused`, as
+/// [`refusal_lenient`]: only absent or `null` means drained.
+pub(crate) fn drain_refusal_lenient<'de, D>(de: D) -> Result<Option<HiveDrainRefusal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(word) = raw else {
+        return Ok(Some(HiveDrainRefusal::Other));
+    };
+    Ok(Some(
+        HiveDrainRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+        )
+        .unwrap_or(HiveDrainRefusal::Other),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1290,39 @@ mod tests {
         ] {
             assert!(!is_dialable(&a.parse().unwrap()), "{a} is never dialable");
         }
+    }
+
+    /// FR-90 P2e-3 — WIRE LOCK: the drain's refusal words, and anything else
+    /// present is still a refusal, never "drained".
+    #[test]
+    fn drain_refusal_words_are_locked_and_unknown_ones_still_refuse() {
+        assert_eq!(
+            HiveDrainRefusal::ALL.map(HiveDrainRefusal::as_str),
+            ["not_running", "other"]
+        );
+        for w in HiveDrainRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(w).unwrap(),
+                serde_json::Value::String(w.as_str().into())
+            );
+        }
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default, deserialize_with = "drain_refusal_lenient")]
+            refused: Option<HiveDrainRefusal>,
+        }
+        let r = |s: &str| serde_json::from_str::<R>(s).unwrap().refused;
+        assert_eq!(
+            r(r#"{"refused":"not_running"}"#),
+            Some(HiveDrainRefusal::NotRunning)
+        );
+        assert_eq!(
+            r(r#"{"refused":"too_tired"}"#),
+            Some(HiveDrainRefusal::Other)
+        );
+        assert_eq!(r(r#"{"refused":3}"#), Some(HiveDrainRefusal::Other));
+        assert_eq!(r(r#"{"refused":null}"#), None);
+        assert_eq!(r("{}"), None);
     }
 
     /// A hash is 64 lowercase hex characters, and nothing else is one.
