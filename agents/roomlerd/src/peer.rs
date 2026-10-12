@@ -2291,7 +2291,7 @@ async fn media_pump(
         target_fps,
         "media pump starting"
     );
-    let mut capturer = capture::open_default(target_fps, downscale);
+    let mut capturer = capture::open_default_async(target_fps, downscale).await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -2480,7 +2480,7 @@ async fn media_pump(
                 // twice a second forever.
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default(target_fps, downscale);
+                capturer = capture::open_default_async(target_fps, downscale).await;
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized
@@ -2722,7 +2722,7 @@ async fn media_pump(
                     );
                     target_fps = new_fps;
                     frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
-                    capturer = capture::open_default(target_fps, downscale);
+                    capturer = capture::open_default_async(target_fps, downscale).await;
                 }
 
                 // rc.38 — when auto-downscale changes target_resolution
@@ -3341,7 +3341,7 @@ async fn media_pump_vp9_444_dc(
         target_fps,
         "VP9-444 DC pump starting"
     );
-    let mut capturer = capture::open_default(target_fps, downscale);
+    let mut capturer = capture::open_default_async(target_fps, downscale).await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -3863,7 +3863,7 @@ async fn media_pump_vp9_444_dc(
                 // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default(target_fps, downscale);
+                capturer = capture::open_default_async(target_fps, downscale).await;
                 encoder = None;
                 encoder_dims = None;
                 continue;
@@ -5290,7 +5290,7 @@ async fn media_pump_ffmpeg_dc(
         slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
-    let mut capturer = capture::open_default(target_fps, downscale);
+    let mut capturer = capture::open_default_async(target_fps, downscale).await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -6179,7 +6179,7 @@ async fn media_pump_ffmpeg_dc(
                             // old pacing), then force the encoder rebuild;
                             // its first frame is a key-flagged IDR so the
                             // viewer resyncs cleanly.
-                            capturer = capture::open_default(target_fps, downscale);
+                            capturer = capture::open_default_async(target_fps, downscale).await;
                             encoder = None;
                             encoder_dims = None;
                         }
@@ -6735,7 +6735,7 @@ async fn media_pump_ffmpeg_dc(
                 // pumps, under the same bounded backoff.
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default(target_fps, downscale);
+                capturer = capture::open_default_async(target_fps, downscale).await;
                 continue;
             }
         };

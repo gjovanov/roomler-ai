@@ -521,6 +521,88 @@ cannot start: on WSL2 the frontend listed ScreenCast + RemoteDesktop the whole
 time, and `CreateSession` timed out activating `…impl.portal.desktop.gnome`.
 "The interface is exposed" proves nothing on its own.
 
+### 4.6 One request per host, and an open that holds no worker (FR-93 P2d)
+
+An attended open shows the person at the screen a dialog and waits for them for
+up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:351`). The FR-93 lab ran
+the portal automatically on KDE and measured what that did with nobody answering:
+
+- **A dialog storm.** The viewer's media watchdog re-creates a session that has
+  shown no frames for 10 s, and every session opened its own request. Four
+  "Share screen with" dialogs stacked within a minute.
+- **A capture for nobody.** Answering a stale dialog late started a capture for a
+  session already gone, with the sharing indicator on.
+- **A held worker, then a dead daemon.** The pumps called
+  `capture::open_default` inline, so each unanswered dialog blocked one runtime
+  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:161`). Four of
+  them is every worker of a 4-core host. Measured on the released **0.4.130**
+  (the KDE guest, 4 cores, `portal_capture` on, one viewer trying):
+  - The viewer's watchdog re-created the session 4 times in 30 s, raising 4
+    helpers and stacking 4 dialogs.
+  - The runtime then stopped. The daemon logged nothing for 86 s, and a fifth
+    session sat at `awaiting_consent` because nothing answered it.
+  - Then `watchdog-of-watchdog: async watchdog has not heartbeat in 60.0s;
+    forcing exit(2)`, and systemd restarted the daemon.
+
+  So a viewer that keeps trying a host where nobody answers takes the daemon
+  down.
+
+The explicit `portal_capture` path had all three from the start. P2d's agent half
+fixes them there, and is the precondition for the portal ever going automatic:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as viewer
+    participant A as session A (pump)
+    participant B as session B (pump)
+    participant K as broker
+    participant P as person at the screen
+    A->>K: open (on the blocking pool)
+    K->>P: ONE dialog (a portal-request thread)
+    Note over V,A: 10 s with no frames: the viewer replaces A with B
+    B->>K: open: the request is pending, so B waits for it
+    K-->>A: superseded (A is gone anyway)
+    P->>K: Share
+    K-->>B: the capture (the newest waiter)
+    Note over B,K: had B's session ended first, its pump was aborted:<br/>the capture lands in a detached open and is dropped at once
+```
+
+| | what | where |
+|---|---|---|
+| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:1267`, the eight pump call sites in `peer.rs` |
+| one request per host | `portal::pending::open`: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:43`, `Broker::open` `:115` |
+| the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:195` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1520`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:1267`, `Request::land` `:182` |
+| mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:45` |
+
+**Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
+`portal_capture` on and no restore token. One viewer opens three sessions in about 60 s with nobody at the
+screen, and the viewer's own watchdog re-creates each one. A sampler on the guest counts the live
+`portal-helper` processes; each is one pending request and one dialog.
+
+| | 0.4.130, the release (two runs) | P2d-1 (two runs) |
+|---|---|---|
+| requests raised by the burst | 4 in 30 s, all 4 dialogs stacked | 1 |
+| most helpers alive at once | 4 | 1 |
+| the third session | sat at `awaiting_consent`, never answered | connected within 1 s |
+| the daemon | no log line for 83–86 s, then `watchdog-of-watchdog: … forcing exit(2)` and a systemd restart, both runs | never restarted, logging throughout |
+| the person answers while the viewer waits | — | the capture 1.6 s after the click, the picture in the viewer, one request in all, no restore token |
+| the person answers after the viewer's last session ended | — | dropped: no pump took it. The restore token it left opened the viewer's next session with no dialog |
+
+⚠️ **The viewer half is still owed** (P2d-2). The viewer still re-creates its
+session every 10 s while no frames arrive. Each new session now joins the same
+request instead of raising a dialog, but the person at the viewer sees a blank
+canvas, not "waiting for the person at the screen". A request nobody answers
+ends at its own 120 s deadline, and the next session raises one dialog again: at
+most one dialog per two minutes, where it was one every 10–20 s.
+
+⚠️ Two controllers opening the same host at once: the older one is superseded,
+not served, and reads the reason as a `backend_error`. A pump registers its shared
+pipeline (P5, `media_share`) only once its capture has opened, so while the
+request is pending the second viewer has nothing to join. That is acceptable for
+a path where one person at the screen allows one share, but it is a known edge.
+
 ## 5. The mutter arm (FR-45 P5) — the unattended sibling
 
 The portal is the obstacle on the host FR-45 was opened for, not the
