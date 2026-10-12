@@ -57,7 +57,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// minutes after a server pod roll while registered on no pod (heartbeats,
 /// log uploads and overlay all fine; rc/tunnel dead). Reconnect must key on
 /// frames RECEIVED, not frames sent.
-const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
+pub(crate) const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 
 /// Hard bound on a single WS frame WRITE on the established connection.
 /// Every select arm awaits its sends inline, so one wedged `ws.send`
