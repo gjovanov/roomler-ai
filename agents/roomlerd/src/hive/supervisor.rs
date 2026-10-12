@@ -78,6 +78,7 @@ use super::gates::{self, HiveConfig};
 use super::hosted::{Hosted, HostedSession, RunningTurn};
 use super::lines::LineReader;
 use super::materializer;
+use super::resume_note;
 use super::store::StoreHandle;
 use super::toolbelt::{self, ApprovalEvent, Toolbelt};
 
@@ -262,6 +263,12 @@ pub struct Moved {
     pub turns: u32,
     /// Where it ran before: this very device on a move back.
     pub from_device_id: ObjectId,
+    /// FR-90 P2e-7 — that device's name and the folder it ran in, and who
+    /// moved it and when: what the resume note says.
+    pub from_device_name: String,
+    pub from_folder: String,
+    pub moved_by_name: String,
+    pub moved_at_ms: u64,
 }
 
 /// The device's answer to a start.
@@ -1611,7 +1618,30 @@ impl Supervisor {
             }
             None => order,
         };
-        match self.launch(order, &account, &folder, store, sidecar, moved.as_ref()) {
+        // P2e-7 — a session from another device is told it moved, once: the
+        // note goes to the harness through its `SessionStart` hook.
+        let note = match &moved {
+            Some(m) if self.moved_from_elsewhere(m) => {
+                let open = last_open_call(&store, &order.session_id.to_hex()).await;
+                let from = resume_note::Provenance {
+                    by: &m.moved_by_name,
+                    at_ms: m.moved_at_ms,
+                    from_device: &m.from_device_name,
+                    from_folder: &m.from_folder,
+                };
+                Some(resume_note::compose(&from, &folder, open.as_deref()))
+            }
+            _ => None,
+        };
+        match self.launch(
+            order,
+            &account,
+            &folder,
+            store,
+            sidecar,
+            moved.as_ref(),
+            note.as_deref(),
+        ) {
             Ok(()) => {
                 if moved.is_some() {
                     self.forget_move(order.session_id, order.fence);
@@ -3198,6 +3228,7 @@ impl Supervisor {
         info!(session = %session, fence, "hive: the session went down with the daemon — kept for the next start");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         self: &Arc<Self>,
         order: &StartOrder,
@@ -3206,6 +3237,7 @@ impl Supervisor {
         store: StoreHandle,
         sidecar: Option<u16>,
         moved: Option<&Moved>,
+        note: Option<&str>,
     ) -> Result<(), (HiveRefusal, String)> {
         // P1d-2 — a session this device hosted goes on where it stood.
         let prior = self
@@ -3223,7 +3255,7 @@ impl Supervisor {
             toolbelt,
             history,
             checkpoints,
-        } = self.spawn(order, account, folder, sidecar, approvals_tx, shown)?;
+        } = self.spawn(order, account, folder, sidecar, approvals_tx, shown, note)?;
         // P1h — who the harness is, for whoever must take it down later: this
         // daemon when it leaves, or the next one after a crash.
         let pid = child.id();
@@ -3234,6 +3266,16 @@ impl Supervisor {
                 order.fence,
                 TranscriptEvent::Note {
                     text: memory_note(m, self.cfg.core_memory),
+                },
+            );
+        }
+        // P2e-7 — and the resume note, as the harness is told it.
+        if let Some(text) = note {
+            store.append(
+                &order.session_id.to_hex(),
+                order.fence,
+                TranscriptEvent::Note {
+                    text: text.to_string(),
                 },
             );
         }
@@ -3347,6 +3389,7 @@ impl Supervisor {
     /// toolbelt, bound before the harness starts because the harness
     /// connects to it as it starts.
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
         order: &StartOrder,
@@ -3355,6 +3398,7 @@ impl Supervisor {
         sidecar: Option<u16>,
         approvals: mpsc::Sender<ApprovalEvent>,
         memory: Option<&CoreMemory>,
+        note: Option<&str>,
     ) -> Result<Spawned, (HiveRefusal, String)> {
         // The account the session runs as: its home, its toolbelt socket's ids
         // (`None`: it runs as the daemon), and the groups the SESSION holds,
@@ -3463,6 +3507,9 @@ impl Supervisor {
         // P1e — the core memory, into the daemon's own directory; the wrapper
         // copies it in as the account. One that cannot be written is said
         // in the log, and the session starts without it.
+        // P2e-7 — the resume note, for the `SessionStart` hook to print; any
+        // other launch leaves none, so a restart's resume adds nothing.
+        leave_note(&dir, note, owner, order.session_id);
         let memory_dir = memory.and_then(|m| match write_memory(&dir, m, owner) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -3559,6 +3606,7 @@ impl Supervisor {
     /// starts SUSPENDED into a Job Object of its own and is resumed only once
     /// it is in it, with the folder as its working directory.
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
         order: &StartOrder,
@@ -3567,6 +3615,7 @@ impl Supervisor {
         sidecar: Option<u16>,
         approvals: mpsc::Sender<ApprovalEvent>,
         memory: Option<&CoreMemory>,
+        note: Option<&str>,
     ) -> Result<Spawned, (HiveRefusal, String)> {
         use crate::hive_win;
         use crate::win_service::supervisor::{JobObject, spawn_into_job};
@@ -3629,6 +3678,8 @@ impl Supervisor {
         spec.resume = order.resume || std::fs::symlink_metadata(spec.history_path()).is_ok();
         let line = hive_win::harness_command_line(&spec.harness, &spec.args())
             .map_err(|e| (HiveRefusal::LaunchFailed, e))?;
+        // P2e-7 — as on Unix; the directory's DACL hands it to the user.
+        leave_note(&dir, note, None, order.session_id);
         let memory_dir = memory.and_then(|m| match write_memory(&dir, m, None) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -3765,6 +3816,12 @@ fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("{}: {e}", d.display()))?;
     }
+    // P2e-7 — the resume note's hook: this binary, as the account, printing
+    // the note when the daemon left one. Without a path to name, no hook,
+    // and a moved session resumes without its note.
+    let session_start_hook = own_exe()
+        .ok()
+        .and_then(|exe| resume_note::hook_command(&exe, &dir.join(resume_note::NOTE_FILE)));
     // P0e — the key helper is the DAEMON's (the sidecar runs it); the session
     // has no `apiKeyHelper`, so nothing in it can print the provider's key.
     let doc = SettingsSpec {
@@ -3772,6 +3829,7 @@ fn write_settings(runtime: &Path, sid: &str) -> Result<PathBuf, String> {
         auto_memory_directory: None,
         sandbox_proxy: None,
         extra_read_denies: Vec::new(),
+        session_start_hook,
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -3826,6 +3884,48 @@ fn write_memory(dir: &Path, m: &CoreMemory, owner: Option<(u32, u32)>) -> Result
         }
     }
     Ok(mem)
+}
+
+/// FR-90 P2e-7 — `dir`'s resume note, as [`write_private_text`] writes core
+/// memory: the account's, `0600`. `None` removes one an earlier launch left.
+/// One that cannot be written is said in the log: the session resumes
+/// without it.
+fn leave_note(dir: &Path, note: Option<&str>, owner: Option<(u32, u32)>, session: ObjectId) {
+    let done = match note {
+        Some(text) => write_private_text(dir, resume_note::NOTE_FILE, text, owner).map(|_| ()),
+        None => match std::fs::remove_file(dir.join(resume_note::NOTE_FILE)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        },
+    };
+    if let Err(e) = done {
+        warn!(session = %session, %e, "hive: the resume note was not left");
+    }
+}
+
+/// FR-90 P2e-7 — the last tool call `sid`'s store holds no result for, as the
+/// resume note names it: a cut turn's, or one the old primary was in when it
+/// went. `None` when there is none, or too much follows it to tell.
+async fn last_open_call(store: &StoreHandle, sid: &str) -> Option<String> {
+    const SCAN: usize = 4096;
+    let used = store.last_of_kind(sid, "tool_use").await.ok()??;
+    let Some(TranscriptEvent::ToolUse { id, name, input }) =
+        TranscriptEvent::from_json(&used.event_json)
+    else {
+        return None;
+    };
+    let after = store.page(sid, used.seq, SCAN).await.ok()?;
+    if after.len() >= SCAN {
+        return None;
+    }
+    let answered = after.iter().any(|e| {
+        matches!(
+            TranscriptEvent::from_json(&e.event_json),
+            Some(TranscriptEvent::ToolResult { tool_use_id, .. }) if tool_use_id == id
+        )
+    });
+    (!answered).then(|| resume_note::describe_call(&name, &input))
 }
 
 /// `dir/name`, whole: written to a temporary name created afresh at `0600`
@@ -8806,6 +8906,10 @@ done
             fence: 2,
             turns: 2,
             from_device_id: ObjectId::new(),
+            from_device_name: "mars".into(),
+            from_folder: "/srv/work".into(),
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_791_813_720_000,
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
@@ -8823,12 +8927,42 @@ done
             "a move is no restart: {:?}",
             notes(&r, sid)
         );
+        // P2e-7 — told it moved, once: the note left for the `SessionStart`
+        // hook, which the session's settings carry.
+        let run = r.root.path().join("run").join(sid.to_hex());
+        let note = std::fs::read_to_string(run.join(resume_note::NOTE_FILE)).unwrap_or_default();
+        assert!(
+            note.starts_with(
+                "This session was moved to this device by Alice at 2026-10-12 14:02 UTC.\n\
+                 It ran on mars, in /srv/work."
+            ),
+            "the resume note is left for the hook: {note:?}"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run.join("settings.json")).unwrap())
+                .unwrap();
+        let hook = &settings["hooks"]["SessionStart"][0];
+        assert_eq!(
+            hook["matcher"], "resume",
+            "the settings carry the hook, on a resume: {settings}"
+        );
+        assert!(
+            hook["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains(resume_note::RESUME_NOTE_SUBCOMMAND)),
+            "the hook prints it: {settings}"
+        );
         r.sup.prompt(sid, None, "recall".into()).unwrap();
         let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
         assert_eq!(
             turns.iter().map(|t| (t.turn, t.status)).collect::<Vec<_>>(),
             [(3, HiveTurnStatus::Running), (3, HiveTurnStatus::Ok)],
             "counted on from the session's two turns"
+        );
+        assert!(
+            notes(&r, sid).contains(&note),
+            "the transcript says what the harness was told: {:?}",
+            notes(&r, sid)
         );
         // Read once a turn ran: the folder put back holds fence 1's `.argv`,
         // which the new harness replaced as it started.
@@ -8847,6 +8981,45 @@ done
         until_ended(&mut r, sid).await;
     }
 
+    /// P2e-7 — the last tool call the store holds no result for, as the
+    /// resume note names it; another call's result answers nothing.
+    #[tokio::test]
+    async fn the_note_names_the_last_tool_call_left_without_a_result() {
+        let r = rig(true, 4);
+        let sid = ObjectId::new().to_hex();
+        assert_eq!(last_open_call(&r.store, &sid).await, None, "no tool call");
+        let call = |id: &str, cmd: &str| TranscriptEvent::ToolUse {
+            id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": cmd }),
+        };
+        let result = |id: &str| TranscriptEvent::ToolResult {
+            tool_use_id: id.into(),
+            ok: true,
+            output: "ok".into(),
+            truncated: false,
+        };
+        r.store.append(&sid, 1, call("t1", "ls"));
+        r.store.append(&sid, 1, result("t1"));
+        assert_eq!(
+            last_open_call(&r.store, &sid).await,
+            None,
+            "a call its result follows is no open call"
+        );
+        r.store.append(&sid, 1, call("t2", "cargo test"));
+        assert_eq!(
+            last_open_call(&r.store, &sid).await.as_deref(),
+            Some("cargo test"),
+            "left open"
+        );
+        r.store.append(&sid, 1, result("t1"));
+        assert_eq!(
+            last_open_call(&r.store, &sid).await.as_deref(),
+            Some("cargo test"),
+            "another call's result answers nothing"
+        );
+    }
+
     /// P2e-5 — a move back is the session coming back where its state is:
     /// nothing is put in place over it. (Had the copy been, the folder this
     /// one changed since would have been refused as the person's own work.)
@@ -8863,7 +9036,19 @@ done
             fence: 2,
             turns: 2,
             from_device_id: me,
+            from_device_name: "mars".into(),
+            from_folder: "/srv/work".into(),
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_791_813_720_000,
         });
+        // P2e-7 — a note an earlier move left here.
+        let left = r
+            .root
+            .path()
+            .join("run")
+            .join(sid.to_hex())
+            .join(resume_note::NOTE_FILE);
+        std::fs::write(&left, "an earlier move's note\n").unwrap();
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
             Answer::accepted("dev")
@@ -8873,10 +9058,23 @@ done
             !r.root.path().join("work").join("notes.md").exists(),
             "nothing put in place"
         );
+        let now = std::fs::read_to_string(&left).unwrap_or_default();
+        assert!(
+            !now.contains("moved to this device"),
+            "a move back is told nothing: {now:?}"
+        );
+        assert!(!left.exists(), "and the note an earlier move left is gone");
         r.sup.prompt(sid, None, "recall".into()).unwrap();
         let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
         assert_eq!(turns.last().map(|t| t.turn), Some(3));
         assert!(said(&r, sid).contains(&"history: 3".to_string()));
+        assert!(
+            !notes(&r, sid)
+                .iter()
+                .any(|n| n.contains("moved to this device")),
+            "nor does its transcript say it moved: {:?}",
+            notes(&r, sid)
+        );
         r.sup.stop(sid, 2, "owner".into());
         until_ended(&mut r, sid).await;
     }
@@ -8907,6 +9105,10 @@ done
             fence: 2,
             turns: 1,
             from_device_id: ObjectId::new(),
+            from_device_name: "mars".into(),
+            from_folder: "/srv/work".into(),
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_791_813_720_000,
         });
         assert_eq!(
             r.sup.start(moved_start(&plain), true).await,
@@ -8924,6 +9126,10 @@ done
             fence: 2,
             turns: 2,
             from_device_id: me,
+            from_device_name: "mars".into(),
+            from_folder: "/srv/work".into(),
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_791_813_720_000,
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
@@ -8955,6 +9161,10 @@ done
             fence: 2,
             turns: 0,
             from_device_id: ObjectId::new(),
+            from_device_name: "mars".into(),
+            from_folder: "/srv/work".into(),
+            moved_by_name: "Alice".into(),
+            moved_at_ms: 1_791_813_720_000,
         });
         assert_eq!(
             r.sup.start(moved_start(&o), true).await,
