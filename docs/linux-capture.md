@@ -228,6 +228,66 @@ from Windows, macOS and older agents.
 **Kill switch**: `wayland_auto` / `ROOMLERD_WAYLAND_AUTO=0` (default on) gives
 back the behaviour before P2.
 
+### 1.3 What a device reports, and the fleet's count (FR-93 P2b)
+
+A Linux daemon tells the server which desktop it would show a controller now, and
+what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
+and which arm serves each": a sweep reaches only the devices that are online.
+The server can, because every device says it in its hello.
+
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1110`),
+all strings, so a newer agent's word reaches an older server as a word:
+
+| field | values | from |
+|---|---|---|
+| `session` | `user` · `greeter` · `lock-screen` · `none` | logind's class for the session a controller would see. A root daemon sees the seat: a person's session first, else the greeter. A per-user daemon sees only its own user's sessions. A tty or an SSH login is no desktop |
+| `type` | `wayland` · `x11` · `tty` · `none` | that session's type |
+| `desktop` | `gnome`, `KDE`, … (absent when logind names none) | logind's `Desktop` |
+| `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
+| `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:232`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on |
+
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:744`), a pure function
+that walks `open_with`'s own order (`:1270`). The two sit together in one file
+because they must not drift:
+
+```mermaid
+flowchart LR
+    A{"§1.2's automatic mutter<br/>(plan Auto, mutter answers)"} -- yes --> MU[mutter]
+    A -- no --> D{drm_capture?}
+    D -- yes --> DRM[drm]
+    D -- no --> P{portal_capture?}
+    P -- "yes, mutter_capture" --> MU
+    P -- yes --> PO[portal]
+    P -- no --> X{"an X11 session,<br/>or the daemon's own Xvfb?"}
+    X -- yes --> X11[x11]
+    X -- "no: a Wayland desktop with nothing on" --> N[none]
+```
+
+⚠️ **A plan, not a promise.** An arm that fails at session time falls through,
+and that session's `rc:video-info` names what actually served it (§1.2). The
+brief answers what the fleet is configured to do. The session answers what
+happened.
+
+⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
+a wedged logind must not stall the hello. A `desktop-brief` thread
+(`desktop_brief.rs:31`) reads it every 60 s into a cache. The hello and the
+heartbeat only read that cache (`signaling.rs:5237`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:1806`).
+Until the first read lands, which is milliseconds after start, the hello
+carries none.
+
+The brief rides `agents.capabilities`, so the device listing returns it with no
+server change. The count is one aggregate (`crates/api/src/routes/stats.rs:357`),
+grouped by `type` and `capture_arm`, with `total` and `online`:
+
+| route | scope |
+|---|---|
+| `GET /api/tenant/{tid}/stats/overview` → `desktops` | the org, for any member |
+| `GET /api/admin/stats/orgs` → `desktops` | the whole fleet, for a platform admin: the denominator a field check after a roll needs |
+
+A device that never sent a brief (Windows, macOS, an agent older than P2b) is not
+counted. `machines.total` beside it says how many devices there are.
+
 ## 2. The X11 arm, and the virtual desktop
 
 `scrap` on Linux is XShm: a full-screen `GetImage` per frame, which XShm cannot
@@ -629,6 +689,7 @@ defect — the capture arms only expose it by being knobs.
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:943`) and the cascade; the FR-80 failure classifier (`:830`); FR-93's verdicts: `linux_no_pixels_code` (`:567`), `xwayland_verdict` (`:616`), the Xwayland guard (`:1159`) and its socket-only probe (`x_server_query` `:705`), the hints (`wayland_hint` `:519`, `wayland_not_enabled_detail` `:601`) |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:31`) and the session a controller would see (`seen_session` `:65`); `planned_arm` / `arm_facts` live beside the cascade in `capture/mod.rs` (`:744`, `:765`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:107`, `primary` `:243`) |

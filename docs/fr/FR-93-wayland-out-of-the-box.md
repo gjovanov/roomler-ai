@@ -1,7 +1,9 @@
 # FR-93: Linux Wayland out of the box — a stock desktop install is seen, driven and told, and a lab proves it
 
 **Issue:** [#1972](https://github.com/gjovanov/roomler-ai/issues/1972) · **Status:** P1 merged 2026-10-11 and
-field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. The operator approved the plan and P0 (the
+field-verified on the lab: GNOME 50, and KDE Plasma 6.7 on Fedora 44. P2a (mutter only, #2019) and P2c (#2020)
+merged 2026-10-12, P2a lab-verified; P2b (the desktop brief and the server's count) built 2026-10-12. P2d is an
+operator decision. The operator approved the plan and P0 (the
 lab on zeus, enrolled in the vmtest org: D2, D8). **D1 is decided: split.** Per-user installs go auto, system installs
 stay opt-in until a non-Debian companion ships. D3 waits for P3 · **Owner:** remote desktop (agent + viewer), vmtest (`roomler-ai-deploy`) ·
 **Anchors:** master `8098ebbe3`, fleet 0.4.124 (0.4.125 bumped, not yet released) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput),
@@ -442,7 +444,12 @@ bridge for text and images in the lab before deciding.
 ### 4.9 Wire (all additive — unknown fields ignored, the `RpcCap` rule)
 
 - hello `desktop: {session, type, desktop, capture_arm, input_reach}` — the server can count Wayland hosts and
-  what serves them, which an exec sweep cannot (a biased sample)
+  what serves them, which an exec sweep cannot (a biased sample). **As built (P2b):** a field of the hello's
+  caps (`AgentCaps.desktop`), not of the hello itself, so it rides the stored `capabilities` blob and the device
+  listing returns it with no server change. `capture_arm` is the arm a session opened now would try first
+  (`capture::planned_arm`, in the cascade's order). logind is read by a refresher thread, and the hello and the
+  heartbeat read only its cache. The counts are `desktops` in the tenant overview and in the platform-admin org
+  rollup ([`linux-capture.md`](../linux-capture.md) §1.3)
 - `rc:media-unavailable` code `wayland_not_enabled`
 - `rc:video-info` `capture_arm`, `attended`
 - the cursor DC on Linux (the existing messages)
