@@ -16,7 +16,9 @@
 //! | either | the server's `rc:hive.replica.close`, the connection's end, or the grant's | the endpoint, its socket and its allocation or route go, and the server is told why |
 //!
 //! A member asks for each stream it follows ([`super::follow`], P2d-3b), and
-//! a build carries both sides from then on, advertising `hive-stream`.
+//! a build carries both sides from then on, advertising `hive-stream`. It
+//! renews each at half its grant's life, the renewal's stream followed beside
+//! the old one until it answers, and the old one let go then (P2d-4).
 //!
 //! ⚠️ What a member holds of these streams in memory is bounded across all of
 //! them, by this device's budgets for event bytes and blob bytes
@@ -91,10 +93,13 @@ const PERMIT_SETTLE: Duration = Duration::from_millis(300);
 /// not landed yet. A member sends one; the bound keeps a replay from growing
 /// the entry.
 const MAX_HELD_CANDIDATES: usize = 16;
-/// The most streams this device follows at once, as a member. Each holds a
-/// UDP socket, and on the relay rung an allocation; a dial past it is closed
-/// `busy`.
+/// The most sessions this device follows at once, as a member
+/// ([`super::follow`]).
 pub(super) const MAX_FOLLOWING: usize = 32;
+/// P2d-4 — the most streams this device follows at once, as a member: each
+/// session followed, and its renewal beside it. Each holds a UDP socket, and
+/// on the relay rung an allocation; a dial past it is closed `busy`.
+pub(super) const MAX_MEMBER_STREAMS: usize = 2 * MAX_FOLLOWING;
 /// P2d-3 — the event bytes a source sends past the member's last ack before
 /// it waits for the next: enough to keep a path busy, and all a member that
 /// stopped reading leaves unread on its connection, well under the
@@ -1152,11 +1157,12 @@ impl Supervisor {
             // A replay: the stream this dial started follows it.
             return debug!(grant = %grant_id, "hive stream: a dial this device follows already");
         }
-        if streams.values().filter(|s| s.role == Role::Member).count() >= MAX_FOLLOWING {
+        if streams.values().filter(|s| s.role == Role::Member).count() >= MAX_MEMBER_STREAMS {
             drop(streams);
             self.on_dial_dropped(session_id, "busy");
             return self.report_close(grant_id, "busy");
         }
+        let ttl_secs = d.ttl_secs;
         let sup = Arc::clone(self);
         let task = tokio::spawn(async move {
             let reason = sup.follow_one(&d).await;
@@ -1176,12 +1182,13 @@ impl Supervisor {
             },
         );
         drop(streams);
-        // P2d-3b — the ask for this session has its answer: followed.
-        self.on_dialed(session_id, grant_id);
+        // P2d-3b — the ask for this session has its answer: followed, or
+        // (P2d-4) followed beside the stream it renews.
+        self.on_dialed(session_id, grant_id, ttl_secs);
     }
 
     /// The member's side of one stream, by the grant's life at most.
-    async fn follow_one(&self, d: &Dial) -> String {
+    async fn follow_one(self: &Arc<Self>, d: &Dial) -> String {
         let Ok(store) = &self.store else {
             return "store_unavailable".to_string();
         };
@@ -1261,6 +1268,10 @@ impl Supervisor {
             if refused {
                 return "refused".to_string();
             }
+            // P2d-4 — it carries: a renewal's stream is the one followed
+            // from here, and the stream it renews is let go before this one
+            // touches the copy.
+            self.on_answered(d.session_id, d.grant_id);
             // P2d-3 — a copy off the source's chain is set aside past the
             // point both hold before it takes the source's events.
             if let SourceMsg::Diverged { at, .. } = &answer
@@ -1654,6 +1665,24 @@ impl Supervisor {
         }
     }
 
+    /// P2d-4 — a stream this device lets go on its own word, from outside its
+    /// task: the old stream once its renewal carries (`renewed`), a renewal
+    /// a newer dial replaced (`replaced`). It ends here at once, and the
+    /// server is told why, which tells the other side. Its follow moved on
+    /// already, so is not told.
+    pub(super) fn end_stream(&self, grant_id: ObjectId, reason: &str) {
+        let gone = self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&grant_id);
+        if let Some(s) = gone {
+            s.task.abort();
+            info!(grant = %grant_id, session = %s.session_id, role = ?s.role, %reason, "hive stream: let go");
+            self.report_close(grant_id, reason);
+        }
+    }
+
     /// The server's `rc:hive.replica.close`: the stream ends here at once,
     /// its endpoint still being stood up or not, and nothing is said back
     /// (the server already forgot the grant).
@@ -1898,6 +1927,18 @@ mod tests {
         token: &str,
         ice: Vec<IceServer>,
     ) {
+        dial_for(mem, g, ready, token, ice, 30);
+    }
+
+    /// [`dial`], the member holding the grant to `ttl_secs`.
+    fn dial_for(
+        mem: &Rig,
+        g: (ObjectId, ObjectId, Option<HiveStreamPath>),
+        ready: ClientMsg,
+        token: &str,
+        ice: Vec<IceServer>,
+        ttl_secs: u32,
+    ) {
         let (grant_id, session_id, path) = g;
         let ClientMsg::HiveReplicaReady {
             refused: None,
@@ -1927,7 +1968,7 @@ mod tests {
                 addrs,
                 ice_servers: ice,
                 derp_pubkey,
-                ttl_secs: 30,
+                ttl_secs,
             },
             true,
         );
@@ -2622,7 +2663,8 @@ mod tests {
         );
     }
 
-    /// A member follows at most its limit at once; a dial past it is closed
+    /// A member follows at most its limit of streams at once, each session
+    /// followed and its renewal beside it (P2d-4); a dial past it is closed
     /// `busy`, and nothing is dialed.
     #[tokio::test]
     async fn a_member_follows_at_most_its_limit() {
@@ -2645,11 +2687,17 @@ mod tests {
             ttl_secs: 30,
         };
         let mut following = Vec::new();
-        for _ in 0..MAX_FOLLOWING {
+        // As many sessions as the follow takes, each with its renewal
+        // beside it: counted here, not read from the limit under test.
+        for _ in 0..2 * MAX_FOLLOWING {
             let d = to_silence();
             following.push(d.grant_id);
             mem.sup.follow_dial(d, true);
         }
+        assert!(
+            following.iter().all(|g| mem.sup.holds_stream(*g)),
+            "every session followed with its renewal beside it"
+        );
         let past = to_silence();
         let grant_id = past.grant_id;
         mem.sup.follow_dial(past, true);
@@ -3470,7 +3518,7 @@ mod tests {
         );
     }
 
-    use super::super::follow::Phase;
+    use super::super::follow::{Phase, Renewing, WANT_TIMEOUT};
 
     /// P2d-3b — the next `rc:hive.replica.want` the rig's device sends for
     /// `sid` on `path`, any other skipped, or `None` within 5 s: its fence,
@@ -3480,7 +3528,17 @@ mod tests {
         sid: ObjectId,
         path: HiveStreamPath,
     ) -> Option<(u64, u64, Option<String>)> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        want_on_within(r, sid, path, Duration::from_secs(5)).await
+    }
+
+    /// [`want_on`], within `within`.
+    async fn want_on_within(
+        r: &mut Rig,
+        sid: ObjectId,
+        path: HiveStreamPath,
+        within: Duration,
+    ) -> Option<(u64, u64, Option<String>)> {
+        let deadline = Instant::now() + within;
         loop {
             let msg = tokio::time::timeout_at(deadline, r.reports.recv())
                 .await
@@ -3683,11 +3741,13 @@ mod tests {
         mem.sup.follow_joined(sid, 1);
         assert!(want_on(&mut mem, sid, Direct).await.is_some());
         let (g1, g2, g3) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        mem.sup.on_dialed(sid, g1);
+        mem.sup.on_dialed(sid, g1, 30);
         mem.sup.on_stream_over(sid, g1, "unreachable", false);
         assert!(want_on(&mut mem, sid, Relay).await.is_some(), "a rung down");
-        mem.sup.on_dialed(sid, g2);
-        mem.sup.on_dialed(sid, g3);
+        mem.sup.on_dialed(sid, g2, 30);
+        // P2d-4 — beside it, and followed once it answers.
+        mem.sup.on_dialed(sid, g3, 30);
+        mem.sup.on_answered(sid, g3);
         mem.sup.on_stream_over(sid, g2, "expired", true);
         assert_eq!(
             mem.sup.follow_phase(sid),
@@ -3866,5 +3926,343 @@ mod tests {
         );
         assert!(!mem.sup.holds_stream(grant_id));
         src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2d-4 — [`served`], the member holding the grant to `ttl_secs` and
+    /// the source to its usual 30 s: what ends the source's side before then
+    /// is the member's word, never the source's clock.
+    async fn served_for(src: &Rig, mem: &Rig, sid: ObjectId, ttl_secs: u32) -> ObjectId {
+        let g = grant(sid, HiveStreamPath::Direct);
+        let ids = (g.grant_id, g.session_id, g.path);
+        let ready = ready_of(src, g, true).await;
+        dial_for(mem, ids, ready, TOKEN, Vec::new(), ttl_secs);
+        ids.0
+    }
+
+    /// A dial for `sid` to a socket that takes the member's packets and
+    /// answers none: a stream that stays in its opening exchange.
+    fn to_silence(sid: ObjectId, grant_id: ObjectId, silent: &std::net::UdpSocket) -> Dial {
+        Dial {
+            grant_id,
+            session_id: sid,
+            fence: 1,
+            source_id: ObjectId::new(),
+            path: Some(HiveStreamPath::Direct),
+            token: TOKEN.into(),
+            cert_fingerprint: "00".repeat(32),
+            addrs: vec![silent.local_addr().unwrap().to_string()],
+            ice_servers: Vec::new(),
+            derp_pubkey: None,
+            ttl_secs: 30,
+        }
+    }
+
+    /// P2d-4 — at half its grant's life a member asks for its stream again,
+    /// from the top, and follows the renewal's stream beside the old one;
+    /// once the new one answers, the old one is let go (`renewed`), the
+    /// source's side of it too, and the new one carries the live tail.
+    #[tokio::test]
+    async fn a_stream_is_renewed_before_its_grant_ends() {
+        use HiveStreamPath::Direct;
+        let src = rig(true, 4);
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        note(&src, sid, &["one", "two"]);
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        // Renewed at 5 s, ended at 10 s.
+        let old = served_for(&src, &mem, sid, 10).await;
+        phase_of(&mem, sid, Phase::Following(old)).await;
+        let end = tip(&src, sid).await.unwrap();
+        assert_eq!(tip_at(&mem, sid, end.seq).await, end);
+
+        // Short of the grant's end (10 s), when the follow would ask from
+        // the top anyway.
+        assert!(
+            want_on_within(&mut mem, sid, Direct, Duration::from_secs(8))
+                .await
+                .is_some(),
+            "the renewal, from the top, at half the grant's life"
+        );
+        assert!(
+            mem.sup.holds_stream(old),
+            "the old stream carries on meanwhile"
+        );
+        let new = served_for(&src, &mem, sid, 30).await;
+        assert_eq!(
+            close_of(&mut mem, old).await.as_deref(),
+            Some("renewed"),
+            "the old one let go once the new one answered"
+        );
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(new)));
+        assert!(mem.sup.holds_stream(new) && !mem.sup.holds_stream(old));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while src.sup.holds_stream(old) {
+            assert!(
+                Instant::now() < deadline,
+                "the source's side of the old one ends with the member's word"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        put(&src, sid, 1, said("live"));
+        let live = tip(&src, sid).await.unwrap();
+        assert_eq!(
+            tip_at(&mem, sid, live.seq).await,
+            live,
+            "the new one carries the live tail"
+        );
+        mem.sup.close_stream(new, "test");
+        src.sup.close_stream(new, "test");
+    }
+
+    /// P2d-4 — a renewal asks from the top whatever rung the stream it
+    /// renews is on (never ratchet), and climbs down a rung on its own
+    /// answers; past the bottom it is let go, the stream followed carries on
+    /// to its end, and that end asks again from the top.
+    #[tokio::test]
+    async fn a_renewal_asks_from_the_top_and_without_a_rung_lets_the_stream_be() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(
+            want_on(&mut mem, sid, Relay).await.is_some(),
+            "the follow fell to relay"
+        );
+        let g = ObjectId::new();
+        mem.sup.on_dialed(sid, g, 1);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "the renewal asks from the top: never ratchet"
+        );
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(
+            want_on_within(&mut mem, sid, Relay, Duration::from_secs(2))
+                .await
+                .is_some(),
+            "a rung down, for the renewal"
+        );
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(g)));
+        // The bottom's answer: a dial on a rung this build cannot name,
+        // turned away.
+        let mut nowhere = to_silence(
+            sid,
+            ObjectId::new(),
+            &std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        );
+        nowhere.path = None;
+        mem.sup.follow_dial(nowhere, true);
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            None,
+            "past the bottom: no renewal this time"
+        );
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Following(g)),
+            "the stream followed carries on"
+        );
+        assert!(
+            !asks_within(&mut mem, sid, Duration::from_millis(700)).await,
+            "nothing more is asked while it does"
+        );
+        mem.sup.on_stream_over(sid, g, "expired", true);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "its end asks again from the top"
+        );
+    }
+
+    /// P2d-4 — a renewal's ask unanswered is taken for `no_answer` on its
+    /// own clock: the timeout of an ask it moved on from moves nothing.
+    #[tokio::test]
+    async fn a_renewal_ask_times_out_on_its_own_clock() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        mem.sup.on_dialed(sid, ObjectId::new(), 1);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "the renewal"
+        );
+        let first = Instant::now();
+        let gap = WANT_TIMEOUT / 2;
+        tokio::time::sleep(gap).await;
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(
+            want_on_within(&mut mem, sid, Relay, Duration::from_secs(2))
+                .await
+                .is_some()
+        );
+        // Past the first ask's timeout, short of the second's.
+        tokio::time::sleep_until(first + WANT_TIMEOUT + gap / 2).await;
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            Some((1, Renewing::Wanting(Relay))),
+            "the first ask's timeout moved nothing"
+        );
+        tokio::time::sleep_until(first + gap + WANT_TIMEOUT + gap / 2).await;
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            None,
+            "the second's own: past the bottom"
+        );
+    }
+
+    /// P2d-4 — a dial beside the stream followed is its renewal. The stream
+    /// followed that ends with its renewal dialed hands over to it, asking
+    /// nothing, and from the renewal's rung: one that then does not carry
+    /// asks a rung down from there.
+    #[tokio::test]
+    async fn a_stream_that_ends_hands_over_to_its_renewal() {
+        use HiveStreamPath::{Direct, Relay};
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        mem.sup.on_refused(
+            sid,
+            1,
+            Some(Direct),
+            Some(HiveStreamRefusal::PathUnavailable),
+        );
+        assert!(
+            want_on(&mut mem, sid, Relay).await.is_some(),
+            "the follow fell to relay"
+        );
+        let (old, new) = (ObjectId::new(), ObjectId::new());
+        mem.sup.on_dialed(sid, old, 1);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "its renewal, on direct"
+        );
+        mem.sup.on_dialed(sid, new, 30);
+        let renewing = Some((
+            0,
+            Renewing::Dialed {
+                grant: new,
+                ttl_secs: 30,
+            },
+        ));
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            renewing,
+            "a dial beside the stream followed is its renewal"
+        );
+        mem.sup.on_dialed(sid, old, 1);
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            renewing,
+            "a replay of the dial followed moves nothing"
+        );
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(old)));
+        mem.sup.on_stream_over(sid, old, "expired", true);
+        assert_eq!(
+            mem.sup.follow_phase(sid),
+            Some(Phase::Following(new)),
+            "its renewal follows on"
+        );
+        assert!(
+            !asks_within(&mut mem, sid, Duration::from_millis(700)).await,
+            "asking nothing"
+        );
+        mem.sup.on_stream_over(sid, new, "unreachable", false);
+        assert!(
+            want_on_within(&mut mem, sid, Relay, Duration::from_secs(2))
+                .await
+                .is_some(),
+            "a rung down from the renewal's own"
+        );
+    }
+
+    /// P2d-4 — an end of the stream followed that lets the session be (the
+    /// server's `member_left`) lets its renewal's stream go too, in the same
+    /// word.
+    #[tokio::test]
+    async fn a_member_let_go_lets_its_renewal_go_too() {
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(
+            want_on(&mut mem, sid, HiveStreamPath::Direct)
+                .await
+                .is_some()
+        );
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (followed, renewal) = (ObjectId::new(), ObjectId::new());
+        mem.sup
+            .follow_dial(to_silence(sid, followed, &silent), true);
+        mem.sup.follow_dial(to_silence(sid, renewal, &silent), true);
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(followed)));
+        mem.sup.close_stream(followed, "member_left");
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Stopped));
+        assert_eq!(
+            close_of(&mut mem, renewal).await.as_deref(),
+            Some("member_left"),
+            "the renewal's stream let go, in the same word"
+        );
+        assert!(!mem.sup.holds_stream(renewal));
+    }
+
+    /// P2d-4 — a renewal asked for when the connection went is asked for
+    /// again on the next one, on its rung, its answer having been the old
+    /// connection's; and it goes with the stream followed, whose end asks
+    /// again from the top.
+    #[tokio::test]
+    async fn a_connection_asks_again_for_a_renewal_in_flight() {
+        use HiveStreamPath::Direct;
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        mem.store.join(&sid.to_hex(), "owner", 1).await.unwrap();
+        mem.sup.follow_joined(sid, 1);
+        assert!(want_on(&mut mem, sid, Direct).await.is_some());
+        let g = ObjectId::new();
+        mem.sup.on_dialed(sid, g, 1);
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "the renewal"
+        );
+        mem.sup.follow_all().await;
+        assert!(
+            want_on_within(&mut mem, sid, Direct, Duration::from_secs(2))
+                .await
+                .is_some(),
+            "asked again on the next connection"
+        );
+        assert_eq!(mem.sup.follow_phase(sid), Some(Phase::Following(g)));
+        mem.sup.on_stream_over(sid, g, "expired", true);
+        assert_eq!(
+            mem.sup.follow_renewal(sid),
+            None,
+            "the renewal goes with the stream followed"
+        );
+        assert!(
+            want_on(&mut mem, sid, Direct).await.is_some(),
+            "whose end asks again from the top"
+        );
     }
 }
