@@ -22,7 +22,7 @@ services:
   # minio/minio is gone from Docker Hub (#2034), and a dev volume made by the old image is
   # root-owned.
   minio:
-    image: cgr.dev/chainguard/minio:latest@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
+    image: ghcr.io/gjovanov/minio:RELEASE.2026-09-22T19-25-18Z@sha256:dc455cdd4db6e390b1b26514f15ff37681a777bf8dab41aac445a0259f751e56
     user: "0:0"
     command: server /data --console-address ":9001"
     ports:
