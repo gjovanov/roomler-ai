@@ -17,8 +17,8 @@ use roomler_ai_services::dao::base::{
 };
 
 use crate::model::{
-    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, ReplicaMember, Replicaset,
-    SessionStatus,
+    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, Promotion, PromotionState,
+    ReplicaMember, Replicaset, SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -31,6 +31,18 @@ fn statuses(set: &[SessionStatus]) -> Bson {
 /// hold it (above `i64::MAX`), so the frame matches nothing.
 fn stored_fence(fence: u64) -> Option<i64> {
     i64::try_from(fence).ok()
+}
+
+/// FR-90 P2e-3 — `fence` ended at the promotion's drained tip, as the record
+/// keeps it (`agent_sessions.fences`). `None` before the primary drained.
+fn fence_mark(p: &Promotion, fence: i64) -> Option<Bson> {
+    let d = p.drained.as_ref()?;
+    bson::to_bson(&crate::model::FenceMark {
+        fence,
+        seq: d.seq,
+        hash: d.hash.clone(),
+    })
+    .ok()
 }
 
 pub struct AgentSessionDao {
@@ -406,6 +418,255 @@ impl AgentSessionDao {
         self.base
             .find_many(doc! { "tenant_id": tenant_id, "_id": { "$in": ids } }, None)
             .await
+    }
+
+    /// FR-90 P2e-3 — a promotion begins: only for a session `owner_id`
+    /// started, still live and launched on `from` at `fence`, with no
+    /// promotion in flight (one past its deadline is replaced: the pod that
+    /// started it is gone). `false` = one of those no longer holds — two
+    /// promotions raced, and this one lost.
+    pub async fn begin_promotion(
+        &self,
+        tenant_id: ObjectId,
+        owner_id: ObjectId,
+        id: ObjectId,
+        p: &Promotion,
+    ) -> DaoResult<bool> {
+        let now = DateTime::now();
+        let promotion = bson::to_bson(p)?;
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tenant_id,
+                    "owner_id": owner_id,
+                    "fence": p.from_fence,
+                    "location.device_id": p.from.device_id,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "$and": [
+                        { "$or": [
+                            { "accepted_at": { "$type": "date" } },
+                            { "status": statuses(&SessionStatus::LAUNCHED) },
+                        ] },
+                        { "$or": [
+                            { "promotion": Bson::Null },
+                            { "promotion.deadline": { "$lt": now } },
+                        ] },
+                    ],
+                },
+                doc! { "$set": { "promotion": promotion } },
+            )
+            .await
+    }
+
+    /// FR-90 P2e-3 — a promotion takes its next step: only the one named,
+    /// only from the state it is in, with the new state's deadline and what
+    /// the step adds (`set`, the drained tip). `false` = it is not there any
+    /// more, or took the step already.
+    pub async fn advance_promotion(
+        &self,
+        id: ObjectId,
+        pid: ObjectId,
+        from: PromotionState,
+        to: PromotionState,
+        deadline: DateTime,
+        mut set: Document,
+    ) -> DaoResult<bool> {
+        set.insert("promotion.state", to.as_str());
+        set.insert("promotion.deadline", deadline);
+        self.base
+            .update_one(
+                doc! { "_id": id, "promotion.id": pid, "promotion.state": from.as_str() },
+                doc! { "$set": set },
+            )
+            .await
+    }
+
+    /// FR-90 P2e-3 — a promotion ends, done or failed: only the one named,
+    /// only while it is in one of `states`. The record as it stood before,
+    /// promotion and all, for the room's note; `None` = it is not there any
+    /// more, or not in those states (another pod's frame ended it first).
+    pub async fn end_promotion(
+        &self,
+        id: ObjectId,
+        pid: ObjectId,
+        states: &[PromotionState],
+    ) -> DaoResult<Option<AgentSession>> {
+        let words: Vec<Bson> = states.iter().map(|s| Bson::from(s.as_str())).collect();
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": id, "promotion.id": pid, "promotion.state": { "$in": words } },
+                doc! {
+                    "$unset": { "promotion": "" },
+                    "$set": { "updated_at": DateTime::now() },
+                },
+            )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?)
+    }
+
+    /// FR-90 P2e-3 — THE move: the lease goes from the primary at `fence` to
+    /// the member the promotion names, at `fence + 1`, in one compare-and-set
+    /// on everything the promotion read: the session still live and on the
+    /// primary at that fence, the promotion still the one syncing, the member
+    /// still a joined one. The member becomes the primary, owed its join at
+    /// the new fence; the old primary becomes `old_role` in `old_state`;
+    /// every other member that held or was taking its copy is owed its join
+    /// at the new fence. The start is unanswered from here, as any start is.
+    ///
+    /// ⚠️ By array filters, never by rewriting the member list: members
+    /// report their tips every few seconds, and a list read before the move
+    /// would undo the reports that landed meanwhile, or miss the move.
+    pub async fn move_lease(
+        &self,
+        id: ObjectId,
+        p: &Promotion,
+        old_role: &str,
+        old_state: MemberState,
+        deadline: DateTime,
+    ) -> DaoResult<bool> {
+        // Syncing holds the drained tip: none, and nothing moves.
+        let Some(mark) = fence_mark(p, p.from_fence) else {
+            return Ok(false);
+        };
+        let (to, from) = (p.to, p.from.device_id);
+        let opts = mongodb::options::UpdateOptions::builder()
+            .array_filters(vec![
+                doc! { "to.device_id": to },
+                doc! { "from.device_id": from },
+                doc! {
+                    "other.device_id": { "$nin": [to, from] },
+                    "other.state": { "$in": [
+                        MemberState::Joined.as_str(),
+                        MemberState::Pending.as_str(),
+                        Bson::Null,
+                    ] },
+                },
+            ])
+            .build();
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "fence": p.from_fence,
+                    "location.device_id": from,
+                    "status": statuses(&SessionStatus::REPORTABLE),
+                    "promotion.id": p.id,
+                    "promotion.state": PromotionState::Syncing.as_str(),
+                    "replicaset.members": { "$elemMatch": {
+                        "device_id": to,
+                        "role": { "$ne": MemberRole::Primary.as_str() },
+                        "state": MemberState::Joined.as_str(),
+                    } },
+                },
+                doc! {
+                    "$set": {
+                        "fence": p.from_fence + 1,
+                        "location.device_id": to,
+                        "location.device_name": &p.to_name,
+                        "location.folder": &p.folder,
+                        "status": SessionStatus::Starting.as_str(),
+                        "replicaset.members.$[to].role": MemberRole::Primary.as_str(),
+                        "replicaset.members.$[to].state": MemberState::Pending.as_str(),
+                        "replicaset.members.$[from].role": old_role,
+                        "replicaset.members.$[from].state": old_state.as_str(),
+                        "replicaset.members.$[other].state": MemberState::Pending.as_str(),
+                        "promotion.state": PromotionState::Moving.as_str(),
+                        "promotion.deadline": deadline,
+                        "updated_at": DateTime::now(),
+                    },
+                    // The fence it supersedes ends at the drained tip.
+                    "$push": { "fences": mark },
+                    "$unset": {
+                        "accepted_at": "",
+                        "location.account": "",
+                        "refusal": "",
+                        "detail": "",
+                        "replicaset.members.$[to].refusal": "",
+                        "replicaset.members.$[to].answered_at": "",
+                        "replicaset.members.$[from].refusal": "",
+                        "replicaset.members.$[from].answered_at": "",
+                        "replicaset.members.$[other].answered_at": "",
+                    },
+                },
+            )
+            .with_options(opts)
+            .await?;
+        Ok(r.modified_count > 0)
+    }
+
+    /// FR-90 P2e-3 — the member refused the start after the lease moved: the
+    /// lease moves back to where the session ran, at the fence AFTER the
+    /// member's (`fence + 2`): a fence once handed out is never handed out
+    /// again, so nothing the member may yet do at its own can count. Only
+    /// while the promotion is `moving` and the member's start unanswered.
+    /// The member is a member again, in its old role; the old primary is the
+    /// primary again; both, and every other member that held its copy, are
+    /// owed their join at the new fence. The promotion ends with it.
+    pub async fn move_lease_back(&self, id: ObjectId, p: &Promotion) -> DaoResult<bool> {
+        // The member's fence ends where it began: it ran nothing.
+        let Some(mark) = fence_mark(p, p.from_fence + 1) else {
+            return Ok(false);
+        };
+        let (to, from) = (p.to, p.from.device_id);
+        let opts = mongodb::options::UpdateOptions::builder()
+            .array_filters(vec![
+                doc! { "to.device_id": to },
+                doc! { "from.device_id": from },
+                doc! {
+                    "other.device_id": { "$nin": [to, from] },
+                    "other.state": { "$in": [
+                        MemberState::Joined.as_str(),
+                        MemberState::Pending.as_str(),
+                        Bson::Null,
+                    ] },
+                },
+            ])
+            .build();
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "fence": p.from_fence + 1,
+                    "location.device_id": to,
+                    "status": SessionStatus::Starting.as_str(),
+                    "accepted_at": Bson::Null,
+                    "promotion.id": p.id,
+                    "promotion.state": PromotionState::Moving.as_str(),
+                },
+                doc! {
+                    "$set": {
+                        "fence": p.from_fence + 2,
+                        "location.device_id": from,
+                        "location.device_name": &p.from.device_name,
+                        "location.folder": &p.from.folder,
+                        "replicaset.members.$[to].role": &p.to_role,
+                        "replicaset.members.$[to].state": MemberState::Pending.as_str(),
+                        "replicaset.members.$[from].role": MemberRole::Primary.as_str(),
+                        "replicaset.members.$[from].state": MemberState::Pending.as_str(),
+                        "replicaset.members.$[other].state": MemberState::Pending.as_str(),
+                        "updated_at": DateTime::now(),
+                    },
+                    "$push": { "fences": mark },
+                    "$unset": {
+                        "promotion": "",
+                        "location.account": "",
+                        "replicaset.members.$[to].answered_at": "",
+                        "replicaset.members.$[from].refusal": "",
+                        "replicaset.members.$[from].answered_at": "",
+                        "replicaset.members.$[other].answered_at": "",
+                    },
+                },
+            )
+            .with_options(opts)
+            .await?;
+        Ok(r.modified_count > 0)
     }
 
     /// FR-90 P1b — the sessions the server holds as running on `device_id`:

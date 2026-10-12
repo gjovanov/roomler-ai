@@ -8451,6 +8451,7 @@ dependencies = [
  "roomler-ai-db",
  "roomler-ai-mod-conference",
  "roomler-ai-mod-fleet",
+ "roomler-ai-mod-hive",
  "roomler-ai-mod-network",
  "roomler-ai-remote-control",
  "roomler-ai-services",

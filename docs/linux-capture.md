@@ -235,7 +235,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1121`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1136`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |

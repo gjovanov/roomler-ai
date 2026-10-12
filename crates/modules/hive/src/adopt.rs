@@ -255,6 +255,8 @@ async fn decide(
         // Placed nowhere: an adopted session stays where it was adopted
         // until P2f makes it a managed one.
         replicaset: None,
+        promotion: None,
+        fences: Vec::new(),
     };
     state.sessions.create(&session).await.map_err(|e| {
         warn!(session = %sid, %e, "hive: an adopted session was not recorded");
