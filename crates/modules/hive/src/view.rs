@@ -36,6 +36,16 @@
 //! room, when the viewer's membership, the device or the org is removed, or
 //! when the session's owner changes the viewer's part in it (P1c,
 //! `role_changed`: a grant carries `may_prompt` as minted).
+//!
+//! # Who serves it (P2d-5)
+//!
+//! The session's primary, while it can serve a view. Else, with the
+//! replicaset's switch on, the freshest member's copy
+//! ([`crate::replica::freshest_copy`]), on a connection that advertises
+//! `hive-view` and `hive-replica` both. A copy is read only: a driver's grant
+//! is minted toward the primary alone, the one device a prompt can reach. With
+//! neither, the primary's own word refuses (`device_offline`,
+//! `device_unsupported`). The audit row of a view from a copy says `copy`.
 
 use std::time::Duration;
 
@@ -212,7 +222,19 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
     let Some(sid) = s.id else {
         return refuse("not_found", None).await;
     };
-    let device_id = s.location.device_id;
+    // P2d-5 — the primary while it can serve; else, with the replicaset on,
+    // the freshest member's copy, read only. With none, the primary's own
+    // word refuses (`device_offline`, `device_unsupported`).
+    let primary = s.location.device_id;
+    let copy = (state.replicaset
+        && state.fleet.rc_hub.agent_supports_hive_view(primary) != Some(true))
+    .then(|| {
+        crate::replica::freshest_copy(&s, |d| {
+            state.fleet.rc_hub.agent_serves_copies(d, s.tenant_id)
+        })
+    })
+    .flatten();
+    let device_id = copy.unwrap_or(primary);
     let audit = |outcome: &'static str, reason: Option<&'static str>| Audit {
         tenant_id: s.tenant_id,
         user_id: user,
@@ -252,8 +274,9 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
     // A driver prompts a live session; every other member reads (P1c). The
     // grant keeps what it was minted with: a change of who drives ends the
     // person's grants (`end_session_grants_of`), and the view they reopen is
-    // minted afresh.
-    let may_prompt = crate::access::drives_now(&s, user);
+    // minted afresh. P2d-5 — never toward a copy: the harness runs on the
+    // primary, the one device a prompt can reach.
+    let may_prompt = crate::access::drives_now(&s, user) && copy.is_none();
     // The address goes with a DRIVER's grant only (P1c-2): the device maps a
     // driver who is not the starter through its own `hive_accounts`, which
     // may name people by address. A reader's never leaves the server.
@@ -306,8 +329,12 @@ async fn open(state: &HiveState, ctx: &WsCtx, data: &Value) {
         audit("refused", Some(reason)).write(state).await;
         return refuse(reason, None).await;
     }
-    audit("sent", None).write(state).await;
-    info!(grant = %grant_id, session = %sid, device = %device_id, user = %user, may_prompt, "hive: view granted");
+    // P2d-5 — the row says when the view is a member's copy.
+    audit("sent", copy.map(|_| "copy")).write(state).await;
+    info!(
+        grant = %grant_id, session = %sid, device = %device_id, user = %user, may_prompt,
+        copy = copy.is_some(), "hive: view granted"
+    );
 
     // A device that never answers: the browser is told, and the device told
     // to drop the grant should its answer arrive after all.

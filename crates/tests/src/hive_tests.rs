@@ -5555,3 +5555,270 @@ async fn with_the_switch_off_no_stream_is_granted() {
         "no refusal either"
     );
 }
+
+// ─── P2d-5 — a replica's read-only view ───────────────────────────────────
+
+/// A primary that runs sessions, carries streams and serves views.
+const SERVES_VIEWS: &[&str] = &["exec", "hive", "hive-view", "hive-stream"];
+/// A member that holds copies, carries streams and serves views of them.
+const COPIES_VIEWS: &[&str] = &["exec", "hive", "hive-view", "hive-replica", "hive-stream"];
+
+/// Open a view of `sid`, have `dev` confirm the grant it is asked, and the
+/// grant it was asked and the browser's `ready`. `asked` says why `dev` is
+/// the one asked, in the panic when it is not.
+async fn view_on(ws: &mut UserWs, dev: &mut Device, sid: &str, asked: &str) -> (Value, Value) {
+    user_send(ws, "hive:view.open", json!({"session_id": sid})).await;
+    let grant = read_until(&mut dev.ws, "rc:hive.view.grant")
+        .await
+        .unwrap_or_else(|| panic!("not asked: {asked}"));
+    let gid = grant["grant_id"].as_str().unwrap().to_string();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.view.grant_ack", "grant_id": gid}),
+    )
+    .await;
+    let ready = user_read(ws, "hive:view.ready").await.expect("ready");
+    assert_eq!(ready["grant_id"], gid.as_str());
+    (grant, ready)
+}
+
+/// The views of `tenant` sent to `device` from a copy, as the audit counts
+/// them, once they number `want` (within 5 s), or the count then.
+async fn copy_views(app: &TestApp, tenant: &str, device: &str, want: u64) -> u64 {
+    let filter = doc! {
+        "tenant_id": ObjectId::parse_str(tenant).unwrap(),
+        "device_id": ObjectId::parse_str(device).unwrap(),
+        "action": "view",
+        "outcome": "sent",
+        "reason": "copy",
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = app
+            .db
+            .collection::<Document>("hive_audit")
+            .count_documents(filter.clone())
+            .await
+            .unwrap();
+        if n == want || Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// P2d-5 — the primary serves a view while it can, the starter driving. Once
+/// it cannot, a member's copy does, read only for everyone, the starter
+/// included, its grant carrying no address; and the audit row says `copy`.
+#[tokio::test]
+async fn a_view_reads_a_members_copy_once_the_primary_cannot_serve() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivecopy").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-cp-primary", SERVES_VIEWS).await;
+    let mut member = device(&app, &seeded, "mach-cp-member", COPIES_VIEWS).await;
+    let sid = followed(&app, &tid, &admin, &mut primary, &mut member, "/srv/cp").await;
+    let mut ws = user_ws(&app, &admin).await;
+
+    let (grant, ready) = view_on(
+        &mut ws,
+        &mut primary,
+        &sid,
+        "the primary, while it can serve",
+    )
+    .await;
+    assert_eq!(
+        (grant["may_prompt"].as_bool(), ready["may_prompt"].as_bool()),
+        (Some(true), Some(true)),
+        "the primary while it can serve, the starter driving: {grant}"
+    );
+    assert!(
+        !device_hears(
+            &mut member.ws,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "no copy is asked while the primary serves"
+    );
+    user_send(
+        &mut ws,
+        "hive:view.close",
+        json!({"grant_id": ready["grant_id"]}),
+    )
+    .await;
+
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let (grant, ready) = view_on(
+        &mut ws,
+        &mut member,
+        &sid,
+        "the member's copy, once the primary cannot",
+    )
+    .await;
+    assert_eq!(grant["session_id"], sid.as_str());
+    assert_eq!(
+        (grant["may_prompt"].as_bool(), ready["may_prompt"].as_bool()),
+        (Some(false), Some(false)),
+        "a copy is read only, the starter's view too: {grant}"
+    );
+    assert!(
+        grant["user_email"].is_null(),
+        "a reader's grant carries no address: {grant}"
+    );
+    assert_eq!(
+        copy_views(&app, &tid, &member.agent_id, 1).await,
+        1,
+        "the audit row says the view was a copy"
+    );
+}
+
+/// P2d-5 — of the members that hold a copy, the freshest by the tip it last
+/// reported serves the view. One whose connection serves no copies (no
+/// `hive-replica`) is passed over, and with none left the primary's word
+/// refuses.
+#[tokio::test]
+async fn a_view_goes_to_the_freshest_copy_that_can_serve() {
+    let app = stream_app().await;
+    let seeded = app.seed_tenant("hivefresh").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    // Three copies: the primary and both members (decision 2's two would
+    // place one).
+    let mut policy = a_policy(0);
+    policy["replicaset"]["restricted_tags"] = json!([]);
+    let (code, p) = put_policy(&app, &tid, &admin, &policy).await;
+    assert_eq!(code, 200, "{p}");
+    let mut primary = device(&app, &seeded, "mach-fr-primary", SERVES_VIEWS).await;
+    let mut behind = device(&app, &seeded, "mach-fr-behind", COPIES_VIEWS).await;
+    let mut ahead = device(&app, &seeded, "mach-fr-ahead", COPIES_VIEWS).await;
+    let s = started(&app, &tid, &admin, &mut primary, "/srv/fr").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    for (m, seq) in [(&mut behind, 3), (&mut ahead, 7)] {
+        read_until(&mut m.ws, "rc:hive.replica.join")
+            .await
+            .expect("the member's join");
+        send(
+            &mut m.ws,
+            json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+        )
+        .await;
+        wait_member(&app, &tid, &admin, &sid, &m.agent_id, "joined", |v| {
+            v["state"] == "joined"
+        })
+        .await;
+        send(
+            &mut m.ws,
+            json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": seq,
+                   "hash": hash("ab")}),
+        )
+        .await;
+        wait_member(&app, &tid, &admin, &sid, &m.agent_id, "its tip", |v| {
+            v["tip"]["seq"] == seq
+        })
+        .await;
+    }
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+
+    let mut ws = user_ws(&app, &admin).await;
+    let (grant, ready) = view_on(&mut ws, &mut ahead, &sid, "the freshest copy").await;
+    assert_eq!(grant["may_prompt"], false, "{grant}");
+    assert!(
+        !device_hears(
+            &mut behind.ws,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "the copy behind is not asked"
+    );
+    user_send(
+        &mut ws,
+        "hive:view.close",
+        json!({"grant_id": ready["grant_id"]}),
+    )
+    .await;
+
+    // The copy ahead comes back on a connection that serves no copies.
+    ahead.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &ahead.agent_id).await;
+    let mut no_copies = connect(&app, &ahead.token, &ahead.machine, VIEWS_HIVE).await;
+    wait_agent_online(&app, &seeded, &ahead.agent_id).await;
+    let (grant, ready) = view_on(
+        &mut ws,
+        &mut behind,
+        &sid,
+        "the copy behind, once the one ahead serves no copies",
+    )
+    .await;
+    assert_eq!(grant["may_prompt"], false, "{grant}");
+    assert!(
+        !device_hears(
+            &mut no_copies,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "a connection that serves no copies is passed over"
+    );
+    user_send(
+        &mut ws,
+        "hive:view.close",
+        json!({"grant_id": ready["grant_id"]}),
+    )
+    .await;
+
+    behind.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &behind.agent_id).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": sid})).await;
+    let refused = user_read(&mut ws, "hive:view.refused")
+        .await
+        .expect("with no copy left, the primary's word refuses");
+    assert_eq!(
+        refused["reason"], "device_offline",
+        "with no copy left, the primary's word: {refused}"
+    );
+}
+
+/// P2d-5 — with the replicaset's switch off, no copy serves a view, whatever
+/// its members hold: the primary's word refuses.
+#[tokio::test]
+async fn with_the_switch_off_no_copy_serves_a_view() {
+    let on = stream_app().await;
+    let seeded = on.seed_tenant("hivecopyoff").await;
+    on_pro(&on, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&on, &seeded, "mach-co-primary", SERVES_VIEWS).await;
+    let mut member = device(&on, &seeded, "mach-co-member", COPIES_VIEWS).await;
+    let sid = followed(&on, &tid, &admin, &mut primary, &mut member, "/srv/co").await;
+
+    let off = switch_off(&on).await;
+    primary.ws.close(None).await.unwrap();
+    member.ws.close(None).await.unwrap();
+    wait_offline(&on, &seeded, &primary.agent_id).await;
+    wait_offline(&on, &seeded, &member.agent_id).await;
+    let mut copier = connect(&off, &member.token, &member.machine, COPIES_VIEWS).await;
+    wait_agent_online(&off, &seeded, &member.agent_id).await;
+
+    let mut ws = user_ws(&off, &admin).await;
+    user_send(&mut ws, "hive:view.open", json!({"session_id": sid})).await;
+    let refused = user_read(&mut ws, "hive:view.refused")
+        .await
+        .expect("with the switch off, the primary's word refuses");
+    assert_eq!(refused["reason"], "device_offline", "{refused}");
+    assert!(
+        !device_hears(
+            &mut copier,
+            "rc:hive.view.grant",
+            Duration::from_millis(300)
+        )
+        .await,
+        "no copy is asked"
+    );
+}

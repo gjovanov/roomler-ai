@@ -37,6 +37,7 @@ function makeViewer(events: any[], pending: string[], mayAnswer: boolean) {
     mayPrompt: ref(mayAnswer),
     mayAnswer: ref(mayAnswer),
     drivingRefused: ref<string | null>(null),
+    copy: ref(false),
     pendingApprovals: ref(pending),
     live: ref(true),
     hasEarlier: ref(false),
@@ -308,6 +309,16 @@ describe('HiveTranscript — who drives (FR-90 P1c)', () => {
     expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
     expect(w.find('[data-testid="hive-read-only"]').text()).toBe(
       "You drive this session, but its device does not let you act there: this device's hive_accounts maps you to no account",
+    )
+  })
+
+  it('says a copy (P2d-5) is read-only because the device that runs the session cannot serve it, with no composer', async () => {
+    hoisted.viewer = makeViewer([], [], false)
+    hoisted.viewer.copy.value = true
+    const w = await render()
+    expect(w.find('[data-testid="hive-ask"]').exists()).toBe(false)
+    expect(w.find('[data-testid="hive-read-only"]').text()).toBe(
+      'You are reading a copy another device holds, because the device that runs this session cannot serve it now. It is read-only: only that device takes prompts.',
     )
   })
 })
