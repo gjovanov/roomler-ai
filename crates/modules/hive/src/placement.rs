@@ -531,7 +531,7 @@ async fn replace_one(
         if added {
             moved = true;
             if runs && let Some(r) = crate::replica::wire_role(role.as_str()) {
-                crate::replica::push_join(state, s.tenant_id, *device, sid, fence, r);
+                crate::replica::push_join(state, s, *device, r);
             }
         }
     }
@@ -541,14 +541,7 @@ async fn replace_one(
     // again at its every connection until it answers `joined`. (`moved` counts
     // only additions here: the leaving come below.)
     if moved && !told && state.sessions.owe_primary_join(sid).await? && runs {
-        crate::replica::push_join(
-            state,
-            s.tenant_id,
-            s.location.device_id,
-            sid,
-            fence,
-            HiveReplicaRole::Primary,
-        );
+        crate::replica::push_join(state, s, s.location.device_id, HiveReplicaRole::Primary);
     }
     // P2e-2 — and leased from its first member on: its device holds it to the
     // server's word from its next connection, not from the one after that.

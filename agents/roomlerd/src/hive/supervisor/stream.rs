@@ -663,10 +663,14 @@ async fn set_aside(
     }
 }
 
-/// P2d-3 — the close's word for an event the store refused.
+/// P2d-3 — the close's word for an event the store refused. P2e-5b —
+/// `not_fence_end`: below the floor, an older fence's event at the `seq` its
+/// fence ended at that is not the event it ended with. The source holds a
+/// chain the record does not, so the member waits and asks again.
 fn refused_word(e: &WriterError) -> &'static str {
     match e {
         WriterError::Store(StoreError::Chain(ChainError::StaleFence { .. })) => "stale_fence",
+        WriterError::Store(StoreError::Chain(ChainError::NotFenceEnd { .. })) => "not_fence_end",
         WriterError::Store(StoreError::Chain(ChainError::Gap { .. })) => "gap",
         WriterError::Store(StoreError::Chain(ChainError::Broken { .. })) => "broken_chain",
         WriterError::Store(StoreError::Purged { .. }) => "purged",
@@ -3393,6 +3397,89 @@ mod tests {
         assert_eq!(
             close_of(&mut mem, grant_id).await.as_deref(),
             Some("broken_chain")
+        );
+        assert_eq!(tip(&mem, sid).await, None, "nothing of it kept");
+    }
+
+    /// P2e-5b — a member that joins after a move holds a floor above every
+    /// event the old primary wrote. Joined as before P2e-5b it refuses the
+    /// first of them; joined with where that fence ended, it takes them over
+    /// the stream up to there, then the new primary's.
+    #[tokio::test]
+    async fn a_member_joined_after_a_move_takes_the_history_below_its_floor() {
+        let src = rig(true, 4);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        // The old primary's history, which the new one held before the move,
+        // then the new primary's own, at fence 2.
+        put(&src, sid, 1, said("one"));
+        put(&src, sid, 1, said("two"));
+        let ended = tip_at(&src, sid, 2).await;
+        put(&src, sid, 2, said("three"));
+        let last = tip_at(&src, sid, 3).await;
+
+        let mut before = member_rig();
+        before.store.join(&s, "owner", 2).await.unwrap();
+        let grant_id = served(&src, &before, sid, TOKEN).await;
+        assert_eq!(
+            close_of(&mut before, grant_id).await.as_deref(),
+            Some("stale_fence"),
+            "no end named: the whole history is below the floor"
+        );
+        assert_eq!(tip(&before, sid).await, None);
+        src.sup.close_stream(grant_id, "test");
+
+        let mem = member_rig();
+        let end = roomler_hive_node::FenceEnd {
+            fence: 1,
+            seq: ended.seq,
+            hash: ended.hash,
+        };
+        mem.store
+            .join_with_ends(&s, "owner", 2, vec![end])
+            .await
+            .unwrap();
+        let grant_id = served(&src, &mem, sid, TOKEN).await;
+        assert_eq!(tip_at(&mem, sid, 3).await, last);
+        assert_eq!(
+            mem.store.page(&s, 0, 10).await.unwrap(),
+            src.store.page(&s, 0, 10).await.unwrap(),
+            "the copy is the new primary's chain, event for event"
+        );
+        mem.sup.close_stream(grant_id, "test");
+        src.sup.close_stream(grant_id, "test");
+    }
+
+    /// P2e-5b — at the `seq` its fence ended, an older fence's event that is
+    /// not the one it ended with is refused, and nothing of it kept: the
+    /// member ends the stream `not_fence_end`.
+    #[tokio::test]
+    async fn an_event_at_a_fences_end_that_is_not_its_end_is_refused() {
+        let mut mem = member_rig();
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let end = roomler_hive_node::FenceEnd {
+            fence: 1,
+            seq: 1,
+            hash: [9; 32],
+        };
+        mem.store
+            .join_with_ends(&s, "owner", 2, vec![end])
+            .await
+            .unwrap();
+        let (_peer, grant_id, _conn, mut send, _recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        let other = EventEnvelope::next(&s, None, 1, 0, &said("not where fence 1 ended"));
+        send_by_hand(&mut send, &[other]).await;
+        assert_eq!(
+            close_of(&mut mem, grant_id).await.as_deref(),
+            Some("not_fence_end"),
+            "the member ends the stream in the chain's word"
         );
         assert_eq!(tip(&mem, sid).await, None, "nothing of it kept");
     }
