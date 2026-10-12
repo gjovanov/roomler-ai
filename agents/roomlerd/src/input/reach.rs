@@ -230,12 +230,14 @@ pub fn current() -> InputReach {
 /// would open one (a portal or mutter arm with `portal_input` on).
 ///
 /// ⚠️ `wayland_session`: there the X server is Xwayland, and GNOME starts it
-/// **on demand** when a client connects, so a read that connects is itself
-/// what starts one. Measured on GNOME 50: no Xwayland before, and the first
-/// brief's read started one that stayed. On a Wayland desktop the brief
-/// therefore connects only to an Xwayland already running (found in `/proc`),
-/// and with none it reads "no X server". An X11 session cannot exist without
-/// its server, so there connecting starts nothing.
+/// **on demand** when a client connects, so a read that connects can itself be
+/// what starts one. The brief reads every minute, so on a Wayland desktop it
+/// connects only to an Xwayland already running (found in `/proc`), and with
+/// none it reads "no X server". An X11 session cannot exist without its
+/// server, so there connecting starts nothing. (Measured on GNOME 50: a daemon
+/// RESTART starts an Xwayland on 0.4.129 and on this build alike, because the
+/// x11 consent panel connects at start, `indicator/x11.rs`. A boot does not.
+/// This rule keeps the brief from adding to that.)
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn predicted(portal_input: bool, wayland_session: bool) -> InputReach {
     let mut facts = gather_with(if wayland_session {
