@@ -90,6 +90,13 @@ pub(crate) struct HostedSession {
     /// P2c-4: set later by a primary's join, while the session runs.
     #[serde(default)]
     pub replicated: bool,
+    /// P2e-2 — the session is leased: after a restart it launches only once
+    /// the server has said on that connection that this device still holds
+    /// it (`rc:hive.lease`). Set by a start's `lease`, or by the first word.
+    /// Absent in a file from before; an older daemon ignores it, and resumes
+    /// on its own word as it always did.
+    #[serde(default)]
+    pub lease: bool,
 }
 
 /// A turn in progress.
@@ -303,6 +310,7 @@ mod tests {
             harness_pid: None,
             harness_started: None,
             replicated: false,
+            lease: false,
         }
     }
 

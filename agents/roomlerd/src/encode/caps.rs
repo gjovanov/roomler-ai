@@ -1662,6 +1662,13 @@ fn rpc_caps() -> Vec<String> {
     if crate::hive::stream_enabled() {
         caps.push(RpcCap::HiveStream);
     }
+    // FR-90 P2e-2 — and holds a leased session to the server's word on each
+    // connection (`rc:hive.lease`): after a restart or a reconnect it runs
+    // one only once the server has said so there. A property of the BUILD,
+    // like `hive`, and kept on a secondary org's connection like it: that
+    // org's Hive frames are refused there either way.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::HiveLease);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

@@ -688,6 +688,15 @@ pub enum RpcCap {
     /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2d
     /// drops every stream frame. Equality-matched, locked by test.
     HiveStream,
+    /// FR-90 P2e-2 — the agent holds a leased session to the server's word:
+    /// it runs one, and lets it call the model, after a restart or a
+    /// reconnect only once the server has said on THAT connection that it
+    /// still holds the session (`rc:hive.lease`). Only a connection with it
+    /// is sent the word, or a start that asks for it (`lease`).
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2e-2
+    /// runs what it hosts on its own word. Equality-matched, locked by test.
+    HiveLease,
 }
 
 impl RpcCap {
@@ -715,11 +724,12 @@ impl RpcCap {
             Self::HiveReplica => "hive-replica",
             Self::HiveArchive => "hive-archive",
             Self::HiveStream => "hive-stream",
+            Self::HiveLease => "hive-lease",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 16] = [
+    pub const ALL: [RpcCap; 17] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -736,6 +746,7 @@ impl RpcCap {
         Self::HiveReplica,
         Self::HiveArchive,
         Self::HiveStream,
+        Self::HiveLease,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -4739,6 +4750,7 @@ mod tests {
         assert_eq!(RpcCap::HiveReplica.wire(), "hive-replica");
         assert_eq!(RpcCap::HiveArchive.wire(), "hive-archive");
         assert_eq!(RpcCap::HiveStream.wire(), "hive-stream");
+        assert_eq!(RpcCap::HiveLease.wire(), "hive-lease");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -4756,7 +4768,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 9] = [
+        const KNOWN: [(RpcCap, RpcCap); 10] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -4780,6 +4792,9 @@ mod tests {
             // FR-90 P2d — nor "carries replica streams". Locked by
             // `hive_stream_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveStream),
+            // FR-90 P2e-2 — nor "holds a leased session to the server's
+            // word". Locked by `hive_lease_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveLease),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -5112,6 +5127,26 @@ mod tests {
         );
         assert_eq!(RpcCap::from_wire("hive-stream"), Some(RpcCap::HiveStream));
         assert!(RpcCap::from_wire("hive-streams").is_none());
+    }
+
+    /// FR-90 P2e-2 — holding a leased session to the server's word is its own
+    /// promise: a build that runs sessions but predates it runs what it hosts
+    /// on its own word, so it must never be read as one that waits.
+    #[test]
+    fn hive_lease_is_a_promise_of_its_own() {
+        let older = AgentCaps {
+            rpc: vec!["hive".into(), "hive-stream".into(), "hive-replica".into()],
+            ..Default::default()
+        };
+        assert!(!older.has_rpc(RpcCap::HiveLease));
+        let leased = AgentCaps {
+            rpc: vec!["hive".into(), "hive-lease".into()],
+            ..Default::default()
+        };
+        assert!(leased.has_rpc(RpcCap::HiveLease));
+        assert!(!leased.has_rpc(RpcCap::HiveStream));
+        assert_eq!(RpcCap::from_wire("hive-lease"), Some(RpcCap::HiveLease));
+        assert!(RpcCap::from_wire("hive-leases").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

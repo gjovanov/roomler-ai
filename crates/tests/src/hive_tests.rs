@@ -2012,6 +2012,174 @@ async fn a_device_that_reports_a_session_held_elsewhere_is_demoted() {
     assert_eq!(s.get_str("status").unwrap(), "idle");
 }
 
+// ─── P2e-2 — the lease word ────────────────────────────────────────────────
+
+/// What a build that holds a leased session to the server's word
+/// advertises.
+const HOLDS_LEASES: &[&str] = &["exec", "hive", "hive-lease"];
+
+/// Start a session on `dev`, which accepts it: the session as the start's
+/// answer shows it, and the `rc:hive.start` frame the device received.
+async fn started_frame(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    dev: &mut Device,
+    folder: &str,
+) -> (Value, Value) {
+    let caller = start(app, tid, token, &dev.agent_id, folder);
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives rc:hive.start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+        frame
+    };
+    let (body, frame) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    (body["session"].clone(), frame)
+}
+
+/// `rc:hive.manifest` naming `sid` at fence 1.
+fn manifest_of(sid: &str) -> Value {
+    json!({"t": "rc:hive.manifest", "sessions": [{"session_id": sid, "fence": 1}]})
+}
+
+/// FR-90 P2e-2 — a replicated session is leased on a device that holds
+/// leases: its start asks for it, and every manifest of that device's is
+/// answered with the server's word, at the record's fence, on the
+/// connection that sent it, the next connection's included. A device that
+/// does not hold leases is never asked, nor sent a word; a session alone gets
+/// none; a session that is over, named in a manifest, is told to stop.
+#[tokio::test]
+async fn a_replicated_session_is_leased_and_each_manifest_answered_with_the_word() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivelease").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let mut primary = device(&app, &seeded, "mach-lease-primary", HOLDS_LEASES).await;
+    let _member = device(&app, &seeded, "mach-lease-member", HOLDS_COPIES).await;
+    let mut older = device(&app, &seeded, "mach-lease-older", RUNS_HIVE).await;
+
+    let (s, frame) = started_frame(&app, &tid, &admin, &mut primary, "/srv/lease").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        (frame["replicated"].clone(), frame["lease"].clone()),
+        (json!(true), json!(true)),
+        "the start asks for the lease: {frame}"
+    );
+    send(&mut primary.ws, manifest_of(&sid)).await;
+    let word = read_until(&mut primary.ws, "rc:hive.lease")
+        .await
+        .expect("the manifest is answered with the word");
+    assert_eq!(
+        (word["session_id"].as_str(), word["fence"].as_u64()),
+        (Some(sid.as_str()), Some(1))
+    );
+
+    // And on the next connection again: a word counts on its own one only.
+    primary.ws.close(None).await.unwrap();
+    wait_offline(&app, &seeded, &primary.agent_id).await;
+    let mut ws = connect(&app, &primary.token, &primary.machine, HOLDS_LEASES).await;
+    wait_agent_online(&app, &seeded, &primary.agent_id).await;
+    send(&mut ws, manifest_of(&sid)).await;
+    let again = read_until(&mut ws, "rc:hive.lease")
+        .await
+        .expect("the next connection's manifest is answered too");
+    assert_eq!(again["session_id"].as_str(), Some(sid.as_str()));
+
+    // A device that does not hold leases: never asked, never sent the word.
+    let (os, oframe) = started_frame(&app, &tid, &admin, &mut older, "/srv/lease-older").await;
+    let osid = os["id"].as_str().unwrap().to_string();
+    assert_eq!(oframe["replicated"], true, "{oframe}");
+    assert!(
+        oframe.get("lease").is_none(),
+        "a device that does not hold leases is never asked: {oframe}"
+    );
+    send(&mut older.ws, manifest_of(&osid)).await;
+    assert!(
+        !device_hears(&mut older.ws, "rc:hive.lease", Duration::from_millis(800)).await,
+        "no word for a device that does not hold leases"
+    );
+
+    // A session alone (another org, one device): no lease asked, no word.
+    let lone = app.seed_tenant("hiveleaselone").await;
+    on_pro(&app, &lone).await;
+    let mut single = device(&app, &lone, "mach-lease-lone", HOLDS_LEASES).await;
+    let (ls, lframe) = started_frame(
+        &app,
+        &lone.tenant_id,
+        &lone.admin.access_token,
+        &mut single,
+        "/srv/lease-lone",
+    )
+    .await;
+    let lsid = ls["id"].as_str().unwrap().to_string();
+    assert!(lframe.get("lease").is_none(), "{lframe}");
+    send(&mut single.ws, manifest_of(&lsid)).await;
+    assert!(
+        !device_hears(&mut single.ws, "rc:hive.lease", Duration::from_millis(800)).await,
+        "no word for a session alone"
+    );
+
+    // Over on the record, and named in a manifest: told to stop, and no word.
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "status": "ended", "end_reason": "owner" } },
+        )
+        .await
+        .unwrap();
+    send(&mut ws, manifest_of(&sid)).await;
+    let stop = read_until(&mut ws, "rc:hive.stop")
+        .await
+        .expect("a session over is told to stop");
+    assert_eq!(
+        (stop["session_id"].as_str(), stop["reason"].as_str()),
+        (Some(sid.as_str()), Some("owner"))
+    );
+    assert!(
+        !device_hears(&mut ws, "rc:hive.lease", Duration::from_millis(500)).await,
+        "no word for a session that is over"
+    );
+}
+
+/// FR-90 P2e-2 — a session that started alone is leased from its first
+/// member on: the primary that holds leases hears the word at once, beside
+/// its join, so it holds the session to the word from its next connection.
+#[tokio::test]
+async fn a_session_that_gains_its_first_member_is_leased_from_then_on() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hiveleasefirst").await;
+    on_pro(&app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut primary = device(&app, &seeded, "mach-leasefirst-primary", HOLDS_LEASES).await;
+    let _b = device(&app, &seeded, "mach-leasefirst-b", HOLDS_COPIES).await;
+    let (s, frame) = started_frame(&app, &tid, &admin, &mut primary, "/srv/leasefirst").await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    assert!(frame.get("lease").is_none(), "alone: {frame}");
+
+    let (code, p) = put_policy(&app, &tid, &admin, &policy_min(2, 1)).await;
+    assert_eq!(code, 200, "{p}");
+    let word = read_until(&mut primary.ws, "rc:hive.lease")
+        .await
+        .expect("leased from its first member on");
+    assert_eq!(
+        (word["session_id"].as_str(), word["fence"].as_u64()),
+        (Some(sid.as_str()), Some(1))
+    );
+}
+
 // ─── P0d-2b — the viewer peer's signalling ─────────────────────────────────
 
 /// A build that runs sessions AND serves them to a browser.

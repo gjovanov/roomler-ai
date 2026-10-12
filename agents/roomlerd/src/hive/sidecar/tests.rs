@@ -180,6 +180,14 @@ async fn sidecar_rig(provider: &Provider, grace: Duration) -> (Rig, tempfile::Te
 /// Start a session and run one prompt, so its launch environment exists.
 async fn started(r: &mut Rig) -> (ObjectId, String, String) {
     let o = order(r);
+    started_with(r, o).await
+}
+
+/// [`started`], with `o` for the start.
+async fn started_with(
+    r: &mut Rig,
+    o: super::super::supervisor::StartOrder,
+) -> (ObjectId, String, String) {
     let sid = o.session_id;
     assert!(r.sup.start(o, true).await.refused.is_none());
     assert_eq!(next_state(r, sid).await.0, HiveRunState::Idle);
@@ -379,6 +387,116 @@ async fn past_the_offline_grace_model_calls_stop() {
     r.sup.connected(tx);
     p.go.notify_one();
     assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// P2e-2 — [`sidecar_rig`], whose leased runs give up on the server's word
+/// after `wait`.
+async fn leased_sidecar_rig(provider: &Provider, wait: Duration) -> (Rig, tempfile::TempDir) {
+    let count_dir = tempfile::tempdir().unwrap();
+    let count = count_dir.path().join("helper-runs");
+    let helper = format!(
+        "echo run >> '{}'; printf '{DEVICE_KEY}\\n'",
+        count.display()
+    );
+    let upstream = provider.url.clone();
+    let r = rig_with(
+        true,
+        4,
+        move |cfg| cfg.api_key_helper = Some(helper),
+        move |sup| {
+            sup.with_sidecar(upstream, OFFLINE_GRACE)
+                .with_lease_wait(wait)
+        },
+    );
+    std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
+    (r, count_dir)
+}
+
+/// P2e-2 — a leased run calls the model after a reconnect only on the
+/// server's word on the NEW connection: without it the call is refused after
+/// the wait, in the provider's "overloaded" shape, and nothing reaches the
+/// provider; a call waiting when the word comes goes. Offline in between,
+/// the closed connection is still the latest one, and its word counts, as
+/// the grace does.
+#[tokio::test]
+async fn a_leased_run_calls_the_model_after_a_reconnect_only_on_the_servers_word() {
+    let p = provider().await;
+    let (mut r, _count) = leased_sidecar_rig(&p, Duration::from_millis(600)).await;
+    let mut o = order(&r);
+    o.lease = true;
+    // The start is the word on its connection, as `handle_start` keeps it.
+    let first = super::super::supervisor::tests::latest(&r);
+    assert!(r.sup.record_word(o.session_id, 1, &first));
+    let (sid, base, token) = started_with(&mut r, o).await;
+    let url = format!("{base}/v1/messages");
+    p.go.notify_one();
+    assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
+
+    // Offline: the closed connection's word, within the grace.
+    drop(std::mem::replace(
+        &mut r.reports,
+        tokio::sync::mpsc::channel(1).1,
+    ));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while r.sup.offline_for().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the loss was never noticed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    p.go.notify_one();
+    assert_eq!(
+        call(&url, Some(&token)).await.status().as_u16(),
+        200,
+        "offline within the grace, on the last connection's word"
+    );
+
+    // A new connection, no word on it yet: refused, and nothing leaves.
+    let (tx, reports) = tokio::sync::mpsc::channel(64);
+    r.reports = reports;
+    r.sup.connected(tx.clone());
+    let hits = p.hits.load(Ordering::SeqCst);
+    let (status, kind) = error_kind(call(&url, Some(&token)).await).await;
+    assert_eq!((status, kind.as_str()), (503, "overloaded_error"));
+    assert_eq!(
+        p.hits.load(Ordering::SeqCst),
+        hits,
+        "a leased run called the model on no word"
+    );
+
+    // The word comes while a call waits: it goes.
+    let waiting = {
+        let (url, token) = (url.clone(), token.clone());
+        tokio::spawn(async move { call(&url, Some(&token)).await.status().as_u16() })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(p.hits.load(Ordering::SeqCst), hits, "it waits for the word");
+    r.sup.take_lease(sid, 1, &tx);
+    p.go.notify_one();
+    assert_eq!(waiting.await.unwrap(), 200);
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// P2e-2 — a run that is not leased keeps P1's behaviour: after a reconnect
+/// it calls the model at once, on no word.
+#[tokio::test]
+async fn a_run_that_is_not_leased_calls_the_model_after_a_reconnect_on_no_word() {
+    let p = provider().await;
+    let (mut r, _count) = leased_sidecar_rig(&p, Duration::from_secs(5)).await;
+    let (sid, base, token) = started(&mut r).await;
+    let url = format!("{base}/v1/messages");
+    let (tx, reports) = tokio::sync::mpsc::channel(64);
+    r.reports = reports;
+    r.sup.connected(tx);
+    p.go.notify_one();
+    let asked = tokio::time::Instant::now();
+    assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "it waited for a word it does not need"
+    );
     r.sup.stop(sid, 1, "owner".into());
 }
 
