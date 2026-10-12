@@ -991,14 +991,6 @@ async fn an_approval_is_one_stub_that_says_how_it_ended() {
         n.get_str("title").unwrap().ends_with("needs approval"),
         "{n}"
     );
-    assert_eq!(
-        notes
-            .count_documents(doc! { "notification_type": "approval_request" })
-            .await
-            .unwrap(),
-        2,
-        "one per approval (a1 and the marker), none for the replay"
-    );
 
     // Answered by someone who is not a driver: the end is taken, the name
     // is not — no stub says a person allowed what they could not have.
@@ -1011,6 +1003,18 @@ async fn an_approval_is_one_stub_that_says_how_it_ended() {
         content(items, &a1).iter().any(|c| c.contains("allowed"))
     })
     .await;
+    // Counted only now: the marker's stub is posted BEFORE its notification
+    // is written, so right after the stub the count could still be 1. A
+    // device's reports are applied one at a time, in order, so once this end
+    // shows, the marker's whole frame was applied — notification included.
+    assert_eq!(
+        notes
+            .count_documents(doc! { "notification_type": "approval_request" })
+            .await
+            .unwrap(),
+        2,
+        "one per approval (a1 and the marker), none for the replay"
+    );
     assert_eq!(
         content(&items, &a1),
         ["🔐 **Approval** · turn 1 — ✅ allowed"]
