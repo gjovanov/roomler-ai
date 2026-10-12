@@ -653,6 +653,17 @@ pub struct HiveFenceMark {
     pub hash: String,
 }
 
+/// FR-90 P2e-6a — where a device's copy of a session ends, as its
+/// `rc:hive.prepare_ack` says it: the fence of its newest event, its `seq`,
+/// and its hash. A promotion away from an unreachable primary moves the
+/// lease to exactly this.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HiveCopyTip {
+    pub fence: u64,
+    pub seq: u64,
+    pub hash: String,
+}
+
 /// FR-90 P2c-3 — a checkpoint a member holds: the `seq` of its `checkpoint`
 /// event, and that event's hash.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -873,6 +884,16 @@ pub mod promote_limits {
     /// it. The server waits this long for `rc:hive.drained`, and a margin for
     /// the last checkpoint after it.
     pub const DRAIN_TURN_CUT_SECS: u64 = 60;
+
+    /// FR-90 P2e-6a — how long a primary must have been unreachable, its
+    /// control connection gone and no heartbeat heard, before its session is
+    /// moved away from it with no drain: the device's own receive deadline
+    /// (80 s), then the grace its sidecar serves model calls for after it
+    /// last heard from the server (120 s), and a margin (30 s). By then the
+    /// device makes no model call, whatever it still runs. ⚠️ Couples to
+    /// `WS_RX_DEADLINE` and `OFFLINE_GRACE` in `roomlerd`: a test there holds
+    /// this to their sum.
+    pub const UNREACHABLE_SECS: u64 = 80 + 120 + 30;
 }
 
 /// FR-90 P2e-3 — why a primary did not drain a session, carried in

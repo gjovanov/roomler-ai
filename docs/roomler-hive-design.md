@@ -166,7 +166,7 @@ envelope relay, an extension host inside `roomlerd`, an import-map SPA loader â€
 Hive outside core. FR-69 provides each of those already: modules mount behind one
 `Module` contract (`crates/core/src/module.rs:23`), the SPA gates on
 `/api/capabilities` (`ui/src/stores/capabilities.ts:30`), every wire variant names its
-owner (`crates/remote_control/src/signaling.rs:1466`), and an unmounted module answers
+owner (`crates/remote_control/src/signaling.rs:1472`), and an unmounted module answers
 503 (`docs/modular-monolith.md`). Hive becomes three modules:
 
 ```mermaid

@@ -733,3 +733,16 @@ fn a_session_path_splits_into_its_id_and_the_provider_path() {
     assert_eq!(split_session("/s/abc"), Some(("abc", "/")));
     assert_eq!(split_session("/v1/messages"), None);
 }
+
+/// FR-90 P2e-6a — the server waits a primary out for `UNREACHABLE_SECS`
+/// before it moves a session away from it with no drain. By then this device
+/// must have stopped serving model calls: its own receive deadline to notice
+/// the server is gone, then the grace it serves calls for after it last heard
+/// from the server, then a margin. A shorter wait could move a session this
+/// device still calls the model for.
+#[test]
+fn the_server_waits_a_primary_out_past_the_grace_it_serves_calls_for() {
+    use roomler_ai_remote_control::hive::promote_limits::UNREACHABLE_SECS;
+    let serves = crate::signaling::WS_RX_DEADLINE + OFFLINE_GRACE + Duration::from_secs(30);
+    assert_eq!(Duration::from_secs(UNREACHABLE_SECS), serves);
+}
