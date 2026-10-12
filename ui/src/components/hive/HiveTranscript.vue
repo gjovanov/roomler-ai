@@ -184,6 +184,9 @@
       <!-- P1c-2 — the server named us a driver, the device does not let us
            act as its account: say so, in the device's words. -->
       <template v-if="adopted">{{ $t('hive.viewer.adoptedReadOnly') }}</template>
+      <!-- P2d-5 — a member's copy, served while the device running the
+           session cannot: read only, for drivers too. -->
+      <template v-else-if="viewer.copy.value">{{ $t('hive.viewer.copyReadOnly') }}</template>
       <template v-else-if="viewer.drivingRefused.value">
         {{ $t('hive.viewer.drivingRefused', { why: viewer.drivingRefused.value }) }}
       </template>

@@ -429,6 +429,33 @@ describe('useHiveViewer', () => {
     expect(viewer.drivingRefused.value, 'forgotten with the peer').toBeNull()
   })
 
+  it('knows a copy (P2d-5) by the hello, and forgets it with the peer', async () => {
+    const { viewer, unmount } = await mountViewer()
+    viewer.open('sess-copy')
+    const ref = sent.find((s) => s.type === 'hive:view.open')!.data.ref
+    serverSays('hive:view.ready', { ref, grant_id: 'g-copy', ice_servers: [], ttl_secs: 600, may_prompt: false })
+    await flush()
+    const ch = FakePeer.last!.channel
+    ch.open()
+    await flush()
+    ch.deliver({
+      op: 'hello',
+      v: 1,
+      tip: 0,
+      live: false,
+      state: null,
+      may_prompt: false,
+      may_answer: false,
+      driving_refused: null,
+      copy: true,
+    })
+    await flush()
+    expect(viewer.copy.value).toBe(true)
+    expect(viewer.mayPrompt.value).toBe(false)
+    unmount()
+    expect(viewer.copy.value, 'forgotten with the peer').toBe(false)
+  })
+
   it('closes the peer when the device ends the grant, and a new open replaces the old peer', async () => {
     const { viewer, unmount } = await mountViewer()
     viewer.open('sess-4')
