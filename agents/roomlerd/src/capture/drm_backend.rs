@@ -656,6 +656,10 @@ impl ScreenCapture for DrmCapture {
         // would advertise monitors this backend cannot deliver.
         1
     }
+
+    fn arm(&self) -> Option<super::CaptureArm> {
+        Some(super::CaptureArm::Drm)
+    }
 }
 
 #[cfg(test)]

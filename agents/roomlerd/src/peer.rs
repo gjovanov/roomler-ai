@@ -3761,6 +3761,7 @@ async fn media_pump_vp9_444_dc(
                     reason,
                     cap_reason,
                     None,
+                    capturer.arm(),
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc
@@ -4738,9 +4739,22 @@ fn video_info_payload(
     // FR-70 P1 — a short human detail for the cap, e.g. `"remembered
     // 200 kbps"` for the slow-link profile (the rate the memory keyed it on).
     cap_detail: Option<&str>,
+    // FR-93 P2 — the Linux arm serving this session, and whether it asked the
+    // person at the screen (FR-45 AC8 option b). Omitted elsewhere, so old
+    // viewers and non-Linux agents are byte-identical.
+    arm: Option<crate::capture::CaptureArm>,
 ) -> String {
     let reason = transport_reason
         .map(|r| format!(r#","transport_reason":"{r}""#))
+        .unwrap_or_default();
+    let arm = arm
+        .map(|a| {
+            format!(
+                r#","capture_arm":"{}","attended":{}"#,
+                a.wire(),
+                a.attended()
+            )
+        })
         .unwrap_or_default();
     let cap = cap_reason
         .map(|r| format!(r#","cap_reason":"{r}""#))
@@ -4750,7 +4764,7 @@ fn video_info_payload(
         .map(|d| format!(r#","cap_detail":"{d}""#))
         .unwrap_or_default();
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}{arm}}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
@@ -6239,6 +6253,7 @@ async fn media_pump_ffmpeg_dc(
                     reason,
                     cap_reason,
                     cap_detail.as_deref(),
+                    capturer.arm(),
                 );
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
@@ -11507,13 +11522,14 @@ mod tests {
                 1,
                 None,
                 None,
+                None,
                 None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1}"#
         );
         assert_eq!(
             super::video_info_payload(
-                "vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None, None, None
+                "vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None, None, None, None
             ),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":2}"#
         );
@@ -11530,6 +11546,7 @@ mod tests {
                 1600,
                 1,
                 Some("lan-captured"),
+                None,
                 None,
                 None
             ),
@@ -11550,7 +11567,8 @@ mod tests {
                 1,
                 None,
                 Some("slow-link-cap"),
-                Some("remembered 200 kbps")
+                Some("remembered 200 kbps"),
+                None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1,"cap_reason":"slow-link-cap","cap_detail":"remembered 200 kbps"}"#
         );
@@ -11566,10 +11584,35 @@ mod tests {
                 1,
                 None,
                 None,
-                Some("remembered 200 kbps")
+                Some("remembered 200 kbps"),
+                None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1}"#
         );
+        // FR-93 P2 — the Linux arm and whether it asked anyone, trailing and
+        // optional like the keys above. Only the portal is attended.
+        use crate::capture::CaptureArm;
+        let arm_of = |arm| {
+            super::video_info_payload(
+                "vp9", "libvpx", false, "yuv444", false, 1280, 800, 1, None, None, None, arm,
+            )
+        };
+        let head = r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"direct","native_w":1280,"native_h":800,"viewers":1"#;
+        for (arm, tail) in [
+            (
+                CaptureArm::Mutter,
+                r#","capture_arm":"mutter","attended":false}"#,
+            ),
+            (
+                CaptureArm::Portal,
+                r#","capture_arm":"portal","attended":true}"#,
+            ),
+            (CaptureArm::Drm, r#","capture_arm":"drm","attended":false}"#),
+            (CaptureArm::X11, r#","capture_arm":"x11","attended":false}"#),
+        ] {
+            assert_eq!(arm_of(Some(arm)), format!("{head}{tail}"));
+        }
+        assert_eq!(arm_of(None), format!("{head}}}"));
     }
 
     // FR-33 P3 — the reason is named only when the session is relayed AND

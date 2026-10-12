@@ -39,44 +39,78 @@ pub struct PortalCapture {
     input_route_generation: Option<u64>,
     /// FR-85 P1d — the compositor draws the pointer into the frames.
     cursor_embedded: bool,
+    /// FR-93 P2 — frames from mutter's own ScreenCast, not the portal: the
+    /// arm the controller is told about.
+    mutter: bool,
+}
+
+/// What one portal session is opened with. [`PortalOpen::from_env`] is the
+/// configured answer. FR-93 P2's automatic arms build their own, because the
+/// keys they act on are unset by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortalOpen {
+    /// Frames from `org.gnome.Mutter.ScreenCast`, which asks nobody.
+    pub mutter: bool,
+    /// Input over the same session's RemoteDesktop.
+    pub input: bool,
+    /// One window rather than the desktop: a picker, so attended.
+    pub window: bool,
+}
+
+impl PortalOpen {
+    pub fn from_env() -> Self {
+        Self {
+            // P4 — input rides the same portal session ONLY when the operator
+            // opts in (`ROOMLERD_PORTAL_INPUT=1`). Default OFF, deliberately: a
+            // `WithInput` session uses a SEPARATE consent grant and restore
+            // token from capture-only, so defaulting it on would make every
+            // portal capture — even on a host that already granted+persisted
+            // capture — demand a FRESH see+touch dialog, and block or fall
+            // through if it is not answered. That regresses capture on hosts
+            // where capture-only works, to buy an input path that has not yet
+            // been field-proven to land. Off by default keeps capture
+            // byte-for-byte P3c; a host that wants input turns it on.
+            input: tunnel_core::env::flag("PORTAL_INPUT", false),
+            // FR-45 P5 — take frames from mutter's own ScreenCast API instead
+            // of the portal. ⚠️⚠️ UNATTENDED: it shows no consent dialog.
+            // Default OFF and loud when it engages, exactly like FR-36's DRM
+            // backend, which is its real peer — NOT the portal, whose whole
+            // point is that it asks.
+            mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
+            // FR-56 P4 — record one application window rather than the
+            // desktop. ⚠️ Default OFF and it must stay that way: the portal
+            // answers this by showing a WINDOW PICKER, so on an unattended
+            // host the capture simply never starts. There is no way to name
+            // the window from here — GNOME refuses `Introspect.GetWindows`
+            // (measured), so mutter's `RecordWindow` has no id to take either.
+            window: tunnel_core::env::flag("WINDOW_CAPTURE", false),
+        }
+    }
 }
 
 impl PortalCapture {
-    /// Spawn the helper and wait for its first frame.
+    /// Spawn the helper and wait for its first frame, as configured.
     ///
     /// Returns an error rather than an empty capturer when anything fails, so
     /// `open_default` can fall through to the rest of the cascade with a reason
     /// in the log.
     pub fn open(target_fps: u32) -> Result<Self> {
-        // P4 — input rides the same portal session ONLY when the operator opts
-        // in (`ROOMLERD_PORTAL_INPUT=1`). Default OFF, deliberately: a
-        // `WithInput` session uses a SEPARATE consent grant and restore token
-        // from capture-only, so defaulting it on would make every portal
-        // capture — even on a host that already granted+persisted capture —
-        // demand a FRESH see+touch dialog, and block or fall through if it is
-        // not answered. That regresses capture on hosts where capture-only
-        // works, to buy an input path that has not yet been field-proven to
-        // land. Off by default keeps capture byte-for-byte P3c; a host that
-        // wants input turns it on.
-        let want_input = tunnel_core::env::flag("PORTAL_INPUT", false);
-        // FR-45 P5 — take frames from mutter's own ScreenCast API instead of
-        // the portal. ⚠️⚠️ UNATTENDED: it shows no consent dialog. Default OFF
-        // and loud when it engages, exactly like FR-36's DRM backend, which is
-        // its real peer — NOT the portal, whose whole point is that it asks.
-        let use_mutter = tunnel_core::env::flag("MUTTER_CAPTURE", false);
+        Self::open_with(target_fps, PortalOpen::from_env())
+    }
+
+    /// [`Self::open`] with the session's options given, not read.
+    pub fn open_with(target_fps: u32, opts: PortalOpen) -> Result<Self> {
+        let PortalOpen {
+            mutter: use_mutter,
+            input: want_input,
+            window: window_capture,
+        } = opts;
         if use_mutter {
             tracing::warn!(
-                "portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY \
-                 (ROOMLERD_MUTTER_CAPTURE=1) — this captures WITHOUT a consent dialog"
+                "portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY — this captures \
+                 WITHOUT a consent dialog"
             );
         }
-        // FR-56 P4 — record one application window rather than the desktop.
-        // ⚠️ Default OFF and it must stay that way: the portal answers this by
-        // showing a WINDOW PICKER, so on an unattended host the capture simply
-        // never starts. There is no way to name the window from here — GNOME
-        // refuses `Introspect.GetWindows` (measured), so mutter's
-        // `RecordWindow` has no id to take either.
-        let window_capture = tunnel_core::env::flag("WINDOW_CAPTURE", false);
         if window_capture {
             tracing::info!(
                 "portal capture: asking for ONE WINDOW (ROOMLERD_WINDOW_CAPTURE=1) — the portal \
@@ -184,6 +218,7 @@ impl PortalCapture {
             height,
             input_route_generation,
             cursor_embedded: started.cursor_embedded,
+            mutter: use_mutter,
         })
     }
 
@@ -292,6 +327,14 @@ impl ScreenCapture for PortalCapture {
         } else {
             crate::capture::pointer::RecordedPointer::Absent
         }
+    }
+
+    fn arm(&self) -> Option<crate::capture::CaptureArm> {
+        Some(if self.mutter {
+            crate::capture::CaptureArm::Mutter
+        } else {
+            crate::capture::CaptureArm::Portal
+        })
     }
 }
 
