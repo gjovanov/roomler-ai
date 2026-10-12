@@ -1253,6 +1253,40 @@ pub fn open_default(target_fps: u32, downscale: DownscalePolicy) -> Box<dyn Scre
     open_with(target_fps, downscale, pointer::PointerRequest::Separate)
 }
 
+/// FR-93 P2d — [`open_default`] for the media pumps, off the runtime's workers.
+///
+/// An attended portal open waits for the person at the screen for up to two
+/// minutes (`portal::backend::HANDSHAKE_DEADLINE`), and the pumps called
+/// `open_default` inline, so each unanswered dialog held one runtime worker for
+/// the whole wait. Four stacked dialogs (seen on the FR-93 lab's KDE guest) is
+/// every worker of a 4-core host, with signalling and heartbeats behind them.
+/// On Linux the open now runs on the blocking pool. The pump also stays
+/// droppable while it waits: a capture that opens after its session is gone is
+/// dropped as it arrives. Elsewhere every open is quick, so it stays inline,
+/// byte for byte.
+pub async fn open_default_async(
+    target_fps: u32,
+    downscale: DownscalePolicy,
+) -> Box<dyn ScreenCapture> {
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::task::spawn_blocking(move || open_default(target_fps, downscale)).await {
+            Ok(capturer) => capturer,
+            Err(e) => {
+                tracing::warn!(error = %e, "capture: the open did not finish (it panicked, or the runtime is stopping)");
+                Box::new(NoopCapture::unavailable(CaptureUnavailable::new(
+                    CaptureUnavailableCode::BackendError,
+                    format!("the capture open did not finish: {e}"),
+                )))
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        open_default(target_fps, downscale)
+    }
+}
+
 /// FR-85 P1d — the recorder's capturer: native resolution, and the pointer
 /// drawn INTO the frames wherever the backend can draw it (WGC's session is
 /// opened with cursor capture on; the live path's never is). The backends
@@ -1456,7 +1490,7 @@ fn open_with(
     #[cfg(all(target_os = "linux", feature = "portal-capture"))]
     {
         if tunnel_core::env::flag("PORTAL_CAPTURE", false) {
-            match portal::backend::PortalCapture::open(_target_fps) {
+            match portal::pending::open(_target_fps) {
                 Ok(c) => {
                     tracing::info!(
                         width = c.width(),

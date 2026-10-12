@@ -348,7 +348,7 @@ const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 /// a human answering the portal's consent dialog — but bounded, because an
 /// unanswered dialog must not park a media-pump worker forever. Restored,
 /// already-granted sessions return in well under a second.
-const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+pub(super) const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[cfg(test)]
 mod tests {
