@@ -50,11 +50,12 @@ use roomler_ai_remote_control::hive::{
     HiveRunState, HiveTurnStatus, hive_limits, promote_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
+use roomler_hive_node::checkpoint::Checkpoint;
 #[cfg(unix)]
 use roomler_hive_node::launch::unix_base_env;
 use roomler_hive_node::launch::{
     APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, attributed_prompt,
-    toolbelt_mcp_config, user_input_line,
+    config_dir_in, history_path_in, toolbelt_mcp_config, user_input_line,
 };
 use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_hive_node::{TranscriptEvent, approval_outcome};
@@ -76,6 +77,7 @@ use tracing::{debug, info, warn};
 use super::gates::{self, HiveConfig};
 use super::hosted::{Hosted, HostedSession, RunningTurn};
 use super::lines::LineReader;
+use super::materializer;
 use super::store::StoreHandle;
 use super::toolbelt::{self, ApprovalEvent, Toolbelt};
 
@@ -128,6 +130,15 @@ const WIND_DOWN_GRACE: Duration = Duration::from_secs(3);
 /// each start, so anything older or more is not waiting for anything.
 const MEMORY_WAIT: Duration = Duration::from_secs(10 * 60);
 const MEMORY_PENDING: usize = 64;
+/// P2e-5 — how long a session's move waits for its start, and how many wait
+/// at once: the server sends one right before each moved start (and before
+/// its re-send on connect), as it does core memory.
+const MOVE_WAIT: Duration = MEMORY_WAIT;
+const MOVE_PENDING: usize = MEMORY_PENDING;
+/// P2e-5 — the most checkpoints a moved session's copy is put in place from:
+/// a history only grows, so its chunks span every checkpoint since it began.
+/// A longer chain is refused whole, never put in place cut short.
+const MAX_CHAIN: usize = 20_000;
 /// Longest stdout line kept; a longer one is consumed and skipped, never
 /// buffered whole.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -237,6 +248,20 @@ pub struct CoreMemory {
     pub claude_md: Option<String>,
     /// The device's facts, for the auto-memory index.
     pub memory_md: Option<String>,
+}
+
+/// FR-90 P2e-5 — `rc:hive.move`: the record's word for the run that starts at
+/// `fence`, sent right before its start. Kept for that start: it counts on
+/// from `turns`, and puts the session's copy in place first when it ran on
+/// another device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub session_id: ObjectId,
+    pub fence: u64,
+    /// The newest turn the session's room has a stub for.
+    pub turns: u32,
+    /// Where it ran before: this very device on a move back.
+    pub from_device_id: ObjectId,
 }
 
 /// The device's answer to a start.
@@ -450,6 +475,11 @@ pub struct Supervisor {
     going_down: AtomicBool,
     /// P1e — core memory waiting for its start's launch, by (session, fence).
     memory: Mutex<HashMap<(ObjectId, u64), (CoreMemory, Instant)>>,
+    /// P2e-5 — moves waiting for their start, by (session, fence).
+    moves: Mutex<HashMap<(ObjectId, u64), (Moved, Instant)>>,
+    /// P2e-5 — this device's own enrollment, which tells a move back (the
+    /// session comes back where its state is) from a move here.
+    agent_id: Option<ObjectId>,
     /// P1j — the terminal sessions this device mirrors ([`adopt`]), on disk.
     adopted: Mutex<adopt::AdoptedFile>,
     /// P1j — adopt offers waiting for the server's word, by offer id.
@@ -508,6 +538,50 @@ pub fn handle_memory(m: CoreMemory, is_primary: bool) {
     match global() {
         Some(sup) => sup.receive_memory(m),
         None => debug!(session = %m.session_id, "hive: rc:hive.memory with no supervisor"),
+    }
+}
+
+/// FR-90 P2e-5 — `rc:hive.move`, just ahead of a moved start: kept for that
+/// start ([`Supervisor::receive_move`]). The primary enrollment's only, like
+/// every Hive frame.
+pub fn handle_move(m: Moved, is_primary: bool) {
+    if !is_primary {
+        warn!(session = %m.session_id, "hive: rc:hive.move ignored — not the primary enrollment");
+        return;
+    }
+    match global() {
+        Some(sup) => sup.receive_move(m),
+        None => debug!(session = %m.session_id, "hive: rc:hive.move with no supervisor"),
+    }
+}
+
+/// FR-90 P2e-5 — `rc:hive.prepare`: could this device take the session over
+/// ([`Supervisor::prepare`])? Answered with `rc:hive.prepare_ack` on `tx`, the
+/// connection it came on.
+pub fn handle_prepare(order: StartOrder, is_primary: bool, tx: mpsc::Sender<ClientMsg>) {
+    let sup = global();
+    tokio::spawn(async move {
+        let answer = match sup {
+            Some(sup) => sup.prepare(&order, is_primary).await,
+            None => Answer::refused(
+                HiveRefusal::HiveDisabled,
+                "agent sessions are not set up on this device",
+            ),
+        };
+        let _ = tx.send(prepare_ack(&order, answer)).await;
+    });
+}
+
+/// FR-90 P2e-5 — a prepare's answer as `rc:hive.prepare_ack` says it.
+fn prepare_ack(order: &StartOrder, a: Answer) -> ClientMsg {
+    ClientMsg::HivePrepareAck {
+        session_id: order.session_id,
+        fence: order.fence,
+        refused: a.refused,
+        account: a.account,
+        detail: a
+            .detail
+            .map(|d| d.chars().take(hive_limits::MAX_DETAIL_LEN).collect()),
     }
 }
 
@@ -588,13 +662,14 @@ pub fn init(cfg: &AgentConfig) {
         Ok(Some(p)) => Hosted::load(p.with_file_name(HOSTED_FILE), &cfg.agent_id),
         _ => Hosted::in_memory(),
     };
-    let sup = Supervisor::new(
+    let mut sup = Supervisor::new(
         hive,
         runtime_root(),
         Launcher::AsMappedAccount,
         store,
         hosted,
     );
+    sup.agent_id = ObjectId::parse_str(&cfg.agent_id).ok();
     let sup = Arc::new(sup);
     let _ = SUPERVISOR.set(Arc::clone(&sup));
     // P1j — the adopt socket, only while the device's owner allows it; with
@@ -850,6 +925,7 @@ pub fn init_as_daemon(
         StoreHandle::spawn(Some(store)),
         Hosted::load(store.with_file_name(HOSTED_FILE), &cfg.agent_id),
     );
+    sup.agent_id = ObjectId::parse_str(&cfg.agent_id).ok();
     // P2d-6 — this process's binary is a test's, which knows no
     // `hive-checkpoint`: a replicated session's checkpoints are taken in
     // process, through the same frames and checks, git's discovery stopping
@@ -1153,6 +1229,8 @@ impl Supervisor {
             resumed: tokio::sync::OnceCell::new(),
             going_down: AtomicBool::new(false),
             memory: Mutex::new(HashMap::new()),
+            moves: Mutex::new(HashMap::new()),
+            agent_id: None,
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -1206,6 +1284,52 @@ impl Supervisor {
         }
         debug!(session = %m.session_id, rev = m.brain_rev, "hive: core memory received");
         pending.insert((m.session_id, m.fence), (m, Instant::now()));
+    }
+
+    /// P2e-5 — keep a session's move for its start at that fence.
+    pub(crate) fn receive_move(&self, m: Moved) {
+        let mut pending = self.moves.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, (_, at)| at.elapsed() < MOVE_WAIT);
+        if pending.len() >= MOVE_PENDING
+            && let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| *k)
+        {
+            pending.remove(&oldest);
+        }
+        info!(
+            session = %m.session_id, fence = m.fence, turns = m.turns, from = %m.from_device_id,
+            "hive: the session moves here"
+        );
+        pending.insert((m.session_id, m.fence), (m, Instant::now()));
+    }
+
+    /// P2e-5 — the move that came for this start, if one did: kept until the
+    /// launch, so a start refused before it still finds it when re-sent.
+    fn kept_move(&self, session: ObjectId, fence: u64) -> Option<Moved> {
+        self.moves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(session, fence))
+            .filter(|(_, at)| at.elapsed() < MOVE_WAIT)
+            .map(|(m, _)| m.clone())
+    }
+
+    /// P2e-5 — the start it came for launched.
+    fn forget_move(&self, session: ObjectId, fence: u64) {
+        self.moves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(session, fence));
+    }
+
+    /// P2e-5 — whether `m` brings the session from another device, whose
+    /// state this one does not hold. A move back is the session coming back
+    /// where its state is: the drain checkpointed it there, and nothing ran
+    /// after. A device that does not know its own id puts the copy in place.
+    fn moved_from_elsewhere(&self, m: &Moved) -> bool {
+        self.agent_id != Some(m.from_device_id)
     }
 
     /// P1e — the core memory that came for this start, once.
@@ -1434,10 +1558,276 @@ impl Supervisor {
         } else {
             None
         };
-        match self.launch(order, &account, &folder, store, sidecar) {
-            Ok(()) => Answer::accepted(&account),
+        // P2e-5 — a start the record moved here: it counts on from the
+        // session's turns, and the session is taken over from its copy first
+        // — unless this device hosts it at this fence already (a restart: its
+        // state is here).
+        let moved = self.kept_move(order.session_id, order.fence).filter(|_| {
+            self.hosted_get(order.session_id)
+                .is_none_or(|h| h.fence != order.fence)
+        });
+        let taken_over;
+        let order = match &moved {
+            Some(m) => {
+                if let Err(why) = self.take_over(order, m, &account, &folder, &store).await {
+                    warn!(session = %order.session_id, fence = order.fence, %why, "hive: the moved session was not taken over — its start is refused");
+                    return Answer::refused(
+                        HiveRefusal::LaunchFailed,
+                        "this device could not take the session over from its copy \
+                         (its log says why)",
+                    );
+                }
+                // The history decides `--resume` or `--session-id`: a session
+                // moved before its first prompt has none.
+                taken_over = StartOrder {
+                    resume: false,
+                    ..order.clone()
+                };
+                &taken_over
+            }
+            None => order,
+        };
+        match self.launch(order, &account, &folder, store, sidecar, moved.as_ref()) {
+            Ok(()) => {
+                if moved.is_some() {
+                    self.forget_move(order.session_id, order.fence);
+                }
+                Answer::accepted(&account)
+            }
             Err((r, detail)) => Answer::refused(r, detail),
         }
+    }
+
+    /// P2e-5 — take over a session the record moved here. From another
+    /// device, its copy as this device's store holds it is put in place
+    /// first ([`Self::put_copy_in_place`]); on a move back its state is here
+    /// already. Either way a session that has had turns must find its
+    /// history: without it, Claude Code would start the conversation afresh,
+    /// silently. `Err` says why, for this device's log.
+    async fn take_over(
+        &self,
+        order: &StartOrder,
+        m: &Moved,
+        account: &str,
+        folder: &Path,
+        store: &StoreHandle,
+    ) -> Result<(), String> {
+        let (who, dest) = self.copy_place(order, account, folder)?;
+        if self.moved_from_elsewhere(m) {
+            self.put_copy_in_place(order, &who, &dest, store).await?;
+        }
+        // The daemon only looks at the entry, never reads it (P1d-2).
+        let history = history_path_in(&dest.config_dir, &order.harness_session);
+        if m.turns > 0 && std::fs::symlink_metadata(&history).is_err() {
+            return Err(format!(
+                "the session has had {} turns, and no history of them is here",
+                m.turns
+            ));
+        }
+        Ok(())
+    }
+
+    /// P2e-5 — a session moved here from another device: its copy, as this
+    /// device's store holds it, put in place AS THE ACCOUNT before the
+    /// harness resumes it — the config directory's files, and the folder
+    /// through the account's own git ([`materializer`]) — and the folder held
+    /// to the copy's tree. `Err` says why, for this device's log: what it
+    /// names may be the account's own files, which never reach the server.
+    async fn put_copy_in_place(
+        &self,
+        order: &StartOrder,
+        who: &materializer::Who,
+        dest: &materializer::Dest,
+        store: &StoreHandle,
+    ) -> Result<(), String> {
+        let sid = order.session_id.to_hex();
+        let mut chain: Vec<Checkpoint> = Vec::new();
+        for env in store.of_kind(&sid, "checkpoint", MAX_CHAIN).await? {
+            match TranscriptEvent::from_json(&env.event_json) {
+                Some(TranscriptEvent::Checkpoint(c)) => chain.push(c),
+                _ => {
+                    return Err(format!(
+                        "event {} is no checkpoint this build reads",
+                        env.seq
+                    ));
+                }
+            }
+        }
+        let Some(last) = chain.last() else {
+            return Err("this device's copy holds no checkpoint".into());
+        };
+        let blobs = materializer::Blobs::Store {
+            store,
+            session: &sid,
+        };
+        let done =
+            materializer::materialize(&self.checkpoint_runner(), who, &chain, dest, &blobs).await?;
+        if let Some(ws) = &last.workspace {
+            match &done.workspace {
+                Some(placed) if placed.tree == ws.tree => {}
+                Some(placed) => {
+                    return Err(format!(
+                        "the folder is at tree {}, the copy's is {}",
+                        placed.tree, ws.tree
+                    ));
+                }
+                None => return Err("the folder was not put in place".into()),
+            }
+        }
+        info!(
+            session = %order.session_id, fence = order.fence, checkpoint = last.n,
+            files = done.files, removed = done.removed,
+            "hive: the moved session's copy is in place"
+        );
+        Ok(())
+    }
+
+    /// P2e-5 — where on this device a session's copy goes, and as whom: the
+    /// places its harness runs from ([`Self::spawn`]'s), as its account.
+    #[cfg(unix)]
+    fn copy_place(
+        &self,
+        order: &StartOrder,
+        account: &str,
+        folder: &Path,
+    ) -> Result<(materializer::Who, materializer::Dest), String> {
+        let (home, as_account) = match &self.launcher {
+            Launcher::AsMappedAccount => (
+                crate::exec::account_home(account)?,
+                Some(account.to_string()),
+            ),
+            #[cfg(all(unix, any(test, feature = "hive-test-launcher")))]
+            Launcher::AsDaemon { home } => (home.clone(), None),
+        };
+        let path = harness_path(&home);
+        Ok((
+            materializer::Who {
+                account: as_account,
+                env: unix_base_env(&home, account, Some(&path)),
+            },
+            copy_dest(order, &home, folder),
+        ))
+    }
+
+    /// P2e-5 — on Windows, as the console user, whom `hive_accounts` must map
+    /// the starter to, as for a start.
+    #[cfg(windows)]
+    fn copy_place(
+        &self,
+        order: &StartOrder,
+        account: &str,
+        folder: &Path,
+    ) -> Result<(materializer::Who, materializer::Dest), String> {
+        let console = crate::hive_win::console_user().map_err(|(_, e)| e)?;
+        crate::hive_win::check_mapping(account, &console).map_err(|(_, e)| e)?;
+        Ok((
+            materializer::Who {
+                account: Some(account.to_string()),
+                env: Vec::new(),
+            },
+            copy_dest(order, &console.profile, folder),
+        ))
+    }
+
+    /// P2e-5 — `rc:hive.prepare`: could this device take the session over at
+    /// `order.fence`? Every gate a start passes, as the device is configured
+    /// now, and none of a start's side effects: nothing is stopped, nothing
+    /// launched, no word kept. And the copy: this device holds the session's
+    /// checkpoints, which a moved start is put in place from.
+    pub(crate) async fn prepare(self: &Arc<Self>, order: &StartOrder, is_primary: bool) -> Answer {
+        if !is_primary {
+            return Answer::refused(
+                HiveRefusal::HiveDisabled,
+                "agent sessions run only for this device's primary organization",
+            );
+        }
+        if !self.cfg.enabled {
+            return Answer::refused(
+                HiveRefusal::HiveDisabled,
+                "agent sessions are off on this device (hive_enabled)",
+            );
+        }
+        if order.harness != HARNESS_CLAUDE_CODE {
+            return Answer::refused(
+                HiveRefusal::Other,
+                format!("unknown harness {:?}", order.harness),
+            );
+        }
+        if let Some(account) = self.running(order.session_id, order.fence) {
+            return Answer::accepted(&account);
+        }
+        if let Some((held, _)) = self.live_fence(order.session_id)
+            && held >= order.fence
+        {
+            return Answer::refused(
+                HiveRefusal::Other,
+                format!("this device runs the session at fence {held}"),
+            );
+        }
+        if self.updating() {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "this device is about to restart for an update — ask again in a minute",
+            );
+        }
+        if self.going_down() {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "this device is restarting — ask again in a minute",
+            );
+        }
+        let account = match gates::account_for(&self.cfg, &order.user_id, &order.user_email) {
+            Ok(a) => a,
+            Err(r) => {
+                return Answer::refused(r, "no hive_accounts entry maps you to a local account");
+            }
+        };
+        if let Err(r) = gates::folder_for(&self.cfg, &order.folder) {
+            return Answer::refused(
+                r,
+                "the folder does not exist or is outside this device's hive_roots",
+            );
+        }
+        // A run of it here at an older fence gives its place up to the start.
+        let others = self.live_count() - usize::from(self.holds_live(order.session_id));
+        if others >= self.cfg.max_sessions {
+            return Answer::refused(
+                HiveRefusal::AtCapacity,
+                format!(
+                    "this device already runs {} agent sessions (hive_max_sessions)",
+                    self.cfg.max_sessions
+                ),
+            );
+        }
+        let store = match &self.store {
+            Ok(s) => s.clone(),
+            Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e.clone()),
+        };
+        match store
+            .last_of_kind(&order.session_id.to_hex(), "checkpoint")
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Answer::refused(
+                    HiveRefusal::Other,
+                    "this device holds no copy of the session to take it over from",
+                );
+            }
+            Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e),
+        }
+        if matches!(self.launcher, Launcher::AsMappedAccount)
+            && let Err((r, detail)) =
+                super::sudo::gate(&account, self.cfg.allow_passwordless_sudo).await
+        {
+            return Answer::refused(r, detail);
+        }
+        if self.cfg.api_key_helper.is_some()
+            && let Err(e) = self.sidecar_port().await
+        {
+            return Answer::refused(HiveRefusal::LaunchFailed, e);
+        }
+        Answer::accepted(&account)
     }
 
     /// P1c-2 — the DEVICE's gate on a driver. The server names who drives a
@@ -2773,11 +3163,13 @@ impl Supervisor {
         folder: &Path,
         store: StoreHandle,
         sidecar: Option<u16>,
+        moved: Option<&Moved>,
     ) -> Result<(), (HiveRefusal, String)> {
         // P1d-2 — a session this device hosted goes on where it stood.
         let prior = self
             .hosted_get(order.session_id)
             .filter(|h| h.fence == order.fence);
+        let restarted = prior.is_some();
         // P1e — the core memory this start came with: shown to the session
         // only where the device's owner allows it (`hive_core_memory`).
         let memory = self.take_memory(order.session_id, order.fence);
@@ -2857,7 +3249,8 @@ impl Supervisor {
                     account: account.to_string(),
                     starter: order.user_id.to_hex(),
                     starter_email: order.user_email.clone(),
-                    turns: 0,
+                    // P2e-5 — a session moved here counts on from its turns.
+                    turns: moved.map_or(0, |m| m.turns),
                     running: None,
                     approvals: Vec::new(),
                     resumed_at: None,
@@ -2869,15 +3262,20 @@ impl Supervisor {
                     replicated: replicated.load(Ordering::SeqCst),
                     lease,
                 });
-                None
+                moved.map(|m| Resumed {
+                    turns: m.turns,
+                    cut: None,
+                    approvals: Vec::new(),
+                    history,
+                })
             }
         };
         // Up and waiting for its first prompt.
         self.report(order.session_id, order.fence, HiveRunState::Idle, None);
         // P1d-2 — and what its last daemon left behind, here, before the
         // launch returns: a connection's manifest goes out once the resume
-        // has, and follows all of it.
-        if let Some(r) = &resumed {
+        // has, and follows all of it. A move left nothing behind here.
+        if restarted && let Some(r) = &resumed {
             self.report_resumed(order.session_id, order.fence, &store, r);
         }
         let sup = Arc::clone(self);
@@ -3001,7 +3399,7 @@ impl Supervisor {
             session: order.harness_session.clone(),
             harness,
             folder: folder.to_path_buf(),
-            state_dir: home.join(".roomler").join("hive").join(&sid),
+            state_dir: session_state_dir(&home, &sid),
             settings,
             mcp_config: Some(mcp_config),
             sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
@@ -3045,10 +3443,7 @@ impl Supervisor {
             .args(spec.args());
         // A clean environment: none of the daemon's (root's, with its
         // ROOMLERD_* knobs) reaches a user's session.
-        let path = format!(
-            "{home}/.local/bin:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
-            home = home.display()
-        );
+        let path = harness_path(&home);
         cmd.env_clear()
             .envs(unix_base_env(&home, account, Some(&path)))
             .envs(spec.env_overrides());
@@ -3178,7 +3573,7 @@ impl Supervisor {
             session: order.harness_session.clone(),
             harness,
             folder: folder.to_path_buf(),
-            state_dir: home.join(".roomler").join("hive").join(&sid),
+            state_dir: session_state_dir(&home, &sid),
             settings,
             mcp_config: Some(mcp_config),
             sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
@@ -3507,6 +3902,36 @@ pub(super) fn own_exe() -> Result<String, String> {
         return Err(format!("the daemon's binary is not at {path} any more"));
     }
     Ok(path.to_string())
+}
+
+/// A session's state directory in its account's home: its config directory,
+/// and a shadow repository of its folder, live there.
+fn session_state_dir(home: &Path, sid: &str) -> PathBuf {
+    home.join(".roomler").join("hive").join(sid)
+}
+
+/// The `PATH` a session's harness, and its children run as its account,
+/// find their tools on: the account's own first.
+#[cfg(unix)]
+fn harness_path(home: &Path) -> String {
+    format!(
+        "{home}/.local/bin:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+        home = home.display()
+    )
+}
+
+/// P2e-5 — a moved session's places under its account's `home`: where its
+/// harness runs from, which its copy is put in place at.
+fn copy_dest(order: &StartOrder, home: &Path, folder: &Path) -> materializer::Dest {
+    let sid = order.session_id.to_hex();
+    let state_dir = session_state_dir(home, &sid);
+    materializer::Dest {
+        harness_session: order.harness_session.clone(),
+        config_dir: config_dir_in(&state_dir),
+        folder: folder.to_path_buf(),
+        state_dir,
+        sid,
+    }
 }
 
 /// The turn in progress.
@@ -8155,6 +8580,366 @@ done
             json!({"type": "control_request", "request_id": "hive-drain-3",
                 "request": {"subtype": "interrupt"}})
         );
+    }
+
+    /// P2e-5 — a rig whose daemon knows its own id (`me`), and takes its
+    /// checkpoints, and puts copies in place, in process.
+    fn moving_rig(me: ObjectId, max: usize) -> Rig {
+        use super::super::checkpointer::Runner;
+        rig_with(
+            true,
+            max,
+            |_| {},
+            |mut s| {
+                // The rig's root is under /tmp: git's discovery stops there.
+                s.checkpoint_runner = Some(Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s.agent_id = Some(me);
+                s
+            },
+        )
+    }
+
+    /// P2e-5 — a replicated session that ran two turns here at fence 1, and
+    /// stopped: its copy, checkpoints and blobs, is in the store, and its
+    /// folder holds `notes.md`.
+    async fn ran_twice(r: &mut Rig) -> StartOrder {
+        let mut o = order(r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(r, sid).await.0, HiveRunState::Idle);
+        std::fs::write(
+            r.root.path().join("work").join("notes.md"),
+            "the session's work\n",
+        )
+        .unwrap();
+        for text in ["hi", "again"] {
+            r.sup.prompt(sid, None, text.into()).unwrap();
+            assert_eq!(next_state(r, sid).await.0, HiveRunState::Running);
+            assert_eq!(next_state(r, sid).await.0, HiveRunState::Idle);
+        }
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(r, sid).await;
+        o
+    }
+
+    /// P2e-5 — this device as another one sees it: nothing of the session but
+    /// its copy in the store — no state directory, an empty folder.
+    fn as_another_device(r: &Rig, sid: ObjectId) {
+        let state = r
+            .root
+            .path()
+            .join("home")
+            .join(".roomler")
+            .join("hive")
+            .join(sid.to_hex());
+        std::fs::remove_dir_all(&state).unwrap();
+        for e in std::fs::read_dir(r.root.path().join("work")).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).unwrap();
+            } else {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+    }
+
+    /// P2e-5 — `o` moved to fence 2, as the server's moved start says it.
+    fn moved_start(o: &StartOrder) -> StartOrder {
+        StartOrder {
+            resume: true,
+            ..at_fence(o, 2)
+        }
+    }
+
+    /// P2e-5 — the fake harness's argv now: read once a turn of the launch in
+    /// question ran, so it is that launch's.
+    fn launched_with(r: &Rig) -> Vec<String> {
+        std::fs::read_to_string(r.root.path().join("work").join(".argv"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// P2e-5 — the assistant's texts in `sid`'s transcript.
+    fn said(r: &Rig, sid: ObjectId) -> Vec<String> {
+        r.store
+            .events(&sid.to_hex())
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::AssistantText { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// P2e-5 — a start the record moved here from another device takes the
+    /// session over from its copy, as the account: the conversation's history
+    /// and the folder are put in place before the harness resumes it, and it
+    /// counts on from the session's turns.
+    #[tokio::test]
+    async fn a_moved_session_is_taken_over_from_its_copy_and_counts_on() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        let o = ran_twice(&mut r).await;
+        let sid = o.session_id;
+        as_another_device(&r, sid);
+
+        r.sup.receive_move(Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 2,
+            from_device_id: ObjectId::new(),
+        });
+        assert_eq!(
+            r.sup.start(moved_start(&o), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert_eq!(
+            std::fs::read_to_string(r.root.path().join("work").join("notes.md"))
+                .unwrap_or_default(),
+            "the session's work\n",
+            "the folder is put back"
+        );
+        assert!(
+            !notes(&r, sid).iter().any(|n| n.contains("restarted")),
+            "a move is no restart: {:?}",
+            notes(&r, sid)
+        );
+        r.sup.prompt(sid, None, "recall".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert_eq!(
+            turns.iter().map(|t| (t.turn, t.status)).collect::<Vec<_>>(),
+            [(3, HiveTurnStatus::Running), (3, HiveTurnStatus::Ok)],
+            "counted on from the session's two turns"
+        );
+        // Read once a turn ran: the folder put back holds fence 1's `.argv`,
+        // which the new harness replaced as it started.
+        assert!(
+            launched_with(&r).iter().any(|a| a == "--resume"),
+            "it resumes the conversation it was given: {:?}",
+            launched_with(&r)
+        );
+        assert!(
+            said(&r, sid).contains(&"history: 3".to_string()),
+            "the history holds the two turns before the move: {:?}",
+            said(&r, sid)
+        );
+        assert_eq!(hosted_on_disk(&r)[0].turns, 3);
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-5 — a move back is the session coming back where its state is:
+    /// nothing is put in place over it. (Had the copy been, the folder this
+    /// one changed since would have been refused as the person's own work.)
+    #[tokio::test]
+    async fn a_move_back_puts_nothing_in_place_and_resumes_the_state_here() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        let o = ran_twice(&mut r).await;
+        let sid = o.session_id;
+        std::fs::remove_file(r.root.path().join("work").join("notes.md")).unwrap();
+
+        r.sup.receive_move(Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 2,
+            from_device_id: me,
+        });
+        assert_eq!(
+            r.sup.start(moved_start(&o), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(
+            !r.root.path().join("work").join("notes.md").exists(),
+            "nothing put in place"
+        );
+        r.sup.prompt(sid, None, "recall".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert_eq!(turns.last().map(|t| t.turn), Some(3));
+        assert!(said(&r, sid).contains(&"history: 3".to_string()));
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-5 — a moved start that cannot take the session over is refused,
+    /// in words that name none of the account's files, and launches nothing:
+    /// a copy with no checkpoint to start from; a session that has had turns
+    /// with no history of them here.
+    #[tokio::test]
+    async fn a_moved_start_that_cannot_take_the_session_over_is_refused() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        const WORDS: &str = "this device could not take the session over from its copy \
+                             (its log says why)";
+
+        // Never replicated: no checkpoint in the copy.
+        let plain = order(&r);
+        let sid = plain.session_id;
+        assert!(r.sup.start(plain.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.prompt(sid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        r.sup.receive_move(Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 1,
+            from_device_id: ObjectId::new(),
+        });
+        assert_eq!(
+            r.sup.start(moved_start(&plain), true).await,
+            Answer::refused(HiveRefusal::LaunchFailed, WORDS),
+            "never replicated: no checkpoint to start from"
+        );
+        assert!(!r.sup.holds_live(sid));
+
+        // Moved back with its history gone.
+        let o = ran_twice(&mut r).await;
+        let sid = o.session_id;
+        as_another_device(&r, sid);
+        r.sup.receive_move(Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 2,
+            from_device_id: me,
+        });
+        assert_eq!(
+            r.sup.start(moved_start(&o), true).await,
+            Answer::refused(HiveRefusal::LaunchFailed, WORDS),
+            "moved back with its history gone"
+        );
+        assert!(!r.sup.holds_live(sid));
+    }
+
+    /// P2e-5 — a session moved before its first prompt has no history: it
+    /// starts its conversation on the new device, with `--session-id`.
+    #[tokio::test]
+    async fn a_session_moved_before_its_first_prompt_begins_its_conversation_there() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 4);
+        let mut o = order(&r);
+        o.replicated = true;
+        let sid = o.session_id;
+        assert!(r.sup.start(o.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        // The drain's own checkpoint (P2e-4): the copy's only one.
+        answered(drain(&r, sid, 1)).await.expect("drained");
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        as_another_device(&r, sid);
+
+        r.sup.receive_move(Moved {
+            session_id: sid,
+            fence: 2,
+            turns: 0,
+            from_device_id: ObjectId::new(),
+        });
+        assert_eq!(
+            r.sup.start(moved_start(&o), true).await,
+            Answer::accepted("dev")
+        );
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        // The new harness has rewritten `.argv` (the folder put back holds
+        // fence 1's) as it started, its first act.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let argv = launched_with(&r);
+        assert!(
+            argv.iter().any(|a| a == "--session-id") && !argv.iter().any(|a| a == "--resume"),
+            "nothing to resume yet: {argv:?}"
+        );
+        r.sup.prompt(sid, None, "hello".into()).unwrap();
+        let (turns, _, _) = reports_until(&mut r, sid, HiveRunState::Idle).await;
+        assert_eq!(
+            turns.last().map(|t| (t.turn, t.status)),
+            Some((1, HiveTurnStatus::Ok))
+        );
+        r.sup.stop(sid, 2, "owner".into());
+        until_ended(&mut r, sid).await;
+    }
+
+    /// P2e-5 — the prepare answers with every gate a start passes, as the
+    /// device is configured now, and the copy, and changes nothing: a run of
+    /// the session here goes on, at its own fence.
+    #[tokio::test]
+    async fn the_prepare_answers_with_a_starts_gates_and_moves_nothing() {
+        let me = ObjectId::new();
+        let mut r = moving_rig(me, 1);
+        let o = ran_twice(&mut r).await;
+        let at2 = at_fence(&o, 2);
+        assert_eq!(r.sup.prepare(&at2, true).await, Answer::accepted("dev"));
+        assert_eq!(
+            r.sup.prepare(&at2, false).await.refused,
+            Some(HiveRefusal::HiveDisabled),
+            "a secondary org's"
+        );
+        let mut stranger = at2.clone();
+        stranger.user_id = ObjectId::new();
+        stranger.user_email = "stranger@example.com".into();
+        assert_eq!(
+            r.sup.prepare(&stranger, true).await.refused,
+            Some(HiveRefusal::NoAccount)
+        );
+        let mut elsewhere = at2.clone();
+        elsewhere.folder = "/etc".into();
+        assert_eq!(
+            r.sup.prepare(&elsewhere, true).await.refused,
+            Some(HiveRefusal::FolderNotAllowed)
+        );
+        let mut no_copy = at2.clone();
+        no_copy.session_id = ObjectId::new();
+        assert_eq!(
+            r.sup.prepare(&no_copy, true).await,
+            Answer::refused(
+                HiveRefusal::Other,
+                "this device holds no copy of the session to take it over from"
+            )
+        );
+
+        // Another session runs here, at fence 1: the device is full for any
+        // other, and the prepare of its own move stops nothing.
+        let mut busy = order(&r);
+        busy.replicated = true;
+        let bid = busy.session_id;
+        assert!(r.sup.start(busy.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, bid).await.0, HiveRunState::Idle);
+        r.sup.prompt(bid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, bid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, bid).await.0, HiveRunState::Idle);
+        assert_eq!(
+            r.sup.prepare(&at2, true).await.refused,
+            Some(HiveRefusal::AtCapacity),
+            "the only place is taken"
+        );
+        assert_eq!(
+            r.sup.prepare(&at_fence(&busy, 2), true).await,
+            Answer::accepted("dev"),
+            "its own run gives its place up to the move"
+        );
+        assert_eq!(
+            r.sup.prepare(&busy, true).await,
+            Answer::accepted("dev"),
+            "at the fence it runs at"
+        );
+        assert_eq!(
+            r.sup.prepare(&at_fence(&busy, 0), true).await,
+            Answer::refused(
+                HiveRefusal::Other,
+                "this device runs the session at fence 1"
+            ),
+            "an older fence than the run here"
+        );
+        assert!(r.sup.runs_at(bid, 1), "the prepare stopped nothing");
+        r.sup.stop(bid, 1, "owner".into());
+        until_ended(&mut r, bid).await;
     }
 }
 
