@@ -38,8 +38,9 @@ and add features like exit nodes. Self-hosting has no device limit imposed by us
 ## Can I host it myself?
 
 Yes, and it is a first-class path rather than a stripped-down one. One compose
-file and a published container image; the documented clean-machine path takes
-about 88 seconds. Nothing is held back from a self-hosted deployment. See
+file and published container images; on a clean machine the documented path
+answered in 32 seconds over a data-centre connection, and in 88 over a home
+one. Nothing is held back from a self-hosted deployment. See
 [self-hosting](/docs/start/self-hosting/).
 
 ## How is this different from Tailscale?
