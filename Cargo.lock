@@ -8455,6 +8455,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",
+ "roomler-hive-node",
  "roomlerd",
  "serde",
  "serde_json",

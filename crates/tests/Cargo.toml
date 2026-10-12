@@ -57,3 +57,6 @@ bytes = "1"
 # but a test build of this crate compiles it.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 roomlerd = { path = "../../agents/roomlerd", features = ["hive-test-launcher"] }
+# FR-90 P2d-6 — the canary reads the member device's store, which its own
+# process wrote, after that process is gone.
+roomler-hive-node = { path = "../hive-node" }
