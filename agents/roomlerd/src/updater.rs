@@ -1804,6 +1804,10 @@ const TARBALL_REQUIRED: &[&str] = &["usr/bin/roomlerd", "usr/bin/roomler"];
 const TARBALL_INSTALL_IF_ABSENT: &[&str] = &[
     "usr/lib/systemd/system/roomlerd.service",
     "usr/lib/systemd/user/roomler.service",
+    // FR-96 — the update half of a per-user install.
+    "usr/lib/systemd/system/roomler-update.service",
+    "usr/lib/systemd/system/roomler-update.timer",
+    "usr/lib/systemd/system/roomler-update.path",
     // RETIRED-NAME-ANCHOR: a path INSIDE the shipped .deb; moving it needs the
     // package layout to move with it. docs/fr/FR-21
     "usr/share/doc/roomler-agent/README.Debian",
@@ -2704,13 +2708,27 @@ fn schedule_transport_retry(
 /// writes it can cause an update CHECK, never choose what gets installed.
 pub const MACOS_UPDATE_TRIGGER: &str = "/private/var/tmp/roomler-update-check";
 
+/// FR-96 — the Linux twin of [`MACOS_UPDATE_TRIGGER`], watched by
+/// `roomler-update.path`. The same rules for the same reasons: a WAKE whose
+/// content is never read.
+pub const LINUX_UPDATE_TRIGGER: &str = "/var/tmp/roomler-update-check";
+
+/// The wake file this platform's root update helper watches.
+pub fn update_trigger_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        MACOS_UPDATE_TRIGGER
+    } else {
+        LINUX_UPDATE_TRIGGER
+    }
+}
+
 /// Touch the update-helper wake file. Portable (plain fs) so the forwarder
 /// type-checks on every platform; only ever called on macOS at runtime.
 ///
 /// O_NOFOLLOW + O_EXCL-free create: /var/tmp is sticky, another local user
 /// could have planted a symlink at this exact name — refuse to write
 /// through it rather than clobber whatever it points at with our bytes.
-pub fn macos_queue_update_check() -> std::io::Result<()> {
+pub fn queue_update_check() -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -2719,7 +2737,7 @@ pub fn macos_queue_update_check() -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut f = opts.open(MACOS_UPDATE_TRIGGER)?;
+    let mut f = opts.open(update_trigger_path())?;
     // Timestamp only — human courtesy for whoever cats the file. The helper
     // never reads it (see the const doc: content is not trusted).
     writeln!(f, "{}", chrono::Utc::now().to_rfc3339())
@@ -2758,7 +2776,7 @@ async fn macos_forward_triggers(
                 // mention of the legacy paths. FR-46 P5a moved the live strings below to
                 // /var/log/roomler and /etc/roomler; the legacy /var/log/roomler-agent and
                 // /etc/roomler-agent are migrated by the .pkg postinstall. docs/fr/FR-46
-                match macos_queue_update_check() {
+                match queue_update_check() {
                     Ok(()) => tracing::info!(
                         trigger = MACOS_UPDATE_TRIGGER,
                         "rc:agent.update queued for the root update helper (com.roomler.update); \
@@ -2823,33 +2841,39 @@ pub(crate) async fn hold_daemon_for_install(socket: PathBuf, ceiling: Duration) 
     }
 }
 
-/// `roomlerd update-helper` — the body of `com.roomler.update`.
+/// `roomlerd update-helper` — the body of `com.roomler.update` on macOS, and
+/// of `roomler-update.service` on Linux (FR-96).
 ///
 /// Root-only, single-shot: consume the wake file, honour the opt-out marker
-/// and the install-storm cooldown, then check → download → verify →
-/// `installer -pkg … -target /` **waiting** on it (unlike every agent-side
-/// spawn there is nothing here the pkg replaces-and-restarts, so waiting is
-/// safe and gives us the real exit code). The pkg's postinstall restarts
-/// the agent halves; this process just reports and exits.
-#[cfg(target_os = "macos")]
+/// and the install-storm cooldown, then check → download → verify → install,
+/// **waiting** on the install (unlike every agent-side spawn there is nothing
+/// here the install replaces-and-restarts, so waiting is safe and gives the
+/// real outcome).
+/// - macOS: `installer -pkg … -target /`, whose postinstall restarts the agent
+///   halves.
+/// - Linux: the root ladder the in-process updater uses on a system install
+///   (`apt-get`/`dpkg`, or the tarball's own placement). A per-user daemon runs
+///   the new binary from its next restart.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub async fn run_update_helper() -> anyhow::Result<()> {
-    use anyhow::{Context, bail};
+    use anyhow::bail;
 
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
         bail!(
-            "update-helper must run as root (launchd system domain); euid={euid}. \
-             This subcommand is the body of com.roomler.update — it is not meant \
-             to be run by hand except as `sudo roomlerd update-helper`."
+            "update-helper must run as root (launchd's system domain on macOS, \
+             roomler-update.service on Linux); euid={euid}. It is the body of that \
+             unit, not meant to be run by hand except as `sudo roomlerd update-helper`."
         );
     }
 
     // Consume the wake file FIRST, unconditionally, content unread —
     // `remove_file` does not follow symlinks, so a planted link is deleted,
     // never dereferenced. Removing before the gates means a wake that loses
-    // to the cooldown doesn't re-fire the WatchPaths job in a tight loop.
-    let _ = std::fs::remove_file(MACOS_UPDATE_TRIGGER);
+    // to the cooldown doesn't re-fire the WatchPaths job (or, on Linux,
+    // roomler-update.path) in a tight loop.
+    let _ = std::fs::remove_file(update_trigger_path());
 
     // The operator's opt-out. postinstall removes the launchd unit when this
     // marker is set, but a loaded job can linger until reboot (it must not
@@ -2894,62 +2918,125 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
             current,
             latest,
             installer_path,
-        } => {
-            // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent
-            // sessions, and the install restarts it with every harness: hold
-            // it for its running turns first, as the in-process updater does
-            // on Linux. The hold ends when `hold` is dropped, right after the
-            // installer returns; a failed install takes prompts again.
-            let hold =
-                hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING)
-                    .await;
-            match &hold {
-                InstallHold::Held {
-                    waited_secs, cut, ..
-                } => tracing::info!(
-                    waited_secs,
-                    cut,
-                    "update-helper: the daemon holds for its agent turns"
-                ),
-                InstallHold::Without(why) => {
-                    tracing::info!(%why, "update-helper: installing without a hold")
-                }
-            }
-            record_update_attempt();
-            tracing::warn!(
-                %current,
-                %latest,
-                pkg = %installer_path.display(),
-                "update-helper: installing (installer -pkg … -target /)"
-            );
-            let status = std::process::Command::new("installer")
-                .args(["-pkg"])
-                .arg(&installer_path)
-                .args(["-target", "/"])
-                .status()
-                .context("running installer(8)");
-            drop(hold);
-            let status = status?;
-            if !status.success() {
-                // Same operator sentinel act_on_outcome raises: a failed
-                // install is otherwise invisible — the fleet version simply
-                // never moves.
-                let _ = crate::notify::raise_attention_machine_aware(&format!(
-                    "Self-update to {latest} failed (installer exited {status}) and this \
-                     Mac is still on {current}. See /var/log/install.log."
-                ));
-                bail!(
-                    "installer(8) exited {status} installing {latest}; this Mac stays on \
-                     {current}. Details: /var/log/install.log"
-                );
-            }
-            tracing::info!(
-                %latest,
-                "update-helper: installed — postinstall re-bootstrapped the agent halves"
-            );
-            Ok(())
+        } => install_from_helper(current, latest, installer_path).await,
+    }
+}
+
+/// The macOS helper's install: hold the root daemon, then `installer(8)`.
+#[cfg(target_os = "macos")]
+async fn install_from_helper(
+    current: String,
+    latest: String,
+    installer_path: PathBuf,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+    // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent sessions, and
+    // the install restarts it with every harness: hold it for its running
+    // turns first, as the in-process updater does on Linux. The hold ends
+    // when `hold` is dropped, right after the installer returns; a failed
+    // install takes prompts again.
+    let hold =
+        hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING).await;
+    match &hold {
+        InstallHold::Held {
+            waited_secs, cut, ..
+        } => tracing::info!(
+            waited_secs,
+            cut,
+            "update-helper: the daemon holds for its agent turns"
+        ),
+        InstallHold::Without(why) => {
+            tracing::info!(%why, "update-helper: installing without a hold")
         }
     }
+    record_update_attempt();
+    tracing::warn!(
+        %current,
+        %latest,
+        pkg = %installer_path.display(),
+        "update-helper: installing (installer -pkg … -target /)"
+    );
+    let status = std::process::Command::new("installer")
+        .args(["-pkg"])
+        .arg(&installer_path)
+        .args(["-target", "/"])
+        .status()
+        .context("running installer(8)");
+    drop(hold);
+    let status = status?;
+    if !status.success() {
+        // Same operator sentinel act_on_outcome raises: a failed install is
+        // otherwise invisible — the fleet version simply never moves.
+        let _ = crate::notify::raise_attention_machine_aware(&format!(
+            "Self-update to {latest} failed (installer exited {status}) and this \
+             Mac is still on {current}. See /var/log/install.log."
+        ));
+        bail!(
+            "installer(8) exited {status} installing {latest}; this Mac stays on \
+             {current}. Details: /var/log/install.log"
+        );
+    }
+    tracing::info!(
+        %latest,
+        "update-helper: installed — postinstall re-bootstrapped the agent halves"
+    );
+    Ok(())
+}
+
+/// FR-96 — the Linux helper's install: the ROOT ladder the in-process updater
+/// uses on a system install (`apt-get`/`dpkg` for the `.deb`, the tarball's own
+/// placement), waited on, then the new binary asked its version.
+///
+/// No hold: the daemon this serves runs as the user, and is not restarted by
+/// the install at all. It runs the new binary from its next restart (P2 asks
+/// it to restart once idle).
+#[cfg(target_os = "linux")]
+async fn install_from_helper(
+    current: String,
+    latest: String,
+    installer_path: PathBuf,
+) -> anyhow::Result<()> {
+    use anyhow::bail;
+    record_update_attempt();
+    tracing::warn!(
+        %current,
+        %latest,
+        package = %installer_path.display(),
+        "update-helper: installing as root"
+    );
+    // Both arms of the Linux install finish before they return (a `.deb` is
+    // waited on, the tarball is placed in-process), so the outcome is known.
+    let path = installer_path.clone();
+    let installed = tokio::task::spawn_blocking(move || spawn_installer_for_flavour_inner(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("the install did not finish: {e}"))
+        .and_then(|r| r);
+    if let Err(e) = installed {
+        let _ = crate::notify::raise_attention_machine_aware(&format!(
+            "Self-update to {latest} failed ({e:#}) and this machine is still on {current}."
+        ));
+        bail!("installing {latest} failed: {e:#}; this machine stays on {current}");
+    }
+    // What a per-user daemon will run next: the installed binary itself.
+    let version = std::process::Command::new("/usr/bin/roomlerd")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match version {
+        Some(v) if crate::post_install::version_matches(&v, &latest) => tracing::info!(
+            %latest,
+            installed = %v,
+            "update-helper: installed and verified — a per-user daemon runs it from its next restart"
+        ),
+        other => tracing::warn!(
+            %latest,
+            installed = ?other,
+            "update-helper: installed, but /usr/bin/roomlerd does not report the release it was given"
+        ),
+    }
+    Ok(())
 }
 
 // RETIRED-NAME-ANCHOR-BEGIN
@@ -3550,6 +3637,87 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(name.ends_with(".pkg"));
         let _ = name; // silence unused warning on non-matched targets
+    }
+
+    // ── FR-96: the Linux update half ─────────────────────────────────
+
+    /// The path unit must watch exactly the file the helper consumes and the
+    /// per-user daemon touches. Three copies of one string; drift between them
+    /// would leave every wake unheard, with nothing failing anywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_update_units_watch_the_helper_wake_file() {
+        assert_eq!(update_trigger_path(), LINUX_UPDATE_TRIGGER);
+        let path_unit = include_str!("../packaging/linux/roomler-update.path");
+        let watch = format!("PathExists={LINUX_UPDATE_TRIGGER}");
+        assert!(
+            path_unit.lines().any(|l| l.trim() == watch.as_str()),
+            "roomler-update.path must watch {LINUX_UPDATE_TRIGGER}"
+        );
+        assert!(
+            path_unit
+                .lines()
+                .any(|l| l.trim() == "Unit=roomler-update.service")
+        );
+        let service = include_str!("../packaging/linux/roomler-update.service");
+        assert!(service.lines().any(|l| l.trim() == "Type=oneshot"));
+        assert!(
+            service
+                .lines()
+                .any(|l| l.trim() == "ExecStart=/usr/bin/roomlerd update-helper"),
+            "roomler-update.service must run the helper"
+        );
+        // Woken by its timer and its path, never enabled on its own.
+        assert!(!service.contains("[Install]"));
+        let timer = include_str!("../packaging/linux/roomler-update.timer");
+        assert!(timer.lines().any(|l| l.trim() == "OnUnitActiveSec=6h"));
+        assert!(timer.lines().any(|l| l.trim() == "WantedBy=timers.target"));
+    }
+
+    /// Every unit ships in both packages, and the tarball installs each only
+    /// where absent, so an operator's edit survives an upgrade.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_update_units_ship_in_the_deb_and_the_tarball() {
+        let cargo = include_str!("../Cargo.toml");
+        let stage = include_str!("../../../scripts/stage-linux-tarball.sh");
+        for unit in [
+            "roomler-update.service",
+            "roomler-update.timer",
+            "roomler-update.path",
+        ] {
+            let dest = format!("usr/lib/systemd/system/{unit}");
+            assert!(
+                cargo.contains(&format!(r#"["packaging/linux/{unit}", "{dest}", "644"]"#)),
+                "the .deb assets must ship {unit}"
+            );
+            assert!(
+                stage.contains("roomler-update.service roomler-update.timer roomler-update.path"),
+                "the tarball stage must ship {unit}"
+            );
+            assert!(
+                TARBALL_INSTALL_IF_ABSENT.contains(&dest.as_str()),
+                "the tarball installs {unit} only where absent"
+            );
+        }
+    }
+
+    /// The helper is root's alone. Run as anyone else it refuses before it
+    /// touches the wake file, the network or the install.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_update_helper_refuses_to_run_as_anyone_but_root() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // A root runner would go on to the network; the refusal is the
+            // only thing under test here.
+            return;
+        }
+        let err = run_update_helper().await.expect_err("must refuse non-root");
+        assert!(
+            err.to_string().contains("must run as root"),
+            "unexpected refusal: {err:#}"
+        );
     }
 
     // ── Linux .deb install candidates ───────────────────────────────

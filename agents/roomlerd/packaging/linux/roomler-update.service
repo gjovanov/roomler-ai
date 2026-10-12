@@ -1,0 +1,29 @@
+[Unit]
+# FR-96 — the UPDATE HALF of a per-user install: `roomlerd update-helper`, as
+# root, once per wake. The systemd twin of the macOS `com.roomler.update`
+# LaunchDaemon (agents/roomlerd/packaging/macos/com.roomler.update.plist).
+#
+# Why it exists: a per-user daemon runs as the user, and writing /usr needs
+# root, whichever format the host takes (the .deb or the tarball). So a
+# per-user install could never update itself unattended (#2046). This unit is
+# the missing root half of updating, and nothing else: no enrollment, no
+# control channel, no device row. It resolves the PUBLIC release feed,
+# verifies what it downloads against the pinned release key, installs, and
+# exits.
+#
+# Woken by roomler-update.timer (boot, then every 6 h) and roomler-update.path
+# (the wake file a per-user daemon touches). Shipped DISABLED: install.sh
+# enables the timer and the path for a per-user install only. A system
+# install's root daemon updates itself, and a host has one updater.
+#
+# The operator's opt-out is the macOS one: /etc/roomler/disable-auto-update.
+# The helper itself honours it, so this unit needs no condition of its own.
+Description=Roomler update helper (root) — installs new releases for a per-user install
+Documentation=https://roomler.ai/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/roomlerd update-helper
+Environment=RUST_LOG=info

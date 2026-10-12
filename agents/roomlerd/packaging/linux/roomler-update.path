@@ -1,0 +1,16 @@
+[Unit]
+# FR-96 — the on-demand wake of roomler-update.service: the twin of the macOS
+# helper's WatchPaths. A per-user daemon is not root, so it touches this file
+# instead of installing. /var/tmp is sticky and world-writable ON PURPOSE: the
+# file is a WAKE, and its content is never read. Whoever writes it can cause an
+# update CHECK as root, never choose what gets installed: the helper resolves
+# and verifies the release itself, and its install-storm cooldown bounds spam.
+# The helper deletes the file first thing, which re-arms this unit.
+Description=Roomler update helper — a check on demand
+
+[Path]
+PathExists=/var/tmp/roomler-update-check
+Unit=roomler-update.service
+
+[Install]
+WantedBy=paths.target
