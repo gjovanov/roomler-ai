@@ -77,6 +77,39 @@ fn pending(s: &AgentSession) -> Vec<(ObjectId, HiveReplicaRole)> {
         .collect()
 }
 
+/// P2d-5 — the member whose copy serves a view of `s` when its primary
+/// cannot: of the members that took their copy (`joined`, never the
+/// primary) and that `serves` says can serve one, the freshest by the tip it
+/// last reported, the fence first and then the seq; an archive replica on a
+/// tie (design §5.2), then the lowest device id, so the choice is the same
+/// every time. A member that has reported no tip ranks below any that has.
+/// Its tip is the device's claim, which only orders the members: it reads
+/// its own copy, and the device serves what it holds.
+pub(crate) fn freshest_copy(
+    s: &AgentSession,
+    serves: impl Fn(ObjectId) -> bool,
+) -> Option<ObjectId> {
+    let primary = s.location.device_id;
+    s.replicaset
+        .as_ref()?
+        .members
+        .iter()
+        .filter(|m| {
+            m.device_id != primary
+                && m.role != MemberRole::Primary.as_str()
+                && m.state == MemberState::Joined
+        })
+        .filter(|m| serves(m.device_id))
+        .max_by_key(|m| {
+            (
+                m.tip.as_ref().map(|t| (t.fence, t.seq)),
+                m.role == MemberRole::Archive.as_str(),
+                std::cmp::Reverse(m.device_id),
+            )
+        })
+        .map(|m| m.device_id)
+}
+
 /// Push one join. `false` = it did not leave: the device is not connected
 /// here, or this connection does not take it (a member's that holds no
 /// copies, a primary's that runs no Hive). It stays owed either way, and goes
@@ -341,6 +374,120 @@ mod tests {
                 placed_at: now,
             }),
         }
+    }
+
+    /// A member in `role`, `state`, whose copy last ended at `fence`, `seq`.
+    fn tipped(role: MemberRole, state: MemberState, fence: i64, seq: i64) -> ReplicaMember {
+        ReplicaMember {
+            tip: Some(MemberTip {
+                fence,
+                seq,
+                hash: "0".repeat(64),
+                checkpoint_seq: None,
+                checkpoint_hash: None,
+                at: DateTime::now(),
+            }),
+            ..member(role, state)
+        }
+    }
+
+    /// P2d-5 — the copy that serves a view: of the joined members that can
+    /// serve, the freshest, the fence before the seq; one with no tip below
+    /// any with one; an archive replica on a tie, then the lowest device id.
+    /// Never the device the session runs on, a row whose role says primary,
+    /// or a member still pending or leaving: each asked about on its own, so
+    /// that no one rule hides another.
+    #[test]
+    fn the_freshest_member_that_can_serve_reads_the_copy() {
+        use MemberRole::{Archive, Owner, Primary};
+        use MemberState::{Joined, Leaving, Pending};
+        let all = |_: ObjectId| true;
+        // The rows that may never serve rank below every other: a rule left
+        // out shows only where it is asked about.
+        let s = session(vec![
+            tipped(Primary, Joined, 1, 1),
+            tipped(Owner, Joined, 1, 80),
+            tipped(Owner, Joined, 2, 10),
+            tipped(Owner, Pending, 1, 1),
+            tipped(Owner, Leaving, 1, 1),
+            member(Owner, Joined),
+        ]);
+        let m = &s.replicaset.as_ref().unwrap().members;
+        // The member with no tip stays out of these two: where it ranks is
+        // asked about below, on its own.
+        let tipped_only = |d: ObjectId| d != m[5].device_id;
+        assert_eq!(
+            freshest_copy(&s, tipped_only),
+            Some(m[2].device_id),
+            "a newer fence before a higher seq"
+        );
+        assert_eq!(
+            freshest_copy(&s, |d| tipped_only(d) && d != m[2].device_id),
+            Some(m[1].device_id),
+            "the next freshest, when the freshest cannot serve"
+        );
+        assert_eq!(
+            freshest_copy(&s, |d| d == m[1].device_id || d == m[5].device_id),
+            Some(m[1].device_id),
+            "one with no tip below any with one"
+        );
+        assert_eq!(
+            freshest_copy(&s, |d| d == m[5].device_id),
+            Some(m[5].device_id),
+            "and chosen when it is all there is"
+        );
+        assert_eq!(
+            freshest_copy(&s, |d| d == m[3].device_id || d == m[4].device_id),
+            None,
+            "never a member pending or leaving"
+        );
+
+        // The device it runs on, whatever its row says; a row that says
+        // primary, wherever the session runs.
+        let mut moved = session(vec![
+            tipped(Primary, Joined, 1, 5),
+            tipped(Owner, Joined, 1, 9),
+        ]);
+        let (row, runs_on) = {
+            let mm = &moved.replicaset.as_ref().unwrap().members;
+            (mm[0].device_id, mm[1].device_id)
+        };
+        moved.location.device_id = runs_on;
+        assert_eq!(
+            freshest_copy(&moved, |d| d == runs_on),
+            None,
+            "never the device it runs on, whatever its member row says"
+        );
+        assert_eq!(
+            freshest_copy(&moved, |d| d == row),
+            None,
+            "never a row whose role says primary"
+        );
+
+        let tie = session(vec![
+            tipped(Primary, Joined, 1, 5),
+            tipped(Owner, Joined, 1, 5),
+            tipped(Archive, Joined, 1, 5),
+            tipped(Owner, Joined, 1, 5),
+        ]);
+        let t = &tie.replicaset.as_ref().unwrap().members;
+        assert_eq!(
+            freshest_copy(&tie, all),
+            Some(t[2].device_id),
+            "an archive replica on a tie"
+        );
+        assert_eq!(
+            freshest_copy(&tie, |d| d != t[2].device_id),
+            Some(t[1].device_id.min(t[3].device_id)),
+            "then the lowest device id"
+        );
+        let mut unplaced = tie.clone();
+        unplaced.replicaset = None;
+        assert_eq!(
+            freshest_copy(&unplaced, all),
+            None,
+            "no replicaset, no copy"
+        );
     }
 
     /// A session alone on its primary is not replicated; one with any other

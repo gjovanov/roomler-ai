@@ -1719,6 +1719,12 @@ impl Supervisor {
         self.cfg.enabled
     }
 
+    /// P2d-5 — the device's own `hive_replica`: it holds copies of its
+    /// owner's sessions run elsewhere, and serves a viewer from them.
+    pub(crate) fn holds_copies(&self) -> bool {
+        self.cfg.replica
+    }
+
     pub(crate) fn store_handle(&self) -> Result<StoreHandle, String> {
         self.store.clone()
     }
