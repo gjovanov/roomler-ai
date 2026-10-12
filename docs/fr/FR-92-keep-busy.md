@@ -1,6 +1,6 @@
 # FR-92: Keep busy — the agent keeps a host active with mouse patterns, and any real user takes over at once
 
-**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** in progress — P0–P9 shipped (0.4.126, 2026-10-11), #1991 in 0.4.127, P10 (a local On) in 0.4.129, P10b (SYSTEM never starts it) in 0.4.130; field-verified (§9), macOS, 24 h of EDR and P10b's negative control included. Owed before the close: the field gaps listed under "Still owed" (AC2's Teams clause, AC9's two reasons, AC12's other clauses)
+**Issue:** [#1942](https://github.com/gjovanov/roomler-ai/issues/1942) · **Status:** **closed (2026-10-13)** — P0–P9 shipped in 0.4.126, #1991 in 0.4.127, P10 (a local On) in 0.4.129, P10b (SYSTEM never starts it) in 0.4.130. Field-verified (§9, rows 1–57) on Windows, macOS, GNOME on Xorg and Wayland, and KDE Plasma; every criterion ticked (§5)
 · **Owner:** remote desktop (agent + viewer), fleet (the org switch) · **Anchors:**
 master `83aede0bd` · **Builds on:** [FR-55](FR-55-always-reachable.md) (power),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent, the companion banner, the person socket),
@@ -333,60 +333,69 @@ stateDiagram-v2
 | P8 | **The default pattern**: circle stays the product default; `TenantSettings.keep_busy_default_pattern` lets an org choose another, validated by **equality** against the agent's 13 wire names, `null` clears, absent leaves alone; the settings `GET` becomes readable by any member so the viewer can pre-select it (`PUT` stays `MANAGE_TENANT`). No agent and no wire change: the menu pre-selects the org default only where the person has no remembered choice; a fetch failure means circle | unset the default (= circle) | #1977 open |
 | P9 | **GNOME on Wayland** (and GNOME on Xorg under a root daemon) through the arbiter's uinput device: a normalised move (`KbOp::MoveNorm`), Mutter's idle clock and layout asked by `portal-helper --keep-busy` inside the person's session, a **blind** host (`Host::blind`). Plus the GDM/Xorg lock fix found in the field: `logind::pick` | `uinput = false` (the GNOME host needs the uinput device); the cap word | #1978, merged `b2b715a50` |
 | P10 | **A local On** (operator, 2026-10-11). The person at the computer turns it on from the tray's "Start keep busy" or with `roomler keep-busy on [--pattern …]`. LocalAPI `KeepBusyOn`, gated to the console person: never root (`roomler exec` on Unix), never session 0, never relayed by a supervised Mac's root daemon. It names "the person at this computer". The server still has no "on". ⚠️ On Windows a `roomler exec` runs in the console session and passes the gate (§3g) | `keep_busy_enabled = false` and an org deny refuse it, as they refuse a viewer's | #2009, merged `63461d575`; released in **0.4.129** |
-| P10b | **SYSTEM never** (operator, 2026-10-12, §6). The Windows pipe listener reads the client's account from its token at accept time (`ClientPeer::system_account`). SYSTEM, LocalService, NetworkService, or an account that cannot be read, are refused keep busy's On, wherever they run. That closes `roomler exec` in SystemContext mode. No environment marker. Plus a Windows CI step for the LocalAPI crate, whose Windows tests ran in no lane | `keep_busy_enabled = false` and an org deny, as for P10; no switch of its own (a refusal, and only of SYSTEM) | this PR; rides the next release |
+| P10b | **SYSTEM never** (operator, 2026-10-12, §6). The Windows pipe listener reads the client's account from its token at accept time (`ClientPeer::system_account`). SYSTEM, LocalService, NetworkService, or an account that cannot be read, are refused keep busy's On, wherever they run. That closes `roomler exec` in SystemContext mode. No environment marker. Plus a Windows CI step for the LocalAPI crate, whose Windows tests ran in no lane | `keep_busy_enabled = false` and an org deny, as for P10; no switch of its own (a refusal, and only of SYSTEM) | #2037, merged `60f511d75`; released in **0.4.130**; field-verified with its negative control (§9 rows 50–51) |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1:** turning it on in the viewer starts it on the host, and every connected viewer shows the
+- [x] **AC1:** turning it on in the viewer starts it on the host, and every connected viewer shows the
   same live state.
-- [ ] **AC2:** while it runs, host idle time stays under 2 s on Windows, macOS and X11, measured. The
-  negative control (OFF ⇒ the host locks and Teams goes Away) is recorded first.
-- [ ] **AC3:** local input (move, click, scroll, typing) and controller input each pause it within 1 s. It
+- [x] **AC2:** while it runs, host idle time stays under 2 s on Windows, macOS and X11, measured. The
+  negative control (OFF ⇒ the host locks at its idle delay) is recorded first. *Reworded 2026-10-13
+  (operator):* the lock replaced "and Teams goes Away", which no lab host could show (none runs
+  Teams). Teams' and Slack's Away read the same OS idle clock that the lock does.
+- [x] **AC3:** local input (move, click, scroll, typing) and controller input each pause it within 1 s. It
   resumes after `resume_after`, and never while the screen is locked or a mouse button is held.
   *Accepted limit (operator, 2026-10-11):* on Windows, a single isolated key tap that lands in the same
   `GetLastInputInfo` tick (15.6 ms) as one of keep busy's own moves reads as that move and does not
   pause it (1 of 9 in the field). A second key, a click or any pointer motion does.
-- [ ] **AC4:** it survives a disconnect, a daemon self-update and a reboot (resuming at the same
+- [x] **AC4:** it survives a disconnect, a daemon self-update and a reboot (resuming at the same
   person's next login).
-- [ ] **AC5:** `keep_busy_enabled = false` withdraws the `keep-busy` cap word, so every surface that reads it
+- [x] **AC5:** `keep_busy_enabled = false` withdraws the `keep-busy` cap word, so every surface that reads it
   hides keep busy; a viewer already connected shows the owner's reason ("Turned off on this computer")
   instead of a working control; every enable is refused; and the server cannot change that key
   (reworded 2026-10-11, operator: the connected viewer is told why rather than finding it gone).
-- [ ] **AC6:** an org deny refuses new enables and stops running instances, including on devices that
+- [x] **AC6:** an org deny refuses new enables and stops running instances, including on devices that
   reconnect later and across pods.
-- [ ] **AC7:** the tray's Stop and `roomler keep-busy status|off` work, including through a Linux
+- [x] **AC7:** the tray's Stop and `roomler keep-busy status|off` work, including through a Linux
   system install's person socket.
-- [ ] **AC8:** no hook or raw-input API is used. A source-scan unit test passes (proven to fail on a
+- [x] **AC8:** no hook or raw-input API is used. A source-scan unit test passes (proven to fail on a
   planted line), the binary's import diff against the previous release is clean, and EDR stays quiet
   for 24 h on the corporate laptop.
-- [ ] **AC9:** Wayland and portal-only hosts that keep busy cannot drive report `unavailable` with a
+- [x] **AC9:** Wayland and portal-only hosts that keep busy cannot drive report `unavailable` with a
   reason the viewer shows (`wayland` without the uinput path; `no_idle_clock` on a desktop with no idle
   clock a helper can read).
-- [ ] **AC14 (P10):** the person at the computer turns it on from the tray's "Start keep busy", and
+- [x] **AC14 (P10):** the person at the computer turns it on from the tray's "Start keep busy", and
   with `roomler keep-busy on` (any pattern, checked by the viewer's parser), on Windows and on a
   supervised Mac. Every connected viewer shows "turned on by the person at this computer". A root or
   SYSTEM caller is refused (reworded 2026-10-12, operator). On an attended Windows install,
   `roomler exec` runs as the signed-in user and is admitted until #2021 decides exec's identity. The
   owner's switch and an org deny refuse a local start as they refuse a viewer's.
-- [ ] **AC13 (P9):** on GNOME on Wayland, through a system install with uinput on, keep busy runs:
+- [x] **AC13 (P9):** on GNOME on Wayland, through a system install with uinput on, keep busy runs:
   the negative control (OFF ⇒ GNOME locks at its idle delay) recorded first, then ON ⇒ no lock and
   Mutter's idle clock under 2 s, and a local key pauses it within 1 s.
-- [ ] **AC10:** docs updated or created with mermaid diagrams (`docs/keep-busy.md`: the state machine,
+- [x] **AC10:** docs updated or created with mermaid diagrams (`docs/keep-busy.md`: the state machine,
   the sequence, the gates) and linked from `docs/README.md`; the configuration reference covers
   `keep_busy_enabled`.
-- [ ] **AC11 (P7):** the history records every on and off a device reports (with who and the pattern,
+- [x] **AC11 (P7):** the history records every on and off a device reports (with who and the pattern,
   and the reason for an off) and every change to the org's settings (naming the admin, only on a
   change), survives the device's removal, is readable only with `MANAGE_AGENTS` and only within the
   tenant, pages by `before`, and is never aged out — field-verified on a release: a device turned on
   and off from the viewer shows two rows with the right names within one heartbeat.
-- [ ] **AC12 (P8):** an org's default pattern is what a viewer's menu pre-selects on a device the
+- [x] **AC12 (P8):** an org's default pattern is what a viewer's menu pre-selects on a device the
   person has no remembered choice on; a person's own last choice wins over it; `null` clears it to
   circle; an unknown pattern is refused; a plain member can read the setting and cannot set it.
+  *Evidence (operator, 2026-10-13):* the pre-select, `null` and the refusal of an unknown pattern are
+  field-proven (§9 row 25; prod HTTP 400, 2026-10-12). Two clauses are accepted on test-level evidence:
+  a plain member's read but not set (`keep_busy_tests.rs`), and a remembered choice winning
+  (`KeepBusyMenu.spec.ts`). The vmtest org has no member account, and none is created on production
+  for a test.
 
 ## 6. Open decisions
 
-- **Whether the arbiter should stop caching a `NoopInjector`.** That would harden RC input as well, but
-  it changes RC behaviour and needs its own test and field check.
+- **Whether the arbiter should stop caching a `NoopInjector`** → **deferred to #2066** at the close
+  (2026-10-13). Keep busy's own path already refuses to cache an injector without permission
+  (`keep_busy_op`). The open question is RC's path (`get_or_insert_with(open_default)`), which changes
+  RC behaviour, needs its own test and field check, and is not FR-92's.
 **Resolved 2026-10-12 (operator: "do per recommendation and proceed"):**
 - *How an On started through `roomler exec` is handled* (§3g, §9 row 43). The decision is an
   **identity check now, #2021's FR later, and no marker**.
@@ -558,6 +567,16 @@ the console session, reached through an interactive scheduled task (`/IT`, the l
 | 54 | **P10b: no regression for the person on an attended install** | the Win11 PC on 0.4.131 (it had auto-updated) | The person's own `roomler keep-busy on` ran (`set_by` "the person at this computer"), and `off` stopped it ✅: the account check reads a user's own token. Exec there, as the signed-in user in session 1, still passes, as documented (§3g) |
 | 55 | **AC8: the source scan fails on a planted line** | `no_keylogger_shaped_api_anywhere_in_keep_busy`, run locally on master `37d6d9b26` in a throwaway worktree | A real constant, `"SetWindowsHookExW"` (not a comment), was planted in `host_win.rs`, and the plant was confirmed to be there. The test **failed**, `host_win.rs:161: uses SetWindowsHookEx`. Restored (no diff), it passed ✅. With row 17's import diff and row 44's EDR window, every clause of AC8 has its evidence |
 
+**AC9 on KDE Plasma, 2026-10-12**: the FR-93 lab's `wlab-kde-sys` (Fedora 44, KDE Plasma 6 on Wayland,
+a system install of 0.4.130), with the lab owner's agreement. "The person" is the autologin user, whose
+`roomler` reaches the system install's person socket. The guest was used as found, returned to stock
+afterwards (`uinput` unset, keep busy off), and shut down.
+
+| # | Cell | Host | Result |
+|---|---|---|---|
+| 56 | **AC9: `wayland`**, a Wayland desktop without the uinput path | `wlab-kde-sys` as found: stock, no `uinput` key | The person's `roomler keep-busy on` answered `phase: unavailable`, **`reason: wayland`**: "Unavailable on this Wayland desktop: here keep busy needs the system service with uinput input turned on, on GNOME." Twelve seconds later it was unchanged ✅ |
+| 57 | **AC9: `no_idle_clock`**, a desktop whose idle clock no helper can read | the same guest with `uinput = true` (one restart) | The person's On answered `phase: unavailable`, **`reason: no_idle_clock`**: "Unavailable: this desktop does not report when it was last used, so a person could not take over." The daemon logged `no X display to drive — asking the GNOME session`, then `GNOME session helper up idle_clock=false geometry=false`: KWin has no idle monitor for the helper to read ✅. A connected viewer shows that sentence as it shows every unavailable reason (rows 14, 22) |
+
 Wrong turns, recorded so nobody repeats them:
 - **On Windows, `roomler exec` is not SYSTEM in session 0.** P10's gate was designed on that belief,
   which `docs/fleet-rpc.md` stated. Exec runs in the worker that holds the agent socket, inside the
@@ -585,26 +604,16 @@ Wrong turns, recorded so nobody repeats them:
   release build hits rustc 1.95's ICE in the dead-code lint (`check_mod_deathness`, modules
   `clipboard` and `encode::policy`). CI's lines carry the feature or the flag.
 
-Still owed before the close (a re-read of every criterion against its rows, 2026-10-12):
-- **AC2, its Teams clause.** The negative control recorded on every host is the screen **locking**
-  (rows 1, 8, 12, 30). "Teams goes Away" was never measured, because no lab host runs Teams. Either
-  measure it on a host with Teams, or reword the clause to the lock on the operator's word.
-- **AC9, both reasons.** Row 11 answered `unsupported`, not `wayland`, and P9 then made GNOME on
-  Wayland run. Still unmeasured: `wayland` on a Wayland desktop without the uinput path, and
-  `no_idle_clock` on KDE or wlroots.
-- **AC12, the clauses past the pre-select** (row 25). "An unknown pattern is refused" is now
-  field-proven: on prod, as the vmtest org's admin, a PUT of `"no-such-pattern"` answered **HTTP 400**,
-  "Unknown keep-busy pattern; one of: circle, …, shuffle", and the setting stayed `null` (2026-10-12).
-  Two clauses rest on tests:
-  - **a plain member can read but not set**: `keep_busy_tests.rs`, where a member's PUT gets 403 and
-    any member may read (`the_default_pattern_is_validated_and_any_member_may_read`). The vmtest org
-    has no member account, and none is created on production for a test;
-  - **a person's remembered choice wins**: `KeepBusyMenu.spec.ts`, "a person's remembered choice for
-    the device wins over the org default".
+Nothing is owed. FR-92 closed on 2026-10-13, after a re-read of every criterion against its rows
+(2026-10-12) and the operator's three calls on what that re-read left open ("do per your
+recommendation", 2026-10-13):
+- **AC2's Teams clause** was reworded to the lock, the negative control recorded on every host
+  (rows 1, 8, 12, 30). No lab host runs Teams.
+- **AC9's two reasons** were measured on KDE Plasma (rows 56–57).
+- **AC12's member and remembered-choice clauses** were accepted on their tests. "An unknown pattern is
+  refused" was field-proven on prod (HTTP 400, the setting stayed `null`).
 
-  Whether test-level evidence closes these two is the operator's call.
-
-Proven so far:
+Proven:
 - macOS: rows 30–37.
 - The releases 0.4.127 and 0.4.129, and the root CLI on a supervised Mac (#1991): rows 38–41.
 - P10 for the person, on a supervised Mac and on Windows: rows 42–43.
@@ -616,6 +625,7 @@ Proven so far:
 - **AC8, every clause**: the planted line (row 55), the import diff (row 17), and 24 h of EDR (row 44).
 - AC11 and AC12, on prod: rows 25–26.
 - AC4's self-update, and AC9/AC13 on the released 0.4.126: rows 28–29.
+- **AC9's two reasons** on KDE Plasma, `wayland` and `no_idle_clock`: rows 56–57.
 
 AC3 and AC5 were reworded on the operator's go (2026-10-11, "proceed per your recommendation"):
 - **AC3** keeps "within 1 s" for moves, clicks, scrolls and typing, and states the accepted limit: on
@@ -630,10 +640,11 @@ AC3 and AC5 were reworded on the operator's go (2026-10-11, "proceed per your re
 - FR-55: keep-busy overrides `power_policy = never` (§3f).
 - FR-27, FR-85, FR-43, and the P6 arbiter (`input/arbiter.rs`).
 - #1738: the lock monitor is session-scoped.
-- **Found along the way, filed separately:** the arbiter's release-all on session close sends a
-  button-up at (0,0), and dispatch moves first. So a session that closes mid-drag throws the cursor
-  into the top-left corner, a hot corner on GNOME and macOS (`arbiter.rs` L109-118,
-  `enigo_backend.rs` L128-138).
+- **Found along the way, filed separately:** #1945, fixed and closed. The arbiter's release-all on
+  session close sent a button-up at (0,0), and dispatch moved first, so a session that closed mid-drag
+  threw the cursor into the top-left corner, a hot corner on GNOME and macOS (`arbiter.rs` L109-118,
+  `enigo_backend.rs` L128-138, as of the anchors above).
+- **Deferred at the close:** #2066, RC input caching a `NoopInjector` for the life of the process (§6).
 - **Found in P10's field test, filed separately:** #2021. On Windows, Fleet RPC runs as the worker,
   because the worker holds the agent socket. That is the signed-in user on an attended install, or
   SYSTEM in the console session in SystemContext mode, never session 0. The docs, the CLI help and
