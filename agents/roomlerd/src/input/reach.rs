@@ -121,9 +121,10 @@ pub(crate) struct Facts {
     pub x: XServer,
 }
 
-const WAYLAND_FIX: &str = "On a system install switch on uinput; on a per-user one, \
-     portal_capture with portal_input (the person at the screen allows Remote \
-     Interaction once).";
+const WAYLAND_FIX: &str = "On a system install switch on uinput. A per-user one asks \
+     the person at the screen for remote control by itself, unless portal_input or \
+     mutter_input is set to false: reconnect, and allow remote control when the \
+     desktop asks.";
 
 /// The fix where KWin gates XTest. The narrow grant, not the global switch:
 /// it names this agent and nothing else. KWin reads it when Xwayland starts,

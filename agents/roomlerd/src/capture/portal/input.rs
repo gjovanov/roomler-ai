@@ -198,6 +198,44 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
     }
 }
 
+/// FR-93 P4b — the bus name xdg-desktop-portal-kde owns while it runs. On a KDE
+/// session the portal's RemoteDesktop calls reach KWin through it.
+const KDE_PORTAL_IMPL: &str = "org.freedesktop.impl.portal.desktop.kde";
+
+/// FR-93 P4b — where a RemoteDesktop backend departs from the portal's own
+/// conventions on its way to the compositor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendQuirks {
+    /// xdg-desktop-portal-kde negates the VERTICAL SMOOTH scroll delta
+    /// (`requestPointerAxis`: `wl_fixed_from_double(-y)`), while the portal's
+    /// convention, GNOME's backend, KDE's own horizontal axis and its discrete
+    /// path all keep positive = down/right. Measured on Plasma 6.7: a wheel
+    /// notch down (`dy = +120`) reached the probe as `-120`, up.
+    pub negated_smooth_y: bool,
+}
+
+/// FR-93 P4b — undo a backend's departure, so the call reaches the compositor
+/// meaning what the portal's convention says it means.
+pub fn for_backend(call: PortalCall, quirks: BackendQuirks) -> PortalCall {
+    match call {
+        PortalCall::Axis { dx, dy } if quirks.negated_smooth_y => PortalCall::Axis { dx, dy: -dy },
+        other => other,
+    }
+}
+
+/// FR-93 P4b — is KDE's portal backend the one on this session's bus? Read
+/// from the bus daemon, which starts nothing. Any error reads as "no": the
+/// calls then go out as the portal's convention has them.
+fn kde_backend(conn: &zbus::blocking::Connection) -> bool {
+    let Ok(bus) = zbus::blocking::fdo::DBusProxy::new(conn) else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(KDE_PORTAL_IMPL) else {
+        return false;
+    };
+    bus.name_has_owner(name).unwrap_or(false)
+}
+
 /// FR-93 P4 — `NotifyPointerAxis` flags on mutter's RemoteDesktop session:
 /// `1` finish, `2` wheel, `4` finger, `8` continuous. With no source flag
 /// mutter assumes a FINGER (a touchpad gesture, which a `FINISH` ends and
@@ -277,6 +315,9 @@ pub struct InputContext {
     /// The space `MotionAbs` coordinates are in: the portal stream's logical
     /// size, or a mutter stream's own size.
     pub logical: (f64, f64),
+    /// FR-93 P4b — what the portal's backend does to the calls (none for
+    /// mutter, which is no portal).
+    pub quirks: BackendQuirks,
 }
 
 impl InputContext {
@@ -292,10 +333,17 @@ impl InputContext {
             super::PORTAL_PATH,
             super::REMOTE_DESKTOP_IFACE,
         )?;
+        // FR-93 P4b — kill switch `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0`, should
+        // KDE's backend ever stop negating.
+        let quirks = BackendQuirks {
+            negated_smooth_y: tunnel_core::env::flag("PORTAL_KDE_SCROLL_FIX", true)
+                && kde_backend(conn),
+        };
         Ok(Self {
             proxy,
             target: Target::Portal { session, node_id },
             logical,
+            quirks,
         })
     }
 
@@ -323,6 +371,7 @@ impl InputContext {
                 stream: input.stream.as_str().to_string(),
             },
             logical: space,
+            quirks: BackendQuirks::default(),
         })
     }
 
@@ -343,7 +392,7 @@ impl InputContext {
             Target::Mutter { stream } => return self.execute_mutter(call, stream),
         };
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        match call {
+        match for_backend(call, self.quirks) {
             PortalCall::MotionAbs { x, y } => self
                 .proxy
                 .call_noreply("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
@@ -409,6 +458,23 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
     let mut executed = 0u64;
     let mut nonascii_keysyms = 0u64;
     let mut warned_nonascii = false;
+    if ctx.quirks.negated_smooth_y {
+        eprintln!(
+            "portal-helper: KDE's portal backend negates the vertical smooth scroll; negating it \
+             first (ROOMLERD_PORTAL_KDE_SCROLL_FIX=0 stops this)"
+        );
+    }
+    // FR-93 P4b — `ROOMLERD_PORTAL_INPUT_TRACE=1`: every event and every call
+    // made for it, on the wall clock, so a lab can line what was SENT up against
+    // what a probe RECEIVED. Off by default: a keystroke log does not belong in
+    // a journal.
+    let trace = tunnel_core::env::flag("PORTAL_INPUT_TRACE", false);
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -445,8 +511,19 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
                 }
             }
         }
+        if trace {
+            eprintln!("portal-helper: input-trace {:.4} event {msg:?}", wall());
+        }
         for call in plan(&msg, ctx.logical, &mut wheel) {
-            match ctx.execute(call) {
+            let done = ctx.execute(call);
+            if trace {
+                eprintln!(
+                    "portal-helper: input-trace {:.4} call {call:?} {}",
+                    wall(),
+                    if done.is_ok() { "sent" } else { "FAILED" }
+                );
+            }
+            match done {
                 Ok(()) => executed += 1,
                 Err(e) => {
                     failed_calls += 1;
@@ -689,6 +766,42 @@ mod tests {
             mutter_call(PortalCall::AxisDiscrete { axis: 0, steps: -2 }),
             Some(MutterCall::AxisDiscrete { axis: 0, steps: -2 }),
             "negative steps are up, as on the portal"
+        );
+    }
+
+    /// FR-93 P4b — KDE's backend negates the vertical smooth scroll, so the
+    /// call is negated first for it, and only for it: the horizontal axis and
+    /// the discrete detents pass through, as they do in KDE's backend.
+    #[test]
+    fn only_kdes_vertical_smooth_scroll_is_negated() {
+        let kde = BackendQuirks {
+            negated_smooth_y: true,
+        };
+        assert_eq!(
+            for_backend(PortalCall::Axis { dx: 4.0, dy: 120.0 }, kde),
+            PortalCall::Axis {
+                dx: 4.0,
+                dy: -120.0
+            }
+        );
+        let discrete = PortalCall::AxisDiscrete { axis: 0, steps: 1 };
+        assert_eq!(
+            for_backend(discrete, kde),
+            discrete,
+            "KDE does not negate detents"
+        );
+        let button = PortalCall::Button {
+            code: 0x110,
+            down: true,
+        };
+        assert_eq!(for_backend(button, kde), button);
+        assert_eq!(
+            for_backend(
+                PortalCall::Axis { dx: 4.0, dy: 120.0 },
+                BackendQuirks::default()
+            ),
+            PortalCall::Axis { dx: 4.0, dy: 120.0 },
+            "every other backend keeps the portal's convention"
         );
     }
 
