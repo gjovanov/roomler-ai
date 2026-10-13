@@ -75,6 +75,10 @@ impl PortalOpen {
             // where capture-only works, to buy an input path that has not yet
             // been field-proven to land. Off by default keeps capture
             // byte-for-byte P3c; a host that wants input turns it on.
+            // ⚠️ This is the CONFIGURED arm's rule. The automatic portal (FR-93
+            // P4b, `capture::auto_portal_input`) asks for remote control unless
+            // `portal_input = false`: nothing was granted there before, so its
+            // first dialog may as well ask for both.
             input,
             // FR-45 P5 — take frames from mutter's own ScreenCast API instead
             // of the portal. ⚠️⚠️ UNATTENDED: it shows no consent dialog.

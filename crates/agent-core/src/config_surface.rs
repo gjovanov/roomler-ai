@@ -1158,7 +1158,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "tribool",
-        description: "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. NOTE (measured on GNOME): this key alone is not enough - the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
+        description: "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Unset, it depends on who chose the portal arm (FR-93 P4b): the AUTOMATIC portal (wayland_auto, a per-user session where mutter is absent, such as KDE) asks for remote control in its one dialog, and false keeps it a screen share; a CONFIGURED portal_capture takes input only with this key true, because an input session needs its own grant and restore token, so switching it on makes an already-granted screen share ask again. A person who refuses remote control is then asked for the screen only: input never costs capture. On a configured mutter arm (mutter_capture) it means mutter's own RemoteDesktop. NOTE (measured on GNOME): the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
     },
     KeyMeta {
         key: "mutter_capture",
@@ -1190,7 +1190,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
+        description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3); it asks for remote control, unless portal_input is false (P4b). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
     },
     KeyMeta {
         key: "mutter_input",

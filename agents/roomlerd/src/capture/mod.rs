@@ -733,6 +733,9 @@ pub(crate) struct ArmFacts {
     pub portal_via_mutter: bool,
     /// `portal_input`: a portal (or configured mutter) arm carries input.
     pub portal_input: bool,
+    /// FR-93 P4b — the automatic portal asks for remote control
+    /// ([`auto_portal_input`]: on unless `portal_input = false`).
+    pub auto_portal_input: bool,
     /// FR-93 P4 — `mutter_input` (default on): a mutter arm's input rides
     /// mutter's RemoteDesktop.
     pub mutter_input: bool,
@@ -775,14 +778,16 @@ pub(crate) fn planned_arm(f: &ArmFacts) -> Option<CaptureArm> {
 /// FR-93 P4 — the RemoteDesktop route a session opened now would register, in
 /// the arm's own terms: the automatic mutter arm carries mutter's input unless
 /// `mutter_input` is off; a configured mutter arm carries it with
-/// `portal_input` too; a portal arm (automatic or configured) carries the
-/// portal's with `portal_input`. `None`: the OS injector decides, as before.
+/// `portal_input` too; the automatic portal carries the portal's unless
+/// `portal_input = false` (P4b); a configured portal arm carries it with
+/// `portal_input`. `None`: the OS injector decides, as before.
 #[cfg(target_os = "linux")]
 pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::RouteKind> {
     use crate::input::reach::RouteKind;
     match planned_arm(f)? {
         CaptureArm::Mutter if f.auto_mutter => f.mutter_input.then_some(RouteKind::Mutter),
         CaptureArm::Mutter => (f.portal_input && f.mutter_input).then_some(RouteKind::Mutter),
+        CaptureArm::Portal if f.auto_portal => f.auto_portal_input.then_some(RouteKind::Portal),
         CaptureArm::Portal => f.portal_input.then_some(RouteKind::Portal),
         CaptureArm::Drm | CaptureArm::X11 => None,
     }
@@ -833,6 +838,7 @@ pub(crate) fn arm_facts(
         portal: cfg!(feature = "portal-capture") && tunnel_core::env::flag("PORTAL_CAPTURE", false),
         portal_via_mutter: tunnel_core::env::flag("MUTTER_CAPTURE", false),
         portal_input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        auto_portal_input: auto_portal_input(),
         mutter_input,
         virtual_desktop,
         x11_session,
@@ -898,6 +904,20 @@ enum AutoPortal {
     Failed(String),
 }
 
+/// FR-93 P4b (operator, 2026-10-13) — does the automatic portal ask for remote
+/// control (a RemoteDesktop session: see AND control) rather than a screen
+/// share? Yes unless `portal_input = false`. KDE's dialog names both
+/// privileges plainly ("See what's on the screen · Control input devices"), and
+/// its answer is restored like the screen share's. A configured portal arm
+/// keeps `portal_input` opt-in: there the operator chose the arm.
+///
+/// A person who refuses remote control is asked once more, for the screen
+/// only: input never costs capture (`portal::helper`'s rule).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn auto_portal_input() -> bool {
+    tunnel_core::env::flag("PORTAL_INPUT", true)
+}
+
 /// How long the automatic portal arm waits for the portal to say whether it
 /// serves ScreenCast, before any dialog.
 #[cfg(all(target_os = "linux", feature = "portal-capture"))]
@@ -915,11 +935,11 @@ fn open_auto_portal(target_fps: u32) -> AutoPortal {
     if let Some(why) = auto_portal_unusable(&portal::detect_within(AUTO_PORTAL_DETECT)) {
         return AutoPortal::Failed(why);
     }
-    // Input over the portal stays opt-in, as for mutter above: a WithInput
-    // grant is a separate dialog and a separate restore token.
+    // FR-93 P4b (operator, 2026-10-13): the one dialog asks for remote control,
+    // seeing and controlling, so the person at the screen decides once.
     let opts = PortalOpen {
         mutter: false,
-        input: tunnel_core::env::flag("PORTAL_INPUT", false),
+        input: auto_portal_input(),
         window: false,
     };
     match portal::pending::open_with(target_fps, opts) {
@@ -2467,23 +2487,25 @@ mod planned_arm_tests {
         };
         assert_eq!(planned_input_route(&view_only), None, "the kill switch");
 
+        // P4b — the automatic portal asks for remote control unless
+        // `portal_input = false`. Unset, `portal_input` reads false for a
+        // configured arm and true for the automatic one.
         let auto_portal = ArmFacts {
             auto_portal: true,
+            auto_portal_input: true,
+            portal_input: false,
             mutter_input: true,
             ..built()
         };
-        assert_eq!(
-            planned_input_route(&auto_portal),
-            None,
-            "the portal's input is its own grant: still opt-in"
-        );
-        let auto_portal_input = ArmFacts {
-            portal_input: true,
+        assert_eq!(planned_input_route(&auto_portal), Some(RouteKind::Portal));
+        let view_only_portal = ArmFacts {
+            auto_portal_input: false,
             ..auto_portal
         };
         assert_eq!(
-            planned_input_route(&auto_portal_input),
-            Some(RouteKind::Portal)
+            planned_input_route(&view_only_portal),
+            None,
+            "portal_input = false keeps the automatic portal view-only"
         );
 
         let configured_mutter = ArmFacts {

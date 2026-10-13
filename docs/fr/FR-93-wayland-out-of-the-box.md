@@ -432,6 +432,29 @@ needed. The D-Bus `Notify*` calls reach native Wayland windows on GNOME 50, and 
 libei leaves them in place. Not in P4a: the portal's input on KDE (still `portal_input`), layouts, and per-output
 mapping.
 
+**As built (P4b, 2026-10-13): the automatic portal asks for remote control** (operator: the one dialog should ask
+for seeing and controlling). Where mutter is absent, the automatic portal opens a RemoteDesktop session unless
+`portal_input = false` (`capture::auto_portal_input`); a configured `portal_capture` keeps `portal_input` opt-in,
+because a screen share it already holds would be asked again. KDE's dialog is titled *Remote Control*, names both
+privileges and restores its answer. A refusal is asked again for the screen only (input never costs capture), and
+is not remembered: the next session asks for remote control again. Two faults stood in the way, both found with the
+AC4 oracle and a new input trace (`ROOMLERD_PORTAL_INPUT_TRACE=1`) lined up against the probe's log
+([`linux-capture.md`](../linux-capture.md) §1.2, §4.3):
+
+- KDE's backend negates the vertical smooth scroll. The helper negates first where KDE's backend owns its bus name
+  (`for_backend`; kill switch `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0`).
+- **The lost keystrokes were ours, not KDE's** (step log 58 had blamed KDE). xdg-desktop-portal runs every
+  RemoteDesktop method call on its own worker thread, and the helper's calls had been fire-and-forget since FR-45's
+  self-review (`call_noreply`). So a key's release could reach the backend before its press. KWin drops that
+  release, the key stays held, and the letter's next press is dropped as a repeat: 41 of 452 typed characters came
+  out wrong. Each portal call now waits for its reply (`Target::delivery`), which keeps the calls in order for
+  0.5 ms a call. Mutter keeps fire-and-forget: it handles its session's calls in order on its main loop. The fault
+  sat in the portal's input on every desktop, GNOME's included, wherever `portal_input` was on.
+
+Not in P4b: KDE's dialog says "An application" (a host app id, registered through the portal's host Registry,
+would let it name Roomler); `rc:media-waiting`'s hint still says "share their screen" where KDE asks for remote
+control; and a refusal is not remembered across sessions.
+
 ### 4.6 Session lifecycle (P5)
 
 The §4.1 watcher re-selects the arm, instead of today's error → backoff → reopen. Each cell must recover
@@ -494,6 +517,7 @@ bridge for text and images in the lab before deciding.
 | **P3g** | tiled scanout via EGL import | `ROOMLERD_DRM_EGL=0` | the x86 cell (D3) | L |
 | **P4** | Mutter RemoteDesktop input, layouts, per-output mapping (§4.5) | `ROOMLERD_MUTTER_INPUT=0` | lab, WSL2 | M |
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
+| ↳ P4b | the automatic portal asks for remote control (`linux-capture.md` §1.2); KDE's negated smooth scroll corrected; every portal input call waits for its reply, which keeps the calls in order (§4.3) | `portal_input = false`; `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0` | ✅ lab (`9a8e20699`, then `64f00509f`), KDE per-user, no key: KDE's *Remote Control* dialog; the AC4 oracle 7/7, three runs; a typing stress's 113 characters exact, four runs. **🔴 the first candidate (`fe0c3ae93`, calls unawaited):** the oracle typed `helo 123A`, and the stress got 41 of 452 characters wrong. A denial: KDE asked again for the screen only, the session ran view-only, and its reach banner named reconnecting to allow remote control | S |
 | **P5** | lifecycle (§4.6) | — | lab | M |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
@@ -577,9 +601,11 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
-  ⏳ GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events). Owed: a
-  released build, and KDE per-user, whose only native path is the portal's input (`portal_input`, a grant at
-  the screen) or KWin's EIS grant (step log 26).
+  ⏳ GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events). KDE
+  per-user: ✅ in the lab on P4b (`9a8e20699`, then `64f00509f`), all 7 checks three times, through the remote
+  control the automatic portal asks for; 🔴 first on the release (0 events through KWin's gate,
+  `remote-control.md`), and on P4b's first candidate (`helo 123A`, calls unawaited). Owed: released builds, and
+  both system installs (uinput).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
@@ -660,6 +686,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-kde` (per-user, `portal_capture`) | 0.4.131, then master `b5871e47f`; prod's viewer `hosted-20261012-f07ba2c` | P2d-2: one viewer, nobody answers for 75 s, then the lab answers (`linux-capture.md` §4.7) | 🔴 0.4.131: 5 sessions (4 re-creates), the notice in 0 of 51 samples, the answer landed with no session live, and the picture came 48 s later from the restore token. ✅ P2d-2: 1 session, the notice in every sample until the answer, the capture about 2 s after the click in that session, 1 request. Step log 52 |
 | 2026-10-13 | `wlab-kde` (per-user, no capture key), `wlab-gnome` (per-user) | 0.4.131, then P2d-3 `ba6ab497f` | P2d-3: the flip (`linux-capture.md` §1.2) | 🔴 0.4.131: brief `capture_arm=none`; a session reads `wayland_not_enabled`, 0 requests, no dialog. ✅ P2d-3: brief `portal`; one dialog, the viewer told at +2 s, and after the lab's answer the picture in that session (`lit=81.7 %`, "desktop portal · allowed at the screen"); the next session on the restore token in 85 ms; with the screen locked, KDE's lock screen from the token, which survived; `wayland_auto = false`: `wayland_not_enabled` with the new hint; GNOME per-user: still mutter, `lit=90.0 %`, no portal request. Step log 53 |
 | 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.131, then P4a `3f9ad6464` | P4a / AC4: the lab's input oracle (`measure/viewer-input.sh … points`) against the probe, a native GTK4 window (`linux-capture.md` §5.2) | 🔴 0.4.131: the picture, 0 events at the probe, all 7 input checks failed, brief `input_reach=none`. ✅ P4a: all 7 passed (three points exact, click, wheel down, "hello 123", Shift+a as "A"), brief `full`. ✅ `mutter_input = false`: view-only again, 0 events. A wrong turn, kept: the first kill-switch run wrote the key while 0.4.131 ran, and its shutdown save erased it (#2078). Step log 54 |
+| 2026-10-13 | `wlab-kde` (per-user, no capture key) | P4b: `fe0c3ae93` (calls unawaited), then `9a8e20699` and `64f00509f` (calls awaited) | P4b / AC4: KDE's *Remote Control* dialog; the AC4 oracle; a typing stress (112 keystrokes, 40 of them the second of a doubled letter, 80 ms apart) into the probe's focused text entry; the helper's input trace lined up against the probe's log on the guest's clock (`linux-capture.md` §1.2, §4.3) | 🔴 unawaited: the oracle passed once, then typed `helo 123A`; the stress got 10, 17, 6 and 8 of 113 characters wrong, with KDE's input method (plasma-keyboard) on or off. The trace showed every call sent, and the window missing a key's release, then a lone release at that letter's next keystroke: a release that overtook its press. xdg-desktop-portal runs each call on a worker thread (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`). ✅ awaited: the oracle 7/7 three times, the stress exact four times, 0.5 ms a call at the median. ✅ The wheel notch down arrives down. ✅ A denial: KDE asked again for the screen only; the session ran view-only with its picture and a reach banner naming the fix. Wrong turn, kept: plasma-keyboard's keyboard grab looked guilty (every key round-trips through it) and was not. Step log 59 |
 
 ## 12. Related
 

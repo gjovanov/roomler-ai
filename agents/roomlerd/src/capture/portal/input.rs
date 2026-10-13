@@ -50,6 +50,11 @@
 //! - Axis sign follows libinput: **positive is down/right**, matching the
 //!   browser's wheel delta directly. ⚠️ evdev `REL_WHEEL` is the opposite —
 //!   copying the uinput backend's inversion here would scroll backwards.
+//!   ⚠️ KDE's backend negates the vertical smooth axis on its way to KWin, so
+//!   [`for_backend`] negates it first there (FR-93 P4b).
+//! - ⚠️ **The portal's calls wait for their replies** (FR-93 P4b). The portal
+//!   handles each call on a worker thread, so unawaited calls can reach the
+//!   compositor out of order. [`Target::delivery`] has the measurement.
 
 use crate::input::hid_evdev::hid_to_evdev;
 use crate::input::{InputMsg, WheelMode, button_code};
@@ -198,6 +203,44 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
     }
 }
 
+/// FR-93 P4b — the bus name xdg-desktop-portal-kde owns while it runs. On a KDE
+/// session the portal's RemoteDesktop calls reach KWin through it.
+const KDE_PORTAL_IMPL: &str = "org.freedesktop.impl.portal.desktop.kde";
+
+/// FR-93 P4b — where a RemoteDesktop backend departs from the portal's own
+/// conventions on its way to the compositor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendQuirks {
+    /// xdg-desktop-portal-kde negates the VERTICAL SMOOTH scroll delta
+    /// (`requestPointerAxis`: `wl_fixed_from_double(-y)`), while the portal's
+    /// convention, GNOME's backend, KDE's own horizontal axis and its discrete
+    /// path all keep positive = down/right. Measured on Plasma 6.7: a wheel
+    /// notch down (`dy = +120`) reached the probe as `-120`, up.
+    pub negated_smooth_y: bool,
+}
+
+/// FR-93 P4b — undo a backend's departure, so the call reaches the compositor
+/// meaning what the portal's convention says it means.
+pub fn for_backend(call: PortalCall, quirks: BackendQuirks) -> PortalCall {
+    match call {
+        PortalCall::Axis { dx, dy } if quirks.negated_smooth_y => PortalCall::Axis { dx, dy: -dy },
+        other => other,
+    }
+}
+
+/// FR-93 P4b — is KDE's portal backend the one on this session's bus? Read
+/// from the bus daemon, which starts nothing. Any error reads as "no": the
+/// calls then go out as the portal's convention has them.
+fn kde_backend(conn: &zbus::blocking::Connection) -> bool {
+    let Ok(bus) = zbus::blocking::fdo::DBusProxy::new(conn) else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(KDE_PORTAL_IMPL) else {
+        return false;
+    };
+    bus.name_has_owner(name).unwrap_or(false)
+}
+
 /// FR-93 P4 — `NotifyPointerAxis` flags on mutter's RemoteDesktop session:
 /// `1` finish, `2` wheel, `4` finger, `8` continuous. With no source flag
 /// mutter assumes a FINGER (a touchpad gesture, which a `FINISH` ends and
@@ -268,6 +311,48 @@ enum Target {
     },
 }
 
+/// FR-93 P4b — how a `Notify*` call goes on the bus. This decides whether the
+/// calls reach the compositor in the order they were sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Wait for each call's reply before sending the next. The reply is empty;
+    /// the wait is what keeps the order.
+    Awaited,
+    /// Write the call and go on (`NO_REPLY_EXPECTED`). Only for a receiver
+    /// that handles calls in the order they arrive.
+    Unawaited,
+}
+
+impl Target {
+    /// ⚠️ **The portal's calls are [`Delivery::Awaited`]: never "optimise"
+    /// them back to `call_noreply`.** xdg-desktop-portal runs every
+    /// RemoteDesktop method call on its own worker thread
+    /// (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`), so two calls sent back to back
+    /// reach the backend in either order.
+    ///
+    /// Measured on KDE (Plasma 6.7) with unawaited calls: 41 of 452 typed
+    /// characters came out wrong over four runs, and none once the calls
+    /// waited. A key's release arrived before its press. KWin dropped the
+    /// release, because the key was not down, then took the press. The key
+    /// stayed held until that letter's next keystroke, and KWin dropped that
+    /// press as a repeat. A button's release overtaking its press would hold a
+    /// mouse button down on the host the same way.
+    ///
+    /// The frontend forwards each call to the backend BEFORE it replies, so
+    /// waiting for the reply keeps the order, for one bus round trip per call.
+    /// Measured on that host: 0.5 ms at the median, under 4 ms at p99. The
+    /// viewer sends a pointer move every 8 ms at most, so this keeps up.
+    ///
+    /// Mutter answers its own RemoteDesktop session on its main loop, in the
+    /// order the calls arrive, so there a reply would only add a round trip.
+    fn delivery(&self) -> Delivery {
+        match self {
+            Target::Portal { .. } => Delivery::Awaited,
+            Target::Mutter { .. } => Delivery::Unawaited,
+        }
+    }
+}
+
 /// Everything needed to execute [`PortalCall`]s against a live RemoteDesktop
 /// session. Built in `run_stream` once the stream is negotiated, handed to
 /// the stdin pump thread.
@@ -277,6 +362,9 @@ pub struct InputContext {
     /// The space `MotionAbs` coordinates are in: the portal stream's logical
     /// size, or a mutter stream's own size.
     pub logical: (f64, f64),
+    /// FR-93 P4b — what the portal's backend does to the calls (none for
+    /// mutter, which is no portal).
+    pub quirks: BackendQuirks,
 }
 
 impl InputContext {
@@ -292,10 +380,17 @@ impl InputContext {
             super::PORTAL_PATH,
             super::REMOTE_DESKTOP_IFACE,
         )?;
+        // FR-93 P4b — kill switch `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0`, should
+        // KDE's backend ever stop negating.
+        let quirks = BackendQuirks {
+            negated_smooth_y: tunnel_core::env::flag("PORTAL_KDE_SCROLL_FIX", true)
+                && kde_backend(conn),
+        };
         Ok(Self {
             proxy,
             target: Target::Portal { session, node_id },
             logical,
+            quirks,
         })
     }
 
@@ -323,6 +418,7 @@ impl InputContext {
                 stream: input.stream.as_str().to_string(),
             },
             logical: space,
+            quirks: BackendQuirks::default(),
         })
     }
 
@@ -330,12 +426,8 @@ impl InputContext {
     /// how loud to be, and it deliberately keeps going: one refused event
     /// must not end input for the session.
     ///
-    /// ⚠️ **`call_noreply`, not `call_method`.** The `Notify*` methods return
-    /// nothing (`-` in the introspected signature), and input is latency, not
-    /// throughput: at ~1000 pointer events/second a per-event round-trip
-    /// waiting for an empty method-return is pure delay. `call_noreply` sets
-    /// `NO_REPLY_EXPECTED` and returns as soon as the message is written,
-    /// while still surfacing a send error (a dead session) to the pump.
+    /// Every call goes out as [`Target::delivery`] says: the portal's wait for
+    /// their replies, which is what keeps them in order.
     fn execute(&self, call: PortalCall) -> Result<(), zbus::Error> {
         use std::collections::HashMap;
         let (sess, node_id) = match &self.target {
@@ -343,54 +435,56 @@ impl InputContext {
             Target::Mutter { stream } => return self.execute_mutter(call, stream),
         };
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        match call {
-            PortalCall::MotionAbs { x, y } => self
-                .proxy
-                .call_noreply("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
-            PortalCall::Button { code, down } => self
-                .proxy
-                .call_noreply("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
-            PortalCall::Axis { dx, dy } => self
-                .proxy
-                .call_noreply("NotifyPointerAxis", &(sess, opts, dx, dy)),
-            PortalCall::AxisDiscrete { axis, steps } => self
-                .proxy
-                .call_noreply("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps)),
-            PortalCall::Keycode { code, down } => self.proxy.call_noreply(
+        match for_backend(call, self.quirks) {
+            PortalCall::MotionAbs { x, y } => {
+                self.send("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y))
+            }
+            PortalCall::Button { code, down } => {
+                self.send("NotifyPointerButton", &(sess, opts, code, u32::from(down)))
+            }
+            PortalCall::Axis { dx, dy } => self.send("NotifyPointerAxis", &(sess, opts, dx, dy)),
+            PortalCall::AxisDiscrete { axis, steps } => {
+                self.send("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps))
+            }
+            PortalCall::Keycode { code, down } => self.send(
                 "NotifyKeyboardKeycode",
                 &(sess, opts, code, u32::from(down)),
             ),
-            PortalCall::Keysym { sym, down } => self
-                .proxy
-                .call_noreply("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
+            PortalCall::Keysym { sym, down } => {
+                self.send("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down)))
+            }
         }
     }
 
-    /// FR-93 P4 — [`Self::execute`] on mutter's own session. `call_noreply`
-    /// for the same reason as the portal's.
+    /// FR-93 P4 — [`Self::execute`] on mutter's own session.
     fn execute_mutter(&self, call: PortalCall, stream: &str) -> Result<(), zbus::Error> {
         let Some(call) = mutter_call(call) else {
             return Ok(());
         };
         match call {
-            MutterCall::MotionAbs { x, y } => self
-                .proxy
-                .call_noreply("NotifyPointerMotionAbsolute", &(stream, x, y)),
-            MutterCall::Button { code, down } => self
-                .proxy
-                .call_noreply("NotifyPointerButton", &(code, down)),
-            MutterCall::Axis { dx, dy, flags } => self
-                .proxy
-                .call_noreply("NotifyPointerAxis", &(dx, dy, flags)),
-            MutterCall::AxisDiscrete { axis, steps } => self
-                .proxy
-                .call_noreply("NotifyPointerAxisDiscrete", &(axis, steps)),
-            MutterCall::Keycode { code, down } => self
-                .proxy
-                .call_noreply("NotifyKeyboardKeycode", &(code, down)),
-            MutterCall::Keysym { sym, down } => self
-                .proxy
-                .call_noreply("NotifyKeyboardKeysym", &(sym, down)),
+            MutterCall::MotionAbs { x, y } => {
+                self.send("NotifyPointerMotionAbsolute", &(stream, x, y))
+            }
+            MutterCall::Button { code, down } => self.send("NotifyPointerButton", &(code, down)),
+            MutterCall::Axis { dx, dy, flags } => self.send("NotifyPointerAxis", &(dx, dy, flags)),
+            MutterCall::AxisDiscrete { axis, steps } => {
+                self.send("NotifyPointerAxisDiscrete", &(axis, steps))
+            }
+            MutterCall::Keycode { code, down } => self.send("NotifyKeyboardKeycode", &(code, down)),
+            MutterCall::Keysym { sym, down } => self.send("NotifyKeyboardKeysym", &(sym, down)),
+        }
+    }
+
+    /// One `Notify*` call, delivered as [`Target::delivery`] says. A send error
+    /// (a dead session) comes back either way; an awaited call also returns a
+    /// refusal the receiver answers with.
+    fn send<B>(&self, method: &'static str, body: &B) -> Result<(), zbus::Error>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        match self.target.delivery() {
+            Delivery::Awaited => self.proxy.call_method(method, body).map(drop),
+            Delivery::Unawaited => self.proxy.call_noreply(method, body),
         }
     }
 }
@@ -409,6 +503,23 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
     let mut executed = 0u64;
     let mut nonascii_keysyms = 0u64;
     let mut warned_nonascii = false;
+    if ctx.quirks.negated_smooth_y {
+        eprintln!(
+            "portal-helper: KDE's portal backend negates the vertical smooth scroll; negating it \
+             first (ROOMLERD_PORTAL_KDE_SCROLL_FIX=0 stops this)"
+        );
+    }
+    // FR-93 P4b — `ROOMLERD_PORTAL_INPUT_TRACE=1`: every event and every call
+    // made for it, on the wall clock, so a lab can line what was SENT up against
+    // what a probe RECEIVED. Off by default: a keystroke log does not belong in
+    // a journal.
+    let trace = tunnel_core::env::flag("PORTAL_INPUT_TRACE", false);
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -445,8 +556,19 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
                 }
             }
         }
+        if trace {
+            eprintln!("portal-helper: input-trace {:.4} event {msg:?}", wall());
+        }
         for call in plan(&msg, ctx.logical, &mut wheel) {
-            match ctx.execute(call) {
+            let done = ctx.execute(call);
+            if trace {
+                eprintln!(
+                    "portal-helper: input-trace {:.4} call {call:?} {}",
+                    wall(),
+                    if done.is_ok() { "sent" } else { "FAILED" }
+                );
+            }
+            match done {
                 Ok(()) => executed += 1,
                 Err(e) => {
                     failed_calls += 1;
@@ -689,6 +811,62 @@ mod tests {
             mutter_call(PortalCall::AxisDiscrete { axis: 0, steps: -2 }),
             Some(MutterCall::AxisDiscrete { axis: 0, steps: -2 }),
             "negative steps are up, as on the portal"
+        );
+    }
+
+    /// FR-93 P4b — KDE's backend negates the vertical smooth scroll, so the
+    /// call is negated first for it, and only for it: the horizontal axis and
+    /// the discrete detents pass through, as they do in KDE's backend.
+    #[test]
+    fn only_kdes_vertical_smooth_scroll_is_negated() {
+        let kde = BackendQuirks {
+            negated_smooth_y: true,
+        };
+        assert_eq!(
+            for_backend(PortalCall::Axis { dx: 4.0, dy: 120.0 }, kde),
+            PortalCall::Axis {
+                dx: 4.0,
+                dy: -120.0
+            }
+        );
+        let discrete = PortalCall::AxisDiscrete { axis: 0, steps: 1 };
+        assert_eq!(
+            for_backend(discrete, kde),
+            discrete,
+            "KDE does not negate detents"
+        );
+        let button = PortalCall::Button {
+            code: 0x110,
+            down: true,
+        };
+        assert_eq!(for_backend(button, kde), button);
+        assert_eq!(
+            for_backend(
+                PortalCall::Axis { dx: 4.0, dy: 120.0 },
+                BackendQuirks::default()
+            ),
+            PortalCall::Axis { dx: 4.0, dy: 120.0 },
+            "every other backend keeps the portal's convention"
+        );
+    }
+
+    /// FR-93 P4b — the portal's calls wait for their replies, because only the
+    /// wait keeps them in order. xdg-desktop-portal handles each call on a
+    /// worker thread; unawaited, 41 of 452 typed characters came out wrong on KDE.
+    #[test]
+    fn portal_calls_wait_for_their_replies() {
+        let portal = Target::Portal {
+            session: zbus::zvariant::OwnedObjectPath::try_from(
+                "/org/freedesktop/portal/desktop/session/1_42/roomler",
+            )
+            .unwrap(),
+            node_id: 42,
+        };
+        assert_eq!(
+            portal.delivery(),
+            Delivery::Awaited,
+            "unawaited portal calls reach the compositor out of order: a key's release \
+             before its press drops typed characters (see Target::delivery)"
         );
     }
 
