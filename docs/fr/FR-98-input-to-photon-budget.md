@@ -1,7 +1,7 @@
 # FR-98: Input-to-photon budget — make "under 50 ms" true on a direct path, and prove it
 
 **Issue:** [#2090](https://github.com/gjovanov/roomler-ai/issues/2090) · **Status:** proposed 2026-10-13 — spec
-and claim · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
+and claim; P1 (C1, the slot-first gate) built behind its switch, field A/B owed · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
 master `c2e79221b` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 ·
 **Builds on:** [FR-16](FR-16-rc-quality-benchmark.md) (L0 and L4, the instrument this FR is accepted on),
 [FR-1](FR-1-remote-desktop-drag-smoothness.md), [FR-70](FR-70-media-pipeline-leaves-the-runtime.md),
@@ -64,7 +64,7 @@ are not a result.
 
 | # | Cut | Anchor | Switch (default for one release) |
 |---|---|---|---|
-| C1 | **Slot-first capture gate.** Check the slot first; sleep only when the source is outrunning the target; period in µs | `wgc_backend.rs` L259, L293–302; `scrap_backend.rs` L352, L505–509 | `capture_gate` = `slot_first` / `legacy` (legacy) |
+| C1 | **Slot-first capture gate.** Check the slot first; sleep only when the source is outrunning the target; period in µs | `wgc_backend.rs` L259, L293–302; `scrap_backend.rs` L352, L505–509 | `ROOMLERD_CAPTURE_GATE` = `slot_first` / `legacy` (legacy) |
 | C2 | **GPU clock pin on for NVENC sessions** | `gpu_clock.rs` | `ROOMLERD_GPU_CLOCK_PIN` (unchanged); the flip is a default change after the A/B |
 | C3 | **Input gap 8 → 4 ms** (0 and 2 measured too) | `useRemoteControl.ts` L5552 | viewer knob `roomler-rc-input-gap` |
 | C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `cursor_poll_ms` |
@@ -73,6 +73,27 @@ are not a result.
 
 ⚠️ **No new per-frame reads in the pump.** FR-70 M3 makes the media thread read an immutable plan. Until
 then, every switch above is read once per open (`peer.rs` L5353–5391), never per frame.
+
+### 4.1 C1 before any measurement: what the slot-first gate is expected to buy
+
+Working the legacy gate through on paper, before L4 exists, narrows what C1 can claim:
+
+- **The legacy gate only bites when a frame is already in the slot**, that is, when it landed while the
+  pump was encoding the previous one. A frame that lands after the pump has started waiting is taken at
+  once, on either gate.
+- **Its period truncates to whole milliseconds**, so its cadence runs slightly faster than a source at the
+  target rate: 33 ms against 33.3 at 30 fps, 16 ms against 16.7 at 60. The phase between the two clocks
+  slides about 0.3 ms (30 fps) or 0.7 ms (60 fps) a frame, a backlog drains on its own, and once the pump
+  is the one waiting the legacy gate costs nothing either (`gate.rs`,
+  `a_truncated_legacy_period_drifts_out_of_the_wait_on_its_own`).
+- **It costs at an exact period** (25, 40, 50 or 125 fps), where the phase can lock, and **for the frames
+  after a slow encode**. A real sleep overshoots, so even a "locked" phase drifts, and the wait saws through
+  the period, averaging about half of it.
+- **The prediction:** C1's steady-state gain on today's 30 and 60 fps targets is small, and L4 has to show
+  otherwise for it to stay on (§4's rule). Its µs period matters more to the high-refresh FR, where
+  `1000/144` truncates to 6 ms and caps at 166 fps.
+- **Scope:** the WGC backend only. `scrap` and DRM grab on request, so their sleep sets the sampling
+  cadence instead of stranding a frame that has already arrived. They keep the legacy gate.
 
 ⚠️ **Intra-refresh is not on this list.** It spreads an IDR's bytes over frames, which is a loss-recovery
 property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, whose spec already says it
@@ -83,7 +104,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The **baseline**: L4 on the cells of §9, recorded before any cut | docs only | this PR |
-| P1 | C1, the slot-first gate | `capture_gate=legacy` | — |
+| P1 | C1, the slot-first gate | `ROOMLERD_CAPTURE_GATE` unset or `legacy` | **built**: `capture/gate.rs` (the token bucket, unit-tested on synthetic timelines); the WGC backend behind the switch, legacy branch unchanged; L0's `gate_lgcy` / `gate_slot` cells (§9). Field A/B owed |
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | the viewer knob, `cursor_poll_ms` | — |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
@@ -96,8 +117,13 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
   cut ships. This is the red record every later AC is read against.
 - [ ] **AC2:** each cut C1–C6 has an L4 A/B on the same cells, one switch flipped. A cut that does not move
   p50 or p95 beyond the cell's run-to-run spread is reverted, and the revert is recorded.
-- [ ] **AC3:** C1 moves L0's capture→decode p50 by at least half a frame period in CI (gate on vs off). It
-  also moves L4 on a direct field pair.
+- [ ] **AC3:** C1 moves L0's capture→decode p50 by at least **a quarter** of a frame period in CI (gate on
+  vs off). It also moves L4 on a direct field pair. *(Amended 2026-10-13, before any measurement: the spec
+  first said half a period. A real sleep overshoots, so the legacy wait saws through the period instead of
+  locking, and half a period is the expected difference itself, not a bound with room. §4.1 has the
+  reasoning.)* L0 measures it on an emulated source at 25 fps, whose 40 ms period is exact, with frames
+  landing three quarters of a period ahead of the legacy cadence. Only there can L0 make the legacy gate
+  pay at all (§4.1).
 - [ ] **AC4:** a direct LAN pair at 60 fps meets the target fixed at P0 (expected: p50 ≤ 50 ms, p95 ≤ 80 ms).
   It is measured by L4, and cross-checked once against a 240 fps camera.
 - [ ] **AC5:** no relay pair regresses: CORPLAP-1 → neo16 L4 p95 and freeze count stay within the baseline's
@@ -139,7 +165,9 @@ Planned cells. Each records the deployed build first.
 
 | # | Date | Build | Result |
 |---|---|---|---|
-| — | — | — | — |
+| L0 | 2026-10-13 | P1 branch, unoptimised, Windows dev box | **Wrong turn, recorded.** The first run read `gate_lgcy` p50 59.8 ms and `gate_slot` p50 45.5 ms, far above `clean`'s 12.6. The emulation stood a timer in for `FrameArrived`, and when the slot was empty it counted that timer's overshoot (up to a Windows timer tick) against both gates. Real WGC wakes the reader on the event itself. Fixed: a frame waited for lands when the wait ends; a frame already in the slot lands on schedule, and its wait is the gate's |
+| L0 | 2026-10-13 | the same | **Green:** `clean` p50 12.8 ms · `gate_slot` p50 13.9 ms, p95 18.3, 25.1 fps from the 25 fps source · `gate_lgcy` p50 36.1 ms, p95 51.3, **21.9 fps**. So the slot-first gate cut p50 by **22.2 ms** (bound: ≥ 10, a quarter of 40 ms), and it also kept the frames the legacy gate dropped when its cadence fell a whole period behind |
+| L0 | 2026-10-13 | the same | **Negative control, red:** a slot-first gate that always sleeps a period (one marked line in `SlotFirst::wait`) failed `gate_slot: 12.7 fps decoded from a 25 fps source` (exit 101). Its p50 difference was 4.9 ms (legacy 35.7, broken slot-first 30.8), which the C1 bound would have refused too. Restored from the commit; the diff was that one line |
 
 ## 10. Related
 
