@@ -91,12 +91,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:1826-1835`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2078-2087`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:1761-1775`).
+(`updater.rs:2009-2023`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -218,14 +218,14 @@ sequenceDiagram
     participant W as /var/tmp/roomler-update-check
     participant P as roomler-update.path / .timer
     participant U as roomlerd update-helper (root)
-    D->>W: touch: a wake, its content never read (P2)
+    D->>W: touch: a wake, its content never read (P2a)
     W-->>P: PathExists
     Note over P: the timer fires too: 5 min after boot, then every 6 h
     P->>U: start roomler-update.service
     U->>U: consume/move-aside the wake; space ≥60 s from the last run; the opt-out; the cooldown
     U->>U: check_once, then download_asset → a FRESH private dir (the pinned release key)
     U->>U: install as root: apt-get / dpkg, or the tarball
-    Note over D: runs the new binary from its next restart (P2 asks it, once idle)
+    Note over D: runs the new binary from its next restart (P2b: once idle)
 ```
 
 | unit | what | the macOS twin (`com.roomler.update.plist`) |
@@ -298,12 +298,60 @@ by the 5-minute install cooldown to one verified ~100 MB download per 5 minutes,
 and can never choose *what* is installed — the helper resolves and verifies the
 release itself.
 
+### The per-user daemon steps aside (P2a)
+
+On a host whose helper is enabled, a per-user daemon installs nothing: a pushed
+`rc:agent.update` becomes a touch of the wake file, and the helper's timer
+replaces the daemon's own periodic check. The daemon decides once, at its start
+(`run_periodic` → `decide_update_owner`, `updater.rs`):
+
+```mermaid
+flowchart TD
+    S([roomlerd run starts its updater]) --> R{running as root?}
+    R -->|yes| IP1[installs its own updates<br/>WARN if the helper is ALSO enabled:<br/>two updaters would race]
+    R -->|no| K{ROOMLERD_UPDATE_HELPER=0?}
+    K -->|yes| IP2[installs its own updates<br/>the kill switch: as before FR-96]
+    K -->|no| E{an enable link for<br/>roomler-update.path or .timer<br/>that leads to the unit?}
+    E -->|no| IP3[installs its own updates]
+    E -->|yes| H[forwards each push to<br/>/var/tmp/roomler-update-check<br/>and installs nothing]
+```
+
+- **"Enabled" is a file check**, not `systemctl is-enabled`: the `.wants` link
+  `systemctl enable` (or `enable --runtime`) leaves under `/etc` or `/run`,
+  followed, so a link a removed package left dangling does not count
+  (`UPDATE_HELPER_ENABLE_LINKS`). No bus and no child process, and it reads the
+  same inside the unit's sandbox.
+- ⚠️ **On doubt, in-process.** A wrong "helper" answer would freeze the host
+  (wakes nobody hears — #2046 again). A wrong "in-process" answer costs a failed
+  `pkexec`, and the helper's own timer still installs.
+- ⚠️ **The user unit grants `/var/tmp`** (`ReadWritePaths=-/var/tmp`,
+  `packaging/linux/roomler.service`). `ProtectSystem=strict` leaves it read-only
+  wherever the user manager applies the sandbox. Measured on Fedora 44 KDE: the
+  0.4.128 unit answered `Read-only file system` there, so every push would have
+  failed. Only the directory can be granted: the helper deletes the file each run,
+  and a `ReadWritePaths` entry binds only what exists when the sandbox is built.
+  A daemon still on an older unit logs the failure and names the cure: re-run
+  `install.sh`. The updater's own tarball install writes units only where absent.
+- **A per-user `auto_update = false` stops the forwarding too**, so a push is
+  dropped. The helper's timer still installs, so on a helper host the opt-out is
+  `/etc/roomler/disable-auto-update`.
+- **Enabling the helper takes effect at the daemon's next start**, so `install.sh`
+  (P3) reloads the user manager (`systemctl --user daemon-reload`, or the old
+  sandbox stays) and restarts the per-user daemon after enabling the units.
+
+Field-verified on the lab's Fedora KDE guest. A real server push reached the
+daemon, which touched the wake file. The helper installed 0.4.133 as root 61 s
+later: its first run waits the full 60 s gap, because it has no stamp yet. The
+daemon logged no install attempt of its own
+([FR-96 §8](fr/FR-96-per-user-linux-installs-update-themselves.md#8-field-verification-log)).
+
 The phases:
 
 | phase | ships |
 |---|---|
 | **P1** | the helper on Linux, and the three units in both packages, disabled |
-| **P2** | the per-user daemon wakes the helper instead of installing, and is restarted onto the new binary once idle |
+| **P2a** | the per-user daemon wakes the helper instead of installing, and its unit may write the wake file |
+| **P2b** | the per-user daemon onto the new binary after an install, once idle |
 | **P3** | `install.sh` enables the units for a per-user install |
 
 Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).
