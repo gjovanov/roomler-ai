@@ -7,8 +7,17 @@
 //!
 //! | Setting | Default | Why | Undo |
 //! |---|---|---|---|
-//! | SRTP + SRTCP replay window | 64 | Without one, webrtc-srtp 0.14 falls back to `srtp_no_replay_protection()`: an on-path attacker can replay a captured SRTCP PLI (forcing an IDR) or REMB (capping the rate) without decrypting anything | `ROOMLERD_SRTP_REPLAY_WINDOW=0` |
+//! | SRTP + SRTCP replay window | 64 | Pinned, not switched on. webrtc-srtp's `Session::new` already gives the remote context a 64-packet window when its config has none, so the agent's sessions refused replays before FR-101 too. Setting it here keeps it 64 should a release change that default | `ROOMLERD_SRTP_REPLAY_WINDOW=N` sizes it; `0` sets none, leaving the library's 64 |
 //! | DTLS cipher suites | the two ECDHE-AES-128-GCM-SHA256 suites | webrtc-dtls' default list still offers ECDHE-AES-256-CBC-SHA. Every browser we support negotiates GCM | `ROOMLERD_DTLS_LEGACY_SUITES=1` |
+//!
+//! ⚠️ **No setting here switches replay protection off.** FR-101's P0
+//! evidence said the agent ran without it. That read the fallback in
+//! webrtc-srtp's `Context::new` (`srtp_no_replay_protection()`), which a
+//! session never reaches: `Session::new` supplies the window first. FR-16 L0's
+//! replay cells (`tests/l4_latency.rs`) replay a captured SRTCP PLI into a
+//! live session. It is refused with this policy and with no window set, and
+//! obeyed only with the protection disabled through the engine, which the
+//! daemon never does.
 //!
 //! Only the remote-desktop peer reads this. Tunnel and overlay peers build
 //! their own engines and are unchanged.
@@ -17,7 +26,8 @@ use tunnel_core::env::node_env;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::dtls::cipher_suite::CipherSuiteId;
 
-/// The replay window when nothing says otherwise. libwebrtc's own default.
+/// The replay window when nothing says otherwise: libwebrtc's default, and
+/// the one webrtc-srtp's `Session::new` supplies when given none.
 pub const DEFAULT_REPLAY_WINDOW: usize = 64;
 /// The largest window an operator may ask for.
 const MAX_REPLAY_WINDOW: usize = 4096;
@@ -29,9 +39,10 @@ pub const GCM_SUITES: [CipherSuiteId; 2] = [
 ];
 
 /// What one session's transport is hardened with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
-    /// SRTP and SRTCP replay window; 0 = off (today's behaviour).
+    /// SRTP and SRTCP replay window. 0 sets none, which leaves webrtc-srtp's
+    /// session default, also 64: no value switches replay protection off.
     pub replay_window: usize,
     /// Restrict DTLS to [`GCM_SUITES`]; false = webrtc-dtls' default list.
     pub gcm_only: bool,
@@ -56,8 +67,7 @@ fn truthy(v: &str) -> bool {
 
 impl Policy {
     /// The policy from the two knobs, as raw strings (`None` = unset). An
-    /// unparseable window keeps the default: a typo must not switch replay
-    /// protection off.
+    /// unparseable window keeps the default.
     pub fn parse(replay_window: Option<&str>, legacy_suites: Option<&str>) -> Self {
         let replay_window = replay_window
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -72,6 +82,10 @@ impl Policy {
     /// The policy from `ROOMLERD_SRTP_REPLAY_WINDOW` and
     /// `ROOMLERD_DTLS_LEGACY_SUITES` (or their config fallbacks).
     pub fn from_env() -> Self {
+        #[cfg(feature = "synthetic-frame-source")]
+        if let Some(forced) = *TEST_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) {
+            return forced;
+        }
         Self::parse(
             node_env("SRTP_REPLAY_WINDOW").as_deref(),
             node_env("DTLS_LEGACY_SUITES").as_deref(),
@@ -88,6 +102,18 @@ impl Policy {
             setting.set_dtls_cipher_suites(GCM_SUITES.to_vec());
         }
     }
+}
+
+/// FR-16 L0's cells set the policy per session in one test process, where
+/// the environment cannot change under running threads (the pattern of
+/// `rtp_playout::set_test_override`). `None` reads the environment.
+/// Compiled only into the test-only `synthetic-frame-source` build.
+#[cfg(feature = "synthetic-frame-source")]
+static TEST_OVERRIDE: std::sync::Mutex<Option<Policy>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "synthetic-frame-source")]
+pub fn set_test_override(policy: Option<Policy>) {
+    *TEST_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = policy;
 }
 
 #[cfg(test)]
@@ -166,8 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn without_a_window_a_replayed_pli_is_accepted_twice() {
-        // The red half: this is what every session ran with before FR-101.
+    fn a_context_without_a_window_decrypts_the_replay_so_a_refusal_is_the_windows() {
+        // The negative control for the test below: the replay is well formed,
+        // and only a window refuses it. NOT what a session ran with before
+        // FR-101, as this test once claimed: `Session::new` supplies a
+        // 64-packet window when its config has none, so this bare context is a
+        // fallback no session reaches. FR-16 L0's replay cells prove that on a
+        // live session (`tests/l4_latency.rs`).
         let (mut tx, mut rx) = rtcp_pair(None);
         let wire = tx.encrypt_rtcp(&pli()).unwrap();
         assert!(rx.decrypt_rtcp(&wire).is_ok());
