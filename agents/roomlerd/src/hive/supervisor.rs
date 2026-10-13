@@ -1972,6 +1972,17 @@ impl Supervisor {
             &parent.harness_session,
         );
         if first && !here(from) {
+            // P2f-3d — never into the folder its parent runs in here: two
+            // harnesses would work one folder. The server compares the folder
+            // only as typed (`same_folder`), and a clean repository passes the
+            // folder's own question below. Both paths are resolved.
+            if self
+                .workplace(parent.session_id)
+                .is_some_and(|w| w.folder == folder)
+            {
+                let why = "the session it forks runs in this folder".to_string();
+                return Err(self.folder_taken(order, folder, why, "fork"));
+            }
             if let Some(refused) = self.folder_refusal(order, account, "fork").await {
                 return Err(refused);
             }
@@ -2231,9 +2242,17 @@ impl Supervisor {
                 ));
             }
         };
-        // A folder must be there to pass the gates, so the sibling is named
-        // for the person to make: allowed once made when its parent is.
-        let sibling = sibling_for(&dest.folder, order.session_id).filter(|s| {
+        Some(self.folder_taken(order, &dest.folder, why, what))
+    }
+
+    /// P2f-2d — `folder` may not take `order`'s copy, for `why`: refused
+    /// `folder_dirty`, naming a sibling folder for the person to make and
+    /// `what` into instead, when it would be under `hive_roots`. A folder
+    /// must be there to pass the gates, so the sibling is named, never made:
+    /// allowed once made when its parent is. P2f-3d — a fork into the folder
+    /// its parent runs in here says so the same way.
+    fn folder_taken(&self, order: &StartOrder, folder: &Path, why: String, what: &str) -> Answer {
+        let sibling = sibling_for(folder, order.session_id).filter(|s| {
             s.parent()
                 .is_some_and(|p| gates::folder_for(&self.cfg, &p.display().to_string()).is_ok())
         });
@@ -2244,8 +2263,8 @@ impl Supervisor {
             ),
             None => why,
         };
-        info!(session = %order.session_id, folder = %dest.folder.display(), %detail, "hive: a {what} refused: its folder holds work of its own");
-        Some(Answer::refused(HiveRefusal::FolderDirty, detail))
+        info!(session = %order.session_id, folder = %folder.display(), %detail, "hive: a {what} refused: its folder holds work of its own");
+        Answer::refused(HiveRefusal::FolderDirty, detail)
     }
 
     /// [`Self::prepare`], and for a teleport ([`Self::prepare_teleport`])
@@ -10270,6 +10289,78 @@ done
             "the person's own\n"
         );
         assert!(argv_in(&work2).is_empty(), "nothing launched");
+    }
+
+    /// FR-90 P2f-3d — a fork into the folder its parent runs in here is
+    /// refused `folder_dirty`, a sibling named, even where the folder's own
+    /// question would let it in: a clean repository holding all the parent's
+    /// work. Two harnesses would work one folder, and the server, which
+    /// compares the folder only as typed, cannot see another spelling of it.
+    #[tokio::test]
+    async fn a_fork_into_the_folder_its_parent_runs_in_here_is_refused() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=Person",
+                    "-c",
+                    "user.email=person@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output();
+            matches!(out, Ok(o) if o.status.success())
+        };
+        let mut r = forking_rig(ObjectId::new());
+        let work = r.root.path().join("work");
+        if !git(&work, &["--version"]) {
+            return eprintln!("no git here");
+        }
+        // The parent's folder: a repository at its HEAD, the fake harness's
+        // own files ignored.
+        let app = work.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("a.txt"), "one\n").unwrap();
+        std::fs::write(
+            app.join(".gitignore"),
+            ".argv\n.pid\n.stdin\n.claude_md\n.memory_md\n",
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "first"],
+        ] {
+            assert!(git(&app, args), "{args:?}");
+        }
+        let mut parent = order(&r);
+        parent.replicated = true;
+        parent.folder = app.display().to_string();
+        let psid = parent.session_id;
+        assert!(r.sup.start(parent.clone(), true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Idle);
+        r.sup.prompt(psid, None, "hi".into()).unwrap();
+        assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Running);
+        assert_eq!(next_state(&mut r, psid).await.0, HiveRunState::Idle);
+
+        // Its folder, typed another way.
+        let fork = StartOrder {
+            folder: app.join(".").display().to_string(),
+            ..forked_from(&r, &parent)
+        };
+        let answer = r.sup.start(fork.clone(), true).await;
+        assert_eq!(answer.refused, Some(HiveRefusal::FolderDirty), "{answer:?}");
+        let detail = answer.detail.unwrap_or_default();
+        assert!(
+            detail.contains("the session it forks runs in this folder")
+                && detail.contains("git worktree add")
+                && detail.contains("and fork there"),
+            "why, and a sibling named: {detail}"
+        );
+        assert!(!r.sup.holds_live(fork.session_id), "nothing launched");
+        assert!(r.sup.holds_live(psid), "the parent runs on");
     }
 
     /// P2f-3a — the argv in `folder` of a harness that names `id`, once it
