@@ -86,11 +86,20 @@ and the policy switch is useful either way.
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec and the claim. The red evidence: a DTLS ClientHello pcap with CBC suites; an SRTCP replay accepted in a unit test | docs only | this PR |
-| P1 | The transport: CBC out, the replay windows, `https` at every entry point, the IPv6 TURN check | `ROOMLERD_DTLS_LEGACY_SUITES=1` restores the old suites | — |
+| P1a | The transport: CBC out, the SRTP/SRTCP replay windows (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`, `ROOMLERD_SRTP_REPLAY_WINDOW=0` | **built**: unit tests red/green on an SRTCP replay; the field pcap is owed |
+| P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | — |
 | P3 | The audit producers | — | — |
 | P4 | Idle timeout, max duration, the request rate limit | each off by default | — |
 | P5 | Docs and the field table | — | — |
+
+⚠️ **Why P1b was split from P1a (2026-10-13).** Replay windows and GCM-only DTLS
+cannot cost a device its connection. Forcing `wss://` can. A config that still holds a
+plaintext, non-loopback `server_url` signals over `ws://` today. That could be an
+enrollment from before the promotion existed in its current home, or a hand edit. After
+an auto-update such a host would dial TLS, fail, and become unreachable, with no remote
+path to fix it: a self-wedge. P1b first counts the devices that would be affected,
+and gives labs an explicit escape before the default flips.
 
 ## 5. Acceptance criteria
 
