@@ -25,6 +25,13 @@
 //! the whole pack's own blobs, the folder comes whole all the same, and the
 //! clone's `HEAD` is still the person's.
 //!
+//! P2f-2c — then, into the clone, B's process is stopped, its store read, and
+//! started again: it resumes the session on the server's word, its store
+//! keeping where it runs it. A third device C joins after the move. B, the
+//! new primary, holds that first pack only as a substitute: its hello says
+//! so, C asks for the pack by a want with no haves, and B makes it again from
+//! its clone. C's copy reaches B's tip, keeping a substitute against nothing.
+//!
 //! ⚠️ The stream rides `direct` on loopback: the tests build carries no
 //! overlay, as in the canary. ⚠️ A process holds one supervisor, so the two
 //! scenarios share this binary only because neither device runs in it.
@@ -357,6 +364,15 @@ async fn prompt(b: &mut Browser, id: &str, text: &str) -> Vec<Value> {
     b.events_until(|e| e["event"]["kind"] == "turn").await
 }
 
+/// Where the primary's chain of `sid` ends, as a viewer's hello says.
+async fn primary_tip(ws: &mut UserWs, sid: &str) -> u64 {
+    let mut b = view(ws, sid).await;
+    b.send(json!({"op": "hello"})).await;
+    let tip = b.recv_op("hello").await["tip"].as_u64().unwrap_or(0);
+    b.close(ws).await;
+    tip
+}
+
 /// The resume note `dir`'s device left for `sid`: what Claude Code would be
 /// told as it resumes there. Empty: none left.
 fn resume_note_of(dir: &Path, sid: &str) -> String {
@@ -558,10 +574,11 @@ async fn scenario(folder: Folder) {
     .await;
 
     stop(b_proc).await;
-    stop(a_proc).await;
 
     // ── P2f-2b — what B took in place of the workspace's whole pack ────────
-    if let Some(head) = &person_head {
+    // Read with B's process gone, and before C asks: the pack B makes again
+    // for C can come out byte for byte the whole pack's, and B keeps it.
+    let whole = person_head.as_ref().map(|head| {
         let store = roomler_hive_node::store::Store::open(&b_dir.join("hive.db"))
             .expect("B's store, its process gone");
         let whole = store
@@ -592,14 +609,86 @@ async fn scenario(folder: Folder) {
                 "B holds none of the whole pack's own blobs"
             );
         }
-        let len = |chunks: &[roomler_hive_node::checkpoint::Chunk]| -> u64 {
-            chunks.iter().map(|c| c.len).sum()
-        };
         let (took, whole_len) = (len(&sub.chunks), len(&whole.pack));
         eprintln!("hive_teleport: took {took} bytes of a {whole_len}-byte whole pack");
         assert!(
             took * 4 < whole_len,
             "the clone's history did not come again: {took} of {whole_len}"
         );
+        // P2f-2c — and where it runs the session, beyond the run.
+        let kept = store
+            .workplace(&sid)
+            .unwrap()
+            .expect("B keeps where the session is worked on");
+        assert_eq!(kept.folder, b_work.display().to_string(), "{kept:?}");
+        whole
+    });
+
+    // ── P2f-2c — B back, then C, a member joined after the move ────────────
+    // B holds the workspace's first pack only as a substitute: C asks for it
+    // by a want with no haves, and B makes it again from its clone.
+    if let Some(whole) = &whole {
+        // B resumes the session it runs, on the server's word.
+        let b_proc = device(&app, &seeded, &b_dir, &b_cfg).await;
+        let c_dir = dir.path().join("c");
+        std::fs::create_dir_all(c_dir.join("home")).unwrap();
+        let mut c_cfg = enrol(&app, &seeded, "hive-teleport-c").await;
+        c_cfg.hive_replica = true;
+        let c = c_cfg.agent_id.clone();
+        let c_proc = device(&app, &seeded, &c_dir, &c_cfg).await;
+        let policy = json!({
+            "replicaset": {
+                "min": 3, "max": 4, "archive": true,
+                "prefer": ["owner_devices"], "restricted_tags": ["prod"],
+            },
+            "retention_days": 90,
+            "archive_devices": [],
+            "revision": 0,
+        });
+        let resp = app
+            .auth_put(&format!("/api/tenant/{tid}/hive/policy"), &owner)
+            .json(&policy)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+        let want = primary_tip(&mut ws, &sid).await;
+        until_session(
+            &app,
+            &seeded,
+            &sid,
+            LONG,
+            "C's copy never reached B's tip: the whole pack B stands in for never came",
+            |s| {
+                member(s, &c).is_some_and(|m| {
+                    m["state"] == "joined"
+                        && m["tip"]["fence"] == 2
+                        && m["tip"]["seq"].as_u64() == Some(want)
+                })
+            },
+        )
+        .await;
+        stop(c_proc).await;
+        stop(b_proc).await;
+        let c_store = roomler_hive_node::store::Store::open(&c_dir.join("hive.db"))
+            .expect("C's store, its process gone");
+        let made_again = c_store
+            .substitute(&sid, &whole.commit)
+            .unwrap()
+            .expect("C keeps the whole pack B made again, as a substitute");
+        assert!(
+            made_again.against.is_empty(),
+            "whole: against nothing, {made_again:?}"
+        );
+        eprintln!(
+            "hive_teleport: C took a {}-byte whole pack, made again by B",
+            len(&made_again.chunks)
+        );
     }
+    stop(a_proc).await;
+}
+
+/// The bytes `chunks` carry.
+fn len(chunks: &[roomler_hive_node::checkpoint::Chunk]) -> u64 {
+    chunks.iter().map(|c| c.len).sum()
 }

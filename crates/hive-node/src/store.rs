@@ -142,6 +142,13 @@ const P2F_TABLES: &str = "CREATE TABLE IF NOT EXISTS substitutes (
                  chunks    TEXT    NOT NULL,
                  kept_ms   INTEGER NOT NULL,
                  PRIMARY KEY (session, commit_id)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS workplaces (
+                 session   TEXT    PRIMARY KEY,
+                 account   TEXT    NOT NULL,
+                 folder    TEXT    NOT NULL,
+                 state_dir TEXT    NOT NULL,
+                 kept_ms   INTEGER NOT NULL
              ) WITHOUT ROWID;";
 
 /// FR-90 P2f-2a — a pack kept in place of a checkpoint's own whole pack: the
@@ -153,6 +160,17 @@ pub struct Substitute {
     pub commit: String,
     pub against: Vec<String>,
     pub chunks: Vec<Chunk>,
+}
+
+/// FR-90 P2f-2c — where on this device a session it ran is worked on: the
+/// account it ran as, its folder and its state directory, as its launch
+/// resolved them. What a source packs from for a member once the session
+/// does not run here, and is no longer hosted once it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkplaceRecord {
+    pub account: String,
+    pub folder: String,
+    pub state_dir: String,
 }
 
 /// FR-90 P2c-3 — one session this device holds a copy of as a member.
@@ -875,6 +893,100 @@ impl Store {
         }))
     }
 
+    /// FR-90 P2f-2c: the commits of `session`'s whole packs this store keeps
+    /// a substitute for and not every blob of the pack itself, the oldest
+    /// kept first, at most `limit`: what a source of this copy cannot serve
+    /// by blobs. A substitute no whole pack of the chain names stands in for
+    /// nothing.
+    pub fn stand_ins(&self, session: &str, limit: usize) -> Result<Vec<String>, StoreError> {
+        let commits: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT commit_id FROM substitutes WHERE session = ?1
+                 ORDER BY kept_ms, commit_id",
+            )?
+            .query_map(params![session], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::new();
+        for commit in commits {
+            if out.len() == limit {
+                break;
+            }
+            // Only the checkpoints that name it are read.
+            let jsons: Vec<String> = self
+                .conn
+                .prepare(
+                    "SELECT event_json FROM events
+                     WHERE session = ?1 AND kind = 'checkpoint' AND instr(event_json, ?2) > 0",
+                )?
+                .query_map(params![session, commit], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let pack =
+                jsons.iter().find_map(|json| {
+                    match crate::event::TranscriptEvent::from_json(json) {
+                        Some(crate::event::TranscriptEvent::Checkpoint(cp)) => cp
+                            .workspace
+                            .filter(|ws| {
+                                ws.commit == commit && ws.base.is_none() && !ws.pack.is_empty()
+                            })
+                            .map(|ws| ws.pack),
+                        _ => None,
+                    }
+                });
+            let Some(pack) = pack else { continue };
+            let mut whole = true;
+            for chunk in &pack {
+                if !self.has_blob(session, &chunk.hash.0)? {
+                    whole = false;
+                    break;
+                }
+            }
+            if !whole {
+                out.push(commit);
+            }
+        }
+        Ok(out)
+    }
+
+    /// FR-90 P2f-2c: keep where `session` is worked on here, in place of
+    /// what an earlier launch kept. Refused for a purged session.
+    pub fn put_workplace(&mut self, session: &str, w: &WorkplaceRecord) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO workplaces (session, account, folder, state_dir, kept_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session) DO UPDATE SET
+                 account = excluded.account, folder = excluded.folder,
+                 state_dir = excluded.state_dir, kept_ms = excluded.kept_ms",
+            params![session, w.account, w.folder, w.state_dir, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// FR-90 P2f-2c: where `session` was last worked on here, if anywhere.
+    pub fn workplace(&self, session: &str) -> Result<Option<WorkplaceRecord>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account, folder, state_dir FROM workplaces WHERE session = ?1",
+                params![session],
+                |r| {
+                    Ok(WorkplaceRecord {
+                        account: r.get(0)?,
+                        folder: r.get(1)?,
+                        state_dir: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// FR-90 P2b-3b — the newest event of `session` whose kind is `kind`: where
     /// a resumed session's next checkpoint starts. The `kind` column is set by
     /// a build that knows the kind, so a checkpoint an older daemon stored is
@@ -1145,6 +1257,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM substitutes WHERE session = ?1",
+            params![session],
+        )?;
+        tx.execute(
+            "DELETE FROM workplaces WHERE session = ?1",
             params![session],
         )?;
         tx.execute(
@@ -1818,6 +1934,116 @@ mod tests {
         assert_eq!(s.substitute("s1", &sub.commit).unwrap(), None);
         assert!(matches!(
             s.put_substitute("s1", &sub),
+            Err(StoreError::Purged { .. })
+        ));
+    }
+
+    /// FR-90 P2f-2c — a whole pack this store keeps a substitute for and not
+    /// every blob of is a stand-in, the oldest kept first, at most the limit;
+    /// a whole pack whose blobs are all here, a thin pack's commit and a
+    /// substitute no whole pack names are not. Where a session is worked on
+    /// is kept per session, a later launch's in its place, and goes with the
+    /// purge.
+    #[test]
+    fn a_stand_in_is_a_whole_pack_held_only_as_a_substitute() {
+        use crate::checkpoint::{Checkpoint, RepoKind, WorkspaceSnap, chunk_bytes};
+        use crate::event::TranscriptEvent;
+        let mut s = Store::open_in_memory().unwrap();
+        let (one, two, thin, four) = (
+            "1".repeat(40),
+            "2".repeat(40),
+            "3".repeat(40),
+            "4".repeat(40),
+        );
+        let ws = |commit: &str, base: Option<&str>, bytes: &[u8]| WorkspaceSnap {
+            repo: RepoKind::Own,
+            prefix: String::new(),
+            tree: "e".repeat(40),
+            commit: commit.to_string(),
+            base: base.map(str::to_string),
+            head: None,
+            pack: chunk_bytes(bytes).0,
+        };
+        let packs = [
+            ws(&one, None, b"whole one"),
+            ws(&two, None, b"whole two"),
+            ws(&thin, Some(&two), b"thin three"),
+            ws(&four, None, b"whole four"),
+        ];
+        for (n, w) in (1..).zip(packs) {
+            let cp = Checkpoint {
+                n,
+                turn: 1,
+                files: Vec::new(),
+                skipped: Vec::new(),
+                workspace: Some(w),
+            };
+            let tip = s.tip("s1").unwrap();
+            let env = EventEnvelope::next("s1", tip, 1, 0, &TranscriptEvent::Checkpoint(cp));
+            s.append(&env).unwrap();
+        }
+        // Whole two's own blob is here; whole one's and four's are not.
+        s.put_blob("s1", b"whole two").unwrap();
+        for (commit, bytes) in [
+            (&one, &b"for one"[..]),
+            (&two, b"for two"),
+            (&thin, b"for three"),
+            (&four, b"for four"),
+            (&"9".repeat(40), b"for nothing"),
+        ] {
+            s.put_blob("s1", bytes).unwrap();
+            let sub = Substitute {
+                commit: commit.clone(),
+                against: Vec::new(),
+                chunks: chunk_bytes(bytes).0,
+            };
+            s.put_substitute("s1", &sub).unwrap();
+        }
+        assert_eq!(
+            s.stand_ins("s1", crate::stream::MAX_WANTS).unwrap(),
+            vec![one.clone(), four.clone()],
+            "the whole packs held only as substitutes"
+        );
+        assert_eq!(
+            s.stand_ins("s1", 1).unwrap(),
+            vec![one.clone()],
+            "the limit"
+        );
+        assert!(
+            s.stand_ins("s2", crate::stream::MAX_WANTS)
+                .unwrap()
+                .is_empty()
+        );
+
+        let w = WorkplaceRecord {
+            account: "dev".into(),
+            folder: "/srv/app".into(),
+            state_dir: "/var/lib/roomler/hive/s1".into(),
+        };
+        assert_eq!(s.workplace("s1").unwrap(), None);
+        s.put_workplace("s1", &w).unwrap();
+        assert_eq!(s.workplace("s1").unwrap(), Some(w.clone()));
+        let later = WorkplaceRecord {
+            folder: "/srv/elsewhere".into(),
+            ..w.clone()
+        };
+        s.put_workplace("s1", &later).unwrap();
+        assert_eq!(
+            s.workplace("s1").unwrap(),
+            Some(later),
+            "a later launch's, in its place"
+        );
+        assert_eq!(s.workplace("s2").unwrap(), None);
+
+        s.purge("s1").unwrap();
+        assert_eq!(s.workplace("s1").unwrap(), None, "the purge takes it");
+        assert!(
+            s.stand_ins("s1", crate::stream::MAX_WANTS)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            s.put_workplace("s1", &w),
             Err(StoreError::Purged { .. })
         ));
     }
