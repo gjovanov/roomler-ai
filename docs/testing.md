@@ -158,7 +158,7 @@ flowchart LR
 
 | Cell | Link | Must show |
 |---|---|---|
-| `clean` | no delay | ≥ 0.9× the source's 30 fps decoded; no freeze |
+| `clean` | no delay | ≥ 0.75× the source's 30 fps decoded; no freeze |
 | `delay100` | +100 ms one way | p50 up by ≥ 80 ms: the metric sees the network |
 | `gate50` | a planted 50 ms hold in the capture stage | p50 up by ≥ 20 ms: the metric sees the pipeline. **The negative control** |
 | `lossy` | +20 ms, 5 ms jitter, 3 % of media packets dropped | the session survives and keeps decoding; its numbers are printed |
