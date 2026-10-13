@@ -22,7 +22,11 @@
 //! `id` is the hash of the cursor HCURSOR handle — constant for the
 //! duration of a shape, changes on I-beam / resize / link click etc.
 //! The browser maps `id` → `ImageBitmap` cache so it only decodes each
-//! shape once per session.
+//! shape once per session, and never replaces a cached id.
+//!
+//! On Linux the DRM arm reads the hardware cursor plane (FR-93 P3c,
+//! `capture::drm_cursor`). There `id` is a hash of the image and its
+//! hotspot, since a cursor plane has no handle that names a shape.
 
 use crate::capture::CursorInfo;
 use std::time::Duration;
@@ -85,9 +89,9 @@ pub struct CursorTracker {
     inner: windows_impl::WindowsCursorTracker,
     /// Whether the caller has already received a `shape` payload for
     /// the current `shape_id`. Resets when the handle changes. Only
-    /// consulted on Windows with the mf-encoder feature; non-Windows
-    /// and signalling-only builds keep the field but never read it
-    /// (the windows_impl `poll()` is cfg-gated). Allowed dead.
+    /// consulted on Windows with the mf-encoder feature, and on Linux
+    /// with DRM capture (FR-93 P3c); other builds keep the field but
+    /// never read it. Allowed dead.
     #[allow(dead_code)]
     last_advertised_shape: Option<u64>,
 }
@@ -120,11 +124,34 @@ impl CursorTracker {
                 shape,
             })
         }
-        #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+        #[cfg(all(target_os = "linux", feature = "drm-capture"))]
         {
-            // Linux + macOS: not yet wired. XFixesGetCursorImage +
-            // NSCursor would slot in here. Returning None falls back
-            // to the browser's synthetic-badge rendering.
+            // FR-93 P3c — the DRM arm's hardware cursor, which its worker reads
+            // off the cursor plane every frame (`capture::drm_cursor`). The
+            // other Linux arms put the pointer in their frames and publish
+            // nothing, so this stays `None` for them: the viewer's badge, as
+            // before, and never a second pointer over the streamed one.
+            let snapshot = super::drm_cursor::latest()?;
+            let new_shape = self.last_advertised_shape != Some(snapshot.shape_id);
+            let shape = new_shape.then(|| (*snapshot.shape).clone());
+            if shape.is_some() {
+                self.last_advertised_shape = Some(snapshot.shape_id);
+            }
+            Some(CursorTick {
+                x: snapshot.x,
+                y: snapshot.y,
+                shape_id: snapshot.shape_id,
+                shape,
+            })
+        }
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "mf-encoder"),
+            all(target_os = "linux", feature = "drm-capture")
+        )))]
+        {
+            // macOS, and Linux builds without DRM capture: not wired.
+            // NSCursor would slot in here. Returning None falls back to the
+            // browser's synthetic-badge rendering.
             None
         }
     }
