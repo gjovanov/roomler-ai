@@ -112,7 +112,7 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 | P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | — |
-| P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **built** (PR pending): wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). The field check needs an agent ≥ 0.4.134 and a promote |
+| P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **built**, PR #2138: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). The field check needs an agent ≥ 0.4.134 and a promote |
 | P4 | Idle timeout, max duration, the request rate limit | each off by default | — |
 | P5 | Docs and the field table | — | — |
 
@@ -128,12 +128,14 @@ and gives labs an explicit escape before the default flips.
 
 - [ ] **AC1 (red first):** a pcap of the deployed agent's DTLS ClientHello lists the CBC suites. After P1 it
   lists only ECDHE-GCM, and every fleet browser still connects.
-- [ ] **AC2 (amended 2026-10-13):** a test replays an SRTCP packet into the agent's **live session**. It
+- [x] **AC2 (amended 2026-10-13):** a test replays an SRTCP packet into the agent's **live session**. It
   is refused under P1's policy, and the test shows it can see a replay accepted: with protection
   disabled through the setting engine, the replay is obeyed. *As first written, this criterion asked
   for "accepted on today's configuration (red)". No such red exists: webrtc-srtp's `Session::new` had
   always given sessions a 64-packet window (§2). The first red came from a bare `Context`, which no
-  session builds.*
+  session builds.* **Verified** by FR-16 L0 in CI on #2130's merged head
+  ([job 115548206168](https://github.com/gjovanov/roomler-ai/actions/runs/38470382360/job/115548206168),
+  Linux): `replay` 0/3 and `legacy` 0/3 refused, `unguarded` 9/9 obeyed (12 IDRs against 4).
 - [ ] **AC3:** a config with `server_url = "http://roomler.ai"` signals over `wss://` after P1, while
   `http://127.0.0.1` stays `ws://`.
 - [ ] **AC4:** a device with `rc_files = off` refuses file transfer, the viewer shows why, and the agent
