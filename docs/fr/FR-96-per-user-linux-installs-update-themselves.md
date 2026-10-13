@@ -78,7 +78,7 @@ sequenceDiagram
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3364-3371` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3001`, `LINUX_UPDATE_TRIGGER` `:3006`, `queue_update_check` / `queue_update_check_at` `:3099-3118` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1548-1563`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`main.rs:1556-1571`) |
 | `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2052-2062`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
@@ -192,7 +192,7 @@ After a successful install, the helper asks every per-user daemon on the host to
 | **P1** | `roomlerd update-helper` on Linux, and the three units in the `.deb` and the tarball | the opt-out marker; the units disabled | the lab: the KDE per-user (tarball) and GNOME per-user (`.deb`) guests, red first on the release | M |
 | **P2a** | the per-user daemon wakes the helper instead of installing (§3.2), and its unit may write the wake file | `ROOMLERD_UPDATE_HELPER=0` | the lab: the KDE per-user guest, a real push → the helper's install (§8) | S |
 | **P2b** | the daemon onto the new binary after an install (§3.3, D1, D2) | `ROOMLERD_UPDATE_HELPER=0` | the lab, with a live session across the install | M |
-| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:4834-4864`) | — | the lab, a fresh install of each format | S |
+| **P3** | the installers: `install.sh` enables the units for a per-user install; a non-root `roomler self-update` wakes the helper (it bails today, `main.rs:4951-4981`) | — | the lab, a fresh install of each format | S |
 | **P4** | docs: `docs/linux-self-update.md` (status, the ladder claim, the helper), `docs/installation.md` (a Linux row beside the macOS three-unit table, `:297-301`, and `:497`), `README.Debian`, the `docs/README.md` index row | — | — | S |
 
 Each phase ships in an agent release (the `ship-it` skill owns the mechanics) and is field-verified before the
