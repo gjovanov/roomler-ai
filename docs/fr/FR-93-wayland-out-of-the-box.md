@@ -597,8 +597,13 @@ New cells run three times before they are trusted. An entry in `expected-failure
   - 🔴 first on 0.4.125, the release then and 0.4.124's code: *"This host has no display to capture
     (headless, or no desktop session)"* (step log 3).
   - Step log 43 on #1972.
-- [ ] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
+- [x] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
   the dialog answered by the harness).
+  ✅ On the lab's Plasma 6.7.5, newer than the 6.6 named here. **System** (`drm_capture` + `uinput`, FR-36's
+  arms, opt-in there by D1): `lit` 95–97 % on the release 0.4.126 (step log 23). **Per-user, no keys:** the
+  automatic portal (P2d-3) asked once, the harness answered, and the picture came in the session that waited
+  (step log 53); on the release 0.4.132 the restore token brought the picture back in 4 s with no dialog
+  (step log 60).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
   ⏳ System installs, with `drm_capture` + `uinput` (FR-36's arms, opt-in there by D1): ✅ GNOME, `points` 8/8
