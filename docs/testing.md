@@ -303,6 +303,51 @@ db.agent_logs.aggregate([
               lost: { $sum: '$lines.fields.lost' } } } ])
 ```
 
+### L4 on a release build: `roomlerd probe-target`
+
+The probe above needs an agent built with the synthetic source, and no release profile has
+it. `roomlerd probe-target` brings L4 to any Windows host. It opens a small topmost window
+flush in the primary monitor's bottom-right corner. Its marker changes when a **real pointer
+move** reaches one of the 16 cells across its pad. The probe is therefore an ordinary
+`mouse_move`, and a round trip also counts what the in-process probe cannot: injection, the
+host's compositor and the capture.
+
+```mermaid
+sequenceDiagram
+    participant V as viewer (roomler-rc-bench=target)
+    participant A as agent (any build)
+    participant T as probe-target window
+    participant S as painter: decode worker or <video>
+    V->>A: mouse_move onto cell N (aimed with rc:video-info's native size)
+    A->>T: injects it like any move (SendInput)
+    Note over T: WM_MOUSEMOVE in the pad → paints N into its marker
+    T-->>S: the next captured, encoded frames carry N bottom-right
+    S->>V: bench-probe {seq: N, paintedAt}: round trip = paintedAt − sent
+```
+
+| | |
+|---|---|
+| Layout (`agents/roomlerd/src/probe_target.rs`) | 144 × 80 physical px: a 32 px pad of 16 cells × 9 px above the 48 px marker area. The marker area is exactly the region the viewer's bottom-right decoder reads, at native size or a 2× or 4× downscale |
+| Aiming | The viewer aims at a cell's centre, `x = w − 144 + (cell − 1)·9 + 4`, `y = h − 64`, sent as `x / (w − 1)`, `y / (h − 1)`. That is the agent's own mapping (`map_normalised_to_virtual` rounds `x·(w − 1)`), so the move lands on that pixel exactly. Both suites pin the same vectors |
+| Numbers | Probe numbers are the cells, 1..16. At ~4 probes a second, a number comes round again only after its last probe has expired (2 s) |
+
+**Run it.**
+1. On the host, start it in the signed-in desktop session: `roomlerd probe-target` from a
+   terminal there. It prints its placement, and closes after `--seconds` (default 600) or
+   on a right-click.
+2. In the viewer, set `localStorage['roomler-rc-bench'] = 'target'`, reload, and connect with
+   input. Keep the session on the **primary** monitor, at native resolution or an exact 2× or
+   4× downscale.
+3. Don't touch the mouse while it runs: a person's own move across the pad paints a number
+   too.
+
+The console and `rc.l4` records then read as they do for the probe.
+
+⚠️ It covers the screen's corner, on Windows the taskbar clock, and re-asserts topmost every
+500 ms to stay above the taskbar. It reads nothing but the pointer over its own pad: no hook,
+no key reading (FR-92). It is Windows-only for now; a Linux or macOS host is benched with a
+synthetic-source build.
+
 ## The overlay stress lane (FR-81)
 
 Everything the mesh promises is a **latency and stability** claim, and before this lane nothing

@@ -104,6 +104,11 @@ pub mod person_socket;
 pub mod pgp_verify;
 pub mod post_install;
 pub mod preflight;
+/// FR-16 L4 — `roomlerd probe-target`: a corner window whose marker changes
+/// on real pointer moves, so a bench viewer times input to photon on a
+/// release build. The layout is pure and tested everywhere; the window is
+/// Windows-only.
+pub mod probe_target;
 /// Pseudo-terminals for Roomler SSH interactive sessions (P4a, Unix only —
 /// the module gates itself, so the `cfg` here would be redundant).
 pub mod pty;

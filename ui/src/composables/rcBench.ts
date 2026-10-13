@@ -49,21 +49,72 @@ export const RC_L4_RECORD_VERSION = 1
 /** Where a frame was painted, so a record says which path it measured. */
 export type BenchPath = 'video' | 'webcodecs' | 'hevc' | 'vp9-444'
 
-/** `roomler-rc-bench=1` in localStorage. Read once per session, like every
- *  other `roomler-rc-*` knob. */
-export function storedBench(): boolean {
+/** How a session times input to photon.
+ *  - `probe`: the agent paints the probe itself. Only a synthetic-source
+ *    build with bench mode on can, and it advertises `bench`.
+ *  - `target`: `roomlerd probe-target` paints it, a window on the host whose
+ *    marker changes when a real pointer move reaches one of its cells. Any
+ *    build, Windows hosts. The probe is a pointer move, so the round trip
+ *    also counts injection and the host's compositor. */
+export type BenchMode = 'probe' | 'target'
+
+/** `roomler-rc-bench`: `1` → `probe`, `target` → `target`, anything else off.
+ *  Read once per session, like every other `roomler-rc-*` knob. */
+export function storedBenchMode(): BenchMode | null {
   try {
-    return globalThis.localStorage?.getItem(BENCH_STORAGE_KEY) === '1'
+    const v = globalThis.localStorage?.getItem(BENCH_STORAGE_KEY)
+    return v === '1' ? 'probe' : v === 'target' ? 'target' : null
   } catch {
-    return false
+    return null
   }
 }
 
-/** Bench mode is on for a session only when the operator asked for it AND
- *  the agent will answer: a probe sent to anything else is noise on the
- *  input channel and a number nobody can read. */
+/** `roomler-rc-bench=1` in localStorage: probe mode asked for. */
+export function storedBench(): boolean {
+  return storedBenchMode() === 'probe'
+}
+
+/** The mode a session runs. `probe` only when the agent advertised `bench`:
+ *  a probe sent to anything else is noise on the input channel and a number
+ *  nobody can read. `target` whenever asked: the window answers it, not the
+ *  agent, and the operator who set the knob started the window. */
+export function benchSessionMode(
+  mode: BenchMode | null,
+  videoCaps: readonly string[] | null | undefined,
+): BenchMode | null {
+  if (mode === 'probe') return (videoCaps ?? []).includes(BENCH_CAP) ? 'probe' : null
+  return mode
+}
+
+/** Probe mode is on for a session: asked for AND advertised. */
 export function benchSessionActive(knob: boolean, videoCaps: readonly string[] | null | undefined): boolean {
-  return knob && (videoCaps ?? []).includes(BENCH_CAP)
+  return benchSessionMode(knob ? 'probe' : null, videoCaps) === 'probe'
+}
+
+/** `roomlerd probe-target`'s layout (`agents/roomlerd/src/probe_target.rs`),
+ *  in the host monitor's physical pixels: 144 wide, a 32 px pad of 16 cells
+ *  × 9 px above the 48 px marker area, flush in the bottom-right corner. */
+export const PROBE_TARGET = { width: 144, height: 80, padH: 32, cells: 16, cellW: 9 } as const
+
+/** A cell's centre in a `monW × monH` monitor's own pixels, or null outside
+ *  1..16 or on a monitor too small for the window. Mirrors
+ *  `probe_target::cell_centre`; both suites pin the same vectors. */
+export function probeTargetCellCentre(monW: number, monH: number, cell: number): { x: number; y: number } | null {
+  const t = PROBE_TARGET
+  if (!Number.isInteger(cell) || cell < 1 || cell > t.cells || monW < t.width || monH < t.height) return null
+  return {
+    x: monW - t.width + (cell - 1) * t.cellW + Math.floor(t.cellW / 2),
+    y: monH - t.height + t.padH / 2,
+  }
+}
+
+/** The same point as the normalised coordinates a `mouse_move` carries. The
+ *  agent maps `round(x · (w − 1))` (`map_normalised_to_virtual`), so dividing
+ *  by `w − 1` lands on the pixel exactly. */
+export function probeTargetPointer(monW: number, monH: number, cell: number): { x: number; y: number } | null {
+  const c = probeTargetCellCentre(monW, monH, cell)
+  if (!c) return null
+  return { x: c.x / (monW - 1), y: c.y / (monH - 1) }
 }
 
 export interface BenchStats {
@@ -103,6 +154,9 @@ export interface BenchProberDeps {
   random?: () => number
   setTimer?: (fn: () => void, ms: number) => unknown
   clearTimer?: (handle: unknown) => void
+  /** Probe numbers run 1..maxSeq. 4095 for the agent's 12-bit probe; 16 for
+   *  `probe-target`, whose cells are the numbers. */
+  maxSeq?: number
 }
 
 export interface BenchBatch {
@@ -128,6 +182,7 @@ export function createBenchProber(deps: BenchProberDeps): BenchProber {
   const random = deps.random ?? Math.random
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
+  const maxSeq = Math.max(1, Math.min(deps.maxSeq ?? 0x0fff, 0x0fff))
   const sent = new Map<number, number>()
   let seq = 0
   let timer: unknown = null
@@ -159,9 +214,11 @@ export function createBenchProber(deps: BenchProberDeps): BenchProber {
     timer = null
     const nowMs = now()
     expire(nowMs)
-    // 1..4095: the agent keeps 12 bits, and an all-zero word paints a
-    // black grid, so 0 is never used.
-    seq = (seq % 0x0fff) + 1
+    // 1..maxSeq: the agent keeps 12 bits, an all-zero word paints a black
+    // grid, and probe-target's cells are numbered from 1, so 0 is never used.
+    // With 16 numbers and a 2 s expiry at ~4 probes a second, a number is
+    // never reused while its last probe could still be in flight.
+    seq = (seq % maxSeq) + 1
     if (deps.send({ t: 'probe', seq })) {
       sent.set(seq, nowMs)
       deps.arm(seq)
