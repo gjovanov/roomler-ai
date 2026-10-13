@@ -141,9 +141,18 @@ L1–L3. Anchors are master `c2e79221b`.
 ### L4 — input to photon in the real viewer
 
 - **The probe.** The viewer sends `{t:"probe", seq}` on the input data channel. The agent in
-  bench mode paints `seq` into the next synthetic frame. The decode worker reads the marker
+  bench mode paints `seq` into a **second marker, bottom-right**, in every synthetic frame
+  that follows; the frame's own number stays bottom-left. The decode worker reads the marker
   from each decoded frame and records **paint − send on the browser's own clock**, so no
-  clock offset is needed.
+  clock offset is needed. The agent half is built, and `l4_latency.rs` gates the round trip
+  in process with its `probe` and `probe50` cells ([testing.md](../testing.md#l4-in-process-the-bench-probe)).
+- ⚠️ **Probes go out at a jittered interval.** A period that is a multiple of the frame
+  interval (250 ms is 15 frames at 60 fps) lands every probe on the same phase of the capture
+  clock. The run would then report one arbitrary point of the wait for the next capture
+  instead of its distribution, and two runs could differ by up to a frame interval for that
+  reason alone. That follows from the arithmetic; it is not a measurement. The in-process
+  harness jitters for the same reason, and its first run did not isolate the effect (field
+  log, 2026-10-13).
 - **The sample** is taken from `frame.clone()` with `copyTo({rect})`, plane 0 only, so the
   paint path is untouched. A GPU-backed frame reads back whole, about 1–2 ms at 1080p. So
   the worker samples one frame in N, and only in bench mode.
@@ -179,8 +188,8 @@ competitors". Engineering may use the numbers; the public pages never print them
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **built**: `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local runs in the field log |
-| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | — |
+| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`c85b3ba28`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
+| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. Owed: the viewer half (worker sampler, upload), `probe-target`, the nightly spec, the baselines |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
 | D | Docs | — | — |
@@ -197,8 +206,11 @@ competitors". Engineering may use the numbers; the public pages never print them
 - [ ] Two consecutive runs of the same cell agree within a stated tolerance
       (repeatability, without which nothing can be A/B'd).
 - [ ] The FR-17 before/after is reported as a distribution from this harness.
-- [ ] **L0** runs in CI as a named `--test`. It is green on clean links, and **red** under
+- [x] **L0** runs in CI as a named `--test`. It is green on clean links, and **red** under
       the planted 50 ms capture gate (the run that proves it can fail is linked).
+      Evidence: CI's recorder job names `--test l4_latency` since #2097 (`c85b3ba28`); green
+      on the runner (field log); red with the gate zeroed (field log, `gate50: p50 rose by
+      0.4 ms, want ≥ 20`).
 - [ ] **L4** puts a known-bad relay pair (CORPLAP-1 → neo16) and a known-good direct pair
       (neo16 → MacBook) at opposite ends of the ladder. Two runs of one cell agree within
       ±10 % at p50. On one cell, L4 agrees with a 240 fps camera within the viewer's
@@ -224,3 +236,6 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-13 | — | Amended: L0 and L4 first, as the instrument of the StarDesk teardown program. Nothing built yet. |
 | 2026-10-13 | L0, unoptimised build, neo16 (Windows) | **First run, green:** `clean` 30.2 fps decoded, p50 10.2 ms, p95 14.8 ms, 0 freezes · `delay100` p50 122.3 ms (+112) · `gate50` p50 63.3 ms (+53); the hold also halves the frame rate to 15.1, because it sits in the capture loop · `lossy` 25.2 fps, p50 46.6 ms, p95 62.1 ms, **3 freezes, 7 IDRs** against clean's 4. So loss is visible as freezes and keyframes even with NACK repair on. |
 | 2026-10-13 | L0, the same build | **Negative control, red:** `gate50` with its hold set to 0 failed `gate50: p50 rose by 0.4 ms, want ≥ 20` (exit 101); restored. A repeat of `clean` read p50 10.2 ms again. |
+| 2026-10-13 | L0, CI runner (Linux), merged head `6856520f6` | **Green in CI** (#2097, merged `c85b3ba28`): `clean` 30.2 fps, p50 12.7 ms, p95 15.5 ms · `delay100` p50 113.9 ms (+101) · `gate50` p50 64.6 ms (+52), 15.3 fps · `lossy` 26.3 fps, p50 38.4 ms, 1 freeze, 7 IDRs. The `clean` fps floor started at 0.9× and is now 0.75×, after a local run under a parallel repo-wide grep decoded 20 fps; a gate that flakes under load gets ignored. |
+| 2026-10-13 | L4 in process, unoptimised, neo16 (Windows) | **First probe run, green:** `probe` 64 round trips, p50 48.1 ms · `probe50` p50 171.1 ms (+123). That is more than the 100 ms two directions should cost. The first suspect was the probe period: 100 ms is exactly three frames, so every probe landed on the same phase of the capture clock. The probes now go out at a jittered interval. **Wrong turn:** with the jitter, `probe` read 43 round trips, p50 45.6 ms, and `probe50` p50 169.4 ms (+124), so the phase was not the extra. Windows timer overshoot in the vnet router is the likely cause: L0's `delay100` reads +112 on this box and +101 on the Linux runner. The jitter stays, because the phase-lock is real. |
+| 2026-10-13 | L4 in process, the same build | **Negative control, red:** with a probe dropped in the input handler before it reaches the source (one marked line), the test failed `probe: 0 round trips measured, want ≥ 20` (exit 101), with every L0 cell unaffected. Restored from the commit; the diff was that one line. |

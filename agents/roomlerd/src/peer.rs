@@ -8355,6 +8355,12 @@ fn attach_input_handler(
                 debug!("input: non-utf8 payload dropped");
                 return;
             };
+            // FR-16 L4 — a bench probe is the synthetic source's to paint,
+            // never an injector's. Outside bench mode it is dropped here.
+            #[cfg(feature = "synthetic-frame-source")]
+            if crate::capture::synthetic_backend::probe::accept_json(text) {
+                return;
+            }
             let parsed: input::InputMsg = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
