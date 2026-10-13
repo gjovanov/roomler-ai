@@ -129,6 +129,17 @@ pub fn start() -> Result<()> {
     }
 }
 
+/// FR-93 P5 (#2144) — at start, a per-user Linux daemon whose unit file wants it
+/// by `graphical-session.target` as well, while only `default.target` links to
+/// it (it was enabled before that target joined the unit's `[Install]`), enables
+/// it again once, so the next login starts it again. Runs on its own thread and
+/// never blocks the caller; a no-op as root and off Linux. Kill switch
+/// `ROOMLERD_UNIT_REPAIR=0`.
+pub fn repair_session_wants_at_start() {
+    #[cfg(target_os = "linux")]
+    linux::repair_session_wants_at_start();
+}
+
 /// #1705 — the desktop companion's service probes, recognised from RAW argv:
 /// `Some(false)` for `service status`, `Some(true)` for
 /// `service status --as-service`, `None` for everything else (any other
@@ -688,6 +699,147 @@ mod linux {
         systemctl(&["--user", "start", resolved_unit()])
     }
 
+    /// FR-93 P5 (#2144) — the target that has to START the unit after a
+    /// logout, because `PartOf=` stops it with the session.
+    const SESSION_TARGET: &str = "graphical-session.target";
+
+    /// The per-user unit's enablement: what `systemctl --user show` says, and
+    /// what its unit file asks for.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct UnitEnablement {
+        /// `UnitFileState`: `enabled`, `disabled`, `static`, …
+        pub state: String,
+        /// The targets that want the unit now: its `WantedBy=` property, from
+        /// the `.wants` links the manager has loaded.
+        pub wanted_by: Vec<String>,
+        /// The targets its unit file's `[Install]` section names.
+        pub install_wanted_by: Vec<String>,
+    }
+
+    /// Whether an enabled unit lacks a link its unit file asks for, the
+    /// session target's: `enable` creates the links, so a unit enabled before
+    /// its file named the target never got that one.
+    pub(super) fn needs_session_wants(e: &UnitEnablement) -> bool {
+        e.state == "enabled"
+            && e.install_wanted_by.iter().any(|t| t == SESSION_TARGET)
+            && !e.wanted_by.iter().any(|t| t == SESSION_TARGET)
+    }
+
+    /// The targets a unit file's `[Install]` section names in `WantedBy=`:
+    /// every such line, space-separated, an empty assignment clearing the list
+    /// (systemd's rule). Other sections and comments are not read.
+    pub(super) fn install_wanted_by(unit_file: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_install = false;
+        for raw in unit_file.lines() {
+            let line = raw.trim();
+            if line.starts_with('[') {
+                in_install = line == "[Install]";
+                continue;
+            }
+            if !in_install || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "WantedBy" {
+                continue;
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                out.clear();
+            } else {
+                out.extend(value.split_whitespace().map(str::to_string));
+            }
+        }
+        out
+    }
+
+    /// What `systemctl --user show` says of `unit`, with its unit file read
+    /// from disk: after a package upgrade the manager may still hold the old
+    /// file, which nobody reloaded for this user. `None` without systemd, a
+    /// user manager, or a unit file.
+    fn enablement(unit: &str) -> Option<UnitEnablement> {
+        let out = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                unit,
+                "-p",
+                "UnitFileState",
+                "-p",
+                "WantedBy",
+                "-p",
+                "FragmentPath",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (mut state, mut wanted_by, mut fragment) = (String::new(), Vec::new(), String::new());
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("UnitFileState=") {
+                state = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("WantedBy=") {
+                wanted_by = v.split_whitespace().map(str::to_string).collect();
+            } else if let Some(v) = line.strip_prefix("FragmentPath=") {
+                fragment = v.trim().to_string();
+            }
+        }
+        let file = std::fs::read_to_string(&fragment).ok()?;
+        Some(UnitEnablement {
+            state,
+            wanted_by,
+            install_wanted_by: install_wanted_by(&file),
+        })
+    }
+
+    /// See the module-level [`super::repair_session_wants_at_start`].
+    ///
+    /// ⚠️ Through `systemctl`, never by writing the link: the unit's sandbox
+    /// (`ProtectHome=read-only`) leaves `~/.config/systemd/user` read-only to
+    /// the daemon, and the user manager, which makes the link, is outside it.
+    pub(super) fn repair_session_wants_at_start() {
+        if !tunnel_core::env::flag("UNIT_REPAIR", true) {
+            return;
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("unit-repair".into())
+            .spawn(|| {
+                let unit = resolved_unit();
+                let Some(e) = enablement(unit) else {
+                    return;
+                };
+                if !needs_session_wants(&e) {
+                    return;
+                }
+                match systemctl(&["--user", "enable", unit]) {
+                    Ok(()) => tracing::info!(
+                        unit,
+                        wanted_by = ?e.wanted_by,
+                        "per-user unit: enabled for graphical-session.target too, so the next login \
+                         starts the daemon again (#2144)"
+                    ),
+                    Err(err) => tracing::warn!(
+                        unit,
+                        error = %format!("{err:#}"),
+                        "per-user unit: could not enable it for graphical-session.target; after a \
+                         logout the daemon stays down until the next boot (#2144)"
+                    ),
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(%e, "per-user unit: no thread to check its enablement (#2144)");
+        }
+    }
+
     pub fn status() -> Result<AutostartStatus> {
         // Either name counts as installed (an upgraded host may still run
         // the legacy-named unit until its next `service install`).
@@ -741,10 +893,11 @@ mod linux {
         directories::BaseDirs::new().map(|d| d.config_dir().join("systemd/user").join(name))
     }
 
-    fn install_user_unit_file() -> Result<()> {
-        let exe = std::env::current_exe().context("locating current exe")?;
-        let exe_str = exe.to_string_lossy();
-        let unit = format!(
+    /// The unit `service install` writes where no packaged one exists. Wanted
+    /// by `graphical-session.target` too, like the packaged unit (#2144):
+    /// `PartOf=` stops it with the session, so the session has to start it.
+    pub(super) fn user_unit_text(exe: &str) -> String {
+        format!(
             "[Unit]\n\
              Description=Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control\n\
              After=graphical-session.target\n\
@@ -752,20 +905,112 @@ mod linux {
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={exe_str} run\n\
+             ExecStart={exe} run\n\
              Restart=on-failure\n\
              RestartSec=5\n\
              Environment=RUST_LOG=roomlerd=info,tunnel_core=info,warn\n\
              \n\
              [Install]\n\
-             WantedBy=default.target\n"
-        );
+             WantedBy=default.target graphical-session.target\n"
+        )
+    }
+
+    fn install_user_unit_file() -> Result<()> {
+        let exe = std::env::current_exe().context("locating current exe")?;
+        let unit = user_unit_text(&exe.to_string_lossy());
         let path = user_unit_path().context("resolving user unit path")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("creating user unit dir")?;
         }
         std::fs::write(&path, unit).context("writing user unit file")?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ue(state: &str, wanted_by: &[&str], file_wants: &[&str]) -> UnitEnablement {
+            UnitEnablement {
+                state: state.to_string(),
+                wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),
+                install_wanted_by: file_wants.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        /// #2144: enabled before the unit file named the session target, so
+        /// only `default.target` links to it, and a user manager that outlives
+        /// a logout never starts it again.
+        #[test]
+        fn an_enabled_unit_without_the_session_link_its_file_names_is_repaired() {
+            let both = ["default.target", "graphical-session.target"];
+            assert!(needs_session_wants(&ue(
+                "enabled",
+                &["default.target"],
+                &both
+            )));
+        }
+
+        #[test]
+        fn nothing_to_repair_when_linked_disabled_or_the_file_is_older() {
+            let both = ["default.target", "graphical-session.target"];
+            assert!(
+                !needs_session_wants(&ue("enabled", &both, &both)),
+                "already linked"
+            );
+            assert!(
+                !needs_session_wants(&ue("disabled", &[], &both)),
+                "a unit the user switched off stays off"
+            );
+            assert!(!needs_session_wants(&ue("static", &[], &both)));
+            assert!(
+                !needs_session_wants(&ue("enabled", &["default.target"], &["default.target"])),
+                "an older unit file: enabling again would add nothing"
+            );
+        }
+
+        #[test]
+        fn install_wanted_by_reads_only_the_install_section() {
+            let file = "[Unit]\n\
+                        WantedBy=not-this.target\n\
+                        PartOf=graphical-session.target\n\
+                        \n\
+                        [Install]\n\
+                        # WantedBy=commented.target\n\
+                        WantedBy = default.target  graphical-session.target\n\
+                        WantedBy=extra.target\n";
+            assert_eq!(
+                install_wanted_by(file),
+                ["default.target", "graphical-session.target", "extra.target"]
+            );
+            assert_eq!(
+                install_wanted_by("[Install]\nWantedBy=a.target\nWantedBy=\nWantedBy=b.target\n"),
+                ["b.target"],
+                "an empty assignment clears the list"
+            );
+            assert!(install_wanted_by("[Service]\nWantedBy=x.target\n").is_empty());
+        }
+
+        /// The two units a per-user install can run, the packaged one and the
+        /// one `service install` writes, both stop with the session and are
+        /// both started again by it.
+        #[test]
+        fn both_per_user_units_are_wanted_by_the_session_they_stop_with() {
+            let packaged = include_str!("../packaging/linux/roomler.service");
+            let written = user_unit_text("/usr/bin/roomlerd");
+            for (name, unit) in [("packaged", packaged), ("written", written.as_str())] {
+                assert!(unit.contains("PartOf=graphical-session.target"), "{name}");
+                let wants = install_wanted_by(unit);
+                assert!(
+                    wants.iter().any(|t| t == "default.target"),
+                    "{name}: {wants:?}"
+                );
+                assert!(
+                    wants.iter().any(|t| t == SESSION_TARGET),
+                    "{name}: {wants:?} (#2144)"
+                );
+            }
+        }
     }
 }
 
