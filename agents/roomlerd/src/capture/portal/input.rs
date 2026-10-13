@@ -379,12 +379,23 @@ impl InputContext {
     /// how loud to be, and it deliberately keeps going: one refused event
     /// must not end input for the session.
     ///
-    /// ⚠️ **`call_noreply`, not `call_method`.** The `Notify*` methods return
-    /// nothing (`-` in the introspected signature), and input is latency, not
-    /// throughput: at ~1000 pointer events/second a per-event round-trip
-    /// waiting for an empty method-return is pure delay. `call_noreply` sets
-    /// `NO_REPLY_EXPECTED` and returns as soon as the message is written,
-    /// while still surfacing a send error (a dead session) to the pump.
+    /// ⚠️ **Every portal call WAITS for its reply** (FR-93 P4b). The reply is
+    /// empty and carries nothing, but waiting for it is what keeps the calls in
+    /// order. xdg-desktop-portal runs each RemoteDesktop method call on its own
+    /// worker thread (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`), so two calls sent
+    /// back to back can reach the backend in either order.
+    ///
+    /// Measured on KDE with `call_noreply`: about 1 keystroke in 15 had its
+    /// release arrive before its press. KWin dropped the release, because the key
+    /// was not down, then took the press. The key stayed held until that
+    /// letter's next keystroke, and KWin dropped that press as a repeat, so typed
+    /// text lost characters. A button's release overtaking its press holds a
+    /// mouse button down on the host the same way.
+    ///
+    /// The frontend forwards the call to the backend BEFORE it replies, so
+    /// waiting for the reply orders the calls. The cost is one bus round trip
+    /// per call. Mutter's own session ([`Self::execute_mutter`]) dispatches on
+    /// its main loop, already in order, so it keeps `call_noreply`.
     fn execute(&self, call: PortalCall) -> Result<(), zbus::Error> {
         use std::collections::HashMap;
         let (sess, node_id) = match &self.target {
@@ -392,31 +403,36 @@ impl InputContext {
             Target::Mutter { stream } => return self.execute_mutter(call, stream),
         };
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        match for_backend(call, self.quirks) {
+        let sent = match for_backend(call, self.quirks) {
             PortalCall::MotionAbs { x, y } => self
                 .proxy
-                .call_noreply("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
+                .call_method("NotifyPointerMotionAbsolute", &(sess, opts, node_id, x, y)),
             PortalCall::Button { code, down } => self
                 .proxy
-                .call_noreply("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
+                .call_method("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
             PortalCall::Axis { dx, dy } => self
                 .proxy
-                .call_noreply("NotifyPointerAxis", &(sess, opts, dx, dy)),
+                .call_method("NotifyPointerAxis", &(sess, opts, dx, dy)),
             PortalCall::AxisDiscrete { axis, steps } => self
                 .proxy
-                .call_noreply("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps)),
-            PortalCall::Keycode { code, down } => self.proxy.call_noreply(
+                .call_method("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps)),
+            PortalCall::Keycode { code, down } => self.proxy.call_method(
                 "NotifyKeyboardKeycode",
                 &(sess, opts, code, u32::from(down)),
             ),
             PortalCall::Keysym { sym, down } => self
                 .proxy
-                .call_noreply("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
-        }
+                .call_method("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
+        };
+        sent.map(drop)
     }
 
-    /// FR-93 P4 — [`Self::execute`] on mutter's own session. `call_noreply`
-    /// for the same reason as the portal's.
+    /// FR-93 P4 — [`Self::execute`] on mutter's own session.
+    ///
+    /// `call_noreply` here, because mutter keeps the calls in order on its own.
+    /// It answers its RemoteDesktop session on its main loop, so the calls are
+    /// handled in the order they were sent. Waiting for an empty reply would
+    /// add a round trip to every pointer event for nothing.
     fn execute_mutter(&self, call: PortalCall, stream: &str) -> Result<(), zbus::Error> {
         let Some(call) = mutter_call(call) else {
             return Ok(());
