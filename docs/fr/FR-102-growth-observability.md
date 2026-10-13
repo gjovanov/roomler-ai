@@ -54,7 +54,9 @@ This FR:
    A source that is down, unset or unbuilt renders `null` with a reason, never `0`.
 5. **Every rate carries its n.** Below n = 30 the UI shows counts and hides the percentage.
 6. **Self-hosted never phones home** (`docs/business-model.md` §6 rule 1, `LICENSING.md:20-23`). Nothing
-   here runs on, or counts, a self-hosted deployment.
+   here sends data from a self-hosted deployment or counts one. What runs on a self-hosted server (its own
+   funnel, its own fetch counters) stays on that server, and every integration that talks to the outside
+   world is in `saas`, which no self-host profile compiles (§3o).
 7. **Aggregates may outlive rows; rows never outlive their owner.** Frozen daily totals carry no person;
    per-org and per-person rows are deleted with the org or the person.
 
@@ -129,8 +131,9 @@ flowchart LR
 - **Two funnels, named apart.** The *visit funnel* (purestat, PS4) runs inside one visit: landing → page →
   goal. The *account funnel* (§3d) runs across days: sign-up → paid. Neither is computed from the other's
   rows.
-- **The join is by key, then by count.** "Campaign `20261019-ssh-without-port-forwar` on LinkedIn: 52
-  visitors, 1 `signup` goal; 2 accounts, 1 org activated" is two queries, one per plane, keyed alike.
+- **The join is by key, then by count.** One row of the Campaigns table, say campaign
+  `20261019-ssh-without-port-forwar` on LinkedIn, is two queries keyed alike. purestat gives its visitors
+  and `signup` goals; roomler gives its accounts, activated orgs and payers.
 
 ### 3b. The campaign key: one taxonomy, checked at both ends
 
@@ -417,19 +420,38 @@ sequenceDiagram
 
 ### 3o. Where the code goes (FR-69)
 
-- **Host** (`crates/api/src/routes/growth.rs`): the cross-module views (funnel, cohorts, orgs, timeline),
-  like FR-88's view. They read core, `fleet`, `remote`, `conference`, `network` and `saas`, and each step
-  answers `null` with a reason when its module is unmounted.
-- **`saas`** (hosted-only, never in a self-host profile): everything that exists for the hosted business.
-  That is the pullers (purestat, Search Console, Bing, GitHub), the ingest routes, SendGrid events,
-  `billing_events`, `growth_daily`, `growth_org_daily` and its job, `growth_exclusions`, the digest and
-  alerts.
-- **`fleet`**: token issuance, fetch counters and the enroll's `install`. These are fleet facts, and a
-  self-hoster's server keeps its own and sends them nowhere. The agent half is MPL-2.0 (`crates/agent-core`,
-  `agents/roomlerd`, the scripts, the wizard).
+The shape is the one `stats_*` already has. The collections are core-level and written through the core
+DAO by whichever module owns the fact (`stats_usage` is written by `network` and `conference`), and
+cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
+
+- **Host** (`crates/api/src/growth/`): the views (funnel, cohorts, orgs, timeline, campaigns, content,
+  install, revenue, newsletter, quality); the nightly job that writes `growth_org_daily` and freezes daily
+  totals; the digest and alerts. A source whose module is unmounted answers `null` with the module's name.
+- **Core** (`crates/services/src/dao/growth.rs`, indexes in core's plan beside `stats_*`): `growth_daily`,
+  `growth_org_daily`, `growth_exclusions`, `growth_alerts`.
+- **`saas`** (hosted-only, never in a self-host profile): what exists only for the hosted business. That is
+  the purestat, Search Console, Bing and GitHub pullers; the promotion pipeline's ingest routes; the
+  SendGrid webhook; `billing_events` and the wider Stripe handling. A self-hosted server compiles none of
+  it, so nothing leaves the server and nothing arrives.
+- **`fleet`**: `enroll_token_issued`, the fetch counters, `setup_diagnostics`, and the enroll's `install`.
+  A self-hosted server keeps its own and sends them nowhere. The agent half is MPL-2.0
+  (`crates/agent-core`, `agents/roomlerd`, the scripts, the wizard).
 - **`remote`**: `session_feedback` and the session carrier.
-- Index sets live in their modules (FR-69 rule 3). New routes change the composition baseline, so it is
-  re-recorded with `COMPOSITION_UPDATE=1` and a commit message that says why.
+- Module collections keep their index sets in the module (FR-69 rule 3). New routes change the composition
+  baseline, so it is re-recorded with `COMPOSITION_UPDATE=1` and a commit message that says why.
+
+| Collection | Owner | Shape | Kept | Written by |
+|---|---|---|---|---|
+| `growth_daily` | core | `_id = "<source>:<metric>:<dims>:<day>"`, `{day, source, metric, dims, value}`; upserted, frozen after 7 days | indefinitely; rows with a `tenant` dimension go with the org | the pullers, the ingest routes, fetch counters, quota collisions, the host's freeze |
+| `growth_org_daily` | core | `_id = "<tenant>:<day>"`, the §3d fields | 25 months; with the org | the host's nightly job |
+| `growth_exclusions` | core | `{kind: tenant\|user, id, reason, by, at}` | until removed | platform admins |
+| `growth_alerts` | core | `{rule, fired_at, detail, cleared_at}` | 90 days | the host's alert job |
+| `billing_events` | `saas` | §3g | with the org | the Stripe webhook |
+| `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
+| `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
+| `agents.install` | `fleet` | `{method, scope, run}` | with the agent row | the enroll |
+| `session_feedback` | `remote` | §3f | 25 months; with the user | the viewer |
+| `subscribers.unsubscribed_via`, `newsletter_sends.delivery` | `saas` | fields on existing collections | as FR-58 | the unsubscribe route, the SendGrid webhook |
 
 ### 3p. Privacy, retention, and the policy
 
