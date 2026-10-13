@@ -37,6 +37,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { resolveDates } from './dates.ts'
 import { ATTRIBUTION_ENABLED } from '../src/utils/attribution.ts'
 import {
+  ANALYTICS,
   BASE,
   BLOG_BASE,
   BLOG_DESCRIPTION,
@@ -809,6 +810,11 @@ function main(): void {
     attribution: ATTRIBUTION_ENABLED
       ? emitter.publishBytes('attribution.js', carryScript(readFileSync(join(THEME_DIR, 'attribution.js'), 'utf8'), installPages))
       : undefined,
+    // FR-102: the hosted-only analytics loader, on every page of whichever
+    // tree is being written (`/blog/assets/` in a blog-only build, so the lane
+    // depends on nothing under the image's `/docs/assets/`). `ANALYTICS = null`
+    // drops it, and with it every trace of the tracker.
+    analytics: ANALYTICS ? emitter.publishFile(join(THEME_DIR, 'analytics.js')) : undefined,
     // The top bar's logo, from the SPA's own copy, so the two never drift.
     logo: emitter.publishFile(join(UI_ROOT, 'src', 'assets', 'brand', 'roomler-logo.svg')),
   }

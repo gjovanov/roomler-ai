@@ -7,6 +7,7 @@ import pinia from '@/plugins/pinia'
 import router from '@/plugins/router'
 import App from '@/App.vue'
 import { clearLegacyTokens } from '@/api/session'
+import { loadAnalytics } from '@/utils/analytics'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Delete the tokens earlier versions kept in localStorage — an access token
@@ -15,6 +16,12 @@ import { useCapabilitiesStore } from '@/stores/capabilities'
 // written: a user who never signs out again would otherwise carry the old pair
 // until they expire. Runs before anything can read them.
 clearLegacyTokens()
+
+// FR-102 (#2127) — the analytics tracker, on the hosted site only. It was a
+// static tag in index.html, so every self-hosted install and every localhost
+// run reported to purestat.ai as roomler.ai. A no-op on any other host, and
+// under a WebDriver, so the e2e suite never loads it either.
+loadAnalytics()
 
 const app = createApp(App)
 

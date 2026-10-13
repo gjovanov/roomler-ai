@@ -3,14 +3,16 @@
 /**
  * FR-88 (#1790) §3b — conversion goals, counted by purestat.
  *
- * purestat's script (`ui/index.html`, and every static page through the
- * shell) defines `window.purestat(name)`, and each goal below has a goal of
- * the same name in purestat, which attributes it to the visit's source. The
+ * purestat's script — injected by `analytics.ts` in the SPA and by the shell's
+ * loader on every static page, on the hosted site only (FR-102, #2127) —
+ * defines `window.purestat(name)`, and each goal below has a goal of the
+ * same name in purestat, which attributes it to the visit's source. The
  * static pages fire the same names from `docs.js` and `home.js`.
  *
- * A call is a NO-OP when the script is absent (blocked, not loaded yet, or
- * turned off) and it never throws: analytics must not be able to break a
- * sign-up, a subscription or a copy.
+ * A call is a NO-OP when the script is absent (blocked, not loaded yet,
+ * turned off, or not this host: a self-hosted deployment never loads it) and
+ * it never throws: analytics must not be able to break a sign-up, a
+ * subscription or a copy.
  *
  * ⚠️ purestat sends `location.href` with every event. Fire a goal only once
  * the URL holds nothing private — see `OAuthCallbackView.vue`, whose URL
