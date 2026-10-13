@@ -5023,7 +5023,8 @@ fn media_waiting_hook(
         info!(
             %session_id,
             gives_up_in_s = wait.gives_up_in.as_secs(),
-            "capture: waiting for the person at the screen to answer the portal dialog; telling the controller"
+            why = ?wait.why,
+            "capture: waiting for the person at the screen (a portal dialog, or an unlock); telling the controller"
         );
         runtime.spawn(async move {
             // Bounded by the dialog's own deadline too: past it, the notice
