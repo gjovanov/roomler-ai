@@ -536,6 +536,57 @@ mod tests {
         assert!(matches!(line.fields.get("ttff_ms"), Some(bson::Bson::Null)));
     }
 
+    /// FR-16 L4 — the bench viewer's input-to-photon record, in exactly the
+    /// shape `buildL4Upload` in `ui/src/composables/rcBench.ts` emits (its
+    /// spec builds the same body from the same numbers). Round trips are
+    /// fractional milliseconds, so they arrive as doubles; a shape drift
+    /// would 422, be swallowed, and look like nobody benchmarking.
+    #[test]
+    fn browser_l4_bench_record_parses() {
+        let raw = r#"{
+            "tenant_id": "69f0000000000000000000a1",
+            "source": "browser",
+            "session_id": "69f0000000000000000000b2",
+            "lines": [{
+                "ts": {"$date": {"$numberLong": "1760364000000"}},
+                "level": "INFO",
+                "target": "rc.l4",
+                "msg": "L4 n=3 lost=1 p50=45.6ms p95=61.2ms max=61.2ms path=video",
+                "fields": {
+                    "v": 1,
+                    "paths": ["video"],
+                    "n": 3,
+                    "lost": 1,
+                    "p50_ms": 45.6,
+                    "p95_ms": 61.2,
+                    "min_ms": 38,
+                    "max_ms": 61.2,
+                    "rtt_ms": [45.6, 38, 61.2],
+                    "agent_id": "69f0000000000000000000c3"
+                }
+            }]
+        }"#;
+        let payload: BrowserLogBatchPayload =
+            serde_json::from_str(raw).expect("the bench viewer's record must parse");
+        let tid = ObjectId::parse_str(&payload.tenant_id).expect("tenant hex");
+        let batch =
+            build_batch(tid, None, Some(ObjectId::new()), payload.inner).expect("build_batch");
+        let line = &batch.lines[0];
+        assert_eq!(line.target, "rc.l4");
+        assert_eq!(line.level, LogLevel::Info);
+        assert_eq!(line.fields.get_f64("p50_ms"), Ok(45.6));
+        let rtts = line.fields.get_array("rtt_ms").expect("rtt_ms array");
+        assert_eq!(rtts.len(), 3);
+        assert_eq!(
+            line.fields
+                .get_array("paths")
+                .expect("paths")
+                .first()
+                .and_then(|p| p.as_str()),
+            Some("video")
+        );
+    }
+
     #[test]
     fn scrub_tokens_passes_through_non_jwt() {
         let s = "just a normal log line with no secrets";
