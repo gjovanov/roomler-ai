@@ -445,9 +445,10 @@ impl InputContext {
             PortalCall::AxisDiscrete { axis, steps } => {
                 self.send("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps))
             }
-            PortalCall::Keycode { code, down } => {
-                self.send("NotifyKeyboardKeycode", &(sess, opts, code, u32::from(down)))
-            }
+            PortalCall::Keycode { code, down } => self.send(
+                "NotifyKeyboardKeycode",
+                &(sess, opts, code, u32::from(down)),
+            ),
             PortalCall::Keysym { sym, down } => {
                 self.send("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down)))
             }
@@ -464,15 +465,11 @@ impl InputContext {
                 self.send("NotifyPointerMotionAbsolute", &(stream, x, y))
             }
             MutterCall::Button { code, down } => self.send("NotifyPointerButton", &(code, down)),
-            MutterCall::Axis { dx, dy, flags } => {
-                self.send("NotifyPointerAxis", &(dx, dy, flags))
-            }
+            MutterCall::Axis { dx, dy, flags } => self.send("NotifyPointerAxis", &(dx, dy, flags)),
             MutterCall::AxisDiscrete { axis, steps } => {
                 self.send("NotifyPointerAxisDiscrete", &(axis, steps))
             }
-            MutterCall::Keycode { code, down } => {
-                self.send("NotifyKeyboardKeycode", &(code, down))
-            }
+            MutterCall::Keycode { code, down } => self.send("NotifyKeyboardKeycode", &(code, down)),
             MutterCall::Keysym { sym, down } => self.send("NotifyKeyboardKeysym", &(sym, down)),
         }
     }
