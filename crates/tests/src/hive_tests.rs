@@ -4382,6 +4382,44 @@ async fn only_a_teleports_prepare_says_have_and_want_and_only_once_turned_on() {
     }
 }
 
+/// FR-90 P2f-2d — a teleport's target whose folder holds work of its own
+/// refuses the prepare `folder_dirty`: the caller is answered in those words,
+/// with the target's own detail (the sibling it names for the person to
+/// make), and nothing moves.
+#[tokio::test]
+async fn a_teleport_into_a_folder_holding_work_of_its_own_is_refused_in_words() {
+    let app = teleport_app().await;
+    let mut m = teleportable(&app, "teleportdirty", TELEPORT_TARGET).await;
+    let detail = "it is neither what its HEAD holds nor what this session last left there; \
+                  make a sibling, e.g. `git worktree add /srv/clone-hive-1234abcd`, and teleport there";
+    let (body, _) = teleport_answered(
+        &app,
+        &mut m,
+        Some("/srv/clone"),
+        Some(json!({"refused": "folder_dirty", "detail": detail})),
+    )
+    .await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("folder_dirty")),
+        "{body}"
+    );
+    // The room's words, escaped for Markdown.
+    let said = body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .replace('\\', "");
+    assert!(
+        said.contains("holds work of its own")
+            && said.contains("git worktree add /srv/clone-hive-1234abcd"),
+        "the room's words: {body}"
+    );
+    assert!(
+        body["session"].get("promotion").is_none(),
+        "nothing moves: {body}"
+    );
+}
+
 /// FR-90 P2f-1 — a teleport is refused by the gate it failed, each in its
 /// own word: the route is not there with the replicaset off; a device that
 /// holds a copy already is promoted to, not teleported to; the target and the
