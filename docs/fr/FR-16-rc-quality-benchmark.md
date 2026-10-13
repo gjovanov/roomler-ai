@@ -111,14 +111,19 @@ L1–L3. Anchors are master `c2e79221b`.
 - **It runs in CI** the way `control_dc_record` already does: one more explicit
   `cargo test -p roomlerd --features openh264-encoder,synthetic-frame-source --test l4_latency`
   line next to `.github/workflows/ci.yml` L686–689. A test file nobody names runs in no lane.
-- **Cells** are small, because openh264 pegs a core above ~35 fps at 1080p: 640×360@30 and
-  1280×720@30. 1080p, 4K and high refresh are field cells.
-- **Assertions that can fail,** each with its negative control:
-  - a clean link gives capture→decode p50 < 25 ms and ≥ 0.9× the target fps;
-  - a 100 ms vnet delay gives p50 ≥ 100 ms, so the metric demonstrably sees the network;
-  - 2 % loss gives freezes (> 200 ms gaps) and more IDRs than the clean run;
-  - **a planted regression** (a 50 ms capture gate behind a test knob) moves p50 by ≥ 20 ms.
-    A benchmark that cannot be made to fail is not a gate.
+- **Cells** run at the synthetic source's default 320×240 and the software pump's 30 fps.
+  CI builds are unoptimised and openh264 pegs a core long before 1080p, so larger sizes
+  (`ROOMLERD_SYNTHETIC_SIZE`) are for local and field runs. 1080p, 4K and high refresh are
+  field cells.
+- **Assertions that can fail.** The bounds are deltas and generous ceilings, because the
+  absolute numbers depend on the machine:
+  - a clean link decodes ≥ 0.9× the target fps, with no freeze and p50 under a debug-build
+    ceiling;
+  - a 100 ms vnet delay raises p50 by ≥ 80 ms, so the metric demonstrably sees the network;
+  - 3 % loss (with 20 ms delay and 5 ms jitter) leaves a session that still decodes; its
+    freezes and IDRs are printed;
+  - **a planted regression** (a 50 ms capture-stage hold) raises p50 by ≥ 20 ms. A benchmark
+    that cannot be made to fail is not a gate.
 
 ### The synthetic source grows up
 
