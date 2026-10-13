@@ -205,6 +205,7 @@ async fn scenario() {
         unreachable_from: false,
         prior: None,
         teleport: false,
+        fork: None,
     };
     assert!(
         dao.begin_promotion(rec.tenant_id, rec.owner_id, session_id, &promotion, false)
