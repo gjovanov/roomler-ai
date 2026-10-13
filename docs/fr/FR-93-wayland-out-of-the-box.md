@@ -572,13 +572,19 @@ New cells run three times before they are trusted. An entry in `expected-failure
 
 ## 7. Acceptance criteria
 
-- [ ] **AC1** — a default **per-user** install on GNOME 50 Wayland, no keys: the viewer shows the real desktop
+- [x] **AC1** — a default **per-user** install on GNOME 50 Wayland, no keys: the viewer shows the real desktop
   (canvas ≈ `virsh screenshot`, the probe counter fresh within 2 s). Red on 0.4.124 first.
   ⏳ 0.4.130 (the guest's own updater from 0.4.129): `lit=90.0 %` and `100.0 %` in two sessions,
   `capture: backend=portal via org.gnome.Mutter.ScreenCast, AUTOMATIC`, and the pill reads
   "GNOME screencast · asks nobody". 🔴 first on 0.4.125: `BLACK (lit=0.0%)`, `backend=scrap` (step log 3).
-  **Not ticked:** the per-user probe is a GTK4 Wayland window that draws **no counter**, so "fresh within
-  2 s" has nothing to read. The probe needs a counter on its Wayland surface first.
+  ✅ **The released 0.4.132**, no keys, mutter AUTOMATIC: the viewer decoded the probe's block code from
+  **112 of 112** frames read every 250 ms for 30 s, **112 distinct counters**, each dated by the probe's own
+  tick log. The counter shown was **0.42–0.68 s old** (median 0.54 s); with the lab's clock uncertainty
+  (±0.43 s) the worst case is 1.1 s, inside the 2 s. A decoded live counter is the canvas showing the guest's
+  own desktop. The earlier "draws no counter" was the guest, not the probe: it lacked `python3-gi-cairo`, so
+  every draw raised *"Couldn't find foreign struct converter for 'cairo.Context'"* and the window stayed
+  blank while its tick log ran. It also ran a probe from before the startup guard that refuses to start
+  without that package (`lab.sh update-probe` brought it current). Step log 61.
 - [x] **AC2** — a default **system** install on GNOME 50 Wayland, no keys: the viewer reads
   `wayland_not_enabled` with the root hint naming `drm_capture` + `uinput` (never "headless"), and once those
   two keys are set it shows the real desktop (canvas ≈ `virsh screenshot`). Red on 0.4.124 first ("headless").
@@ -597,15 +603,22 @@ New cells run three times before they are trusted. An entry in `expected-failure
   - 🔴 first on 0.4.125, the release then and 0.4.124's code: *"This host has no display to capture
     (headless, or no desktop session)"* (step log 3).
   - Step log 43 on #1972.
-- [ ] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
+- [x] **AC3** — Plasma 6.6 Wayland, per-user and system: a picture (attended where the only path is attended,
   the dialog answered by the harness).
+  ✅ On the lab's Plasma 6.7.5, newer than the 6.6 named here. **System** (`drm_capture` + `uinput`, FR-36's
+  arms, opt-in there by D1): `lit` 95–97 % on the release 0.4.126 (step log 23). **Per-user, no keys:** the
+  automatic portal (P2d-3) asked once, the harness answered, and the picture came in the session that waited
+  (step log 53); on the release 0.4.132 the restore token brought the picture back in 4 s with no dialog
+  (step log 60).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
-  ⏳ GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events). KDE
-  per-user: ✅ in the lab on P4b (`9a8e20699`, then `64f00509f`), all 7 checks three times, through the remote
-  control the automatic portal asks for; 🔴 first on the release (0 events through KWin's gate,
-  `remote-control.md`), and on P4b's first candidate (`helo 123A`, calls unawaited). Owed: released builds, and
-  both system installs (uinput).
+  ⏳ System installs, with `drm_capture` + `uinput` (FR-36's arms, opt-in there by D1): ✅ GNOME, `points` 8/8
+  on 0.4.125 and again on the release 0.4.128 (step logs 16, 31); ✅ KDE, 8/8 on the release 0.4.126 (step log
+  23). GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events), and ✅
+  again on the released 0.4.132, all 7 checks (step log 60). KDE per-user: ✅ in the lab on P4b (`9a8e20699`,
+  then `64f00509f`), all 7 checks three times, through the remote control the automatic portal asks for; 🔴
+  first on the release (0 events through KWin's gate, `remote-control.md`), and on P4b's first candidate
+  (`helo 123A`, calls unawaited). Owed: KDE per-user on a released build (P4b rides the release after 0.4.132).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
@@ -685,8 +698,10 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-12 | `wlab-kde` (4 cores) | 0.4.130, then P2d-1 `bbb065e` | P2d-1: one viewer, three sessions in ~60 s plus the viewer's watchdog, nobody answering; then an answer (`linux-capture.md` §4.6) | 🔴 0.4.130 ×2: 4 requests, 4 helpers alive at once, the third session never answered, then `watchdog-of-watchdog … forcing exit(2)`. ✅ P2d-1 ×2: 1 request, 1 helper, `NRestarts=0`. ✅ An answer while a session waits: the capture 1.6 s later, one request in all. ✅ An answer after the last session left: dropped. Step log 46 |
 | 2026-10-13 | `wlab-kde` (per-user, `portal_capture`) | 0.4.131, then master `b5871e47f`; prod's viewer `hosted-20261012-f07ba2c` | P2d-2: one viewer, nobody answers for 75 s, then the lab answers (`linux-capture.md` §4.7) | 🔴 0.4.131: 5 sessions (4 re-creates), the notice in 0 of 51 samples, the answer landed with no session live, and the picture came 48 s later from the restore token. ✅ P2d-2: 1 session, the notice in every sample until the answer, the capture about 2 s after the click in that session, 1 request. Step log 52 |
 | 2026-10-13 | `wlab-kde` (per-user, no capture key), `wlab-gnome` (per-user) | 0.4.131, then P2d-3 `ba6ab497f` | P2d-3: the flip (`linux-capture.md` §1.2) | 🔴 0.4.131: brief `capture_arm=none`; a session reads `wayland_not_enabled`, 0 requests, no dialog. ✅ P2d-3: brief `portal`; one dialog, the viewer told at +2 s, and after the lab's answer the picture in that session (`lit=81.7 %`, "desktop portal · allowed at the screen"); the next session on the restore token in 85 ms; with the screen locked, KDE's lock screen from the token, which survived; `wayland_auto = false`: `wayland_not_enabled` with the new hint; GNOME per-user: still mutter, `lit=90.0 %`, no portal request. Step log 53 |
-| 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.131, then P4a `3f9ad6464` | P4a / AC4: the lab's input oracle (`measure/viewer-input.sh … points`) against the probe, a native GTK4 window (`linux-capture.md` §5.2) | 🔴 0.4.131: the picture, 0 events at the probe, all 7 input checks failed, brief `input_reach=none`. ✅ P4a: all 7 passed (three points exact, click, wheel down, "hello 123", Shift+a as "A"), brief `full`. ✅ `mutter_input = false`: view-only again, 0 events. A wrong turn, kept: the first kill-switch run wrote the key while 0.4.131 ran, and its shutdown save erased it (#2078). Step log 54 |
+| 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.131, then P4a `3f9ad6464` | P4a / AC4: the lab's input oracle (`measure/viewer-input.sh … points`) against the probe, a native GTK4 window (`linux-capture.md` §5.2) | 🔴 0.4.131: the picture, 0 events at the probe, all 7 input checks failed, brief `input_reach=none`. ✅ P4a: all 7 passed (three points exact, click, wheel down, "hello 123", Shift+a as "A"), brief `full`. ✅ `mutter_input = false`: view-only again, 0 events. A wrong turn, kept: the first kill-switch run wrote the key while 0.4.131 ran, and its shutdown save erased it (#2078). Step logs 55–56 |
 | 2026-10-13 | `wlab-kde` (per-user, no capture key) | P4b: `fe0c3ae93` (calls unawaited), then `9a8e20699` and `64f00509f` (calls awaited) | P4b / AC4: KDE's *Remote Control* dialog; the AC4 oracle; a typing stress (112 keystrokes, 40 of them the second of a doubled letter, 80 ms apart) into the probe's focused text entry; the helper's input trace lined up against the probe's log on the guest's clock (`linux-capture.md` §1.2, §4.3) | 🔴 unawaited: the oracle passed once, then typed `helo 123A`; the stress got 10, 17, 6 and 8 of 113 characters wrong, with KDE's input method (plasma-keyboard) on or off. The trace showed every call sent, and the window missing a key's release, then a lone release at that letter's next keystroke: a release that overtook its press. xdg-desktop-portal runs each call on a worker thread (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`). ✅ awaited: the oracle 7/7 three times, the stress exact four times, 0.5 ms a call at the median. ✅ The wheel notch down arrives down. ✅ A denial: KDE asked again for the screen only; the session ran view-only with its picture and a reach banner naming the fix. Wrong turn, kept: plasma-keyboard's keyboard grab looked guilty (every key round-trips through it) and was not. Step log 59 |
+| 2026-10-13 | `wlab-gnome` (per-user), `wlab-gnome-sys`, `wlab-kde` (per-user) | 0.4.132, the release | the release in the lab: each guest's update path, then AC4 on GNOME per-user, a session to the no-key system guest, and the automatic portal on KDE | GNOME per-user: the 0.4.131 updater verified the `.asc`, then could not install a `.deb` as uid 1000 (no pkexec, no passwordless sudo; FR-96 P1's root helper starts with 0.4.132), so the verified package went in by hand; ✅ the AC4 oracle 7/7 on the released build. GNOME system: ✅ its own updater, `SucceededVerified`, the live daemon on 0.4.132 within seconds; a session refuses with `wayland_not_enabled` and the admin's fix. KDE per-user (a tarball install, #2046), by hand after gpg reported a good signature: ✅ the screen share restored from its token, the picture at +4 s, no dialog, view-only, since P4b is not in 0.4.132. Step log 60 |
+| 2026-10-13 | `wlab-gnome` (per-user, no key) | 0.4.132, the release | AC1: the viewer decodes the probe's block code from the frame every 250 ms for 30 s; each counter is dated by the probe's own tick log, on mars's clock with the guest's offset measured over the lab's ssh | The first run decoded nothing: the probe window was blank. The guest lacked `python3-gi-cairo` (it predates that bake line), so every draw raised a TypeError while the tick log ran on, and its probe predated the startup guard that refuses to start without the package. ✅ With it installed (and the probe updated afterwards): 112 of 112 frames decoded, 112 distinct counters, the counter shown 0.42–0.68 s old (median 0.54 s), clock uncertainty ±0.43 s. Step log 61 |
 
 ## 12. Related
 
