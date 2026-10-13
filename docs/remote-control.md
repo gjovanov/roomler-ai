@@ -390,7 +390,7 @@ Key design choices:
 
 Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which requires the agent to be in the `input` group (or have `CAP_SYS_ADMIN`). Installer adds the user to `input` group + udev rule. If permission isn't granted, the agent runs in **view-only** mode and the UI clearly says so.
 
-As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
+As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. A per-user Wayland session whose portal switched itself on (FR-93 P4b, KDE and other desktops without mutter) asks for remote control with no key set. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
 
 **Saying so (FR-93 P1).** An injector that reaches nothing does not fail. XTest
 into Xwayland *succeeds*, and moves only Xwayland's own pointer, which the
@@ -425,8 +425,13 @@ read fine. There, two readable facts stand in:
   (`libkwin.so.6.7.5`). 6.1 is the release that hands every Xwayland an EI
   socket (Plasma 6.1's changelog), so Plasma 5.27 stays `xwayland_only`.
 
-KWin's grant is the per-user input path on Plasma, and the release binary
-already uses it. Measured on Plasma 6.7 with the viewer oracle's `points` plan:
+From FR-93 P4b the per-user input path on Plasma is the automatic portal's
+remote control: one dialog, its answer restored afterwards, and no settings to
+change ([`linux-capture.md`](linux-capture.md#12-a-per-user-wayland-session-switches-itself-on-fr-93-p2-decision-d1)
+§1.2). So a session whose reach still reads `none` there tells the person to
+reconnect and allow remote control first. KWin's grant is the other path, and
+the release binary already uses it. Measured on Plasma 6.7 with the viewer
+oracle's `points` plan:
 
 | kwinrc `[Xwayland]` | result |
 |---|---|

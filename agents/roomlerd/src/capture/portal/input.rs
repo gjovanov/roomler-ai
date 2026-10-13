@@ -330,12 +330,13 @@ impl Target {
     /// (`HANDLE_METHOD_INVOCATIONS_IN_THREAD`), so two calls sent back to back
     /// reach the backend in either order.
     ///
-    /// Measured on KDE (Plasma 6.7) with unawaited calls: about 1 keystroke in
-    /// 15 had its release arrive before its press. KWin dropped the release,
-    /// because the key was not down, then took the press. The key stayed held
-    /// until that letter's next keystroke, and KWin dropped that press as a
-    /// repeat: typed text lost characters. A button's release overtaking its
-    /// press would hold a mouse button down on the host the same way.
+    /// Measured on KDE (Plasma 6.7) with unawaited calls: 41 of 452 typed
+    /// characters came out wrong over four runs, and none once the calls
+    /// waited. A key's release arrived before its press. KWin dropped the
+    /// release, because the key was not down, then took the press. The key
+    /// stayed held until that letter's next keystroke, and KWin dropped that
+    /// press as a repeat. A button's release overtaking its press would hold a
+    /// mouse button down on the host the same way.
     ///
     /// The frontend forwards each call to the backend BEFORE it replies, so
     /// waiting for the reply keeps the order, for one bus round trip per call.
@@ -851,7 +852,7 @@ mod tests {
 
     /// FR-93 P4b — the portal's calls wait for their replies, because only the
     /// wait keeps them in order. xdg-desktop-portal handles each call on a
-    /// worker thread; unawaited, about 1 keystroke in 15 lost characters on KDE.
+    /// worker thread; unawaited, 41 of 452 typed characters came out wrong on KDE.
     #[test]
     fn portal_calls_wait_for_their_replies() {
         let portal = Target::Portal {

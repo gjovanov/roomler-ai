@@ -126,12 +126,16 @@ const WAYLAND_FIX: &str = "On a system install switch on uinput. A per-user one 
      mutter_input is set to false: reconnect, and allow remote control when the \
      desktop asks.";
 
-/// The fix where KWin gates XTest. The narrow grant, not the global switch:
-/// it names this agent and nothing else. KWin reads it when Xwayland starts,
-/// hence the new login.
-const KWIN_FIX: &str = "On Plasma, the person at the screen allows roomlerd once in \
-     System Settings, Legacy X11 App Support (kwinrc [Xwayland] \
-     XwaylandEisNoPromptApps=roomlerd), then logs in again; on a system install, \
+/// The fix where KWin gates XTest. First the remote control a per-user
+/// install's automatic portal asks for (FR-93 P4b): a session lands here when
+/// the person refused it, or `portal_input = false`. Then the narrow grant, not
+/// the global switch: it names this agent and nothing else. KWin reads it when
+/// Xwayland starts, hence the new login.
+const KWIN_FIX: &str = "A per-user install asks the person at the screen for remote \
+     control by itself, unless portal_input is set to false: reconnect, and allow \
+     remote control when the desktop asks. Or the person at the screen allows \
+     roomlerd once in System Settings, Legacy X11 App Support (kwinrc [Xwayland] \
+     XwaylandEisNoPromptApps=roomlerd), then logs in again. On a system install, \
      switch on uinput.";
 
 /// The reach `input::open_default` would give a session with these facts.
@@ -654,7 +658,14 @@ mod tests {
         })));
         assert_eq!(r.reach, Reach::None);
         assert!(r.reason.contains("KWin"), "{}", r.reason);
-        // The fix it names is the narrow grant, for this agent alone.
+        // P4b — first the remote control the automatic portal asks for: the
+        // session lands here when the person refused it.
+        assert!(
+            r.reason.contains("allow remote control when the desktop asks"),
+            "{}",
+            r.reason
+        );
+        // Then the narrow grant, for this agent alone.
         assert!(
             r.reason.contains("XwaylandEisNoPromptApps=roomlerd"),
             "{}",
