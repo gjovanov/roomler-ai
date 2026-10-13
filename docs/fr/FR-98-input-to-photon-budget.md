@@ -69,7 +69,7 @@ are not a result.
 | C3 | **Input gap 8 → 4 ms** (0 and 2 measured too) | `useRemoteControl.ts` L5552 | viewer knob `roomler-rc-input-gap` |
 | C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `cursor_poll_ms` |
 | C5 | **NVENC preset `p1`–`p3` × tune `ull`** | `encoder.rs` L329–330 | the existing `ROOMLERD_FFMPEG_PRESET` / `_TUNE`; bake the winner per backend |
-| C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `rtp_playout_delay_zero` |
+| C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` (off) |
 
 ⚠️ **No new per-frame reads in the pump.** FR-70 M3 makes the media thread read an immutable plan. Until
 then, every switch above is read once per open (`peer.rs` L5353–5391), never per frame.
@@ -108,7 +108,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | the viewer knob, `cursor_poll_ms` | — |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
-| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `rtp_playout_delay_zero=false` | — |
+| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` unset | **built**, default off: `agents/roomlerd/src/rtp_playout.rs`. Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell proves the wire; every other cell proves the off state. Owed: the Chrome measurement (`jitterBufferDelay ÷ jitterBufferEmittedCount` from `getStats`, and L4 on the `<video>` path, on and off) and then the Known-Issue verdict, AC6 |
 | P6 | Docs, and the final field table | — | — |
 
 ## 6. Acceptance criteria
