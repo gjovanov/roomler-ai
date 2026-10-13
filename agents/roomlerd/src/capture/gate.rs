@@ -5,11 +5,13 @@
 //!
 //! **The legacy gate** (still the default) sleeps out the rest of a frame
 //! period, measured from the last call, *before* it looks at the slot. A
-//! frame that is already waiting pays that sleep. On a source that runs at
-//! the target rate the wait locks to the phase between the two clocks: every
-//! frame pays the same amount, anywhere up to a whole period, for as long as
-//! the phase holds. Its period is also whole milliseconds, so `1000 / 60`
-//! caps at 62.5 fps and `1000 / 144` at 166.
+//! frame that is already waiting pays that sleep. At an exact period (25,
+//! 40, 50 fps) the wait can lock to the phase between the two clocks, every
+//! frame paying the same amount, anywhere up to a whole period. Its period
+//! is whole milliseconds, though, so at 30 and 60 fps its cadence runs
+//! slightly fast and drifts out of the wait on its own: there the cost is
+//! mostly the frames that land during a slow encode. And `1000 / 60` caps at
+//! 62.5 fps, `1000 / 144` at 166 (FR-98 §4.1).
 //!
 //! **The slot-first gate** is a token bucket at the target rate that holds
 //! up to two frames of credit. A waiting frame goes out at once while there

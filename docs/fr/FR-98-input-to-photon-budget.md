@@ -167,6 +167,7 @@ Planned cells. Each records the deployed build first.
 |---|---|---|---|
 | L0 | 2026-10-13 | P1 branch, unoptimised, Windows dev box | **Wrong turn, recorded.** The first run read `gate_lgcy` p50 59.8 ms and `gate_slot` p50 45.5 ms, far above `clean`'s 12.6. The emulation stood a timer in for `FrameArrived`, and when the slot was empty it counted that timer's overshoot (up to a Windows timer tick) against both gates. Real WGC wakes the reader on the event itself. Fixed: a frame waited for lands when the wait ends; a frame already in the slot lands on schedule, and its wait is the gate's |
 | L0 | 2026-10-13 | the same | **Green:** `clean` p50 12.8 ms · `gate_slot` p50 13.9 ms, p95 18.3, 25.1 fps from the 25 fps source · `gate_lgcy` p50 36.1 ms, p95 51.3, **21.9 fps**. So the slot-first gate cut p50 by **22.2 ms** (bound: ≥ 10, a quarter of 40 ms), and it also kept the frames the legacy gate dropped when its cadence fell a whole period behind |
+| L0 | 2026-10-13 | the same | **Negative control, red:** a slot-first gate that always sleeps a period (one marked line in `SlotFirst::wait`) failed `gate_slot: 12.7 fps decoded from a 25 fps source` (exit 101). Its p50 difference was 4.9 ms (legacy 35.7, broken slot-first 30.8), which the C1 bound would have refused too. Restored from the commit; the diff was that one line |
 
 ## 10. Related
 
