@@ -661,7 +661,8 @@ mod tests {
         // P4b — first the remote control the automatic portal asks for: the
         // session lands here when the person refused it.
         assert!(
-            r.reason.contains("allow remote control when the desktop asks"),
+            r.reason
+                .contains("allow remote control when the desktop asks"),
             "{}",
             r.reason
         );
