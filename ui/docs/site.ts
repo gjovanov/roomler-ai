@@ -10,6 +10,7 @@
  * docs site 404s its own navigation, and it cannot happen if the nav is
  * derived from the files that exist.
  */
+import { ANALYTICS_DOMAIN, ANALYTICS_HOSTS, ANALYTICS_SRC } from '../src/utils/analytics.ts'
 
 /** Absolute origin. Canonicals, OG URLs and the sitemap are absolute — a
  *  relative canonical is legal but silently useless when a crawler reaches
@@ -197,14 +198,24 @@ export const AUTHORS: Record<string, Author> = {
 }
 
 /**
- * First-party analytics on the static pages, the same script the SPA loads
- * (`ui/index.html`), which the pod CSP already allows (`script-src
- * https://purestat.ai`). FR-60's pages loaded none, so organic search traffic
- * — the reason FR-87 exists — was unmeasured. `null` turns it off.
+ * First-party analytics on the static pages: the same tracker, the same site
+ * and the same host allowlist as the SPA (`ui/src/utils/analytics.ts`, which
+ * has no imports so the build can read it), which the pod CSP already allows
+ * (`script-src https://purestat.ai`). FR-60's pages loaded none, so organic
+ * search traffic — the reason FR-87 exists — was unmeasured.
+ *
+ * FR-102 (#2127): the shell no longer writes the tracker's tag. It writes a
+ * same-origin loader (`theme/analytics.js`, content-hashed like every other
+ * theme file) carrying these values as `data-*` attributes, and the loader
+ * injects the tracker only on an allowlisted hostname over https, never
+ * under a WebDriver — so a self-hosted copy of these pages, a fork and a
+ * `localhost` build make no request to purestat.ai. `null` turns it off: no
+ * loader, no tag.
  */
-export const ANALYTICS: { src: string; domain: string } | null = {
-  src: 'https://purestat.ai/js/purestat.js',
-  domain: 'roomler.ai',
+export const ANALYTICS: { src: string; domain: string; hosts: readonly string[] } | null = {
+  src: ANALYTICS_SRC,
+  domain: ANALYTICS_DOMAIN,
+  hosts: ANALYTICS_HOSTS,
 }
 
 /**
