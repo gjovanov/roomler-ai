@@ -137,19 +137,34 @@ async fn set_device_policy(
     seeded: &crate::fixtures::seed::SeededTenant,
     agent_id: &str,
 ) {
-    let resp = app
-        .auth_put(
-            &format!(
-                "/api/tenant/{}/agent/{}/exec-policy",
-                seeded.tenant_id, agent_id
-            ),
-            &seeded.admin.access_token,
-        )
-        .json(&json!({ "mode": "on", "consent_mode": "auto" }))
-        .send()
-        .await
-        .unwrap();
+    let resp = put_policy(
+        app,
+        seeded,
+        agent_id,
+        json!({ "mode": "on", "consent_mode": "auto" }),
+    )
+    .await;
     assert!(resp.status().is_success(), "policy: {:?}", resp.status());
+}
+
+/// `PUT …/exec-policy` with `body`, answered as it came.
+async fn put_policy(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    agent_id: &str,
+    body: Value,
+) -> reqwest::Response {
+    app.auth_put(
+        &format!(
+            "/api/tenant/{}/agent/{}/exec-policy",
+            seeded.tenant_id, agent_id
+        ),
+        &seeded.admin.access_token,
+    )
+    .json(&body)
+    .send()
+    .await
+    .unwrap()
 }
 
 /// `POST /api/agent/anchor`, the request `roomlerd anchor` sends.
@@ -774,4 +789,139 @@ async fn exec_require_system_refuses_an_unanchored_windows_device() {
     );
     let rows = audit_rows(&app, &seeded).await;
     assert_eq!(rows[0]["denied"], json!("system_required"));
+}
+
+/// FR-94 P4 — a policy that names the signed-in user reaches the service in
+/// the claim, and the audit records that identity, not SYSTEM.
+#[tokio::test]
+async fn console_user_runs_through_the_service_and_is_audited_as_such() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr94cu").await;
+    let (agent_id, agent_token) = enroll_windows(&app, &seeded, "m-fr94-cu", "HOST-U").await;
+    let mut ws = connect_agent(&app, &agent_token, "HOST-U", &["exec", "exec-system"]).await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    set_org_exec(&app, &seeded, json!({ "remote_exec_enabled": true })).await;
+    let set = put_policy(
+        &app,
+        &seeded,
+        &agent_id,
+        json!({ "mode": "on", "consent_mode": "auto", "run_as": "console_user" }),
+    )
+    .await;
+    assert!(set.status().is_success(), "{:?}", set.status());
+    let service = anchor(&app, &seeded, &agent_id, "HOST-U").await;
+
+    let exec = spawn_exec(&app, &seeded, &agent_id, "whoami");
+    let frame = read_until(&mut ws, "rc:rpc.exec").await.expect("frame");
+    let request_id = frame["request_id"].as_str().unwrap().to_string();
+    let claimed = claim(&app, &service, &request_id).await;
+    assert_eq!(claimed.status(), 200);
+    let claimed: Value = claimed.json().await.unwrap();
+    assert_eq!(claimed["run_as"], json!("console_user"));
+    let posted = post_result(
+        &app,
+        &service,
+        &request_id,
+        json!({ "exit_code": 0, "stdout": "host-u person\r\n", "ran_as": "console_user" }),
+    )
+    .await;
+    assert_eq!(posted.status(), 200);
+    let out = tokio::time::timeout(Duration::from_secs(10), exec)
+        .await
+        .expect("the caller should resolve")
+        .unwrap();
+    assert_eq!(out["ran_as"], json!("console_user"), "{out}");
+
+    let rows = audit_rows(&app, &seeded).await;
+    let ran = rows
+        .iter()
+        .find(|r| r["request_id"] == json!(request_id) && r["denied"].is_null())
+        .expect("the run is audited");
+    assert_eq!(ran["ran_as"], json!("console_user"));
+}
+
+/// Without the service, `console_user` is refused rather than run as the
+/// worker: in SystemContext mode the worker IS SYSTEM, the opposite of what
+/// the policy says.
+#[tokio::test]
+async fn console_user_without_the_service_is_refused() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr94cuno").await;
+    let (agent_id, agent_token) = enroll_windows(&app, &seeded, "m-fr94-cuno", "HOST-N").await;
+    // `exec` only: no anchor, no service.
+    let _ws = connect_agent(&app, &agent_token, "HOST-N", &["exec"]).await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    set_org_exec(&app, &seeded, json!({ "remote_exec_enabled": true })).await;
+    let set = put_policy(
+        &app,
+        &seeded,
+        &agent_id,
+        json!({ "mode": "on", "consent_mode": "auto", "run_as": "console_user" }),
+    )
+    .await;
+    assert!(set.status().is_success(), "{:?}", set.status());
+
+    let out = spawn_exec(&app, &seeded, &agent_id, "whoami")
+        .await
+        .unwrap();
+    assert!(
+        out["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("only its SYSTEM service can do")),
+        "{out}"
+    );
+    let rows = audit_rows(&app, &seeded).await;
+    assert_eq!(rows[0]["denied"], json!("run_as_unavailable"));
+}
+
+/// `console_user` is a Windows mode, and a PUT that does not name `run_as`
+/// keeps the stored one: the policy PUT is a full replace, and a stale client
+/// saving it must not turn `console_user` back into SYSTEM.
+#[tokio::test]
+async fn run_as_is_windows_only_and_survives_a_put_that_omits_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr94ra").await;
+    let (linux_id, _) = enroll_os(&app, &seeded, "m-fr94-ra-l", "HOST-L", "linux").await;
+    let refused = put_policy(
+        &app,
+        &seeded,
+        &linux_id,
+        json!({ "mode": "on", "run_as": "console_user" }),
+    )
+    .await;
+    assert_eq!(refused.status(), 400);
+
+    let (win_id, _) = enroll_windows(&app, &seeded, "m-fr94-ra-w", "HOST-W2").await;
+    let set: Value = put_policy(
+        &app,
+        &seeded,
+        &win_id,
+        json!({ "mode": "on", "run_as": "console_user" }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(set["run_as"], json!("console_user"));
+    let kept: Value = put_policy(&app, &seeded, &win_id, json!({ "mode": "on" }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        kept["run_as"],
+        json!("console_user"),
+        "absent means keep it"
+    );
+    let back: Value = put_policy(
+        &app,
+        &seeded,
+        &win_id,
+        json!({ "mode": "on", "run_as": "system" }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(back["run_as"], json!("system"));
 }

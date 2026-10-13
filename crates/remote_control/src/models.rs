@@ -1087,11 +1087,12 @@ pub enum ExecMode {
 /// that grants screen-view, and "may watch your screen" must never be the
 /// same checkbox as "may run a root shell".
 ///
-/// ⚠️ On a perMachine Windows install the daemon runs as **SYSTEM**, and on a
-/// systemd host as **root** — so `ExecMode::On` is root-equivalent by
-/// construction. That is required for the diagnostics this exists for
-/// (`Get-NetFirewallRule`, `netsh`, route tables, service state) and is stated
-/// in the admin UI's opt-in copy rather than buried here.
+/// ⚠️ On a systemd host commands run as **root**, and on an anchored Windows
+/// device as **SYSTEM** through its service (FR-94; [`Self::run_as`]) — so
+/// `ExecMode::On` is root-equivalent by construction. That is required for
+/// the diagnostics this exists for (`Get-NetFirewallRule`, `netsh`, route
+/// tables, service state) and is stated in the admin UI's opt-in copy rather
+/// than buried here.
 /// `PartialEq` so a caller can ask "is this indistinguishable from the
 /// untouched default?" — the API listing needs exactly that question to avoid
 /// reporting a policy nobody set (see `AgentResponse::exec_policy`).
@@ -1124,6 +1125,35 @@ pub struct ExecPolicy {
     /// every shell the host supports.
     #[serde(default)]
     pub shells: Vec<String>,
+    /// FR-94 P4 — which account a Windows device's commands run as through
+    /// its SYSTEM service. Default SYSTEM. Meaningless off Windows, where the
+    /// route that sets it refuses `console_user`.
+    #[serde(default)]
+    pub run_as: ExecRunAs,
+}
+
+/// FR-94 P4 — the account a Windows command runs as, through the device's
+/// SYSTEM service ([`ExecPolicy::run_as`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecRunAs {
+    /// `NT AUTHORITY\SYSTEM`, in session 0. The default.
+    #[default]
+    System,
+    /// The user signed in at the console. The service reaches them through
+    /// `WTSQueryUserToken`, which only SYSTEM may call; with nobody signed in
+    /// the command is refused.
+    ConsoleUser,
+}
+
+impl ExecRunAs {
+    /// The spelling the claim hands the service, and the audit's `ran_as`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::ConsoleUser => "console_user",
+        }
+    }
 }
 
 impl ExecPolicy {
@@ -3220,6 +3250,12 @@ pub enum ExecDenyReason {
     /// device's. Nothing ran. Recorded because a forged or replayed doorbell
     /// is exactly what this refusal is for (FR-94 AC4).
     ClaimRefused,
+    /// FR-94 P4 — the device's policy runs commands as the signed-in user
+    /// (`ExecRunAs::ConsoleUser`), which only its SYSTEM service can do, and
+    /// this command cannot take that path (not anchored, or the service is
+    /// down). Refused rather than run as whatever the worker is: in
+    /// SystemContext mode that would be SYSTEM, the opposite of the policy.
+    RunAsUnavailable,
 }
 
 /// Why a roomler-SSH grant was refused. The twin of [`ExecDenyReason`]; kept

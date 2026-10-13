@@ -31,11 +31,12 @@
 //!
 //! ## Privilege
 //!
-//! Commands inherit the daemon's identity: root under systemd; on Windows the
-//! console-session worker's, which is the signed-in user on an attended
-//! install and SYSTEM in SystemContext mode (FR-94 makes SYSTEM the default).
-//! Enabling gate 3 on a device is granting root
-//! on it, and the admin UI says so in those words.
+//! Root under systemd. On Windows, SYSTEM through the device's service once
+//! an administrator anchored it, or the signed-in user if its policy says
+//! `console_user` (FR-94, `crate::exec_service`); a device that is not
+//! anchored runs commands as its console-session worker, the signed-in user
+//! on an attended install and SYSTEM in SystemContext mode. Enabling gate 3 on
+//! a device is granting root on it, and the admin UI says so in those words.
 
 use axum::{
     Json,
@@ -47,7 +48,7 @@ use roomler_ai_remote_control::{
     error::Error as HubError,
     models::{
         Agent, ExecAuditEvent, ExecDenyReason, ExecMode, ExecOutcome, ExecPending, ExecPolicy,
-        OsKind, exec_limits,
+        ExecRunAs, OsKind, exec_limits,
     },
     signaling::ServerMsg,
 };
@@ -141,6 +142,12 @@ pub struct ExecPolicyBody {
     pub consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     #[serde(default)]
     pub shells: Vec<String>,
+    /// FR-94 P4 — `system` or `console_user`. Always present when read back.
+    /// In a PUT, absent means "leave it as it is": this PUT is a full replace,
+    /// and a client from before FR-94 (or a stale tab) saving the policy must
+    /// not turn `console_user` back into SYSTEM, a quiet escalation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<ExecRunAs>,
 }
 
 impl From<ExecPolicy> for ExecPolicyBody {
@@ -161,6 +168,7 @@ impl From<ExecPolicy> for ExecPolicyBody {
             allowed_role_ids,
             consent_mode,
             shells,
+            run_as,
         } = p;
         Self {
             mode,
@@ -169,6 +177,7 @@ impl From<ExecPolicy> for ExecPolicyBody {
             allowed_role_ids: allowed_role_ids.iter().map(|i| i.to_hex()).collect(),
             consent_mode,
             shells,
+            run_as: Some(run_as),
         }
     }
 }
@@ -341,6 +350,16 @@ pub async fn authorize(
         return Err(ExecDenyReason::SystemRequired);
     }
 
+    // FR-94 P4 — a policy that runs commands as the signed-in user needs the
+    // device's SYSTEM service: only SYSTEM may ask for the console user's
+    // token. Without that path the command would run as the worker, which in
+    // SystemContext mode is SYSTEM, the opposite of what the policy says.
+    if agent.exec_policy.run_as == ExecRunAs::ConsoleUser
+        && !crate::exec_service::routes_via_service(state, agent)
+    {
+        return Err(ExecDenyReason::RunAsUnavailable);
+    }
+
     // Ceiling, enforced LAST so a refusal is attributable to an identity that
     // already passed the gates (and is audited by `dispatch`) rather than an
     // anonymous throttle. This is the one place both the HTTP route and the
@@ -445,6 +464,7 @@ pub async fn dispatch(
             if consent_mode != roomler_ai_remote_control::models::ConsentMode::Auto {
                 deadline += CONSENT_GRACE;
             }
+            let run_as = agent.exec_policy.run_as;
             let result = if via_service {
                 run_via_service(
                     state,
@@ -455,6 +475,7 @@ pub async fn dispatch(
                     body,
                     caller,
                     (timeout_ms, max_output_bytes),
+                    run_as,
                     msg,
                     deadline,
                 )
@@ -469,7 +490,8 @@ pub async fn dispatch(
                 Ok(outcome) => {
                     // FR-94 — the server's own routing decision. The device's
                     // claim about its identity rides in `outcome.ran_as`.
-                    audit.ran_as = Some(if via_service { "system" } else { "worker" }.to_string());
+                    audit.ran_as =
+                        Some(if via_service { run_as.wire() } else { "worker" }.to_string());
                     audit.exit_code = outcome.exit_code;
                     audit.duration_ms = Some(outcome.duration_ms);
                     audit.truncated = outcome.truncated;
@@ -554,6 +576,7 @@ async fn run_via_service(
     body: &ExecRequestBody,
     caller: &Caller,
     (timeout_ms, max_output_bytes): (u64, u64),
+    run_as: ExecRunAs,
     msg: ServerMsg,
     deadline: std::time::Duration,
 ) -> Result<ExecOutcome, HubError> {
@@ -576,7 +599,7 @@ async fn run_via_service(
         max_output_bytes,
         cwd: body.cwd.clone(),
         caller: caller.display.clone(),
-        run_as: "system".to_string(),
+        run_as: run_as.wire().to_string(),
         state: ExecPending::PENDING.to_string(),
         created_at: DateTime::from_millis(now_ms),
         claim_by: DateTime::from_millis(claim_by_ms),
@@ -648,6 +671,12 @@ fn deny_message(reason: ExecDenyReason) -> String {
         }
         ExecDenyReason::ClaimRefused => {
             "the device's service claimed a command that is not pending for it".to_string()
+        }
+        ExecDenyReason::RunAsUnavailable => {
+            "this device's policy runs commands as the signed-in user, which only its SYSTEM \
+             service can do: an administrator has not anchored it (`roomlerd anchor`), or its \
+             service is not running"
+                .to_string()
         }
     }
 }
@@ -870,6 +899,14 @@ pub async fn set_policy(
             .collect()
     };
 
+    // FR-94 P4 — absent keeps what is stored (see `ExecPolicyBody::run_as`).
+    let run_as = body.run_as.unwrap_or(agent.exec_policy.run_as);
+    if run_as == ExecRunAs::ConsoleUser && !matches!(agent.os, OsKind::Windows) {
+        return Err(ApiError::BadRequest(
+            "`console_user` is a Windows mode: a Linux or macOS daemon runs commands as root"
+                .into(),
+        ));
+    }
     let policy = ExecPolicy {
         mode: body.mode,
         can_originate: body.can_originate,
@@ -877,16 +914,18 @@ pub async fn set_policy(
         allowed_role_ids: parse_ids(&body.allowed_role_ids, "role id")?,
         consent_mode: body.consent_mode,
         shells: body.shells.clone(),
+        run_as,
     };
     state
         .agents
         .update_exec_policy(tid, agent.id.unwrap_or_default(), &policy)
         .await?;
     info!(
-        agent = %agent_id, admin = %auth.user_id, mode = ?policy.mode,
+        agent = %agent_id, admin = %auth.user_id, mode = ?policy.mode, run_as = run_as.wire(),
         "fleet-rpc: exec policy updated"
     );
-    Ok(Json(body))
+    // The policy as stored, so a PUT that left `run_as` out still hears it.
+    Ok(Json(ExecPolicyBody::from(policy)))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

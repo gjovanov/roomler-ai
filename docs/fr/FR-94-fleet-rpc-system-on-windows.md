@@ -1,10 +1,9 @@
 # FR-94: Windows Fleet RPC runs as SYSTEM — a machine trust anchor, a doorbell, and an explicit `console_user`
 
 **Issue:** [#2035](https://github.com/gjovanov/roomler-ai/issues/2035) · **Status:** in progress — P0 done (spec
-#2036, wording #2039, measurements #2086); P1's server half and P2 built (§6); next the agent half (P1's
-`roomlerd anchor` + P3) · **Owner:** fleet (the anchor, the pending store, the claim and result
-routes), the Windows agent (the service runner) · **Anchors:** §2 master `d31e3c729`; §5 the FR-94
-server PR (rebased on `7d20cd817`) · **Builds on:**
+#2036, wording #2039, measurements #2086); P1–P5 built (§6: #2099, #2105, the P4 PR); next the field cells
+(§10) · **Owner:** fleet (the anchor, the pending store, the claim and result routes), the Windows agent
+(the service runner) · **Anchors:** §2 master `d31e3c729`; §5 #2099 (`077778aa0`) · **Builds on:**
 [Fleet RPC](../fleet-rpc.md), [roomler SSH account modes](../roomler-ssh.md),
 [FR-43](FR-43-macos-single-enrollment.md) (the supervised-daemon delegation model), #2021
 
@@ -215,11 +214,11 @@ stateDiagram-v2
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | This spec, the issue and the registry row. The wording PR, so today's identity is said truthfully. The P0 measurements (§10) | docs only | ✅ #2036, #2039, #2086 |
-| P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | server half built (the FR-94 server PR); agent half next |
-| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | built (the FR-94 server PR) |
-| P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | — |
-| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system` | — |
-| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | — |
+| P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | built: server #2099, `roomlerd anchor` #2105 (the wizard writing it: not yet) |
+| P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | built #2099 |
+| P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | built #2105 |
+| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system`; absent in a PUT keeps it | built: the device #2105, the policy + UI the P4 PR |
+| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | built #2105 + the P4 PR; field owed (§10) |
 
 ## 7. Acceptance criteria
 

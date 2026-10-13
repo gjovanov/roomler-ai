@@ -197,6 +197,16 @@ everywhere; `ROOMLERD_EXEC_VIA_SERVICE=0` on a device withdraws its word.
 `exec_enabled` (the worker checks it before it rings, exactly as before) and the
 anchor's (the service checks it before it claims).
 
+**The account.** A Windows device's execution policy chooses who the service
+runs a command as: **SYSTEM** (the default) or **the signed-in user**
+(`run_as: console_user`), whom only SYSTEM can reach (`WTSQueryUserToken`), and
+which is refused when nobody is signed in. Both need the service, so
+`console_user` on a device that cannot take that path is refused
+(`run_as_unavailable`) rather than run as the worker, which in SystemContext
+mode is SYSTEM, the opposite of the policy. A policy `PUT` that does not name
+`run_as` keeps the stored one: a stale client saving the policy must not turn
+the signed-in user back into SYSTEM.
+
 **An org can require SYSTEM.** With `exec_require_system` on (workspace
 Settings, `PUT /api/tenant/{tid}/exec-settings`), a Windows command that cannot
 take the SYSTEM path is refused as `system_required` instead of running as the
@@ -302,9 +312,7 @@ the machine, on purpose.
   `FirewallRules` verbs promoted from whichever shell bundles prove themselves,
   plus exposing the existing `status` / `peers` / `ping` / `config` /
   `tail-log` LocalAPI verbs remotely.
-- Run-as-interactive-user as a per-device policy (FR-94 P4: the service can
-  already run `console_user`; the policy field and its UI are what is left),
-  output streaming **on the RPC wire** (the engine
+- Output streaming **on the RPC wire** (the engine
   itself streams for Roomler SSH since FR-89; the `rc:rpc.result` row and its
   audit sample would need a different shape), scheduled probes, and an
   `exec_policies` selector collection shaped like `overlay_policies`.

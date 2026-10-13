@@ -91,6 +91,27 @@
           use its owner's permissions across the whole fleet.
         </div>
 
+        <!-- FR-94 P4 — Windows only: which account the device's SYSTEM
+             service runs a command as. -->
+        <template v-if="agent?.os === 'windows'">
+          <v-select
+            v-model="runAs"
+            :items="runAsOptions"
+            label="Run commands as"
+            density="compact"
+            variant="outlined"
+            class="mt-4"
+            hide-details
+            data-testid="exec-run-as"
+          />
+          <div class="text-caption text-medium-emphasis mb-4">
+            <strong>SYSTEM</strong> is the default.
+            <strong>The signed-in user</strong> runs each command as whoever is
+            signed in at the console, and is refused when nobody is. Both go
+            through the device's service, so the device must be anchored.
+          </div>
+        </template>
+
         <v-select
           v-model="draft.consent_mode"
           :items="consentOptions"
@@ -240,6 +261,19 @@ const modeOn = computed({
 const consentOptions = [
   { title: 'Prompt at the device (recommended)', value: null },
   { title: 'Unattended — run immediately', value: 'auto' },
+]
+
+// FR-94 P4 — unset reads as SYSTEM, the server's default.
+const runAs = computed({
+  get: () => draft.value.run_as ?? 'system',
+  set: (v: 'system' | 'console_user') => {
+    draft.value.run_as = v
+  },
+})
+
+const runAsOptions = [
+  { title: 'SYSTEM (default)', value: 'system' },
+  { title: 'The signed-in user', value: 'console_user' },
 ]
 
 const memberOptions = computed(() =>
