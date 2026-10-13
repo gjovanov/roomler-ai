@@ -78,6 +78,23 @@ FR-92's ban rules out `SetWindowsHookEx`. The block uses **`BlockInput(TRUE)`** 
 If any of them fails, this FR ships the **curtain alone** and says so in the consent prompt and the docs.
 FR-92's source scan is extended to this module either way, so a hook can never be added later by accident.
 
+**P0's answers (vmtest Win11, agent 0.4.134, 2026-10-13; field log rows 1–4).** Standalone probes ran as
+the signed-in person through an `/IT` scheduled task. The person was QMP input, and the controller was the
+production viewer from a LAN neighbour.
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Integrity level | **High.** A medium-integrity caller gets `BlockInput(TRUE) = FALSE`, `ERROR_ACCESS_DENIED` (5). The signed-in user's elevated token succeeds. So the attended worker, which runs at the user's medium level, **cannot** block. The block needs the SystemContext worker (SYSTEM in session, untested but above high) or an elevated helper |
+| 2 | Injection from the blocking thread | **Only that thread's `SendInput` lands.** The blocking thread's own move did land. The agent's injection, from the SystemContext worker (another process), was blocked like the person's: 73 L4 probe moves were lost in the batch spanning a 20 s block, against 0 in the batch before and 0, then 2, in the two after as the session recovered. The injector must therefore be the blocking thread itself. Mouse moves were tested; keys and the wheel were not |
+| 3 | The way out, and P10 Disconnect | **Ctrl+Alt+Del lifts the block**, and nobody tells the blocking thread. After the secure-attention sequence and Esc, the person's moves landed again while the probe still thought it was blocking. Its `BlockInput(FALSE)` then returned FALSE. So the agent has to detect the lift itself, audit `local_override` and never re-arm silently. **P10's Disconnect is not reachable under the block**, because it needs a click. It is reachable after Ctrl+Alt+Del. See open decision 4 |
+| 4 | EDR | **Not tested.** vmtest guests run Defender only; FR-92's EDR-window method is still owed |
+
+**The curtain, on the deployed capture path.** A topmost, click-through, no-activate window over the
+primary monitor was given `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (the call succeeds,
+affinity `0x11`). The host's screenshot (what the person sees) showed the curtain, and the viewer's stream
+showed the desktop under it. **The red half:** the same window without the affinity showed in the stream.
+That is SystemContext's DXGI capture; WGC (attended capture) is untested.
+
 ### 3c. Authorization and audit
 
 - **A new `Permissions::PRIVACY` bit.** The hub adds it **only** for agents that advertise the
@@ -125,7 +142,7 @@ says muting the host silences the client too. The FR ships only the honest versi
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | this PR |
+| P0 | This spec and the claim. The feasibility probes: `BlockInput` (the four questions in §3b), loopback under mute, the macOS lock mechanism | docs only | spec merged. **`BlockInput` and the curtain probed on vmtest 2026-10-13** (§3b's answers): high integrity needed, only the blocking thread injects, Ctrl+Alt+Del lifts the block, and the curtain stays out of DXGI capture. Still owed: EDR, keys and the wheel under the block, WGC, loopback under mute, the macOS lock |
 | P1 | The curtain + the permission bit + the device opt-in + audit (Windows) | `privacy_mode_allowed=false` (default) | — |
 | P2 | The input block, if P0 cleared it | `privacy_input_block=false` | — |
 | P3 | Lock on end (Windows, Linux, macOS) | `lock_on_end=never` | — |
@@ -165,6 +182,16 @@ says muting the host silences the client too. The FR ships only the honest versi
    by software.
 3. **Default `lock_on_end`.** Recommended: `auto` on new installs, `never` on existing ones until the field
    cells pass.
+4. **How the person reaches P10's Disconnect under the block** (raised by P0, 2026-10-13). `BlockInput`
+   swallows the click, so Disconnect is reachable only after Ctrl+Alt+Del, which ends the block anyway.
+   AC3 says "Disconnect works while privacy is on", which holds for the curtain alone but not under the
+   block. The options:
+   - Ctrl+Alt+Del is the person's path. It lifts the block, the agent sees the lift and audits
+     `local_override`, and Disconnect is then one click away. AC3 is reworded to say so;
+   - privacy without the block (the curtain alone) keeps Disconnect clickable, and the block becomes a
+     separate, stricter level.
+
+   Recommended: the first, and the curtain's notice says "Press Ctrl+Alt+Del to take this computer back".
 
 ## 7. Out of scope
 
@@ -176,7 +203,10 @@ says muting the host silences the client too. The FR ships only the honest versi
 
 | # | Date | Cell | Result |
 |---|---|---|---|
-| — | — | — | — |
+| 1 | 2026-10-13 | **P0 probe, not the product.** vmtest Win11 guest, agent 0.4.134 (SystemContext), a standalone WinForms curtain run as the person; the production viewer from a LAN neighbour | **The curtain stays out of DXGI capture.** Without the affinity (the red half), the stream showed the magenta curtain. With `WDA_EXCLUDEFROMCAPTURE` (`SetWindowDisplayAffinity = True`, affinity `0x11`), the host's screenshot showed the curtain while the viewer's stream showed the companion's Welcome window under it |
+| 2 | 2026-10-13 | The same guest, probe-target and the viewer in L4 target mode, `BlockInput` probes as the person | **The integrity level, and who may inject.** Elevated: `BlockInput(TRUE) = True`; the cursor froze for 20 s; the agent's injected probe moves were lost (73 in the batch spanning the block; 0 in the batch before, 0 and then 2 in the two after); the probe's own `SendInput` landed (cursor to 200,200). Not elevated: `BlockInput(TRUE) = False, err 5`, and the moves kept landing |
+| 3 | 2026-10-13 | The same guest, no viewer, so the person (QMP `mouse_move`) is the only thing moving the cursor | **The person is blocked, with a control.** With no block, the person's move moved the cursor (to 1279,799). Under the block, two moves changed nothing (it stayed at 200,200) |
+| 4 | 2026-10-13 | The same, then `virsh send-key` Ctrl+Alt+Del and Esc during the block | **The way out.** At Ctrl+Alt+Del the input desktop switched (`GetCursorPos` read 0,0). After Esc the person's next move landed (1279,799) while the probe still believed it was blocking. Its `BlockInput(FALSE)` then returned FALSE. The OS lifted the block and told no one |
 
 Attended runs happen on the operator's spare box, never on a machine someone is using.
 
