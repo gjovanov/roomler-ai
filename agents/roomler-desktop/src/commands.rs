@@ -438,7 +438,16 @@ pub async fn cmd_config_set(
     let mut daemon_err: Option<String> = None;
     if let Ok(mut client) = localapi::connect().await {
         match client.config_set(&key, value.as_deref()).await {
-            Ok(entry) => return Ok(entry),
+            Ok(mut entry) => {
+                // A daemon from before the surface carried liveness answers
+                // `restart_required: true` for EVERY key; the flags its
+                // ConfigSet re-seeds were in force all along.
+                if roomler_node_core::config_surface::RESEEDED_ON_SET.contains(&entry.key.as_str())
+                {
+                    entry.restart_required = false;
+                }
+                return Ok(entry);
+            }
             Err(e) => daemon_err = Some(e.to_string()),
         }
     }
@@ -464,7 +473,9 @@ fn config_set_blocking(
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     roomler_node_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
-    roomler_node_core::config_surface::entry_for(&cfg, &key)
+    // Written behind the daemon's back: the flags only its ConfigSet re-seeds
+    // are NOT in force yet, and the entry must say so.
+    roomler_node_core::config_surface::entry_for_direct_write(&cfg, &key)
         .ok_or_else(|| format!("unknown config key {key:?}"))
 }
 

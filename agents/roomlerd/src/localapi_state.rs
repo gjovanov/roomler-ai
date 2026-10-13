@@ -884,16 +884,23 @@ impl LocalApiState for DaemonState {
         match saved {
             Ok((entry, cfg)) => {
                 // Re-seed the LIVE gate-4 flags from what was just written,
-                // still under the write lock. Everything else on this surface
-                // genuinely is restart-required; `exec_enabled` and
-                // `remote_config_enabled` are not, and leaving them stale here
-                // would mean a SERVER push took effect faster than the owner's
-                // own decision (docs/remote-config.md).
+                // still under the write lock. `exec_enabled` and
+                // `remote_config_enabled` are not restart-required, and
+                // leaving them stale here would mean a SERVER push took
+                // effect faster than the owner's own decision
+                // (docs/remote-config.md). Which keys are live is the
+                // surface's call (`config_surface::RESEEDED_ON_SET` +
+                // `READ_AT_USE`), carried on the entry.
                 if let Some(rc) = self.remote_config.as_ref() {
                     rc.adopt_local(&cfg);
                 }
-                tracing::info!(key = %entry.key, value = ?entry.value,
-                    "localapi: config key updated (takes effect on restart)");
+                if entry.restart_required {
+                    tracing::info!(key = %entry.key, value = ?entry.value,
+                        "localapi: config key updated (takes effect on restart)");
+                } else {
+                    tracing::info!(key = %entry.key, value = ?entry.value,
+                        "localapi: config key updated (in effect now)");
+                }
                 Response::ConfigUpdated { entry }
             }
             Err(message) => Response::Error { message },

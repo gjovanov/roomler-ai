@@ -1081,9 +1081,17 @@ pub async fn config_ls(json: bool) -> Result<()> {
         };
         println!("{:key_w$}  {:9}  {value}", e.key, e.kind);
     }
+    let live: Vec<&str> = entries
+        .iter()
+        .filter(|e| !restart_required(e))
+        .map(|e| e.key.as_str())
+        .collect();
     println!(
         "\nchanges take effect on the next daemon restart — `roomler config set <key> <value>`"
     );
+    if !live.is_empty() {
+        println!("except these, in effect at once: {}", live.join(", "));
+    }
     Ok(())
 }
 
@@ -1100,17 +1108,28 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         Some(v) if !v.is_empty() => println!("{} = {v}", entry.key),
         _ => println!("{} cleared (built-in default applies)", entry.key),
     }
-    // Two keys are LIVE as of the gate-4 liveness work (docs/remote-config.md
-    // §7b): the daemon re-seeds them from the file it just wrote, so telling an
-    // operator to restart would be wrong in the direction that matters — they
-    // would believe a refusal they just made is not in force yet, and either
-    // restart a healthy daemon for nothing or assume they are still exposed.
-    if matches!(entry.key.as_str(), "exec_enabled" | "remote_config_enabled") {
+    // The daemon says which keys are LIVE (`restart_required`, from the
+    // surface's `RESEEDED_ON_SET` + `READ_AT_USE`): the gate-4 flags it
+    // re-seeds from the file it just wrote (docs/remote-config.md §7b), and
+    // FR-52's `external_*`, read from the file at every knock. Telling an operator to restart would be
+    // wrong in the direction that matters — they would believe a refusal they
+    // just made is not in force yet, and either restart a healthy daemon for
+    // nothing or assume they are still exposed.
+    if !restart_required(&entry) {
         println!("in effect now — no restart needed");
     } else {
         println!("takes effect on the next daemon restart");
     }
     Ok(())
+}
+
+/// Whether a change to this entry waits for a daemon restart, as `config set`
+/// and `config ls` report it. A daemon from before the surface carried
+/// liveness answers `restart_required: true` for EVERY key, so the two
+/// gate-4 flags its ConfigSet already re-seeded keep their name-based answer.
+fn restart_required(entry: &localapi::ConfigEntry) -> bool {
+    entry.restart_required
+        && !matches!(entry.key.as_str(), "exec_enabled" | "remote_config_enabled")
 }
 
 /// FR-52 gate 4 — `roomler rc password set`.
