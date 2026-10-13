@@ -218,8 +218,8 @@ stateDiagram-v2
 | P1 | The machine trust anchor. **Server:** `AgentService` credentials bound to an `anchor_id`, `POST /api/agent/anchor` (explicit device), renew, un-anchor. **Agent:** `roomlerd anchor` (elevated) writing the anchor under a hardened dir; the wizard doing the same | no anchor ⇒ today's behaviour | ✅ server #2099, `roomlerd anchor` #2105; field rows 8, 11, 15, 19. The wizard writing the anchor was **not built**: devices are anchored with `roomlerd anchor` (§9) |
 | P2 | Server: `exec_pending`, the claim and result routes, dispatch writing the row, the claim window, the worker-answer withdrawal, `exec_require_system`, the composition baseline | `rc.exec_via_service = false` ⇒ never routes via the service | ✅ #2099; field rows 9, 17–19 |
 | P3 | Agent: the service runner, the doorbell, the `exec-system` cap word | `ROOMLERD_EXEC_VIA_SERVICE=0` withdraws the cap word ⇒ the server never routes | ✅ #2105, in 0.4.133; field rows 8, 12, 15 |
-| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system`; absent in a PUT keeps it | ✅ the device #2105, the policy + UI #2110; field rows 10, 13, 20; the refusal's wording, the field-log PR (0.4.134) |
-| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | ✅ #2105 + #2110 + the field-log PR; field rows 7–20 |
+| P4 | `console_user` for Fleet RPC: policy, UI, audit; the refusal text | the policy defaults to `system`; absent in a PUT keeps it | ✅ the device #2105, the policy + UI #2110; field rows 10, 13, 20; the refusal's wording #2135 (0.4.134) |
+| P5 | `ran_as` everywhere, the device's identity in the UI, docs, field | — | ✅ #2105 + #2110 + #2135; field rows 7–20 |
 
 ## 7. Acceptance criteria
 
@@ -273,7 +273,7 @@ stateDiagram-v2
   naming why.
   *(Attended: row 10, `VMTEST-WIN\vmtest session=1 Medium`. SystemContext: row 20, the same identity,
   although that worker is SYSTEM. Nobody signed in: row 13, refused before anything ran, with the reason.
-  The wording fix in this PR ships with 0.4.134.)*
+  The wording fix (#2135) ships with 0.4.134.)*
 - [x] **AC7:** every `exec_audit` row records `ran_as`. The admin UI shows each Windows device's exec
   identity. An unanchored device keeps working and reports `worker`.
   *(Row 16 for the UI, on prod. `ran_as` is in every audited run of rows 7–20:*
@@ -291,7 +291,7 @@ stateDiagram-v2
   - *the identity per install type (a table);*
   - *the SYSTEM path's sequence diagram (#2105);*
   - *the anchor's lifecycle as a state diagram, with what each event does to the credential;*
-  - *the whole routing decision as a flowchart (the field-log PR).*
+  - *the whole routing decision as a flowchart (#2135).*
 
   *The row is in `docs/README.md`. CLAUDE.md's Fleet RPC line, the `roomler exec` help and the policy
   dialog name the identity per mode (#2105, #2110; the dialog's text is in row 16).)*
@@ -358,7 +358,7 @@ Field-verification log:
 | 10 | **AC6: `console_user`** | the same guest, 15:33Z | With the policy at `run_as: console_user`, the same probe printed `VMTEST-WIN\vmtest session=1 integrity=Medium`: the person's own token through the service, not the worker's elevated one (row 7). `ran_as=console_user` from the device and in the audit. The policy was set back to `system` after |
 | 11 | **Revocation** | the same guest, 15:34Z | `DELETE …/exec-anchor` answered `was_anchored: true`. The device still advertised `exec-system` (its anchor file stayed), yet the next command went to the worker (`vmtest`, session 1, High, `ran_as=worker`), **because routing needs both halves**. The service's next ring was refused: "this device's SYSTEM service credential is no longer accepted (re-anchored or un-anchored); anchor it again" |
 | 12 | **AC3: SystemContext, red → green** | vmtest `win11/installer/system`, 0.4.133, 15:43Z | **Unanchored:** the probe printed `NT AUTHORITY\SYSTEM session=1 integrity=System`. The worker is SYSTEM in the console session, so `ran_as=worker`. **Anchored** the same way as row 8: `exec-system` advertised within 75 s, and the probe printed **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, `ran_as=system`. SystemContext and attended installs now run a command as the same identity in the same session |
-| 13 | **AC6: `console_user` with nobody signed in** | the same SystemContext guest, 15:46Z | Policy `console_user`, then `logoff` of the person's session. The console became session 2 with no user, and the device stayed online and anchored (a SystemContext worker runs at the sign-in screen). The command was **refused before anything ran**: "console session 2 has no user token (nobody has signed in since boot); nothing to run as". It did not fall back to SYSTEM. ("Since boot" is wrong after a sign-out. The FR-94 field-log PR changes it to "nobody is signed in at the console", in `exec.rs`'s `win_console` and in the SSH twin in `pty/windows.rs`. It ships with 0.4.134.) An attended install with nobody signed in has no worker, so it is offline (row 3), and the question does not arise |
+| 13 | **AC6: `console_user` with nobody signed in** | the same SystemContext guest, 15:46Z | Policy `console_user`, then `logoff` of the person's session. The console became session 2 with no user, and the device stayed online and anchored (a SystemContext worker runs at the sign-in screen). The command was **refused before anything ran**: "console session 2 has no user token (nobody has signed in since boot); nothing to run as". It did not fall back to SYSTEM. ("Since boot" is wrong after a sign-out. #2135 changes it to "nobody is signed in at the console", in `exec.rs`'s `win_console` and in the SSH twin in `pty/windows.rs`. It ships with 0.4.134.) An attended install with nobody signed in has no worker, so it is offline (row 3), and the question does not arise |
 | 14 | **AC2 RED: a STANDARD user's attended device** | vmtest `win11/installer/attended` plus #2086's standard-user steps, 0.4.133, 20:23Z | A local standard account (`stduser`) was made the autologon user, the guest was rebooted, and the account enrolled its own device (`FreshPrimary`, a per-user config). The enrollment ran at Medium integrity, and the token file was read once and deleted. **Unanchored:** the probe printed `VMTEST-WIN\stduser session=1 integrity=Medium`, no admin rights at all (#2086 row 5), `ran_as=worker` |
 | 15 | **AC2 GREEN: the same device, anchored** | the same guest, 20:25Z | Anchored from the `vmtest` admin's elevated session (`--device` naming `stduser`'s row: §5c P1). Within 75 s **the standard user's Medium-integrity worker advertised `exec-system`**. The probe printed **`NT AUTHORITY\SYSTEM session=0 integrity=System`**, `ran_as=system`. The device type FR-94 was mainly for now has admin rights for diagnosis |
 | 16 | **AC7: the admin UI, on prod** | a private Playwright run on mars as the vmtest admin, prod `hosted-20261013-c6bcdb2`, 20:28Z | On the anchored device of row 15, the execution policy dialog read "Anchored 10/13/2026: commands run as SYSTEM through this device's service", with **Un-anchor** shown. Settings showed the "Windows: require SYSTEM" switch. The API listed the device with `exec_anchor` present. Every row above recorded `ran_as` (`worker`, `system`, `console_user`) |
