@@ -156,8 +156,23 @@ Built once, in [`theme/shell.ts:91`](../ui/docs/theme/shell.ts), for every colle
   Search Console reports each collection on its own. FR-60's sitemap also listed five SPA
   routes whose served canonical is `/`, a contradiction Search Console reports as "Duplicate,
   submitted URL not selected as canonical". They are gone.
-- **Analytics:** the SPA's own first-party purestat script, which the CSP already allows.
-  `ANALYTICS = null` ([`site.ts:155`](../ui/docs/site.ts)) turns it off.
+- **Analytics — on the hosted site only** ([FR-102](fr/FR-102-growth-observability.md) §3c,
+  #2127). No page carries purestat's tag. Each carries a same-origin **loader**,
+  [`theme/analytics.js`](../ui/docs/theme/analytics.js), content-hashed like every theme file
+  (and into the blog lane's own `/blog/assets/`), whose configuration rides on its own
+  `<script>` tag as `data-src` / `data-domain` / `data-hosts`, written by the shell from
+  `ANALYTICS` ([`site.ts:215`](../ui/docs/site.ts)); there is no inline script, so the CSP is
+  unchanged (`script-src 'self' https://purestat.ai` already covers both). The loader injects
+  the tracker only when **all three** hold: the page's hostname is on the allowlist exactly
+  (`roomler.ai`, `www.roomler.ai`; no subdomain, no fork, no preview origin), the page is
+  `https:`, and `navigator.webdriver` is not set (a Playwright run is not a visit). The SPA
+  applies the same rule from `main.ts` through
+  [`ui/src/utils/analytics.ts`](../ui/src/utils/analytics.ts), in place of the tag
+  `ui/index.html` used to carry, and `site.ts` takes its values from that module so the two
+  cannot drift. The reason: the product promises no telemetry from self-hosted deployments
+  (`LICENSING.md`), and before this every self-hosted install, fork and `localhost` run beaconed
+  as `roomler.ai` — 42 % of the site's events over 90 days. The loader reads and writes nothing
+  on the visitor's device. `ANALYTICS = null` still turns it all off: no loader, no tag.
 
 ## 5. How nginx serves it
 
@@ -340,6 +355,7 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 | [`ui/docs/site.ts`](../ui/docs/site.ts) | sections, limits, keys, the Organization, authors, the blog's constants |
 | [`ui/docs/theme/render.ts`](../ui/docs/theme/render.ts) | markdown → HTML: containers, images, headings, code |
 | [`ui/docs/theme/shell.ts`](../ui/docs/theme/shell.ts) | the `<head>`, top bar, footer, search dialog |
+| [`ui/docs/theme/analytics.js`](../ui/docs/theme/analytics.js) · [`ui/src/utils/analytics.ts`](../ui/src/utils/analytics.ts) | the hosted-only analytics loader (FR-102), and the SPA's rule it mirrors |
 | [`ui/docs/theme/layout.ts`](../ui/docs/theme/layout.ts) | a docs page |
 | [`ui/docs/theme/blog-layout.ts`](../ui/docs/theme/blog-layout.ts) | a post, the index, tag pages |
 | [`ui/docs/theme/posts.ts`](../ui/docs/theme/posts.ts) | the post contract, ordering, backlinks |

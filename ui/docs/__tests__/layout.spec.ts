@@ -141,8 +141,14 @@ describe('the head', () => {
     expect(html).toContain('<meta property="og:image:alt" content="')
   })
 
-  it('loads the same first-party analytics as the SPA', () => {
-    expect(render({})).toContain('<script defer data-domain="roomler.ai" src="https://purestat.ai/js/purestat.js"></script>')
+  it('loads the hosted-only analytics loader the build published, never the tracker itself (FR-102)', () => {
+    const analytics = '/docs/assets/analytics.9999999999.js'
+    const html = renderPage({ nav: [], page: base, assets: { ...assets, analytics } }, new Set())
+    expect(html).toContain(`<script src="${analytics}" defer data-src="https://purestat.ai/js/purestat.js" data-domain="roomler.ai" data-hosts="roomler.ai,www.roomler.ai"></script>`)
+    expect(html).not.toMatch(/<script[^>]*\ssrc="https:\/\/purestat\.ai/) // `\ssrc`: the loader carries data-src
+    // Without a published loader (ANALYTICS = null), nothing at all.
+    expect(render({})).not.toMatch(/<script[^>]*data-hosts=/)
+    expect(render({}).toLowerCase()).not.toContain('purestat')
   })
 
   it('emits ONE graph, published by G ROX EOOD, never "G ROX LTD"', () => {

@@ -32,6 +32,9 @@ export interface SiteAssets {
    *  install and download links (`attribution.js`). Absent when
    *  `ATTRIBUTION_ENABLED` is off, and then no page loads it. */
   attribution?: string
+  /** FR-102: the hosted-only analytics loader (`analytics.js`). Absent when
+   *  `ANALYTICS` is null, and then no page carries a tracker in any form. */
+  analytics?: string
   /** The top bar's logo: the light lockup the SPA also uses
    *  (`ui/src/assets/brand/roomler-logo.svg`; the site has no dark theme).
    *  Without it the brand is the plain word, as in a test fixture. */
@@ -144,9 +147,14 @@ export function renderHead(h: HeadInput): string {
     ...(h.styles ?? []).map((s) => `<link rel="stylesheet" href="${s}">`),
     `<script src="${h.assets.osPreference}"></script>`,
     ...(h.headScripts ?? []).map((s) => `<script src="${s}"></script>`),
-    // The same first-party script the SPA loads; `defer`, so it never holds
-    // up the page. `ANALYTICS = null` in site.ts turns it off.
-    ANALYTICS ? `<script defer data-domain="${ANALYTICS.domain}" src="${ANALYTICS.src}"></script>` : '',
+    // FR-102 (#2127): the loader, not the tracker. Same-origin and `defer`,
+    // carrying the tracker's URL, its site and the host allowlist as `data-*`
+    // (no inline script: the CSP forbids it); it injects the tracker only on
+    // the hosted site, as the SPA's `ui/src/utils/analytics.ts` does.
+    // `ANALYTICS = null` in site.ts leaves both out.
+    ANALYTICS && h.assets.analytics
+      ? `<script src="${h.assets.analytics}" defer data-src="${escapeHtml(ANALYTICS.src)}" data-domain="${escapeHtml(ANALYTICS.domain)}" data-hosts="${escapeHtml(ANALYTICS.hosts.join(','))}"></script>`
+      : '',
     h.jsonLd ? jsonLdScript(h.jsonLd) : '',
   ]
     .filter(Boolean)
