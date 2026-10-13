@@ -26,6 +26,8 @@ pub mod x11_damage;
 /// on Windows or macOS. The only backend that can see a Wayland desktop.
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_backend;
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+pub mod drm_cursor;
 
 /// FR-45 P1 — desktop-portal availability. Detection only: whether ScreenCast
 /// exists at all, and why not. The capture path itself is P2/P3.

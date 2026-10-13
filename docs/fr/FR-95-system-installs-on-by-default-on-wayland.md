@@ -48,7 +48,7 @@ flowchart TD
 ```
 
 1. **Default-on where the person can see it, not per distro.** The root branch of `capture::wayland_plan`
-   (`agents/roomlerd/src/capture/mod.rs:681`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
+   (`agents/roomlerd/src/capture/mod.rs:683`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
    finds a surface for the session a controller would see, DRM + uinput switch themselves on, the way the keys
    would. If not, nothing changes. A Debian x86_64 host then goes default-on the day this ships, and every other
    host the day it gets a surface.
