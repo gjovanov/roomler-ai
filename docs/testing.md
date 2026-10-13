@@ -121,7 +121,7 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, diffed against an expected-failures list; regressions file an issue |
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
-| **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
+| **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
@@ -179,12 +179,66 @@ Reference run (2026-10-13, unoptimised, Windows dev box):
 | `lossy` | 25.2 | 46.6 ms | 62.1 ms | 3 | 7 |
 
 With `gate50`'s hold set to zero the test fails on `gate50: p50 rose by 0.4 ms, want ≥ 20`. That
-run is the proof that the gate can fail.
+run is the proof that the gate can fail. The CI runner (Linux) on the merged head read `clean`
+p50 12.7 ms, `delay100` +101 ms, `gate50` +52 ms, and `lossy` 1 freeze and 7 IDRs.
 
 ⚠️ The numbers come from an **unoptimised** build on whatever machine runs it, so the bounds are
 deltas and generous ceilings, not targets. Field numbers come from L4 in the real viewer.
 ⚠️ CI has no FFmpeg, so the session uses the RTP track. A data-channel cell needs a decoder
 binding the test does not have yet.
+⚠️ On Windows a delayed vnet link costs about 10 ms more per direction than it is set to:
+`delay100` reads +112 ms on the dev box and +101 ms on the Linux runner. The likely cause is the
+router's sleep until each packet is due, which overshoots on Windows timers. The bounds leave
+room for it.
+
+### L4 in process: the bench probe
+
+L0 starts the clock at capture, but input to photon starts at the viewer's input. So L4 adds a
+**probe** that travels the input path, and the same test file runs it in process, in two more
+cells. The browser half of L4 reads the same probe out of real decoded frames
+([FR-16](fr/FR-16-rc-quality-benchmark.md#l4--input-to-photon-in-the-real-viewer)).
+
+```mermaid
+sequenceDiagram
+    participant V as controller (a bench viewer)
+    participant I as agent input handler
+    participant S as synthetic source
+    V->>I: {"t":"probe","seq":N} on the input DataChannel, stamped t_send(N)
+    I->>S: probe::accept_json records N (bench mode only)
+    Note over S: every following frame carries N<br/>in a second marker, bottom-right
+    S-->>V: the frame, encoded, over RTP
+    V->>V: decode, read N from the bottom-right<br/>round trip = t_decode − t_send(N)
+```
+
+| Cell | Link | Must show |
+|---|---|---|
+| `probe` | no delay, probes on | ≥ 20 probe round trips measured: a probe reaches the source and comes back in the picture |
+| `probe50` | +50 ms one way, probes on | the round trip up by ≥ 80 ms. Either half alone would add 50, so only a probe that crosses the link **both** ways passes |
+
+- **Gated at every entry point on the agent.** The probe path exists only in the test-only
+  `synthetic-frame-source` build; no release profile has it. The input handler
+  ([`peer.rs`](../agents/roomlerd/src/peer.rs), `attach_input_handler`) hands a probe to
+  `synthetic_backend::probe` before it parses input, so a probe never reaches an injector. It
+  is recorded only with `ROOMLERD_BENCH=1`. The hello advertises `bench` in `AgentCaps.video`
+  only when the synthetic source is selected **and** bench mode is on. Only a session holding
+  INPUT gets the input handler at all.
+- **The two markers never overlap.** The frame's own number stays bottom-left. The probe's
+  grid goes bottom-right only in a frame at least 288 px wide, and is refused, never squeezed,
+  in a narrower one.
+- ⚠️ **Probes go out at a jittered interval.** A 100 ms period is exactly three 30 fps frames.
+  Every probe then lands on the same phase of the capture clock, and a cell reports one
+  arbitrary point of the 0–33 ms wait for the next capture instead of its distribution. The
+  viewer half must jitter too: 250 ms is exactly 15 frames at 60 fps.
+
+Reference run of the probe cells (2026-10-13, unoptimised, Windows dev box):
+
+| Cell | round trips | p50 | p95 |
+|---|---|---|---|
+| `probe` | 43 | 45.6 ms | 65.9 ms |
+| `probe50` | 45 | 169.4 ms (+124) | 223.9 ms |
+
+With the probe dropped in the input handler before it reaches the source, the test fails on
+`probe: 0 round trips measured, want ≥ 20`.
 
 ## The overlay stress lane (FR-81)
 

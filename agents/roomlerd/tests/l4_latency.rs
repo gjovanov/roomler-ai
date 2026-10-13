@@ -757,7 +757,7 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
 
     // `probe`: L4 in process. A probe sent on the input channel comes back
     // painted into a decoded frame: the round trip exists end to end. About
-    // 55 are sent after the warm-up; 20 is the floor.
+    // 45 are measured after the warm-up; 20 is the floor.
     assert!(
         probe_run.probe_ms.len() >= 20,
         "probe: {} round trips measured, want ≥ 20 — probes are not reaching the \
