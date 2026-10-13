@@ -8455,6 +8455,7 @@ dependencies = [
  "roomler-ai-mod-network",
  "roomler-ai-remote-control",
  "roomler-ai-services",
+ "roomler-cli",
  "roomler-core",
  "roomler-hive-node",
  "roomlerd",

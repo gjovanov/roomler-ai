@@ -191,6 +191,12 @@ pub struct ConnectedAgent {
     /// only to a connection with it. Per connection, for the same reason;
     /// `hive` does NOT imply it.
     pub supports_hive_fork: bool,
+    /// FR-90 P2f-4b — the agent advertises `hive-manage`: a start carrying
+    /// `from_terminal` makes a terminal session it adopted a managed one.
+    /// A build before it would start the conversation afresh, so such a
+    /// start goes only to a connection with it. Per connection; `hive` does
+    /// NOT imply it.
+    pub supports_hive_manage: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -511,6 +517,9 @@ impl Hub {
             // FR-90 P2f-3 — set by `set_agent_hive_fork_support`; `false` = no
             // fork's start is ever sent to this connection.
             supports_hive_fork: false,
+            // FR-90 P2f-4b — set by `set_agent_hive_manage_support`; `false` =
+            // no start that makes a terminal session managed is sent here.
+            supports_hive_manage: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -2230,6 +2239,58 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !(entry.supports_hive && entry.supports_hive_fork) {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2f-4b — record whether this connection makes a terminal
+    /// session it adopted a managed one (`hive-manage`), right after
+    /// registration.
+    pub fn set_agent_hive_manage_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_manage = supports;
+        }
+    }
+
+    /// FR-90 P2f-4b — whether the device's CURRENT connection on this pod
+    /// runs sessions and makes a terminal session managed: `hive` and
+    /// `hive-manage`. `None` = not online here, or another tenant's.
+    pub fn agent_supports_hive_manage(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .map(|a| a.supports_hive && a.supports_hive_manage)
+    }
+
+    /// FR-90 P2f-4b — push a start that makes a terminal session managed,
+    /// checked in the lookup that sends it, as [`Self::push_hive_fork`]:
+    /// offline or another tenant's is [`Error::AgentOffline`]; a connection
+    /// without `hive` and `hive-manage` is [`Error::ExecUnsupported`] and
+    /// receives nothing. Never through [`Self::push_hive`]: a build that
+    /// ignores `from_terminal` would start the conversation afresh.
+    pub fn push_hive_manage(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !(entry.supports_hive && entry.supports_hive_manage) {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }
@@ -4482,6 +4543,68 @@ mod tests {
         hub.set_agent_hive_support(agent_id, false);
         assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(false));
         assert!(hub.push_hive_fork(agent_id, tenant, stop()).is_err());
+    }
+
+    /// FR-90 P2f-4b — a start that makes a terminal session managed reaches
+    /// only a connection that runs sessions and advertises `hive-manage`:
+    /// one that adopts and starts forks would start the conversation afresh,
+    /// and another org's is not reachable at all.
+    #[tokio::test]
+    async fn a_made_managed_start_reaches_only_a_connection_that_makes_one() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let stop = || ServerMsg::HiveStop {
+            session_id: ObjectId::new(),
+            fence: 1,
+            reason: "owner".into(),
+        };
+        hub.set_agent_hive_support(agent_id, true);
+        hub.set_agent_hive_fork_support(agent_id, true);
+        assert_eq!(
+            hub.agent_supports_hive_manage(agent_id, tenant),
+            Some(false)
+        );
+        let err = hub
+            .push_hive_manage(agent_id, tenant, stop())
+            .expect_err("a connection without hive-manage");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        hub.set_agent_hive_manage_support(agent_id, true);
+        assert_eq!(
+            hub.agent_supports_hive_manage(agent_id, ObjectId::new()),
+            None
+        );
+        let err = hub
+            .push_hive_manage(agent_id, ObjectId::new(), stop())
+            .expect_err("another org's connection");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        assert_eq!(hub.agent_supports_hive_manage(agent_id, tenant), Some(true));
+        hub.push_hive_manage(agent_id, tenant, stop())
+            .expect("a connection that makes one");
+        assert!(
+            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveStop { .. })),
+            "it reached the connection"
+        );
+        // `hive-manage` without `hive` makes nothing.
+        hub.set_agent_hive_support(agent_id, false);
+        assert_eq!(
+            hub.agent_supports_hive_manage(agent_id, tenant),
+            Some(false)
+        );
+        assert!(hub.push_hive_manage(agent_id, tenant, stop()).is_err());
     }
 
     // ─── Fleet RPC broker ────────────────────────────────────────────

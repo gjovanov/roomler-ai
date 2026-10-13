@@ -17,8 +17,8 @@ use roomler_ai_services::dao::base::{
 };
 
 use crate::model::{
-    AgentApproval, AgentSession, HiveAuditEvent, MemberState, MemberTip, MovedStart, Promotion,
-    PromotionState, ReplicaMember, Replicaset, SessionStatus,
+    AgentApproval, AgentSession, FromTerminal, HiveAuditEvent, MemberState, MemberTip, MovedStart,
+    Promotion, PromotionState, ReplicaMember, Replicaset, SessionOrigin, SessionStatus,
 };
 use crate::placement::MemberRole;
 
@@ -337,6 +337,124 @@ impl AgentSessionDao {
                     "detail": detail,
                     "ended_at": DateTime::now(),
                 } },
+            )
+            .await
+    }
+
+    /// FR-90 P2f-4b — an ended adopted session made a managed one, at its
+    /// fence, on its own device: its start is unanswered from here, as a new
+    /// session's is. `false` = the record changed first (another asking won,
+    /// or the session is no longer an ended adopted one).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn make_managed(
+        &self,
+        id: ObjectId,
+        tenant_id: ObjectId,
+        owner_id: ObjectId,
+        fence: i64,
+        from: &FromTerminal,
+        folder: &str,
+        replicaset: Option<&Replicaset>,
+        brain_rev: Option<i64>,
+    ) -> DaoResult<bool> {
+        let mut set = doc! {
+            "status": SessionStatus::Starting.as_str(),
+            "location.folder": folder,
+            "from_terminal": bson::to_bson(from)?,
+            "updated_at": DateTime::now(),
+        };
+        if let Some(r) = replicaset {
+            set.insert("replicaset", bson::to_bson(r)?);
+        }
+        if let Some(rev) = brain_rev {
+            set.insert("brain_rev", rev);
+        }
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tenant_id,
+                    "owner_id": owner_id,
+                    "origin": SessionOrigin::Adopted.as_str(),
+                    "status": SessionStatus::Ended.as_str(),
+                    "fence": fence,
+                },
+                doc! {
+                    "$set": set,
+                    // A started session stores no origin; its start is
+                    // answered anew.
+                    "$unset": {
+                        "origin": "",
+                        "accepted_at": "",
+                        "ended_at": "",
+                        "end_reason": "",
+                        "detail": "",
+                        "refusal": "",
+                    },
+                },
+            )
+            .await
+    }
+
+    /// FR-90 P2f-4b — a made-managed start refused by its device, or one that
+    /// never reached it: the adopted session it was again, its own end and
+    /// folder put back, and the word kept for whoever asked. Only for THIS asking
+    /// (`at`), and only while its start is unanswered: a device that already
+    /// took it runs a managed session.
+    pub async fn restore_adopted(
+        &self,
+        id: ObjectId,
+        from: &FromTerminal,
+        word: &str,
+        detail: Option<String>,
+    ) -> DaoResult<bool> {
+        let mut set = doc! {
+            "origin": SessionOrigin::Adopted.as_str(),
+            "status": SessionStatus::Ended.as_str(),
+            "from_terminal.refused": word,
+            "updated_at": DateTime::now(),
+        };
+        if let Some(d) = detail {
+            set.insert("from_terminal.refused_detail", d);
+        }
+        let mut unset = doc! { "replicaset": "" };
+        match from.ended_at {
+            Some(t) => {
+                set.insert("ended_at", t);
+            }
+            None => {
+                unset.insert("ended_at", "");
+            }
+        }
+        match &from.end_reason {
+            Some(r) => {
+                set.insert("end_reason", r.clone());
+            }
+            None => {
+                unset.insert("end_reason", "");
+            }
+        }
+        match &from.detail {
+            Some(d) => {
+                set.insert("detail", d.clone());
+            }
+            None => {
+                unset.insert("detail", "");
+            }
+        }
+        if let Some(f) = &from.folder {
+            set.insert("location.folder", f.clone());
+        }
+        self.base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "status": SessionStatus::Starting.as_str(),
+                    "accepted_at": Bson::Null,
+                    "from_terminal.at": from.at,
+                    "from_terminal.refused": Bson::Null,
+                },
+                doc! { "$set": set, "$unset": unset },
             )
             .await
     }

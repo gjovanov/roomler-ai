@@ -191,6 +191,47 @@ pub(crate) fn adopted_note(s: &AgentSession) -> String {
     t
 }
 
+/// FR-90 P2f-4b — the owner asked that this terminal session be made a
+/// managed one, on the device that adopted it.
+pub(crate) fn managing_note(s: &AgentSession, by: &str) -> String {
+    format!(
+        "🧭 **{}** is making this terminal session a managed one on {}, in {}",
+        md_escape(by),
+        device_label(s),
+        md_escape(&s.location.folder)
+    )
+}
+
+/// FR-90 P2f-4b — "Made managed": it runs from its terminal's history now,
+/// where and as whom the device says.
+pub(crate) fn made_managed_note(s: &AgentSession) -> String {
+    let mut t = format!(
+        "▶️ Made a managed session on {} in {}",
+        device_label(s),
+        md_escape(&s.location.folder)
+    );
+    if let Some(account) = &s.location.account {
+        t.push_str(&format!(" as **{}**", md_escape(account)));
+    }
+    t.push_str(" — it goes on from its terminal's conversation, and can be prompted from here");
+    t
+}
+
+/// FR-90 P2f-4b — the device did not make it a managed one: why, in its
+/// words; the session is the adopted one it was.
+pub(crate) fn manage_refused_note(s: &AgentSession, word: &str, detail: Option<&str>) -> String {
+    let mut t = format!(
+        "⛔ {} did not make this terminal session a managed one: {}",
+        device_label(s),
+        crate::routes::device_refusal_message(word)
+    );
+    if let Some(detail) = detail {
+        t.push_str(&format!(" — {}", md_escape(detail)));
+    }
+    t.push_str(". It is the adopted session it was");
+    t
+}
+
 /// FR-90 P2f-3 — "Forked", in the parent's room: who made a fork of it, what
 /// it is called and where it runs; the session itself goes on as it was.
 pub(crate) fn forked_note(title: &str, device_name: &str, folder: &str, by: &str) -> String {
@@ -874,6 +915,7 @@ mod tests {
             fences: Vec::new(),
             moved: None,
             parent: None,
+            from_terminal: None,
         };
         assert_eq!(
             moved_note(&s, &p, "Alice"),
