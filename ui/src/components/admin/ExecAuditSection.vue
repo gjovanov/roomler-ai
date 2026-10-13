@@ -104,6 +104,7 @@ const DENY_LABEL: Record<string, string> = {
   agent_disabled: 'disabled on device',
   system_required: 'SYSTEM required',
   claim_refused: 'claim refused',
+  run_as_unavailable: 'needs the SYSTEM service',
 }
 
 /** FR-94 — the identity the server sent the command to. `worker` stays
