@@ -327,6 +327,20 @@ pub struct Promotion {
     /// promotion to a member, every one before P2f-1.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub teleport: bool,
+    /// FR-90 P2f-3c — a fork onto a device that held no copy: a teleport's
+    /// steps up to the copy (the prepare, the join, the catching up), then
+    /// the fork made there instead of the drain. The session itself never
+    /// moves. Absent = a promotion or a teleport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkPlan>,
+}
+
+/// FR-90 P2f-3c — the fork a fork-joining move is for, made once its target's
+/// copy caught up: by [`Promotion::by`], on [`Promotion::to`], in
+/// [`Promotion::folder`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ForkPlan {
+    pub title: String,
 }
 
 impl Promotion {
@@ -581,6 +595,10 @@ pub struct PromotionView {
     /// promotion to a member.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub teleport: bool,
+    /// P2f-3c — a fork onto a device that held no copy: the session stays
+    /// where it is. Absent: a move.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fork: bool,
 }
 
 impl From<&Promotion> for PromotionView {
@@ -597,6 +615,7 @@ impl From<&Promotion> for PromotionView {
             started_at: rfc3339(p.started_at),
             deadline: rfc3339(p.deadline),
             teleport: p.teleport,
+            fork: p.fork.is_some(),
         }
     }
 }
@@ -1031,6 +1050,7 @@ mod tests {
             unreachable_from: false,
             prior: None,
             teleport: false,
+            fork: None,
         };
         assert!(p.in_flight(now));
         assert!(
@@ -1048,17 +1068,25 @@ mod tests {
                 .contains_key("teleport"),
             "a promotion stores no teleport word, as every one before P2f-1"
         );
+        assert!(
+            !stored
+                .get_document("promotion")
+                .unwrap()
+                .contains_key("fork"),
+            "nor a fork's plan"
+        );
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert_eq!(v["promotion"]["state"], "syncing", "{v}");
         assert!(v["promotion"]["deadline"].is_string(), "{v}");
         assert_eq!(v["promotion"]["to"], p.to.to_hex());
         assert!(v["promotion"].get("teleport").is_none(), "{v}");
+        assert!(v["promotion"].get("fork").is_none(), "{v}");
 
         // P2f-1 — a teleport says so, stored and viewed.
         s.promotion = Some(Promotion {
             teleport: true,
             state: PromotionState::Joining,
-            ..p
+            ..p.clone()
         });
         let back: AgentSession = bson::from_document(bson::to_document(&s).unwrap()).unwrap();
         assert!(back.promotion.as_ref().is_some_and(|p| p.teleport));
@@ -1068,6 +1096,34 @@ mod tests {
             (&serde_json::json!(true), &serde_json::json!("joining")),
             "{v}"
         );
+
+        // P2f-3c — and so does a fork onto a device that held no copy: its
+        // plan stored whole, its view saying it is a fork.
+        s.promotion = Some(Promotion {
+            teleport: true,
+            fork: Some(ForkPlan {
+                title: "try it".into(),
+            }),
+            state: PromotionState::Joining,
+            ..p
+        });
+        let stored = bson::to_document(&s).unwrap();
+        assert_eq!(
+            stored
+                .get_document("promotion")
+                .and_then(|p| p.get_document("fork"))
+                .and_then(|f| f.get_str("title"))
+                .ok(),
+            Some("try it"),
+            "{stored}"
+        );
+        let back: AgentSession = bson::from_document(stored).unwrap();
+        assert_eq!(
+            back.promotion.and_then(|p| p.fork).map(|f| f.title),
+            Some("try it".to_string())
+        );
+        let v = serde_json::to_value(SessionView::from(&s)).unwrap();
+        assert_eq!(v["promotion"]["fork"], true, "{v}");
     }
 
     /// FR-90 P2c-3 — the member words are locked, and a member placed before
