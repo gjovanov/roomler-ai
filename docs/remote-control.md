@@ -2422,5 +2422,49 @@ sequenceDiagram
   the supervisor respawns it in-process, so the service itself never leaves
   `RUNNING`. Prefer it remotely too: `roomler exec <host> -- roomler restart
   --no-wait`.
+- ✅ Field-verified on 0.4.130 (CORPLAP-3). Ten milliseconds after Stop the state
+  was `STOP_PENDING` with a 20 s wait hint. The stop took 2.29 s, and
+  `Restart-Service` waited ("Waiting for service … to stop"), exited 0, and the
+  service was back 2.47 s after the stop began.
+
+#### 19.8.8 A host that dies comes back (#2087)
+
+Until #2087 the `Roomler` service had **no SCM recovery actions**. A service host
+that died left the device dark until the next reboot. Worse, a supervisor that
+failed or panicked still ended with `STOPPED` and exit code 0, which looks like a
+clean stop. A startup error before the supervisor existed did not report
+`STOPPED` at all, so the SCM kept showing `RUNNING` for a host that did nothing.
+
+```mermaid
+flowchart LR
+    End["host's run ends"] --> Asked{"Stop / Preshutdown<br/>was requested?"}
+    Asked -- yes --> Zero["STOPPED, exit 0<br/>nothing restarts it"]
+    Asked -- no --> NonZero["STOPPED, ServiceSpecific 1–4"]
+    NonZero --> SCM["SCM failure actions:<br/>restart 5 s → 30 s → 60 s"]
+    Crash["host process dies"] --> SCM
+```
+
+- `install()` writes the recovery actions when it registers the service:
+  **restart after 5 s, 30 s, then 60 s** for every later failure, with the count
+  reset after a day without failures. It also turns failure actions on for
+  **non-crash failures**. Restart is the only action: never a reboot, never a
+  command. The MSI's `RegisterService` runs the newly installed binary's `service
+  install --as-service`, and a major upgrade recreates the service, so every
+  device gets the actions with its next update.
+- `exit_code_for` decides the code reported with `STOPPED`:
+
+  | How the run ended | Exit code | The SCM then |
+  |---|---|---|
+  | A requested stop (Stop or Preshutdown from an operator, an MSI or the OS), whatever happened during it | `0` | leaves the service stopped |
+  | The supervisor returned with no stop requested | `ServiceSpecific(1)` | restarts it |
+  | The supervisor returned an error | `ServiceSpecific(2)` | restarts it |
+  | The supervisor panicked | `ServiceSpecific(3)` | restarts it |
+  | No supervisor at all (the worker path or the startup sequence failed) | `ServiceSpecific(4)` | restarts it |
+
+  ⚠️ A requested stop must stay `0`. With non-crash failure actions on, any other
+  code would have the SCM undo an operator's, an MSI's or the OS's stop.
+- netd's shutdown reap waits a bounded `NETD_REAP_WAIT` after `kill()` instead of
+  an unbounded `wait()`. `SHUTDOWN_BOUND`, and with it §19.8.7's wait hint,
+  includes that wait.
 
 <!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->
