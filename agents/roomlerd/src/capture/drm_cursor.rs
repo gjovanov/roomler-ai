@@ -260,6 +260,7 @@ mod tests {
     /// A `w×h` buffer with a `pitch`, every pixel transparent but the listed
     /// `(x, y, pixel)`s.
     fn buffer(w: usize, h: usize, pitch: usize, set: &[(usize, usize, [u8; 4])]) -> Vec<u8> {
+        assert!(pitch >= w * 4, "a pitch shorter than its row");
         let mut b = vec![0u8; pitch * h];
         for (x, y, px) in set {
             b[y * pitch + x * 4..y * pitch + x * 4 + 4].copy_from_slice(px);
