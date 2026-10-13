@@ -48,6 +48,10 @@ pub mod synthetic_backend;
 /// slot-first (look, and pace only a source that outruns the target).
 pub mod gate;
 
+/// FR-16 L4 — the frame marker (a 12-bit number and a CRC-4 as luma blocks)
+/// the synthetic source and `roomlerd probe-target` paint and the viewer reads.
+pub mod bench_marker;
+
 pub mod cursor;
 
 /// FR-85 P1d — the mouse pointer in a recording: whether each backend draws
