@@ -1010,14 +1010,14 @@ pub struct AgentConfig {
     /// with no capture key set, switches capture on by itself
     /// (`ROOMLERD_WAYLAND_AUTO`). Built-in default: **ON**.
     ///
-    /// The one automatic arm is mutter's own screencast, which asks nobody
-    /// (GNOME). The portal stays opt-in (`portal_capture`) until its attended
-    /// flow can wait for the person at the screen without a new dialog per
-    /// viewer reconnect (FR-93 P2d). A root (system) install never switches an
-    /// arm on by itself: D1 keeps DRM and uinput opt-in there until a desktop
-    /// companion ships for non-Debian hosts. Any capture key set, to anything,
-    /// takes the choice back. `false` is the kill switch: the behaviour before
-    /// P2, unchanged. Restart required.
+    /// The automatic arm is mutter's own screencast, which asks nobody (GNOME),
+    /// and where mutter is absent the desktop portal, which asks the person at
+    /// the screen once and restores their answer afterwards (FR-93 P2d-3). A
+    /// root (system) install never switches an arm on by itself: D1 keeps DRM
+    /// and uinput opt-in there until a desktop companion ships for non-Debian
+    /// hosts. Any capture key set, to anything, takes the choice back. `false`
+    /// is the kill switch: the behaviour before P2, unchanged. Restart
+    /// required.
     #[serde(default)]
     pub wayland_auto: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
