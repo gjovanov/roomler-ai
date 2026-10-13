@@ -56,6 +56,7 @@ pub mod dao;
 pub mod fork;
 pub mod hooks;
 pub mod lease;
+pub mod manage;
 pub mod model;
 pub mod participants;
 pub mod placement;
@@ -202,6 +203,8 @@ impl Module for HiveState {
             .route("/{session_id}/teleport", post(promote::teleport))
             // P2f-3 — a new session, its own, from this one's conversation.
             .route("/{session_id}/fork", post(fork::fork))
+            // P2f-4b — an ended terminal session made a managed one.
+            .route("/{session_id}/manage", post(manage::manage))
             // P1c — who besides the owner takes part, and how.
             .route("/{session_id}/participant", get(participants::list))
             .route(

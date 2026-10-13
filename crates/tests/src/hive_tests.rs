@@ -9935,3 +9935,613 @@ async fn with_the_switch_off_no_copy_serves_a_view() {
         "no copy is asked"
     );
 }
+
+// ─── P2f-4b — an ended adopted session made a managed one ───────────────────
+
+/// A device that adopts terminal sessions and makes an ended one managed.
+const MANAGES: &[&str] = &["hive", "hive-view", "hive-adopt", "hive-manage"];
+
+/// The terminal session every test here adopts.
+const TERMINAL: &str = "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f71";
+
+/// `POST …/session/{sid}/manage`, as `token`.
+async fn post_manage(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    folder: Option<&str>,
+) -> (u16, Value) {
+    let body = match folder {
+        Some(f) => json!({ "folder": f }),
+        None => json!({}),
+    };
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/hive/session/{sid}/manage"),
+            token,
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// A terminal session adopted on `dev` for `email`'s person, whose terminal
+/// then ended there: what the device says when it does.
+async fn ended_terminal(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    dev: &mut Device,
+    email: &str,
+) -> String {
+    let ack = adopt(&mut dev.ws, "m1", TERMINAL, &[email]).await;
+    assert!(ack.get("refused").is_none(), "{ack}");
+    let sid = ack["session_id"].as_str().unwrap().to_string();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "ended",
+               "detail": "the terminal session ended (exit)"}),
+    )
+    .await;
+    wait_status(app, tid, token, &sid, "ended").await;
+    sid
+}
+
+/// The asking, `folder` as typed if any, answered by the device with
+/// `answer` (merged into its `rc:hive.start_ack`): the route's answer, and
+/// the start the device got.
+async fn managed(
+    app: &TestApp,
+    dev: &mut Device,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    folder: Option<&str>,
+    answer: Value,
+) -> (Value, Value) {
+    let caller = post_manage(app, tid, token, sid, folder);
+    let device = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives the start");
+        let mut ack = json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                             "fence": frame["fence"]});
+        for (k, v) in answer.as_object().unwrap() {
+            ack[k] = v.clone();
+        }
+        send(&mut dev.ws, ack).await;
+        frame
+    };
+    let ((code, body), frame) = tokio::join!(caller, device);
+    assert_eq!(code, 200, "{body}");
+    (body, frame)
+}
+
+/// `manage` rows of the audit for `sid`, oldest first: outcome and reason.
+async fn manage_audit(app: &TestApp, sid: &str) -> Vec<(String, String)> {
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "session_id": ObjectId::parse_str(sid).unwrap(), "action": "manage" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        out.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+        ));
+    }
+    out
+}
+
+/// FR-90 P2f-4b — decision 11's other half on the server. The owner makes
+/// their ended adopted session a managed one: the SAME record, at its fence,
+/// on the device that adopted it. Its start says so, and goes there. It is a
+/// started session now, placed by the policy; the room says so, and the
+/// audit records it. Asked again, it is a managed one already.
+#[tokio::test]
+async fn an_ended_terminal_session_is_made_a_managed_one_on_its_own_device() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivemanage").await;
+    let admin = &seeded.admin;
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+    let sid = ended_terminal(&app, &tid, &admin.access_token, &mut dev, &admin.email).await;
+    let before = stored(&app, &sid).await;
+    let ended_at = before.get_datetime("ended_at").unwrap().to_owned();
+
+    let (body, frame) = managed(
+        &app,
+        &mut dev,
+        &tid,
+        &admin.access_token,
+        &sid,
+        None,
+        json!({"account": "alice"}),
+    )
+    .await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    assert_eq!(
+        body["session"]["id"],
+        sid.as_str(),
+        "the same record: {body}"
+    );
+    assert_eq!(body["session"]["origin"], "started", "{body}");
+    assert_eq!(
+        (
+            frame["session_id"].clone(),
+            frame["harness_session"].clone(),
+            frame["fence"].clone(),
+            frame["from_terminal"].clone(),
+            frame["resume"].clone(),
+            frame["folder"].clone(),
+        ),
+        (
+            json!(sid),
+            json!(TERMINAL),
+            json!(1),
+            json!(true),
+            json!(false),
+            json!("/home/alice/client-x"),
+        ),
+        "the start makes the terminal's own conversation a managed one: {frame}"
+    );
+    assert!(frame.get("fork_of").is_none(), "{frame}");
+
+    let after = stored(&app, &sid).await;
+    assert!(
+        after.get("origin").is_none(),
+        "a started session stores no origin: {after}"
+    );
+    assert!(after.get_datetime("accepted_at").is_ok(), "{after}");
+    assert!(after.get("end_reason").is_none(), "{after}");
+    let from = after.get_document("from_terminal").expect("where it began");
+    assert_eq!(
+        from.get_object_id("device_id").unwrap().to_hex(),
+        dev.agent_id
+    );
+    assert_eq!(from.get_object_id("by").unwrap().to_hex(), admin.id);
+    assert_eq!(from.get_datetime("ended_at").unwrap(), &ended_at);
+    assert_eq!(from.get_str("end_reason").unwrap(), "exited");
+    assert!(from.get("refused").is_none(), "{from}");
+    assert!(
+        after.get_document("replicaset").is_ok(),
+        "it follows the policy now: {after}"
+    );
+    assert_eq!(
+        notes_in(
+            &app,
+            &tid,
+            &admin.access_token,
+            &sid,
+            "is making this terminal session"
+        )
+        .await
+        .len(),
+        1,
+        "the room says it was asked"
+    );
+    assert_eq!(
+        notes_in(
+            &app,
+            &tid,
+            &admin.access_token,
+            &sid,
+            "Made a managed session on"
+        )
+        .await
+        .len(),
+        1,
+        "and that it was made"
+    );
+    assert_eq!(
+        manage_audit(&app, &sid).await,
+        [("sent".to_string(), String::new())]
+    );
+
+    // It runs as any session does, and is a managed one already.
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": sid, "fence": 1, "state": "idle"}),
+    )
+    .await;
+    wait_status(&app, &tid, &admin.access_token, &sid, "idle").await;
+    let (code, again) = post_manage(&app, &tid, &admin.access_token, &sid, None).await;
+    assert_eq!(
+        (code, again["reason"].as_str()),
+        (200, Some("not_adopted")),
+        "{again}"
+    );
+}
+
+/// FR-90 P2f-4b — a start the device refused leaves the adopted session it
+/// was: its own end and folder back, the device's word kept for whoever
+/// asked. It never becomes a refused managed session that nothing could
+/// start again. Asked again, it is made one, where its terminal ran.
+#[tokio::test]
+async fn a_refused_start_leaves_the_adopted_session_it_was() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivemanagerefused").await;
+    let admin = &seeded.admin;
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+    let sid = ended_terminal(&app, &tid, &admin.access_token, &mut dev, &admin.email).await;
+
+    // Asked to run it in another folder.
+    let began = Instant::now();
+    let (body, frame) = managed(
+        &app,
+        &mut dev,
+        &tid,
+        &admin.access_token,
+        &sid,
+        Some("/home/alice/client-y"),
+        json!({"refused": "launch_failed",
+               "detail": "this device could not put its terminal's history in place"}),
+    )
+    .await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("launch_failed")),
+        "{body}"
+    );
+    assert_eq!(frame["folder"], "/home/alice/client-y", "{frame}");
+    assert!(
+        began.elapsed() < Duration::from_secs(hive_limits::START_ACK_TIMEOUT_SECS / 2),
+        "the refusal wakes whoever asked, not the start's bound: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(body["session"]["origin"], "adopted", "{body}");
+    let row = stored(&app, &sid).await;
+    assert_eq!(
+        (
+            row.get_str("origin").unwrap(),
+            row.get_str("status").unwrap(),
+            row.get_str("end_reason").unwrap(),
+        ),
+        ("adopted", "ended", "exited"),
+        "the adopted session it was: {row}"
+    );
+    assert!(row.get_datetime("ended_at").is_ok(), "{row}");
+    assert!(
+        row.get("replicaset").is_none(),
+        "placed nowhere again: {row}"
+    );
+    assert_eq!(
+        row.get_document("location")
+            .ok()
+            .and_then(|l| l.get_str("folder").ok()),
+        Some("/home/alice/client-x"),
+        "its own folder back: {row}"
+    );
+    let from = row.get_document("from_terminal").unwrap();
+    assert_eq!(from.get_str("refused").unwrap(), "launch_failed");
+    assert!(
+        from.get_str("refused_detail")
+            .unwrap()
+            .contains("history in place"),
+        "{from}"
+    );
+    assert_eq!(
+        notes_in(
+            &app,
+            &tid,
+            &admin.access_token,
+            &sid,
+            "did not make this terminal session a managed one"
+        )
+        .await
+        .len(),
+        1,
+        "the room says why"
+    );
+    assert_eq!(
+        manage_audit(&app, &sid).await,
+        [
+            ("sent".to_string(), String::new()),
+            ("refused".to_string(), "launch_failed".to_string())
+        ]
+    );
+
+    // Asked again, naming no folder: it is made one, where its terminal ran.
+    let (body, frame) = managed(
+        &app,
+        &mut dev,
+        &tid,
+        &admin.access_token,
+        &sid,
+        None,
+        json!({"account": "alice"}),
+    )
+    .await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    assert_eq!(
+        (frame["from_terminal"].clone(), frame["folder"].clone()),
+        (json!(true), json!("/home/alice/client-x")),
+        "{frame}"
+    );
+    let row = stored(&app, &sid).await;
+    assert!(
+        row.get_document("from_terminal")
+            .unwrap()
+            .get("refused")
+            .is_none(),
+        "this asking's own record: {row}"
+    );
+}
+
+/// FR-90 P2f-4b — the server's gates. Only the owner learns the session
+/// exists; only an ended terminal session, whose mirroring was never stopped
+/// from Roomler, is made a managed one; only on a device that is here and
+/// makes one; and only with `HIVE_RUN`. Nothing reaches the device on any of
+/// them.
+#[tokio::test]
+async fn only_an_ended_terminal_session_is_made_managed_and_by_its_owner() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivemanagegates").await;
+    let (admin, member) = (&seeded.admin, &seeded.member);
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+
+    // A live terminal session: not yet.
+    let ack = adopt(&mut dev.ws, "g1", TERMINAL, &[&admin.email]).await;
+    let live = ack["session_id"].as_str().unwrap().to_string();
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &live, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("not_ended")),
+        "{body}"
+    );
+    // Someone else's: no such session.
+    let (code, _) = post_manage(&app, &tid, &member.access_token, &live, None).await;
+    assert_eq!(code, 404, "nobody else learns it exists");
+    // Stopped from Roomler: its terminal went on after the stop.
+    let (code, _) = stop(&app, &tid, &admin.access_token, &live).await;
+    assert_eq!(code, 200);
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": live, "fence": 1, "state": "ended",
+               "detail": "mirroring stopped; the terminal session goes on"}),
+    )
+    .await;
+    wait_status(&app, &tid, &admin.access_token, &live, "ended").await;
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &live, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("stopped")),
+        "{body}"
+    );
+
+    // An ended one, on a device that does not make one: an older build.
+    let mut old = device(&app, &seeded, "older", &["hive", "hive-view", "hive-adopt"]).await;
+    let ack = adopt(
+        &mut old.ws,
+        "g2",
+        "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f72",
+        &[&admin.email],
+    )
+    .await;
+    let on_old = ack["session_id"].as_str().unwrap().to_string();
+    send(
+        &mut old.ws,
+        json!({"t": "rc:hive.state", "session_id": on_old, "fence": 1, "state": "ended",
+               "detail": "the terminal session ended (exit)"}),
+    )
+    .await;
+    wait_status(&app, &tid, &admin.access_token, &on_old, "ended").await;
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &on_old, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("device_unsupported")),
+        "{body}"
+    );
+    assert!(
+        !device_hears(&mut old.ws, "rc:hive.start", Duration::from_millis(300)).await,
+        "nothing reached it"
+    );
+    // Offline.
+    drop(old.ws);
+    wait_offline(&app, &seeded, &old.agent_id).await;
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &on_old, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("device_offline")),
+        "{body}"
+    );
+
+    // Without HIVE_RUN: a plain member's own ended terminal session.
+    let ack = adopt(
+        &mut dev.ws,
+        "g3",
+        "6f1c8a2e-3b7d-4e5f-9a10-2b3c4d5e6f73",
+        &[&member.email],
+    )
+    .await;
+    let members = ack["session_id"].as_str().unwrap().to_string();
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.state", "session_id": members, "fence": 1, "state": "ended",
+               "detail": "the terminal session ended (exit)"}),
+    )
+    .await;
+    wait_status(&app, &tid, &member.access_token, &members, "ended").await;
+    let (code, body) = post_manage(&app, &tid, &member.access_token, &members, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("no_permission")),
+        "{body}"
+    );
+    assert!(
+        !device_hears(&mut dev.ws, "rc:hive.start", Duration::from_millis(300)).await,
+        "nothing reached the device"
+    );
+    let row = stored(&app, &members).await;
+    assert_eq!(
+        row.get_str("origin").unwrap(),
+        "adopted",
+        "untouched: {row}"
+    );
+}
+
+/// FR-90 P2f-4b — the server is off, and so is the route: P2's switch.
+#[tokio::test]
+async fn making_a_terminal_session_managed_is_off_with_the_replicaset() {
+    let app = hive_app_polling().await;
+    let seeded = app.seed_tenant("hivemanageoff").await;
+    let admin = &seeded.admin;
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+    let sid = ended_terminal(&app, &tid, &admin.access_token, &mut dev, &admin.email).await;
+    let (code, _) = post_manage(&app, &tid, &admin.access_token, &sid, None).await;
+    assert_eq!(code, 404);
+}
+
+/// FR-90 P2f-4b — a start the device never answered is sent again on its
+/// next connection, still a terminal's; past the start's redelivery window,
+/// counted from the asking and not from the adoption, it is the adopted
+/// session it was, never a lost one.
+#[tokio::test]
+async fn an_unanswered_start_is_sent_again_and_past_its_window_restored() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivemanagelate").await;
+    let admin = &seeded.admin;
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+    let sid = ended_terminal(&app, &tid, &admin.access_token, &mut dev, &admin.email).await;
+    // The adoption was long ago: only the asking's own time counts.
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "created_at": bson::DateTime::from_millis(0) } },
+        )
+        .await
+        .unwrap();
+
+    // The device stays silent: pending.
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &sid, None).await;
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("pending")),
+        "{body}"
+    );
+    let first = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+    assert_eq!(first["from_terminal"], true);
+
+    // Its next connection: the start again, still a terminal's.
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let mut ws = connect(&app, &dev.token, &dev.machine, MANAGES).await;
+    let again = read_until(&mut ws, "rc:hive.start")
+        .await
+        .expect("the start again");
+    assert_eq!(
+        (again["session_id"].as_str(), again["from_terminal"].clone()),
+        (Some(sid.as_str()), json!(true)),
+        "{again}"
+    );
+    assert_eq!(
+        stored(&app, &sid).await.get_str("status").unwrap(),
+        "starting"
+    );
+
+    // Past the window, counted from the asking: the adopted session it was.
+    drop(ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let late = bson::DateTime::from_millis(
+        bson::DateTime::now().timestamp_millis()
+            - (hive_limits::START_REDELIVERY_WINDOW_SECS + 60) * 1000,
+    );
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "from_terminal.at": late } },
+        )
+        .await
+        .unwrap();
+    let mut ws = connect(&app, &dev.token, &dev.machine, MANAGES).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let row = loop {
+        let row = stored(&app, &sid).await;
+        if row.get_str("status").unwrap() != "starting" {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "never restored: {row}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // Read whole, so a record made `lost` fails here, by name.
+    assert_eq!(
+        (
+            row.get_str("origin").ok(),
+            row.get_str("status").ok(),
+            row.get_document("from_terminal")
+                .ok()
+                .and_then(|f| f.get_str("refused").ok())
+        ),
+        (Some("adopted"), Some("ended"), Some("never_answered")),
+        "never lost: {row}"
+    );
+    assert!(
+        !device_hears(&mut ws, "rc:hive.start", Duration::from_millis(300)).await,
+        "and not sent again"
+    );
+}
+
+/// FR-90 P2f-4b — the device comes back as a build that does not make one:
+/// the start is not sent to it, and the session is the adopted one it was.
+#[tokio::test]
+async fn a_device_back_as_an_older_build_leaves_the_adopted_session_it_was() {
+    let app = replicaset_app().await;
+    let seeded = app.seed_tenant("hivemanageolder").await;
+    let admin = &seeded.admin;
+    let tid = seeded.tenant_id.clone();
+    let mut dev = device(&app, &seeded, "manager", MANAGES).await;
+    let sid = ended_terminal(&app, &tid, &admin.access_token, &mut dev, &admin.email).await;
+    let (code, body) = post_manage(&app, &tid, &admin.access_token, &sid, None).await;
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("pending")),
+        "{body}"
+    );
+    drop(dev.ws);
+    wait_offline(&app, &seeded, &dev.agent_id).await;
+    let mut ws = connect(
+        &app,
+        &dev.token,
+        &dev.machine,
+        &["hive", "hive-view", "hive-adopt"],
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let row = loop {
+        let row = stored(&app, &sid).await;
+        if row.get_str("status").unwrap() != "starting" {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "never restored: {row}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        (
+            row.get_str("origin").unwrap(),
+            row.get_document("from_terminal")
+                .unwrap()
+                .get_str("refused")
+                .unwrap()
+        ),
+        ("adopted", "device_unsupported"),
+        "{row}"
+    );
+    assert!(
+        !device_hears(&mut ws, "rc:hive.start", Duration::from_millis(300)).await,
+        "nothing a build before it would start afresh"
+    );
+}

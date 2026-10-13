@@ -63,3 +63,6 @@ roomlerd = { path = "../../agents/roomlerd", features = ["hive-test-launcher"] }
 # FR-90 P2d-6 — the canary reads the member device's store, which its own
 # process wrote, after that process is gone.
 roomler-hive-node = { path = "../hive-node" }
+# FR-90 P2f-4 — the real hook client (`roomler hive hook`) adopts the terminal
+# session `tests/hive_manage.rs` makes managed, through the device's socket.
+roomler-cli = { path = "../../agents/roomler-cli" }

@@ -1013,9 +1013,20 @@ pub fn init_as_daemon(
             .parent()
             .map_or_else(|| runtime.to_path_buf(), Path::to_path_buf),
     });
+    let sup = Arc::new(sup);
     SUPERVISOR
-        .set(Arc::new(sup))
-        .map_err(|_| "a supervisor is already set up in this process".to_string())
+        .set(Arc::clone(&sup))
+        .map_err(|_| "a supervisor is already set up in this process".to_string())?;
+    // FR-90 P2f-4 — and the adopt socket, as the daemon's own init opens it:
+    // a test device adopts a terminal session through the real hook client.
+    if sup.cfg.adopt {
+        tokio::spawn(async move {
+            if let Err(e) = sup.adopt_listen().await {
+                warn!(%e, "hive: the adopt socket could not be opened — nothing is adopted");
+            }
+        });
+    }
+    Ok(())
 }
 
 /// The daemon's supervisor, once [`init`] ran.

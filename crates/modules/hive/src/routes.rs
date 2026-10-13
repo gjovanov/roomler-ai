@@ -120,6 +120,11 @@ pub(crate) fn device_refusal_message(word: &str) -> &'static str {
              would give the agent root (hive_allow_passwordless_sudo)"
         }
         "folder_dirty" => "the folder on the device holds work of its own",
+        // P2f-4b — the server's own words for a start that never reached
+        // its device: a terminal session made managed keeps them.
+        "device_offline" => "the device was offline when its start was sent",
+        "device_unsupported" => "the device's agent does not make terminal sessions managed",
+        "never_answered" => "the device never answered",
         _ => "the device refused the session",
     }
 }
@@ -556,6 +561,7 @@ pub(crate) async fn begin(
         fences: Vec::new(),
         moved: None,
         parent,
+        from_terminal: None,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.
@@ -652,7 +658,9 @@ pub(crate) async fn begin(
 
 /// FR-90 P2f-3 — push `msg`, a start of `s`, to `device`: a fork's only to a
 /// connection that starts forks, since a build that ignores `fork_of` would
-/// start it empty; every other start as any Hive frame goes.
+/// start it empty; P2f-4b a terminal session's being made managed only to
+/// one that makes it, for the same reason; every other start as any Hive
+/// frame goes.
 pub(crate) fn push_start(
     state: &HiveState,
     s: &AgentSession,
@@ -662,6 +670,10 @@ pub(crate) fn push_start(
     let hub = &state.fleet.rc_hub;
     if s.parent.is_some() {
         hub.push_hive_fork(device, s.tenant_id, msg)
+    } else if s.managing() {
+        // P2f-4b — a terminal session being made a managed one: only to a
+        // connection that makes one, as a fork's start goes.
+        hub.push_hive_manage(device, s.tenant_id, msg)
     } else {
         hub.push_hive(device, s.tenant_id, msg)
     }
