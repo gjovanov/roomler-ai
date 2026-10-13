@@ -111,14 +111,19 @@ L1–L3. Anchors are master `c2e79221b`.
 - **It runs in CI** the way `control_dc_record` already does: one more explicit
   `cargo test -p roomlerd --features openh264-encoder,synthetic-frame-source --test l4_latency`
   line next to `.github/workflows/ci.yml` L686–689. A test file nobody names runs in no lane.
-- **Cells** are small, because openh264 pegs a core above ~35 fps at 1080p: 640×360@30 and
-  1280×720@30. 1080p, 4K and high refresh are field cells.
-- **Assertions that can fail,** each with its negative control:
-  - a clean link gives capture→decode p50 < 25 ms and ≥ 0.9× the target fps;
-  - a 100 ms vnet delay gives p50 ≥ 100 ms, so the metric demonstrably sees the network;
-  - 2 % loss gives freezes (> 200 ms gaps) and more IDRs than the clean run;
-  - **a planted regression** (a 50 ms capture gate behind a test knob) moves p50 by ≥ 20 ms.
-    A benchmark that cannot be made to fail is not a gate.
+- **Cells** run at the synthetic source's default 320×240 and the software pump's 30 fps.
+  CI builds are unoptimised and openh264 pegs a core long before 1080p, so larger sizes
+  (`ROOMLERD_SYNTHETIC_SIZE`) are for local and field runs. 1080p, 4K and high refresh are
+  field cells.
+- **Assertions that can fail.** The bounds are deltas and generous ceilings, because the
+  absolute numbers depend on the machine:
+  - a clean link decodes ≥ 0.9× the target fps, with no freeze and p50 under a debug-build
+    ceiling;
+  - a 100 ms vnet delay raises p50 by ≥ 80 ms, so the metric demonstrably sees the network;
+  - 3 % loss (with 20 ms delay and 5 ms jitter) leaves a session that still decodes; its
+    freezes and IDRs are printed;
+  - **a planted regression** (a 50 ms capture-stage hold) raises p50 by ≥ 20 ms. A benchmark
+    that cannot be made to fail is not a gate.
 
 ### The synthetic source grows up
 
@@ -174,7 +179,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | — |
+| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **built**: `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | — |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
@@ -217,3 +222,5 @@ competitors". Engineering may use the numbers; the public pages never print them
 |---|---|---|
 | 2026-08-27 | 0.4.9 | Baseline field session above; FR filed. |
 | 2026-10-13 | — | Amended: L0 and L4 first, as the instrument of the StarDesk teardown program. Nothing built yet. |
+| 2026-10-13 | L0, unoptimised build, neo16 (Windows) | **First run, green:** `clean` 30.2 fps decoded, p50 10.2 ms, p95 14.8 ms, 0 freezes · `delay100` p50 122.3 ms (+112) · `gate50` p50 63.3 ms (+53); the hold also halves the frame rate to 15.1, because it sits in the capture loop · `lossy` 25.2 fps, p50 46.6 ms, p95 62.1 ms, **3 freezes, 7 IDRs** against clean's 4. So loss is visible as freezes and keyframes even with NACK repair on. |
+| 2026-10-13 | L0, the same build | **Negative control, red:** `gate50` with its hold set to 0 failed `gate50: p50 rose by 0.4 ms, want ≥ 20` (exit 101); restored. A repeat of `clean` read p50 10.2 ms again. |
