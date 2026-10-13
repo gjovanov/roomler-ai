@@ -80,7 +80,7 @@ flowchart TB
 |---|---|
 | [use-cases.md](use-cases.md) | Scenario walkthroughs across all three pillars in plain language, plus the permission model |
 | [self-hosting.md](self-hosting.md) | Running the whole product yourself — one compose file, TLS termination, the conference media-port caveat, upgrades and backups |
-| [compare/](compare/README.md) | Head-to-head against Tailscale, RustDesk, TeamViewer, MeshCentral and NetBird — each page naming what the other product does better, first |
+| [compare/](compare/README.md) | Head-to-head against Tailscale, RustDesk, TeamViewer, MeshCentral, NetBird and StarDesk — each page naming what the other product does better, first |
 | [agent-tunnel-architecture.md](agent-tunnel-architecture.md) | The remote-access stack (daemon + CLI + coordination) in five minutes — written for end users and operators |
 | [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
 | [modular-monolith.md](modular-monolith.md) | How the server is composed (FR-69): `roomler-core` + six modules behind one `Module` contract, the DAG, the five build profiles and what each leaves out, runtime capability gating, wire ownership, the hooks that carry the inverse cascades, and the composition baseline that gates every move — and (FR-75) how each profile is proven to CARRY TRAFFIC rather than merely link: a throwaway cell per profile whose 404-vs-401 door probes assert every absence positively, then chat + a real call, remote-desktop frames, and a two-agent overlay ping |
@@ -185,3 +185,4 @@ authoritative.
 | [overlay-symmetric-punch.md](overlay-symmetric-punch.md) | Design — symmetric-NAT-aware punch completion via observed-source promotion |
 | [roomler-hive-design.md](roomler-hive-design.md) | Design — FR-90, agent sessions on the org's own machines: a replicaset that keeps transcripts off the server, chat as the surface, promotion and teleport, the vault, knowhow and a shared brain |
 | [moq-remote-desktop-evaluation.md](moq-remote-desktop-evaluation.md) | Deferred — Media-over-QUIC evaluated for the remote desktop; revisit criteria inside |
+| [plans/stardesk-teardown-program.md](plans/stardesk-teardown-program.md) | Program — the StarDesk teardown (2026-10-13): what a gaming-grade remote desktop claims (4K/144 fps, HDR, zero-copy, "under 50 ms", privacy mode, mutual authentication) checked against the code, the clean-room rule, and the FRs it became: FR-16 amended with L0/L4 input-to-photon, then FR-98 (latency budget), FR-99 (privacy mode), FR-100 (controller identity), FR-101 (session hygiene), and the wave-2/3 designs |
