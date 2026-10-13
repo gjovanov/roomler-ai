@@ -275,6 +275,7 @@ async fn rename_propagates_to_live_overlay_node_with_dedup() {
         supports_overlay_echo: false,
         supports_org_relay: false,
         advertised_routes: vec![],
+        route_offer_withheld: None,
     };
     // A neighbour already OWNS the label the rename will want — forces the
     // in-network de-dup onto the `-2` suffix.

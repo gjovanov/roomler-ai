@@ -110,6 +110,7 @@ async fn device(
             supports_overlay_echo: false,
             supports_org_relay: false,
             advertised_routes: vec![],
+            route_offer_withheld: None,
         })
         .await
         .unwrap();
