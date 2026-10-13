@@ -229,7 +229,7 @@ stopped serving kept routing between its adapters for as long as it ran
 ```mermaid
 flowchart LR
     SETUP["setup: per interface<br/>FWD guid ifIndex before"] --> HOLD["ForwardingHolds<br/>refcount per interface"]
-    HOLD --> LEDGER["%ProgramData%\roomler\<br/>overlay-host-ledger.json<br/>(GUIDs we turned on)"]
+    HOLD --> LEDGER["HKLM\SOFTWARE\Roomler\Overlay<br/>value HostLedger<br/>(GUIDs we turned on)"]
     DROP["Drop: Remove-NetNat,<br/>release each hold"] --> LAST{"last holder, and<br/>it was Disabled?"}
     LAST -- yes --> OFF["Set-NetIPInterface<br/>-Forwarding Disabled"]
     LAST -- no --> KEEP["leave it: another org's<br/>router still needs it,<br/>or it was never ours"]
@@ -240,8 +240,9 @@ flowchart LR
 |---|---|---|
 | The setup script reports each interface's adapter GUID and the forwarding state it **found** | `nat.rs` Windows `setup` | Only what we turned on is ours to turn off |
 | Holds are refcounted per interface, and the **first** holder's observation decides | `host_ledger::ForwardingHolds` | Two orgs' routers can share one egress adapter; the second sees `Enabled` because the first enabled it |
-| Only GUID identities reach the disk | `ForwardingHolds::ledger` | An ifIndex can name a different interface after a reboot |
-| GUIDs are validated strictly before going back into PowerShell | `host_ledger::is_guid` | The ledger is read back from disk at boot |
+| Only GUID identities are recorded | `ForwardingHolds::ledger` | An ifIndex can name a different interface after a reboot |
+| The ledger lives in `HKLM\SOFTWARE`, never a file under `%ProgramData%` | `host_ledger::store` | Any account may create a file in `%ProgramData%`, and SYSTEM acts on the ledger at boot: a planted one would choose the adapter SYSTEM switches forwarding off on. Only SYSTEM and Administrators may write below `HKLM\SOFTWARE` |
+| GUIDs are validated strictly before going back into PowerShell | `host_ledger::is_guid` | The ledger is read back at boot |
 | `New-NetNat` failures carry WinNAT's own message to the log | `nat.rs` Windows `setup` | `-ErrorAction SilentlyContinue` used to hide why a NAT never appeared (an overlapping Docker/WSL prefix) |
 
 > ⚠️ Linux is deliberately unchanged: the revert there leaves `ip_forward` on.

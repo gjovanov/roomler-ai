@@ -276,8 +276,10 @@ flowchart TB
   running `Remove-NetNat` (#2077). *P0b-2b:* the setup script reports each interface's adapter GUID and its state
   before; `host_ledger::ForwardingHolds` refcounts per interface (two orgs can share an egress adapter, and the
   first holder's observation decides); the last holder of an interface we turned on switches it off in `Drop`; and
-  a ledger at `%ProgramData%\roomler\overlay-host-ledger.json` lets `purge_exit_routes()` do the same after an
-  unclean exit (`nat::purge_forwarding`). `New-NetNat` failures now log WinNAT's own message.
+  a ledger at `HKLM\SOFTWARE\Roomler\Overlay` (value `HostLedger`) lets `purge_exit_routes()` do the same after
+  an unclean exit (`nat::purge_forwarding`). Not a file under `%ProgramData%`, where any account may create one:
+  SYSTEM acts on the ledger at boot, so a planted file would choose the adapter it switches forwarding off on.
+  `New-NetNat` failures now log WinNAT's own message.
 - **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2549`). The approval stays stored, because a
   flapping join must not cost an admin's decision, but it takes effect only while the device still offers the route.
   An agent older than P0b keeps advertising what it always did, so the intersection changes nothing for it.
