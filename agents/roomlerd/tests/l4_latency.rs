@@ -24,6 +24,7 @@
 //! | `lossy` | +20 ms, 3 % of media packets dropped | the session survives and keeps decoding; its numbers are reported |
 //! | `probe` | no delay, L4 probes on | a probe sent on the `input` channel comes back painted into decoded frames |
 //! | `probe50` | +50 ms one way, L4 probes on | the probe round trip rises by ≥ 80 ms: it crosses the link in both directions |
+//! | `gate_lgcy` / `gate_slot` | an emulated 25 fps event-driven source behind each capture gate (FR-98 C1) | the slot-first gate's p50 is lower by ≥ a quarter period: the clock starts when a frame lands in the slot, so a frame the legacy gate holds there counts its wait |
 //!
 //! The two `probe` cells are L4 in process. A bench viewer sends
 //! `{"t":"probe","seq":N}` on the input DataChannel; the synthetic source
@@ -47,6 +48,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::ClientMsg;
+use roomlerd::capture::gate::GateMode;
 use roomlerd::capture::synthetic_backend::{self, clock, marker};
 use roomlerd::encode::EncoderPreference;
 use roomlerd::peer::{AgentPeer, l0};
@@ -115,6 +117,9 @@ struct Cell {
     /// L4 in process: send bench probes on an `input` DataChannel and time
     /// each one to the first decoded frame that carries it.
     probe: bool,
+    /// FR-98 C1: the synthetic source emulates an event-driven source
+    /// behind this capture gate, and the clock starts when a frame lands.
+    compositor: Option<synthetic_backend::TestCompositor>,
 }
 
 /// What one cell measured.
@@ -392,6 +397,7 @@ async fn controller_peer(net: Arc<Net>) -> Result<Arc<RTCPeerConnection>> {
 /// Run one cell end to end and return what it measured.
 async fn run_cell(cell: Cell) -> Result<Run> {
     synthetic_backend::set_test_gate(cell.gate);
+    synthetic_backend::set_test_compositor(cell.compositor);
     let (agent_net, controller_net, wan) = vnet_pair(&cell).await?;
     l0::set_setting_engine_hook(Some(Arc::new(move |s: &mut SettingEngine| {
         s.set_vnet(Some(Arc::clone(&agent_net)));
@@ -620,6 +626,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     trickle.abort();
     l0::set_setting_engine_hook(None);
     synthetic_backend::set_test_gate(Duration::ZERO);
+    synthetic_backend::set_test_compositor(None);
     let _ = wan.lock().await.stop().await;
 
     let samples = results.lock().unwrap().clone();
@@ -657,6 +664,25 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         loss_permille,
         gate: Duration::from_millis(gate_ms),
         probe: false,
+        compositor: None,
+    }
+}
+
+/// FR-98 C1's cells: a 25 fps source behind a 25 fps gate. A whole number of
+/// milliseconds per period (40), so the legacy gate's arithmetic is exact
+/// and only its sleeps drift, and frames land three quarters of a period
+/// ahead of the cadence the legacy gate keeps.
+const GATE_FPS: u32 = 25;
+
+fn gate_cell(name: &'static str, gate: GateMode) -> Cell {
+    Cell {
+        compositor: Some(synthetic_backend::TestCompositor {
+            source_fps: GATE_FPS,
+            target_fps: GATE_FPS,
+            lead: 0.75,
+            gate,
+        }),
+        ..cell(name, 0, 0, 0)
     }
 }
 
@@ -701,8 +727,20 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         ..cell("probe50", 50, 0, 0)
     };
 
+    let gate_legacy = gate_cell("gate_lgcy", GateMode::Legacy);
+    let gate_slot = gate_cell("gate_slot", GateMode::SlotFirst);
+
     let mut runs = Vec::new();
-    for c in [clean, delay100, gate50, lossy, probe_clean, probe_delay50] {
+    for c in [
+        clean,
+        delay100,
+        gate50,
+        lossy,
+        probe_clean,
+        probe_delay50,
+        gate_legacy,
+        gate_slot,
+    ] {
         let run = rt.block_on(run_cell(c)).unwrap_or_else(|e| panic!("{e:#}"));
         println!("{}", run.line(&c));
         runs.push(run);
@@ -714,7 +752,9 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         lossy_run,
         probe_run,
         probe50_run,
-    ] = <[Run; 6]>::try_from(runs).unwrap();
+        legacy_run,
+        slot_run,
+    ] = <[Run; 8]>::try_from(runs).unwrap();
 
     // `clean`: frames flow at the source rate, through a real pipeline.
     assert!(
@@ -779,5 +819,27 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         r >= 80.0,
         "probe50: the round trip rose by {r:.1} ms, want ≥ 80: the probe does not \
          cross the link both ways"
+    );
+
+    // `gate_lgcy` vs `gate_slot`: FR-98 C1. Frames that land ahead of the
+    // legacy cadence wait for it, and the slot-first gate hands them out on
+    // arrival. With exact arithmetic the legacy wait would be locked at 30 ms;
+    // a real sleep overshoots, so the cadence drifts and the wait saws
+    // through the period instead, averaging about half of it. A quarter of a
+    // period is the bound, half the expected difference.
+    let period_ms = 1000.0 / f64::from(GATE_FPS);
+    for (run, name) in [(&legacy_run, "gate_lgcy"), (&slot_run, "gate_slot")] {
+        assert!(
+            run.fps() >= f64::from(GATE_FPS) * CLEAN_FPS_FLOOR,
+            "{name}: {:.1} fps decoded from a {GATE_FPS} fps source",
+            run.fps()
+        );
+    }
+    let c1 = legacy_run.pct(0.5) - slot_run.pct(0.5);
+    assert!(
+        c1 >= period_ms / 4.0,
+        "FR-98 C1: the slot-first gate cut p50 by {c1:.1} ms, want ≥ {:.1} (a quarter \
+         of the {period_ms:.0} ms period): the gate does not see frames that wait in the slot",
+        period_ms / 4.0
     );
 }
