@@ -17,8 +17,8 @@
 //! per-org secrets managed by `roomlerd enroll` / the `org` CLI
 //! verbs, same policy as `tunnel_routes`; a future desktop org pane gets
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
-//! fields. Every key is read at daemon startup, so the whole surface is
-//! `restart_required = true`.
+//! fields. A key is read at daemon startup — `restart_required = true` —
+//! unless it is in [`RESEEDED_ON_SET`] or [`READ_AT_USE`].
 
 use crate::config::{AgentConfig, EncoderPreferenceChoice};
 use roomler_localapi::ConfigEntry;
@@ -832,6 +832,36 @@ const KEYS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Keys the daemon re-seeds from the file its LocalAPI `ConfigSet` just wrote
+/// (`RemoteConfig::adopt_local`): live when written THROUGH the daemon, and
+/// only then — a file edited behind its back waits for a restart.
+pub const RESEEDED_ON_SET: &[&str] = &["exec_enabled", "remote_config_enabled"];
+
+/// Keys read from the FILE at the moment of use — each time an outsider
+/// knocks and each time an external session is requested (FR-52,
+/// `RemoteConfig::external_access_live` / `external_session_live`): live
+/// however the file was written.
+pub const READ_AT_USE: &[&str] = &[
+    "external_access_enabled",
+    "external_consent_mode",
+    "external_max_permissions",
+];
+
+/// Whether a change to `key` made through the daemon's `ConfigSet` waits for
+/// a restart; every key not in [`RESEEDED_ON_SET`] or [`READ_AT_USE`] is read
+/// at startup.
+///
+/// ⚠️ Each live key is a REFUSAL its owner may be making right now. A surface
+/// that called them restart-required told that owner a revocation was not in
+/// force yet when it already was, inviting a restart of a healthy daemon or
+/// the belief that they were still exposed.
+///
+/// Equality, never a prefix: `external_access_enabled` must not make every
+/// `external_access*` key look live.
+fn restart_required(key: &str) -> bool {
+    !RESEEDED_ON_SET.contains(&key) && !READ_AT_USE.contains(&key)
+}
+
 /// The full editable surface with current values from `cfg`.
 pub fn entries(cfg: &AgentConfig) -> Vec<ConfigEntry> {
     KEYS.iter()
@@ -839,7 +869,7 @@ pub fn entries(cfg: &AgentConfig) -> Vec<ConfigEntry> {
             key: (*key).to_string(),
             value: current_value(cfg, key),
             kind: (*kind).to_string(),
-            restart_required: true,
+            restart_required: restart_required(key),
             description: (*description).to_string(),
         })
         .collect()
@@ -853,9 +883,20 @@ pub fn entry_for(cfg: &AgentConfig, key: &str) -> Option<ConfigEntry> {
             key: (*k).to_string(),
             value: current_value(cfg, k),
             kind: (*kind).to_string(),
-            restart_required: true,
+            restart_required: restart_required(k),
             description: (*description).to_string(),
         })
+}
+
+/// [`entry_for`], for a change written to the file DIRECTLY — not through the
+/// daemon's `ConfigSet` (the desktop companion's fallback when the daemon is
+/// unreachable). Nothing re-seeded the [`RESEEDED_ON_SET`] flags, so they wait
+/// for a restart; [`READ_AT_USE`] keys are in force all the same.
+pub fn entry_for_direct_write(cfg: &AgentConfig, key: &str) -> Option<ConfigEntry> {
+    entry_for(cfg, key).map(|mut e| {
+        e.restart_required |= RESEEDED_ON_SET.contains(&key);
+        e
+    })
 }
 
 fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
@@ -1706,12 +1747,59 @@ mod tests {
         // Every listed key roundtrips through entry_for + a no-op apply
         // of its own current value (or a clear for unset optionals).
         for e in &all {
-            assert!(e.restart_required);
+            let k = e.key.as_str();
+            assert_eq!(
+                e.restart_required,
+                !RESEEDED_ON_SET.contains(&k) && !READ_AT_USE.contains(&k),
+                "restart_required for {k}"
+            );
             assert!(!e.description.is_empty());
             apply(&mut cfg, &e.key, e.value.as_deref()).expect("self-value apply");
             let echoed = entry_for(&cfg, &e.key).expect("known key");
             assert_eq!(echoed.value, e.value, "roundtrip for {}", e.key);
         }
+    }
+
+    /// The owner's refusals report as IN FORCE, and only where they are. A
+    /// live key that drifted out of the surface (a rename, a typo) would
+    /// quietly fall back to "restart required", so every entry must name a
+    /// real key.
+    #[test]
+    fn the_refusals_an_owner_makes_report_as_live() {
+        let cfg = crate::config::test_fixture();
+        for key in RESEEDED_ON_SET.iter().chain(READ_AT_USE) {
+            assert!(
+                KEYS.iter().any(|(k, _, _)| k == key),
+                "{key} is not on the surface"
+            );
+            let e = entry_for(&cfg, key).expect("known key");
+            assert!(!e.restart_required, "{key} is live through the daemon");
+        }
+        // FR-52 gate 3 and gate 5, and the ceiling: the daemon reads the FILE
+        // at every knock, so even a direct write is in force at once.
+        for key in [
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+        ] {
+            let e = entry_for_direct_write(&cfg, key).expect("known key");
+            assert!(!e.restart_required, "{key} is read at use");
+        }
+        // Re-seeded only by the daemon's own ConfigSet: a file written behind
+        // its back has NOT put them in force.
+        for key in RESEEDED_ON_SET {
+            let e = entry_for_direct_write(&cfg, key).expect("known key");
+            assert!(
+                e.restart_required,
+                "{key} written directly waits for a restart"
+            );
+        }
+        // Read once, at startup.
+        assert!(
+            entry_for(&cfg, "ssh_enabled")
+                .expect("known key")
+                .restart_required
+        );
     }
 
     #[test]
