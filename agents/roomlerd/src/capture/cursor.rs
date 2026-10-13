@@ -25,6 +25,41 @@
 //! shape once per session.
 
 use crate::capture::CursorInfo;
+use std::time::Duration;
+
+/// FR-98 C4 — the cursor poller's period unless `ROOMLERD_CURSOR_POLL_MS`
+/// says otherwise: 8 ms, 125 Hz (rc.38).
+pub const DEFAULT_POLL: Duration = Duration::from_millis(8);
+
+/// The poller's period from `ROOMLERD_CURSOR_POLL_MS`, read once per
+/// session. Clamped to 2–50 ms: below 2 the poll and its data-channel send
+/// stop being cheap, above 50 the remote cursor visibly trails the pointer.
+/// Anything unparseable keeps the default. A knob for the field A/B: FR-98
+/// keeps a cadence change only if L4 shows it moving input to photon.
+pub fn poll_interval(raw: Option<&str>) -> Duration {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms.clamp(2, 50)),
+        None => DEFAULT_POLL,
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+
+    #[test]
+    fn the_poll_period_is_8_ms_unless_set_and_stays_in_2_to_50() {
+        assert_eq!(poll_interval(None), DEFAULT_POLL);
+        assert_eq!(DEFAULT_POLL, Duration::from_millis(8));
+        assert_eq!(poll_interval(Some("4")), Duration::from_millis(4));
+        assert_eq!(poll_interval(Some(" 16 ")), Duration::from_millis(16));
+        assert_eq!(poll_interval(Some("0")), Duration::from_millis(2));
+        assert_eq!(poll_interval(Some("1000")), Duration::from_millis(50));
+        for junk in ["", "fast", "-4", "4ms", "4.5"] {
+            assert_eq!(poll_interval(Some(junk)), DEFAULT_POLL, "{junk:?}");
+        }
+    }
+}
 
 /// Per-poll result. `None` means the cursor isn't visible (fullscreen
 /// video, hidden by software). `Some` returns the current position;

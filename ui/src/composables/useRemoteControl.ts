@@ -1985,6 +1985,28 @@ export function storedFlowParams(): RcFlowParams {
   }
 }
 
+/** FR-98 C3 — `roomler-rc-input-gap`: the pointer-move coalescing gap in ms.
+ *  Default 8 (≈125 Hz, FR-1 P6), clamped to 0..16; 0 sends every pointer
+ *  event as it arrives. A knob for the field A/B: FR-98 keeps a cadence
+ *  change only if L4 shows it moving input to photon. Read once per
+ *  composable, like every other `roomler-rc-*` knob. Pure + exported for
+ *  tests. */
+export const INPUT_GAP_STORAGE_KEY = 'roomler-rc-input-gap'
+export const DEFAULT_INPUT_GAP_MS = 8
+
+export function storedInputGapMs(): number {
+  try {
+    return normalizeIntKnob(
+      globalThis.localStorage?.getItem(INPUT_GAP_STORAGE_KEY),
+      DEFAULT_INPUT_GAP_MS,
+      0,
+      16,
+    )
+  } catch {
+    return DEFAULT_INPUT_GAP_MS
+  }
+}
+
 export function diagHudEnabled(): boolean {
   try {
     return globalThis.localStorage?.getItem(DIAG_HUD_STORAGE_KEY) === '1'
@@ -5548,8 +5570,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // and even idle, rAF adds up to a frame (~16 ms) before the FIRST send.
   // Now: send immediately when the min-gap has passed, else one timer for
   // the remainder; latest-wins. 8 ms ≈ 125 Hz ceiling, ~60 B/msg — noise
-  // even on a constrained relay.
-  const INPUT_MOVE_GAP_MS = 8
+  // even on a constrained relay. FR-98 C3: the gap is a knob for the field
+  // A/B (`roomler-rc-input-gap`, `storedInputGapMs`); 8 unless set.
+  const INPUT_MOVE_GAP_MS = storedInputGapMs()
   let moveTimer: ReturnType<typeof setTimeout> | null = null
   let lastMoveSentAt = 0
 
