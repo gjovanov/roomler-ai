@@ -3349,6 +3349,12 @@ pub enum ServerMsg {
         /// before P2f-1a).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         teleport: bool,
+        /// P2f-2b — a teleport's target may take the workspace's first pack
+        /// as one thin against what its folder's repository holds already
+        /// (git's have and want; FR-90 decision 16). Absent = it takes the
+        /// whole pack, as every target before P2f-2b did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        have_want: bool,
     },
 
     /// FR-90 P2e-3 — the session's lease is about to leave this device, its
@@ -4876,6 +4882,7 @@ mod tests {
             user_email: "a@example.com".into(),
             caller: "Alice".into(),
             teleport: false,
+            have_want: false,
         };
         let promotion_prepare = serde_json::json!({
             "t": "rc:hive.prepare", "session_id": sid.to_hex(), "fence": 2,
@@ -4899,6 +4906,7 @@ mod tests {
             user_email: "a@example.com".into(),
             caller: "Alice".into(),
             teleport: true,
+            have_want: false,
         };
         let mut teleport_prepare = promotion_prepare.clone();
         teleport_prepare["teleport"] = serde_json::json!(true);
@@ -4911,6 +4919,23 @@ mod tests {
             serde_json::from_value::<ServerMsg>(promotion_prepare).unwrap(),
             ServerMsg::HivePrepare {
                 teleport: false,
+                ..
+            }
+        ));
+        // P2f-2b — a teleport whose target may take the workspace against
+        // its clone says so too; a prepare that does not say takes it whole.
+        let mut have_want = teleport.clone();
+        if let ServerMsg::HivePrepare { have_want: hw, .. } = &mut have_want {
+            *hw = true;
+        }
+        let mut have_want_prepare = serde_json::to_value(&teleport).unwrap();
+        have_want_prepare["have_want"] = serde_json::json!(true);
+        assert_eq!(serde_json::to_value(&have_want).unwrap(), have_want_prepare);
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(serde_json::to_value(&teleport).unwrap()).unwrap(),
+            ServerMsg::HivePrepare {
+                teleport: true,
+                have_want: false,
                 ..
             }
         ));
