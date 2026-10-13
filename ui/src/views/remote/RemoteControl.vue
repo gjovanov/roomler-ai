@@ -753,7 +753,7 @@
         <strong>{{ rc.inputReach.value.reach === 'xwayland_only'
           ? 'Your mouse and keyboard reach only some apps on this device.'
           : 'Your mouse and keyboard do not reach this device’s desktop.' }}</strong>
-        {{ rc.inputReach.value.reason }}
+        {{ asSentence(rc.inputReach.value.reason) }}
       </v-alert>
 
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
@@ -1963,6 +1963,7 @@ import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import KeepBusyMenu from '@/components/remote/KeepBusyMenu.vue'
 import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
+import { asSentence } from '@/utils/sentence'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
