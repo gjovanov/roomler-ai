@@ -1081,12 +1081,18 @@ pub(crate) async fn reconcile_on_connect(
                     resume: moved,
                     replicated,
                     lease,
-                    // P2f-3b — a fork's record says what it was made from.
-                    fork_of: None,
+                    // P2f-3 — a fork's every start says what it was made from.
+                    fork_of: s.fork_of(),
                 };
-                match state.fleet.rc_hub.push_hive(device_id, tenant_id, msg) {
+                match crate::routes::push_start(state, &s, device_id, msg) {
                     Ok(()) => {
                         info!(session = %sid, device = %device_id, "hive: unanswered start re-sent on connect")
+                    }
+                    // P2f-3 — a fork's start goes only to a connection that
+                    // starts forks (a build before them would start it
+                    // empty), so it waits for the next one that does.
+                    Err(e) if s.parent.is_some() => {
+                        warn!(session = %sid, %e, "hive: a fork's start not re-sent — it goes again on a connection that starts forks")
                     }
                     Err(e) => debug!(session = %sid, %e, "hive: start not re-sent"),
                 }
