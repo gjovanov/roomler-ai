@@ -299,7 +299,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2607`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2615`,
 `virtual_desktop.rs:528`) starts Xvfb at `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION`
 (default `1920x1080`) with the window manager named by
 `ROOMLERD_VIRTUAL_DESKTOP_WM` (default `openbox`) and the comma-separated
@@ -496,7 +496,7 @@ cannot yet say it; whether it should is FR-45's open AC8.
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`main.rs:4764`): `capture-smoke: portal=<status>
+line an operator can act on (`main.rs:4772`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -774,7 +774,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`main.rs:3017-3022`, `watchdog.rs:389`) and it forced
+watchdog's 90 s window (`main.rs:3025-3030`, `watchdog.rs:389`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

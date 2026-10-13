@@ -38,6 +38,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
 use crate::chain::{ChainError, ChainTip, EventEnvelope, FenceEnd, check_next_with_ends};
+use crate::checkpoint::Chunk;
 use crate::event::TranscriptEvent;
 
 /// The schema this build writes. A newer file is refused rather than written
@@ -130,6 +131,30 @@ const P2E_TABLES: &str = "CREATE TABLE IF NOT EXISTS fence_ends (
                  PRIMARY KEY (session, fence)
              ) WITHOUT ROWID;";
 
+/// FR-90 P2f-2a: packs that stand in for a checkpoint's own whole pack. A
+/// substitute brings the same commit's objects into a repository that holds
+/// every commit in `against` (none: anywhere). New and made only when
+/// missing, like P2a's tables, so `user_version` stays 1.
+const P2F_TABLES: &str = "CREATE TABLE IF NOT EXISTS substitutes (
+                 session   TEXT    NOT NULL,
+                 commit_id TEXT    NOT NULL,
+                 against   TEXT    NOT NULL,
+                 chunks    TEXT    NOT NULL,
+                 kept_ms   INTEGER NOT NULL,
+                 PRIMARY KEY (session, commit_id)
+             ) WITHOUT ROWID;";
+
+/// FR-90 P2f-2a — a pack kept in place of a checkpoint's own whole pack: the
+/// one that brings `commit` into a repository holding every commit of
+/// `against`, as `chunks` of blobs this session holds. Git checks it where it
+/// is used, as it checks every pack, and the checkpoint's tree is held to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Substitute {
+    pub commit: String,
+    pub against: Vec<String>,
+    pub chunks: Vec<Chunk>,
+}
+
 /// FR-90 P2c-3 — one session this device holds a copy of as a member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
@@ -207,6 +232,23 @@ pub enum StoreError {
         kind: String,
         limit: usize,
     },
+    /// P2f-2a: a substitute names a blob the session does not hold: one is
+    /// kept only once every byte of it is.
+    #[error(
+        "a substitute for {commit} names the blob {hash}, which session {session} does not hold"
+    )]
+    SubstituteBlobMissing {
+        session: String,
+        commit: String,
+        hash: String,
+    },
+    /// P2f-2a: a kept substitute that no longer reads as one.
+    #[error("the substitute kept for {commit} of session {session} does not read: {why}")]
+    CorruptSubstitute {
+        session: String,
+        commit: String,
+        why: String,
+    },
 }
 
 /// One full-text match.
@@ -255,6 +297,7 @@ impl Store {
         conn.execute_batch(P2A_TABLES)?;
         conn.execute_batch(P2C_TABLES)?;
         conn.execute_batch(P2E_TABLES)?;
+        conn.execute_batch(P2F_TABLES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -757,6 +800,81 @@ impl Store {
             .is_some())
     }
 
+    /// FR-90 P2f-2a: keep `sub` for `session`, in place of whatever was kept
+    /// for the same commit. Its blobs come first ([`Self::put_named_blob`]):
+    /// a substitute naming one this session does not hold is refused, so one
+    /// kept here always has every byte. Refused for a purged session.
+    pub fn put_substitute(&mut self, session: &str, sub: &Substitute) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        if Self::purged_in(&tx, session)? {
+            return Err(StoreError::Purged {
+                session: session.to_string(),
+            });
+        }
+        for chunk in &sub.chunks {
+            let held = tx
+                .query_row(
+                    "SELECT 1 FROM blob_refs WHERE session = ?1 AND hash = ?2",
+                    params![session, chunk.hash.0.as_slice()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !held {
+                return Err(StoreError::SubstituteBlobMissing {
+                    session: session.to_string(),
+                    commit: sub.commit.clone(),
+                    hash: hex(&chunk.hash.0),
+                });
+            }
+        }
+        let corrupt = |e: serde_json::Error| StoreError::CorruptSubstitute {
+            session: session.to_string(),
+            commit: sub.commit.clone(),
+            why: e.to_string(),
+        };
+        let against = serde_json::to_string(&sub.against).map_err(corrupt)?;
+        let chunks = serde_json::to_string(&sub.chunks).map_err(corrupt)?;
+        tx.execute(
+            "INSERT INTO substitutes (session, commit_id, against, chunks, kept_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session, commit_id) DO UPDATE SET
+                 against = excluded.against, chunks = excluded.chunks, kept_ms = excluded.kept_ms",
+            params![session, sub.commit, against, chunks, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// FR-90 P2f-2a: the substitute kept for `commit` of `session`, if any.
+    pub fn substitute(
+        &self,
+        session: &str,
+        commit: &str,
+    ) -> Result<Option<Substitute>, StoreError> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT against, chunks FROM substitutes WHERE session = ?1 AND commit_id = ?2",
+                params![session, commit],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((against, chunks)) = row else {
+            return Ok(None);
+        };
+        let corrupt = |e: serde_json::Error| StoreError::CorruptSubstitute {
+            session: session.to_string(),
+            commit: commit.to_string(),
+            why: e.to_string(),
+        };
+        Ok(Some(Substitute {
+            commit: commit.to_string(),
+            against: serde_json::from_str(&against).map_err(corrupt)?,
+            chunks: serde_json::from_str(&chunks).map_err(corrupt)?,
+        }))
+    }
+
     /// FR-90 P2b-3b — the newest event of `session` whose kind is `kind`: where
     /// a resumed session's next checkpoint starts. The `kind` column is set by
     /// a build that knows the kind, so a checkpoint an older daemon stored is
@@ -1023,6 +1141,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM memberships WHERE session = ?1",
+            params![session],
+        )?;
+        tx.execute(
+            "DELETE FROM substitutes WHERE session = ?1",
             params![session],
         )?;
         tx.execute(
@@ -1636,6 +1758,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, when);
+    }
+
+    /// FR-90 P2f-2a — a substitute is kept only once its blobs are, replaces
+    /// one kept for the same commit, is the session's alone, and goes with
+    /// the purge; a purged session keeps none.
+    #[test]
+    fn a_substitute_is_kept_only_with_its_blobs_and_goes_with_the_purge() {
+        use crate::checkpoint::Digest;
+        let mut s = Store::open_in_memory().unwrap();
+        let held = s.put_blob("s1", b"pack bytes").unwrap();
+        let chunk = |hash: [u8; 32], len: u64| Chunk {
+            offset: 0,
+            len,
+            hash: Digest(hash),
+        };
+        let sub = Substitute {
+            commit: "c".repeat(40),
+            against: vec!["a".repeat(40)],
+            chunks: vec![chunk(held, 10)],
+        };
+        let missing = Substitute {
+            chunks: vec![chunk(blob_hash(b"never kept"), 10)],
+            ..sub.clone()
+        };
+        let refused =
+            |r: Result<(), StoreError>| matches!(r, Err(StoreError::SubstituteBlobMissing { .. }));
+        assert!(
+            refused(s.put_substitute("s1", &missing)),
+            "a substitute without its blob is refused"
+        );
+        assert_eq!(s.substitute("s1", &sub.commit).unwrap(), None);
+        assert!(
+            refused(s.put_substitute("s2", &sub)),
+            "another session's blob is not this one's"
+        );
+
+        s.put_substitute("s1", &sub).unwrap();
+        assert_eq!(s.substitute("s1", &sub.commit).unwrap(), Some(sub.clone()));
+        assert_eq!(s.substitute("s1", &"d".repeat(40)).unwrap(), None);
+        assert_eq!(s.substitute("s2", &sub.commit).unwrap(), None);
+        let whole = Substitute {
+            against: Vec::new(),
+            ..sub.clone()
+        };
+        s.put_substitute("s1", &whole).unwrap();
+        assert_eq!(
+            s.substitute("s1", &sub.commit).unwrap(),
+            Some(whole),
+            "replaced, not added beside"
+        );
+
+        s.purge("s1").unwrap();
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM substitutes"),
+            0,
+            "the purge takes them"
+        );
+        assert_eq!(s.substitute("s1", &sub.commit).unwrap(), None);
+        assert!(matches!(
+            s.put_substitute("s1", &sub),
+            Err(StoreError::Purged { .. })
+        ));
     }
 
     #[test]
