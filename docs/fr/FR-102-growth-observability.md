@@ -116,11 +116,11 @@ flowchart LR
   subgraph acct["Account plane — roomler"]
     S["sign-up"] --> O["org"] --> D["device enrolled"] --> F["first value"] --> R["retained"] --> M["paid"]
   end
-  P -- "UTM on the link" --> V
-  V -- "UTM carried on the CTA link (FR-88)" --> S
-  P -. "campaign key + counts" .-> G[("Growth")]
-  V -. "campaign key + counts" .-> G
-  acct -. "campaign key + counts" .-> G
+  P -->|"UTM on the link"| V
+  V -->|"UTM carried on the CTA link (FR-88)"| S
+  P -.->|"campaign key + counts"| G[("Growth")]
+  V -.->|"campaign key + counts"| G
+  acct -.->|"campaign key + counts"| G
 ```
 
 - **First touch is the record.** An account's acquisition is its `signup_attribution` (FR-88): the UTM it
