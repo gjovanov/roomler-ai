@@ -1829,7 +1829,7 @@ pub fn synthetic_frames_requested() -> bool {
 /// (`1` / `true` / `yes` / `on`, case-insensitive). Anything else
 /// (unset, `0`, garbage) falls back to the normal cascade.
 #[cfg(feature = "synthetic-frame-source")]
-fn synthetic_env_enabled() -> bool {
+pub(crate) fn synthetic_env_enabled() -> bool {
     use tunnel_core::env::node_env;
     match node_env("SYNTHETIC_FRAMES") {
         Some(v) => {

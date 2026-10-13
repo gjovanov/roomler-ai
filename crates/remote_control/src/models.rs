@@ -88,6 +88,12 @@ pub struct AgentCaps {
     ///   the channel is reliable+ordered, which is the property FR-17
     ///   exists to give up: on a lossy relay that ordering costs seconds
     ///   of head-of-line blocking (measured: one frame blocked 10 263 ms).
+    /// * `bench` — FR-16 L4: this agent paints the last bench probe it
+    ///   received on the input channel (`{"t":"probe","seq":N}`) into a
+    ///   marker in every frame, so a viewer in bench mode can time input
+    ///   to photon. Only a build with the synthetic frame source, running
+    ///   it, with `ROOMLERD_BENCH=1`, ever advertises it; a viewer sends no
+    ///   probe to an agent without it.
     ///
     /// Empty / unset (older agents) deserialises to `[]` and the browser
     /// keeps the legacy unframed format. The capability is what makes the

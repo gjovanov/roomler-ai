@@ -22,6 +22,15 @@
 //! | `delay100` | +100 ms one way | p50 rises by ≥ 80 ms: the metric sees the network |
 //! | `gate50` | a planted 50 ms capture-stage hold | p50 rises by ≥ 20 ms: the metric sees the pipeline. This is the negative control a gate needs; a harness that cannot be made to fail is not one |
 //! | `lossy` | +20 ms, 3 % of media packets dropped | the session survives and keeps decoding; its numbers are reported |
+//! | `probe` | no delay, L4 probes on | a probe sent on the `input` channel comes back painted into decoded frames |
+//! | `probe50` | +50 ms one way, L4 probes on | the probe round trip rises by ≥ 80 ms: it crosses the link in both directions |
+//!
+//! The two `probe` cells are L4 in process. A bench viewer sends
+//! `{"t":"probe","seq":N}` on the input DataChannel; the synthetic source
+//! paints the last probe it saw into a second marker, bottom-right; the
+//! viewer times send → the first decoded frame carrying `N`. That is input
+//! to photon through the real agent, minus the host's own input stack and
+//! the viewer's display, which the field half of L4 covers.
 //!
 //! Absolute numbers here are from an unoptimised build on a CI runner. The
 //! field numbers come from L4 in the real viewer; this file is the gate that
@@ -29,7 +38,7 @@
 
 #![cfg(all(feature = "openh264-encoder", feature = "synthetic-frame-source"))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -47,6 +56,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -76,6 +86,16 @@ const WARMUP: Duration = Duration::from_millis(1_500);
 /// A gap between two decoded frames longer than this is a freeze (FR-16).
 const FREEZE: Duration = Duration::from_millis(200);
 
+/// How often a probe cell sends a probe: at least three frame intervals
+/// apart, so every probe gets a frame of its own, plus a jitter of up to one
+/// frame interval. Without the jitter a 100 ms period is exactly three
+/// frames, every probe lands on the same phase of the capture clock, and a
+/// cell reports one arbitrary point of the wait for the next capture
+/// (anywhere in 0–33 ms) instead of its distribution: two cells then differ
+/// by up to a frame interval for no reason at all.
+const PROBE_EVERY: Duration = Duration::from_millis(100);
+const PROBE_JITTER_MS: u64 = 34;
+
 /// The clean cell must decode at least this share of the source rate. Not
 /// 0.9: an unoptimised build on a busy machine measured 20 fps (a parallel
 /// repo-wide grep on the same box), and a gate that flakes under load gets
@@ -92,27 +112,41 @@ struct Cell {
     loss_permille: u32,
     /// The synthetic source's planted capture-stage hold.
     gate: Duration,
+    /// L4 in process: send bench probes on an `input` DataChannel and time
+    /// each one to the first decoded frame that carries it.
+    probe: bool,
 }
 
 /// What one cell measured.
 #[derive(Debug, Default)]
 struct Run {
     latencies_ms: Vec<f64>,
+    /// Probe round trips: send → the first decoded frame carrying it.
+    probe_ms: Vec<f64>,
     decoded: usize,
     freezes: usize,
     idr: usize,
     window: Duration,
 }
 
+/// The `p`-quantile of `samples`, NaN when empty.
+fn quantile(samples: &[f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let i = ((v.len() - 1) as f64 * p).round() as usize;
+    v[i]
+}
+
 impl Run {
     fn pct(&self, p: f64) -> f64 {
-        if self.latencies_ms.is_empty() {
-            return f64::NAN;
-        }
-        let mut v = self.latencies_ms.clone();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let i = ((v.len() - 1) as f64 * p).round() as usize;
-        v[i]
+        quantile(&self.latencies_ms, p)
+    }
+
+    fn probe_pct(&self, p: f64) -> f64 {
+        quantile(&self.probe_ms, p)
     }
 
     fn fps(&self) -> f64 {
@@ -120,8 +154,18 @@ impl Run {
     }
 
     fn line(&self, cell: &Cell) -> String {
+        let probe = if cell.probe {
+            format!(
+                " | L4 probes={} p50={:.1}ms p95={:.1}ms",
+                self.probe_ms.len(),
+                self.probe_pct(0.50),
+                self.probe_pct(0.95)
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "L0 {:<9} decoded={:>3} fps={:>5.1} p50={:>6.1}ms p95={:>6.1}ms max={:>6.1}ms freezes={} idr={}",
+            "L0 {:<9} decoded={:>3} fps={:>5.1} p50={:>6.1}ms p95={:>6.1}ms max={:>6.1}ms freezes={} idr={}{probe}",
             cell.name,
             self.decoded,
             self.fps(),
@@ -354,6 +398,13 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         ice_timeouts(s);
     })));
 
+    // A probe cell needs INPUT: the agent attaches its input handler, the
+    // one place a probe is read, only for a session that holds it.
+    let permissions = if cell.probe {
+        Permissions::VIEW | Permissions::INPUT
+    } else {
+        Permissions::VIEW
+    };
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(1024);
     let agent = AgentPeer::new(
         bson::oid::ObjectId::new(),
@@ -365,7 +416,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         None,
         false,
         false,
-        Permissions::VIEW,
+        permissions,
         "l0-harness".into(),
         None,
         RcOverlay::default(),
@@ -375,16 +426,42 @@ async fn run_cell(cell: Cell) -> Result<Run> {
 
     let pc = controller_peer(controller_net).await?;
 
+    // L4: the channel a bench viewer sends its probes on, created before the
+    // offer with the viewer's own reliability profile (unordered, no
+    // retransmits: `useRemoteControl.ts`).
+    let input_dc = if cell.probe {
+        Some(
+            pc.create_data_channel(
+                "input",
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    max_retransmits: Some(0),
+                    ..Default::default()
+                }),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    // Probe sequence → send instant, and (decode-done instant, round trip).
+    let sent: Arc<std::sync::Mutex<HashMap<u16, Instant>>> = Arc::default();
+    let probe_rtts: Arc<std::sync::Mutex<Vec<(Instant, Duration)>>> = Arc::default();
+
     // Decoded frames: (decode-done instant, latency).
     let results: Arc<std::sync::Mutex<Vec<(Instant, Duration)>>> = Arc::default();
     let idr_count = Arc::new(AtomicU64::new(0));
     {
         let results = Arc::clone(&results);
         let idr_count = Arc::clone(&idr_count);
+        let sent = Arc::clone(&sent);
+        let probe_rtts = Arc::clone(&probe_rtts);
         let pc_weak = Arc::downgrade(&pc);
         pc.on_track(Box::new(move |track, _, _| {
             let results = Arc::clone(&results);
             let idr_count = Arc::clone(&idr_count);
+            let sent = Arc::clone(&sent);
+            let probe_rtts = Arc::clone(&probe_rtts);
             let pc_weak = pc_weak.clone();
             Box::pin(async move {
                 let ssrc = track.ssrc();
@@ -422,17 +499,32 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                             if has_idr(&au) {
                                 idr_count.fetch_add(1, Ordering::Relaxed);
                             }
-                            let seq = match decoder.decode(&au) {
+                            let (seq, probe) = match decoder.decode(&au) {
                                 Ok(Some(pic)) => {
                                     use openh264::formats::YUVSource;
                                     let (w, h) = pic.dimensions();
+                                    let (w, h) = (w as u32, h as u32);
                                     let (ys, _, _) = pic.strides();
-                                    marker::decode_luma(pic.y(), w as u32, h as u32, ys)
+                                    let y = pic.y();
+                                    (
+                                        marker::decode_luma(y, w, h, ys),
+                                        if cell.probe {
+                                            marker::decode_luma_at(
+                                                marker::Corner::BottomRight,
+                                                y,
+                                                w,
+                                                h,
+                                                ys,
+                                            )
+                                        } else {
+                                            None
+                                        },
+                                    )
                                 }
-                                Ok(None) => None,
+                                Ok(None) => (None, None),
                                 Err(_) => {
                                     want_keyframe = true;
-                                    None
+                                    (None, None)
                                 }
                             };
                             let done = Instant::now();
@@ -441,6 +533,14 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                                 && captured <= done
                             {
                                 results.lock().unwrap().push((done, done - captured));
+                            }
+                            // The FIRST frame carrying a probe ends its round
+                            // trip; removing it keeps the frames after it,
+                            // which carry it too, from counting again.
+                            if let Some(p) = probe
+                                && let Some(at) = sent.lock().unwrap().remove(&p)
+                            {
+                                probe_rtts.lock().unwrap().push((done, done - at));
                             }
                         }
                         if want_keyframe && let Some(pc) = ask_keyframe(&mut last_pli) {
@@ -480,8 +580,41 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         }
     });
 
+    // L4: once the channel opens, a probe every PROBE_EVERY plus jitter,
+    // each stamped just before it is sent.
+    let prober = input_dc.map(|dc| {
+        let sent = Arc::clone(&sent);
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel::<()>();
+        dc.on_open(Box::new(move || {
+            let _ = open_tx.send(());
+            Box::pin(async {})
+        }));
+        tokio::spawn(async move {
+            if open_rx.await.is_err() {
+                return;
+            }
+            let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+            loop {
+                let jitter = Duration::from_millis(rng.next() % PROBE_JITTER_MS);
+                tokio::time::sleep(PROBE_EVERY + jitter).await;
+                let seq = next_probe_seq();
+                sent.lock().unwrap().insert(seq, Instant::now());
+                if dc
+                    .send_text(format!(r#"{{"t":"probe","seq":{seq}}}"#))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
+
     tokio::time::sleep(RUN).await;
 
+    if let Some(prober) = prober {
+        prober.abort();
+    }
     agent.close().await;
     let _ = pc.close().await;
     trickle.abort();
@@ -495,8 +628,16 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     };
     let from = first + WARMUP;
     let kept: Vec<_> = samples.iter().filter(|(t, _)| *t >= from).collect();
+    let probe_ms = probe_rtts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| *t >= from)
+        .map(|(_, rtt)| rtt.as_secs_f64() * 1e3)
+        .collect();
     let mut run = Run {
         latencies_ms: kept.iter().map(|(_, l)| l.as_secs_f64() * 1e3).collect(),
+        probe_ms,
         decoded: kept.len(),
         idr: idr_count.load(Ordering::Relaxed) as usize,
         ..Default::default()
@@ -515,7 +656,16 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         jitter: Duration::ZERO,
         loss_permille,
         gate: Duration::from_millis(gate_ms),
+        probe: false,
     }
+}
+
+/// The next probe number. Process-wide, so no cell can match a probe the
+/// previous cell left painted in the agent's bottom-right marker. Starts at
+/// 1: an all-zero word is a black grid.
+fn next_probe_seq() -> u16 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    (NEXT.fetch_add(1, Ordering::Relaxed) & 0x0FFF) as u16
 }
 
 #[test]
@@ -542,14 +692,29 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         jitter: Duration::from_millis(5),
         ..cell("lossy", 20, 30, 0)
     };
+    let probe_clean = Cell {
+        probe: true,
+        ..cell("probe", 0, 0, 0)
+    };
+    let probe_delay50 = Cell {
+        probe: true,
+        ..cell("probe50", 50, 0, 0)
+    };
 
     let mut runs = Vec::new();
-    for c in [clean, delay100, gate50, lossy] {
+    for c in [clean, delay100, gate50, lossy, probe_clean, probe_delay50] {
         let run = rt.block_on(run_cell(c)).unwrap_or_else(|e| panic!("{e:#}"));
         println!("{}", run.line(&c));
         runs.push(run);
     }
-    let [clean_run, delay_run, gate_run, lossy_run] = <[Run; 4]>::try_from(runs).unwrap();
+    let [
+        clean_run,
+        delay_run,
+        gate_run,
+        lossy_run,
+        probe_run,
+        probe50_run,
+    ] = <[Run; 6]>::try_from(runs).unwrap();
 
     // `clean`: frames flow at the source rate, through a real pipeline.
     assert!(
@@ -588,5 +753,31 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         lossy_run.decoded > 0 && lossy_run.fps() >= SOURCE_FPS * 0.3,
         "lossy: {:.1} fps decoded — the session did not survive 3 % loss",
         lossy_run.fps()
+    );
+
+    // `probe`: L4 in process. A probe sent on the input channel comes back
+    // painted into a decoded frame: the round trip exists end to end. About
+    // 55 are sent after the warm-up; 20 is the floor.
+    assert!(
+        probe_run.probe_ms.len() >= 20,
+        "probe: {} round trips measured, want ≥ 20 — probes are not reaching the \
+         source, or not coming back in the picture",
+        probe_run.probe_ms.len()
+    );
+    assert!(
+        probe_run.probe_pct(0.5) < 200.0,
+        "probe: p50 {:.1} ms on a loopback link",
+        probe_run.probe_pct(0.5)
+    );
+
+    // `probe50`: 50 ms each way must cost the round trip about 100 ms. Only a
+    // probe that really crosses the link in BOTH directions moves by more
+    // than the one-way 50, so this is what proves the instrument measures a
+    // round trip and not either half of one.
+    let r = probe50_run.probe_pct(0.5) - probe_run.probe_pct(0.5);
+    assert!(
+        r >= 80.0,
+        "probe50: the round trip rose by {r:.1} ms, want ≥ 80: the probe does not \
+         cross the link both ways"
     );
 }
