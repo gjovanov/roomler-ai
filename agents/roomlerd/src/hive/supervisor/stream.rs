@@ -46,7 +46,7 @@
 //! only once built would wait out its whole grant, holding its socket and its
 //! allocation, with nobody coming.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,10 +58,10 @@ use roomler_ai_remote_control::hive::{
 };
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use roomler_ai_remote_control::turn_url;
-use roomler_hive_node::checkpoint::Digest;
-use roomler_hive_node::store::StoreError;
+use roomler_hive_node::checkpoint::{Digest, WorkspaceSnap, chunk_bytes};
+use roomler_hive_node::store::{StoreError, Substitute};
 use roomler_hive_node::stream::{self as wire, BlobMsg, EventMeta, Mark, MemberMsg, SourceMsg};
-use roomler_hive_node::{ChainError, ChainTip, EventEnvelope};
+use roomler_hive_node::{ChainError, ChainTip, EventEnvelope, TranscriptEvent};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -74,6 +74,7 @@ use tunnel_core::transport::quic::{
 use tunnel_core::transport::relay::{self, RelayConn, RelayUdpSocket};
 
 use super::Supervisor;
+use crate::hive::packer;
 use crate::hive::store::{StoreHandle, WriterError};
 
 /// How long each address is tried, and how long the source waits for the
@@ -110,6 +111,12 @@ const AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// would cut a slow path short; none would let a side that stopped part way
 /// hold the stream to its grant's end.
 const STALL: Duration = Duration::from_secs(60);
+/// P2f-2b — how long a member waits for the answer to its `want_pack`: the
+/// source makes the pack as the session's account, within `hive-pack`'s own
+/// limit, and a margin.
+const PACK_ANSWER: Duration = Duration::from_secs(packer::PACK_TIMEOUT.as_secs() + 30);
+// The stream's limit on a want's haves is the account's git's.
+const _: () = assert!(wire::MAX_WANT_HAVES == crate::hive::workspace::MAX_HAVES);
 /// P2d-3 — the most often a member reports its tip while events land.
 const TIP_EVERY: Duration = Duration::from_secs(5);
 /// P2d-3 — the event bytes this device holds in memory as a member, across
@@ -511,16 +518,33 @@ async fn send_from_store(
     }
 }
 
+/// P2f-2b — what the member's reader hands the blob sender: the blobs it
+/// needs, or the pack it wants against what its own repository holds.
+enum Work {
+    Need(Vec<Digest>),
+    Pack { commit: String, haves: Vec<String> },
+}
+
+/// P2f-2b — the `want_pack`s one stream may carry: one per commit, and at
+/// most this many. A member of this build asks once for each whole pack it
+/// takes, and a chain holds few; each want costs the source a read of the
+/// chain's checkpoints, and one for a pack of its own a run of the
+/// account's git.
+const MAX_WANTS: usize = 16;
+
 /// P2d-3 — the member's frames, until it lets the connection go or sends
 /// what it may not. An `ack` must name the last event of a frame sent and
 /// not yet acked, by its hash; a `need` goes to the blob sender, and the
-/// next frame is read once it was taken.
+/// next frame is read once it was taken. P2f-2b — so does a `want_pack`,
+/// held to the wire's rules and to [`MAX_WANTS`].
 async fn read_member(
     mut recv: RecvStream,
     sent: &Mutex<Sent>,
     acked: watch::Sender<u64>,
-    need: mpsc::Sender<Vec<Digest>>,
+    need: mpsc::Sender<Work>,
 ) -> String {
+    // P2f-2b — the commits this stream's member asked a pack for.
+    let mut wanted: HashSet<String> = HashSet::new();
     loop {
         let msg: MemberMsg = match read_frame(&mut recv).await {
             Ok(m) => m,
@@ -548,8 +572,20 @@ async fn read_member(
                 if wire::check_need(&blobs).is_err() {
                     return "bad_frame".to_string();
                 }
-                if need.send(blobs).await.is_err() {
+                if need.send(Work::Need(blobs)).await.is_err() {
                     // The blob sender ended, and its reason ends the stream.
+                    return std::future::pending().await;
+                }
+            }
+            // P2f-2b — the pack against what the member's repository holds.
+            MemberMsg::WantPack { commit, haves } => {
+                if wire::check_want_pack(&commit, &haves).is_err()
+                    || wanted.len() >= MAX_WANTS
+                    || !wanted.insert(commit.clone())
+                {
+                    return "bad_frame".to_string();
+                }
+                if need.send(Work::Pack { commit, haves }).await.is_err() {
                     return std::future::pending().await;
                 }
             }
@@ -595,13 +631,15 @@ async fn read_blob(
     mut uni: RecvStream,
     asked: Arc<Mutex<HashMap<Digest, u64>>>,
 ) -> Result<(Digest, Vec<u8>), String> {
-    let BlobMsg::Blob { hash, len } =
-        match tokio::time::timeout(STALL, read_frame::<BlobMsg>(&mut uni)).await {
-            Ok(Ok(header)) => header,
-            Ok(Err(e)) if e.is::<wire::FrameError>() => return Err("bad_blob".to_string()),
-            Ok(Err(_)) => return Err("closed".to_string()),
-            Err(_) => return Err("stalled".to_string()),
-        };
+    let (hash, len) = match tokio::time::timeout(STALL, read_frame::<BlobMsg>(&mut uni)).await {
+        Ok(Ok(BlobMsg::Blob { hash, len })) => (hash, len),
+        // P2f-2b — a pack's answer where a blob of the wave was to come:
+        // nothing this wave asked for.
+        Ok(Ok(_)) => return Err("bad_blob".to_string()),
+        Ok(Err(e)) if e.is::<wire::FrameError>() => return Err("bad_blob".to_string()),
+        Ok(Err(_)) => return Err("closed".to_string()),
+        Err(_) => return Err("stalled".to_string()),
+    };
     // Taken once: a second stream for one blob is not one the wave asked for.
     let wanted = asked
         .lock()
@@ -619,6 +657,22 @@ async fn read_blob(
 /// rewrite a store allows, and only of an older fence's tail. `at` must be a
 /// point the member named, genesis or one of its hello's checkpoints: a
 /// source's word alone never moves a copy back.
+/// P2f-2b — whether `commit` is the workspace of one of `sid`'s checkpoints
+/// whose pack is whole: the one thing a member's `want_pack` may name, and a
+/// source packs nothing else for it.
+async fn whole_pack_commit(store: &StoreHandle, sid: &str, commit: &str) -> Result<bool, String> {
+    let envs = store.of_kind(sid, "checkpoint", super::MAX_CHAIN).await?;
+    Ok(envs.iter().any(|env| {
+        matches!(
+            TranscriptEvent::from_json(&env.event_json),
+            Some(TranscriptEvent::Checkpoint(cp))
+                if cp.workspace.as_ref().is_some_and(|ws| {
+                    ws.commit == commit && ws.base.is_none() && !ws.pack.is_empty()
+                })
+        )
+    }))
+}
+
 async fn set_aside(
     store: &StoreHandle,
     sid: &str,
@@ -1003,8 +1057,17 @@ impl Supervisor {
                 return "not_held".to_string();
             };
             let sid = g.session_id.to_hex();
-            self.serve_events(store, &conn, send, recv, g.grant_id, &sid, from)
-                .await
+            self.serve_events(
+                store,
+                &conn,
+                send,
+                recv,
+                g.grant_id,
+                g.session_id,
+                &sid,
+                from,
+            )
+            .await
         })
         .await;
         served.unwrap_or_else(|_| "expired".to_string())
@@ -1025,6 +1088,7 @@ impl Supervisor {
         mut send: SendStream,
         recv: RecvStream,
         grant_id: ObjectId,
+        session: ObjectId,
         sid: &str,
         from: u64,
     ) -> String {
@@ -1075,7 +1139,7 @@ impl Supervisor {
         let reason = tokio::select! {
             why = events => why,
             why = read_member(recv, &sent, acked_tx, need_tx) => why,
-            why = self.send_blobs(conn, store, grant_id, sid, need_rx) => why,
+            why = self.send_blobs(conn, store, grant_id, session, sid, need_rx) => why,
         };
         let reason = ended_by(conn, "member", "closed", reason);
         let s = sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -1096,10 +1160,28 @@ impl Supervisor {
         conn: &QuicConnection,
         store: &StoreHandle,
         grant_id: ObjectId,
+        session: ObjectId,
         sid: &str,
-        mut need: mpsc::Receiver<Vec<Digest>>,
+        mut need: mpsc::Receiver<Work>,
     ) -> String {
-        while let Some(blobs) = need.recv().await {
+        while let Some(work) = need.recv().await {
+            let blobs = match work {
+                Work::Need(blobs) => blobs,
+                // P2f-2b — answered on a stream of its own, as a blob is.
+                Work::Pack { commit, haves } => {
+                    let answer = self
+                        .answer_want_pack(store, session, sid, &commit, &haves)
+                        .await;
+                    let Ok(mut uni) = conn.open_uni().await else {
+                        return "closed".to_string();
+                    };
+                    if write_frame(&mut uni, &answer).await.is_err() {
+                        return "closed".to_string();
+                    }
+                    let _ = uni.finish();
+                    continue;
+                }
+            };
             for hash in blobs {
                 let bytes = match store.get_blob(sid, hash.0).await {
                     Ok(Some(b)) => b,
@@ -1287,6 +1369,11 @@ impl Supervisor {
             }
             // P2d-3b — a session over on the source is followed only until
             // the copy holds all of it: where the source's chain ends.
+            // P2f-2b — the source answers `want_pack`.
+            let packs = matches!(
+                answer,
+                SourceMsg::Hello { packs: true, .. } | SourceMsg::Diverged { packs: true, .. }
+            );
             let until = match &answer {
                 SourceMsg::Hello {
                     tip, live: false, ..
@@ -1298,7 +1385,7 @@ impl Supervisor {
                 } => Some(tip.seq),
                 _ => None,
             };
-            self.follow_events(store, &conn, send, recv, d, &sid, until)
+            self.follow_events(store, &conn, send, recv, d, &sid, until, packs)
                 .await
         })
         .await;
@@ -1328,6 +1415,7 @@ impl Supervisor {
         d: &Dial,
         sid: &str,
         until: Option<u64>,
+        packs: bool,
     ) -> String {
         let (moved, moves) = watch::channel(());
         let applying = async {
@@ -1358,7 +1446,16 @@ impl Supervisor {
                 let mut tip = None;
                 for meta in &events {
                     match self
-                        .take_event(store, conn, &mut send, &mut recv, d.grant_id, sid, meta)
+                        .take_event(
+                            store,
+                            conn,
+                            &mut send,
+                            &mut recv,
+                            d.grant_id,
+                            (d.session_id, sid),
+                            packs,
+                            meta,
+                        )
                         .await
                     {
                         Ok(t) => tip = Some(t),
@@ -1395,7 +1492,8 @@ impl Supervisor {
         send: &mut SendStream,
         recv: &mut RecvStream,
         grant_id: ObjectId,
-        sid: &str,
+        (session, sid): (ObjectId, &str),
+        packs: bool,
         meta: &EventMeta,
     ) -> Result<ChainTip, String> {
         // At most MAX_EVENT_BYTES (`check_events`), which the budget holds.
@@ -1410,7 +1508,21 @@ impl Supervisor {
         };
         let env = meta.envelope(sid, json);
         let tip = env.tip();
-        self.fetch_blobs(store, conn, send, grant_id, sid, &env)
+        // P2f-2b — a checkpoint's whole pack, stood in for by a pack against
+        // what the folder this session will run in holds, when one is kept or
+        // the source answers the want: its own blobs are not asked for.
+        let mut stood_in = HashSet::new();
+        if let Some(TranscriptEvent::Checkpoint(cp)) = env.event()
+            && let Some(ws) = cp.workspace.as_ref()
+            && ws.base.is_none()
+            && !ws.pack.is_empty()
+            && self
+                .stand_in(store, conn, send, grant_id, (session, sid), packs, ws)
+                .await?
+        {
+            stood_in.extend(ws.pack.iter().map(|c| c.hash));
+        }
+        self.fetch_blobs(store, conn, send, grant_id, sid, &env, &stood_in)
             .await?;
         // Held already when another stream of the session carried it first
         // (a renewal beside the stream it replaces), its blobs before it.
@@ -1427,6 +1539,7 @@ impl Supervisor {
     /// kept, a wave at a time: as many as this device's blob budget holds, at
     /// most [`wire::MAX_NEED`], the budget taken BEFORE the `need` goes, so
     /// every blob of a wave is read the moment it arrives.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_blobs(
         &self,
         store: &StoreHandle,
@@ -1435,9 +1548,13 @@ impl Supervisor {
         grant_id: ObjectId,
         sid: &str,
         env: &EventEnvelope,
+        stood_in: &HashSet<Digest>,
     ) -> Result<(), String> {
         let mut missing = Vec::new();
         for (hash, len) in wire::blobs_named(env) {
+            if stood_in.contains(&hash) {
+                continue;
+            }
             if wire::check_blob_len(len).is_err() {
                 warn!(session = sid, seq = env.seq, blob = %hash, len, "hive stream: an event names a blob past the stream's limit");
                 return Err("blob_too_large".to_string());
@@ -1451,7 +1568,24 @@ impl Supervisor {
                 }
             }
         }
-        let mut rest = missing.as_slice();
+        self.fetch_list(store, conn, send, grant_id, sid, &missing)
+            .await
+    }
+
+    /// P2d-3 — `missing`, asked for and kept a wave at a time: as many as
+    /// this device's blob budget holds, at most [`wire::MAX_NEED`], the
+    /// budget taken BEFORE the `need` goes, so every blob of a wave is read
+    /// the moment it arrives.
+    async fn fetch_list(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        send: &mut SendStream,
+        grant_id: ObjectId,
+        sid: &str,
+        missing: &[(Digest, u64)],
+    ) -> Result<(), String> {
+        let mut rest = missing;
         while !rest.is_empty() {
             // At least one, each at most MAX_STREAM_BLOB, which the budget
             // holds four of: the budget is never asked for more than it has.
@@ -1491,6 +1625,238 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// P2f-2b — whether a checkpoint's whole pack (`ws`) is stood in for: by
+    /// a substitute this store keeps already, or by one the source makes now
+    /// against what the folder this device will run the session in holds
+    /// (git's have and want). Asked only for a teleport this device was
+    /// prepared for with the server's `have_want`, of a source that answers
+    /// it (`packs`), and only while the whole pack's own blobs are not all
+    /// here. `Ok(false)`: its own blobs are asked for, as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn stand_in(
+        &self,
+        store: &StoreHandle,
+        conn: &QuicConnection,
+        send: &mut SendStream,
+        grant_id: ObjectId,
+        (session, sid): (ObjectId, &str),
+        packs: bool,
+        ws: &WorkspaceSnap,
+    ) -> Result<bool, String> {
+        match store.substitute(sid, &ws.commit).await {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(session = sid, %e, "hive stream: the store could not say whether it keeps a substitute");
+                return Err("store_error".to_string());
+            }
+        }
+        if !packs {
+            return Ok(false);
+        }
+        let Some((order, account, folder)) = self.have_want_place(session) else {
+            return Ok(false);
+        };
+        let mut whole_here = true;
+        for c in &ws.pack {
+            match store.has_blob(sid, c.hash.0).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    whole_here = false;
+                    break;
+                }
+                Err(_) => return Err("store_error".to_string()),
+            }
+        }
+        if whole_here {
+            // Every one of its blobs is here: nothing to stand in for.
+            return Ok(false);
+        }
+        let Some(haves) = self.haves_for(&order, &account, &folder, ws).await else {
+            return Ok(false);
+        };
+        let want = MemberMsg::WantPack {
+            commit: ws.commit.clone(),
+            haves: haves.clone(),
+        };
+        if write_frame(send, &want).await.is_err() {
+            return Err("closed".to_string());
+        }
+        // Its own stream: the source may have sent events past this one on
+        // the stream they share, which this one is read before.
+        let answer = tokio::time::timeout(PACK_ANSWER, async {
+            let mut uni = conn.accept_uni().await.map_err(|_| "closed".to_string())?;
+            read_frame::<BlobMsg>(&mut uni).await.map_err(|e| {
+                if e.is::<wire::FrameError>() {
+                    "bad_frame".to_string()
+                } else {
+                    "closed".to_string()
+                }
+            })
+        })
+        .await;
+        let answer = match answer {
+            Ok(Ok(a)) => a,
+            Ok(Err(why)) => return Err(why),
+            Err(_) => return Err("stalled".to_string()),
+        };
+        match answer {
+            BlobMsg::Pack {
+                commit,
+                against,
+                chunks,
+            } => {
+                if wire::check_pack(&ws.commit, &haves, &commit, &against, &chunks).is_err() {
+                    return Err("bad_pack".to_string());
+                }
+                let list: Vec<(Digest, u64)> = chunks.iter().map(|c| (c.hash, c.len)).collect();
+                self.fetch_list(store, conn, send, grant_id, sid, &list)
+                    .await?;
+                let sub = Substitute {
+                    commit,
+                    against,
+                    chunks,
+                };
+                match store.put_substitute(sid, sub).await {
+                    Ok(()) => {}
+                    Err(WriterError::Store(StoreError::Purged { .. })) => {
+                        return Err("purged".to_string());
+                    }
+                    Err(e) => {
+                        warn!(session = sid, %e, "hive stream: a substitute could not be kept");
+                        return Err("store_error".to_string());
+                    }
+                }
+                info!(
+                    session = sid, commit = %ws.commit, against = haves.len(),
+                    "hive stream: the workspace came as a pack against this folder's repository"
+                );
+                Ok(true)
+            }
+            BlobMsg::NoPack { why, .. } => {
+                info!(
+                    session = sid, commit = %ws.commit, %why,
+                    "hive stream: no pack against this folder's repository — the whole pack instead"
+                );
+                Ok(false)
+            }
+            // A blob nobody asked for.
+            BlobMsg::Blob { .. } => Err("bad_blob".to_string()),
+        }
+    }
+
+    /// P2f-2b — what the folder this device will run the session in holds
+    /// that a pack can be made against: the person's `HEAD` where the
+    /// checkpoint was taken, when this repository holds it, and its own
+    /// `HEAD`. Asked of the account's own git, as the account. `None`:
+    /// nothing to offer, or nothing could be asked.
+    async fn haves_for(
+        &self,
+        order: &super::StartOrder,
+        account: &str,
+        folder: &std::path::Path,
+        ws: &WorkspaceSnap,
+    ) -> Option<Vec<String>> {
+        let (who, dest) = match self.copy_place(order, account, folder) {
+            Ok(place) => place,
+            Err(e) => {
+                debug!(session = %order.session_id, %e, "hive stream: no place to ask the folder's repository from");
+                return None;
+            }
+        };
+        let req = packer::Request {
+            v: packer::REQUEST_V,
+            folder: dest.folder,
+            state_dir: dest.state_dir,
+            ask: packer::Ask::Holds {
+                candidates: ws.head.iter().cloned().collect(),
+            },
+        };
+        let (mut haves, head) = match packer::ask(&self.checkpoint_runner(), &who, &req).await {
+            Ok(packer::Answer::Holds { held, head }) => (held, head),
+            Ok(_) => return None,
+            Err(e) => {
+                debug!(session = %order.session_id, %e, "hive stream: the folder's repository could not be asked");
+                return None;
+            }
+        };
+        if let Some(h) = head
+            && !haves.contains(&h)
+        {
+            haves.push(h);
+        }
+        haves.retain(|h| *h != ws.commit);
+        haves.truncate(wire::MAX_WANT_HAVES);
+        (!haves.is_empty()).then_some(haves)
+    }
+
+    /// P2f-2b — the answer to a member's `want_pack`: the pack that brings
+    /// `commit` into a repository holding `haves`, made as the session's
+    /// account from its own repository while it runs here, its chunks kept
+    /// as blobs of the session for the member to `need` as any blob. Only
+    /// for the commit of one of the session's whole packs. Anything else is
+    /// `no_pack`, in a word, and the member takes the whole pack.
+    async fn answer_want_pack(
+        &self,
+        store: &StoreHandle,
+        session: ObjectId,
+        sid: &str,
+        commit: &str,
+        haves: &[String],
+    ) -> BlobMsg {
+        let no = |why: &str| BlobMsg::NoPack {
+            commit: commit.to_string(),
+            why: why.to_string(),
+        };
+        match whole_pack_commit(store, sid, commit).await {
+            Ok(true) => {}
+            Ok(false) => return no("not_a_whole_pack"),
+            Err(e) => {
+                warn!(session = sid, %e, "hive stream: the checkpoints could not be read for a want");
+                return no("store_error");
+            }
+        }
+        let Some(place) = self.workplace(session) else {
+            return no("not_live");
+        };
+        let req = packer::Request {
+            v: packer::REQUEST_V,
+            folder: place.folder.clone(),
+            state_dir: place.state_dir.clone(),
+            ask: packer::Ask::Pack {
+                commit: commit.to_string(),
+                haves: haves.to_vec(),
+            },
+        };
+        let (against, pack) = match packer::ask(&self.checkpoint_runner(), &place.who, &req).await {
+            Ok(packer::Answer::Pack { against, pack }) => (against, pack),
+            Ok(_) => return no("other"),
+            Err(e) => {
+                warn!(session = sid, commit, %e, "hive stream: no pack against the member's repository");
+                return no("pack_failed");
+            }
+        };
+        let (chunks, blobs) = chunk_bytes(&pack);
+        for blob in blobs {
+            if let Err(e) = store.put_blob(sid, blob).await {
+                warn!(session = sid, %e, "hive stream: a pack's chunk could not be kept");
+                return no("store_error");
+            }
+        }
+        info!(
+            session = sid,
+            commit,
+            against = against.len(),
+            bytes = pack.len(),
+            "hive stream: a pack against the member's repository"
+        );
+        BlobMsg::Pack {
+            commit: commit.to_string(),
+            against,
+            chunks,
+        }
     }
 
     /// P2d-3 — the member's tip reported as its stream moves it: at once,
@@ -2133,6 +2499,7 @@ mod tests {
                     hash: hex::encode(tip.hash),
                 },
                 live: true,
+                packs: true,
             },
             "an empty copy is a prefix"
         );
@@ -2175,6 +2542,7 @@ mod tests {
                     hash: hex::encode(tip.hash),
                 },
                 live: true,
+                packs: true,
             },
             "over both allocations"
         );
@@ -2340,6 +2708,7 @@ mod tests {
                     hash: hex::encode(tip.hash),
                 },
                 live: true,
+                packs: true,
             },
             "over DERP"
         );
@@ -2530,6 +2899,7 @@ mod tests {
                     hash: hex::encode(end.hash),
                 }),
                 live: true,
+                packs: true,
             },
             "past the newest checkpoint both hold"
         );
@@ -3399,6 +3769,7 @@ mod tests {
             v: wire::STREAM_V,
             tip: Mark::genesis(),
             live: true,
+            packs: false,
         };
         write_frame(&mut send, &hello).await.unwrap();
         let mut env = EventEnvelope::next(&sid.to_hex(), None, 1, 0, &said("forged"));
@@ -3482,6 +3853,7 @@ mod tests {
             v: wire::STREAM_V,
             tip: Mark::genesis(),
             live: true,
+            packs: false,
         };
         write_frame(&mut send, &hello).await.unwrap();
         let other = EventEnvelope::next(&s, None, 1, 0, &said("not where fence 1 ended"));
@@ -3523,6 +3895,7 @@ mod tests {
                 v: wire::STREAM_V,
                 tip: Mark::genesis(),
                 live: true,
+                packs: false,
             };
             write_frame(&mut send, &hello).await.unwrap();
             send_by_hand(&mut send, std::slice::from_ref(&env)).await;
@@ -3574,6 +3947,7 @@ mod tests {
                 at,
                 tip: None,
                 live: true,
+                packs: false,
             },
         )
         .await
@@ -3598,6 +3972,7 @@ mod tests {
             v: wire::STREAM_V,
             tip: Mark::genesis(),
             live: true,
+            packs: false,
         };
         write_frame(&mut send, &hello).await.unwrap();
         let listing = SourceMsg::Events {
@@ -4130,7 +4505,9 @@ mod tests {
             .join(&leftover.to_hex(), "teleport", 1)
             .await
             .unwrap();
-        r.sup.admit_teleport(teleport, 2);
+        let mut prepared = super::super::tests::order(&r);
+        (prepared.session_id, prepared.fence) = (teleport, 2);
+        r.sup.admit_teleport(&prepared, None);
         let (tx, mut reports) = mpsc::channel(64);
         r.sup.connected(tx);
         let deadline = Instant::now() + Duration::from_millis(3000);
@@ -4200,7 +4577,9 @@ mod tests {
         mem.store.join(&sid.to_hex(), "teleport", 1).await.unwrap();
         // Prepared for the start at fence 2: its join, at fence 1, is the
         // teleport's.
-        mem.sup.admit_teleport(sid, 2);
+        let mut prepared = super::super::tests::order(&mem);
+        (prepared.session_id, prepared.fence) = (sid, 2);
+        mem.sup.admit_teleport(&prepared, None);
         let grant_id = served(&src, &mem, sid, TOKEN).await;
         assert_eq!(
             tip_at(&mem, sid, 2).await.seq,
@@ -4556,5 +4935,594 @@ mod tests {
             want_on(&mut mem, sid, Direct).await.is_some(),
             "whose end asks again from the top"
         );
+    }
+
+    // ─── P2f-2b: the have and want ──────────────────────────────────────────
+
+    /// `git` as a person runs it in `dir`.
+    fn person(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args([
+                "-c",
+                "user.name=Person",
+                "-c",
+                "user.email=person@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn have_git() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// A rig whose children run in this process, git's discovery stopping at
+    /// `/tmp`, where every rig's root is.
+    fn packing_rig(replica: bool) -> Rig {
+        rig_with(
+            true,
+            4,
+            move |c| c.replica = replica,
+            |mut s| {
+                s.checkpoint_runner = Some(crate::hive::checkpointer::Runner::InProcess {
+                    ceiling: std::path::PathBuf::from("/tmp"),
+                });
+                s.without_follow_at_connect()
+            },
+        )
+    }
+
+    /// The person's repository at `<root>/src`, a commit of its own, and the
+    /// session's first checkpoint of it: the person's `HEAD`, the workspace
+    /// (its pack whole) and that pack's blobs.
+    fn checkpointed_repo(
+        root: &std::path::Path,
+        sid: ObjectId,
+    ) -> (String, WorkspaceSnap, Vec<Vec<u8>>) {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        person(&src, &["init", "-q"]);
+        std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        person(&src, &["add", "-A"]);
+        person(&src, &["commit", "-q", "-m", "first"]);
+        let head = person(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        let git = crate::hive::workspace::Git::under(root);
+        let state = root.join("src-state");
+        match crate::hive::workspace::checkpoint(&git, &src, &state, &sid.to_hex(), 1, 1, None) {
+            crate::hive::workspace::Outcome::Taken { snap, blobs } => (head, snap, blobs),
+            crate::hive::workspace::Outcome::Skipped(why) => panic!("{why}"),
+        }
+    }
+
+    /// A checkpoint holding the workspace `ws` and no file: the first event
+    /// of `sid`.
+    fn workspace_event(sid: ObjectId, ws: &WorkspaceSnap) -> EventEnvelope {
+        let cp = TranscriptEvent::Checkpoint(Checkpoint {
+            n: 1,
+            turn: 1,
+            files: Vec::new(),
+            skipped: Vec::new(),
+            workspace: Some(ws.clone()),
+        });
+        EventEnvelope::next(&sid.to_hex(), None, 1, 0, &cp)
+    }
+
+    /// `blobs` on streams of their own, as a source answers a `need`.
+    async fn serve_by_hand(conn: &QuicConnection, blobs: &[(Digest, Vec<u8>)]) {
+        for (hash, bytes) in blobs {
+            let mut uni = conn.open_uni().await.unwrap();
+            let header = BlobMsg::Blob {
+                hash: *hash,
+                len: bytes.len() as u64,
+            };
+            write_frame(&mut uni, &header).await.unwrap();
+            uni.write_all(bytes).await.unwrap();
+            let _ = uni.finish();
+        }
+    }
+
+    /// `mem`, a teleport's target for `sid` whose folder is a clone of the
+    /// person's repository from a remote as it were (`--no-local`), or, not
+    /// `cloned`, an empty folder in no repository; prepared with the
+    /// server's `have_want` or without.
+    async fn teleports_target(
+        mem: &Rig,
+        sid: ObjectId,
+        have_want: bool,
+        cloned: bool,
+    ) -> std::path::PathBuf {
+        let root = mem.root.path();
+        let clone = root.join(format!("clone-{sid}"));
+        if cloned {
+            person(
+                root,
+                &[
+                    "clone",
+                    "-q",
+                    "--no-local",
+                    &root.join("src").display().to_string(),
+                    &clone.display().to_string(),
+                ],
+            );
+        } else {
+            std::fs::create_dir_all(&clone).unwrap();
+        }
+        mem.store.join(&sid.to_hex(), "teleport", 1).await.unwrap();
+        let mut prepared = super::super::tests::order(mem);
+        (prepared.session_id, prepared.fence) = (sid, 2);
+        let place = have_want.then(|| ("dev".to_string(), clone.clone()));
+        mem.sup.admit_teleport(&prepared, place);
+        clone
+    }
+
+    /// P2f-2b — a teleport's target, prepared with the server's `have_want`,
+    /// takes a checkpoint's whole pack as one against what its clone holds:
+    /// it asks a source that answers wants for the pack against its clone's
+    /// `HEAD`, takes the answer's chunks as any blobs, keeps them as a
+    /// substitute, and applies the checkpoint holding none of the whole
+    /// pack's own blobs.
+    #[tokio::test]
+    async fn a_teleports_target_takes_the_whole_pack_against_its_clone() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let mem = packing_rig(false);
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let root = mem.root.path().to_path_buf();
+        let (head, snap, _whole) = checkpointed_repo(&root, sid);
+        assert!(snap.base.is_none() && snap.head.as_deref() == Some(head.as_str()));
+        teleports_target(&mem, sid, true, true).await;
+        let env = workspace_event(sid, &snap);
+
+        let (_peer, _grant_id, conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+            packs: true,
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+        let want: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert_eq!(
+            want,
+            MemberMsg::WantPack {
+                commit: snap.commit.clone(),
+                haves: vec![head.clone()],
+            },
+            "it names what its clone holds, once"
+        );
+        let (pack, against) = crate::hive::workspace::pack_against(
+            &crate::hive::workspace::Git::under(&root),
+            &root.join("src"),
+            &root.join("src-state"),
+            &snap.commit,
+            std::slice::from_ref(&head),
+        )
+        .unwrap();
+        let (chunks, blobs) = chunk_bytes(&pack);
+        let mut uni = conn.open_uni().await.unwrap();
+        let answer = BlobMsg::Pack {
+            commit: snap.commit.clone(),
+            against: against.clone(),
+            chunks: chunks.clone(),
+        };
+        write_frame(&mut uni, &answer).await.unwrap();
+        let _ = uni.finish();
+        let need: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert_eq!(
+            need,
+            MemberMsg::Need {
+                blobs: chunks.iter().map(|c| c.hash).collect()
+            },
+            "the pack's chunks, asked for as any blobs"
+        );
+        let named: Vec<(Digest, Vec<u8>)> = chunks.iter().map(|c| c.hash).zip(blobs).collect();
+        serve_by_hand(&conn, &named).await;
+        let ack: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert!(
+            matches!(ack, MemberMsg::Ack { seq: 1, .. }),
+            "applied: {ack:?}"
+        );
+        assert_eq!(
+            mem.store.substitute(&s, &snap.commit).await.unwrap(),
+            Some(Substitute {
+                commit: snap.commit.clone(),
+                against,
+                chunks,
+            }),
+            "kept in place of the whole pack"
+        );
+        for c in &snap.pack {
+            assert!(
+                !mem.store.has_blob(&s, c.hash.0).await.unwrap(),
+                "none of the whole pack's own blobs came"
+            );
+        }
+    }
+
+    /// P2f-2b — a source that cannot answer (`no_pack`) leaves the target to
+    /// take the whole pack by its blobs, as before; a target whose folder
+    /// holds nothing to be thin against never asks, nor one the server gave
+    /// no `have_want`.
+    #[tokio::test]
+    async fn without_a_pack_against_its_clone_the_target_takes_the_whole_pack() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let mem = packing_rig(false);
+        let root = mem.root.path().to_path_buf();
+        let first = ObjectId::new();
+        let (_head, snap, whole) = checkpointed_repo(&root, first);
+        let names: Vec<Digest> = snap.pack.iter().map(|c| c.hash).collect();
+        let named: Vec<(Digest, Vec<u8>)> = names.iter().copied().zip(whole).collect();
+        for (case, have_want, cloned) in [
+            ("no_pack", true, true),
+            ("nothing held", true, false),
+            ("no have_want", false, true),
+        ] {
+            let sid = ObjectId::new();
+            let s = sid.to_hex();
+            teleports_target(&mem, sid, have_want, cloned).await;
+            let env = workspace_event(sid, &snap);
+            let (_peer, _grant_id, conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+            let hello = SourceMsg::Hello {
+                v: wire::STREAM_V,
+                tip: Mark::genesis(),
+                live: true,
+                packs: true,
+            };
+            write_frame(&mut send, &hello).await.unwrap();
+            send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+            let mut first: MemberMsg = read_frame(&mut recv).await.unwrap();
+            if have_want && cloned {
+                assert!(
+                    matches!(first, MemberMsg::WantPack { .. }),
+                    "{case}: {first:?}"
+                );
+                let mut uni = conn.open_uni().await.unwrap();
+                let none = BlobMsg::NoPack {
+                    commit: snap.commit.clone(),
+                    why: "not_live".into(),
+                };
+                write_frame(&mut uni, &none).await.unwrap();
+                let _ = uni.finish();
+                first = read_frame(&mut recv).await.unwrap();
+            }
+            assert_eq!(
+                first,
+                MemberMsg::Need {
+                    blobs: names.clone()
+                },
+                "{case}: the whole pack, by its blobs"
+            );
+            serve_by_hand(&conn, &named).await;
+            let ack: MemberMsg = read_frame(&mut recv).await.unwrap();
+            assert!(
+                matches!(ack, MemberMsg::Ack { seq: 1, .. }),
+                "{case}: {ack:?}"
+            );
+            assert_eq!(
+                mem.store.substitute(&s, &snap.commit).await.unwrap(),
+                None,
+                "{case}: nothing stands in for it"
+            );
+        }
+    }
+
+    /// P2f-2b — a source answers a member's `want_pack` with the pack against
+    /// what the member holds, made from the session's repository while it
+    /// runs there and kept as blobs the member then asks for as any; and
+    /// `no_pack`, in a word, for a commit that is no whole pack of the chain,
+    /// or a session that does not run there.
+    #[tokio::test]
+    async fn a_source_answers_a_want_with_a_pack_or_says_why_not() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let src = packing_rig(false);
+        let root = src.root.path().to_path_buf();
+        let running = ObjectId::new();
+        let (head, snap, whole) = checkpointed_repo(&root, running);
+        let away = ObjectId::new();
+        for sid in [running, away] {
+            for b in &whole {
+                src.store.put_blob(&sid.to_hex(), b.clone()).await.unwrap();
+            }
+            let cp = Checkpoint {
+                n: 1,
+                turn: 1,
+                files: Vec::new(),
+                skipped: Vec::new(),
+                workspace: Some(snap.clone()),
+            };
+            put(&src, sid, 1, TranscriptEvent::Checkpoint(cp));
+            src.sup.host_for_tests(sid);
+        }
+        // `running` runs here; `away` is only hosted.
+        src.sup.workplace_for_tests(
+            running,
+            packer::Workplace {
+                who: crate::hive::materializer::Who {
+                    account: None,
+                    env: Vec::new(),
+                },
+                folder: root.join("src"),
+                state_dir: root.join("src-state"),
+            },
+        );
+        let ask = |commit: &str, haves: &[String]| MemberMsg::WantPack {
+            commit: commit.to_string(),
+            haves: haves.to_vec(),
+        };
+        let answer_on = |conn: QuicConnection| async move {
+            let mut uni = conn.accept_uni().await.unwrap();
+            read_frame::<BlobMsg>(&mut uni).await.unwrap()
+        };
+
+        let g = grant(running, HiveStreamPath::Direct);
+        let (_peer, conn, mut send, mut recv) = dial_by_hand(ready_of(&src, g, true).await).await;
+        write_frame(&mut send, &empty_hello(running)).await.unwrap();
+        let hello: SourceMsg = read_frame(&mut recv).await.unwrap();
+        assert!(
+            matches!(hello, SourceMsg::Hello { packs: true, .. }),
+            "it says it answers wants: {hello:?}"
+        );
+        write_frame(&mut send, &ask(&snap.commit, std::slice::from_ref(&head)))
+            .await
+            .unwrap();
+        let BlobMsg::Pack {
+            commit,
+            against,
+            chunks,
+        } = answer_on(conn.clone()).await
+        else {
+            panic!("a pack");
+        };
+        assert_eq!(
+            (commit.as_str(), against.as_slice()),
+            (snap.commit.as_str(), std::slice::from_ref(&head))
+        );
+        let whole_len: u64 = snap.pack.iter().map(|c| c.len).sum();
+        let pack_len: u64 = chunks.iter().map(|c| c.len).sum();
+        assert!(
+            pack_len < whole_len,
+            "thin against the member's HEAD: {pack_len} of {whole_len}"
+        );
+        let need = MemberMsg::Need {
+            blobs: chunks.iter().map(|c| c.hash).collect(),
+        };
+        write_frame(&mut send, &need).await.unwrap();
+        for c in &chunks {
+            let mut uni = conn
+                .accept_uni()
+                .await
+                .expect("each of the pack's chunks, served as any blob");
+            let BlobMsg::Blob { hash, len } = read_frame::<BlobMsg>(&mut uni).await.unwrap() else {
+                panic!("a blob");
+            };
+            let mut bytes = vec![0u8; len as usize];
+            uni.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(
+                (hash, Digest::of(&bytes)),
+                (c.hash, c.hash),
+                "served as any blob"
+            );
+        }
+        write_frame(
+            &mut send,
+            &ask(&"e".repeat(40), std::slice::from_ref(&head)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            answer_on(conn.clone()).await,
+            BlobMsg::NoPack {
+                commit: "e".repeat(40),
+                why: "not_a_whole_pack".into()
+            }
+        );
+        conn.close(0u32.into(), b"done");
+
+        let g = grant(away, HiveStreamPath::Direct);
+        let (_peer, conn, mut send, mut recv) = dial_by_hand(ready_of(&src, g, true).await).await;
+        write_frame(&mut send, &empty_hello(away)).await.unwrap();
+        let _: SourceMsg = read_frame(&mut recv).await.unwrap();
+        write_frame(&mut send, &ask(&snap.commit, std::slice::from_ref(&head)))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer_on(conn.clone()).await,
+            BlobMsg::NoPack {
+                commit: snap.commit.clone(),
+                why: "not_live".into()
+            },
+            "a session that does not run here"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// P2f-2b — the answer to a `want_pack` is held to it: a pack of another
+    /// commit, or one thin against what the member did not name, ends the
+    /// stream `bad_pack`, and a blob in its place `bad_blob`; nothing is
+    /// applied, and nothing kept to stand in for the whole pack.
+    #[tokio::test]
+    async fn a_pack_that_is_not_the_one_asked_for_ends_the_stream() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let mut mem = packing_rig(false);
+        let root = mem.root.path().to_path_buf();
+        let (head, snap, _whole) = checkpointed_repo(&root, ObjectId::new());
+        let (chunks, _) = chunk_bytes(b"no pack at all");
+        let cases = [
+            (
+                "another commit's",
+                BlobMsg::Pack {
+                    commit: "e".repeat(40),
+                    against: vec![head.clone()],
+                    chunks: chunks.clone(),
+                },
+                "bad_pack",
+            ),
+            (
+                "thin against what it did not name",
+                BlobMsg::Pack {
+                    commit: snap.commit.clone(),
+                    against: vec!["d".repeat(40)],
+                    chunks: chunks.clone(),
+                },
+                "bad_pack",
+            ),
+            (
+                "a blob",
+                BlobMsg::Blob {
+                    hash: chunks[0].hash,
+                    len: chunks[0].len,
+                },
+                "bad_blob",
+            ),
+        ];
+        for (case, answer, word) in cases {
+            let sid = ObjectId::new();
+            let s = sid.to_hex();
+            teleports_target(&mem, sid, true, true).await;
+            let env = workspace_event(sid, &snap);
+            let (_peer, grant_id, conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+            let hello = SourceMsg::Hello {
+                v: wire::STREAM_V,
+                tip: Mark::genesis(),
+                live: true,
+                packs: true,
+            };
+            write_frame(&mut send, &hello).await.unwrap();
+            send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+            let want: MemberMsg = read_frame(&mut recv).await.unwrap();
+            assert!(
+                matches!(want, MemberMsg::WantPack { .. }),
+                "{case}: {want:?}"
+            );
+            let mut uni = conn.open_uni().await.unwrap();
+            write_frame(&mut uni, &answer).await.unwrap();
+            let _ = uni.finish();
+            assert_eq!(
+                close_of(&mut mem, grant_id).await.as_deref(),
+                Some(word),
+                "{case}"
+            );
+            assert_eq!(tip(&mem, sid).await, None, "{case}: not applied");
+            assert_eq!(
+                mem.store.substitute(&s, &snap.commit).await.unwrap(),
+                None,
+                "{case}: nothing kept"
+            );
+        }
+    }
+
+    /// P2f-2b — a target that holds every blob of a whole pack already has
+    /// nothing to stand in for: it applies the checkpoint asking for nothing.
+    #[tokio::test]
+    async fn a_target_holding_the_whole_pack_asks_for_nothing() {
+        if !have_git() {
+            return eprintln!("no git here");
+        }
+        let mem = packing_rig(false);
+        let root = mem.root.path().to_path_buf();
+        let sid = ObjectId::new();
+        let s = sid.to_hex();
+        let (_head, snap, whole) = checkpointed_repo(&root, sid);
+        teleports_target(&mem, sid, true, true).await;
+        for b in whole {
+            mem.store.put_blob(&s, b).await.unwrap();
+        }
+        let env = workspace_event(sid, &snap);
+        let (_peer, _grant_id, _conn, mut send, mut recv) = source_by_hand(&mem, sid).await;
+        let hello = SourceMsg::Hello {
+            v: wire::STREAM_V,
+            tip: Mark::genesis(),
+            live: true,
+            packs: true,
+        };
+        write_frame(&mut send, &hello).await.unwrap();
+        send_by_hand(&mut send, std::slice::from_ref(&env)).await;
+        let ack: MemberMsg = read_frame(&mut recv).await.unwrap();
+        assert!(
+            matches!(ack, MemberMsg::Ack { seq: 1, .. }),
+            "applied, nothing asked: {ack:?}"
+        );
+        assert_eq!(mem.store.substitute(&s, &snap.commit).await.unwrap(), None);
+    }
+
+    /// P2f-2b — a member's `want_pack` is held to the wire's rules before a
+    /// pack is made, and a stream carries one per commit, at most
+    /// [`MAX_WANTS`]: a want that names its commit among its haves, one for a
+    /// commit asked already, and one past them end the stream `bad_frame`,
+    /// unanswered. Each want before it is answered on a stream of its own.
+    #[tokio::test]
+    async fn a_want_that_breaks_the_wires_rules_ends_the_stream() {
+        let (c, h) = ("c".repeat(40), "a".repeat(40));
+        let want = |commit: &str, have: &str| MemberMsg::WantPack {
+            commit: commit.to_string(),
+            haves: vec![have.to_string()],
+        };
+        let many: Vec<MemberMsg> = (0..=MAX_WANTS)
+            .map(|i| want(&format!("{i:040x}"), &h))
+            .collect();
+        let cases = [
+            ("its commit among its haves", vec![want(&c, &c)]),
+            ("a commit asked again", vec![want(&c, &h), want(&c, &h)]),
+            ("past the stream's wants", many),
+        ];
+        let mut src = rig(true, 4);
+        for (case, wants) in cases {
+            let sid = ObjectId::new();
+            note(&src, sid, &["one"]);
+            let g = grant(sid, HiveStreamPath::Direct);
+            let grant_id = g.grant_id;
+            let (_peer, conn, mut send, mut recv) =
+                dial_by_hand(ready_of(&src, g, true).await).await;
+            write_frame(&mut send, &empty_hello(sid)).await.unwrap();
+            let _: SourceMsg = read_frame(&mut recv).await.unwrap();
+            let (last, answered) = wants.split_last().unwrap();
+            for w in answered {
+                write_frame(&mut send, w).await.unwrap();
+                let mut uni = conn
+                    .accept_uni()
+                    .await
+                    .expect("each want before it answered");
+                let answer: BlobMsg = read_frame(&mut uni).await.unwrap();
+                assert!(
+                    matches!(answer, BlobMsg::NoPack { .. }),
+                    "{case}: {answer:?}"
+                );
+            }
+            write_frame(&mut send, last).await.unwrap();
+            assert_eq!(
+                close_of(&mut src, grant_id).await.as_deref(),
+                Some("bad_frame"),
+                "{case}"
+            );
+            conn.close(0u32.into(), b"done");
+        }
     }
 }

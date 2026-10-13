@@ -386,6 +386,21 @@ struct Live {
     /// P2e-4 — drained for a move: no new prompt is taken. The server's word
     /// at this fence lifts it; a demote ends the run.
     draining: bool,
+    /// P2f-2b — where it runs here and as whom, from its launch: what a
+    /// member's `want_pack` is packed from ([`Supervisor::workplace`]).
+    workplace: Arc<super::packer::Workplace>,
+}
+
+/// FR-90 P2f-1a — a teleport this device was prepared for: its prepare's
+/// order (the session, and the start's fence) and when it passed.
+struct Prepared {
+    order: StartOrder,
+    at: Instant,
+    /// P2f-2b — the account the prepare's gates mapped the owner to and the
+    /// folder they resolved, when the server let the copy's workspace come
+    /// against what that folder's repository holds (`have_want`): what the
+    /// stream's have and want asks about. `None`: the whole pack.
+    have_want: Option<(String, PathBuf)>,
 }
 
 /// What a launch hands the session task.
@@ -494,10 +509,14 @@ pub struct Supervisor {
     memory: Mutex<HashMap<(ObjectId, u64), (CoreMemory, Instant)>>,
     /// P2e-5 — moves waiting for their start, by (session, fence).
     moves: Mutex<HashMap<(ObjectId, u64), (Moved, Instant)>>,
-    /// P2f-1a — teleports this device was prepared for, by session: the
-    /// fence the prepare named (the start's), and when it passed. What admits
-    /// that session's join in the teleport's role ([`Self::teleport_admitted`]).
-    teleports: Mutex<HashMap<ObjectId, (u64, Instant)>>,
+    /// P2f-1a — teleports this device was prepared for, by session: what
+    /// admits that session's join in the teleport's role
+    /// ([`Self::teleport_admitted`]), and (P2f-2b) where it will run here.
+    teleports: Mutex<HashMap<ObjectId, Prepared>>,
+    /// Test-only: the workplaces of sessions a test serves without running
+    /// them ([`Self::workplace`]).
+    #[cfg(all(test, unix))]
+    test_workplaces: Mutex<HashMap<ObjectId, Arc<super::packer::Workplace>>>,
     /// P2e-5 — this device's own enrollment, which tells a move back (the
     /// session comes back where its state is) from a move here.
     agent_id: Option<ObjectId>,
@@ -580,9 +599,12 @@ pub fn handle_move(m: Moved, is_primary: bool) {
 /// ([`Supervisor::prepare`])? Answered with `rc:hive.prepare_ack` on `tx`, the
 /// connection it came on. P2f-1a — a teleport's: could it run the session,
 /// once it holds the copy it takes next ([`Supervisor::prepare_teleport`])?
+/// P2f-2b — `have_want`: the server lets it take the workspace's first pack
+/// against what its folder's repository holds.
 pub fn handle_prepare(
     order: StartOrder,
     teleport: bool,
+    have_want: bool,
     is_primary: bool,
     tx: mpsc::Sender<ClientMsg>,
 ) {
@@ -590,7 +612,10 @@ pub fn handle_prepare(
     tokio::spawn(async move {
         let (answer, tip) = match sup {
             // No tip: the copy is still to come.
-            Some(sup) if teleport => (sup.prepare_teleport(&order, is_primary).await, None),
+            Some(sup) if teleport => (
+                sup.prepare_teleport(&order, is_primary, have_want).await,
+                None,
+            ),
             Some(sup) => sup.prepare_with_tip(&order, is_primary).await,
             None => (
                 Answer::refused(
@@ -1273,6 +1298,8 @@ impl Supervisor {
             memory: Mutex::new(HashMap::new()),
             moves: Mutex::new(HashMap::new()),
             teleports: Mutex::new(HashMap::new()),
+            #[cfg(all(test, unix))]
+            test_workplaces: Mutex::new(HashMap::new()),
             agent_id: None,
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
@@ -1390,17 +1417,77 @@ impl Supervisor {
     /// `fence`: its join is admitted for [`TELEPORT_ADMISSION`]. A later
     /// prepare of the same session replaces it; past
     /// [`TELEPORTS_PENDING`], the oldest goes.
-    fn admit_teleport(&self, session: ObjectId, fence: u64) {
+    fn admit_teleport(&self, order: &StartOrder, have_want: Option<(String, PathBuf)>) {
+        let (session, fence) = (order.session_id, order.fence);
         let mut held = self.teleports.lock().unwrap_or_else(|e| e.into_inner());
-        held.retain(|_, (_, at)| at.elapsed() < TELEPORT_ADMISSION);
+        held.retain(|_, p| p.at.elapsed() < TELEPORT_ADMISSION);
         if held.len() >= TELEPORTS_PENDING
             && !held.contains_key(&session)
-            && let Some(oldest) = held.iter().min_by_key(|(_, (_, at))| *at).map(|(s, _)| *s)
+            && let Some(oldest) = held.iter().min_by_key(|(_, p)| p.at).map(|(s, _)| *s)
         {
             held.remove(&oldest);
         }
-        info!(session = %session, fence, "hive: prepared for a teleport — its join is admitted");
-        held.insert(session, (fence, Instant::now()));
+        info!(
+            session = %session, fence, have_want = have_want.is_some(),
+            "hive: prepared for a teleport — its join is admitted"
+        );
+        held.insert(
+            session,
+            Prepared {
+                order: order.clone(),
+                at: Instant::now(),
+                have_want,
+            },
+        );
+    }
+
+    /// P2f-2b — where a session live here runs, and as whom: what a member's
+    /// `want_pack` is packed from. `None` when it does not run here now.
+    pub(super) fn workplace(&self, session: ObjectId) -> Option<Arc<super::packer::Workplace>> {
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .map(|l| Arc::clone(&l.workplace));
+        #[cfg(all(test, unix))]
+        let live = live.or_else(|| {
+            self.test_workplaces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&session)
+                .cloned()
+        });
+        live
+    }
+
+    /// Test-only: `session` served from `workplace` as if it ran here.
+    #[cfg(all(test, unix))]
+    pub(super) fn workplace_for_tests(
+        &self,
+        session: ObjectId,
+        workplace: super::packer::Workplace,
+    ) {
+        self.test_workplaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session, Arc::new(workplace));
+    }
+
+    /// P2f-2b — where a teleport this device was prepared for runs its
+    /// session, when the server let the copy's workspace come against what
+    /// its folder's repository holds: the order, the account and the folder.
+    /// `None` without such an admission, or past its time.
+    pub(super) fn have_want_place(
+        &self,
+        session: ObjectId,
+    ) -> Option<(StartOrder, String, PathBuf)> {
+        let held = self.teleports.lock().unwrap_or_else(|e| e.into_inner());
+        let p = held
+            .get(&session)
+            .filter(|p| p.at.elapsed() < TELEPORT_ADMISSION)?;
+        let (account, folder) = p.have_want.clone()?;
+        Some((p.order.clone(), account, folder))
     }
 
     /// P2f-1a — whether a join of `session` at `fence` in the teleport's role
@@ -1414,8 +1501,8 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&session)
-            .is_some_and(|(prepared, at)| {
-                fence.checked_add(1) == Some(*prepared) && at.elapsed() < TELEPORT_ADMISSION
+            .is_some_and(|p| {
+                fence.checked_add(1) == Some(p.order.fence) && p.at.elapsed() < TELEPORT_ADMISSION
             })
     }
 
@@ -1427,17 +1514,14 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|(_, at)| at.elapsed() < TELEPORT_ADMISSION)
+            .any(|p| p.at.elapsed() < TELEPORT_ADMISSION)
     }
 
     /// P2f-1a — the session launched here at `fence`: a teleport prepared at
     /// that fence or before is done with.
     fn forget_teleport(&self, session: ObjectId, fence: u64) {
         let mut held = self.teleports.lock().unwrap_or_else(|e| e.into_inner());
-        if held
-            .get(&session)
-            .is_some_and(|(prepared, _)| *prepared <= fence)
-        {
+        if held.get(&session).is_some_and(|p| p.order.fence <= fence) {
             held.remove(&session);
         }
     }
@@ -1896,15 +1980,25 @@ impl Supervisor {
     /// passes admits that session's join in the teleport's role for
     /// [`TELEPORT_ADMISSION`] ([`Self::teleport_admitted`]), whatever the
     /// owner's `hive_replica`: the gates that let a device RUN a session are
-    /// these, and a device that runs it holds its copy anyway.
+    /// these, and a device that runs it holds its copy anyway. P2f-2b — with
+    /// `have_want`, the admission keeps the account and folder they passed,
+    /// for the copy's workspace to come against that folder's repository.
     pub(crate) async fn prepare_teleport(
         self: &Arc<Self>,
         order: &StartOrder,
         is_primary: bool,
+        have_want: bool,
     ) -> Answer {
         let answer = self.prepare_as(order, is_primary, true).await;
         if answer.refused.is_none() {
-            self.admit_teleport(order.session_id, order.fence);
+            // P2f-2b — the account and folder the gates just passed, as the
+            // start resolves them, kept for the copy's have and want.
+            let place = answer
+                .account
+                .clone()
+                .zip(gates::folder_for(&self.cfg, &order.folder).ok())
+                .filter(|_| have_want);
+            self.admit_teleport(order, place);
         }
         answer
     }
@@ -3404,6 +3498,7 @@ impl Supervisor {
         let lease = order.lease || prior.as_ref().is_some_and(|h| h.lease);
         // P2e-1 — dropped by the session's task once it has let go.
         let (gone_tx, gone) = watch::channel(());
+        let workplace = Arc::new(checkpoints.workplace());
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
             order.session_id,
             Live {
@@ -3419,6 +3514,7 @@ impl Supervisor {
                 gone,
                 lease,
                 draining: false,
+                workplace,
             },
         );
         if prior.is_some() {
@@ -9580,7 +9676,7 @@ done
         );
 
         assert_eq!(
-            r.sup.prepare_teleport(&o, false).await.refused,
+            r.sup.prepare_teleport(&o, false, false).await.refused,
             Some(HiveRefusal::HiveDisabled),
             "a secondary org's"
         );
@@ -9588,13 +9684,16 @@ done
         stranger.user_id = ObjectId::new();
         stranger.user_email = "stranger@example.com".into();
         assert_eq!(
-            r.sup.prepare_teleport(&stranger, true).await.refused,
+            r.sup.prepare_teleport(&stranger, true, false).await.refused,
             Some(HiveRefusal::NoAccount)
         );
         let mut elsewhere = o.clone();
         elsewhere.folder = "/etc".into();
         assert_eq!(
-            r.sup.prepare_teleport(&elsewhere, true).await.refused,
+            r.sup
+                .prepare_teleport(&elsewhere, true, false)
+                .await
+                .refused,
             Some(HiveRefusal::FolderNotAllowed)
         );
         assert_eq!(
@@ -9605,7 +9704,7 @@ done
         assert!(!r.sup.reports_copies());
 
         assert_eq!(
-            r.sup.prepare_teleport(&o, true).await,
+            r.sup.prepare_teleport(&o, true, false).await,
             Answer::accepted("dev"),
             "no copy needed"
         );
@@ -9658,13 +9757,78 @@ done
         if let Some(long_ago) =
             Instant::now().checked_sub(TELEPORT_ADMISSION + Duration::from_secs(1))
         {
-            r.sup.teleports.lock().unwrap().insert(sid, (2, long_ago));
+            r.sup.teleports.lock().unwrap().insert(
+                sid,
+                Prepared {
+                    order: o.clone(),
+                    at: long_ago,
+                    have_want: None,
+                },
+            );
             assert_eq!(
                 join(sid, 1, teleport, true).await,
                 Some(HiveJoinRefusal::NotPrepared),
                 "run out"
             );
             assert!(!r.sup.reports_copies(), "and nothing to tell");
+        }
+    }
+
+    /// FR-90 P2f-2b — a teleport's prepare keeps where the session will run
+    /// here, and as whom, only when the server let the copy's workspace come
+    /// against what that folder's repository holds (`have_want`): the account
+    /// its gates mapped the owner to and the folder they resolved, for that
+    /// session, until the admission runs out. A refused prepare keeps
+    /// nothing.
+    #[tokio::test]
+    async fn a_teleports_prepare_keeps_its_place_only_with_have_and_want() {
+        let r = moving_rig(ObjectId::new(), 1);
+        let o = at_fence(&order(&r), 2);
+        let sid = o.session_id;
+        assert_eq!(
+            r.sup.prepare_teleport(&o, true, false).await,
+            Answer::accepted("dev")
+        );
+        assert!(
+            r.sup.have_want_place(sid).is_none(),
+            "without it, the whole pack: no folder to ask about"
+        );
+        assert_eq!(
+            r.sup.prepare_teleport(&o, true, true).await,
+            Answer::accepted("dev")
+        );
+        let (kept, account, folder) = r.sup.have_want_place(sid).expect("kept, with it");
+        assert_eq!(
+            (kept.session_id, kept.fence, account.as_str()),
+            (sid, 2, "dev")
+        );
+        assert_eq!(
+            Some(folder),
+            gates::folder_for(&r.sup.cfg, &o.folder).ok(),
+            "the folder its gates resolved"
+        );
+        assert!(
+            r.sup.have_want_place(ObjectId::new()).is_none(),
+            "for that session only"
+        );
+        let mut elsewhere = o.clone();
+        elsewhere.session_id = ObjectId::new();
+        elsewhere.folder = "/etc".into();
+        assert_eq!(
+            r.sup.prepare_teleport(&elsewhere, true, true).await.refused,
+            Some(HiveRefusal::FolderNotAllowed)
+        );
+        assert!(
+            r.sup.have_want_place(elsewhere.session_id).is_none(),
+            "a refused prepare keeps nothing"
+        );
+        if let Some(long_ago) =
+            Instant::now().checked_sub(TELEPORT_ADMISSION + Duration::from_secs(1))
+        {
+            if let Some(p) = r.sup.teleports.lock().unwrap().get_mut(&sid) {
+                p.at = long_ago;
+            }
+            assert!(r.sup.have_want_place(sid).is_none(), "run out");
         }
     }
 }

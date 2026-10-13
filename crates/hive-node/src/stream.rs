@@ -17,12 +17,15 @@
 //! | `events {events: [{seq, fence, ts_ms, prev_hash, len}]}`, then each event's JSON, `len` bytes | source | envelopes in `seq` order (P2d-3): from where the opening exchange left the member, then the live tail as it is appended |
 //! | `need {blobs}` | member | the blobs the next event names that it does not hold, by hash |
 //! | `ack {seq, hash}` | member | applied and on disk: the events up to `seq`, and every blob they name |
+//! | `want_pack {commit, haves}` | member | P2f-2b, in place of `need` for a checkpoint's whole pack, and only to a source whose hello said `packs`: the pack that brings `commit` into a repository holding `haves` |
 //!
 //! On a stream of its own, one per blob the member asked for:
 //!
 //! | Message | From | Says |
 //! |---|---|---|
 //! | `blob {hash, len}`, then its bytes | source | one blob of the `need` |
+//! | `pack {commit, against, chunks}` | source | P2f-2b, the answer to `want_pack`: the pack's chunks, kept by the source as blobs of the session for the member to `need` as any blob, and the commits it is thin against |
+//! | `no_pack {commit, why}` | source | P2f-2b: it cannot answer, and the member takes the whole pack |
 //!
 //! ⚠️ **A member asks for a blob; it is never pushed one.** A blob pushed
 //! ahead of the event that names it would reach the member before it could
@@ -47,7 +50,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::chain::{EventEnvelope, GENESIS};
-use crate::checkpoint::{CHUNK_MAX, Digest};
+use crate::checkpoint::{CHUNK_MAX, Chunk, Digest};
 use crate::event::TranscriptEvent;
 use crate::store::{Store, StoreError, hex};
 
@@ -75,6 +78,12 @@ pub const MAX_EVENT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_STREAM_BLOB: usize = CHUNK_MAX;
 /// P2d-3 — the most blobs one `need` asks for.
 pub const MAX_NEED: usize = 64;
+/// P2f-2b — the most commits a `want_pack` names, as many as the account's
+/// git is asked about (`MAX_HAVES` in the daemon's workspace).
+pub const MAX_WANT_HAVES: usize = 16;
+/// P2f-2b — the most chunks a `pack` answer lists: a pack of the largest a
+/// checkpoint carries (512 MiB), in chunks of [`CHUNK_MAX`].
+pub const MAX_PACK_CHUNKS: usize = 512 * 1024 * 1024 / CHUNK_MAX + 1;
 
 /// A point in a session's chain: an event's `seq`, and its hash as
 /// lowercase hex. Seq 0 is before the first event, at [`GENESIS`].
@@ -121,6 +130,11 @@ pub enum MemberMsg {
     /// P2d-3 — applied and on disk: the events up to `seq`, whose hash is
     /// `hash`, and every blob they name.
     Ack { seq: u64, hash: String },
+    /// P2f-2b — in place of `need` for a checkpoint's whole pack: the pack
+    /// that brings `commit` into a repository holding `haves` (git's have
+    /// and want). Answered on a stream of its own ([`BlobMsg::Pack`] or
+    /// [`BlobMsg::NoPack`]); sent only to a source whose hello said `packs`.
+    WantPack { commit: String, haves: Vec<String> },
 }
 
 /// What the source sends.
@@ -137,6 +151,10 @@ pub enum SourceMsg {
         /// lets the stream go. Absent (an older source) = live.
         #[serde(default = "live_unless_said")]
         live: bool,
+        /// P2f-2b — it answers `want_pack`. Absent (an older source) = it
+        /// does not: a member asks it for a whole pack's blobs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        packs: bool,
     },
     /// The member's tip is not in the source's chain: `at` is the newest
     /// checkpoint both hold (genesis, if none), past which the member sets
@@ -149,6 +167,9 @@ pub enum SourceMsg {
         /// P2d-3b — as in `hello`.
         #[serde(default = "live_unless_said")]
         live: bool,
+        /// P2f-2b — as in `hello`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        packs: bool,
     },
     /// The source cannot serve this stream.
     Refused { reason: String },
@@ -208,7 +229,24 @@ impl EventMeta {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum BlobMsg {
-    Blob { hash: Digest, len: u64 },
+    Blob {
+        hash: Digest,
+        len: u64,
+    },
+    /// P2f-2b — the answer to `want_pack`: the pack that brings `commit` into a
+    /// repository holding `against`, as chunks the source keeps as blobs of
+    /// the session, for the member to `need` as any blob. Nothing follows.
+    Pack {
+        commit: String,
+        against: Vec<String>,
+        chunks: Vec<Chunk>,
+    },
+    /// P2f-2b — `want_pack` cannot be answered: the member takes the whole
+    /// pack, by its blobs.
+    NoPack {
+        commit: String,
+        why: String,
+    },
 }
 
 /// P2d-3 — the blobs `env` names, each once, with its length: a
@@ -246,6 +284,9 @@ pub enum FrameError {
     /// P2d-3 — a `need` asking for none, or more than [`MAX_NEED`].
     #[error("a need of {0} blobs: one at least, {MAX_NEED} at most")]
     Need(usize),
+    /// P2f-2b — a `want_pack`, or its `pack` answer, that is not one.
+    #[error("a pack's have and want that is not one: {0}")]
+    Pack(String),
 }
 
 /// P2d-3 — an `events` frame's listing, checked before any of its JSON is
@@ -275,6 +316,68 @@ pub fn check_blob_len(len: u64) -> Result<usize, FrameError> {
 pub fn check_need(blobs: &[Digest]) -> Result<(), FrameError> {
     if blobs.is_empty() || blobs.len() > MAX_NEED {
         return Err(FrameError::Need(blobs.len()));
+    }
+    Ok(())
+}
+
+/// P2f-2b — an object id as git prints one: 40 or 64 lowercase hex digits.
+fn is_commit_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// P2f-2b — a `want_pack`'s names: a commit id each, at most
+/// [`MAX_WANT_HAVES`] haves, the commit not among them.
+pub fn check_want_pack(commit: &str, haves: &[String]) -> Result<(), FrameError> {
+    if !is_commit_id(commit) {
+        return Err(FrameError::Pack(format!("{commit:?} is not a commit id")));
+    }
+    if haves.is_empty() || haves.len() > MAX_WANT_HAVES {
+        return Err(FrameError::Pack(format!(
+            "{} haves: one at least, {MAX_WANT_HAVES} at most",
+            haves.len()
+        )));
+    }
+    match haves.iter().find(|h| !is_commit_id(h) || *h == commit) {
+        Some(h) => Err(FrameError::Pack(format!("{h:?} is not a have"))),
+        None => Ok(()),
+    }
+}
+
+/// P2f-2b — a `pack` answer held to the `want_pack` it answers: the same
+/// commit, thin only against commits the want named, and chunks that follow
+/// one another from offset 0, each a blob the stream carries, at most
+/// [`MAX_PACK_CHUNKS`]. The bytes are the blobs' to check, as they arrive.
+pub fn check_pack(
+    wanted: &str,
+    haves: &[String],
+    commit: &str,
+    against: &[String],
+    chunks: &[Chunk],
+) -> Result<(), FrameError> {
+    if commit != wanted {
+        return Err(FrameError::Pack(format!(
+            "a pack of {commit:?}, for {wanted:?}"
+        )));
+    }
+    if let Some(a) = against.iter().find(|a| !haves.contains(a)) {
+        return Err(FrameError::Pack(format!(
+            "a pack against {a:?}, which was no have"
+        )));
+    }
+    if chunks.is_empty() || chunks.len() > MAX_PACK_CHUNKS {
+        return Err(FrameError::Pack(format!(
+            "a pack of {} chunks",
+            chunks.len()
+        )));
+    }
+    let mut offset = 0u64;
+    for c in chunks {
+        if c.offset != offset || c.len == 0 || c.len > MAX_STREAM_BLOB as u64 {
+            return Err(FrameError::Pack(
+                "its chunks do not follow one another".into(),
+            ));
+        }
+        offset += c.len;
     }
     Ok(())
 }
@@ -366,6 +469,7 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg, live: bool) -> Result<Sour
             v: STREAM_V,
             tip: own,
             live,
+            packs: true,
         });
     }
     // Newest first, as the member listed them; at most as many as it may.
@@ -380,6 +484,7 @@ pub fn answer_hello(store: &Store, hello: &MemberMsg, live: bool) -> Result<Sour
         at,
         tip: Some(own),
         live,
+        packs: true,
     })
 }
 
@@ -447,6 +552,7 @@ mod tests {
             at: Mark::genesis(),
             tip: Some(Mark::genesis()),
             live: false,
+            packs: false,
         };
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
@@ -456,6 +562,7 @@ mod tests {
             v: 1,
             tip: Mark::genesis(),
             live: true,
+            packs: false,
         };
         assert_eq!(
             serde_json::to_value(&h).unwrap(),
@@ -477,6 +584,7 @@ mod tests {
                 at: Mark::genesis(),
                 tip: None,
                 live: true,
+                packs: false,
             }
         );
         assert_eq!(
@@ -523,6 +631,7 @@ mod tests {
                     v: STREAM_V,
                     tip: own.clone(),
                     live: true,
+                    packs: true,
                 }
             );
         }
@@ -534,6 +643,7 @@ mod tests {
                 v: STREAM_V,
                 tip: own,
                 live: false,
+                packs: true,
             }
         );
     }
@@ -566,6 +676,7 @@ mod tests {
                 at: common,
                 tip: own.clone(),
                 live: true,
+                packs: true,
             },
             "the newest checkpoint both hold, and where the source's chain ends"
         );
@@ -575,6 +686,7 @@ mod tests {
                 at: Mark::genesis(),
                 tip: own.clone(),
                 live: false,
+                packs: true,
             },
             "none both hold"
         );
@@ -588,6 +700,7 @@ mod tests {
                 at: Mark::genesis(),
                 tip: own,
                 live: true,
+                packs: true,
             },
             "a tip past the source's own end is not in its chain"
         );
@@ -812,5 +925,112 @@ mod tests {
             blobs_named(&unknown).is_empty(),
             "a kind this build cannot read"
         );
+    }
+
+    /// P2f-2b — the have and want's frames, by name; a source's hello says
+    /// it answers them, and one that does not say (an older source) does not.
+    #[test]
+    fn the_have_and_wants_frames_are_named_and_an_older_source_takes_none() {
+        let (c, h) = ("c".repeat(40), "a".repeat(40));
+        let want = MemberMsg::WantPack {
+            commit: c.clone(),
+            haves: vec![h.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(&want).unwrap(),
+            serde_json::json!({"t": "want_pack", "commit": c, "haves": [h]})
+        );
+        let chunk = Chunk {
+            offset: 0,
+            len: 3,
+            hash: Digest::of(b"abc"),
+        };
+        let pack = BlobMsg::Pack {
+            commit: c.clone(),
+            against: vec![h.clone()],
+            chunks: vec![chunk],
+        };
+        assert_eq!(
+            serde_json::to_value(&pack).unwrap()["t"],
+            serde_json::json!("pack")
+        );
+        assert_eq!(
+            serde_json::to_value(BlobMsg::NoPack {
+                commit: c.clone(),
+                why: "not_live".into()
+            })
+            .unwrap(),
+            serde_json::json!({"t": "no_pack", "commit": c, "why": "not_live"})
+        );
+        let zero = serde_json::json!({"seq": 0, "hash": hex(&GENESIS)});
+        let says =
+            serde_json::json!({"t": "hello", "v": 1, "tip": zero, "live": true, "packs": true});
+        assert!(matches!(
+            serde_json::from_value::<SourceMsg>(says).unwrap(),
+            SourceMsg::Hello { packs: true, .. }
+        ));
+        assert!(
+            matches!(
+                serde_json::from_value::<SourceMsg>(
+                    serde_json::json!({"t": "hello", "v": 1, "tip": zero})
+                )
+                .unwrap(),
+                SourceMsg::Hello { packs: false, .. }
+            ),
+            "an older source answers no want_pack"
+        );
+    }
+
+    /// P2f-2b — a want names commit ids, at least one have and at most
+    /// [`MAX_WANT_HAVES`], never the commit itself; a pack answers that want
+    /// alone, thin against its haves only, in chunks that follow one another.
+    #[test]
+    fn a_want_and_its_pack_are_held_to_each_other() {
+        let (c, h, x) = ("c".repeat(40), "a".repeat(40), "b".repeat(40));
+        assert!(check_want_pack(&c, std::slice::from_ref(&h)).is_ok());
+        for (commit, haves) in [
+            ("HEAD".to_string(), vec![h.clone()]),
+            (c.clone(), vec![]),
+            (c.clone(), vec![c.clone()]),
+            (c.clone(), vec!["--all".to_string()]),
+            (c.clone(), vec![h.clone(); MAX_WANT_HAVES + 1]),
+        ] {
+            assert!(
+                matches!(check_want_pack(&commit, &haves), Err(FrameError::Pack(_))),
+                "{commit} {haves:?}"
+            );
+        }
+        let chunk = |offset: u64, len: u64| Chunk {
+            offset,
+            len,
+            hash: Digest::of(b"x"),
+        };
+        let haves = vec![h.clone()];
+        let whole = [chunk(0, 4), chunk(4, 2)];
+        assert!(check_pack(&c, &haves, &c, std::slice::from_ref(&h), &whole).is_ok());
+        assert!(
+            check_pack(&c, &haves, &c, &[], &whole).is_ok(),
+            "a whole pack"
+        );
+        for (commit, against, chunks) in [
+            (x.clone(), vec![h.clone()], whole.to_vec()),
+            (c.clone(), vec![x.clone()], whole.to_vec()),
+            (c.clone(), vec![h.clone()], vec![]),
+            (c.clone(), vec![h.clone()], vec![chunk(1, 4)]),
+            (c.clone(), vec![h.clone()], vec![chunk(0, 4), chunk(5, 2)]),
+            (
+                c.clone(),
+                vec![h.clone()],
+                vec![chunk(0, MAX_STREAM_BLOB as u64 + 1)],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    check_pack(&c, &haves, &commit, &against, &chunks),
+                    Err(FrameError::Pack(_))
+                ),
+                "{commit} {against:?} {chunks:?}"
+            );
+        }
     }
 }
