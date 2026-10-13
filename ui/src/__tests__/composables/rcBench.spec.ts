@@ -7,12 +7,17 @@ import {
   BENCH_PROBE_TTL_MS,
   BENCH_STORAGE_KEY,
   BENCH_UPLOAD_EVERY,
+  PROBE_TARGET,
   benchSessionActive,
+  benchSessionMode,
   buildL4Upload,
   createBenchProber,
   createL4Uploader,
   createVideoBenchSampler,
+  probeTargetCellCentre,
+  probeTargetPointer,
   storedBench,
+  storedBenchMode,
   type BenchBatch,
 } from '@/composables/rcBench'
 
@@ -40,6 +45,81 @@ function manualTimers() {
 
 afterEach(() => {
   localStorage.removeItem(BENCH_STORAGE_KEY)
+})
+
+describe('rcBench — target mode (roomlerd probe-target)', () => {
+  it('reads the knob: 1 is probe, target is target, anything else is off', () => {
+    expect(storedBenchMode()).toBeNull()
+    localStorage.setItem(BENCH_STORAGE_KEY, '1')
+    expect(storedBenchMode()).toBe('probe')
+    localStorage.setItem(BENCH_STORAGE_KEY, 'target')
+    expect(storedBenchMode()).toBe('target')
+    localStorage.setItem(BENCH_STORAGE_KEY, 'Target')
+    expect(storedBenchMode()).toBeNull()
+  })
+
+  it('runs target mode on any agent, and probe mode only where bench is advertised', () => {
+    expect(benchSessionMode('target', [])).toBe('target')
+    expect(benchSessionMode('target', undefined)).toBe('target')
+    expect(benchSessionMode('probe', ['chunk-framing'])).toBeNull()
+    expect(benchSessionMode('probe', ['bench'])).toBe('probe')
+    expect(benchSessionMode(null, ['bench'])).toBeNull()
+  })
+
+  it('has the window geometry probe_target.rs paints', () => {
+    expect(PROBE_TARGET).toEqual({ width: 144, height: 80, padH: 32, cells: 16, cellW: 9 })
+  })
+
+  it('aims at the same cell centres probe_target.rs pins', () => {
+    // `every_cell_centre_lands_in_its_own_cell` in probe_target.rs pins these
+    // too: if either side drifts, one of the two suites fails.
+    expect(probeTargetCellCentre(1920, 1080, 1)).toEqual({ x: 1780, y: 1016 })
+    expect(probeTargetCellCentre(1920, 1080, 16)).toEqual({ x: 1915, y: 1016 })
+    expect(probeTargetCellCentre(2560, 1600, 7)).toEqual({ x: 2474, y: 1536 })
+    expect(probeTargetCellCentre(1920, 1080, 0)).toBeNull()
+    expect(probeTargetCellCentre(1920, 1080, 17)).toBeNull()
+    expect(probeTargetCellCentre(100, 1080, 1)).toBeNull()
+  })
+
+  it('lands each normalised move on its pixel through the agent mapping', () => {
+    // The agent maps round(x · (w − 1)) (`map_normalised_to_virtual`).
+    for (const [w, h] of [
+      [1920, 1080],
+      [2560, 1600],
+      [3840, 2160],
+      [1366, 768],
+    ] as const) {
+      for (let cell = 1; cell <= PROBE_TARGET.cells; cell++) {
+        const p = probeTargetPointer(w, h, cell)!
+        const c = probeTargetCellCentre(w, h, cell)!
+        expect(Math.round(p.x * (w - 1)), `${w}x${h} cell ${cell} x`).toBe(c.x)
+        expect(Math.round(p.y * (h - 1)), `${w}x${h} cell ${cell} y`).toBe(c.y)
+      }
+    }
+  })
+
+  it('numbers target probes 1..16, so a probe is a cell', () => {
+    const sent: number[] = []
+    const pending: Array<() => void> = []
+    const p = createBenchProber({
+      send: (m) => {
+        sent.push(m.seq)
+        return true
+      },
+      arm: () => {},
+      now: () => 0,
+      random: () => 0,
+      maxSeq: PROBE_TARGET.cells,
+      setTimer: (fn) => {
+        pending.push(fn)
+        return fn
+      },
+      clearTimer: () => {},
+    })
+    p.start()
+    for (let i = 0; i < 18; i++) pending.shift()!()
+    expect(sent).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1, 2])
+  })
 })
 
 describe('rcBench — the gate', () => {
