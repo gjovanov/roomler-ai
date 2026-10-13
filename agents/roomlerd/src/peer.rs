@@ -416,8 +416,8 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
-        // FR-101 P1 — replay windows on SRTP/SRTCP (webrtc-srtp has none by
-        // default) and GCM-only DTLS, each with its own switch back.
+        // FR-101 P1 — GCM-only DTLS, with its switch back, and the SRTP/SRTCP
+        // replay windows pinned at 64 (webrtc-srtp's session default too).
         let transport = crate::rc_transport::Policy::from_env();
         transport.apply(&mut setting);
         // FR-16 L0 — the loopback harness routes this session's ICE through a
