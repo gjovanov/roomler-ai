@@ -37,7 +37,9 @@ use roomler_ai_services::dao::{
     recording_activity::RecordingActivityDao, remote_audit::RemoteAuditDao,
     remote_session::RemoteSessionDao, transfer_activity::TransferActivityDao,
 };
-use roomler_core::{AgentSocketHooks, Capabilities, Core, Module, TenantCtx};
+use roomler_core::{
+    AgentSocketHooks, Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter,
+};
 
 pub mod agent_socket;
 pub mod controller;
@@ -60,6 +62,9 @@ pub struct RemoteState {
     /// host's claims, beside the `CLIPBOARD` / `FILES` grant in
     /// `remote_audit`).
     pub transfer_activity: Arc<TransferActivityDao>,
+    /// FR-101 P4a — the per-(caller, device) ceiling on session requests,
+    /// checked after the authz gate (`controller::SESSION_REQUESTS_PER_MINUTE`).
+    pub session_request_limiter: Arc<RateLimiter>,
     /// PR-2 relay — owner-side proxy controllers for cross-pod rc sessions,
     /// keyed by the ORIGIN connection id. See [`relay`].
     pub rc_proxy_controllers: Arc<relay::ProxyControllers>,
@@ -96,6 +101,7 @@ impl Module for RemoteState {
             remote_audit: Arc::new(RemoteAuditDao::new(db)),
             recording_activity: Arc::new(RecordingActivityDao::new(db)),
             transfer_activity: Arc::new(TransferActivityDao::new(db)),
+            session_request_limiter: Arc::new(RateLimiter::new()),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
             fleet,
