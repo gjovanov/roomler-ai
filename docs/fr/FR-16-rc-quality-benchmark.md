@@ -170,7 +170,13 @@ L1–L3. Anchors are master `c2e79221b`.
   target `rc.l4`, timing metadata only), so fleet runs are queryable in `agent_logs`.
 - **The host path.** `roomlerd probe-target` is a small topmost window that flips the marker
   on **real OS input**. It is the only cell that includes injection and the host's own
-  compositor. Field-only.
+  compositor. Field-only. **Built** (`agents/roomlerd/src/probe_target.rs`): it sits flush in
+  the primary monitor's bottom-right corner, 144 × 80 physical px, with 16 cells above the
+  marker area. The viewer's `target` mode (`roomler-rc-bench=target`) probes with pointer
+  moves onto the cells, aimed with `rc:video-info`'s native size. The window paints the cell's
+  number where the bottom-right decoder reads. It runs on every Windows build, release
+  profiles included, through `windows-sys`; Linux and macOS hosts bench with a
+  synthetic-source build ([testing.md](../testing.md#l4-on-a-release-build-roomlerd-probe-target)).
 - **Nightly.** `rc-bench.spec.ts` runs in the pwrunner sidecar against the synthetic e2e
   agent (`Dockerfile.agent-e2e`) and records the L4 trend.
 
@@ -194,7 +200,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`c85b3ba28`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
-| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. Owed: an end-to-end session against a bench agent, `probe-target`, the nightly spec, the baselines |
+| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. **`probe-target` built**: the window (`probe_target.rs`) and the viewer's `target` mode. Owed: an end-to-end session against a bench agent or a probe-target host, the nightly spec, the baselines |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
 | D | Docs | — | — |
@@ -246,3 +252,5 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-13 | L4 in process, the same build | **Negative control, red:** with a probe dropped in the input handler before it reaches the source (one marked line), the test failed `probe: 0 round trips measured, want ≥ 20` (exit 101), with every L0 cell unaffected. Restored from the commit; the diff was that one line. |
 | 2026-10-13 | L4 viewer half, headless Chromium 151 (Playwright), the real TS modules bundled | **The browser's reader on frames Chromium decoded itself.** Two markers painted on a canvas: the frame's own number bottom-left, a probe bottom-right. Each case went through `readProbe`, the worker sampler's real `copyTo({rect})` path. A canvas-backed BGRA frame read correctly. Through Chromium's WebCodecs encode → decode: VP9 640×360 at 500 kbps 12/12 I420 frames, VP9 at 150 kbps 12/12, VP9 1280×720 scaled 2× to 640×360 12/12 (the k=2 path), H.264 at 500 kbps 12/12. A canvas played through `<video>` and read in `requestVideoFrameCallback` by `readVideoProbe`: 20/20. Every copy was the 144×48 corner, never the whole picture. |
 | 2026-10-13 | the same harness | **Negative control:** the same frames with no probe painted read `null` in every case (0 of 69 frames), although each still carried its own number bottom-left. So the reader can fail, and it does not invent a number. Not yet run: a session against a bench agent. |
+| 2026-10-13 | `probe-target`, a debug build, the Windows dev box | **The window, on a real desktop.** `roomlerd probe-target --seconds 4` placed itself at `144x80 at (2416,1520) on a 2560x1600 primary monitor`, flush in the corner in physical pixels on a 150 %-scaled display. A DPI-aware screenshot of the corner showed it above the taskbar: the 16 alternating pad cells, and the plain mid-grey marker area of the "no move yet" state. It closed on its own timer, leaving no process. Its unit tests pin the layout, the cell under each point, the cell centres (the viewer pins the same vectors and checks the agent's mapping lands on each exact pixel), and a painted cell reading back from a frame's bottom-right through the decoder, with nothing read before the first move. Not yet run: a pointer move into the pad. That would move the pointer of the person using this box, so it waits for a bench host. |
+| 2026-10-13 | the same | **Negative control, red:** a window that reads its cells 10 px wide instead of 9 (one marked line in `cell_at`) failed `every_cell_centre_lands_in_its_own_cell` (cell 6's centre read back as 5) and `a_point_maps_to_its_cell_and_the_marker_area_to_none`. A drift between where the viewer aims and where the window reads is caught. Restored from the commit; the diff was that one line. |

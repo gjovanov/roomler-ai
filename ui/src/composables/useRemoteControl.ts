@@ -64,13 +64,16 @@ import {
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import {
-  benchSessionActive,
+  PROBE_TARGET,
+  benchSessionMode,
   benchStats,
   createBenchProber,
   createL4Uploader,
   createVideoBenchSampler,
   formatBenchLine,
-  storedBench,
+  probeTargetPointer,
+  storedBenchMode,
+  type BenchMode,
   type BenchPath,
   type BenchProber,
   type VideoBenchSampler,
@@ -4485,10 +4488,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  been sent — an unframed stream parsed as framed is garbage, not a
    *  degraded picture, so the two must move together. */
   let sessionChunkFraming = false
-  /** FR-16 L4 — true when THIS session runs the bench probe: the knob
-   *  `roomler-rc-bench=1` is set AND the agent advertised `bench` in
-   *  `AgentCaps.video`. Resolved beside `sessionChunkFraming`, before any
-   *  worker gets its `init-canvas`, which carries it. */
+  /** FR-16 L4 — how THIS session times input to photon, if at all:
+   *  `probe` when the knob `roomler-rc-bench=1` is set AND the agent
+   *  advertised `bench` in `AgentCaps.video`; `target` when the knob says
+   *  `target` (a `roomlerd probe-target` window on the host paints the
+   *  answers). Resolved beside `sessionChunkFraming`, before any worker gets
+   *  its `init-canvas`, which carries `sessionBench`. */
+  let sessionBenchMode: BenchMode | null = null
   let sessionBench = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
@@ -5648,6 +5654,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  /** FR-16 L4, target mode — the probe is a real pointer move onto cell
+   *  `seq` of the host's `roomlerd probe-target` window. Aimed with the
+   *  agent's reported native size, since the window lives in the host's own
+   *  pixels however the stream is scaled. Same gates as `sendInput`. */
+  function sendBenchTargetMove(probe: { t: 'probe'; seq: number }): boolean {
+    if (!inputGranted.value) return false
+    const ch = channels.input
+    if (!ch || ch.readyState !== 'open') return false
+    const video = benchSurface?.querySelector('video') as HTMLVideoElement | null
+    const monW = videoInfo.value?.native_w || mediaIntrinsicW.value || video?.videoWidth || 0
+    const monH = videoInfo.value?.native_h || mediaIntrinsicH.value || video?.videoHeight || 0
+    const p = probeTargetPointer(monW, monH, probe.seq)
+    if (!p) return false
+    try {
+      ch.send(JSON.stringify({ t: 'mouse_move', x: p.x, y: p.y, mon: 0 }))
+      return true
+    } catch {
+      return false
+    }
+  }
+
   /** FR-16 L4 — a sampler read probe `seq` off a frame painted at
    *  `paintedAt` (epoch ms). */
   function onBenchProbe(seq: unknown, paintedAt: unknown, path: BenchPath) {
@@ -5664,8 +5691,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       findVideo: () => (benchSurface?.querySelector('video') as HTMLVideoElement | null) ?? null,
       onProbe: (seq, paintedAt) => onBenchProbe(seq, paintedAt, 'video'),
     })
+    const target = sessionBenchMode === 'target'
     benchProber = createBenchProber({
-      send: sendBenchProbe,
+      send: target ? sendBenchTargetMove : sendBenchProbe,
+      maxSeq: target ? PROBE_TARGET.cells : undefined,
       arm: (seq) => {
         hevcWorker?.postMessage({ type: 'bench-arm', seq })
         vp9_444Worker?.postMessage({ type: 'bench-arm', seq })
@@ -9294,8 +9323,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       && (agent?.value?.capabilities?.video ?? []).includes('chunk-framing')
     // FR-16 L4 — the same rule for the bench probe: on only when the agent
     // will answer it, decided before any worker is told.
-    sessionBench = benchSessionActive(storedBench(), agent?.value?.capabilities?.video)
-    if (sessionBench) console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
+    sessionBenchMode = benchSessionMode(storedBenchMode(), agent?.value?.capabilities?.video)
+    sessionBench = sessionBenchMode !== null
+    if (sessionBenchMode === 'probe') {
+      console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
+    } else if (sessionBenchMode === 'target') {
+      console.info('[rc] bench mode: target — probing with pointer moves onto the host\'s `roomlerd probe-target` window (FR-16 L4)')
+    }
 
     // Everything above this point - the local-relay probe and the
     // browser's MediaCapabilities decode probes - runs before a single
