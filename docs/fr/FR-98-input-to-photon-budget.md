@@ -69,7 +69,7 @@ are not a result.
 | C3 | **Input gap 8 → 4 ms** (0 and 2 measured too) | `useRemoteControl.ts` L5552 | viewer knob `roomler-rc-input-gap` |
 | C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `ROOMLERD_CURSOR_POLL_MS` (2–50 ms) |
 | C5 | **NVENC preset `p1`–`p3` × tune `ull`** | `encoder.rs` L329–330 | the existing `ROOMLERD_FFMPEG_PRESET` / `_TUNE`; bake the winner per backend |
-| C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `rtp_playout_delay_zero` |
+| C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` (off) |
 
 ⚠️ **No new per-frame reads in the pump.** FR-70 M3 makes the media thread read an immutable plan. Until
 then, every switch above is read once per open (`peer.rs` L5353–5391), never per frame.
@@ -108,7 +108,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | `roomler-rc-input-gap` unset (8 ms); `ROOMLERD_CURSOR_POLL_MS` unset (8 ms) | **knobs built**, defaults unchanged: `storedInputGapMs` (0–16 ms, read once per viewer) and `capture::cursor::poll_interval` (2–50 ms, read once per session). The 0/2/4 ms A/B on L4 is owed, and open decision 3 waits on it |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
-| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `rtp_playout_delay_zero=false` | — |
+| P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` unset | **built**, default off: `agents/roomlerd/src/rtp_playout.rs`. Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell proves the wire; every other cell proves the off state. Owed: the Chrome measurement (`jitterBufferDelay ÷ jitterBufferEmittedCount` from `getStats`, and L4 on the `<video>` path, on and off) and then the Known-Issue verdict, AC6 |
 | P6 | Docs, and the final field table | — | — |
 
 ## 6. Acceptance criteria
@@ -168,6 +168,8 @@ Planned cells. Each records the deployed build first.
 | L0 | 2026-10-13 | P1 branch, unoptimised, Windows dev box | **Wrong turn, recorded.** The first run read `gate_lgcy` p50 59.8 ms and `gate_slot` p50 45.5 ms, far above `clean`'s 12.6. The emulation stood a timer in for `FrameArrived`, and when the slot was empty it counted that timer's overshoot (up to a Windows timer tick) against both gates. Real WGC wakes the reader on the event itself. Fixed: a frame waited for lands when the wait ends; a frame already in the slot lands on schedule, and its wait is the gate's |
 | L0 | 2026-10-13 | the same | **Green:** `clean` p50 12.8 ms · `gate_slot` p50 13.9 ms, p95 18.3, 25.1 fps from the 25 fps source · `gate_lgcy` p50 36.1 ms, p95 51.3, **21.9 fps**. So the slot-first gate cut p50 by **22.2 ms** (bound: ≥ 10, a quarter of 40 ms), and it also kept the frames the legacy gate dropped when its cadence fell a whole period behind |
 | L0 | 2026-10-13 | the same | **Negative control, red:** a slot-first gate that always sleeps a period (one marked line in `SlotFirst::wait`) failed `gate_slot: 12.7 fps decoded from a 25 fps source` (exit 101). Its p50 difference was 4.9 ms (legacy 35.7, broken slot-first 30.8), which the C1 bound would have refused too. Restored from the commit; the diff was that one line |
+| L0 | 2026-10-13 | P5 branch, unoptimised, Windows dev box | **C6, the wire, green.** The controller offers `playout-delay` the way Chrome does. With the switch off (every cell but one), the answer negotiates nothing, so the default stays byte-identical. `playout0` (switch on): negotiated, **217 of 217** video packets at 0/0 (0 other, 0 without), 30.2 fps, p50 11.9 ms, the same as `clean`. L0's controller has no jitter buffer, so this proves the wire, not the effect on Chrome |
+| L0 | 2026-10-13 | the same | **Negative control, red:** with the switch on but the pump not writing the extension (one marked line), the test failed `playout0: want playout-delay 0/0 on every packet, saw PlayoutSeen { negotiated: true, zero: 0, other: 0, without: 217 }` (exit 101). Restored from the commit; the diff was that one line |
 
 ## 10. Related
 

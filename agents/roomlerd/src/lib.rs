@@ -121,6 +121,9 @@ pub mod relay_probe;
 /// FR-19 P1d — the org-relay reachability responder (process-wide, opt-in).
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod relay_server;
+/// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
+/// browser's jitter buffer renders as soon as it decodes (default off).
+pub mod rtp_playout;
 /// FR-84 D5b — the companion's Devices page: the org's device list and mesh,
 /// asked of the server with the org's agent token.
 pub mod self_view;

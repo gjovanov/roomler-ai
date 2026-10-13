@@ -360,6 +360,12 @@ impl AgentPeer {
         engine
             .register_default_codecs()
             .context("register default codecs")?;
+        // FR-98 C6 — only a session that sends `playout-delay` registers it,
+        // so with the switch off the answer stays byte-identical.
+        if crate::rtp_playout::enabled() {
+            crate::rtp_playout::register(&mut engine)?;
+            info!(%session_id, "rtp playout-delay 0/0 offered on the video track (FR-98 C6)");
+        }
 
         // Install NACK responder + TWCC + RTCP reports. Without these
         // interceptors the sender silently drops NACK retransmit requests,
@@ -2371,6 +2377,9 @@ async fn media_pump(
     // first sample uses the nominal floor derived from target_fps.
     let mut frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
     let mut last_sample_at: Option<std::time::Instant> = None;
+    // FR-98 C6 — read once per open, never per frame (FR-70). The extension
+    // goes on a packet only if this session's answer negotiated it.
+    let playout_zero = crate::rtp_playout::enabled().then(|| [crate::rtp_playout::zero()]);
 
     // Keep the most recent captured frame around so we can re-feed it to
     // the encoder during idle periods. DXGI Desktop Duplication only
@@ -2954,7 +2963,11 @@ async fn media_pump(
                 prev_dropped_packets: 0,
                 prev_padding_packets: 0,
             };
-            if let Err(e) = track.write_sample(&sample).await {
+            let written = match &playout_zero {
+                Some(ext) => track.write_sample_with_extensions(&sample, ext).await,
+                None => track.write_sample(&sample).await,
+            };
+            if let Err(e) = written {
                 write_errors += 1;
                 // Elevated from debug — silent drops were hiding the real
                 // problem during first-bringup on Windows.

@@ -25,6 +25,7 @@
 //! | `probe` | no delay, L4 probes on | a probe sent on the `input` channel comes back painted into decoded frames |
 //! | `probe50` | +50 ms one way, L4 probes on | the probe round trip rises by ≥ 80 ms: it crosses the link in both directions |
 //! | `gate_lgcy` / `gate_slot` | an emulated 25 fps event-driven source behind each capture gate (FR-98 C1) | the slot-first gate's p50 is lower by ≥ a quarter period: the clock starts when a frame lands in the slot, so a frame the legacy gate holds there counts its wait |
+//! | `playout0` | no delay; the agent's `playout-delay` 0/0 switch on (FR-98 C6) | the extension is negotiated and on every video packet at 0/0, without costing frames. In every other cell (the switch off) the answer does not negotiate it at all, though the controller offers it as Chrome does |
 //!
 //! The two `probe` cells are L4 in process. A bench viewer sends
 //! `{"t":"probe","seq":N}` on the input DataChannel; the synthetic source
@@ -120,6 +121,22 @@ struct Cell {
     /// FR-98 C1: the synthetic source emulates an event-driven source
     /// behind this capture gate, and the clock starts when a frame lands.
     compositor: Option<synthetic_backend::TestCompositor>,
+    /// FR-98 C6: force the agent's `playout-delay` 0/0 switch for this
+    /// session (`None` reads the environment, which is off here).
+    playout_zero: Option<bool>,
+}
+
+/// What the controller saw of the `playout-delay` extension.
+#[derive(Debug, Default, Clone, Copy)]
+struct PlayoutSeen {
+    /// The answer negotiated the extension at all.
+    negotiated: bool,
+    /// Packets carrying min = max = 0.
+    zero: u64,
+    /// Packets carrying any other value.
+    other: u64,
+    /// Packets without it, on a session that negotiated it.
+    without: u64,
 }
 
 /// What one cell measured.
@@ -132,6 +149,7 @@ struct Run {
     freezes: usize,
     idr: usize,
     window: Duration,
+    playout: PlayoutSeen,
 }
 
 /// The `p`-quantile of `samples`, NaN when empty.
@@ -371,6 +389,9 @@ fn ice_timeouts(s: &mut SettingEngine) {
 async fn controller_peer(net: Arc<Net>) -> Result<Arc<RTCPeerConnection>> {
     let mut engine = MediaEngine::default();
     engine.register_default_codecs()?;
+    // Offer `playout-delay` the way Chrome does, so the agent's answer
+    // decides whether it is negotiated (FR-98 C6).
+    roomlerd::rtp_playout::register(&mut engine)?;
     // The browser's receive-side interceptors: NACK generation and receiver
     // reports, so loss behaves as it does against Chrome.
     let registry = register_default_interceptors(Registry::new(), &mut engine)?;
@@ -398,6 +419,7 @@ async fn controller_peer(net: Arc<Net>) -> Result<Arc<RTCPeerConnection>> {
 async fn run_cell(cell: Cell) -> Result<Run> {
     synthetic_backend::set_test_gate(cell.gate);
     synthetic_backend::set_test_compositor(cell.compositor);
+    roomlerd::rtp_playout::set_test_override(cell.playout_zero);
     let (agent_net, controller_net, wan) = vnet_pair(&cell).await?;
     l0::set_setting_engine_hook(Some(Arc::new(move |s: &mut SettingEngine| {
         s.set_vnet(Some(Arc::clone(&agent_net)));
@@ -457,20 +479,31 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     // Decoded frames: (decode-done instant, latency).
     let results: Arc<std::sync::Mutex<Vec<(Instant, Duration)>>> = Arc::default();
     let idr_count = Arc::new(AtomicU64::new(0));
+    let playout: Arc<std::sync::Mutex<PlayoutSeen>> = Arc::default();
     {
         let results = Arc::clone(&results);
         let idr_count = Arc::clone(&idr_count);
         let sent = Arc::clone(&sent);
         let probe_rtts = Arc::clone(&probe_rtts);
+        let playout = Arc::clone(&playout);
         let pc_weak = Arc::downgrade(&pc);
         pc.on_track(Box::new(move |track, _, _| {
             let results = Arc::clone(&results);
             let idr_count = Arc::clone(&idr_count);
             let sent = Arc::clone(&sent);
             let probe_rtts = Arc::clone(&probe_rtts);
+            let playout = Arc::clone(&playout);
             let pc_weak = pc_weak.clone();
             Box::pin(async move {
                 let ssrc = track.ssrc();
+                // FR-98 C6: the id the answer gave `playout-delay`, if any.
+                let playout_id = track
+                    .params()
+                    .header_extensions
+                    .iter()
+                    .find(|e| e.uri == roomlerd::rtp_playout::URI)
+                    .map(|e| e.id as u8);
+                playout.lock().unwrap().negotiated = playout_id.is_some();
                 tokio::spawn(async move {
                     let mut asm = Assembler::default();
                     let mut decoder = match openh264::decoder::Decoder::new() {
@@ -494,6 +527,19 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                         let _ = pc.write_rtcp(&pli(ssrc)).await;
                     }
                     while let Ok((pkt, _)) = track.read_rtp().await {
+                        if let Some(id) = playout_id {
+                            use webrtc::util::Unmarshal;
+                            let mut seen = playout.lock().unwrap();
+                            match pkt.header.get_extension(id) {
+                                Some(mut raw) => {
+                                    match webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::unmarshal(&mut raw) {
+                                        Ok(p) if p.min_delay == 0 && p.max_delay == 0 => seen.zero += 1,
+                                        _ => seen.other += 1,
+                                    }
+                                }
+                                None => seen.without += 1,
+                            }
+                        }
                         let (aus, skipped) = asm.push(
                             pkt.header.sequence_number,
                             pkt.header.timestamp,
@@ -627,6 +673,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     l0::set_setting_engine_hook(None);
     synthetic_backend::set_test_gate(Duration::ZERO);
     synthetic_backend::set_test_compositor(None);
+    roomlerd::rtp_playout::set_test_override(None);
     let _ = wan.lock().await.stop().await;
 
     let samples = results.lock().unwrap().clone();
@@ -647,6 +694,7 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         probe_ms,
         decoded: kept.len(),
         idr: idr_count.load(Ordering::Relaxed) as usize,
+        playout: *playout.lock().unwrap(),
         ..Default::default()
     };
     if let (Some(a), Some(b)) = (kept.first(), kept.last()) {
@@ -665,6 +713,7 @@ const fn cell(name: &'static str, delay_ms: u64, loss_permille: u32, gate_ms: u6
         gate: Duration::from_millis(gate_ms),
         probe: false,
         compositor: None,
+        playout_zero: None,
     }
 }
 
@@ -731,6 +780,10 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
     let gate_slot = gate_cell("gate_slot", GateMode::SlotFirst);
 
     let mut runs = Vec::new();
+    let playout0 = Cell {
+        playout_zero: Some(true),
+        ..cell("playout0", 0, 0, 0)
+    };
     for c in [
         clean,
         delay100,
@@ -740,9 +793,10 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         probe_delay50,
         gate_legacy,
         gate_slot,
+        playout0,
     ] {
         let run = rt.block_on(run_cell(c)).unwrap_or_else(|e| panic!("{e:#}"));
-        println!("{}", run.line(&c));
+        println!("{} | playout {:?}", run.line(&c), run.playout);
         runs.push(run);
     }
     let [
@@ -754,7 +808,28 @@ fn l0_capture_to_decode_latency_sees_the_network_and_the_pipeline() {
         probe50_run,
         legacy_run,
         slot_run,
-    ] = <[Run; 8]>::try_from(runs).unwrap();
+        playout_run,
+    ] = <[Run; 9]>::try_from(runs).unwrap();
+
+    // FR-98 C6. Off (the default), the agent does not even register the
+    // extension, so an answer to an offer that carries it negotiates nothing
+    // and the session is byte-identical to before.
+    assert!(
+        !clean_run.playout.negotiated,
+        "clean: the answer negotiated playout-delay with the switch off: {:?}",
+        clean_run.playout
+    );
+    // On, it is negotiated and on every video packet, at 0/0.
+    let p = playout_run.playout;
+    assert!(
+        p.negotiated && p.zero > 0 && p.other == 0 && p.without == 0,
+        "playout0: want playout-delay 0/0 on every packet, saw {p:?}"
+    );
+    assert!(
+        playout_run.fps() >= SOURCE_FPS * CLEAN_FPS_FLOOR,
+        "playout0: {:.1} fps decoded: writing the extension must not cost frames",
+        playout_run.fps()
+    );
 
     // `clean`: frames flow at the source rate, through a real pipeline.
     assert!(
