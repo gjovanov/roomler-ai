@@ -273,10 +273,20 @@ flowchart LR
 | The ledger lives in `HKLM\SOFTWARE`, never a file under `%ProgramData%` | `host_ledger::store` | Any account may create a file in `%ProgramData%`, and SYSTEM acts on the ledger at boot: a planted one would choose the adapter SYSTEM switches forwarding off on. Only SYSTEM and Administrators may write below `HKLM\SOFTWARE` |
 | GUIDs are validated strictly before going back into PowerShell | `host_ledger::is_guid` | The ledger is read back at boot |
 | `New-NetNat` failures carry WinNAT's own message to the log | `nat.rs` Windows `setup` | `-ErrorAction SilentlyContinue` used to hide why a NAT never appeared (an overlapping Docker/WSL prefix) |
+| (P0b-2c) Our adapter comes up **not** forwarding | `tun.rs` Windows `up()`, `winroute::forwarding_enabled_v4` | The boot purge cannot reach it: the adapter goes with the process, and Windows re-applies its forwarding setting when it is created again (field: Enabled after `taskkill /F`) |
+| (P0b-2c) The ledger records our WinNAT instances; the revert forgets them and the purge removes them | `host_ledger::record_nat` / `forget_nat`, `nat::remove_nat_instances` | A crash left `roomler-overlay` behind (field, 0.4.134 and the P0b-2b candidate alike). Only names like ours are removed (`host_ledger::is_nat_name`), never Docker's or WSL's instance for the same prefix |
 
 > ⚠️ Linux is deliberately unchanged: the revert there leaves `ip_forward` on.
 > That sysctl is host-global and routinely shared with Docker and Kubernetes,
 > so switching it off on the way out could break them.
+
+> ⚠️ **WinNAT comes with Hyper-V, not with the edition.** The class `setup`
+> manages WinNAT through (`MSFT_NetNat`) is registered by the Hyper-V feature.
+> Windows Home cannot install it (`Invalid class`); Pro and Enterprise leave it
+> off by default (`Not found`). Field, a Windows 11 Enterprise eval VM: absent
+> with Hyper-V and Containers off, still absent with Containers on, present
+> once Hyper-V was enabled. A device without it withholds the exit and subnet
+> offer and says so (`roomler status`, and the admin row).
 
 ### Exit-client pins (FR-97 P0e)
 
@@ -323,7 +333,7 @@ flowchart LR
 | **Client**: v6 egress through an exit | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
 | **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]`, re-pinned when the uplink moves (FR-97 P0e) | IP Helper route via the uplink's gateway, re-pinned when the uplink moves (FR-97 P0e) | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
 | **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | ✗ not yet (FR-97 P1c): `roomler status` says `DNS NOT steered` |
-| **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT; not on Windows Home, which withholds the offer (#2077) | ✗ not yet (FR-97 P1b): the offer is withheld |
+| **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT, which needs the Hyper-V feature; without it (always on Home) the offer is withheld (#2077) | ✗ not yet (FR-97 P1b): the offer is withheld |
 | **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | ✗ |
 
 A device that cannot serve as an exit advertises nothing and says why, in
