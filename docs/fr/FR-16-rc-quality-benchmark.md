@@ -149,8 +149,10 @@ L1–L3. Anchors are master `c2e79221b`.
 - ⚠️ **Probes go out at a jittered interval.** A period that is a multiple of the frame
   interval (250 ms is 15 frames at 60 fps) lands every probe on the same phase of the capture
   clock. The run would then report one arbitrary point of the wait for the next capture
-  instead of its distribution. Measured in process: two cells differed by up to a frame
-  interval for no reason.
+  instead of its distribution, and two runs could differ by up to a frame interval for that
+  reason alone. That follows from the arithmetic; it is not a measurement. The in-process
+  harness jitters for the same reason, and its first run did not isolate the effect (field
+  log, 2026-10-13).
 - **The sample** is taken from `frame.clone()` with `copyTo({rect})`, plane 0 only, so the
   paint path is untouched. A GPU-backed frame reads back whole, about 1–2 ms at 1080p. So
   the worker samples one frame in N, and only in bench mode.
