@@ -232,11 +232,14 @@ pub(crate) fn floor_safe(
     !non_overlay_v4.iter().copied().any(inside) && !orig_gateway_v4.is_some_and(inside)
 }
 
-/// macOS — one `route -n get` answer, reduced to the fields a re-assert or an
-/// exemption decides on. BSD `route` prints `key: value` lines; a host route
-/// has no `mask:` line, a lookup that fell through prints the COVERING route
+/// macOS — one `route -n get` answer, reduced to the fields a re-assert or the
+/// uplink decides on. BSD `route` prints `key: value` lines; a host route has
+/// no `mask:` line, a lookup that fell through prints the COVERING route
 /// (`destination: default`), and one that matched nothing at all prints no
 /// `destination:` (`not in table`) ⇒ `None`.
+///
+/// ⚠️ A lookup is never the read-back of an exemption pin: it can answer with
+/// a scoped clone instead (see [`BsdTableRow`]).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BsdRouteGet {
@@ -246,15 +249,6 @@ pub(crate) struct BsdRouteGet {
     /// for a route with no next hop.
     pub(crate) gateway: Option<String>,
     pub(crate) interface: Option<String>,
-    /// The names inside `flags: <UP,GATEWAY,HOST,DONE,STATIC>`.
-    pub(crate) flags: Vec<String>,
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl BsdRouteGet {
-    pub(crate) fn has_flag(&self, name: &str) -> bool {
-        self.flags.iter().any(|f| f == name)
-    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -271,16 +265,6 @@ pub(crate) fn parse_bsd_route_get(out: &str) -> Option<BsdRouteGet> {
             got.gateway = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("interface:") {
             got.interface = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("flags:") {
-            got.flags = v
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .split(',')
-                .map(str::trim)
-                .filter(|f| !f.is_empty())
-                .map(str::to_string)
-                .collect();
         }
     }
     destination.map(|destination| BsdRouteGet { destination, ..got })
@@ -358,44 +342,78 @@ pub(crate) fn bsd_default_uplink(
     })
 }
 
-/// FR-97 P1a — a static host route for exactly `ip`, wherever it points: the
-/// one shape this device may repoint in place or remove. A lookup that fell
-/// through to a covering route is not one, and neither is a clone.
+/// FR-97 P1a — one row of `netstat -rnW -f inet[6]`: the routing TABLE, not a
+/// lookup.
+///
+/// ⚠️ A pin is read from the table because a lookup does not show it. Once a
+/// connection has gone out through the default route, the kernel keeps an
+/// interface-scoped clone for its destination (`WASCLONED,IFSCOPE`), and an
+/// unscoped `route -n get` answers with that clone even after an unscoped
+/// static host route for the same address went in: the lookup prefers a
+/// route scoped to the primary interface over an unscoped one of the same
+/// length. Field, a tart Mac on 0.4.133, 2026-10-13: `route -n add -host`
+/// returned 0 and `netstat` listed the pin (`UGHS en0`), while `route -n get`
+/// still answered `WASCLONED,IFSCOPE`. Read back by lookup, every pin for the
+/// coordination server, whose WebSocket always holds such a clone, was
+/// refused, and each refused pin stayed in the table untracked. `route
+/// change` resolves its target the same way and left the pin as it was.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn bsd_static_host_route(got: Option<&BsdRouteGet>, ip: std::net::IpAddr) -> bool {
-    got.is_some_and(|got| {
-        bsd_addr(&got.destination, ip.is_ipv6()) == Some(ip)
-            && got.mask.is_none()
-            && got.has_flag("HOST")
-            && got.has_flag("STATIC")
-            && !got.has_flag("WASCLONED")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BsdTableRow {
+    pub(crate) destination: String,
+    pub(crate) gateway: String,
+    pub(crate) flags: String,
+    pub(crate) netif: String,
+}
+
+/// Parse `netstat -rnW -f inet[6]`: four columns per route (destination,
+/// gateway, flags, netif; an expiry may follow). Section titles, the header
+/// row and anything shorter are skipped.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_bsd_netstat(out: &str) -> Vec<BsdTableRow> {
+    out.lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let (destination, gateway, flags, netif) =
+                (cols.next()?, cols.next()?, cols.next()?, cols.next()?);
+            if destination == "Destination" || !flags.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return None;
+            }
+            Some(BsdTableRow {
+                destination: destination.into(),
+                gateway: gateway.into(),
+                flags: flags.into(),
+                netif: netif.into(),
+            })
+        })
+        .collect()
+}
+
+/// FR-97 P1a — the pin this device keeps for `ip`: the UNSCOPED static host
+/// route for exactly that address. Never a clone (`W`) or a scoped route
+/// (`I`), which the kernel makes on its own. A clone shows the same gateway
+/// and interface as a pin, but it expires, and the one replacing it comes from
+/// whatever covers the address by then: our `/1`, under an exit.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn bsd_pin_row(rows: &[BsdTableRow], ip: std::net::IpAddr) -> Option<&BsdTableRow> {
+    rows.iter().find(|r| {
+        bsd_addr(&r.destination, ip.is_ipv6()) == Some(ip)
+            && r.flags.contains('H')
+            && r.flags.contains('S')
+            && !r.flags.contains('W')
+            && !r.flags.contains('I')
     })
 }
 
-/// FR-97 P1a — does a `route -n get <ip>` answer show `ip` pinned through
-/// `uplink`: a static host route for exactly `ip`, through the uplink's next
-/// hop, on its interface?
-///
-/// ⚠️ A CLONED host route (`WASCLONED`) is not a pin, though it can show the
-/// very same gateway and interface: it is the kernel's per-destination cache
-/// of a covering route, it expires on its own, and the clone that replaces it
-/// comes from whatever covers `ip` by then, which under an exit is our `/1`.
+/// FR-97 P1a — does that pin go through `uplink`: flagged as a gateway route,
+/// through the uplink's next hop, on its interface?
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn bsd_exemption_holds(
-    got: Option<&BsdRouteGet>,
-    ip: std::net::IpAddr,
-    uplink: &BsdUplink,
-) -> bool {
-    bsd_static_host_route(got, ip)
-        && got.is_some_and(|got| {
-            got.has_flag("GATEWAY")
-                && got
-                    .gateway
-                    .as_deref()
-                    .and_then(|g| bsd_addr(g, ip.is_ipv6()))
-                    == Some(uplink.gateway)
-                && got.interface.as_deref() == Some(uplink.interface.as_str())
-        })
+pub(crate) fn bsd_pin_holds(row: Option<&BsdTableRow>, uplink: &BsdUplink) -> bool {
+    row.is_some_and(|r| {
+        r.flags.contains('G')
+            && bsd_addr(&r.gateway, uplink.gateway.is_ipv6()) == Some(uplink.gateway)
+            && r.netif == uplink.interface
+    })
 }
 
 /// Is the route a `route -n get` for `dest/plen` matched EXACTLY our route on
@@ -471,8 +489,8 @@ fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
 #[cfg(test)]
 mod bsd_route_tests {
     use super::{
-        BsdRouteGet, BsdUplink, bsd_default_uplink, bsd_exemption_holds, bsd_route_is_ours,
-        bsd_static_host_route, parse_bsd_route_get,
+        BsdRouteGet, BsdUplink, bsd_default_uplink, bsd_pin_holds, bsd_pin_row, bsd_route_is_ours,
+        parse_bsd_netstat, parse_bsd_route_get,
     };
     use std::net::IpAddr;
 
@@ -516,7 +534,6 @@ destination: fd72:6f6f:6d6c::6441:400
                 mask: None,
                 gateway: None,
                 interface: Some("utun0".into()),
-                flags: vec!["UP".into(), "HOST".into(), "DONE".into(), "STATIC".into()],
             })
         );
         let lan = parse_bsd_route_get(LAN_NET).unwrap();
@@ -727,7 +744,6 @@ destination: fd72:6f6f:6d6c::6441:400
             destination: "default".into(),
             mask: Some("128.0.0.0".into()),
             interface: Some("utun4".into()),
-            flags: vec!["UP".into(), "DONE".into(), "STATIC".into()],
             ..Default::default()
         };
         assert_eq!(bsd_default_uplink(Some(&our_half), false, "utun4"), None);
@@ -752,7 +768,6 @@ destination: fd72:6f6f:6d6c::6441:400
                 mask: Some("default".into()),
                 gateway: gw.clone(),
                 interface: Some("utun7".into()),
-                flags: vec!["UP".into(), "DONE".into(), "STATIC".into()],
             };
             assert_eq!(
                 bsd_default_uplink(Some(&iface_route), false, "utun4"),
@@ -762,92 +777,101 @@ destination: fd72:6f6f:6d6c::6441:400
         }
     }
 
-    /// The pinned shape: `route -n get` after `route -n add -host`.
-    const PINNED: &str = "   route to: 94.130.141.98
-destination: 94.130.141.98
-    gateway: 192.168.8.1
-  interface: en0
-      flags: <UP,GATEWAY,HOST,DONE,STATIC>
+    /// `netstat -rnW -f inet`. The pin row is verbatim from the field (a tart
+    /// Mac on 0.4.133, after `route -n add -host`); the others are
+    /// constructed in netstat's format, one per shape the table can hold for
+    /// a pinned address.
+    const TABLE_V4: &str = "Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.64.1       UGScg                 en0
+94.130.141.98      192.168.64.1       UGHS                  en0
+127                127.0.0.1          UCS                   lo0
+127.0.0.1          127.0.0.1          UH                    lo0
+192.168.64         link#4             UCS                   en0      !
+192.168.64.1       ae:7f:23:0:44:64   UHLWIir               en0   1186
+203.0.113.8        192.168.64.1       UGHWIig               en0
+203.0.113.9        192.168.64.1       UGHSI                 en0
+203.0.113.10       127.0.0.1          UGHS                  lo0
+203.0.113.11       link#1             UHS                   lo0
+";
+
+    const TABLE_V6: &str = "Routing tables
+
+Internet6:
+Destination                             Gateway                                 Flags               Netif Expire
+default                                 fe80::1%en0                             UGcg                  en0
+2a01:4f8::1                             fe80::1%en0                             UGHS                  en0
 ";
 
     #[test]
-    fn a_pin_holds_only_through_the_uplink_it_names() {
+    fn the_table_parses_routes_and_skips_titles() {
+        let rows = parse_bsd_netstat(TABLE_V4);
+        assert_eq!(rows.len(), 10, "{rows:#?}");
+        assert!(rows.iter().all(|r| r.destination != "Destination"));
+        assert_eq!(rows[1].destination, "94.130.141.98");
+        assert_eq!(rows[1].flags, "UGHS");
+        assert!(parse_bsd_netstat("").is_empty());
+    }
+
+    /// FR-97 P1a — the pin is read from the table; see `BsdTableRow` for why a
+    /// lookup cannot show it.
+    #[test]
+    fn the_pin_is_the_unscoped_static_host_route_through_the_uplink() {
+        let rows = parse_bsd_netstat(TABLE_V4);
         let server = ip("94.130.141.98");
-        let got = parse_bsd_route_get(PINNED);
-        assert!(bsd_static_host_route(got.as_ref(), server));
-        assert!(bsd_exemption_holds(
-            got.as_ref(),
-            server,
-            &uplink("192.168.8.1", "en0")
-        ));
-        // The uplink moved: a new gateway, or the same one on another NIC.
-        assert!(!bsd_exemption_holds(
-            got.as_ref(),
-            server,
-            &uplink("10.0.0.1", "en0")
-        ));
-        assert!(!bsd_exemption_holds(
-            got.as_ref(),
-            server,
-            &uplink("192.168.8.1", "en7")
-        ));
-        // A pin for one address says nothing about another.
-        assert!(!bsd_exemption_holds(
-            got.as_ref(),
-            ip("94.130.141.99"),
-            &uplink("192.168.8.1", "en0")
-        ));
-        // v6, through a link-local next hop.
-        let v6 = parse_bsd_route_get(
-            "destination: 2a01:4f8::1\n    gateway: fe80::1%en0\n  interface: en0\n      \
-             flags: <UP,GATEWAY,HOST,DONE,STATIC>\n",
-        );
-        assert!(bsd_exemption_holds(
-            v6.as_ref(),
-            ip("2a01:4f8::1"),
+        let pin = bsd_pin_row(&rows, server);
+        assert_eq!(pin.map(|r| r.netif.as_str()), Some("en0"));
+        assert!(bsd_pin_holds(pin, &uplink("192.168.64.1", "en0")));
+        // The uplink moved: a new next hop, or the same one on another NIC.
+        assert!(!bsd_pin_holds(pin, &uplink("10.0.0.1", "en0")));
+        assert!(!bsd_pin_holds(pin, &uplink("192.168.64.1", "en7")));
+        assert!(!bsd_pin_holds(None, &uplink("192.168.64.1", "en0")));
+        // v6, through a zoned link-local next hop.
+        let rows6 = parse_bsd_netstat(TABLE_V6);
+        assert!(bsd_pin_holds(
+            bsd_pin_row(&rows6, ip("2a01:4f8::1")),
             &uplink("fe80::1%en0", "en0")
         ));
     }
 
-    /// The #2081 field read-back, the clone, and a capture into a tunnel:
-    /// none of them is a pin, whatever its gateway and interface say.
+    /// The kernel's own entries for an address are never the pin, so they
+    /// never satisfy the read-back and are never deleted as one.
     #[test]
-    fn a_capture_a_clone_or_a_tunnel_route_is_not_a_pin() {
-        let server = ip("94.130.141.98");
-        let up = uplink("192.168.8.1", "en0");
-        // 0.4.131 on a tart Mac: the server fell into our `/1`.
-        let captured = BsdRouteGet {
-            destination: "default".into(),
-            mask: Some("128.0.0.0".into()),
-            interface: Some("utun4".into()),
-            flags: vec!["UP".into(), "DONE".into(), "STATIC".into()],
-            ..Default::default()
-        };
-        assert!(!bsd_static_host_route(Some(&captured), server));
-        assert!(!bsd_exemption_holds(Some(&captured), server, &up));
-        // The kernel's clone of the default route: right gateway, right
-        // interface, and gone the moment it expires.
-        let cloned = parse_bsd_route_get(
-            "destination: 94.130.141.98\n    gateway: 192.168.8.1\n  interface: en0\n      \
-             flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF>\n",
+    fn a_clone_or_a_scoped_route_is_never_the_pin() {
+        let rows = parse_bsd_netstat(TABLE_V4);
+        assert_eq!(bsd_pin_row(&rows, ip("203.0.113.8")), None, "a clone (W)");
+        assert_eq!(
+            bsd_pin_row(&rows, ip("203.0.113.9")),
+            None,
+            "a scoped route (I)"
         );
-        assert!(!bsd_static_host_route(cloned.as_ref(), server));
-        assert!(!bsd_exemption_holds(cloned.as_ref(), server, &up));
-        // A static host route into a tunnel (another VPN pinning the same
-        // address): ours to repoint, never a pin.
-        let tunnel = parse_bsd_route_get(
-            "destination: 94.130.141.98\n  interface: utun5\n      \
-             flags: <UP,HOST,DONE,STATIC>\n",
+        assert_eq!(
+            bsd_pin_row(&rows, ip("203.0.113.99")),
+            None,
+            "no row at all"
         );
-        assert!(bsd_static_host_route(tunnel.as_ref(), server));
-        assert!(!bsd_exemption_holds(tunnel.as_ref(), server, &up));
-        // A gateway that is printed but not flagged is not a next hop.
-        let unflagged = parse_bsd_route_get(
-            "destination: 94.130.141.98\n    gateway: 192.168.8.1\n  interface: en0\n      \
-             flags: <UP,HOST,DONE,STATIC>\n",
+    }
+
+    /// A pin through another next hop, or an interface route for the address,
+    /// is found (so it can be replaced) and does not hold.
+    #[test]
+    fn a_pin_elsewhere_is_found_and_does_not_hold() {
+        let rows = parse_bsd_netstat(TABLE_V4);
+        let up = uplink("192.168.64.1", "en0");
+        let stale = bsd_pin_row(&rows, ip("203.0.113.10"));
+        assert!(stale.is_some());
+        assert!(!bsd_pin_holds(stale, &up));
+        let iface = bsd_pin_row(&rows, ip("203.0.113.11"));
+        assert!(
+            iface.is_some(),
+            "an interface route is a static host route too"
         );
-        assert!(!bsd_exemption_holds(unflagged.as_ref(), server, &up));
-        assert!(!bsd_exemption_holds(None, server, &up));
+        assert!(
+            !bsd_pin_holds(iface, &up),
+            "with no gateway flag it is no pin"
+        );
     }
 }
 
@@ -4714,26 +4738,28 @@ mod system {
         }
 
         /// FR-97 P1a — the macOS arm: a static host route through the CURRENT
-        /// uplink's next hop, which counts only once it reads back as one.
+        /// uplink's next hop, which counts only once the routing TABLE shows
+        /// it. Never a lookup: `route -n get` answers with the scoped clone a
+        /// connection left for the address, even once the pin is in (see
+        /// [`super::BsdTableRow`]; field, a tart Mac on 0.4.133).
         ///
         /// BSD `route` has no idempotent write, so this looks first (#1856):
         /// - a pin that already holds is left alone. The gate re-pins after
         ///   every carrier change, and a re-write is a route-monitor event;
-        /// - a static host route for `ip` through some other next hop (the old
-        ///   uplink after a network change, or a pin a crashed run left) is
-        ///   REPOINTED with `route change`, which leaves no instant where `ip`
-        ///   falls into the `/1`s, as delete-then-add would;
-        /// - one into a tunnel (an interface route, which `change` would keep
-        ///   as an interface route) is replaced. Its traffic was not reaching
-        ///   the uplink anyway;
+        /// - a pin that does not hold (through the old uplink after a network
+        ///   change, a pin a crashed run left, an interface route for the
+        ///   address) is deleted, then added. Its traffic was not reaching the
+        ///   uplink anyway, so the gap costs nothing. `route change` cannot do
+        ///   it: it resolves its target the way the lookup does, and on the
+        ///   field Mac it left the pin untouched;
         /// - anything else gets `route add`.
         ///
-        /// Then the read-back decides, whatever the write said: an `add` that
-        /// lost a race may still have left the right route, and a write that
-        /// succeeded proves nothing about where `ip` goes now. When it does not
-        /// read back through the uplink, the route this call wrote comes out
-        /// again: the gate withholds on the `Err`, and a route nobody tracks
-        /// is the one a later network change turns into a black hole.
+        /// Then the table decides, whatever the write said: an `add` that lost
+        /// a race may still have left the right route, and a write that
+        /// succeeded proves nothing about where it went. A route this call
+        /// wrote that does not hold comes out again: the gate withholds on the
+        /// `Err`, and a route nobody tracks is the one a later network change
+        /// turns into a black hole.
         ///
         /// #2081 was this arm's absence: the trait's `Ok(())` told the gate
         /// every exemption was pinned, and the `/1`s then captured the WS,
@@ -4754,86 +4780,64 @@ mod system {
                     "no IPv4 default route through a gateway to pin it on"
                 }));
             };
-            let got = bsd_route_get_host(ip).await;
-            if super::bsd_exemption_holds(got.as_ref(), ip, &uplink) {
+            let rows = bsd_table(v6).await;
+            let pin = super::bsd_pin_row(&rows, ip);
+            if super::bsd_pin_holds(pin, &uplink) {
                 return Ok(());
             }
-            let family = bsd_family(v6);
-            let write = |verb: &str| {
-                bsd_route_write(vec![
-                    "-n".into(),
-                    verb.into(),
-                    family.into(),
-                    "-host".into(),
-                    ip.to_string(),
-                    uplink.gateway_arg.clone(),
-                ])
-            };
-            let host_route = super::bsd_static_host_route(got.as_ref(), ip);
-            let wrote = if host_route && got.as_ref().is_some_and(|g| g.has_flag("GATEWAY")) {
-                match write("change").await {
-                    // Gone between the look and the write: add it instead.
-                    Err(e) => write("add").await.map_err(|_| e),
-                    ok => ok,
-                }
-            } else {
-                if host_route {
-                    let _ = bsd_route_write(vec![
-                        "-n".into(),
-                        "delete".into(),
-                        family.into(),
-                        "-host".into(),
-                        ip.to_string(),
-                    ])
-                    .await;
-                }
-                write("add").await
-            };
-            let got = bsd_route_get_host(ip).await;
-            if super::bsd_exemption_holds(got.as_ref(), ip, &uplink) {
+            if pin.is_some() {
+                bsd_unpin(ip).await;
+            }
+            let wrote = bsd_route_write(vec![
+                "-n".into(),
+                "add".into(),
+                bsd_family(v6).into(),
+                "-host".into(),
+                ip.to_string(),
+                uplink.gateway_arg.clone(),
+            ])
+            .await;
+            let rows = bsd_table(v6).await;
+            let pin = super::bsd_pin_row(&rows, ip);
+            if super::bsd_pin_holds(pin, &uplink) {
                 return Ok(());
             }
             let want = format!("{} on {}", uplink.gateway_arg, uplink.interface);
-            Err(std::io::Error::other(match wrote {
-                Err(e) => format!("route refused the pin through {want}: {e}"),
-                Ok(()) => {
-                    if super::bsd_static_host_route(got.as_ref(), ip) {
-                        self.del_host_exemption(ip).await;
-                    }
-                    let via = got
-                        .as_ref()
-                        .and_then(|g| g.interface.clone())
-                        .unwrap_or_else(|| "nothing".into());
-                    format!("the pin reads back via {via}, not {want}")
+            let why = match (wrote, pin) {
+                (Err(e), _) => format!("route refused the pin through {want}: {e}"),
+                (Ok(()), Some(row)) => {
+                    format!(
+                        "the pin went via {} on {}, not {want}",
+                        row.gateway, row.netif
+                    )
                 }
-            }))
+                (Ok(()), None) => {
+                    format!("no pin in the routing table after `route add` through {want}")
+                }
+            };
+            // Whatever pin the table still shows comes out: the one this call
+            // wrote, or the one it failed to replace. Neither is tracked.
+            if pin.is_some_and(|row| row.netif != self.if_name) {
+                bsd_unpin(ip).await;
+            }
+            Err(std::io::Error::other(why))
         }
 
-        /// Remove a macOS exemption: a static host route for exactly `ip`,
-        /// never one on this utun. `route delete` keys on the destination
-        /// alone, so the look comes first: a lookup that fell through names a
-        /// covering route this call must not touch.
+        /// Remove a macOS exemption: our pin for `ip`, as the table shows it,
+        /// never a route on this utun (a peer route). The table comes first
+        /// because `route delete` keys on the destination alone, and with no
+        /// unscoped pin left it removed something else on the field Mac.
         #[cfg(target_os = "macos")]
         async fn del_host_exemption(&self, ip: std::net::IpAddr) {
-            let got = bsd_route_get_host(ip).await;
-            if !super::bsd_static_host_route(got.as_ref(), ip)
-                || got.as_ref().and_then(|g| g.interface.as_deref()) == Some(self.if_name.as_str())
-            {
-                return;
+            let rows = bsd_table(ip.is_ipv6()).await;
+            if super::bsd_pin_row(&rows, ip).is_some_and(|row| row.netif != self.if_name) {
+                bsd_unpin(ip).await;
             }
-            let _ = bsd_route_write(vec![
-                "-n".into(),
-                "delete".into(),
-                bsd_family(ip.is_ipv6()).into(),
-                "-host".into(),
-                ip.to_string(),
-            ])
-            .await;
         }
 
-        /// FR-97 P1a — every pin that does not read back through its family's
+        /// FR-97 P1a — every pin the table does not show through its family's
         /// CURRENT uplink. Re-reads the uplinks first, which is what notices a
-        /// network change; one route lookup per pin after that.
+        /// network change, then reads one table per family.
         #[cfg(target_os = "macos")]
         async fn stale_host_exemptions(
             &self,
@@ -4850,13 +4854,11 @@ mod system {
                     continue;
                 }
                 let uplink = self.current_uplink(v6).await;
+                let rows = bsd_table(v6).await;
                 for ip in family {
-                    let holds = match &uplink {
-                        Some(u) => {
-                            super::bsd_exemption_holds(bsd_route_get_host(ip).await.as_ref(), ip, u)
-                        }
-                        None => false,
-                    };
+                    let holds = uplink
+                        .as_ref()
+                        .is_some_and(|u| super::bsd_pin_holds(super::bsd_pin_row(&rows, ip), u));
                     if !holds {
                         stale.push(ip);
                     }
@@ -5334,16 +5336,35 @@ mod system {
         super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// FR-97 P1a — `route -n get <ip>` in `ip`'s family.
+    /// FR-97 P1a — the routing table of one family, from `netstat -rnW`: where
+    /// a pin is read (see [`super::BsdTableRow`]). Empty on any failure, which
+    /// reads as "no pin" and so fails toward withhold.
     #[cfg(target_os = "macos")]
-    async fn bsd_route_get_host(ip: std::net::IpAddr) -> Option<super::BsdRouteGet> {
-        bsd_route_get(vec![
+    async fn bsd_table(v6: bool) -> Vec<super::BsdTableRow> {
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new("netstat")
+                .args(["-rnW", "-f", if v6 { "inet6" } else { "inet" }])
+                .output()
+                .map(|out| super::parse_bsd_netstat(&String::from_utf8_lossy(&out.stdout)))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// FR-97 P1a — delete the unscoped host route for `ip`. Callers check the
+    /// table first: with no such route left, `route delete` removes something
+    /// else of the kernel's (field, a tart Mac on 0.4.133).
+    #[cfg(target_os = "macos")]
+    async fn bsd_unpin(ip: std::net::IpAddr) {
+        let _ = bsd_route_write(vec![
             "-n".into(),
-            "get".into(),
+            "delete".into(),
             bsd_family(ip.is_ipv6()).into(),
+            "-host".into(),
             ip.to_string(),
         ])
-        .await
+        .await;
     }
 
     #[cfg(target_os = "macos")]
@@ -6469,6 +6490,104 @@ mod macos_kernel_tests {
         super::parse_bsd_route_get(&sh("route", &["-n", "get", family, dest]))
     }
 
+    /// The routing table of `family` (`inet` | `inet6`): where a pin is
+    /// read, because a lookup can answer with a clone instead (see
+    /// `BsdTableRow`).
+    fn table(family: &str) -> Vec<super::BsdTableRow> {
+        super::parse_bsd_netstat(&sh("netstat", &["-rnW", "-f", family]))
+    }
+
+    fn pin_holds(family: &str, ip: std::net::IpAddr, uplink: &super::BsdUplink) -> bool {
+        super::bsd_pin_holds(super::bsd_pin_row(&table(family), ip), uplink)
+    }
+
+    /// FR-97 P1a, found in the field. A destination a connection has gone to
+    /// keeps an interface-scoped clone of the default route
+    /// (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that
+    /// clone even once the pin is in. The coordination server always has one,
+    /// held by the control WebSocket. On a tart Mac on 0.4.133 a read-back by
+    /// lookup refused that pin and left it in the table untracked. Staged here
+    /// with connection attempts to TEST-NET-3, before any capture, which is
+    /// the order the exit gate pins in.
+    #[tokio::test]
+    async fn a_pin_holds_beside_the_scoped_clone_a_connection_leaves() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        /// Whatever happens, the host route this test makes is removed.
+        struct Unpin(&'static str);
+        impl Drop for Unpin {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("route")
+                    .args(["-n", "delete", "-inet", "-host", self.0])
+                    .output();
+            }
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let dest = "203.0.113.8";
+        let ip: std::net::IpAddr = dest.parse().unwrap();
+        let uplink =
+            super::bsd_default_uplink(route_get("-inet", "default").as_ref(), false, &iface)
+                .expect("a macOS runner has an IPv4 default route through a gateway");
+        let _unpin = Unpin("203.0.113.8");
+
+        // Out through the default route, as the WebSocket goes: the kernel
+        // clones the route for the destination, scoped to the uplink.
+        let _ = std::net::TcpStream::connect_timeout(
+            &"203.0.113.8:9".parse().unwrap(),
+            std::time::Duration::from_millis(800),
+        );
+        let udp = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp socket");
+        let _ = udp.connect("203.0.113.8:9");
+        let _ = udp.send(b"fr97");
+        let staged = sh("route", &["-n", "get", "-inet", dest]);
+        assert!(
+            staged.contains("WASCLONED") && staged.contains("IFSCOPE"),
+            "no scoped clone was staged, so this run proves nothing:\n{staged}"
+        );
+
+        tun.add_host_exemption(ip)
+            .await
+            .expect("a pin beside a scoped clone must pin");
+        assert!(
+            pin_holds("inet", ip, &uplink),
+            "the table must hold the pin through {uplink:?}:\n{}",
+            sh("netstat", &["-rnW", "-f", "inet"])
+        );
+        assert!(
+            tun.stale_host_exemptions(&[ip]).await.is_empty(),
+            "a pin beside a clone is not stale"
+        );
+
+        // The capture goes in over it, as the `/1`s do, and the address
+        // still leaves through the uplink.
+        tun.add_cidr_route("203.0.113.0/24")
+            .await
+            .expect("the staged capture");
+        assert_eq!(
+            route_get("-inet", dest).and_then(|g| g.interface),
+            Some(uplink.interface.clone()),
+            "under the capture the pin must carry {dest} out the uplink"
+        );
+
+        tun.del_host_exemption(ip).await;
+        assert!(
+            super::bsd_pin_row(&table("inet"), ip).is_none(),
+            "the pin must be gone:\n{}",
+            sh("netstat", &["-rnW", "-f", "inet"])
+        );
+        tun.del_cidr_route("203.0.113.0/24").await;
+        drop(udp);
+    }
+
     /// FR-97 P1a — the macOS exemption arm on a real kernel (#2081 was its
     /// absence). A real `/1` would take half of the runner's own traffic, so
     /// the exit's capture is staged one size down: TEST-NET-3 (RFC 5737)
@@ -6509,10 +6628,14 @@ mod macos_kernel_tests {
         tun.add_host_exemption(ip)
             .await
             .expect("the exemption pins");
-        let got = route_get("-inet", dest);
         assert!(
-            super::bsd_exemption_holds(got.as_ref(), ip, &uplink),
-            "pinned through {uplink:?}, outranking the capture: {got:?}"
+            pin_holds("inet", ip, &uplink),
+            "the table must hold the pin through {uplink:?}"
+        );
+        assert_eq!(
+            route_get("-inet", dest).and_then(|g| g.interface),
+            Some(uplink.interface.clone()),
+            "and the pin must outrank the capture"
         );
         assert!(
             tun.stale_host_exemptions(&[ip]).await.is_empty(),
@@ -6565,23 +6688,22 @@ mod macos_kernel_tests {
         );
 
         // The shape a network change leaves: a static host route through
-        // another next hop. Named stale, then repointed in place.
+        // another next hop. Named stale, then pinned through the uplink again.
         sh(
             "route",
             &["-n", "change", "-inet", "-host", dest, "127.0.0.1"],
         );
-        let moved = route_get("-inet", dest);
+        let rows = table("inet");
+        let moved = super::bsd_pin_row(&rows, ip);
         assert!(
-            super::bsd_static_host_route(moved.as_ref(), ip)
-                && !super::bsd_exemption_holds(moved.as_ref(), ip, &uplink),
+            moved.is_some() && !super::bsd_pin_holds(moved, &uplink),
             "staging a stale pin failed: {moved:?}"
         );
         assert_eq!(tun.stale_host_exemptions(&[ip]).await, vec![ip]);
         tun.add_host_exemption(ip).await.expect("re-pinned");
-        let got = route_get("-inet", dest);
         assert!(
-            super::bsd_exemption_holds(got.as_ref(), ip, &uplink),
-            "repointed through {uplink:?}: {got:?}"
+            pin_holds("inet", ip, &uplink),
+            "re-pinned through {uplink:?}"
         );
 
         // The address captured into another interface by a host route of its
@@ -6591,26 +6713,23 @@ mod macos_kernel_tests {
             "route",
             &["-n", "add", "-inet", "-host", dest, "-interface", "lo0"],
         );
-        assert!(!super::bsd_exemption_holds(
-            route_get("-inet", dest).as_ref(),
-            ip,
-            &uplink
-        ));
+        assert!(!pin_holds("inet", ip, &uplink), "staging a capture failed");
         tun.add_host_exemption(ip).await.expect("taken back");
-        let got = route_get("-inet", dest);
         assert!(
-            super::bsd_exemption_holds(got.as_ref(), ip, &uplink),
-            "taken back through {uplink:?}: {got:?}"
+            pin_holds("inet", ip, &uplink),
+            "taken back through {uplink:?}"
         );
 
         // Removed, the address falls back into the capture.
         tun.del_host_exemption(ip).await;
-        let after = route_get("-inet", dest);
         assert!(
-            !super::bsd_static_host_route(after.as_ref(), ip),
-            "the pin must be gone: {after:?}"
+            super::bsd_pin_row(&table("inet"), ip).is_none(),
+            "the pin must be gone"
         );
-        assert_eq!(after.and_then(|g| g.interface), Some(iface.clone()));
+        assert_eq!(
+            route_get("-inet", dest).and_then(|g| g.interface),
+            Some(iface.clone())
+        );
 
         // Removal never touches a host route on our own utun: that is a peer
         // route, the peer path's to manage.
@@ -6657,15 +6776,11 @@ mod macos_kernel_tests {
             None => {
                 let err = res.expect_err("no v6 uplink: refused, never reported pinned");
                 assert!(err.to_string().contains("no IPv6 default route"), "{err}");
-                assert!(!super::bsd_static_host_route(
-                    route_get("-inet6", dest).as_ref(),
-                    ip
-                ));
+                assert!(super::bsd_pin_row(&table("inet6"), ip).is_none());
             }
             Some(u) => {
                 res.expect("a v6 uplink pins the /128");
-                let got = route_get("-inet6", dest);
-                assert!(super::bsd_exemption_holds(got.as_ref(), ip, &u), "{got:?}");
+                assert!(pin_holds("inet6", ip, &u), "pinned through {u:?}");
                 tun.del_host_exemption(ip).await;
             }
         }
@@ -6699,7 +6814,7 @@ mod macos_kernel_tests {
             .expect_err("switched off: refused");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
         assert!(
-            !super::bsd_static_host_route(route_get("-inet", "203.0.113.7").as_ref(), ip),
+            super::bsd_pin_row(&table("inet"), ip).is_none(),
             "and nothing written"
         );
     }
