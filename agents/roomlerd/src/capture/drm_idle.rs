@@ -24,6 +24,12 @@
 //! - the last frame delivered is younger than [`MAX_SKIP`]. A change that
 //!   crosses no sampled row waits at most that long: FR-29's bound for X11.
 //!
+//! A skip is not reported to the pump at once. `next_frame` goes on asking at
+//! the frame rate and says "nothing this tick" after [`IDLE_WAIT`] of
+//! unchanged frames, as the portal arm does on a still stream. The pump answers
+//! each "nothing" with a keepalive re-encode of its last frame, so one every
+//! frame period would spend on keepalives most of what the skip saves.
+//!
 //! ⚠️ **Wayland only.** An X server and the kernel console draw into the buffer
 //! on screen in place, so its identity never changes and only the sampled rows
 //! would see a change: a typed character could wait [`MAX_SKIP`]. The caller
@@ -36,6 +42,15 @@ use std::time::{Duration, Instant};
 /// The longest a frame is skipped for: a change no sampled row crosses is
 /// delivered this late at worst. FR-29's bound for the X11 damage skip.
 pub const MAX_SKIP: Duration = Duration::from_millis(1000);
+
+/// How long `next_frame` waits out a still screen before it tells the pump
+/// "nothing this tick": the portal arm's `FRAME_WAIT`, so every Wayland arm
+/// meets the pump the same way. The pump answers each "nothing" with a
+/// keepalive re-encode of its last frame (every 60 ms at most on the data
+/// channel pumps), so answering every frame period would trade the frames this
+/// skips for as many keepalives. A change inside the wait is still delivered
+/// within a frame period.
+pub const IDLE_WAIT: Duration = Duration::from_millis(250);
 
 /// How many rows the change check hashes, spread evenly down the picture.
 /// 32 rows of a 1280-pixel scanout is 160 KiB a tick, against the 4 MiB a
@@ -96,14 +111,19 @@ pub fn sample_rows(src: &[u8], row_bytes: usize, height: u32, pitch: u32) -> u64
     let mut h = FNV_OFFSET;
     let n = SAMPLE_ROWS.min(height);
     for i in 0..n {
-        let y = (u64::from(2 * i + 1) * u64::from(height) / u64::from(2 * n)) as usize;
-        let start = y * pitch as usize;
+        let start = sampled_row(i, n, height) * pitch as usize;
         let Some(row) = src.get(start..start + row_bytes) else {
             break;
         };
         h = mix(h, row);
     }
     h
+}
+
+/// The `i`-th of `n` sampled rows of a `height`-row picture: the centre of the
+/// `i`-th of `n` equal bands.
+fn sampled_row(i: u32, n: u32, height: u32) -> usize {
+    (u64::from(2 * i + 1) * u64::from(height) / u64::from(2 * n)) as usize
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -187,9 +207,7 @@ mod tests {
     /// The rows [`sample_rows`] reads for a `height`-row picture.
     fn sampled(height: u32) -> Vec<usize> {
         let n = SAMPLE_ROWS.min(height);
-        (0..n)
-            .map(|i| (u64::from(2 * i + 1) * u64::from(height) / u64::from(2 * n)) as usize)
-            .collect()
+        (0..n).map(|i| sampled_row(i, n, height)).collect()
     }
 
     #[test]

@@ -126,6 +126,13 @@ struct Cached {
     mapping: Mapping,
 }
 
+/// Whether a mapping of `mapped` (its buffer and length) still maps buffer
+/// `id` at `len` bytes: the same framebuffer over the same buffer, the same
+/// size. The framebuffer id alone is not enough (P3f).
+fn maps(mapped: Option<(BufferId, usize)>, id: BufferId, len: usize) -> bool {
+    mapped == Some((id, len))
+}
+
 /// `DRM_CLOEXEC` for the PRIME export: the exported fd must not leak into a
 /// child the daemon spawns meanwhile (a helper, a `roomler exec` command),
 /// where it would hold the screen's buffer.
@@ -533,8 +540,18 @@ fn repack_to_bgra(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool
 }
 
 enum WorkerReply {
-    Frame(Box<Option<Frame>>),
+    Grabbed(Grabbed),
     Failed(String),
+}
+
+/// What one grab came to.
+enum Grabbed {
+    /// A frame to deliver.
+    Frame(Box<Frame>),
+    /// FR-93 P3d — the same picture as the last frame delivered.
+    Unchanged,
+    /// Nothing is scanned out (a mode change, a blanked panel).
+    Nothing,
 }
 
 type FrameRequest = oneshot::Sender<WorkerReply>;
@@ -711,7 +728,7 @@ fn worker(
             gate.as_mut(),
             &unchanged,
         ) {
-            Ok(f) => WorkerReply::Frame(Box::new(f)),
+            Ok(grabbed) => WorkerReply::Grabbed(grabbed),
             Err(e) => WorkerReply::Failed(format!("{e:#}")),
         };
         if reply_tx.send(reply).is_err() {
@@ -742,7 +759,7 @@ fn grab(
     cursor: Option<&mut CursorReader>,
     gate: Option<&mut IdleGate>,
     unchanged: &AtomicU64,
-) -> Result<Option<Frame>> {
+) -> Result<Grabbed> {
     let Some((fb, crtc)) = primary_plane(card, planes) else {
         // Nothing being scanned out right now (mode change, blanked panel).
         // Not an error: report "no frame" and let the pump retry.
@@ -753,7 +770,7 @@ fn grab(
         if let Some(gate) = gate {
             gate.forget();
         }
-        return Ok(None);
+        return Ok(Grabbed::Nothing);
     };
     // FR-93 P3c — the pointer at this frame, for the cursor data channel. Read
     // before the primary's pixels, so a failure there cannot leave it stale;
@@ -800,8 +817,7 @@ fn grab(
     };
 
     // Re-map only when the compositor handed us a different buffer.
-    let needs_map = !matches!(cached, Some(c) if c.id == id && c.mapping.len == len);
-    if needs_map {
+    if !maps(cached.as_ref().map(|c| (c.id, c.mapping.len)), id, len) {
         // SAFETY: a fresh private read-only mapping of the exported dma-buf,
         // sized from the framebuffer's own pitch × height.
         let ptr = unsafe {
@@ -829,7 +845,7 @@ fn grab(
     drop(prime);
 
     let Some(Cached { mapping, .. }) = cached.as_ref() else {
-        return Ok(None);
+        return Ok(Grabbed::Nothing);
     };
 
     // FR-93 P3d — the same buffer, with the same sampled rows, within
@@ -845,7 +861,7 @@ fn grab(
         && gate.unchanged(shown, now)
     {
         unchanged.fetch_add(1, Ordering::Relaxed);
-        return Ok(None);
+        return Ok(Grabbed::Unchanged);
     }
     // Decide the output size BEFORE touching pixels, so a downscaled frame is
     // produced in ONE pass instead of building a full-size intermediate and
@@ -874,7 +890,7 @@ fn grab(
         gate.delivered(shown, now);
     }
 
-    Ok(Some(Frame {
+    Ok(Grabbed::Frame(Box::new(Frame {
         width: scaled.width,
         height: scaled.height,
         stride: scaled.stride,
@@ -888,7 +904,7 @@ fn grab(
         // Pre-downscale dims, so the pump can still reason about the real
         // screen size; `None` when we delivered native.
         source: scaled.source,
-    }))
+    })))
 }
 
 /// A frame's pixels plus the geometry that describes them.
@@ -993,29 +1009,41 @@ fn now_us() -> u64 {
 #[async_trait::async_trait]
 impl ScreenCapture for DrmCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
-        if let Some(last) = self.last_frame_at {
-            let elapsed = last.elapsed();
-            if elapsed < self.target_frame_period {
-                tokio::time::sleep(self.target_frame_period - elapsed).await;
-            }
-        }
-        let (res_tx, res_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(res_tx)
-            .map_err(|_| anyhow!("drm capture worker exited"))?;
-        let reply = res_rx
-            .await
-            .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
-        self.last_frame_at = Some(Instant::now());
-        match reply {
-            WorkerReply::Frame(f) => {
-                if let Some(fr) = f.as_ref() {
-                    self.width = fr.width;
-                    self.height = fr.height;
+        let started = Instant::now();
+        loop {
+            if let Some(last) = self.last_frame_at {
+                let elapsed = last.elapsed();
+                if elapsed < self.target_frame_period {
+                    tokio::time::sleep(self.target_frame_period - elapsed).await;
                 }
-                Ok(*f)
             }
-            WorkerReply::Failed(e) => Err(anyhow!(e)),
+            let (res_tx, res_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(res_tx)
+                .map_err(|_| anyhow!("drm capture worker exited"))?;
+            let reply = res_rx
+                .await
+                .map_err(|_| anyhow!("drm capture worker dropped reply"))?;
+            self.last_frame_at = Some(Instant::now());
+            match reply {
+                WorkerReply::Grabbed(Grabbed::Frame(frame)) => {
+                    self.width = frame.width;
+                    self.height = frame.height;
+                    return Ok(Some(*frame));
+                }
+                WorkerReply::Grabbed(Grabbed::Nothing) => return Ok(None),
+                // FR-93 P3d — a still screen is waited out at the frame rate,
+                // up to IDLE_WAIT, as the portal arm waits on its stream. The
+                // pump answers each "nothing this tick" with a keepalive
+                // re-encode of its last frame, so a "nothing" every frame
+                // period would cost more encodes than the frames it saved.
+                WorkerReply::Grabbed(Grabbed::Unchanged) => {
+                    if started.elapsed() >= drm_idle::IDLE_WAIT {
+                        return Ok(None);
+                    }
+                }
+                WorkerReply::Failed(e) => return Err(anyhow!(e)),
+            }
         }
     }
 
@@ -1176,6 +1204,44 @@ mod tests {
 
     fn handle(n: u32) -> drm::buffer::Handle {
         drm::control::from_u32(n).expect("a non-zero handle")
+    }
+
+    /// FR-93 P3f — the kernel reuses a framebuffer id for a new buffer once
+    /// the old one is gone, and a mapping keyed on the id alone went on
+    /// showing the old buffer.
+    #[test]
+    fn a_mapping_is_reused_only_for_the_same_buffer_at_the_same_size() {
+        let fb =
+            |n: u32| -> framebuffer::Handle { drm::control::from_u32(n).expect("a non-zero id") };
+        let a = BufferId {
+            fb: fb(31),
+            inode: 1001,
+        };
+        assert!(maps(Some((a, 4096)), a, 4096));
+        assert!(!maps(None, a, 4096), "nothing mapped yet");
+        assert!(
+            !maps(
+                Some((a, 4096)),
+                BufferId {
+                    fb: fb(31),
+                    inode: 1002
+                },
+                4096
+            ),
+            "the framebuffer id reused for a new buffer"
+        );
+        assert!(
+            !maps(
+                Some((a, 4096)),
+                BufferId {
+                    fb: fb(32),
+                    inode: 1001
+                },
+                4096
+            ),
+            "another framebuffer"
+        );
+        assert!(!maps(Some((a, 4096)), a, 8192), "a new size");
     }
 
     /// FR-93 AC9: every handle a GETFB2 hands back is closed, each buffer
