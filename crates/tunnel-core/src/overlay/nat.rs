@@ -120,7 +120,9 @@ pub struct RouteOffer {
 ///
 /// `ROOMLERD_ROUTE_OFFER_UNPROBED=1` skips the probe and offers as before.
 pub async fn gate_offer(advertised: Vec<String>) -> RouteOffer {
-    let unprobed = std::env::var("ROOMLERD_ROUTE_OFFER_UNPROBED").as_deref() == Ok("1");
+    // Through the node env chain like every other knob, so the config-backed
+    // fallback and the older prefix are honoured too.
+    let unprobed = crate::env::flag("ROUTE_OFFER_UNPROBED", false);
     gate_offer_with(advertised, unprobed, probe()).await
 }
 

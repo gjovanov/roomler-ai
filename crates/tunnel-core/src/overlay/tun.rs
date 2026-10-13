@@ -2276,6 +2276,16 @@ mod system {
         /// default (v4-only uplink) — v6 egress then stays fail-closed.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         orig_default_v6: Option<OrigDefaultRoute6>,
+        /// FR-97 P1a — the macOS twin of `orig_default` / `orig_default_v6`:
+        /// the uplink each family's exemptions are pinned through. Captured
+        /// at bring-up like them, but re-read before every pin and by
+        /// [`TunIo::stale_host_exemptions`], because a Mac changes networks
+        /// under a running daemon (Wi-Fi ↔ Ethernet, a new SSID) and a `/32`
+        /// left on the old next hop black-holes the endpoint it was pinned
+        /// for. A family that has no usable default at the moment keeps the
+        /// one it had: a network in transit is no reason to touch the pins.
+        #[cfg(target_os = "macos")]
+        uplinks: std::sync::Mutex<BsdUplinks>,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -3841,6 +3851,36 @@ mod system {
                 d
             };
 
+            // FR-97 P1a — the macOS twin of both captures above. Not final:
+            // every pin re-reads its family's uplink, so a Mac that booted
+            // without a network still pins once it has one.
+            #[cfg(target_os = "macos")]
+            let uplinks = {
+                let mut found = BsdUplinks::default();
+                for v6 in [false, true] {
+                    let up = discover_bsd_uplink(v6, &if_name);
+                    match (&up, v6) {
+                        (Some(u), false) => tracing::info!(
+                            gateway = %u.gateway_arg, interface = %u.interface,
+                            "overlay: captured original default route (exit-node exemptions available)"
+                        ),
+                        (Some(u), true) => tracing::info!(
+                            gateway = %u.gateway_arg, interface = %u.interface,
+                            "overlay: captured original IPv6 default route (v6 exit exemptions available)"
+                        ),
+                        (None, false) => tracing::info!(
+                            "overlay: no default route through a gateway yet; exit-node exemptions \
+                             wait for one"
+                        ),
+                        (None, true) => tracing::info!(
+                            "overlay: no IPv6 default route; v6 exit egress will stay fail-closed"
+                        ),
+                    }
+                    *found.slot(v6) = up;
+                }
+                std::sync::Mutex::new(found)
+            };
+
             // #1237 — record this adapter as one of ours so the eviction
             // helpers and the block-floor gate never mistake a sibling org
             // adapter for a foreign product. `Drop` removes it. (`tun_luid`
@@ -3870,6 +3910,8 @@ mod system {
                 orig_default,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 orig_default_v6,
+                #[cfg(target_os = "macos")]
+                uplinks,
                 #[cfg(windows)]
                 _wfp,
                 #[cfg(windows)]
@@ -4671,18 +4713,167 @@ mod system {
             }
         }
 
-        /// #2081 — no host-exemption arm here (macOS among them), so REFUSE.
+        /// FR-97 P1a — the macOS arm: a static host route through the CURRENT
+        /// uplink's next hop, which counts only once it reads back as one.
         ///
-        /// This device installs real OS routes: `add_cidr_route` has a working
-        /// macOS arm, so the exit-node `/1` halves land in the kernel. Inheriting
-        /// the trait's `Ok(())` told `reconcile_exit_routing` that every carrier
-        /// exemption was pinned when none was, and it then routed the WS, coturn
-        /// and the exit's own endpoint into the utun that carries them: the
-        /// self-wedge the exemption gate exists to stop, re-asserted on every
-        /// guard tick and re-installed after a restart. An `Err` makes the gate
-        /// WITHHOLD, and `roomler status` says why, until a real arm lands
-        /// (FR-97 P1a).
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        /// BSD `route` has no idempotent write, so this looks first (#1856):
+        /// - a pin that already holds is left alone. The gate re-pins after
+        ///   every carrier change, and a re-write is a route-monitor event;
+        /// - a static host route for `ip` through some other next hop (the old
+        ///   uplink after a network change, or a pin a crashed run left) is
+        ///   REPOINTED with `route change`, which leaves no instant where `ip`
+        ///   falls into the `/1`s, as delete-then-add would;
+        /// - one into a tunnel (an interface route, which `change` would keep
+        ///   as an interface route) is replaced. Its traffic was not reaching
+        ///   the uplink anyway;
+        /// - anything else gets `route add`.
+        ///
+        /// Then the read-back decides, whatever the write said: an `add` that
+        /// lost a race may still have left the right route, and a write that
+        /// succeeded proves nothing about where `ip` goes now. When it does not
+        /// read back through the uplink, the route this call wrote comes out
+        /// again: the gate withholds on the `Err`, and a route nobody tracks
+        /// is the one a later network change turns into a black hole.
+        ///
+        /// #2081 was this arm's absence: the trait's `Ok(())` told the gate
+        /// every exemption was pinned, and the `/1`s then captured the WS,
+        /// coturn and the exit's own endpoint.
+        #[cfg(target_os = "macos")]
+        async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
+            if !exit_client_macos_enabled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "the macOS exit client is switched off (ROOMLERD_EXIT_CLIENT_MACOS=0)",
+                ));
+            }
+            let v6 = ip.is_ipv6();
+            let Some(uplink) = self.current_uplink(v6).await else {
+                return Err(std::io::Error::other(if v6 {
+                    "no IPv6 default route through a gateway to pin it on"
+                } else {
+                    "no IPv4 default route through a gateway to pin it on"
+                }));
+            };
+            let got = bsd_route_get_host(ip).await;
+            if super::bsd_exemption_holds(got.as_ref(), ip, &uplink) {
+                return Ok(());
+            }
+            let family = bsd_family(v6);
+            let write = |verb: &str| {
+                bsd_route_write(vec![
+                    "-n".into(),
+                    verb.into(),
+                    family.into(),
+                    "-host".into(),
+                    ip.to_string(),
+                    uplink.gateway_arg.clone(),
+                ])
+            };
+            let host_route = super::bsd_static_host_route(got.as_ref(), ip);
+            let wrote = if host_route && got.as_ref().is_some_and(|g| g.has_flag("GATEWAY")) {
+                match write("change").await {
+                    // Gone between the look and the write: add it instead.
+                    Err(e) => write("add").await.map_err(|_| e),
+                    ok => ok,
+                }
+            } else {
+                if host_route {
+                    let _ = bsd_route_write(vec![
+                        "-n".into(),
+                        "delete".into(),
+                        family.into(),
+                        "-host".into(),
+                        ip.to_string(),
+                    ])
+                    .await;
+                }
+                write("add").await
+            };
+            let got = bsd_route_get_host(ip).await;
+            if super::bsd_exemption_holds(got.as_ref(), ip, &uplink) {
+                return Ok(());
+            }
+            let want = format!("{} on {}", uplink.gateway_arg, uplink.interface);
+            Err(std::io::Error::other(match wrote {
+                Err(e) => format!("route refused the pin through {want}: {e}"),
+                Ok(()) => {
+                    if super::bsd_static_host_route(got.as_ref(), ip) {
+                        self.del_host_exemption(ip).await;
+                    }
+                    let via = got
+                        .as_ref()
+                        .and_then(|g| g.interface.clone())
+                        .unwrap_or_else(|| "nothing".into());
+                    format!("the pin reads back via {via}, not {want}")
+                }
+            }))
+        }
+
+        /// Remove a macOS exemption: a static host route for exactly `ip`,
+        /// never one on this utun. `route delete` keys on the destination
+        /// alone, so the look comes first: a lookup that fell through names a
+        /// covering route this call must not touch.
+        #[cfg(target_os = "macos")]
+        async fn del_host_exemption(&self, ip: std::net::IpAddr) {
+            let got = bsd_route_get_host(ip).await;
+            if !super::bsd_static_host_route(got.as_ref(), ip)
+                || got.as_ref().and_then(|g| g.interface.as_deref()) == Some(self.if_name.as_str())
+            {
+                return;
+            }
+            let _ = bsd_route_write(vec![
+                "-n".into(),
+                "delete".into(),
+                bsd_family(ip.is_ipv6()).into(),
+                "-host".into(),
+                ip.to_string(),
+            ])
+            .await;
+        }
+
+        /// FR-97 P1a — every pin that does not read back through its family's
+        /// CURRENT uplink. Re-reads the uplinks first, which is what notices a
+        /// network change; one route lookup per pin after that.
+        #[cfg(target_os = "macos")]
+        async fn stale_host_exemptions(
+            &self,
+            pinned: &[std::net::IpAddr],
+        ) -> Vec<std::net::IpAddr> {
+            let mut stale = Vec::new();
+            for v6 in [false, true] {
+                let family: Vec<std::net::IpAddr> = pinned
+                    .iter()
+                    .copied()
+                    .filter(|ip| ip.is_ipv6() == v6)
+                    .collect();
+                if family.is_empty() {
+                    continue;
+                }
+                let uplink = self.current_uplink(v6).await;
+                for ip in family {
+                    let holds = match &uplink {
+                        Some(u) => {
+                            super::bsd_exemption_holds(bsd_route_get_host(ip).await.as_ref(), ip, u)
+                        }
+                        None => false,
+                    };
+                    if !holds {
+                        stale.push(ip);
+                    }
+                }
+            }
+            stale
+        }
+
+        /// #2081 — no host-exemption arm on this platform, so REFUSE.
+        ///
+        /// This device installs real OS routes, so inheriting the trait's
+        /// `Ok(())` would tell `reconcile_exit_routing` that every carrier
+        /// exemption was pinned when none was, and it would then route the WS,
+        /// coturn and the exit's own endpoint into the device that carries
+        /// them: the self-wedge the exemption gate exists to stop. An `Err`
+        /// makes the gate WITHHOLD, and `roomler status` says why.
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -5127,16 +5318,127 @@ mod system {
     /// to the write it always did. A lookup is never a table change (#1856).
     #[cfg(target_os = "macos")]
     async fn bsd_route_get(args: Vec<String>) -> Option<super::BsdRouteGet> {
+        tokio::task::spawn_blocking(move || bsd_route_get_blocking(&args))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`bsd_route_get`] for the synchronous bring-up path.
+    #[cfg(target_os = "macos")]
+    fn bsd_route_get_blocking(args: &[String]) -> Option<super::BsdRouteGet> {
+        let out = std::process::Command::new("route")
+            .args(args)
+            .output()
+            .ok()?;
+        super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// FR-97 P1a — `route -n get <ip>` in `ip`'s family.
+    #[cfg(target_os = "macos")]
+    async fn bsd_route_get_host(ip: std::net::IpAddr) -> Option<super::BsdRouteGet> {
+        bsd_route_get(vec![
+            "-n".into(),
+            "get".into(),
+            bsd_family(ip.is_ipv6()).into(),
+            ip.to_string(),
+        ])
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bsd_family(v6: bool) -> &'static str {
+        if v6 { "-inet6" } else { "-inet" }
+    }
+
+    /// FR-97 P1a — one `route` write for a host exemption: `Err` carries the
+    /// tool's own words (its first stderr line), which end up in the gate's
+    /// WARN and in `roomler status`.
+    #[cfg(target_os = "macos")]
+    async fn bsd_route_write(args: Vec<String>) -> Result<(), String> {
         tokio::task::spawn_blocking(move || {
             let out = std::process::Command::new("route")
                 .args(&args)
                 .output()
-                .ok()?;
-            super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
+                .map_err(|e| format!("route could not run: {e}"))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(err
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map_or_else(|| format!("route exited {}", out.status), str::to_string))
         })
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| e.to_string())?
+    }
+
+    /// FR-97 P1a — the uplink `route -n get [-inet6] default` names right now,
+    /// or `None` when there is none to pin through (see
+    /// [`super::bsd_default_uplink`]).
+    #[cfg(target_os = "macos")]
+    fn discover_bsd_uplink(v6: bool, overlay_if: &str) -> Option<super::BsdUplink> {
+        let got = bsd_route_get_blocking(&[
+            "-n".into(),
+            "get".into(),
+            bsd_family(v6).into(),
+            "default".into(),
+        ]);
+        super::bsd_default_uplink(got.as_ref(), v6, overlay_if)
+    }
+
+    /// FR-97 P1a — see [`SystemTun`]'s `uplinks`.
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Default)]
+    struct BsdUplinks {
+        v4: Option<super::BsdUplink>,
+        v6: Option<super::BsdUplink>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl BsdUplinks {
+        fn slot(&mut self, v6: bool) -> &mut Option<super::BsdUplink> {
+            if v6 { &mut self.v6 } else { &mut self.v4 }
+        }
+    }
+
+    /// FR-97 P1a — `ROOMLERD_EXIT_CLIENT_MACOS=0` puts the macOS exit client
+    /// back where P0a left it: every exemption is refused, so the exit is
+    /// withheld and `roomler status` says why. Default ON.
+    #[cfg(target_os = "macos")]
+    fn exit_client_macos_enabled() -> bool {
+        crate::env::flag("EXIT_CLIENT_MACOS", true)
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SystemTun {
+        /// FR-97 P1a — the uplink `v6`'s exemptions pin through right now:
+        /// re-read, and adopted (logged) when it is not the one held. A family
+        /// with no usable default at this moment keeps the one it had.
+        async fn current_uplink(&self, v6: bool) -> Option<super::BsdUplink> {
+            let if_name = self.if_name.clone();
+            let found = tokio::task::spawn_blocking(move || discover_bsd_uplink(v6, &if_name))
+                .await
+                .ok()
+                .flatten();
+            let mut held = self.uplinks.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = held.slot(v6);
+            if let Some(found) = found
+                && slot.as_ref() != Some(&found)
+            {
+                tracing::info!(
+                    family = if v6 { "v6" } else { "v4" },
+                    was = ?slot.as_ref().map(|u| format!("{} on {}", u.gateway_arg, u.interface)),
+                    gateway = %found.gateway_arg,
+                    interface = %found.interface,
+                    "overlay exit-node: carrier exemptions now pin through this uplink"
+                );
+                *slot = Some(found);
+            }
+            slot.clone()
+        }
     }
 
     /// The host's original default route — the gateway + interface that carried

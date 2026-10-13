@@ -340,13 +340,59 @@ pub(super) fn exit_node_status(
 /// exit config doesn't spam the log every reconcile while still surfacing each
 /// distinct cause. The live reason is also exposed via [`ExitNodeStatus`] for
 /// `roomler status`.
-pub(super) fn note_withheld(state: &mut ExitRoutingState, selector: &str, reason: &'static str) {
+pub(super) fn note_withheld(state: &mut ExitRoutingState, selector: &str, reason: &str) {
     if state.withheld_reason.as_deref() != Some(reason) {
         warn!(
             exit = %selector, reason,
             "overlay exit-node: default routing WITHHELD (split-tunnel safety) — egress stays on the local uplink"
         );
         state.withheld_reason = Some(reason.to_string());
+    }
+}
+
+/// FR-97 P1a — how often, at most, the pinned exemptions are re-checked
+/// against the uplink ([`TunIo::stale_host_exemptions`]). The sweep reconciles
+/// every few seconds and every carrier event reconciles too; a re-check costs
+/// a route lookup per pin on macOS, so a burst of carrier events at startup
+/// must not multiply it. A moved uplink is still noticed within a sweep.
+pub(super) const EXEMPTION_RECHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// FR-97 P1a — is a re-check of the pinned exemptions due? Pure.
+pub(super) fn exemption_recheck_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= EXEMPTION_RECHECK_EVERY)
+}
+
+/// FR-97 P1a — record that pinning `ip` failed with `err`. `true` when that
+/// is news worth a WARN: the first failure for `ip`, or a different cause.
+/// The gate retries on every reconcile, which is every few seconds, and the
+/// field Mac on 0.4.132 logged the same failure every ~5 s for as long as it
+/// was up.
+pub(super) fn note_exemption_failure(state: &mut ExitRoutingState, ip: IpAddr, err: &str) -> bool {
+    if state.exemption_failures.get(&ip).map(String::as_str) == Some(err) {
+        return false;
+    }
+    state.exemption_failures.insert(ip, err.to_string());
+    true
+}
+
+/// FR-97 P1a — the withheld reason when a v4 exemption cannot be pinned: the
+/// device's own cause for the lowest such address. Lowest, so the reason (the
+/// withhold WARN's dedup key, and what `roomler status` prints) is the same on
+/// every reconcile rather than following a hash set's order. Pure.
+pub(super) fn exemption_withheld_reason(
+    want: &HashSet<IpAddr>,
+    state: &ExitRoutingState,
+) -> String {
+    let lowest = want
+        .iter()
+        .filter(|ip| ip.is_ipv4() && !state.exemptions.contains(ip))
+        .min();
+    match lowest {
+        Some(ip) => match state.exemption_failures.get(ip) {
+            Some(err) => format!("carrier-endpoint exemption for {ip} unavailable: {err}"),
+            None => format!("carrier-endpoint exemption for {ip} unavailable"),
+        },
+        None => "carrier-endpoint exemption unavailable".to_string(),
     }
 }
 
@@ -359,6 +405,14 @@ pub(super) struct ExitRoutingState {
     /// `/32` (host) exemptions currently pinned via the original gateway — so we
     /// add only NEW ones per reconcile and revert exactly on teardown.
     pub(super) exemptions: HashSet<IpAddr>,
+    /// FR-97 P1a — the cause last logged per endpoint that would not pin, so
+    /// the WARN fires once per cause ([`note_exemption_failure`]) and the
+    /// withheld reason can name it. Cleared for an endpoint when it pins;
+    /// pruned to the endpoints still wanted.
+    pub(super) exemption_failures: HashMap<IpAddr, String>,
+    /// FR-97 P1a — when the pins were last re-checked against the uplink; see
+    /// [`EXEMPTION_RECHECK_EVERY`].
+    pub(super) exemptions_checked_at: Option<Instant>,
     /// Whether the v4 split-default (`0.0.0.0/1`+`128.0.0.0/1`) is installed.
     pub(super) split_default_installed: bool,
     /// S4 — why default routing is currently WITHHELD (the split-tunnel signal),
@@ -513,9 +567,39 @@ impl OverlayRuntime {
         }
         state.pinned_exit = Some(exit_id);
 
+        // FR-97 P1a — a pin holds only while the uplink it was made through
+        // does. A device that re-reads its uplink (macOS) names the pins that
+        // no longer hold; each is re-pinned through the current one, and one
+        // that cannot be is DELETED before it is forgotten. A host route left
+        // on a next hop that no longer answers black-holes the very endpoint
+        // it was pinned for, the coordination server included, and once
+        // untracked no teardown would ever remove it.
+        let now = Instant::now();
+        if !state.exemptions.is_empty() && exemption_recheck_due(state.exemptions_checked_at, now) {
+            state.exemptions_checked_at = Some(now);
+            let pinned: Vec<IpAddr> = state.exemptions.iter().copied().collect();
+            for ip in tun.stale_host_exemptions(&pinned).await {
+                match tun.add_host_exemption(ip).await {
+                    Ok(()) => {
+                        state.exemption_failures.remove(&ip);
+                        info!(%ip, "overlay exit-node: re-pinned a carrier exemption through the current uplink");
+                    }
+                    Err(e) => {
+                        tun.del_host_exemption(ip).await;
+                        state.exemptions.remove(&ip);
+                        let err = e.to_string();
+                        if note_exemption_failure(state, ip, &err) {
+                            warn!(%ip, %err, "overlay exit-node: a carrier exemption stopped holding and cannot be re-pinned — removed it; that family's exit egress is withheld (v6: fail-closed) until it pins again");
+                        }
+                    }
+                }
+            }
+        }
+
         // Pin any exemptions we don't yet hold, BEFORE (re)installing the /1s —
         // the coturn set grows as relay carriers appear, so re-run on churn.
         let want = exit_exemption_set(&self.exit_server_ips, by_node);
+        state.exemption_failures.retain(|ip, _| want.contains(ip));
         for ip in &want {
             if state.exemptions.contains(ip) {
                 continue;
@@ -523,10 +607,15 @@ impl OverlayRuntime {
             match tun.add_host_exemption(*ip).await {
                 Ok(()) => {
                     state.exemptions.insert(*ip);
+                    state.exemption_failures.remove(ip);
                     info!(%ip, "overlay exit-node: pinned carrier-endpoint exemption via the original uplink");
                 }
                 Err(e) => {
-                    warn!(%ip, %e, "overlay exit-node: FAILED to pin a carrier exemption — withholding default routing to avoid a self-wedge");
+                    // FR-97 P1a — once per cause, not once per reconcile.
+                    let err = e.to_string();
+                    if note_exemption_failure(state, *ip, &err) {
+                        warn!(%ip, %err, "overlay exit-node: FAILED to pin a carrier exemption — withholding default routing to avoid a self-wedge");
+                    }
                 }
             }
         }
@@ -547,11 +636,9 @@ impl OverlayRuntime {
                 self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
                     .await;
             }
-            note_withheld(
-                state,
-                selector,
-                "carrier-endpoint exemption unavailable (no original default route?)",
-            );
+            // FR-97 P1a — the device's own cause, not a guess at one.
+            let reason = exemption_withheld_reason(&want, state);
+            note_withheld(state, selector, &reason);
             return;
         }
 
