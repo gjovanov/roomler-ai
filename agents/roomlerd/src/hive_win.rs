@@ -1063,6 +1063,17 @@ pub unsafe fn run_checkpoint(
     unsafe { run_fed(who, cmdline, None, "the checkpoint", timeout, max) }
 }
 
+/// FR-90 P2f-2a — the command line that runs `roomlerd hive-pack <request>`,
+/// run as [`run_checkpoint`] runs a checkpoint's.
+pub fn pack_command_line(exe: &Path, request: &Path) -> Result<String, String> {
+    Ok(format!(
+        "{} {} {}",
+        program(exe)?,
+        crate::hive::PACK_SUBCOMMAND,
+        quote_arg(utf8(request.as_os_str(), "the request's path")?)
+    ))
+}
+
 // ─── FR-90 P2b-4a: a materialize, fed as the console user ───────────────────
 
 /// The command line that runs `roomlerd hive-materialize`, which reads its

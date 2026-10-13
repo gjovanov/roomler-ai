@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use roomler_hive_node::store::{Membership, SearchHit, Store, StoreError};
+use roomler_hive_node::store::{Membership, SearchHit, Store, StoreError, Substitute};
 use roomler_hive_node::{ChainTip, EventEnvelope, FenceEnd, TranscriptEvent};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
@@ -127,6 +127,17 @@ enum Member {
         session: String,
         hash: [u8; 32],
         reply: Reply<bool>,
+    },
+    /// FR-90 P2f-2a — a pack kept in place of a checkpoint's whole pack.
+    PutSubstitute {
+        session: String,
+        sub: Substitute,
+        reply: Reply<()>,
+    },
+    Substitute {
+        session: String,
+        commit: String,
+        reply: Reply<Option<Substitute>>,
     },
     Purge {
         session: String,
@@ -467,6 +478,37 @@ impl StoreHandle {
         .await
     }
 
+    /// FR-90 P2f-2a — keep `sub` for `session`, its blobs kept first.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))] // P2f-2b's stream keeps them
+    pub(crate) async fn put_substitute(
+        &self,
+        session: &str,
+        sub: Substitute,
+    ) -> Result<(), WriterError> {
+        let session = session.to_string();
+        self.ask(|reply| Member::PutSubstitute {
+            session,
+            sub,
+            reply,
+        })
+        .await
+    }
+
+    /// FR-90 P2f-2a — the substitute kept for `commit` of `session`.
+    pub(crate) async fn substitute(
+        &self,
+        session: &str,
+        commit: &str,
+    ) -> Result<Option<Substitute>, WriterError> {
+        let (session, commit) = (session.to_string(), commit.to_string());
+        self.ask(|reply| Member::Substitute {
+            session,
+            commit,
+            reply,
+        })
+        .await
+    }
+
     /// Purge `session` and keep its id; how many events were removed.
     pub(crate) async fn purge(&self, session: &str) -> Result<u64, WriterError> {
         let session = session.to_string();
@@ -727,6 +769,20 @@ fn member(store: &mut Store, publish: &broadcast::Sender<Arc<EventEnvelope>>, cm
             reply,
         } => {
             let _ = reply.send(store.has_blob(&session, &hash));
+        }
+        Member::PutSubstitute {
+            session,
+            sub,
+            reply,
+        } => {
+            let _ = reply.send(store.put_substitute(&session, &sub));
+        }
+        Member::Substitute {
+            session,
+            commit,
+            reply,
+        } => {
+            let _ = reply.send(store.substitute(&session, &commit));
         }
         Member::Purge { session, reply } => {
             let _ = reply.send(store.purge(&session));

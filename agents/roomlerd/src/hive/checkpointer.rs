@@ -521,15 +521,27 @@ impl Checkpoints {
     }
 }
 
-/// The request, where only the daemon writes and the account reads it: the
-/// session's runtime directory, the daemon's own. On Unix the file is made
-/// `0600` and handed to the account through its descriptor, never by a path;
-/// on Windows it takes the session directory's DACL, readable by the account
-/// alone. Replaced whole, through a rename.
+/// The request, where only the daemon writes and the account reads it
+/// ([`write_private`]).
 fn write_request(dir: &Path, req: &Request, owner: Option<(u32, u32)>) -> Result<PathBuf, String> {
     let bytes = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-    let path = dir.join("checkpoint.json");
-    let tmp = dir.join("checkpoint.json.tmp");
+    write_private(dir, "checkpoint.json", &bytes, owner)
+}
+
+/// `bytes` as `<dir>/<name>`, where only the daemon writes and the account
+/// reads it: the session's runtime directory, the daemon's own. On Unix the
+/// file is made `0600` and handed to the account through its descriptor,
+/// never by a path; on Windows it takes the session directory's DACL,
+/// readable by the account alone. Replaced whole, through a rename. A
+/// checkpoint's request goes this way, and (P2f-2a) `hive-pack`'s.
+pub(super) fn write_private(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    owner: Option<(u32, u32)>,
+) -> Result<PathBuf, String> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
     let _ = std::fs::remove_file(&tmp);
     let fail = |e: std::io::Error| format!("{}: {e}", tmp.display());
     #[cfg(unix)]
@@ -541,7 +553,7 @@ fn write_request(dir: &Path, req: &Request, owner: Option<(u32, u32)>) -> Result
             .mode(0o600)
             .open(&tmp)
             .map_err(fail)?;
-        f.write_all(&bytes).map_err(fail)?;
+        f.write_all(bytes).map_err(fail)?;
         if let Some((uid, gid)) = owner {
             std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(fail)?;
         }
@@ -549,7 +561,7 @@ fn write_request(dir: &Path, req: &Request, owner: Option<(u32, u32)>) -> Result
     #[cfg(not(unix))]
     {
         let _ = owner;
-        std::fs::write(&tmp, &bytes).map_err(fail)?;
+        std::fs::write(&tmp, bytes).map_err(fail)?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)

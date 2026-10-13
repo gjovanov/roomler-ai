@@ -41,6 +41,7 @@ use std::time::Duration;
 use roomler_hive_node::checkpoint::{
     self, Checkpoint, Chunk, Digest, MAX_DEPTH, MAX_FILES, RepoKind, WorkspaceSnap,
 };
+use roomler_hive_node::store::Substitute;
 use serde::{Deserialize, Serialize};
 
 use super::checkpointer::{Runner, allowed};
@@ -103,6 +104,12 @@ pub(crate) struct Workspace {
     /// Each pack's length, in the order they arrive: from the last whole pack
     /// on, each thin against the one before.
     pub packs: Vec<u64>,
+    /// P2f-2a — what the first pack is thin against when it is a substitute
+    /// for a whole one ([`plan`]): commits the folder's repository holds
+    /// already, every one of them, or nothing is materialized. Empty for a
+    /// whole pack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub against: Vec<String>,
 }
 
 /// One file as the checkpoint has it.
@@ -182,8 +189,14 @@ pub(crate) struct Planned {
 }
 
 /// The target for materializing the last of `chain` (oldest first) at
-/// `dest`, and the chunks that make each of its files and packs.
-pub(crate) fn plan(chain: &[Checkpoint], dest: &Dest) -> Result<(Target, Planned), String> {
+/// `dest`, and the chunks that make each of its files and packs. P2f-2a — a
+/// whole pack one of `substitutes` stands in for is not read: the walk ends
+/// at the substitute ([`packs_of`]).
+pub(crate) fn plan(
+    chain: &[Checkpoint],
+    dest: &Dest,
+    substitutes: &[Substitute],
+) -> Result<(Target, Planned), String> {
     let last = chain.last().ok_or("no checkpoint to materialize")?;
     if last.files.len() > MAX_FILES {
         return Err(format!("{} files", last.files.len()));
@@ -206,7 +219,7 @@ pub(crate) fn plan(chain: &[Checkpoint], dest: &Dest) -> Result<(Target, Planned
     let (workspace, packs) = match &last.workspace {
         None => (None, Vec::new()),
         Some(ws) => {
-            let packs = packs_of(chain, ws)?;
+            let (packs, against) = packs_of(chain, ws, substitutes)?;
             let lens = packs
                 .iter()
                 .map(|p| p.iter().map(|c| c.len).sum())
@@ -218,6 +231,7 @@ pub(crate) fn plan(chain: &[Checkpoint], dest: &Dest) -> Result<(Target, Planned
                 tree: ws.tree.clone(),
                 commit: ws.commit.clone(),
                 packs: lens,
+                against,
             };
             (Some(target), packs)
         }
@@ -241,7 +255,16 @@ pub(crate) fn plan(chain: &[Checkpoint], dest: &Dest) -> Result<(Target, Planned
 /// each `base` to a whole pack (one with no base), past the turns that
 /// changed nothing (an empty pack, the same commit). Each pack's chunks must
 /// follow one another from offset 0.
-fn packs_of(chain: &[Checkpoint], last: &WorkspaceSnap) -> Result<Vec<Vec<Chunk>>, String> {
+///
+/// P2f-2a — a whole pack one of `substitutes` stands in for ends the walk at
+/// the substitute, and what that is thin against comes back with the packs:
+/// the folder's repository must hold every one of those commits. Only a
+/// whole pack is ever stood in for; a thin one's commit is never looked up.
+fn packs_of(
+    chain: &[Checkpoint],
+    last: &WorkspaceSnap,
+    substitutes: &[Substitute],
+) -> Result<(Vec<Vec<Chunk>>, Vec<String>), String> {
     let mut need = last.commit.as_str();
     let mut packs = Vec::new();
     for cp in chain.iter().rev() {
@@ -257,22 +280,41 @@ fn packs_of(chain: &[Checkpoint], last: &WorkspaceSnap) -> Result<Vec<Vec<Chunk>
         if ws.pack.is_empty() {
             continue;
         }
+        let sub = ws
+            .base
+            .is_none()
+            .then(|| substitutes.iter().find(|s| s.commit == ws.commit))
+            .flatten();
+        let (chunks, what) = match sub {
+            Some(s) => (
+                &s.chunks,
+                format!("the substitute for checkpoint {}'s pack", cp.n),
+            ),
+            None => (&ws.pack, format!("checkpoint {}'s pack", cp.n)),
+        };
+        if chunks.is_empty() {
+            return Err(format!("{what} is empty"));
+        }
         let mut offset = 0u64;
-        for chunk in &ws.pack {
+        for chunk in chunks {
             if chunk.offset != offset {
-                return Err(format!("checkpoint {}'s pack has a gap", cp.n));
+                return Err(format!("{what} has a gap"));
             }
             offset += chunk.len;
         }
         if offset > workspace::MAX_PACK as u64 {
-            return Err(format!("checkpoint {}'s pack is over its limit", cp.n));
+            return Err(format!("{what} is over its limit"));
         }
-        packs.push(ws.pack.clone());
+        packs.push(chunks.clone());
+        if let Some(s) = sub {
+            packs.reverse();
+            return Ok((packs, s.against.clone()));
+        }
         match ws.base.as_deref() {
             Some(base) => need = base,
             None => {
                 packs.reverse();
-                return Ok(packs);
+                return Ok((packs, Vec::new()));
             }
         }
     }
@@ -299,6 +341,46 @@ impl Blobs<'_> {
             #[cfg(test)]
             Blobs::Map(m) => Ok(m.get(hash).cloned()),
         }
+    }
+
+    /// P2f-2a — the substitutes kept for `chain`'s whole packs whose own
+    /// blobs are not all here: what [`plan`] ends its walk on. A whole pack
+    /// that is here is read as it is, whatever stands in for it.
+    async fn substitutes(&self, chain: &[Checkpoint]) -> Result<Vec<Substitute>, String> {
+        let (store, session) = match self {
+            Blobs::Store { store, session } => (store, session),
+            #[cfg(test)]
+            Blobs::Map(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        let whole = chain
+            .iter()
+            .filter_map(|c| c.workspace.as_ref())
+            .filter(|ws| ws.base.is_none() && !ws.pack.is_empty());
+        for ws in whole {
+            let mut held = true;
+            for chunk in &ws.pack {
+                if !store
+                    .has_blob(session, chunk.hash.0)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    held = false;
+                    break;
+                }
+            }
+            if held {
+                continue;
+            }
+            if let Some(sub) = store
+                .substitute(session, &ws.commit)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                out.push(sub);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -414,7 +496,8 @@ pub(crate) async fn materialize(
     dest: &Dest,
     blobs: &Blobs<'_>,
 ) -> Result<Done, String> {
-    let (target, planned) = plan(chain, dest)?;
+    let substitutes = blobs.substitutes(chain).await?;
+    let (target, planned) = plan(chain, dest, &substitutes)?;
     match run {
         Runner::Subprocess => {
             let exe = PathBuf::from(super::supervisor::own_exe()?);
@@ -675,6 +758,17 @@ fn prepare(
 ) -> Result<(workspace::Place, workspace::Current), String> {
     let at = |e: String| format!("the workspace: {e}");
     let place = workspace::place_for(git, &ws.folder, &ws.state_dir).map_err(at)?;
+    // P2f-2a — a substitute's pack is thin against commits the folder's
+    // repository must hold already: without them git could resolve none of
+    // its deltas, and the tree would not be whole.
+    if !ws.against.is_empty() {
+        let held = workspace::place_holds(git, &place, &ws.against).map_err(at)?;
+        if let Some(missing) = ws.against.iter().find(|c| !held.contains(c)) {
+            return Err(at(format!(
+                "the folder's repository holds no commit {missing}, which the copy's pack is thin against"
+            )));
+        }
+    }
     for (i, &len) in ws.packs.iter().enumerate() {
         let got = u64::from_le_bytes(read_array(r, "a pack's length")?);
         if got != len {
@@ -745,11 +839,18 @@ pub(crate) fn refusal(target: &Target, os: Os) -> Option<String> {
                 && s.bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
-        if !sid_ok || !is_id(&ws.tree) || !is_id(&ws.commit) {
+        if !sid_ok || !is_id(&ws.tree) || !is_id(&ws.commit) || !ws.against.iter().all(|c| is_id(c))
+        {
             return Some("the workspace names something that is not git's".into());
         }
         if ws.packs.iter().any(|&l| l > workspace::MAX_PACK as u64) {
             return Some("a workspace pack is over its limit".into());
+        }
+        if ws.against.len() > workspace::MAX_HAVES {
+            return Some(format!(
+                "the workspace's first pack is thin against more than {} commits",
+                workspace::MAX_HAVES
+            ));
         }
     }
     None
@@ -1146,7 +1247,7 @@ mod tests {
         dir: &Path,
         blobs: &HashMap<Digest, Vec<u8>>,
     ) -> Vec<u8> {
-        let (target, planned) = plan(chain, &dest(dir)).unwrap();
+        let (target, planned) = plan(chain, &dest(dir), &[]).unwrap();
         let mut bytes = Vec::new();
         assert!(
             write_frames(&mut bytes, &target, &planned, &Blobs::Map(blobs))
@@ -1261,7 +1362,7 @@ mod tests {
         refused(b"HIVEMZ2\n", "no magic");
         refused(&good[..header_end - 1], "inside the header");
 
-        let (mut target, _) = plan(&chain, &dest(&config)).unwrap();
+        let (mut target, _) = plan(&chain, &dest(&config), &[]).unwrap();
         let reheader = |t: &Target| {
             let h = serde_json::to_vec(&Header { target: t.clone() }).unwrap();
             let mut b = MAGIC.to_vec();
@@ -1284,6 +1385,42 @@ mod tests {
         let mut longer = target.clone();
         longer.files[0].len += 1;
         refused(&reheader(&longer), "its entry says");
+    }
+
+    /// P2f-2a — what a substitute's pack is thin against is held to git's
+    /// ids, and to the most any request names, before anything is read.
+    #[test]
+    fn a_workspace_thin_against_what_is_no_commit_id_is_refused() {
+        let target = |against: Vec<String>| Target {
+            v: TARGET_V,
+            harness_session: HID.into(),
+            config_dir: PathBuf::from("/c"),
+            files: Vec::new(),
+            workspace: Some(Workspace {
+                sid: SID.into(),
+                folder: PathBuf::from("/w"),
+                state_dir: PathBuf::from("/s"),
+                tree: "a".repeat(40),
+                commit: "b".repeat(40),
+                packs: vec![12],
+                against,
+            }),
+        };
+        assert_eq!(refusal(&target(vec!["c".repeat(40)]), Os::Linux), None);
+        for bad in ["HEAD", "--all"] {
+            let why = refusal(&target(vec![bad.to_string()]), Os::Linux);
+            assert!(
+                why.as_deref().is_some_and(|w| w.contains("not git's")),
+                "against {bad} is refused: {why:?}"
+            );
+        }
+        let many = vec!["c".repeat(40); workspace::MAX_HAVES + 1];
+        let why = refusal(&target(many), Os::Linux);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("thin against more than")),
+            "more than any request names is refused: {why:?}"
+        );
     }
 
     /// For a Windows target, a name Windows cannot hold is refused before
@@ -1432,6 +1569,330 @@ mod tests {
         );
     }
 
+    /// `git` as a person runs it in `dir`: an identity of its own, nothing
+    /// signed, nothing of the caller's git environment.
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args([
+                "-c",
+                "user.name=Person",
+                "-c",
+                "user.email=person@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A session's checkpoints, their blobs by hash, and the person's `HEAD`.
+    type Turns = (Vec<Checkpoint>, HashMap<Digest, Vec<u8>>, String);
+
+    /// Two checkpoints of a session whose folder (`work`) is a repository
+    /// with a commit of its own, the person's `HEAD`: the first pack whole,
+    /// the second thin against it. Their blobs by hash, and the `HEAD`.
+    fn two_turns_in_a_repository(root: &Path) -> Option<Turns> {
+        use super::super::checkpointer::{REQUEST_V, Request, produce};
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "-q"]);
+        write(&work, "lib.rs", b"pub fn f() {}\n");
+        write(&work, "notes.md", b"# notes the session never touches\n");
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-q", "-m", "first"]);
+        let head = git_in(&work, &["rev-parse", "HEAD"]);
+        let git = Git::under(root);
+        let req = |n: u64, previous: Option<Checkpoint>| Request {
+            v: REQUEST_V,
+            sid: SID.into(),
+            harness_session: HID.into(),
+            config_dir: root.join("claude"),
+            folder: work.clone(),
+            state_dir: root.join("state"),
+            n,
+            turn: n as u32,
+            previous,
+        };
+        write(&root.join("claude"), &history(), b"{\"t\":1}\n");
+        write(&work, "main.rs", b"fn main() {}\n");
+        let (one, b1) = produce(&req(1, None), &git).unwrap();
+        write(&root.join("claude"), &history(), b"{\"t\":1}\n{\"t\":2}\n");
+        write(&work, "src/x.rs", b"pub fn x() {}\n");
+        let (two, b2) = produce(&req(2, Some(one.clone())), &git).unwrap();
+        let blobs = b1
+            .into_iter()
+            .chain(b2)
+            .map(|b| (Digest::of(&b), b))
+            .collect();
+        Some((vec![one, two], blobs, head))
+    }
+
+    /// [`lines_under`] of a clone, its git directory left out.
+    #[cfg(unix)]
+    fn work_under(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        lines_under(dir)
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(".git/"))
+            .collect()
+    }
+
+    /// P2f-2a — a copy that holds no blob of the first checkpoint's whole
+    /// pack, but a substitute for it thin against the person's `HEAD`, is
+    /// materialized into a clone holding that `HEAD`, end to end through the
+    /// store: the walk ends at the substitute, the later thin pack lands on
+    /// top. With nothing standing in for the whole pack, it is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_substitute_against_the_clones_head_stands_in_for_the_whole_pack() {
+        let src = tempfile::tempdir().unwrap();
+        let Some((chain, blobs, head)) = two_turns_in_a_repository(src.path()) else {
+            return eprintln!("no git here");
+        };
+        let one = chain[0].workspace.clone().unwrap();
+        let two = chain[1].workspace.clone().unwrap();
+        assert!(one.base.is_none() && two.base.is_some(), "whole, then thin");
+        let (pack, against) = workspace::pack_against(
+            &Git::under(src.path()),
+            &src.path().join("work"),
+            &src.path().join("state"),
+            &one.commit,
+            std::slice::from_ref(&head),
+        )
+        .unwrap();
+        assert_eq!(against, vec![head.clone()]);
+        let (chunks, sub_blobs) = checkpoint::chunk_bytes(&pack);
+        let sub = Substitute {
+            commit: one.commit.clone(),
+            against,
+            chunks,
+        };
+
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        git_in(
+            dst.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                &src.path().join("work").display().to_string(),
+                "work",
+            ],
+        );
+        let store = super::super::store::StoreHandle::spawn(None).unwrap();
+        let whole: HashSet<Digest> = one.pack.iter().map(|c| c.hash).collect();
+        for (hash, bytes) in &blobs {
+            if !whole.contains(hash) {
+                store
+                    .put_named_blob(SID, hash.0, bytes.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        let run = Runner::InProcess {
+            ceiling: dst.path().to_path_buf(),
+        };
+        let who = Who {
+            account: None,
+            env: Vec::new(),
+        };
+        let at = Blobs::Store {
+            store: &store,
+            session: SID,
+        };
+        let e = materialize(&run, &who, &chain, &dest(&config), &at)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("blob"),
+            "nothing stands in for the whole pack: {e}"
+        );
+
+        for b in &sub_blobs {
+            store
+                .put_named_blob(SID, Digest::of(b).0, b.clone())
+                .await
+                .unwrap();
+        }
+        store.put_substitute(SID, sub.clone()).await.unwrap();
+        let done = materialize(&run, &who, &chain, &dest(&config), &at)
+            .await
+            .unwrap();
+        assert_eq!(
+            done.workspace,
+            Some(Placed {
+                repo: RepoKind::Own,
+                tree: two.tree.clone()
+            })
+        );
+        assert_eq!(
+            work_under(&dst.path().join("work")),
+            work_under(&src.path().join("work"))
+        );
+        assert_eq!(
+            files_under(&config),
+            files_under(&src.path().join("claude"))
+        );
+
+        // A whole pack that is here is read as it is, whatever stands in for
+        // it: this substitute is of no use in a folder that is new.
+        let all = super::super::store::StoreHandle::spawn(None).unwrap();
+        let every = blobs
+            .iter()
+            .map(|(h, b)| (*h, b.clone()))
+            .chain(sub_blobs.iter().map(|b| (Digest::of(b), b.clone())));
+        for (hash, bytes) in every {
+            all.put_named_blob(SID, hash.0, bytes).await.unwrap();
+        }
+        all.put_substitute(SID, sub).await.unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_run = Runner::InProcess {
+            ceiling: fresh.path().to_path_buf(),
+        };
+        let at_all = Blobs::Store {
+            store: &all,
+            session: SID,
+        };
+        let done = materialize(
+            &fresh_run,
+            &who,
+            &chain,
+            &dest(&fresh.path().join("claude")),
+            &at_all,
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "a whole pack that is here is read as it is: {done:?}"
+        );
+        assert_eq!(
+            lines_under(&fresh.path().join("work")),
+            work_under(&src.path().join("work"))
+        );
+    }
+
+    /// P2f-2a — a substitute thin against a commit the folder's repository
+    /// does not hold is refused before the folder is touched, and no config
+    /// file lands either: git could resolve none of its deltas there.
+    #[tokio::test]
+    async fn a_substitute_where_its_commits_are_not_held_writes_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        let Some((chain, mut blobs, head)) = two_turns_in_a_repository(src.path()) else {
+            return eprintln!("no git here");
+        };
+        let one = chain[0].workspace.clone().unwrap();
+        let (pack, against) = workspace::pack_against(
+            &Git::under(src.path()),
+            &src.path().join("work"),
+            &src.path().join("state"),
+            &one.commit,
+            &[head],
+        )
+        .unwrap();
+        let (chunks, sub_blobs) = checkpoint::chunk_bytes(&pack);
+        for b in sub_blobs {
+            blobs.insert(Digest::of(&b), b);
+        }
+        let sub = Substitute {
+            commit: one.commit.clone(),
+            against,
+            chunks,
+        };
+        let dst = tempfile::tempdir().unwrap();
+        let config = dst.path().join("claude");
+        let work = dst.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (target, planned) = plan(&chain, &dest(&config), &[sub]).unwrap();
+        let mut bytes = Vec::new();
+        assert!(
+            write_frames(&mut bytes, &target, &planned, &Blobs::Map(&blobs))
+                .await
+                .is_ok()
+        );
+        let got = materialize_from(&mut bytes.as_slice(), Os::this(), &Git::under(dst.path()));
+        assert!(
+            matches!(&got, Err(e) if e.contains("holds no commit")),
+            "refused before anything is written, in words: {got:?}"
+        );
+        assert_eq!(
+            files_under(&work),
+            BTreeMap::new(),
+            "the folder is untouched"
+        );
+        assert_eq!(
+            files_under(&config),
+            BTreeMap::new(),
+            "no config file landed"
+        );
+    }
+
+    /// P2f-2a — the walk ends at a substitute for a whole pack and hands back
+    /// what it is thin against; one named for a thin pack's commit is never
+    /// looked at, and none at all walks to the whole pack as before.
+    #[test]
+    fn the_walk_ends_at_a_whole_packs_substitute_only() {
+        let src = tempfile::tempdir().unwrap();
+        let Some((chain, _, head)) = two_turns_in_a_repository(src.path()) else {
+            return eprintln!("no git here");
+        };
+        let (one, two) = (
+            chain[0].workspace.clone().unwrap(),
+            chain[1].workspace.clone().unwrap(),
+        );
+        let stand_in = |commit: &str| Substitute {
+            commit: commit.to_string(),
+            against: vec![head.clone()],
+            chunks: vec![Chunk {
+                offset: 0,
+                len: 7,
+                hash: Digest::of(b"a pack"),
+            }],
+        };
+        let (packs, against) = packs_of(&chain, &two, &[stand_in(&one.commit)]).unwrap();
+        assert_eq!(packs, vec![stand_in(&one.commit).chunks, two.pack.clone()]);
+        assert_eq!(against, vec![head.clone()]);
+
+        let (packs, against) = packs_of(&chain, &two, &[stand_in(&two.commit)]).unwrap();
+        assert_eq!(
+            packs,
+            vec![one.pack.clone(), two.pack.clone()],
+            "a thin pack is never stood in for"
+        );
+        assert!(against.is_empty());
+        assert_eq!(
+            packs_of(&chain, &two, &[]).unwrap(),
+            (vec![one.pack.clone(), two.pack.clone()], Vec::new())
+        );
+        let empty = Substitute {
+            chunks: Vec::new(),
+            ..stand_in(&one.commit)
+        };
+        let e = packs_of(&chain, &two, &[empty]).unwrap_err();
+        assert!(e.contains("is empty"), "{e}");
+    }
+
     /// P2b-4b — a workspace whose commit does not hold the tree it claims is
     /// refused before the folder is touched, and no config file lands either.
     #[tokio::test]
@@ -1443,7 +1904,7 @@ mod tests {
         };
         let dst = tempfile::tempdir().unwrap();
         let config = dst.path().join("claude");
-        let (mut target, planned) = plan(&chain, &dest(&config)).unwrap();
+        let (mut target, planned) = plan(&chain, &dest(&config), &[]).unwrap();
         // A real tree, the first turn's, but not the commit's.
         target.workspace.as_mut().unwrap().tree = first.tree;
         let mut bytes = Vec::new();
@@ -1543,7 +2004,7 @@ mod tests {
                 got.display()
             ),
         );
-        let (target, planned) = plan(&chain, &dest(&config)).unwrap();
+        let (target, planned) = plan(&chain, &dest(&config), &[]).unwrap();
         let done = run_as(
             &cat,
             None,
@@ -1579,7 +2040,7 @@ mod tests {
             blobs.insert(Digest::of(&blob), blob);
         }
         chain.push(cp);
-        let (target, planned) = plan(&chain, &dest(&config)).unwrap();
+        let (target, planned) = plan(&chain, &dest(&config), &[]).unwrap();
         let refuses = child("refuses.sh", "echo 'the folder is not allowed' >&2; exit 1");
         let e = run_as(
             &refuses,
