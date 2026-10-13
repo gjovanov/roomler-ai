@@ -264,7 +264,10 @@ fn read_planes(card: &Card) -> Vec<PlaneEntry> {
 /// cursor and overlay planes are unbound; the cursor plane is bound wherever
 /// the pointer shows, and an overlay whenever a compositor scans a video out
 /// directly.
-fn primary_plane(card: &Card, planes: &[PlaneEntry]) -> Option<(framebuffer::Handle, crtc::Handle)> {
+fn primary_plane(
+    card: &Card,
+    planes: &[PlaneEntry],
+) -> Option<(framebuffer::Handle, crtc::Handle)> {
     let bound: Vec<_> = planes
         .iter()
         .map(|entry| {
@@ -320,7 +323,12 @@ impl CursorReader {
     /// with a framebuffer (a hidden pointer, a pointer on another CRTC, or a
     /// compositor drawing it into the primary plane, where it is already in
     /// the frame).
-    fn read(&mut self, card: &Card, planes: &[PlaneEntry], crtc: crtc::Handle) -> Option<CursorSnapshot> {
+    fn read(
+        &mut self,
+        card: &Card,
+        planes: &[PlaneEntry],
+        crtc: crtc::Handle,
+    ) -> Option<CursorSnapshot> {
         let (entry, fb) = planes
             .iter()
             .filter(|e| e.kind == Some(PlaneKind::Cursor))
@@ -381,13 +389,19 @@ impl CursorReader {
 
 /// The cursor plane's buffer, straightened and cropped. `Ok(None)` for one
 /// with nothing visible in it.
-fn read_cursor_pixels(card: &Card, fb: framebuffer::Handle) -> Result<Option<drm_cursor::CursorPixels>> {
+fn read_cursor_pixels(
+    card: &Card,
+    fb: framebuffer::Handle,
+) -> Result<Option<drm_cursor::CursorPixels>> {
     let info = card
         .get_planar_framebuffer(fb)
         .map_err(|e| anyhow!("drmModeGetFB2 on the cursor plane: {e}"))?;
     let _handles = FbHandles::new(card, info.buffers());
     if info.pixel_format() != DrmFourcc::Argb8888 {
-        bail!("cursor plane format {:?}, not ARGB8888", info.pixel_format());
+        bail!(
+            "cursor plane format {:?}, not ARGB8888",
+            info.pixel_format()
+        );
     }
     if !modifier_is_linear(&info) {
         bail!("cursor plane modifier {:?} is not linear", info.modifier());
@@ -400,8 +414,8 @@ fn read_cursor_pixels(card: &Card, fb: framebuffer::Handle) -> Result<Option<drm
     }
     let pitch = info.pitches()[0];
     let len = pitch as usize * height as usize;
-    let handle = info.buffers()[0]
-        .ok_or_else(|| anyhow!("the cursor framebuffer has no GEM handle"))?;
+    let handle =
+        info.buffers()[0].ok_or_else(|| anyhow!("the cursor framebuffer has no GEM handle"))?;
     let prime = card
         .buffer_to_prime_fd(handle, 0)
         .map_err(|e| anyhow!("PRIME export of the cursor buffer: {e}"))?;

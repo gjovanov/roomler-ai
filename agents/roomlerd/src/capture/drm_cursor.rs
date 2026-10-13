@@ -105,7 +105,12 @@ pub struct CursorPixels {
 ///
 /// `None` for a fully transparent buffer (nothing to show), or one shorter
 /// than `pitch × height`.
-pub fn straighten_and_crop(src: &[u8], width: u32, height: u32, pitch: u32) -> Option<CursorPixels> {
+pub fn straighten_and_crop(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    pitch: u32,
+) -> Option<CursorPixels> {
     let (w, h, pitch) = (width as usize, height as usize, pitch as usize);
     if w == 0 || h == 0 || pitch < w * 4 || src.len() < pitch * (h - 1) + w * 4 {
         return None;
@@ -271,7 +276,10 @@ mod tests {
         assert_eq!(px.bgra, vec![128, 64, 0, 128]);
         // Opaque passes through unchanged.
         let src = buffer(1, 1, 4, &[(0, 0, premul(10, 20, 30, 255))]);
-        assert_eq!(straighten_and_crop(&src, 1, 1, 4).unwrap().bgra, vec![10, 20, 30, 255]);
+        assert_eq!(
+            straighten_and_crop(&src, 1, 1, 4).unwrap().bgra,
+            vec![10, 20, 30, 255]
+        );
     }
 
     /// A 64×64 hardware buffer with an arrow in one corner sends only the
@@ -350,15 +358,28 @@ mod tests {
     #[test]
     fn the_primary_plane_is_picked_by_type() {
         use PlaneKind::*;
-        let planes = [(Some(Cursor), Some('c')), (Some(Overlay), Some('o')), (Some(Primary), Some('p'))];
+        let planes = [
+            (Some(Cursor), Some('c')),
+            (Some(Overlay), Some('o')),
+            (Some(Primary), Some('p')),
+        ];
         assert_eq!(pick_primary(&planes), Some('p'));
         // An unbound primary is no scanout.
-        assert_eq!(pick_primary(&[(Some(Primary), None), (Some(Cursor), Some('c'))]), None);
+        assert_eq!(
+            pick_primary(&[(Some(Primary), None), (Some(Cursor), Some('c'))]),
+            None
+        );
         // A driver that never said what its planes are: the first bound one, as
         // before P3c.
-        assert_eq!(pick_primary(&[(None, None), (None, Some('x')), (None, Some('y'))]), Some('x'));
+        assert_eq!(
+            pick_primary(&[(None, None), (None, Some('x')), (None, Some('y'))]),
+            Some('x')
+        );
         // A typed primary wins over an earlier untyped plane.
-        assert_eq!(pick_primary(&[(None, Some('x')), (Some(Primary), Some('p'))]), Some('p'));
+        assert_eq!(
+            pick_primary(&[(None, Some('x')), (Some(Primary), Some('p'))]),
+            Some('p')
+        );
     }
 
     #[test]
