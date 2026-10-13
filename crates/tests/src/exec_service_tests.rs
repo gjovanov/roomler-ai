@@ -580,6 +580,83 @@ async fn re_anchoring_and_un_anchoring_revoke_the_service_credential() {
     exec.abort();
 }
 
+/// #2133: removing a device ENDS its anchor. The same machine enrolling again
+/// revives the removed row in place (`AgentDao::rehydrate`), but not the
+/// anchor. The credential that anchor minted stays refused, and a command goes
+/// to the worker until an administrator anchors the device again. Before the
+/// fix the revived row carried `exec_anchor` back, so the old credential was
+/// accepted with no elevated step.
+#[tokio::test]
+async fn a_removed_device_comes_back_unanchored() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr94removed").await;
+    let (agent_id, _) = enroll_windows(&app, &seeded, "m-fr94-removed", "HOST-R").await;
+    let service = anchor(&app, &seeded, &agent_id, "HOST-R").await;
+    assert_eq!(
+        claim(&app, &service, "none").await.status(),
+        404,
+        "accepted while anchored"
+    );
+
+    let removed = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "remove the device");
+    assert_eq!(
+        claim(&app, &service, "none").await.status(),
+        401,
+        "a removed device's service is refused"
+    );
+
+    // The same machine enrolls again: the SAME row comes back...
+    let (again, agent_token) = enroll_windows(&app, &seeded, "m-fr94-removed", "HOST-R").await;
+    assert_eq!(
+        again, agent_id,
+        "re-enrolling the same machine revives the row in place"
+    );
+
+    // ...without its anchor.
+    let row: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        row.get("exec_anchor").is_none_or(|a| a.is_null()),
+        "a revived row must not carry the removed device's anchor: {row}"
+    );
+    assert_eq!(
+        claim(&app, &service, "none").await.status(),
+        401,
+        "the credential the removed anchor minted stays dead"
+    );
+
+    // A command goes to the worker, although the device still advertises
+    // `exec-system` (its service still holds the old anchor file).
+    let mut ws = connect_agent(&app, &agent_token, "HOST-R", &["exec", "exec-system"]).await;
+    wait_agent_online(&app, &seeded, &agent_id).await;
+    set_org_exec(&app, &seeded, json!({ "remote_exec_enabled": true })).await;
+    set_device_policy(&app, &seeded, &agent_id).await;
+    let exec = spawn_exec(&app, &seeded, &agent_id, "whoami");
+    let frame = read_until(&mut ws, "rc:rpc.exec").await.expect("frame");
+    assert!(
+        frame.get("via_service").is_none_or(|v| v == &json!(false)),
+        "a revived, un-anchored device must not be routed to a service: {frame}"
+    );
+    exec.abort();
+}
+
 /// The worker can answer a `via_service` frame itself: a declined prompt, a
 /// doorbell nobody answered. Before any claim, that answer WITHDRAWS the
 /// command, so a late claim cannot run what the caller was told did not run.

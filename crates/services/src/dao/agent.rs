@@ -941,11 +941,22 @@ impl AgentDao {
     /// rather than re-stamping it. The route 404s a repeat `DELETE` before
     /// reaching here (#1821); this keeps the removal hooks' and the archive
     /// sweep's calls to the same answer.
+    ///
+    /// #2133: a removal also ENDS the device's FR-94 exec anchor, in the same
+    /// update. Enrolling the same machine again revives this row in place
+    /// ([`Self::rehydrate`]), and an anchor left here would revive with it.
+    /// The service credential still on the machine's disk would then be
+    /// accepted again, with no elevated step. Removing a device must do at
+    /// least what un-anchoring it does. `rehydrate` deliberately does not
+    /// touch the anchor: re-enrolling a LIVE device keeps it.
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(
                 Self::live_row(tenant_id, agent_id),
-                doc! { "$set": { "deleted_at": DateTime::now() } },
+                doc! {
+                    "$set": { "deleted_at": DateTime::now() },
+                    "$unset": { "exec_anchor": "" },
+                },
             )
             .await
     }
