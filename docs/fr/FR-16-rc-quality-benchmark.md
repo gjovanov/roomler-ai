@@ -153,9 +153,14 @@ L1–L3. Anchors are master `c2e79221b`.
   reason alone. That follows from the arithmetic; it is not a measurement. The in-process
   harness jitters for the same reason, and its first run did not isolate the effect (field
   log, 2026-10-13).
-- **The sample** is taken from `frame.clone()` with `copyTo({rect})`, plane 0 only, so the
-  paint path is untouched. A GPU-backed frame reads back whole, about 1–2 ms at 1080p. So
-  the worker samples one frame in N, and only in bench mode.
+- **The sample** is taken from `frame.clone()` with `copyTo({rect})` of the 144×48 corner,
+  so the paint path is untouched. A GPU-backed frame reads back whole, about 1–2 ms at
+  1080p. So the worker samples **only while a probe is armed**, one frame at a time in paint
+  order, and an unanswered probe expires after 2 s. The design first said "one frame in N";
+  that would have credited each probe to a frame up to N−1 frames late. On the plain
+  `<video>` path the same read goes through a small canvas inside
+  `requestVideoFrameCallback`, stamped with its `presentationTime`
+  (`ui/src/composables/rcBench.ts`).
 - **Gated at every entry point:**
   - the agent's marker painter exists only in the synthetic source;
   - `probe` is refused unless `ROOMLERD_BENCH=1` **and** the build has the feature;
@@ -189,7 +194,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`c85b3ba28`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
-| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. Owed: the viewer half (worker sampler, upload), `probe-target`, the nightly spec, the baselines |
+| L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. Owed: an end-to-end session against a bench agent, `probe-target`, the nightly spec, the baselines |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
 | D | Docs | — | — |
@@ -239,3 +244,5 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-13 | L0, CI runner (Linux), merged head `6856520f6` | **Green in CI** (#2097, merged `c85b3ba28`): `clean` 30.2 fps, p50 12.7 ms, p95 15.5 ms · `delay100` p50 113.9 ms (+101) · `gate50` p50 64.6 ms (+52), 15.3 fps · `lossy` 26.3 fps, p50 38.4 ms, 1 freeze, 7 IDRs. The `clean` fps floor started at 0.9× and is now 0.75×, after a local run under a parallel repo-wide grep decoded 20 fps; a gate that flakes under load gets ignored. |
 | 2026-10-13 | L4 in process, unoptimised, neo16 (Windows) | **First probe run, green:** `probe` 64 round trips, p50 48.1 ms · `probe50` p50 171.1 ms (+123). That is more than the 100 ms two directions should cost. The first suspect was the probe period: 100 ms is exactly three frames, so every probe landed on the same phase of the capture clock. The probes now go out at a jittered interval. **Wrong turn:** with the jitter, `probe` read 43 round trips, p50 45.6 ms, and `probe50` p50 169.4 ms (+124), so the phase was not the extra. Windows timer overshoot in the vnet router is the likely cause: L0's `delay100` reads +112 on this box and +101 on the Linux runner. The jitter stays, because the phase-lock is real. |
 | 2026-10-13 | L4 in process, the same build | **Negative control, red:** with a probe dropped in the input handler before it reaches the source (one marked line), the test failed `probe: 0 round trips measured, want ≥ 20` (exit 101), with every L0 cell unaffected. Restored from the commit; the diff was that one line. |
+| 2026-10-13 | L4 viewer half, headless Chromium 151 (Playwright), the real TS modules bundled | **The browser's reader on frames Chromium decoded itself.** Two markers painted on a canvas: the frame's own number bottom-left, a probe bottom-right. Each case went through `readProbe`, the worker sampler's real `copyTo({rect})` path. A canvas-backed BGRA frame read correctly. Through Chromium's WebCodecs encode → decode: VP9 640×360 at 500 kbps 12/12 I420 frames, VP9 at 150 kbps 12/12, VP9 1280×720 scaled 2× to 640×360 12/12 (the k=2 path), H.264 at 500 kbps 12/12. A canvas played through `<video>` and read in `requestVideoFrameCallback` by `readVideoProbe`: 20/20. Every copy was the 144×48 corner, never the whole picture. |
+| 2026-10-13 | the same harness | **Negative control:** the same frames with no probe painted read `null` in every case (0 of 69 frames), although each still carried its own number bottom-left. So the reader can fail, and it does not invent a number. Not yet run: a session against a bench agent. |
