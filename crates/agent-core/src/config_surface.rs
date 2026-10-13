@@ -1150,7 +1150,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "tribool",
-        description: "FR-45 - capture a Wayland desktop through xdg-desktop-portal ScreenCast + PipeWire. The ATTENDED path: needs a logged-in user session, and the first use shows that user a consent dialog (later ones restore the grant without asking). Serves hosts DRM cannot reach - no scanout, nested compositors. Built-in default: OFF - an unattended host would wait forever on a dialog nobody answers. Tried after DRM, before X11. Env: ROOMLERD_PORTAL_CAPTURE. Restart required.",
+        description: "FR-45 - capture a Wayland desktop through xdg-desktop-portal ScreenCast + PipeWire. The ATTENDED path: needs a logged-in user session, and the first use shows that user a consent dialog (later ones restore the grant without asking). Serves hosts DRM cannot reach - no scanout, nested compositors. Built-in default: OFF - an unattended host would wait on a dialog nobody answers. A per-user install in its own Wayland session uses the portal by itself where mutter is absent (wayland_auto, FR-93 P2d-3), so this key matters there only to force it (true) or to keep it off (false). Tried after DRM, before X11. Env: ROOMLERD_PORTAL_CAPTURE. Restart required.",
     },
     KeyMeta {
         key: "portal_input",
@@ -1190,7 +1190,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-93 P2 - a PER-USER install in a GNOME Wayland session, with no capture key set, switches on mutter's own screencast by itself (** it asks nobody **). Other desktops keep the portal opt-in (portal_capture). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
+        description: "FR-93 P2 - a PER-USER install in its own Wayland session, with no capture key set, switches capture on by itself: on GNOME mutter's own screencast (** it asks nobody **), elsewhere (KDE and other desktops) the desktop portal, which asks the person at the screen once and restores their answer afterwards (P2d-3). A root (system) install never switches capture on: DRM and uinput stay opt-in there. Any capture key set (drm_capture, portal_capture, mutter_capture, window_capture) takes the choice back. Built-in default: ON. Off = the behaviour before P2 (the kill switch). Env: ROOMLERD_WAYLAND_AUTO. Restart required.",
     },
     KeyMeta {
         key: "x11_damage",

@@ -164,6 +164,76 @@ pub fn detect() -> PortalStatus {
         .unwrap_or_else(|_| PortalStatus::Unknown("detection thread panicked".into()))
 }
 
+/// FR-93 P2d-3 — [`detect`], bounded. The automatic portal arm asks this inside
+/// a session's capture open, before it raises a dialog, so a wedged session bus
+/// (or a portal that hangs while D-Bus starts it) costs a reason rather than
+/// the open: [`detect`] alone waits out D-Bus's own 25 s method timeout.
+pub fn detect_within(timeout: std::time::Duration) -> PortalStatus {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already have timed out; nothing to do about that.
+        let _ = tx.send(detect_blocking());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(status) => status,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PortalStatus::Unknown(format!(
+            "{PORTAL_BUS} did not answer within {}s",
+            timeout.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            PortalStatus::Unknown("detection thread panicked".into())
+        }
+    }
+}
+
+/// How long [`reachable`] waits: two calls to the bus daemon itself.
+const REACHABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// FR-93 P2d-3 — is a desktop portal on this process's session bus, running or
+/// installed to start on demand? For the desktop brief, which asks every
+/// minute. Unlike [`detect`] it never starts the portal: a name's owner and the
+/// bus's activatable names are read from the bus daemon, which activates
+/// nothing. So it cannot say whether ScreenCast is served. The brief is a plan,
+/// not a promise, and the session's own open asks [`detect_within`].
+pub fn reachable() -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = (|| {
+            let conn = zbus::blocking::Connection::session()
+                .map_err(|e| format!("no session bus: {e}"))?;
+            let bus = zbus::blocking::fdo::DBusProxy::new(&conn)
+                .map_err(|e| format!("the session bus: {e}"))?;
+            let name = zbus::names::BusName::try_from(PORTAL_BUS)
+                .map_err(|e| format!("{PORTAL_BUS}: {e}"))?;
+            if bus.name_has_owner(name).unwrap_or(false) {
+                return Ok(());
+            }
+            let activatable = bus
+                .list_activatable_names()
+                .map_err(|e| format!("the session bus's activatable names: {e}"))?;
+            if activatable.iter().any(|n| n.as_str() == PORTAL_BUS) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "no {PORTAL_BUS} on this session's bus, running or installed"
+                ))
+            }
+        })();
+        // The receiver may already have timed out; nothing to do about that.
+        let _ = tx.send(answer);
+    });
+    match rx.recv_timeout(REACHABLE_TIMEOUT) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "the session bus did not answer within {}s",
+            REACHABLE_TIMEOUT.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the portal probe thread panicked".to_string())
+        }
+    }
+}
+
 fn detect_blocking() -> PortalStatus {
     let conn = match zbus::blocking::Connection::session() {
         Ok(c) => c,
