@@ -2849,6 +2849,7 @@ async fn the_promotions_compare_and_sets_move_the_lease_once() {
         unreachable_from: false,
         prior: None,
         teleport: false,
+        fork: None,
     };
     let (one, two) = (promotion(), promotion());
     assert!(
@@ -4767,13 +4768,18 @@ fn checkpoint_seq_of(s: &Document, device: &str) -> Option<i64> {
 /// A replicated session running on `a`, which advertises [`FORKS`], at fence
 /// 1, whose member `b` (advertising `b_caps`) took its copy.
 async fn forkable(app: &TestApp, tag: &str, b_caps: &[&str]) -> Moving {
+    forkable_with(app, tag, FORKS, b_caps).await
+}
+
+/// [`forkable`], its primary advertising `a_caps`.
+async fn forkable_with(app: &TestApp, tag: &str, a_caps: &[&str], b_caps: &[&str]) -> Moving {
     let seeded = app.seed_tenant(tag).await;
     on_pro(app, &seeded).await;
     let tid = seeded.tenant_id.clone();
     let admin = seeded.admin.access_token.clone();
     let (code, p) = put_policy(app, &tid, &admin, &policy_min(2, 0)).await;
     assert_eq!(code, 200, "{p}");
-    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), FORKS).await;
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), a_caps).await;
     let mut b = device(app, &seeded, &format!("mach-{tag}-b"), b_caps).await;
     let (s, frame) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
     assert_eq!(frame["replicated"], true, "{frame}");
@@ -5187,8 +5193,9 @@ async fn a_fork_waits_for_the_members_copy_to_reach_the_last_checkpoint() {
 
 /// FR-90 P2f-3b — each gate refuses in its own words, and audits it: a
 /// session with no turn kept, or no checkpoint of one; an archived org; an
-/// owner without `HIVE_RUN`; an adopted session; a device that holds no copy,
-/// or a member that has not taken its copy; one that lacks a restricted tag;
+/// owner without `HIVE_RUN`; an adopted session; a device that holds no copy
+/// and takes none (P2f-3c: no `hive-teleport`), or a member that has not taken
+/// its copy and takes none either; one that lacks a restricted tag;
 /// a session moving; one that does not start forks, or is offline; a session
 /// alone has no copy to fork; another person's session, or a server with the
 /// replicaset off, is not there at all.
@@ -5256,11 +5263,12 @@ async fn a_fork_is_refused_by_the_gate_it_failed() {
         }
     }
 
-    // A device of the org that holds no copy.
+    // A device of the org that holds no copy, and takes none: it does not
+    // advertise `hive-teleport` (P2f-3c).
     let c = device(&app, &m.seeded, "mach-forkgate-c", FORKS).await;
     let (_, body) = post_fork(&app, &tid, &admin, &sid, &c.agent_id, "/srv/g").await;
-    assert_eq!(body["reason"], "no_copy", "{body}");
-    // A member whose copy is not taken yet.
+    assert_eq!(body["reason"], "device_unsupported", "{body}");
+    // A member whose copy is not taken yet holds none either, and takes none.
     let b_row = doc! {
         "_id": ObjectId::parse_str(&sid).unwrap(),
         "replicaset.members.device_id": ObjectId::parse_str(&b).unwrap(),
@@ -5275,7 +5283,7 @@ async fn a_fork_is_refused_by_the_gate_it_failed() {
             .unwrap();
         if state == "pending" {
             let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
-            assert_eq!(body["reason"], "no_copy", "{body}");
+            assert_eq!(body["reason"], "device_unsupported", "{body}");
         }
     }
 
@@ -5318,8 +5326,8 @@ async fn a_fork_is_refused_by_the_gate_it_failed() {
             "org_archived",
             "no_permission",
             "not_forkable",
-            "no_copy",
-            "no_copy",
+            "device_unsupported",
+            "device_unsupported",
             "restricted",
             "in_progress"
         ],
@@ -5593,6 +5601,416 @@ async fn a_promoted_forks_moved_start_names_its_parent() {
     assert_eq!(
         moved_start["fork_of"], first["fork_of"],
         "the moved start names its parent: {moved_start}"
+    );
+}
+
+// ─── FR-90 P2f-3c — a fork onto a device that holds no copy ───────────────
+
+/// [`FORKS`] and `hive-teleport`: a primary that hands its copy over to a
+/// teleport's target, and so to a fork's.
+const FORKS_AND_COPIES: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+    "hive-fork",
+];
+
+/// A device that holds no copies (no `hive-replica`) but takes a teleport's
+/// copy, and starts forks: a fork onto it takes a copy first.
+const TAKES_A_COPY_TO_FORK: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+    "hive-fork",
+];
+
+/// [`forkable`], its primary handing copies over and its first turn kept;
+/// and `c`, the owner's third device, which holds no copy of it.
+async fn joinable(app: &TestApp, tag: &str) -> (Moving, Device) {
+    let mut m = forkable_with(app, tag, FORKS_AND_COPIES, FORKS).await;
+    kept_a_turn(app, &mut m, 5).await;
+    let c = device(
+        app,
+        &m.seeded,
+        &format!("mach-{tag}-c"),
+        TAKES_A_COPY_TO_FORK,
+    )
+    .await;
+    (m, c)
+}
+
+/// Fork `m`'s session onto `c`, which holds no copy: `c` answers the
+/// teleport's prepare it is sent, ready or with the `refused` word. The
+/// route's answer and the prepare.
+async fn fork_join_prepared(
+    app: &TestApp,
+    m: &Moving,
+    c: &mut Device,
+    folder: &str,
+    refused: Option<&str>,
+) -> (Value, Value) {
+    let caller = post_fork(app, &m.tid, &m.admin, &m.sid, &c.agent_id, folder);
+    let target = async {
+        let prep = read_until(&mut c.ws, "rc:hive.prepare")
+            .await
+            .expect("the device is asked to prepare");
+        let mut ack = json!({"t": "rc:hive.prepare_ack", "session_id": prep["session_id"],
+                             "fence": prep["fence"], "account": "dev"});
+        if let Some(word) = refused {
+            ack["refused"] = json!(word);
+        }
+        send(&mut c.ws, ack).await;
+        prep
+    };
+    let ((code, body), prep) = tokio::join!(caller, target);
+    assert_eq!(code, 200, "{body}");
+    (body, prep)
+}
+
+/// `dev`'s join of `sid` in `role`, read and answered `joined`.
+async fn join_answered(dev: &mut Device, sid: &str, role: &str) -> Value {
+    let join = loop {
+        let j = read_until(&mut dev.ws, "rc:hive.replica.join")
+            .await
+            .unwrap_or_else(|| panic!("the {role}'s join of {sid}"));
+        if j["session_id"] == sid && j["role"] == role {
+            break j;
+        }
+    };
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": join["fence"]}),
+    )
+    .await;
+    join
+}
+
+/// The sessions forked from `parent`.
+async fn forks_of(app: &TestApp, parent: &str) -> Vec<Document> {
+    let mut rows = app
+        .db
+        .collection::<Document>("agent_sessions")
+        .find(doc! { "parent.session_id": ObjectId::parse_str(parent).unwrap() })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        out.push(d.unwrap());
+    }
+    out
+}
+
+/// FR-90 P2f-3c — a fork onto a device that holds no copy: the device is
+/// asked to prepare as a teleport's target, for the session, in the fork's
+/// folder, and the answer is `joining`; it joins in the teleport's role and
+/// takes a copy from the primary while the session runs; once its copy holds
+/// what the primary said it holds, the fork is made there, its start naming
+/// its parent, and the device is let go from the session's replicaset. The
+/// session never moves; both rooms say what happened.
+#[tokio::test]
+async fn a_fork_onto_a_device_with_no_copy_takes_one_first_and_is_made_there() {
+    let app = fork_app().await;
+    let (mut m, mut c) = joinable(&app, "forkjoin").await;
+    let sid = m.sid.clone();
+    let parent_harness = stored(&app, &sid)
+        .await
+        .get_document("harness")
+        .unwrap()
+        .get_str("session")
+        .unwrap()
+        .to_string();
+
+    let (body, prep) = fork_join_prepared(&app, &m, &mut c, "/srv/forkjoin-c", None).await;
+    assert_eq!(body["outcome"], "joining", "{body}");
+    assert!(body.get("session").is_none(), "no fork yet: {body}");
+    assert_eq!(
+        (
+            prep["session_id"].as_str(),
+            prep["teleport"].as_bool(),
+            prep["folder"].as_str()
+        ),
+        (Some(sid.as_str()), Some(true), Some("/srv/forkjoin-c")),
+        "a teleport's prepare, for the session, in the fork's folder: {prep}"
+    );
+    wait_note(&app, &m, "is forking the session into **Fork of forkjoin**").await;
+    assert!(
+        forks_of(&app, &sid).await.is_empty(),
+        "no fork before its device holds a copy"
+    );
+
+    // The device takes its copy as a teleport's target; the primary says where
+    // its copy ends, and the device's copy reaches it.
+    join_answered(&mut c, &sid, "teleport").await;
+    join_answered(&mut m.a, &sid, "primary").await;
+    send(&mut m.a.ws, tip_at(&sid, 1, 9, "ab")).await;
+    send(&mut c.ws, tip_at(&sid, 1, 9, "ab")).await;
+
+    // The fork's start, naming its parent, on that device, in that folder.
+    let start = read_until(&mut c.ws, "rc:hive.start")
+        .await
+        .expect("the fork's start, once the copy caught up");
+    assert_eq!(
+        start["fork_of"],
+        json!({"session_id": sid, "harness_session": parent_harness}),
+        "the start names its parent: {start}"
+    );
+    assert_eq!(start["folder"], "/srv/forkjoin-c", "{start}");
+    assert_eq!(start["fence"], 1, "{start}");
+    let fsid = start["session_id"].as_str().unwrap().to_string();
+    assert_ne!(fsid, sid, "a session of its own");
+    send(
+        &mut c.ws,
+        json!({"t": "rc:hive.start_ack", "session_id": fsid, "fence": 1, "account": "dev"}),
+    )
+    .await;
+
+    let fork = wait_stored(&app, &fsid, "the fork's device answers", |s| {
+        s.get_datetime("accepted_at").is_ok()
+    })
+    .await;
+    let link = fork
+        .get_document("parent")
+        .expect("the fork names its parent");
+    assert_eq!(link.get_object_id("session_id").unwrap().to_hex(), sid);
+    assert_eq!(
+        fork.get_document("location")
+            .unwrap()
+            .get_object_id("device_id")
+            .unwrap()
+            .to_hex(),
+        c.agent_id,
+        "made on the device that took the copy"
+    );
+    assert_eq!(fork.get_str("title").unwrap(), "Fork of forkjoin");
+
+    // The session moved nothing, and its fork's device is let go from it.
+    let after = wait_stored(&app, &sid, "the fork's taking of a copy ends", |s| {
+        !s.contains_key("promotion")
+    })
+    .await;
+    assert_eq!(
+        after
+            .get_document("location")
+            .unwrap()
+            .get_object_id("device_id")
+            .unwrap()
+            .to_hex(),
+        m.a.agent_id,
+        "the session stays where it is"
+    );
+    assert_eq!(after.get_i64("fence").unwrap(), 1, "nothing moved");
+    assert_eq!(
+        stored_member(&after, &c.agent_id),
+        ("teleport".into(), "leaving".into()),
+        "the device took its copy only to fork: let go"
+    );
+    assert!(
+        !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(300)).await,
+        "the primary never drains"
+    );
+    wait_note(&app, &m, "forked the session into **Fork of forkjoin**").await;
+    assert_eq!(
+        notes_in(&app, &m.tid, &m.admin, &fsid, "A fork of **forkjoin**")
+            .await
+            .len(),
+        1,
+        "the fork's room says what it was made from"
+    );
+    assert_eq!(
+        fork_audit(&app, &sid).await,
+        [
+            ("joining".to_string(), String::new(), String::new()),
+            ("sent".to_string(), String::new(), fsid.clone())
+        ],
+        "the audit names the session forked, at each step"
+    );
+}
+
+/// FR-90 P2f-3c — a fork whose device does not take its copy is not made: a
+/// refused prepare answers in the device's words, and a refused join fails
+/// the fork in the room, its device let go. No fork is made either way.
+#[tokio::test]
+async fn a_fork_whose_device_does_not_take_its_copy_is_not_made() {
+    let app = fork_app().await;
+    let (m, mut c) = joinable(&app, "forkjoinno").await;
+    let sid = m.sid.clone();
+
+    let (body, _) =
+        fork_join_prepared(&app, &m, &mut c, "/srv/forkjoinno-c", Some("folder_dirty")).await;
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("folder_dirty")),
+        "refused in the device's words: {body}"
+    );
+    wait_stored(
+        &app,
+        &sid,
+        "the refused prepare ends the fork's move",
+        |s| !s.contains_key("promotion"),
+    )
+    .await;
+
+    let (body, _) = fork_join_prepared(&app, &m, &mut c, "/srv/forkjoinno-c2", None).await;
+    assert_eq!(body["outcome"], "joining", "{body}");
+    let join = read_until(&mut c.ws, "rc:hive.replica.join")
+        .await
+        .expect("the device's join");
+    send(
+        &mut c.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": join["fence"],
+               "refused": "not_prepared", "detail": "a restart came between"}),
+    )
+    .await;
+    // `fail` tells the room last: once it has, the rest is written.
+    let why = wait_note(&app, &m, "did not take a copy of the session").await;
+    assert!(
+        why.iter().all(|n| n.contains("The fork onto")),
+        "the fork's words, not a move's: {why:?}"
+    );
+    let after = stored(&app, &sid).await;
+    assert!(!after.contains_key("promotion"), "{after:?}");
+    assert_eq!(
+        stored_member(&after, &c.agent_id),
+        ("teleport".into(), "leaving".into()),
+        "its copy is let go"
+    );
+    assert!(forks_of(&app, &sid).await.is_empty(), "no fork was made");
+    assert!(
+        notes_with(&app, &m, "forked the session into")
+            .await
+            .is_empty(),
+        "the room tells of no fork"
+    );
+    assert_eq!(
+        fork_audit(&app, &sid)
+            .await
+            .into_iter()
+            .map(|(o, r, _)| (o, r))
+            .collect::<Vec<_>>(),
+        [
+            ("joining".to_string(), String::new()),
+            ("failed".to_string(), "folder_dirty".to_string()),
+            ("joining".to_string(), String::new()),
+            ("failed".to_string(), "join_refused".to_string())
+        ],
+        "each attempt audited, naming the session"
+    );
+}
+
+/// FR-90 P2f-3c — a fork onto a device that holds no copy is refused by the
+/// gate it failed, before anything is asked of it: a primary that does not
+/// hand copies over, or is offline; a session that does not run; and the
+/// device's own gate, and the session's, before the primary's. A fork taking
+/// a copy moves nothing: a fork onto a member is not held up by it, while a
+/// second fork taking a copy, or a promotion, waits for it.
+#[tokio::test]
+async fn a_fork_onto_a_device_with_no_copy_is_refused_by_the_gate_it_failed() {
+    let app = fork_app().await;
+
+    // A primary that does not hand copies over.
+    let mut old = forkable(&app, "forkjoinold", FORKS).await;
+    kept_a_turn(&app, &mut old, 5).await;
+    let mut c = device(
+        &app,
+        &old.seeded,
+        "mach-forkjoinold-c",
+        TAKES_A_COPY_TO_FORK,
+    )
+    .await;
+    let (_, body) = post_fork(&app, &old.tid, &old.admin, &old.sid, &c.agent_id, "/srv/j").await;
+    assert_eq!(body["reason"], "primary_unsupported", "{body}");
+    assert!(
+        arrives(&mut c.ws, "rc:hive.prepare", Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing asked of the device"
+    );
+    // A device that takes no copy is told so first: its own gate comes before
+    // the primary's.
+    let e = device(&app, &old.seeded, "mach-forkjoinold-e", FORKS).await;
+    let (_, body) = post_fork(&app, &old.tid, &old.admin, &old.sid, &e.agent_id, "/srv/j").await;
+    assert_eq!(
+        body["reason"], "device_unsupported",
+        "the device's gate first: {body}"
+    );
+
+    // A fork taking a copy moves nothing.
+    let (mut m, mut c) = joinable(&app, "forkjoingate").await;
+    let (body, _) = fork_join_prepared(&app, &m, &mut c, "/srv/forkjoingate-c", None).await;
+    assert_eq!(body["outcome"], "joining", "{body}");
+    let (tid, admin, sid, b) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+    // A fork onto a member that holds a copy goes ahead meanwhile.
+    let (body, _) = forked(&app, &mut m.b, &tid, &admin, &sid, "/srv/forkjoingate-b").await;
+    assert_eq!(body["outcome"], "accepted", "not held up: {body}");
+    // A second fork taking a copy, or a move, waits for it.
+    let d = device(&app, &m.seeded, "mach-forkjoingate-d", TAKES_A_COPY_TO_FORK).await;
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &d.agent_id, "/srv/j").await;
+    assert_eq!(body["reason"], "in_progress", "{body}");
+    let (code, body) = post_promote(&app, &tid, &admin, &sid, &b, None).await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("promotion_in_progress")),
+        "{body}"
+    );
+
+    // A session that does not run: no copy can be taken. Its members' copies
+    // still fork it.
+    let (mut m, c) = joinable(&app, "forkjoinstop").await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "status": "ended" } },
+        )
+        .await
+        .unwrap();
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &c.agent_id, "/srv/j").await;
+    assert_eq!(body["reason"], "no_copy", "{body}");
+    let (body, _) = forked(&app, &mut m.b, &tid, &admin, &sid, "/srv/forkjoinstop-b").await;
+    assert_eq!(
+        body["outcome"], "accepted",
+        "a member's copy forks it: {body}"
+    );
+    // A session that does not run says so first, whatever its primary: the
+    // session's own gate comes before the primary's.
+    m.a.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.a.agent_id).await;
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &c.agent_id, "/srv/j2").await;
+    assert_eq!(
+        body["reason"], "no_copy",
+        "the session's gate first: {body}"
+    );
+
+    // A primary that is offline.
+    let (mut m, c) = joinable(&app, "forkjoinaway").await;
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    m.a.ws.close(None).await.unwrap();
+    wait_offline(&app, &m.seeded, &m.a.agent_id).await;
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &c.agent_id, "/srv/j").await;
+    assert_eq!(body["reason"], "primary_offline", "{body}");
+
+    let reasons: Vec<String> = fork_audit(&app, &old.sid)
+        .await
+        .into_iter()
+        .map(|(_, r, _)| r)
+        .collect();
+    assert_eq!(
+        reasons,
+        ["primary_unsupported", "device_unsupported"],
+        "audited"
     );
 }
 

@@ -13,6 +13,7 @@
 //! | a prompt on the fork | B's harness answers from the parent's conversation, now the fork's own | `history: 3`: the parent's two prompts, then this one; the folder's file |
 //! | the parent | A runs it on as it was | its harness alive, nothing of the fork's prompt in it |
 //! | a fork on A, the parent's own device, in a folder of its own | A puts it in place from its own store | `history: 3` again |
+//! | P2f-3c — a fork onto C, which holds no copies (`hive_replica` off) | C prepares as a teleport's target, joins in that role and takes its copy from A; once it caught up, the fork is made there | the answer `joining`; `history: 3`; C let go from the session's replicaset; the session never moved |
 //!
 //! ⚠️ The stream rides `direct` on loopback: the tests build carries no
 //! overlay, as in the canary. ⚠️ A process holds one supervisor, so neither
@@ -491,6 +492,83 @@ async fn scenario() {
         Some(WORK)
     );
 
+    // ── P2f-3c — a fork onto C, which holds no copy of the session ─────────
+    // C holds no copies at all (`hive_replica` off): it takes one as a
+    // teleport's target does, and the fork is made there once it has.
+    let c_dir = dir.path().join("c");
+    device_dir(&c_dir);
+    let mut c_cfg = enrol(&app, &seeded, "hive-fork-c").await;
+    runs_and_holds(&mut c_cfg, &seeded, &c_dir);
+    c_cfg.hive_replica = false;
+    let c = c_cfg.agent_id.clone();
+    let c_proc = device(&app, &seeded, &c_dir, &c_cfg).await;
+    assert!(
+        member(&session(&app, &seeded, &sid).await, &c).is_none(),
+        "C holds no copy"
+    );
+    let c_fork = c_dir.join("roots").join("fork");
+    std::fs::create_dir_all(&c_fork).unwrap();
+    let began = Instant::now();
+    let answer = fork(&app, &tid, &owner, &sid, &c, &c_fork).await;
+    assert_eq!(answer["outcome"], "joining", "{answer}");
+    let fsid_c = until_forked_on(&app, &sid, &c).await;
+    assert!(
+        reached(&app, &seeded, &fsid_c, "idle").await,
+        "the fork never came up on C"
+    );
+    eprintln!(
+        "hive_fork: forked onto C, which held no copy, in {} ms",
+        began.elapsed().as_millis()
+    );
+    let turn = recall(&mut ws, &fsid_c, "f3").await;
+    assert!(
+        turn.iter().any(|e| text_of(e).contains("history: 3")),
+        "C's fork holds the parent's two prompts, then its own: {turn:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(c_fork.join("notes.md"))
+            .ok()
+            .as_deref(),
+        Some(WORK),
+        "the parent's folder, in C's fork's"
+    );
+    until_session(&app, &seeded, &sid, LONG, "C was never let go", |s| {
+        member(s, &c).is_some_and(|m| m["state"] == "leaving") && s["promotion"].is_null()
+    })
+    .await;
+    let parent = session(&app, &seeded, &sid).await;
+    assert_eq!(
+        (parent["device_id"].as_str(), parent["fence"].as_u64()),
+        (Some(a.as_str()), Some(1)),
+        "the session never moved: {parent}"
+    );
+
+    stop(c_proc).await;
     stop(b_proc).await;
     stop(a_proc).await;
+}
+
+/// The fork of `parent` made on `device`, once there is one, within [`LONG`].
+async fn until_forked_on(app: &TestApp, parent: &str, device: &str) -> String {
+    let filter = bson::doc! {
+        "parent.session_id": bson::oid::ObjectId::parse_str(parent).unwrap(),
+        "location.device_id": bson::oid::ObjectId::parse_str(device).unwrap(),
+    };
+    let deadline = Instant::now() + LONG;
+    loop {
+        if let Some(s) = app
+            .db
+            .collection::<bson::Document>("agent_sessions")
+            .find_one(filter.clone())
+            .await
+            .unwrap()
+        {
+            return s.get_object_id("_id").unwrap().to_hex();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no fork of {parent} was made on {device}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }

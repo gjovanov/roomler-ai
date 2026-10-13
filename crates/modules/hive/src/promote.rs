@@ -58,8 +58,8 @@ use tracing::{debug, info, warn};
 
 use crate::HiveState;
 use crate::model::{
-    AgentSession, DrainedTip, MemberState, MovedStart, Promotion, PromotionState, SessionLocation,
-    SessionOrigin, SessionStatus, SessionView,
+    AgentSession, DrainedTip, ForkPlan, MemberState, MovedStart, Promotion, PromotionState,
+    SessionLocation, SessionOrigin, SessionStatus, SessionView,
 };
 use crate::placement::MemberRole;
 use crate::room;
@@ -386,6 +386,9 @@ fn reported(s: &AgentSession, device: ObjectId) -> (i64, i64) {
 enum Kind {
     Promote,
     Teleport,
+    /// P2f-3c — a fork onto a device that holds no copy: a teleport's steps
+    /// up to the copy, then the fork made there. The session never moves.
+    Fork,
 }
 
 impl Kind {
@@ -394,11 +397,14 @@ impl Kind {
         match self {
             Self::Promote => "promote",
             Self::Teleport => "teleport",
+            Self::Fork => "fork",
         }
     }
 
     fn of(p: &Promotion) -> Self {
-        if p.teleport {
+        if p.fork.is_some() {
+            Self::Fork
+        } else if p.teleport {
             Self::Teleport
         } else {
             Self::Promote
@@ -470,8 +476,9 @@ async fn authorize(
             }
             hub.agent_supports_hive_promote(target, tid)
         }
-        // P2f-1 — a device that holds a copy already is promoted to.
-        Kind::Teleport => {
+        // P2f-1 — a device that holds a copy already is promoted to. P2f-3c —
+        // a fork is gated by its own route, and would be as a teleport.
+        Kind::Teleport | Kind::Fork => {
             if member_role(s, target).is_some() {
                 return Ok(Err(PromoteDenyReason::AlreadyAMember));
             }
@@ -596,7 +603,9 @@ fn member_role(s: &AgentSession, device: ObjectId) -> Option<String> {
     })
 }
 
-/// The audit row of a move, `promote` or (P2f-1) `teleport`.
+/// The audit row of a move, `promote` or (P2f-1) `teleport`. P2f-3c — a
+/// `fork`'s rows name the session it forks as their target, and no session
+/// of their own, as the fork route's rows do: the fork is not made yet.
 fn audit(
     kind: Kind,
     s: &AgentSession,
@@ -605,12 +614,16 @@ fn audit(
     outcome: &'static str,
     reason: Option<&'static str>,
 ) -> Audit {
+    let (target_id, session_id) = match kind {
+        Kind::Fork => (s.id, None),
+        Kind::Promote | Kind::Teleport => (None, s.id),
+    };
     Audit {
         tenant_id: s.tenant_id,
         user_id: by,
-        target_id: None,
+        target_id,
         device_id: device,
-        session_id: s.id,
+        session_id,
         action: kind.action(),
         outcome,
         reason,
@@ -700,13 +713,101 @@ async fn begin(
             )));
         }
     };
+    let to = MoveTo {
+        target,
+        device: &device,
+        folder,
+        fork: None,
+    };
+    let started = start_move(&state, &s, auth.user_id, to, kind, reach).await?;
+    let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
+    Ok(Json(match started {
+        Started::Refused(reason) => {
+            PromoteResponse::refused(reason.as_str(), reason.message().to_string(), &s)
+        }
+        Started::Ready => PromoteResponse {
+            outcome: match kind {
+                Kind::Promote => "promoting",
+                Kind::Teleport | Kind::Fork => "teleporting",
+            },
+            reason: None,
+            message: None,
+            session: SessionView::from(&s),
+        },
+        Started::PrepareRefused { reason, message } => {
+            PromoteResponse::refused(&reason, message, &s)
+        }
+        Started::Pending => PromoteResponse {
+            outcome: "pending",
+            reason: None,
+            message: Some(
+                "the device has not answered yet; the session says how the move goes on".into(),
+            ),
+            session: SessionView::from(&s),
+        },
+    }))
+}
+
+/// FR-90 P2f-3c — where a move whose gates passed goes: the device, the
+/// folder it runs in there, and, for a fork, the fork it is for.
+pub(crate) struct MoveTo<'a> {
+    pub target: ObjectId,
+    pub device: &'a Agent,
+    pub folder: String,
+    /// A fork's plan: present for a fork's move (`Kind::Fork`) and only for it.
+    pub fork: Option<ForkPlan>,
+}
+
+/// What became of a move's start, its gates passed.
+#[derive(Debug)]
+pub(crate) enum Started {
+    /// Refused in the server's words, at the record or the push: nothing
+    /// reached the target.
+    Refused(PromoteDenyReason),
+    /// The target is ready.
+    Ready,
+    /// The target said no, in its words.
+    PrepareRefused { reason: String, message: String },
+    /// The target has not answered within the start's bound.
+    Pending,
+}
+
+/// A move whose gates passed, of every kind: its record, its prepare, and its
+/// target's answer, waited for within the start's bound. The rest goes on
+/// without the caller, step by step on the devices' frames.
+async fn start_move(
+    state: &HiveState,
+    s: &AgentSession,
+    by: ObjectId,
+    to: MoveTo<'_>,
+    kind: Kind,
+    reach: Reach,
+) -> Result<Started, ApiError> {
+    let Some(sid) = s.id else {
+        return Err(ApiError::Internal("a session record without its id".into()));
+    };
+    let tid = s.tenant_id;
+    let MoveTo {
+        target,
+        device,
+        folder,
+        fork,
+    } = to;
+    // P2f-3c — a fork's plan is what makes the move a fork's: without it, a
+    // caught-up target would drain the session and move it.
+    let fork = match kind {
+        Kind::Fork => {
+            Some(fork.ok_or_else(|| ApiError::Internal("a fork's move without its fork".into()))?)
+        }
+        Kind::Promote | Kind::Teleport => None,
+    };
     let to_role = match kind {
         Kind::Promote => {
-            member_role(&s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into())
+            member_role(s, target).unwrap_or_else(|| MemberRole::Owner.as_str().into())
         }
-        Kind::Teleport => MemberRole::Teleport.as_str().into(),
+        Kind::Teleport | Kind::Fork => MemberRole::Teleport.as_str().into(),
     };
-    let unanswered = kind == Kind::Promote && unanswered_move(&s);
+    let unanswered = kind == Kind::Promote && unanswered_move(s);
     // Read before the promotion begins: nothing after it may fail on the way
     // to the push, or the promotion would wait out its bound for nothing.
     let user = state.users.base.find_by_id(s.owner_id).await?;
@@ -719,42 +820,36 @@ async fn begin(
         folder: folder.clone(),
         from: s.location.clone(),
         from_fence: s.fence,
-        by: auth.user_id,
+        by,
         state: PromotionState::Preparing,
         started_at: now,
         deadline: deadline_after(state.promote_bounds.prepare),
         drained: None,
         unreachable_from: reach == Reach::Unreachable,
-        prior: unanswered.then(|| prior_of(&s)).flatten(),
-        teleport: kind == Kind::Teleport,
+        prior: unanswered.then(|| prior_of(s)).flatten(),
+        teleport: kind != Kind::Promote,
+        fork,
+    };
+    // P2f-3c — a fork's refusals are the fork route's to word and audit.
+    let refused_row = |reason: PromoteDenyReason| {
+        (kind != Kind::Fork).then(|| audit(kind, s, by, target, "refused", Some(reason.as_str())))
     };
     if !state
         .sessions
-        .begin_promotion(tid, auth.user_id, sid, &p, unanswered)
+        .begin_promotion(tid, by, sid, &p, unanswered)
         .await?
     {
         // Another tab's promotion won, or the session moved on meanwhile.
-        let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
-        let reason = if s.promotion.is_some() {
+        let held = state.sessions.find(sid).await?;
+        let reason = if held.is_some_and(|h| h.promotion.is_some()) {
             PromoteDenyReason::InProgress
         } else {
             PromoteDenyReason::NotRunning
         };
-        audit(
-            kind,
-            &s,
-            auth.user_id,
-            target,
-            "refused",
-            Some(reason.as_str()),
-        )
-        .write(&state)
-        .await;
-        return Ok(Json(PromoteResponse::refused(
-            reason.as_str(),
-            reason.message().to_string(),
-            &s,
-        )));
+        if let Some(row) = refused_row(reason) {
+            row.write(state).await;
+        }
+        return Ok(Started::Refused(reason));
     }
 
     // The waiter before the push: the member's answer, however fast, must
@@ -770,15 +865,16 @@ async fn begin(
         user_id: s.owner_id,
         user_email: user.email,
         caller: user.display_name,
-        teleport: kind == Kind::Teleport,
+        teleport: p.teleport,
         // P2f-2b — the target may take the workspace against its clone: a
-        // teleport's only, and only once the operator turned it on.
-        have_want: kind == Kind::Teleport && state.teleport_have_want,
+        // teleport's only (P2f-3c: a fork-joining one's too), and only once
+        // the operator turned it on.
+        have_want: p.teleport && state.teleport_have_want,
     };
     let hub = &state.fleet.rc_hub;
     let pushed = match kind {
         Kind::Promote => hub.push_hive_promote(target, tid, msg),
-        Kind::Teleport => hub.push_hive_teleport(target, tid, msg),
+        Kind::Teleport | Kind::Fork => hub.push_hive_teleport(target, tid, msg),
     };
     if let Err(e) = pushed {
         // Gone, or reconnected as a build that takes no part, between the
@@ -792,29 +888,22 @@ async fn begin(
             HubError::ExecUnsupported(_) => PromoteDenyReason::DeviceUnsupported,
             _ => PromoteDenyReason::DeviceOffline,
         };
-        audit(
-            kind,
-            &s,
-            auth.user_id,
-            target,
-            "refused",
-            Some(reason.as_str()),
-        )
-        .write(&state)
-        .await;
-        let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
-        return Ok(Json(PromoteResponse::refused(
-            reason.as_str(),
-            reason.message().to_string(),
-            &s,
-        )));
+        if let Some(row) = refused_row(reason) {
+            row.write(state).await;
+        }
+        return Ok(Started::Refused(reason));
     }
-    audit(kind, &s, auth.user_id, target, "sent", None)
-        .write(&state)
-        .await;
+    // P2f-3c — a fork's prepare is not yet the fork: its start is sent once
+    // the target's copy caught up, and audited then.
+    let sent = if kind == Kind::Fork {
+        "joining"
+    } else {
+        "sent"
+    };
+    audit(kind, s, by, target, sent, None).write(state).await;
     info!(
         tenant = %tid, session = %sid, from = %s.location.device_id, to = %target,
-        user = %auth.user_id, action = kind.action(), "hive: move started — prepare sent"
+        user = %by, action = kind.action(), "hive: move started — prepare sent"
     );
     tokio::spawn(watch(state.clone(), sid, p.id));
 
@@ -824,29 +913,26 @@ async fn begin(
     )
     .await;
     state.prepare_acks.forget(p.id);
-    let s = state.sessions.find_owned(tid, auth.user_id, sid).await?;
-    Ok(Json(match heard {
-        Ok(Ok(PrepareAnswer::Ready)) => PromoteResponse {
-            outcome: match kind {
-                Kind::Promote => "promoting",
-                Kind::Teleport => "teleporting",
-            },
-            reason: None,
-            message: None,
-            session: SessionView::from(&s),
-        },
+    Ok(match heard {
+        Ok(Ok(PrepareAnswer::Ready)) => Started::Ready,
         Ok(Ok(PrepareAnswer::Refused { reason, message })) => {
-            PromoteResponse::refused(&reason, message, &s)
+            Started::PrepareRefused { reason, message }
         }
-        _ => PromoteResponse {
-            outcome: "pending",
-            reason: None,
-            message: Some(
-                "the device has not answered yet; the session says how the move goes on".into(),
-            ),
-            session: SessionView::from(&s),
-        },
-    }))
+        _ => Started::Pending,
+    })
+}
+
+/// FR-90 P2f-3c — a fork of `s` onto a device that holds no copy of it, the
+/// fork route's gates passed: a teleport's steps up to the copy begin (the
+/// record, the prepare, the target's answer). Once the target's copy caught
+/// up with the primary, the fork is made there ([`make_fork`]).
+pub(crate) async fn begin_fork_join(
+    state: &HiveState,
+    s: &AgentSession,
+    by: ObjectId,
+    to: MoveTo<'_>,
+) -> Result<Started, ApiError> {
+    start_move(state, s, by, to, Kind::Fork, Reach::Online).await
 }
 
 /// Why a promotion failed before the lease moved.
@@ -1070,7 +1156,13 @@ pub(crate) async fn fail(
     .write(state)
     .await;
     if runs {
-        room::note(state, &before, room::move_failed_note(&was, &why)).await;
+        let note = match Kind::of(&was) {
+            // P2f-3c — the session never moved: it is the fork that did not
+            // happen.
+            Kind::Fork => room::fork_failed_note(&was, &why),
+            Kind::Promote | Kind::Teleport => room::move_failed_note(&was, &why),
+        };
+        room::note(state, &before, note).await;
     }
     let reason = match &failure {
         Failure::PrepareRefused { word, .. } => word.as_str().to_string(),
@@ -1287,9 +1379,13 @@ async fn begin_joining(state: &HiveState, s: &AgentSession, p: &Promotion) {
     }
     crate::replica::push_join(state, &s, p.to, HiveReplicaRole::Teleport);
     crate::replica::push_join(state, &s, s.location.device_id, HiveReplicaRole::Primary);
-    info!(session = %sid, to = %p.to, "hive: the teleport's target is ready — it takes a copy first");
+    info!(session = %sid, to = %p.to, action = Kind::of(p).action(), "hive: the teleport's target is ready — it takes a copy first");
     let by = display_name(state, p.by).await;
-    room::note(state, &s, room::teleporting_note(p, &by)).await;
+    let note = match Kind::of(p) {
+        Kind::Fork => room::fork_joining_note(p, &by),
+        Kind::Promote | Kind::Teleport => room::teleporting_note(p, &by),
+    };
+    room::note(state, &s, note).await;
     state.prepare_acks.deliver(p.id, p.to, PrepareAnswer::Ready);
     // The answers may be in already.
     if let Ok(Some(now)) = state.sessions.find(sid).await {
@@ -1369,12 +1465,41 @@ async fn check_joined(state: &HiveState, s: &AgentSession) {
     }
     match joined_of(s, &p) {
         Joined::Waiting => {}
+        // P2f-3c — a fork's target caught up: the fork is made there, and the
+        // session stays where it is.
+        Joined::CaughtUp if Kind::of(&p) == Kind::Fork => {
+            info!(session = %sid, to = %p.to, "hive: the fork's target caught up");
+            make_fork(state, s, &p).await;
+        }
         Joined::CaughtUp => {
             info!(session = %sid, to = %p.to, "hive: the teleport's target caught up");
             drain_primary(state, s, &p, PromotionState::Joining).await;
         }
         Joined::Failed(f) => fail(state, sid, &p, f, false).await,
     }
+}
+
+/// FR-90 P2f-3c — a fork's target caught up with the session's primary: the
+/// fork-joining move ends, its target is let go from this session's
+/// replicaset (it took its copy only to fork it: the copy stays until the
+/// purge, P2g), and the fork is made there from that copy, as the fork route
+/// makes one on a device that held a copy already. Off the frame's task:
+/// making it waits on the device's answer to its start.
+async fn make_fork(state: &HiveState, s: &AgentSession, p: &Promotion) {
+    let Some(sid) = s.id else { return };
+    let before = match state
+        .sessions
+        .end_promotion(sid, p.id, &[PromotionState::Joining])
+        .await
+    {
+        Ok(Some(before)) => before,
+        // Another frame took the step, or failed it, first.
+        Ok(None) => return,
+        Err(e) => return warn!(session = %sid, %e, "hive: a fork's move was not ended"),
+    };
+    let_go(state, sid, p.to).await;
+    let (state, p) = (state.clone(), p.clone());
+    tokio::spawn(async move { crate::fork::make_joined(&state, &before, &p).await });
 }
 
 /// P2f-1 — a join's answer landed (`rc:hive.replica.join_ack`): a teleport
@@ -2036,6 +2161,7 @@ mod tests {
             unreachable_from: false,
             prior: None,
             teleport: false,
+            fork: None,
         };
         let member = |device_id, role: &str, tip| ReplicaMember {
             device_id,
