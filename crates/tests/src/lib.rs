@@ -103,6 +103,8 @@ mod plan_limit_tests;
 #[cfg(test)]
 mod rate_limit_tests;
 #[cfg(test)]
+mod rc_request_ceiling_tests;
+#[cfg(test)]
 mod relay_region_tests;
 #[cfg(test)]
 mod remote_control_tests;
