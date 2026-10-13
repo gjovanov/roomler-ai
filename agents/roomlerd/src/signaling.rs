@@ -4302,6 +4302,7 @@ async fn handle_server_msg(
             replicated,
             lease,
             fork_of,
+            from_terminal,
         } => {
             #[cfg(hive_host)]
             crate::hive::handle_start(
@@ -4323,6 +4324,9 @@ async fn handle_server_msg(
                     lease,
                     // P2f-3a — a fork: started from its parent's copy here.
                     fork_of,
+                    // P2f-4a — a terminal session this device adopted, made a
+                    // managed one: started from the terminal's own history.
+                    from_terminal,
                 },
                 ctx.is_primary,
                 outbound_tx.clone(),
@@ -4342,6 +4346,7 @@ async fn handle_server_msg(
                     replicated,
                     lease,
                     &fork_of,
+                    from_terminal,
                 );
                 warn!(
                     session = %session_id, %caller,
@@ -4443,6 +4448,7 @@ async fn handle_server_msg(
                     // P2f-3a — a prepare launches nothing; the moved start
                     // that follows says whether the session is a fork.
                     fork_of: None,
+                    from_terminal: false,
                 },
                 teleport,
                 have_want,

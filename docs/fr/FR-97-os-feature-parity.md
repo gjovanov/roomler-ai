@@ -3,7 +3,7 @@
 **Issue:** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) · **Status:** in progress — P0a (#2081, #2085)
 shipped in 0.4.132 and field-verified (AC1); P0b-1 (#2098, server) live since the hosted promote of `c6bcdb2de`;
 P0b-2a (#2104, device) ships in 0.4.133; P0b-3 (#2108, admin row) merged, not yet promoted; P0b-2b not started;
-P1a (the macOS exit client) in review · **Owner:** the agent on all
+P1a (the macOS exit client) merged (#2122), with a field finding fixed before any release (#2125, in review) · **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
 **Depends on:** [FR-43](FR-43-macos-single-enrollment.md) P3 (one Mac, one row, in the mesh),
 [FR-94](FR-94-fleet-rpc-system-on-windows.md) (Windows exec as SYSTEM),
@@ -74,7 +74,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:1756-1785`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:1768-1797`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -90,7 +90,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1374`).
+  although every agent row has one (`models.rs:1386`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2549`). A client accepts any peer whose fanned routes hold `/0`
@@ -183,7 +183,7 @@ and the consent chain's fallbacks.
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:925`); recordings write Opus, not AAC | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`) | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1374`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1386`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -284,27 +284,31 @@ flowchart TB
 Mirror the Linux arm with the BSD tools the macOS code already drives, and close two gaps the Linux arm has (N12):
 
 1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
-   (`tun.rs:3854`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
-   every pin (`current_uplink`, `tun.rs:5420`): a Mac that booted without a network still pins once it has one, and
-   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:332`) refuses a route on our
+   (`tun.rs:3878`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
+   every pin (`current_uplink`, `tun.rs:5441`): a Mac that booted without a network still pins once it has one, and
+   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:316`) refuses a route on our
    own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
    next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
    in transit does not move the pins.
-2. **`add_host_exemption`** (`tun.rs:4742`) looks first, because BSD `route` has no idempotent write (#1856): a pin
-   that holds is left alone; a static host route through another next hop is repointed with `route change`, which
-   leaves no instant where the endpoint falls into the `/1`s; an interface route for the address is replaced;
-   anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6).
-3. **The read-back decides** (`bsd_exemption_holds`, `tun.rs:384`): a STATIC host route for exactly the address,
-   flagged GATEWAY, through the uplink's next hop, on its interface. A clone of the default route (`WASCLONED`) shows
-   the same gateway and is not a pin: it expires and is re-cloned from whatever covers the address by then, our `/1`
-   under an exit. On a mismatch after a successful write, the route written comes out again and the call errs.
+2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:5343`), never from a
+   lookup. A destination a connection has used keeps an interface-scoped clone of the default route
+   (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that clone even after the pin is in (field,
+   §8: the first P1a read back by lookup and refused every pin for the server). The pin is the UNSCOPED static host
+   route for exactly the address (`bsd_pin_row`, `tun.rs:398`: flags `H` and `S`, never `W` or `I`), and it holds
+   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:411`).
+3. **`add_host_exemption`** (`tun.rs:4740`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+   that holds is left alone; one that does not (the old uplink, a crashed run's, an interface route) is deleted, then
+   added; anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6). Never `route
+   change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
+   then decides; a pin that does not hold comes out again and the call errs.
 4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:4838` on macOS, an empty default
-   elsewhere) names the pins that no longer read back through the current uplink. The gate (`route_guard.rs:570`)
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:570`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
-5. **`del_host_exemption`** removes only a static host route for exactly the address, never one on our utun (a peer
-   route). The boot purge already removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit
-   leaves behind are N13, all three OSes.
+5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
+   unscoped pin left, `route -n delete -host` removed something else on the field Mac. The boot purge already
+   removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
+   three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
    `route_guard.rs:370`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
    (`exemption_withheld_reason`, `route_guard.rs:382`) instead of `no original default route?`.
@@ -321,11 +325,11 @@ sequenceDiagram
     Note over T,K: at bring-up — route -n get default / -inet6 default → gateway + uplink
     G->>T: add_host_exemption(server, coturn, exit endpoint)
     T->>K: route -n add -host ip gw
-    T->>K: route -n get ip
-    alt every v4 exemption reads back on the uplink
+    T->>K: netstat -rnW (the table: a lookup answers with a scoped clone)
+    alt every v4 pin holds through the uplink
         G->>T: add_cidr_route(0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1)
         G->>G: steer DNS (P1c); set_v6_exit only when the v6 exemptions hold
-    else a pin fails, or the read-back names utunN
+    else a pin fails, or the table shows it elsewhere
         G->>G: WITHHOLD — egress stays on the uplink, the reason goes to roomler status
     end
 ```
@@ -611,3 +615,7 @@ one depends on it.
 | 2026-10-13 | released 0.4.131 | a throwaway tart macOS VM (vmtest org), root daemon, `overlay_exit_node` set before its one start; a throwaway Linux exit, approved | 🔴 **S1 reproduced (AC1 red).** `roomler status` said `active`; `0/1` and `128.0/1` sat on `utun4`; `route -n get 94.130.141.98` answered `utun4` in every sample while the daemon logged "pinned carrier-endpoint exemption … ip=94.130.141.98". `GET /health` failed in 14 of 16 samples. The failure flaps rather than staying solid: the exit's carrier dies inside the captured routes, the guard tears the split-default down ("no live carrier"), and it is re-installed within a second, every ~45 s. The 300 s dead-man booted the daemon out |
 | 2026-10-13 | released 0.4.132 (carries `c2e79221b`) | the same setup; the exit confirmed `is_exit_node: true, online: true` just before the run | 🟢 **AC1.** `withheld — carrier-endpoint exemption unavailable …` in every sample; no `/1` routes; the server via `en0`; health 200 throughout; the row online. The daemon logs `FAILED to pin a carrier exemption … no host-exemption route support on this platform`. Follow-ups: that WARN repeats every ~5 s (log once per reason), and the status reason should name the platform, not "no original default route?" (both go away with P1a) |
 | 2026-10-13 | CI, #2098 | unit + integration lanes | 🔴→🟢 P0b-1. Tests-only commit: 2 unit tests failed ("a /0 the device no longer offers must not reach a single peer") and the end-to-end `an_exit_that_stops_offering_its_default_route_stops_being_one` failed ("no delta without 0.0.0.0/0 arrived after the rejoin"); the fix passed all three (552 integration tests) |
+| 2026-10-13 | CI, #2122 | the macOS job's real utun | 🔴→🟢 P1a. The tests-only commit `19eb919c1` failed `an_exemption_pins_through_the_uplink_and_outranks_an_overlay_capture` at "the exemption pins: Unsupported … cannot exempt 203.0.113.7", after parsing the runner's real default route into an uplink, and `a_v6_exemption_needs_a_v6_uplink` on the refusal's wording; the arm `cda067f94` passed 6 of 6 |
+| 2026-10-13 | released 0.4.133 | throwaway Linux exit containers in the vmtest org: the anchor image as is (no iptables), then with iptables and `ip_forward` | 🟢 **#2104, Linux.** Without iptables: `routes offer withheld — iptables cannot use the nat table (iptables could not start: No such file or directory (os error 2)), so this host cannot forward or NAT for its peers`, nothing advertised, `can_be_exit_node: false`; on 0.4.132 the same image was approved as an exit (the P0a rows above). With iptables: offered, approved, one MASQUERADE rule |
+| 2026-10-13 | released 0.4.133 | a throwaway tart Mac, root daemon; `overlay_exit_node` (the iptables exit) and `overlay_exit_node_enabled` set before its one start | 🟢 **#2104, macOS:** `routes offer withheld — this platform has no NAT for the overlay yet … (FR-97 P1b)`. 🔴 **AC4 red**, as on 0.4.132: `withheld — carrier-endpoint exemption unavailable (no original default route?)`, no `/1`s, health 200 in 12 of 12 samples, egress the Mac's own address. The pin WARN fired up to three times within 250 ms during carrier bursts. **Finding:** `route -n get <server>` answered with an interface-scoped clone (`WASCLONED,IFSCOPE`) in every sample |
+| 2026-10-13 | the same VM, by hand | `route -n add/change/delete -host` on the server's address | 🔴 **P1a as merged (#2122) would refuse in the field.** After `route -n add -host` (rc 0) `netstat -rnW` listed the pin (`UGHS en0`) while `route -n get` still answered with the clone; `route -n change` (rc 0) left the pin unchanged; `route -n delete -host` removed exactly the pin. #2122 read pins back by lookup, so it would refuse every pin for the server and leave each in the table untracked. #2125 reads them from the table, before any release carried #2122 |

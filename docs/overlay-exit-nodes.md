@@ -248,18 +248,19 @@ sequenceDiagram
     Note over T,K: bring-up: route -n get [-inet6] default → next hop + uplink
     G->>T: add_host_exemption(server, coturn, exit endpoint)
     T->>K: route -n get default (re-read: the Mac may have moved)
-    T->>K: route -n get <ip>
-    alt already a static host route through the uplink
+    T->>K: netstat -rnW -f inet (the TABLE, never a lookup)
+    alt our pin, through the uplink
         T-->>G: Ok, nothing written
-    else a static host route through another next hop
-        T->>K: route -n change -host <ip> <gw>
-    else nothing of ours
+    else a pin that does not hold
+        T->>K: route -n delete -host <ip>, then route -n add -host <ip> <gw>
+    else no pin
         T->>K: route -n add -host <ip> <gw>
     end
-    T->>K: route -n get <ip> (read back)
-    alt static, host, through <gw> on the uplink
+    T->>K: netstat -rnW -f inet (read back)
+    alt unscoped static host route through <gw> on the uplink
         T-->>G: Ok — the gate may install the /1s
     else anything else
+        T->>K: delete what is left of it
         T-->>G: Err(the device's cause) — WITHHOLD
     end
     loop every reconcile, at most every 3 s
@@ -271,12 +272,29 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:3854`, `current_uplink` `tun.rs:5420`, `bsd_default_uplink` `tun.rs:332` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Look first, then add or change | `add_host_exemption` `tun.rs:4742` | BSD `route` has no idempotent write; a re-write is a route-monitor event (#1856), and delete-then-add leaves a hole in which the endpoint falls into the `/1`s |
-| Read back before it counts | `bsd_exemption_holds` `tun.rs:384` | Only a **static** host route through the uplink's next hop is a pin. A clone of the default route (`WASCLONED`) shows the same gateway, then expires and is re-cloned from our own `/1` |
+| Capture the uplink per family, re-read before every pin | `tun.rs:3878`, `current_uplink` `tun.rs:5441`, `bsd_default_uplink` `tun.rs:316` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:362`, `bsd_pin_row` `tun.rs:398`, `bsd_pin_holds` `tun.rs:411`, `bsd_table` `tun.rs:5343` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:4740` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
 | Re-check the pins | `stale_host_exemptions` `tun.rs:4838`, the gate `route_guard.rs:570` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
 | A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:570` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
 | One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:370`, `exemption_withheld_reason` `route_guard.rs:382` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+
+> ⚠️ **A lookup does not show a pin.** A destination a connection has used
+> keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
+> The coordination server always has one, held by the control WebSocket. An
+> unscoped `route -n get` answers with that clone even after the pin is in.
+> Measured on a tart Mac on 0.4.133, before P1a shipped:
+>
+> | step | `route -n get <server>` | `netstat -rnW -f inet` |
+> |---|---|---|
+> | before | the clone (`WASCLONED,IFSCOPE`) | — |
+> | `route -n add -host` (rc 0) | still the clone | `UGHS en0`, the pin |
+> | `route -n change -host … 127.0.0.1` (rc 0) | still the clone | the pin, unchanged |
+> | `route -n delete -host` | still the clone | gone |
+>
+> The first P1a read back by lookup, so it refused every pin for the server
+> and left each one in the table untracked. That is why pins are read from
+> the table and replaced by delete + add.
 
 > ⚠️ **DNS is not steered on a Mac yet (P1c).** Egress goes through the exit,
 > but queries go to whatever resolver the Mac already uses. A LAN resolver is

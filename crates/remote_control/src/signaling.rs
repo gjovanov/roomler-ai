@@ -3146,6 +3146,16 @@ pub enum ServerMsg {
         /// start the fork empty.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_of: Option<crate::hive::HiveForkOf>,
+        /// FR-90 P2f-4 — the session is a terminal session this device
+        /// adopted, whose terminal ended here, made a managed one: at its
+        /// first start the device puts the terminal's own history in place
+        /// as the account it ran as, and resumes it. Carried by every start
+        /// the device has not answered yet. Sent only to a connection
+        /// advertising [`crate::models::RpcCap::HiveManage`]: a device before
+        /// it would start the conversation afresh. Absent when false, so
+        /// every other start is the frame it was.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        from_terminal: bool,
     },
 
     /// FR-90 P2c-3 — hold a copy of a session: placement chose this device
@@ -4305,6 +4315,7 @@ mod tests {
             replicated: false,
             lease: false,
             fork_of: None,
+            from_terminal: false,
         };
         let v = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -4362,6 +4373,7 @@ mod tests {
             replicated: true,
             lease: true,
             fork_of: None,
+            from_terminal: false,
         };
         let v = serde_json::to_value(&leased).unwrap();
         assert_eq!(
@@ -4390,6 +4402,7 @@ mod tests {
                 session_id: parent,
                 harness_session: "9d1c2f10-6a43-4a43-9d63-2d1b0b9e3c7e".into(),
             }),
+            from_terminal: false,
         };
         let v = serde_json::to_value(&fork).unwrap();
         assert_eq!(
@@ -4400,6 +4413,19 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::HiveStart { fork_of: Some(f), .. } if f.session_id == parent
+        ));
+        // P2f-4 — a terminal session made a managed one says so, and only
+        // then: every frame above went without the key.
+        let mut managed = serde_json::to_value(&m).unwrap();
+        assert!(managed.get("from_terminal").is_none());
+        managed["from_terminal"] = serde_json::json!(true);
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(managed).unwrap(),
+            ServerMsg::HiveStart {
+                from_terminal: true,
+                fork_of: None,
+                ..
+            }
         ));
     }
 

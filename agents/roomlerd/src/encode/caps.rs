@@ -1710,6 +1710,14 @@ fn rpc_caps() -> Vec<String> {
     // fork empty.
     #[cfg(hive_host)]
     caps.push(RpcCap::HiveFork);
+    // FR-90 P2f-4a — and makes a terminal session it adopted, whose terminal
+    // ended here, a managed one: a start carrying `from_terminal` puts the
+    // terminal's own history in place as the account it ran as, by this
+    // device's record of whose terminal it was, and resumes it. A property of
+    // the BUILD where adopting is (Unix: nothing is adopted on Windows); the
+    // device's start gates still decide, `hive_enabled` first.
+    #[cfg(all(hive_host, unix))]
+    caps.push(RpcCap::HiveManage);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

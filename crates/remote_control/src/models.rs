@@ -740,6 +740,16 @@ pub enum RpcCap {
     /// ignores `fork_of` and starts the fork EMPTY, a new conversation in
     /// the folder as it is. Equality-matched, locked by test.
     HiveFork,
+    /// FR-90 P2f-4a — `hive-manage`: the device makes a terminal session it
+    /// adopted, whose terminal ended there, a managed one. A start carrying
+    /// `from_terminal` puts the terminal's own history in place as the
+    /// account it ran as, by this device's record of whose terminal it was,
+    /// and resumes it. A build property, on the platforms that adopt.
+    ///
+    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
+    /// ignores `from_terminal` and starts the conversation afresh, under the
+    /// terminal's session id. Equality-matched, locked by test.
+    HiveManage,
     /// FR-94 — a Windows device runs Fleet RPC as SYSTEM through its
     /// session-0 service. An administrator anchored the device (the service
     /// holds its own credential, in a file only SYSTEM and Administrators can
@@ -785,12 +795,13 @@ impl RpcCap {
             Self::HivePromote => "hive-promote",
             Self::HiveTeleport => "hive-teleport",
             Self::HiveFork => "hive-fork",
+            Self::HiveManage => "hive-manage",
             Self::ExecSystem => "exec-system",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 21] = [
+    pub const ALL: [RpcCap; 22] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -811,6 +822,7 @@ impl RpcCap {
         Self::HivePromote,
         Self::HiveTeleport,
         Self::HiveFork,
+        Self::HiveManage,
         Self::ExecSystem,
     ];
 
@@ -4990,6 +5002,7 @@ mod tests {
         assert_eq!(RpcCap::HivePromote.wire(), "hive-promote");
         assert_eq!(RpcCap::HiveTeleport.wire(), "hive-teleport");
         assert_eq!(RpcCap::HiveFork.wire(), "hive-fork");
+        assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -5007,7 +5020,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 14] = [
+        const KNOWN: [(RpcCap, RpcCap); 15] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -5043,6 +5056,9 @@ mod tests {
             // FR-90 P2f-3a — nor "starts a fork from a copy". Locked by
             // `hive_fork_is_a_promise_of_its_own`.
             (RpcCap::Hive, RpcCap::HiveFork),
+            // FR-90 P2f-4a — nor "makes an ended terminal session a managed
+            // one". Locked by `hive_manage_is_a_promise_of_its_own`.
+            (RpcCap::Hive, RpcCap::HiveManage),
             // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
             // service". Locked by `exec_does_not_imply_exec_system`.
             (RpcCap::Exec, RpcCap::ExecSystem),
@@ -5497,6 +5513,27 @@ mod tests {
         assert!(!forks.has_rpc(RpcCap::HiveTeleport));
         assert_eq!(RpcCap::from_wire("hive-fork"), Some(RpcCap::HiveFork));
         assert!(RpcCap::from_wire("hive-forks").is_none());
+    }
+
+    /// FR-90 P2f-4a — `hive-manage` is its own promise: a build before it
+    /// would start an adopted session's conversation afresh, so a server that
+    /// read it out of `hive`, or out of `hive-adopt`, would hand a person an
+    /// empty session for the terminal they ran.
+    #[test]
+    fn hive_manage_is_a_promise_of_its_own() {
+        let adopts = AgentCaps {
+            rpc: vec!["hive".into(), "hive-adopt".into(), "hive-fork".into()],
+            ..Default::default()
+        };
+        assert!(!adopts.has_rpc(RpcCap::HiveManage));
+        let manages = AgentCaps {
+            rpc: vec!["hive".into(), "hive-manage".into()],
+            ..Default::default()
+        };
+        assert!(manages.has_rpc(RpcCap::HiveManage));
+        assert!(!manages.has_rpc(RpcCap::HiveAdopt));
+        assert_eq!(RpcCap::from_wire("hive-manage"), Some(RpcCap::HiveManage));
+        assert!(RpcCap::from_wire("hive-managed").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has

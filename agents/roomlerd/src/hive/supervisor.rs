@@ -248,6 +248,12 @@ pub struct StartOrder {
     /// it starts from ([`Supervisor::put_fork_in_place`]); for its life, its
     /// checkpoints keep the parent's history beside its own.
     pub fork_of: Option<HiveForkOf>,
+    /// FR-90 P2f-4a — a terminal session this device adopted, whose terminal
+    /// ended here, made a managed one: at its first start here the
+    /// terminal's own history is put in place as the account it ran as
+    /// ([`Supervisor::terminal_in_place`]), and the launch resumes it. Once the
+    /// session's history is its own, a start launches it as any other.
+    pub from_terminal: bool,
 }
 
 /// FR-90 P1e — a session's core memory, as `rc:hive.memory` carries it.
@@ -1666,6 +1672,14 @@ impl Supervisor {
                 "a fork must be made from another session, named by its ids",
             );
         }
+        // P2f-4a — a session started from a terminal's history is that
+        // terminal's, never a fork of another.
+        if order.from_terminal && order.fork_of.is_some() {
+            return Answer::refused(
+                HiveRefusal::Other,
+                "a start takes a terminal's history or forks a session, never both",
+            );
+        }
         // Idempotent on session + fence: the start may be a re-send of one
         // whose answer was lost.
         if let Some(account) = self.running(order.session_id, order.fence) {
@@ -1837,6 +1851,20 @@ impl Supervisor {
             }
             None => None,
         };
+        // P2f-4a — a terminal session this device adopted, made a managed
+        // one: at its first start here, its terminal's own history put in
+        // place as the account it ran as, and the session told so.
+        let imported = if order.from_terminal {
+            match self
+                .terminal_in_place(order, &account, &folder, &store)
+                .await
+            {
+                Ok(imported) => imported,
+                Err(refused) => return refused,
+            }
+        } else {
+            None
+        };
         // P2e-7 — a session from another device is told it moved, once: the
         // note goes to the harness through its `SessionStart` hook.
         let moved_note = match &moved {
@@ -1852,10 +1880,17 @@ impl Supervisor {
             }
             _ => None,
         };
-        let note = match (fork_note, moved_note) {
-            (Some(fork), Some(moved)) => Some(format!("{fork}{moved}")),
-            (fork, moved) => fork.or(moved),
+        let (terminal_note, terminal_turns) = match imported {
+            Some(i) => (Some(i.note), Some(i.turns)),
+            None => (None, None),
         };
+        let note = [fork_note, terminal_note, moved_note]
+            .into_iter()
+            .flatten()
+            .reduce(|mut all, next| {
+                all.push_str(&next);
+                all
+            });
         match self.launch(
             order,
             &account,
@@ -1864,12 +1899,17 @@ impl Supervisor {
             sidecar,
             moved.as_ref(),
             note.as_deref(),
+            terminal_turns,
         ) {
             Ok(()) => {
                 if moved.is_some() {
                     self.forget_move(order.session_id, order.fence);
                 }
                 self.forget_teleport(order.session_id, order.fence);
+                // P2f-4a — a managed session now, served as any session is.
+                if order.from_terminal {
+                    self.made_managed(order.session_id);
+                }
                 Answer::accepted(&account)
             }
             Err((r, detail)) => Answer::refused(r, detail),
@@ -3168,6 +3208,9 @@ impl Supervisor {
             // parent's history, and before its first prompt it still starts
             // from it.
             fork_of: h.fork_of,
+            // P2f-4a — a session made managed from a terminal is hosted only
+            // once its history was put in place: it resumes its own.
+            from_terminal: false,
         };
         let answer = self.start_locked(order, true).await;
         if answer.refused.is_some() {
@@ -3718,6 +3761,9 @@ impl Supervisor {
         sidecar: Option<u16>,
         moved: Option<&Moved>,
         note: Option<&str>,
+        // P2f-4a — a terminal session made a managed one counts on from the
+        // turns its terminal began.
+        terminal_turns: Option<u32>,
     ) -> Result<(), (HiveRefusal, String)> {
         // P1d-2 — a session this device hosted goes on where it stood.
         let prior = self
@@ -3832,8 +3878,9 @@ impl Supervisor {
                     account: account.to_string(),
                     starter: order.user_id.to_hex(),
                     starter_email: order.user_email.clone(),
-                    // P2e-5 — a session moved here counts on from its turns.
-                    turns: moved.map_or(0, |m| m.turns),
+                    // P2e-5 — a session moved here counts on from its turns,
+                    // P2f-4a and a terminal's from its terminal's.
+                    turns: moved.map(|m| m.turns).or(terminal_turns).unwrap_or(0),
                     running: None,
                     approvals: Vec::new(),
                     resumed_at: None,
@@ -3848,6 +3895,9 @@ impl Supervisor {
                 });
                 moved
                     .map(|m| m.turns)
+                    // P2f-4a — and a terminal's history: its first turn
+                    // reports no cost counted from the terminal's total.
+                    .or(terminal_turns)
                     // P2f-3a — a fork's first launch resumes its parent's
                     // history: like a resumed process's, its first turn
                     // reports no cost rather than one counted from the
@@ -6151,6 +6201,7 @@ done
             replicated: false,
             lease: false,
             fork_of: None,
+            from_terminal: false,
         }
     }
 

@@ -610,6 +610,7 @@ pub(crate) async fn begin(
             && state.fleet.rc_hub.agent_supports_hive_lease(device_id, tid) == Some(true),
         // P2f-3 — a fork's start says what it was made from.
         fork_of: session.fork_of(),
+        from_terminal: false,
     };
     if let Err(e) = push_start(state, &session, device_id, msg) {
         // The device left — or reconnected as a build without Hive — between
