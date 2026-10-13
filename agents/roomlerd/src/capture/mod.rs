@@ -44,6 +44,10 @@ pub mod wgc_backend;
 #[cfg(feature = "synthetic-frame-source")]
 pub mod synthetic_backend;
 
+/// FR-98 C1 — the capture gate: legacy (sleep, then look at the slot) or
+/// slot-first (look, and pace only a source that outruns the target).
+pub mod gate;
+
 pub mod cursor;
 
 /// FR-85 P1d — the mouse pointer in a recording: whether each backend draws
