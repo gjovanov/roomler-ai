@@ -240,6 +240,68 @@ Reference run of the probe cells (2026-10-13, unoptimised, Windows dev box):
 With the probe dropped in the input handler before it reaches the source, the test fails on
 `probe: 0 round trips measured, want ≥ 20`.
 
+### L4 in the real viewer
+
+The same probe, timed by the browser that a person would actually use, on whatever paints the
+frames. That is one of the three decode workers, or the plain `<video>` element on the RTP
+track.
+
+```mermaid
+sequenceDiagram
+    participant P as prober (rcBench.ts)
+    participant A as bench agent
+    participant W as painter: decode worker or <video>
+    P->>A: {"t":"probe","seq":N} on the input channel, t_send = epochNowMs()
+    P->>W: bench-arm N (only now does the painter read frames)
+    A-->>W: frames carrying N in the bottom-right marker
+    Note over W: clone before paint, stamp paintedAt after it,<br/>copy only the 144×48 corner, decode, in paint order
+    W->>P: bench-probe {seq: N, paintedAt}
+    Note over P: round trip = paintedAt − t_send<br/>every ~40 round trips → console + one rc.l4 record
+```
+
+**Run it.** Start an agent built with `synthetic-frame-source` with `ROOMLERD_SYNTHETIC_FRAMES=1`
+and `ROOMLERD_BENCH=1`; its hello then advertises `bench` in `AgentCaps.video`. In the viewer's
+browser, set `localStorage['roomler-rc-bench'] = '1'`, reload, and connect with input. About
+every ten seconds the console prints `[rc] bench L4 n=… lost=… p50=… p95=… max=… path=…`, and
+the same batch is posted as one `rc.l4` line to `agent_logs`.
+
+| Piece | File | What it does |
+|---|---|---|
+| Marker decoder | `ui/src/workers/rc-bench-marker.ts` | The Rust `marker` module ported bit for bit. Both test suites pin the same CRC words, so a drift on either side fails one of them |
+| Worker sampler | `ui/src/workers/rc-bench-sampler.ts` | Armed per probe. Clones the frame before paint and reads only the corner region after. Reads one frame at a time in paint order; an unanswered probe expires after 2 s |
+| Prober, `<video>` sampler, upload | `ui/src/composables/rcBench.ts` | Sends probes 250 ms apart plus up to 34 ms of jitter. Reads the `<video>` through `requestVideoFrameCallback`, stamped with its `presentationTime`. Posts `rc.l4` through FR-22's route, capped at 6 records a minute |
+
+- **Gated at every entry point in the viewer.** The knob is honoured only when the hello
+  advertises `bench`. Each worker samples only when its `init-canvas` says `bench: true`.
+  Probes ride the input channel's own gates, so a view-only session sends none.
+- ⚠️ **The paint stamp is not the photon.** A worker stamps right after `drawImage`, and
+  `<video>` uses the moment the frame was submitted for composition. The display's own latency
+  (a vsync or two, and the panel) comes after both. That gap is what the FR-16 AC compares
+  against a 240 fps camera.
+- ⚠️ **Readbacks are paid only while a probe is out.** A GPU-backed frame reads back whole
+  however small the rect, so sampling every frame would tax the path being measured.
+
+**Mining it** (the same place and the same 7-day TTL as `rc.connect`, above in
+[remote-control.md](remote-control.md)):
+
+```js
+// Every L4 round trip per device and paint path: the distribution, not batch medians.
+db.agent_logs.aggregate([
+  { $match: { source: 'browser', 'lines.target': 'rc.l4' } },
+  { $unwind: '$lines' },
+  { $unwind: '$lines.fields.rtt_ms' },
+  { $group: { _id: { agent: '$lines.fields.agent_id', paths: '$lines.fields.paths' },
+              n: { $sum: 1 },
+              p: { $percentile: { input: '$lines.fields.rtt_ms', p: [0.5, 0.95], method: 'approximate' } } } } ])
+
+// Probes that never came back, per device: one count per record, so before any $unwind of rtt_ms.
+db.agent_logs.aggregate([
+  { $match: { source: 'browser', 'lines.target': 'rc.l4' } },
+  { $unwind: '$lines' },
+  { $group: { _id: '$lines.fields.agent_id', answered: { $sum: '$lines.fields.n' },
+              lost: { $sum: '$lines.fields.lost' } } } ])
+```
+
 ## The overlay stress lane (FR-81)
 
 Everything the mesh promises is a **latency and stability** claim, and before this lane nothing

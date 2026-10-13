@@ -29,9 +29,16 @@
  * instead).
  */
 
-type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas }
+import { epochNowMs } from './rc-hop-stats'
+import { createBenchSampler } from './rc-bench-sampler'
+
+/** `bench` — FR-16 L4 bench mode, set only when the knob is on AND the
+ *  agent advertised `bench`: sample the probe marker while a probe is armed. */
+type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas; bench?: boolean }
+/** FR-16 L4 — the main thread just sent bench probe `seq`. */
+type BenchArmMessage = { type: 'bench-arm'; seq: number }
 type CloseMessage = { type: 'close' }
-type IncomingMessage = InitCanvasMessage | CloseMessage
+type IncomingMessage = InitCanvasMessage | BenchArmMessage | CloseMessage
 
 interface RTCTransformerLike {
   readable: ReadableStream<unknown>
@@ -55,6 +62,9 @@ const workerScope = self as unknown as {
   postMessage: (msg: unknown) => void
 }
 
+/** FR-16 L4 — reads the bench probe off painted frames, only while armed. */
+const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now: epochNowMs })
+
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
 let decoder: VideoDecoder | null = null
@@ -69,6 +79,9 @@ workerScope.onmessage = (e) => {
   if (msg.type === 'init-canvas') {
     canvas = msg.canvas
     ctx = canvas.getContext('2d')
+    if (typeof msg.bench === 'boolean') bench.setEnabled(msg.bench)
+  } else if (msg.type === 'bench-arm') {
+    bench.arm(msg.seq)
   } else if (msg.type === 'close') {
     try {
       decoder?.close()
@@ -91,12 +104,17 @@ workerScope.onrtctransform = async (event) => {
   decoder = new VideoDecoder({
     output: (frame) => {
       framesDecoded++
+      // Snapshot before paint closes the frame (a closed one reports 0).
+      const firstDims = framesDecoded === 1 ? { w: frame.displayWidth, h: frame.displayHeight } : null
+      // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
+      const benchClone = bench.take(frame)
       paintFrame(frame)
-      if (framesDecoded === 1) {
+      if (benchClone) bench.settle(benchClone, epochNowMs())
+      if (firstDims) {
         workerScope.postMessage({
           type: 'first-frame',
-          width: frame.displayWidth,
-          height: frame.displayHeight,
+          width: firstDims.w,
+          height: firstDims.h,
         })
       }
     },
