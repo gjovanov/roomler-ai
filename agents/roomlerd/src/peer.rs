@@ -410,14 +410,21 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
+        // FR-101 P1 — replay windows on SRTP/SRTCP (webrtc-srtp has none by
+        // default) and GCM-only DTLS, each with its own switch back.
+        let transport = crate::rc_transport::Policy::from_env();
+        transport.apply(&mut setting);
         // FR-16 L0 — the loopback harness routes this session's ICE through a
         // webrtc-util vnet (a set delay, jitter and loss). Only the test-only
-        // `synthetic-frame-source` build carries the hook.
+        // `synthetic-frame-source` build carries the hook. Applied last, so
+        // the harness runs on the production transport policy above.
         #[cfg(feature = "synthetic-frame-source")]
         l0::apply(&mut setting);
         info!(
             session = %session_id,
             overlay_blocks = rc_overlay.v4_nets.len(),
+            srtp_replay_window = transport.replay_window,
+            dtls_gcm_only = transport.gcm_only,
             "rc ICE: overlay {}",
             rc_overlay.describe()
         );
