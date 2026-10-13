@@ -106,6 +106,9 @@ import {
   storedCtxMode,
   storedPerFrameMsg,
   storedFlowParams,
+  storedInputGapMs,
+  INPUT_GAP_STORAGE_KEY,
+  DEFAULT_INPUT_GAP_MS,
   diagHudEnabled,
   remoteCursorCssFor,
   storedSharpenMode,
@@ -3578,6 +3581,33 @@ describe('localRelayIceServer (Phase 2)', () => {
     })
     expect(s.urls[0]).toBe('turn:127.0.0.1:12345')
     expect(s.urls[0]).not.toContain('100.64')
+  })
+})
+
+describe('storedInputGapMs (FR-98 C3)', () => {
+  afterEach(() => {
+    localStorage.removeItem(INPUT_GAP_STORAGE_KEY)
+  })
+
+  it('keeps the FR-1 P6 gap of 8 ms unless set', () => {
+    expect(DEFAULT_INPUT_GAP_MS).toBe(8)
+    expect(storedInputGapMs()).toBe(8)
+    localStorage.setItem(INPUT_GAP_STORAGE_KEY, 'fast')
+    expect(storedInputGapMs()).toBe(8)
+  })
+
+  it('takes 0..16, clamping the rest', () => {
+    for (const [raw, want] of [
+      ['0', 0],
+      ['2', 2],
+      ['4', 4],
+      ['16', 16],
+      ['40', 16],
+      ['-3', 0],
+    ] as const) {
+      localStorage.setItem(INPUT_GAP_STORAGE_KEY, raw)
+      expect(storedInputGapMs(), raw).toBe(want)
+    }
   })
 })
 
