@@ -493,6 +493,22 @@ within 10 s or name its reason; a frozen frame with no reason is a failure.
 | suspend → resume (`virsh dompmsuspend`) | re-open | re-open | re-open |
 | compositor crash (kill `gnome-shell`) | new scanout | re-open | re-open |
 
+**Measured first (2026-10-13, step log 66): the lifecycle oracle.** A lab-only spec holds one viewer session and
+samples it every 500 ms; the harness drives the guest from outside (QMP keys, `loginctl`, GNOME's own idle blank)
+and dates each event. On the releases: **DRM** (GNOME 50 system, 0.4.133) recovers from lock, unlock, wake,
+logout and login in 0.7–2.9 s, but an **idle blank** leaves the last frame with no reason (P3e's case). **mutter**
+(GNOME 50 per-user, 0.4.132) **freezes at the first lock for good** (#2145: GNOME closes both mutter sessions at
+a lock), and after a logout and a login **the daemon never comes back** (#2144). The **portal** (Plasma 6.7.5
+per-user, 0.4.133) streams the lock screen, but shows the last frame through a logout and about 30 s of black after
+the login, with no reason either time.
+
+**As built (P5a, #2144): the per-user unit is wanted by the graphical session it stops with.** It was `PartOf=` the
+session but wanted by `default.target` alone, which a user manager that outlives a logout (a lingering user, an SSH
+login) reached long ago. Both per-user units now name `graphical-session.target` too, and a daemon enabled before
+that line enables itself again once at start, through `systemctl --user enable` (the sandbox leaves
+`~/.config/systemd/user` read-only to it). Kill switch `ROOMLERD_UNIT_REPAIR=0`
+([`installation.md`](../installation.md#linux)).
+
 ### 4.7 Consent and the indicator (P6 — with FR-27's owner)
 
 - Field-run the companion's consent window and banner on GNOME 50 and Plasma 6.6: QMP answers, and
@@ -544,6 +560,7 @@ bridge for text and images in the lab before deciding.
 | ↳ P4a | mutter's own RemoteDesktop drives the mutter screencast and takes the viewer's input; the route carries its kind, so `rc:input-reach` and the brief name it | `mutter_input` | ✅ lab (`3f9ad6464`), GNOME 50 per-user, no key, the AC4 oracle. **🔴 0.4.131:** the picture, and 0 events at the probe, all 7 input checks failed. **P4a:** all 7 passed: the three points exact, click, wheel down, "hello 123", Shift+a as "A"; the brief `input_reach=full`. `mutter_input = false` gives the view-only arm back | S |
 | ↳ P4b | the automatic portal asks for remote control (`linux-capture.md` §1.2); KDE's negated smooth scroll corrected; every portal input call waits for its reply, which keeps the calls in order (§4.3) | `portal_input = false`; `ROOMLERD_PORTAL_KDE_SCROLL_FIX=0` | ✅ lab (`9a8e20699`, then `64f00509f`), KDE per-user, no key: KDE's *Remote Control* dialog; the AC4 oracle 7/7, three runs; a typing stress's 113 characters exact, four runs. **🔴 the first candidate (`fe0c3ae93`, calls unawaited):** the oracle typed `helo 123A`, and the stress got 41 of 452 characters wrong. A denial: KDE asked again for the screen only, the session ran view-only, and its reach banner named reconnecting to allow remote control | S |
 | **P5** | lifecycle (§4.6) | — | lab | M |
+| ↳ P5a | the per-user unit is wanted by `graphical-session.target` as well as `default.target`, and a daemon enabled before that enables itself again once at start (#2144) | `ROOMLERD_UNIT_REPAIR=0` | ✅ lab (`91017d9e4`), GNOME 50 per-user, a lingering user. **🔴 0.4.132:** after a logout and a login the daemon never came back (step log 66). **P5a:** the new unit file laid down as an upgrade does, then the candidate's start repaired the enablement (one log line; a restart repaired nothing more); the logout read *reconnecting* within 1.4 s, and after the login the daemon started with the session and the viewer had a new picture 4.9 s after the final Enter | S |
 | **P6** | consent and indicator (§4.7) | FR-27's switches | lab GNOME + KDE | M |
 | **P7** | clipboard (§4.8) | `ROOMLERD_SESSION_CLIPBOARD=0` | lab | M |
 | **P8** | leftovers: FR-45 AC8 + P5b, FR-56 AC7/AC9/AC10, FR-92 AC9, FR-85's Wayland rows | each FR's own | lab, WSL2 | S each |
@@ -659,6 +676,12 @@ New cells run three times before they are trusted. An entry in `expected-failure
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
 - [ ] **AC7** — lifecycle (§4.6): each event recovers within 10 s or names its reason.
+  ⏳ Measured first on the releases (step log 66, §4.6): DRM passes every event but the idle blank (the last
+  frame, no reason); mutter freezes at a lock for good (#2145), and its daemon did not come back after a logout and
+  a login (#2144); the portal passes lock and unlock, but not logout and login (the last frame, then ~30 s of black,
+  no reason). ✅ #2144 fixed in the lab by P5a (the daemon back, a picture 4.9 s after the login). Owed: #2145, the
+  DRM blank (P3e), the portal's logout and login, user switch, resolution change, suspend, a compositor crash, and
+  a released build.
 - [ ] **AC8** — an idle DRM session's CPU, measured before and after, within 2× of FR-29's X11 figure.
   ⏳ ✅ in the lab on P3d (`cac2d7c43`): the GNOME 50 system guest, an idle desktop on the viewer's default path,
   every `roomlerd` process's CPU over two 60 s windows. **57.9 %** of a core on the released 0.4.133, **5.5 % and
@@ -751,6 +774,8 @@ New cells run three times before they are trusted. An entry in `expected-failure
 | 2026-10-13 | `wlab-gnome-sys` (system, `drm_capture` + `uinput`); `wlab-gnome` (per-user) | 0.4.133; 0.4.132, the releases | AC8 fail-first: an idle desktop, the probe stopped, one viewer session on the default path (the VP9-444 data-channel pump); every `roomlerd` process's CPU over two 60 s windows from `/proc` | 🔴 DRM: 57.9 % and 57.9 % of a core, 30 frames read and encoded a second, ~1.2 MB per 30. For comparison, mutter: 8.6 % and 8.8 %; mutter sent 3 frames, and the pump re-encoded its last frame ~4 times a second, on each 250 ms "no frame" (`FRAME_WAIT`). Wrong turns, kept: FR-29's configuration (H.264 over the RTP track) shows no picture in the lab's Chromium, which has no H.264, and the RTP track carried no video with VP9 either; and the harness's start marker first matched the source line Playwright quotes in its error report. Step log 65 |
 | 2026-10-13 | `wlab-gnome-sys` | P3d `cac2d7c43` | P3d / AC8: idle CPU as above; freshness with the probe ticking (`ac1-fresh`); AC5's `cursor` plan; AC4's `points`; then `ROOMLERD_DRM_IDLE_SKIP=0` | ✅ 5.5 % and 5.3 %: ~1 frame read and ~4 encoded a second, ~2 KB per 30, `idle_skip=true`. Fresh: 111 of 111 frames decoded, 109 distinct counters, 0.42–0.70 s old. The cursor overlay at both targets; AC4 8 of 8. Kill switch: 64.3 % and 60.7 %, `idle_skip=false`. Step log 65 |
 | 2026-10-13 | `wlab-kde-sys` (system, `drm_capture` + `uinput`) | P3d `cac2d7c43` | the same A/B on KWin (Plasma 6.7.5) | ✅ 4.7 % and 4.7 %, `idle_skip=true`; fresh: 111 of 111 decoded, 0.39–0.67 s old; the cursor overlay at (0.299, 0.597) and (0.699, 0.597); AC4 8 of 8. Kill switch: 46.1 % and 44.5 %, `idle_skip=false`. Step log 65 |
+| 2026-10-13 | `wlab-gnome-sys` (system, DRM); `wlab-gnome` (per-user, mutter); `wlab-kde` (per-user, portal) | 0.4.133; 0.4.132; 0.4.133, the releases | AC7 fail-first: the lifecycle oracle (§4.6), one viewer session through lock, unlock, GNOME's idle blank, wake, logout and login | DRM: lock 1.0 s, unlock 1.1, wake 0.7, logout 2.9, login 2.0 ✅; **the idle blank ❌** (the guest's screen black, the viewer's last frame, no reason). mutter: **lock ❌ frozen for good** (#2145), unlock, blank, wake ❌; logout *reconnecting* in 1.4 s; **the daemon never back after the login** (#2144). portal: lock 1.4 s, unlock 0.7 ✅; **logout ❌** (the last frame for 40 s, no reason), **login ❌** (black ~30 s, no reason); the blank not measured (`kscreen-doctor --dpms off` never darkened the guest). Wrong turns, kept: a hand-set `PowerSaveMode` (nothing wakes it), a stale lab password, a frame in flight read as recovery. Step log 66 |
+| 2026-10-13 | `wlab-gnome` (per-user, a lingering user) | P5a `91017d9e4` | #2144: the new unit file laid down as an upgrade does, the candidate started, then a logout and a login | ✅ the start logged its one repair and both `.wants` links stood; a restart repaired nothing more; the logout read *reconnecting* within 1.4 s; after the login the daemon started with the session (2 s after the Enter) and the viewer had a new picture 4.9 s after it. 🔴 0.4.132: the daemon never came back (step log 66) |
 
 ## 12. Related
 
