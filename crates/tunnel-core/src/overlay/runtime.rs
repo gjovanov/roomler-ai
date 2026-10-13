@@ -1251,6 +1251,12 @@ pub struct OverlayRuntime {
     /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
     /// Sent in the join; the server gates them behind admin approval.
     advertised_routes: Vec<String>,
+    /// FR-97 P0b — why this node offers no routes although it was configured
+    /// to: the host cannot forward or NAT for the overlay ([`super::nat::gate_offer`],
+    /// run at the top of [`Self::run`], before the first join). Sent in the
+    /// join and published for `roomler status`. `None` = offering as
+    /// configured.
+    route_offer_withheld: Option<String>,
     /// Unification P1 — where to publish this node's live overlay view (self
     /// IP + peers with connection type) for the daemon's LocalAPI. `None` in
     /// test / direct mode (nothing reads it there).
@@ -1460,6 +1466,7 @@ fn build_overlay_view(
         // Set by `publish_view` from the runtime's exit-routing state (S4)
         // and DNS bring-up state (S2).
         exit_node: None,
+        route_offer_withheld: None,
         dns: None,
         srflx: None,
         warm_relay: None,
@@ -1507,6 +1514,7 @@ impl OverlayRuntime {
             mtu,
             key_epoch: 0,
             advertised_routes: Vec::new(),
+            route_offer_withheld: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -1539,6 +1547,7 @@ impl OverlayRuntime {
             mtu,
             key_epoch: 0,
             advertised_routes: Vec::new(),
+            route_offer_withheld: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -1897,6 +1906,8 @@ impl OverlayRuntime {
             // S4 — the exit-node routing status the runtime holds (the view
             // builder is pure over peers, so this is grafted on after).
             view.exit_node = exit_status;
+            // FR-97 P0b — why this node offers no routes it was configured to.
+            view.route_offer_withheld = self.route_offer_withheld.clone();
             // S2 — ditto for the DNS bring-up outcome.
             view.dns = self.dns_status.clone();
             // NAT-traversal — ditto for the srflx gather outcome. An empty
@@ -1985,6 +1996,8 @@ impl OverlayRuntime {
                 .then(super::orgrelay::relay_server_port),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
+            // FR-97 P0b — and, when we withheld them, why.
+            route_offer_withheld: self.route_offer_withheld.clone(),
         }
     }
 
@@ -1992,6 +2005,19 @@ impl OverlayRuntime {
     /// node's overlay IP), brings up the TUN + inbound writer, then
     /// steady-state pumps TUN traffic and applies netmap deltas.
     pub async fn run(mut self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
+        // FR-97 P0b — offer `/0` and subnet routes only if this host can
+        // forward and NAT for the overlay, decided BEFORE the first join: every
+        // join below sends `advertised_routes`, and `nat::enable` (after the
+        // first netmap) and the ingress scope read the same list. A host that
+        // cannot serve offers nothing, so no admin can approve a black hole.
+        let offer = super::nat::gate_offer(std::mem::take(&mut self.advertised_routes)).await;
+        if let Some(why) = &offer.withheld {
+            warn!(reason = %why,
+                "overlay: route offer WITHHELD (no /0, no subnet route advertised): this host cannot forward or NAT for its peers");
+        }
+        self.advertised_routes = offer.routes;
+        self.route_offer_withheld = offer.withheld;
+
         // rc.131 — direct LAN path: bind a shared UDP socket + discover our
         // LAN endpoint so a same-subnet peer dials us directly and skips the
         // relay. Off in Direct mode (the test/helper path) and when disabled.

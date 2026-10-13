@@ -585,6 +585,8 @@ impl LocalApiState for DaemonState {
             ephemeral: self.ephemeral,
             // P5/S4 — exit-node routing status the overlay runtime published.
             exit_node: self.overlay.borrow().exit_node.clone(),
+            // FR-97 P0b — why this node offers no routes it was configured to.
+            route_offer_withheld: self.overlay.borrow().route_offer_withheld.clone(),
             // S1b — the config file this daemon actually loaded, so the
             // desktop stops guessing which copy is live.
             config_path: self
@@ -1886,6 +1888,7 @@ mod tests {
                 debug: None,
             }],
             exit_node: None,
+            route_offer_withheld: None,
             dns: None,
             derp_inbound_drops: None,
             srflx: None,

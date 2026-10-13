@@ -99,6 +99,134 @@ pub async fn enable(
     }
 }
 
+/// FR-97 P0b — what a node offers its peers: every route it was configured
+/// to advertise, or none, with the reason it cannot serve them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteOffer {
+    pub routes: Vec<String>,
+    pub withheld: Option<String>,
+}
+
+/// FR-97 P0b — offer `/0` and subnet routes only where this host can forward
+/// and NAT for the overlay.
+///
+/// [`enable`] runs after the join, because it needs the netmap's address
+/// space, so a node used to offer whatever it was configured to and find out
+/// afterwards whether it could serve it. Where it could not, an admin could
+/// approve the offer and every client that took it black-holed: a Mac, which
+/// has no NAT arm at all, and a Windows Home PC, which ships the `winnat`
+/// service without its management class (#2077). This asks first, so such a
+/// node advertises nothing and says why: in `roomler status`, and in its join.
+///
+/// `ROOMLERD_ROUTE_OFFER_UNPROBED=1` skips the probe and offers as before.
+pub async fn gate_offer(advertised: Vec<String>) -> RouteOffer {
+    let unprobed = std::env::var("ROOMLERD_ROUTE_OFFER_UNPROBED").as_deref() == Ok("1");
+    gate_offer_with(advertised, unprobed, probe()).await
+}
+
+async fn gate_offer_with(
+    advertised: Vec<String>,
+    unprobed: bool,
+    probe: impl std::future::Future<Output = Result<(), String>>,
+) -> RouteOffer {
+    if advertised.is_empty() || unprobed {
+        return RouteOffer {
+            routes: advertised,
+            withheld: None,
+        };
+    }
+    match probe.await {
+        Ok(()) => RouteOffer {
+            routes: advertised,
+            withheld: None,
+        },
+        Err(why) => RouteOffer {
+            routes: Vec::new(),
+            withheld: Some(why),
+        },
+    }
+}
+
+/// Can this host forward and NAT for the overlay? `Err` says why not.
+#[cfg(target_os = "linux")]
+async fn probe() -> Result<(), String> {
+    // `setup` writes its MASQUERADE and FORWARD rules with iptables, so a host
+    // where iptables cannot use the nat table (no binary, not root, no
+    // NET_ADMIN in a container) cannot serve. A per-user daemon is the common
+    // case.
+    probe_cmd(&["iptables", "-t", "nat", "-S", "POSTROUTING"])
+        .await
+        .map_err(|e| {
+            format!(
+                "iptables cannot use the nat table ({e}), so this host cannot forward or NAT \
+                 for its peers"
+            )
+        })
+}
+
+/// Can this host forward and NAT for the overlay? `Err` says why not.
+#[cfg(target_os = "windows")]
+async fn probe() -> Result<(), String> {
+    // `setup` creates a WinNAT instance. Windows Home has the `winnat` service
+    // but not the class that manages it: `New-NetNat` answers `Invalid class`.
+    probe_cmd(&[
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "try { Get-CimClass -Namespace root/StandardCimv2 -ClassName MSFT_NetNat \
+         -ErrorAction Stop | Out-Null; exit 0 } \
+         catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
+    ])
+    .await
+    .map_err(|e| {
+        format!(
+            "WinNAT is not available on this edition of Windows ({e}); Windows Home cannot be \
+             an exit node or a subnet router"
+        )
+    })
+}
+
+/// Can this host forward and NAT for the overlay? Not yet, on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+async fn probe() -> Result<(), String> {
+    Err(
+        "this platform has no NAT for the overlay yet, so it cannot be an exit node or a \
+         subnet router (FR-97 P1b)"
+            .into(),
+    )
+}
+
+/// Run a probe off the reactor, hidden on Windows. `Err` carries the first
+/// line of its stderr (bounded: it travels into the status and the join).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn probe_cmd(args: &[&str]) -> Result<(), String> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&args[0]);
+        cmd.args(&args[1..]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stderr);
+                let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+                Err(match line {
+                    Some(l) => l.chars().take(200).collect(),
+                    None => format!("{} exited with {}", args[0], o.status),
+                })
+            }
+            Err(e) => Err(format!("{} could not start: {e}", args[0])),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("the probe task failed: {e}")))
+}
+
 #[cfg(target_os = "linux")]
 async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
     // Global forwarding (leave it on at teardown — another service may rely on
@@ -482,4 +610,70 @@ async fn run(args: Vec<String>) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::{RouteOffer, gate_offer_with};
+
+    fn routes(r: &[&str]) -> Vec<String> {
+        r.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A probe that must never run: polling it fails the test.
+    async fn never() -> Result<(), String> {
+        panic!("probed a node that offers nothing, or with the probe switched off")
+    }
+
+    #[tokio::test]
+    async fn a_host_that_can_serve_offers_everything_it_advertised() {
+        let offer = gate_offer_with(routes(&["10.1.0.0/24", "0.0.0.0/0"]), false, async {
+            Ok(())
+        })
+        .await;
+        assert_eq!(
+            offer,
+            RouteOffer {
+                routes: routes(&["10.1.0.0/24", "0.0.0.0/0"]),
+                withheld: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_serve_offers_nothing_and_says_why() {
+        let offer = gate_offer_with(routes(&["0.0.0.0/0"]), false, async {
+            Err("Invalid class".to_string())
+        })
+        .await;
+        assert!(offer.routes.is_empty(), "nothing it cannot serve");
+        assert_eq!(offer.withheld.as_deref(), Some("Invalid class"));
+    }
+
+    #[tokio::test]
+    async fn nothing_to_offer_or_the_probe_switched_off_never_probes() {
+        assert_eq!(
+            gate_offer_with(Vec::new(), false, never()).await,
+            RouteOffer {
+                routes: Vec::new(),
+                withheld: None
+            }
+        );
+        assert_eq!(
+            gate_offer_with(routes(&["0.0.0.0/0"]), true, never()).await,
+            RouteOffer {
+                routes: routes(&["0.0.0.0/0"]),
+                withheld: None
+            },
+            "ROOMLERD_ROUTE_OFFER_UNPROBED=1 offers as before"
+        );
+    }
+
+    /// The platform without a NAT arm says so, rather than offering a route
+    /// nothing on the host would forward.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[tokio::test]
+    async fn a_platform_without_a_nat_arm_withholds() {
+        assert!(super::probe().await.is_err());
+    }
 }
