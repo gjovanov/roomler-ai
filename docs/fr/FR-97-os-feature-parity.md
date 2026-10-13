@@ -1,7 +1,8 @@
 # FR-97: OS parity — what one OS does, the other two do, or the device says why not
 
-**Issue:** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) · **Status:** proposed 2026-10-13 — spec and
-claim, on the operator's "file the bug and claim the FR"; P0a (#2081) is in progress · **Owner:** the agent on all
+**Issue:** [#2082](https://github.com/gjovanov/roomler-ai/issues/2082) · **Status:** in progress — P0a (#2081, #2085)
+shipped in 0.4.132 and field-verified (AC1); P0b-1 (#2098) and P0b-2a (#2104) merged; P0b-3 (#2108) in review;
+P0b-2b not started · **Owner:** the agent on all
 three platforms; the network module for the route gate (P0b) ·
 **Depends on:** [FR-43](FR-43-macos-single-enrollment.md) P3 (one Mac, one row, in the mesh),
 [FR-94](FR-94-fleet-rpc-system-on-windows.md) (Windows exec as SYSTEM),
@@ -504,9 +505,9 @@ one depends on it.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (S1):** a macOS root daemon with `overlay_exit_node` set and no exemption surface withholds the exit,
+- [x] **AC1 (S1):** a macOS root daemon with `overlay_exit_node` set and no exemption surface withholds the exit,
   `roomler status` says why, and the control WS stays up. Red first on 0.4.131 in a throwaway macOS VM, under a
-  dead-man switch.
+  dead-man switch. *(Field: red on 0.4.131, green on 0.4.132, 2026-10-13, §8 and #2081.)*
 - [ ] **AC2 (S2):** a Mac (before P1b) and a Windows Home device with exit or subnet serving enabled advertise
   nothing and say why, on the device and in the admin UI. A client of a previously approved exit whose device stopped
   offering returns to its own uplink within one netmap fan-out. The Windows revert leaves both interfaces' forwarding
@@ -579,3 +580,7 @@ one depends on it.
 | date | build | host | result |
 |---|---|---|---|
 | 2026-10-13 | master `e00fba126` | — (code reading) | S1 and S2 traced line by line (§2.1); nothing run on hardware yet |
+| 2026-10-13 | CI, #2085 | the macOS job's real utun | 🔴→🟢 P0a. The test-only commit failed `macos_kernel_tests::an_exemption_it_cannot_pin_is_refused_not_reported_pinned` ("… never reported pinned: ()"); the fix passed it, 4 of 4 kernel tests |
+| 2026-10-13 | released 0.4.131 | a throwaway tart macOS VM (vmtest org), root daemon, `overlay_exit_node` set before its one start; a throwaway Linux exit, approved | 🔴 **S1 reproduced (AC1 red).** `roomler status` said `active`; `0/1` and `128.0/1` sat on `utun4`; `route -n get 94.130.141.98` answered `utun4` in every sample while the daemon logged "pinned carrier-endpoint exemption … ip=94.130.141.98". `GET /health` failed in 14 of 16 samples. The failure flaps rather than staying solid: the exit's carrier dies inside the captured routes, the guard tears the split-default down ("no live carrier"), and it is re-installed within a second, every ~45 s. The 300 s dead-man booted the daemon out |
+| 2026-10-13 | released 0.4.132 (carries `c2e79221b`) | the same setup; the exit confirmed `is_exit_node: true, online: true` just before the run | 🟢 **AC1.** `withheld — carrier-endpoint exemption unavailable …` in every sample; no `/1` routes; the server via `en0`; health 200 throughout; the row online. The daemon logs `FAILED to pin a carrier exemption … no host-exemption route support on this platform`. Follow-ups: that WARN repeats every ~5 s (log once per reason), and the status reason should name the platform, not "no original default route?" (both go away with P1a) |
+| 2026-10-13 | CI, #2098 | unit + integration lanes | 🔴→🟢 P0b-1. Tests-only commit: 2 unit tests failed ("a /0 the device no longer offers must not reach a single peer") and the end-to-end `an_exit_that_stops_offering_its_default_route_stops_being_one` failed ("no delta without 0.0.0.0/0 arrived after the rejoin"); the fix passed all three (552 integration tests) |
