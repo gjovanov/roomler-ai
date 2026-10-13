@@ -632,8 +632,9 @@ impl AttachedStartupInfo {
     }
 }
 
-/// `CreateProcessW` with the pseudoconsole attached — the DAEMON identity
-/// (SYSTEM under a perMachine service install).
+/// `CreateProcessW` with the pseudoconsole attached — the DAEMON identity:
+/// the worker's, which is the signed-in user on an attended install and SYSTEM
+/// in SystemContext mode (FR-94 §2).
 fn spawn_attached(
     pc: &PseudoConsole,
     cmdline: &str,
@@ -684,9 +685,10 @@ fn spawn_attached(
 /// `sshd` at all, "as the signed-in domain user" is the whole point.
 ///
 /// Requires the daemon to be SYSTEM — `WTSQueryUserToken` returns
-/// `ERROR_PRIVILEGE_NOT_HELD` otherwise, which is a perMachine service install
-/// and not a perUser task. Reported as a refusal with that reason, never as a
-/// fallback to the daemon's own identity.
+/// `ERROR_PRIVILEGE_NOT_HELD` otherwise. Only a SystemContext worker is: an
+/// attended worker, which serves SSH, runs as the signed-in user even under a
+/// perMachine install (FR-94 §2). Reported as a refusal with that reason,
+/// never as a fallback to the daemon's own identity.
 fn spawn_attached_as_console_user(
     pc: &PseudoConsole,
     cmdline: &str,
@@ -712,8 +714,9 @@ fn spawn_attached_as_console_user(
         }
         Err(e) => {
             return Err(format!(
-                "cannot obtain the console user's token ({e}). This needs the daemon to run as \
-                 SYSTEM — a perMachine service install, not a perUser task."
+                "cannot obtain the console user's token ({e}): only a daemon running as SYSTEM \
+                 may, and on an attended Windows install the worker that serves SSH runs as the \
+                 signed-in user. Its `daemon` mode already opens shells as that user."
             ));
         }
     };

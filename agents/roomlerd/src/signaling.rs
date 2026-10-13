@@ -1241,6 +1241,11 @@ async fn connect_once(
     if !ctx.is_primary {
         strip_replica_verbs(&mut hello_caps.rpc);
     }
+    // FR-94 — `exec-system` on exactly the connection of the device this
+    // machine's SYSTEM service is anchored for, and the heartbeat re-announces
+    // when that changes (an anchor written or removed while connected).
+    let mut last_announced_exec_system = crate::exec_service::advertised_for(&cfg.agent_id);
+    crate::exec_service::apply_word(&mut hello_caps.rpc, last_announced_exec_system);
     // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
     // worker can record. Saying the root daemon's own list (nothing) would
     // strip RECORD for the 30 s until the first heartbeat corrects it, after
@@ -1804,10 +1809,12 @@ async fn connect_once(
                     .unwrap_or_else(record_caps);
                 let keep_busy_now = crate::keep_busy::advertised();
                 let desktop_now = crate::desktop_brief::current();
+                let exec_system_now = crate::exec_service::advertised_for(&cfg.agent_id);
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && keep_busy_now == last_announced_keep_busy
                     && desktop_now == last_announced_desktop
+                    && exec_system_now == last_announced_exec_system
                 {
                     None
                 } else {
@@ -1815,6 +1822,7 @@ async fn connect_once(
                     last_announced_record = record_now.clone();
                     last_announced_keep_busy = keep_busy_now;
                     last_announced_desktop = desktop_now;
+                    last_announced_exec_system = exec_system_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -1825,6 +1833,7 @@ async fn connect_once(
                     if !ctx.is_primary {
                         strip_replica_verbs(&mut c.rpc);
                     }
+                    crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
                     c.record = record_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
@@ -3987,15 +3996,15 @@ async fn handle_server_msg(
             consent_mode,
             via_service,
         } => {
-            // FR-94 — a command meant for this device's SYSTEM service. This
-            // build has no doorbell, and it never advertises `exec-system`, so
-            // a server should never send this here. If one does, refuse it:
-            // running it in this process would run it as an identity nobody
-            // asked for (see `exec::RunAs`).
-            if via_service {
+            // FR-94 — a command meant for the SYSTEM service. Only a Windows
+            // build advertises `exec-system`, so a server should never send
+            // this anywhere else; if one does, refuse it here, before anyone
+            // is asked to approve it. It never runs in THIS process: that
+            // would be an identity nobody asked for (see `exec::RunAs`).
+            if via_service && !cfg!(windows) {
                 warn!(
                     %request_id, %caller,
-                    "rc:rpc.exec via the SYSTEM service refused — this build has no service runner"
+                    "rc:rpc.exec via the SYSTEM service refused — not a Windows device"
                 );
                 let _ = outbound_tx
                     .send(ClientMsg::RpcResult {
@@ -4140,11 +4149,7 @@ async fn handle_server_msg(
                 // FR-27 — same convergence point as the RC path: take the
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
-                let outcome = if decision.granted() {
-                    crate::exec::shared()
-                        .run(req, &crate::exec::redactor())
-                        .await
-                } else {
+                let outcome = if !decision.granted() {
                     warn!(%request_id, %caller, ?decision, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
                         error: Some(format!(
@@ -4152,6 +4157,30 @@ async fn handle_server_msg(
                         )),
                         ..Default::default()
                     }
+                } else if via_service {
+                    // FR-94 — approved: ring the SYSTEM service with the
+                    // request id alone. It claims the command from the server
+                    // and posts the result there itself, so once it has taken
+                    // it nothing more is said from here. If it has not, the
+                    // reason is this command's answer, and the server
+                    // withdraws the command so a late claim cannot run it.
+                    match crate::exec_service::ring(&request_id).await {
+                        Ok(()) => {
+                            info!(%request_id, %caller, "rc:rpc.exec handed to the SYSTEM service");
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(%request_id, %caller, %e, "rc:rpc.exec: the SYSTEM service did not take it");
+                            crate::exec::ExecOutcome {
+                                error: Some(e),
+                                ..Default::default()
+                            }
+                        }
+                    }
+                } else {
+                    crate::exec::shared()
+                        .run(req, &crate::exec::redactor())
+                        .await
                 };
                 if let Err(e) = outbound
                     .send(ClientMsg::RpcResult {
@@ -4176,7 +4205,9 @@ async fn handle_server_msg(
         ServerMsg::RpcCancel { request_id } => {
             tokio::spawn(async move {
                 let found = crate::exec::shared().cancel(&request_id).await;
-                info!(%request_id, found, "rc:rpc.cancel");
+                // FR-94 — a command the SYSTEM service runs is killed there.
+                let in_service = !found && crate::exec_service::cancel(&request_id).await;
+                info!(%request_id, found, in_service, "rc:rpc.cancel");
             });
         }
 

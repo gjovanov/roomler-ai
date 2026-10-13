@@ -20,10 +20,54 @@
           icon="mdi-shield-alert-outline"
         >
           Allowing remote execution on this device lets permitted users run
-          commands as <strong>root</strong> (Linux) or, on Windows, as the
-          <strong>signed-in user</strong> on an attended install and as
-          <strong>SYSTEM</strong> in SystemContext mode. It is a separate power
-          from remote control, which is consent-gated and visible on screen.
+          commands as <strong>root</strong> (Linux) or, on Windows, as
+          <strong>SYSTEM</strong> once the device is anchored (otherwise as the
+          <strong>signed-in user</strong> on an attended install, and as SYSTEM
+          in SystemContext mode). It is a separate power from remote control,
+          which is consent-gated and visible on screen.
+        </v-alert>
+
+        <!-- FR-94 — on Windows, WHO runs a command depends on whether an
+             administrator anchored the device. Said here, beside the switch
+             that grants it, not discovered in the audit afterwards. -->
+        <v-alert
+          v-if="agent?.os === 'windows'"
+          :type="anchored ? 'success' : 'info'"
+          variant="tonal"
+          density="compact"
+          class="mb-4"
+          data-testid="exec-identity"
+        >
+          <template v-if="anchored">
+            Anchored {{ anchoredWhen }}: commands run as <strong>SYSTEM</strong>
+            through this device's service.
+            <v-btn
+              size="small"
+              variant="text"
+              color="error"
+              class="ml-1"
+              :loading="unanchoring"
+              data-testid="exec-unanchor"
+              @click="unanchor"
+            >
+              Un-anchor
+            </v-btn>
+          </template>
+          <template v-else>
+            Not anchored: commands run as the <strong>signed-in user</strong>
+            (an attended install) or as SYSTEM (SystemContext mode). To run them
+            as SYSTEM, on the device, from an elevated prompt:
+            <code>roomlerd anchor create --server … --token … --device {{ agent.id }}</code>
+          </template>
+        </v-alert>
+        <v-alert
+          v-if="unanchorError"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mb-4"
+        >
+          {{ unanchorError }}
         </v-alert>
 
         <v-switch
@@ -105,6 +149,10 @@
           <code>roomler config set exec_enabled true</code> on the host, then
           restart the service. That switch belongs to whoever holds the machine
           and cannot be set from here.
+          <template v-if="anchored">
+            An anchored device's service checks its own switch as well
+            (<code>roomlerd anchor exec on</code>, elevated).
+          </template>
         </v-alert>
       </v-card-text>
 
@@ -141,6 +189,28 @@ const agentStore = useAgentStore()
 const saving = ref(false)
 const agent = computed(() => props.agent)
 const orgDisabled = computed(() => agentStore.orgExecEnabled === false)
+
+// FR-94 — the device's exec identity on Windows.
+const anchored = computed(() => !!agent.value?.exec_anchor)
+const anchoredWhen = computed(() => {
+  const at = agent.value?.exec_anchor?.anchored_at
+  const d = at ? new Date(at) : null
+  return d && !Number.isNaN(d.getTime()) ? d.toLocaleDateString() : ''
+})
+const unanchoring = ref(false)
+const unanchorError = ref<string | null>(null)
+
+async function unanchor() {
+  unanchoring.value = true
+  unanchorError.value = null
+  try {
+    await agentStore.unanchorDevice(props.tenantId, agent.value.id)
+  } catch (e) {
+    unanchorError.value = (e as Error).message
+  } finally {
+    unanchoring.value = false
+  }
+}
 
 /** A closed default, so a dialog opened on a device with no policy row can
  *  only ever be saved MORE permissive by an explicit click. */

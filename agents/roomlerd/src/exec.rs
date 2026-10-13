@@ -3131,10 +3131,12 @@ mod tests {
 /// same wall-clock timeout, the same COMBINED output ceiling and the same
 /// process-tree kill, so a session here is bounded exactly like Fleet RPC.
 ///
-/// Requires the daemon to be SYSTEM (`WTSQueryUserToken` returns
-/// `ERROR_PRIVILEGE_NOT_HELD` otherwise), which a perMachine service install
-/// is and a perUser task install is not. That is reported as a refusal, not a
-/// fallback — see [`RunAs`].
+/// Requires the caller to be SYSTEM (`WTSQueryUserToken` returns
+/// `ERROR_PRIVILEGE_NOT_HELD` otherwise): the SYSTEM service, or a
+/// SystemContext worker. An attended worker runs as the signed-in user even
+/// under a perMachine install (FR-94 §2), so on such a device Fleet RPC
+/// reaches this through the anchored service (`crate::exec_service`). That is
+/// reported as a refusal, not a fallback — see [`RunAs`].
 #[cfg(windows)]
 mod win_console {
     use std::sync::Arc;
@@ -3204,11 +3206,15 @@ mod win_console {
                 ));
             }
             Err(e) => {
-                // The overwhelmingly likely cause is the daemon not running as
-                // SYSTEM, so say that rather than echoing a bare error number.
+                // The overwhelmingly likely cause is this process not running
+                // as SYSTEM, so say that rather than echoing a bare error
+                // number — and not "install perMachine": an attended
+                // perMachine worker is the signed-in user too (FR-94 §2).
                 return ExecOutcome::failed(format!(
-                    "cannot obtain the console user's token ({e}). This needs the daemon to run \
-                     as SYSTEM — a perMachine service install, not a perUser task."
+                    "cannot obtain the console user's token ({e}): only a process running as \
+                     SYSTEM may. On an attended Windows install the worker runs as the signed-in \
+                     user; anchor the device (`roomlerd anchor create`) so commands run through \
+                     its SYSTEM service."
                 ));
             }
         };

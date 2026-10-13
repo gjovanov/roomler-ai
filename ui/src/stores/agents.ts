@@ -291,6 +291,10 @@ export interface Agent {
    *  feature. Either way consumers must read it as `mode: 'off'`, never as
    *  permissive. */
   exec_policy?: ExecPolicy
+  /** FR-94 — present when an administrator anchored this Windows device, so
+   *  its commands run as SYSTEM through its service. Who and when; the
+   *  credential never leaves the device. */
+  exec_anchor?: { anchored_at: string; anchored_by: string } | null
   /** Roomler SSH gate 3. Same rule as `exec_policy`: absent means OFF.
    *
    *  ⚠️ Absent is also the ONLY correct reading for an unconfigured device:
@@ -530,6 +534,10 @@ export type ExecDenyReason =
   | 'consent_denied'
   | 'rate_limited'
   | 'agent_disabled'
+  // FR-94 — the org requires SYSTEM and this Windows device cannot take that
+  // path; and a device's SYSTEM service asked for a command not pending for it.
+  | 'system_required'
+  | 'claim_refused'
 
 /** One row of the Fleet-RPC attempt log. Every attempt lands here, allowed
  *  or denied — a refused exec is the interesting one. */
@@ -581,6 +589,11 @@ export interface ExecAuditEntry {
   output_sha256?: string
   output_bytes?: number
   truncated?: boolean
+  /** FR-94 — where the server sent the command: `system` (a Windows device's
+   *  SYSTEM service), `console_user` (the same service, as the signed-in
+   *  user) or `worker` (the agent's own process). Absent on a refusal and on
+   *  rows from before FR-94. */
+  ran_as?: string | null
 }
 
 /** Why a roomler-SSH request was refused. Mirrors the Rust `SshDenyReason`. */
@@ -1052,31 +1065,58 @@ export const useAgentStore = defineStore('agents', () => {
    *  policy says — the console shows that as the reason rather than letting
    *  an admin hunt through per-device settings. */
   const orgExecEnabled = ref<boolean | null>(null)
+  /** FR-94 — whether the org refuses a Windows command a device would run as
+   *  the signed-in user rather than as SYSTEM. `null` until fetched, and on a
+   *  server from before FR-94, which never names it. */
+  const orgExecRequireSystem = ref<boolean | null>(null)
+
+  type OrgExecSettings = { remote_exec_enabled: boolean; exec_require_system?: boolean }
+
+  function applyOrgExecSettings(resp: OrgExecSettings) {
+    orgExecEnabled.value = resp.remote_exec_enabled
+    orgExecRequireSystem.value =
+      typeof resp.exec_require_system === 'boolean' ? resp.exec_require_system : null
+  }
 
   async function fetchOrgExecEnabled(tenantId: string) {
     if (!(await mayReadOrgSettings(tenantId))) {
       orgExecEnabled.value = null
+      orgExecRequireSystem.value = null
       return
     }
     try {
-      const resp = await api.get<{ remote_exec_enabled: boolean }>(
-        `/tenant/${tenantId}/exec-settings`,
-      )
-      orgExecEnabled.value = resp.remote_exec_enabled
+      applyOrgExecSettings(await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`))
     } catch {
       // A 403 here means "not an admin", not "disabled" — leave it unknown
       // rather than claiming the org is off.
       orgExecEnabled.value = null
+      orgExecRequireSystem.value = null
     }
   }
 
-  /** Flip gate 1. MANAGE_TENANT server-side. */
+  /** Flip gate 1. MANAGE_TENANT server-side. Names only the kill-switch: the
+   *  server leaves `exec_require_system` as it is when a PUT omits it. */
   async function setOrgExecEnabled(tenantId: string, enabled: boolean) {
-    const resp = await api.put<{ remote_exec_enabled: boolean }>(
-      `/tenant/${tenantId}/exec-settings`,
-      { remote_exec_enabled: enabled },
+    applyOrgExecSettings(
+      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+        remote_exec_enabled: enabled,
+      }),
     )
-    orgExecEnabled.value = resp.remote_exec_enabled
+  }
+
+  /** FR-94 — flip `exec_require_system`. The PUT must carry the kill-switch
+   *  too (the server reads it as required), so this sends the value it holds
+   *  and refuses to guess one it does not. */
+  async function setOrgExecRequireSystem(tenantId: string, required: boolean) {
+    if (orgExecEnabled.value === null) {
+      throw new Error('The organization settings are not loaded yet')
+    }
+    applyOrgExecSettings(
+      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+        remote_exec_enabled: orgExecEnabled.value,
+        exec_require_system: required,
+      }),
+    )
   }
 
   /** Replace a device's exec policy (gate 3). MANAGE_AGENTS server-side. */
@@ -1084,6 +1124,15 @@ export const useAgentStore = defineStore('agents', () => {
     await api.put(`/tenant/${tenantId}/agent/${agentId}/exec-policy`, policy)
     const idx = agents.value.findIndex((a) => a.id === agentId)
     if (idx !== -1) agents.value[idx]!.exec_policy = policy
+  }
+
+  /** FR-94 — revoke a Windows device's SYSTEM service without removing the
+   *  device: its commands go to the worker again, or are refused where the
+   *  org requires SYSTEM. MANAGE_AGENTS server-side. */
+  async function unanchorDevice(tenantId: string, agentId: string) {
+    await api.delete(`/tenant/${tenantId}/agent/${agentId}/exec-anchor`)
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.exec_anchor = null
   }
 
   // ── Roomler SSH ──────────────────────────────────────────────────
@@ -1446,7 +1495,10 @@ export const useAgentStore = defineStore('agents', () => {
     orgExecEnabled,
     fetchOrgExecEnabled,
     setOrgExecEnabled,
+    orgExecRequireSystem,
+    setOrgExecRequireSystem,
     updateExecPolicy,
+    unanchorDevice,
     orgSshEnabled,
     fetchOrgSshEnabled,
     setOrgSshEnabled,
