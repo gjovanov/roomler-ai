@@ -177,6 +177,12 @@ pub struct ConnectedAgent {
     /// The server teleports only between two connections with it. Per
     /// connection, for the same reason; `hive-promote` does NOT imply it.
     pub supports_hive_teleport: bool,
+    /// FR-90 P2f-3 — the agent advertises `hive-fork`: a start that names
+    /// the session it forks starts from its parent's copy there. A build
+    /// before it would start the fork EMPTY, so a fork's every start goes
+    /// only to a connection with it. Per connection, for the same reason;
+    /// `hive` does NOT imply it.
+    pub supports_hive_fork: bool,
 }
 
 /// FR-85 P3 — what a device says about remote recording, from its caps.
@@ -479,6 +485,9 @@ impl Hub {
             // FR-90 P2f-1 — set by `set_agent_hive_teleport_support`; `false` =
             // no teleport moves a session to, or away from, this connection.
             supports_hive_teleport: false,
+            // FR-90 P2f-3 — set by `set_agent_hive_fork_support`; `false` = no
+            // fork's start is ever sent to this connection.
+            supports_hive_fork: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -2116,6 +2125,69 @@ impl Hub {
                 return Err(Error::AgentOffline(agent_id.to_hex()));
             }
             if !entry.supports_hive_teleport {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// FR-90 P2f-3 — record whether this connection starts a fork from its
+    /// parent's copy (`hive-fork`), right after registration.
+    pub fn set_agent_hive_fork_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_hive_fork = supports;
+        }
+    }
+
+    /// FR-90 P2f-3 — whether the device's CURRENT connection on this pod
+    /// runs sessions and starts a fork: `hive` and `hive-fork`. `None` = not
+    /// online here, or another tenant's (answered alike, as
+    /// [`Self::push_hive`] answers).
+    pub fn agent_supports_hive_fork(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+    ) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .map(|a| a.supports_hive && a.supports_hive_fork)
+    }
+
+    /// FR-90 P2f-3 — whether THIS connection advertises `hive-fork`, as
+    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or
+    /// a newer connection holds the slot.
+    pub fn agent_supports_hive_fork_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .filter(|a| ptr_eq(&a.tx, tx))
+            .map(|a| a.supports_hive && a.supports_hive_fork)
+    }
+
+    /// FR-90 P2f-3 — push a fork's start, checked in the lookup that sends
+    /// it, as [`Self::push_hive`]: offline or another tenant's is
+    /// [`Error::AgentOffline`]; a connection without `hive` and `hive-fork`
+    /// is [`Error::ExecUnsupported`] and receives nothing. A fork's start
+    /// never goes through [`Self::push_hive`]: a build that ignores
+    /// `fork_of` would start the fork empty.
+    pub fn push_hive_fork(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !(entry.supports_hive && entry.supports_hive_fork) {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
         }
@@ -4275,6 +4347,64 @@ mod tests {
             matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveReplicaJoin { .. })),
             "the frame reached it"
         );
+    }
+
+    /// FR-90 P2f-3 — a fork's start reaches only a connection that runs
+    /// sessions and advertises `hive-fork`: one that runs sessions and takes
+    /// teleports would start the fork empty, and another org's is not
+    /// reachable at all.
+    #[tokio::test]
+    async fn a_forks_start_reaches_only_a_connection_that_starts_forks() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        let stop = || ServerMsg::HiveStop {
+            session_id: ObjectId::new(),
+            fence: 1,
+            reason: "owner".into(),
+        };
+        hub.set_agent_hive_support(agent_id, true);
+        hub.set_agent_hive_teleport_support(agent_id, true);
+        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(false));
+        assert_eq!(hub.agent_supports_hive_fork_on(agent_id, &tx), Some(false));
+        let err = hub
+            .push_hive_fork(agent_id, tenant, stop())
+            .expect_err("a connection without hive-fork");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        hub.set_agent_hive_fork_support(agent_id, true);
+        assert_eq!(
+            hub.agent_supports_hive_fork(agent_id, ObjectId::new()),
+            None
+        );
+        let err = hub
+            .push_hive_fork(agent_id, ObjectId::new(), stop())
+            .expect_err("another org's connection");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
+
+        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(true));
+        assert_eq!(hub.agent_supports_hive_fork_on(agent_id, &tx), Some(true));
+        hub.push_hive_fork(agent_id, tenant, stop())
+            .expect("a connection that starts forks");
+        assert!(
+            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveStop { .. })),
+            "it reached the connection"
+        );
+        // `hive-fork` without `hive` starts nothing.
+        hub.set_agent_hive_support(agent_id, false);
+        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(false));
+        assert!(hub.push_hive_fork(agent_id, tenant, stop()).is_err());
     }
 
     // ─── Fleet RPC broker ────────────────────────────────────────────

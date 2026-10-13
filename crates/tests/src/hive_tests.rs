@@ -4528,10 +4528,15 @@ async fn a_teleport_whose_target_refuses_its_join_lets_it_go() {
                "refused": "not_prepared", "detail": "a restart came between"}),
     )
     .await;
-    let s = wait_stored(&app, &sid, "the teleport fails", |s| {
+    wait_stored(&app, &sid, "the teleport fails", |s| {
         !s.contains_key("promotion")
     })
     .await;
+    // `fail` ends the promotion, lets the target go, audits, then tells the
+    // room, each its own write: once the room is told, the rest is there.
+    let why = wait_note(&app, &m, "did not take a copy of the session").await;
+    assert!(why[0].contains("no longer prepared"), "{}", why[0]);
+    let s = stored(&app, &sid).await;
     assert_eq!(
         teleport_audit(&app, &sid).await.last(),
         Some(&("failed".to_string(), "join_refused".to_string())),
@@ -4543,8 +4548,6 @@ async fn a_teleport_whose_target_refuses_its_join_lets_it_go() {
         "its copy is let go"
     );
     assert_eq!(s.get_i64("fence").unwrap(), 1, "nothing moved");
-    let why = wait_note(&app, &m, "did not take a copy of the session").await;
-    assert!(why[0].contains("no longer prepared"), "{}", why[0]);
     assert!(
         !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(500)).await,
         "the primary never drains"
@@ -4564,20 +4567,21 @@ async fn a_teleport_whose_target_never_catches_up_fails_at_its_bound() {
     joined(&mut m.a.ws, &sid).await;
     send(&mut m.a.ws, tip_at(&sid, 1, 9, "ab")).await;
     send(&mut m.b.ws, tip_at(&sid, 1, 3, "cd")).await;
-    let s = wait_stored(&app, &sid, "the joining step runs out", |s| {
+    wait_stored(&app, &sid, "the joining step runs out", |s| {
         !s.contains_key("promotion")
     })
     .await;
+    // As above: the room is told last, after the target is let go.
+    let why = wait_note(&app, &m, "did not catch up in time").await;
+    assert_eq!(why.len(), 1, "{why:?}");
     assert_eq!(
-        stored_member(&s, &m.b.agent_id),
+        stored_member(&stored(&app, &sid).await, &m.b.agent_id),
         ("teleport".into(), "leaving".into())
     );
     assert!(
         !device_hears(&mut m.a.ws, "rc:hive.drain", Duration::from_millis(300)).await,
         "never drained"
     );
-    let why = wait_note(&app, &m, "did not catch up in time").await;
-    assert_eq!(why.len(), 1, "{why:?}");
     assert_eq!(
         teleport_audit(&app, &sid).await.last(),
         Some(&("failed".to_string(), "join_timeout".to_string()))
@@ -4706,6 +4710,889 @@ async fn a_teleports_moved_start_the_target_refuses_lets_its_copy_go() {
         .await
         .is_none(),
         "no join at the new fence"
+    );
+}
+
+// ─── FR-90 P2f-3b — a fork ─────────────────────────────────────────────────
+
+/// What a build that starts a fork from its parent's copy advertises: a
+/// promotion's words, and `hive-fork`.
+const FORKS: &[&str] = &[
+    "exec",
+    "hive",
+    "hive-replica",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-fork",
+];
+
+/// [`promote_app`], a fork's wait for its device's copy bound to 2 s.
+async fn fork_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.modules.hive = true;
+        s.hive.replicaset = true;
+        s.hive.promote_prepare_secs = 4;
+        s.hive.promote_drain_secs = 4;
+        s.hive.promote_sync_secs = 4;
+        s.hive.fork_copy_secs = 2;
+        s.app.rate_limit_per_sec = 100;
+        s.app.rate_limit_burst = 1000;
+    })
+    .await
+}
+
+/// A tip of `sid` at fence 1, its copy's last checkpoint at `checkpoint`.
+fn tip_with_checkpoint(sid: &str, seq: u64, checkpoint: u64) -> Value {
+    json!({"t": "rc:hive.replica.tip", "session_id": sid, "fence": 1, "seq": seq,
+           "hash": hash("e"), "checkpoint": {"seq": checkpoint, "hash": hash("c")}})
+}
+
+/// The last checkpoint the stored member `device` of `s` reported.
+fn checkpoint_seq_of(s: &Document, device: &str) -> Option<i64> {
+    let id = ObjectId::parse_str(device).unwrap();
+    s.get_document("replicaset")
+        .ok()?
+        .get_array("members")
+        .ok()?
+        .iter()
+        .filter_map(|m| m.as_document())
+        .find(|m| m.get_object_id("device_id").ok() == Some(id))?
+        .get_document("tip")
+        .ok()?
+        .get_i64("checkpoint_seq")
+        .ok()
+}
+
+/// A replicated session running on `a`, which advertises [`FORKS`], at fence
+/// 1, whose member `b` (advertising `b_caps`) took its copy.
+async fn forkable(app: &TestApp, tag: &str, b_caps: &[&str]) -> Moving {
+    let seeded = app.seed_tenant(tag).await;
+    on_pro(app, &seeded).await;
+    let tid = seeded.tenant_id.clone();
+    let admin = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(app, &tid, &admin, &policy_min(2, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut a = device(app, &seeded, &format!("mach-{tag}-a"), FORKS).await;
+    let mut b = device(app, &seeded, &format!("mach-{tag}-b"), b_caps).await;
+    let (s, frame) = started_frame(app, &tid, &admin, &mut a, &format!("/srv/{tag}")).await;
+    assert_eq!(frame["replicated"], true, "{frame}");
+    let sid = s["id"].as_str().unwrap().to_string();
+    read_until(&mut b.ws, "rc:hive.replica.join")
+        .await
+        .expect("the member's join");
+    send(
+        &mut b.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": sid, "fence": 1}),
+    )
+    .await;
+    let id = b.agent_id.clone();
+    wait_member(app, &tid, &admin, &sid, &id, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+    Moving {
+        tid,
+        admin,
+        admin_id: seeded.admin.id.clone(),
+        sid,
+        a,
+        b,
+        more: Vec::new(),
+        seeded,
+    }
+}
+
+/// The session's first turn ends on its primary, which reports no checkpoint
+/// of it yet.
+async fn turn_ended(app: &TestApp, m: &mut Moving) {
+    let sid = m.sid.clone();
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 1,
+               "status": "ok", "prompted_by": m.admin_id, "steps": 1, "duration_ms": 10}),
+    )
+    .await;
+    wait_stored(app, &sid, "the turn", |s| {
+        s.get_document("last_turn").is_ok()
+    })
+    .await;
+}
+
+/// The session's first turn ends on its primary, which then reports its tip
+/// at its checkpoint 5; the member's copy reports `member_checkpoint`.
+async fn kept_a_turn(app: &TestApp, m: &mut Moving, member_checkpoint: u64) {
+    turn_ended(app, m).await;
+    checkpointed(app, m, member_checkpoint).await;
+}
+
+/// The primary reports its tip at its checkpoint 5, the member's copy at
+/// `member_checkpoint`.
+async fn checkpointed(app: &TestApp, m: &mut Moving, member_checkpoint: u64) {
+    let sid = m.sid.clone();
+    send(&mut m.a.ws, tip_with_checkpoint(&sid, 6, 5)).await;
+    send(&mut m.b.ws, tip_with_checkpoint(&sid, 6, member_checkpoint)).await;
+    let (a, b) = (m.a.agent_id.clone(), m.b.agent_id.clone());
+    wait_stored(app, &sid, "the turn, and both copies' checkpoints", |s| {
+        s.get_document("last_turn").is_ok()
+            && checkpoint_seq_of(s, &a) == Some(5)
+            && checkpoint_seq_of(s, &b) == i64::try_from(member_checkpoint).ok()
+    })
+    .await;
+}
+
+async fn post_fork(
+    app: &TestApp,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    device: &str,
+    folder: &str,
+) -> (u16, Value) {
+    let resp = app
+        .auth_post(&format!("/api/tenant/{tid}/hive/session/{sid}/fork"), token)
+        .json(&json!({ "device_id": device, "folder": folder }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// Fork `sid` onto `dev`, which accepts the fork's start: the route's answer
+/// and the `rc:hive.start` the device received.
+async fn forked(
+    app: &TestApp,
+    dev: &mut Device,
+    tid: &str,
+    token: &str,
+    sid: &str,
+    folder: &str,
+) -> (Value, Value) {
+    let caller = post_fork(app, tid, token, sid, &dev.agent_id, folder);
+    let target = async {
+        let frame = read_until(&mut dev.ws, "rc:hive.start")
+            .await
+            .expect("the device receives the fork's start");
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "account": "dev"}),
+        )
+        .await;
+        frame
+    };
+    let ((code, body), frame) = tokio::join!(caller, target);
+    assert_eq!(code, 200, "{body}");
+    (body, frame)
+}
+
+/// The notes in `sid`'s room whose text contains `needle`.
+async fn notes_in(app: &TestApp, tid: &str, token: &str, sid: &str, needle: &str) -> Vec<String> {
+    let room = stored(app, sid)
+        .await
+        .get_object_id("room_id")
+        .unwrap()
+        .to_hex();
+    room_messages(app, tid, token, &room)
+        .await
+        .1
+        .iter()
+        .filter_map(|i| i["content"].as_str())
+        .filter(|c| c.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `fork` audit rows naming `parent` as the session forked, in order:
+/// (outcome, reason, the fork's id).
+async fn fork_audit(app: &TestApp, parent: &str) -> Vec<(String, String, String)> {
+    let mut rows = app
+        .db
+        .collection::<Document>("hive_audit")
+        .find(doc! { "target_id": ObjectId::parse_str(parent).unwrap(), "action": "fork" })
+        .sort(doc! { "at": 1, "_id": 1 })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(d) = rows.next().await {
+        let d = d.unwrap();
+        out.push((
+            d.get_str("outcome").unwrap().to_string(),
+            d.get_str("reason").unwrap_or("").to_string(),
+            d.get_object_id("session_id")
+                .map(|o| o.to_hex())
+                .unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// FR-90 P2f-3b — a fork on a member that holds the session's last
+/// checkpoint: a new record, its owner's, with its own harness id and room,
+/// naming its parent and carrying its restricted tags; its start names the
+/// parent; both rooms say so, and the audit names the session it forks. The
+/// parent is as it was.
+#[tokio::test]
+async fn a_fork_on_a_member_is_a_new_session_whose_start_names_its_parent() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "fork", FORKS).await;
+    kept_a_turn(&app, &mut m, 5).await;
+    let parent = stored(&app, &m.sid).await;
+    let parent_harness = parent
+        .get_document("harness")
+        .unwrap()
+        .get_str("session")
+        .unwrap()
+        .to_string();
+    let (tid, admin, sid) = (m.tid.clone(), m.admin.clone(), m.sid.clone());
+    // The session carries a restricted tag the policy does not name, which
+    // the fork's device carries and the parent's primary does not: only the
+    // parent's tags can restrict the fork to it.
+    set_device(&app, &m.b.agent_id, doc! { "tags": ["secret"] }).await;
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "replicaset.restricted_tags": ["secret"] } },
+        )
+        .await
+        .unwrap();
+
+    let (body, frame) = forked(&app, &mut m.b, &tid, &admin, &sid, "/srv/fork-b").await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let fork = &body["session"];
+    let fsid = fork["id"].as_str().unwrap().to_string();
+    assert_ne!(fsid, sid);
+    assert_eq!(
+        fork["parent_session_id"], sid,
+        "the fork names its parent: {fork}"
+    );
+    assert_eq!(fork["title"], "Fork of fork", "{fork}");
+    assert_eq!(fork["owner_id"], m.admin_id);
+    assert_eq!(fork["device_id"], m.b.agent_id);
+    assert_eq!(fork["folder"], "/srv/fork-b");
+    assert_ne!(
+        fork["harness_session"], parent_harness,
+        "a harness id of its own"
+    );
+    assert_eq!(
+        frame["fork_of"],
+        json!({"session_id": sid, "harness_session": parent_harness}),
+        "the start names its parent: {frame}"
+    );
+    assert_eq!(frame["session_id"], fsid);
+    assert_eq!(frame["fence"], 1);
+    assert_eq!(frame["resume"], false);
+
+    let stored_fork = stored(&app, &fsid).await;
+    let link = stored_fork.get_document("parent").unwrap();
+    assert_eq!(link.get_object_id("session_id").unwrap().to_hex(), sid);
+    assert_eq!(link.get_str("harness_session").unwrap(), parent_harness);
+    assert_ne!(
+        stored_fork.get_object_id("room_id").unwrap(),
+        parent.get_object_id("room_id").unwrap(),
+        "a room of its own"
+    );
+    let placed = stored_fork
+        .get_document("replicaset")
+        .expect("placed under the rules");
+    // An empty list is left out of the record: read it as empty.
+    let restricted = placed
+        .get_array("restricted_tags")
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+    assert_eq!(
+        restricted,
+        vec![bson::Bson::String("secret".into())],
+        "a fork of a restricted session is restricted: {placed}"
+    );
+    let a_id = ObjectId::parse_str(&m.a.agent_id).unwrap();
+    assert!(
+        !placed
+            .get_array("members")
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_document())
+            .any(|x| x.get_object_id("device_id").ok() == Some(a_id)),
+        "the parent's primary lacks the tag, so it holds no copy of the fork: {placed}"
+    );
+    assert_eq!(placed.get_str("short").ok(), Some("restricted"), "{placed}");
+
+    assert_eq!(
+        notes_in(
+            &app,
+            &tid,
+            &admin,
+            &sid,
+            "forked the session into **Fork of fork**"
+        )
+        .await
+        .len(),
+        1,
+        "the parent's room says so, once"
+    );
+    assert_eq!(
+        notes_in(&app, &tid, &admin, &fsid, "A fork of **fork**")
+            .await
+            .len(),
+        1,
+        "the fork's room says what it was made from"
+    );
+    assert_eq!(
+        fork_audit(&app, &sid).await,
+        [("sent".to_string(), String::new(), fsid.clone())],
+        "the audit names the session forked"
+    );
+    let after = stored(&app, &sid).await;
+    assert_eq!(
+        after.get_str("status").unwrap(),
+        parent.get_str("status").unwrap(),
+        "the parent goes on as it was"
+    );
+    assert!(after.get_document("parent").is_err());
+}
+
+/// FR-90 P2f-3b — a fork on the session's own primary runs in a folder of its
+/// own: there the copy is current by definition. The session's own folder is
+/// refused `same_folder`.
+#[tokio::test]
+async fn a_fork_on_its_primary_needs_a_folder_of_its_own() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "forkhere", FORKS).await;
+    kept_a_turn(&app, &mut m, 1).await;
+    let (tid, admin, sid, a) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.a.agent_id.clone(),
+    );
+    let (code, body) = post_fork(&app, &tid, &admin, &sid, &a, "/srv/forkhere").await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("same_folder")),
+        "{body}"
+    );
+    assert!(body.get("session").is_none(), "no record: {body}");
+
+    // A fork the device refuses: its own room says so, the parent's nothing.
+    let caller = post_fork(&app, &tid, &admin, &sid, &a, "/srv/forkhere-dirty");
+    let target = async {
+        let frame = read_until(&mut m.a.ws, "rc:hive.start")
+            .await
+            .expect("the device receives the fork's start");
+        send(
+            &mut m.a.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": frame["fence"], "refused": "folder_dirty"}),
+        )
+        .await;
+    };
+    let ((code, body), ()) = tokio::join!(caller, target);
+    assert_eq!(
+        (code, body["outcome"].as_str(), body["reason"].as_str()),
+        (200, Some("refused"), Some("folder_dirty")),
+        "{body}"
+    );
+    assert!(
+        notes_in(&app, &tid, &admin, &sid, "forked the session into")
+            .await
+            .is_empty(),
+        "the parent's room says nothing of a fork its device refused"
+    );
+
+    // The member's copy is behind; the primary's is not.
+    let (body, frame) = forked(&app, &mut m.a, &tid, &admin, &sid, "/srv/forkhere-2").await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    assert_eq!(frame["fork_of"]["session_id"], sid, "{frame}");
+    assert_eq!(body["session"]["device_id"], a);
+    assert_eq!(
+        notes_in(&app, &tid, &admin, &sid, "forked the session into")
+            .await
+            .len(),
+        1,
+        "the parent's room tells of the fork its device took"
+    );
+}
+
+/// FR-90 P2f-3b — a member's copy must reach the session's last checkpoint
+/// first: a fork waits for it, and goes ahead once it does; one that never
+/// does is refused `copy_behind` at the bound, and nothing is made.
+#[tokio::test]
+async fn a_fork_waits_for_the_members_copy_to_reach_the_last_checkpoint() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "forklag", FORKS).await;
+    kept_a_turn(&app, &mut m, 3).await;
+    let (tid, admin, sid, b) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+
+    let started = Instant::now();
+    let (code, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/forklag-b").await;
+    assert_eq!(
+        (code, body["reason"].as_str()),
+        (200, Some("copy_behind")),
+        "{body}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it waited out its bound"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "its bound is the setting's, not the default's: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        arrives(&mut m.b.ws, "rc:hive.start", Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing reached the member"
+    );
+
+    // Caught up while the fork waits: it goes ahead.
+    let caller = post_fork(&app, &tid, &admin, &sid, &b, "/srv/forklag-b");
+    let target = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        send(&mut m.b.ws, tip_with_checkpoint(&sid, 7, 5)).await;
+        let frame = read_until(&mut m.b.ws, "rc:hive.start")
+            .await
+            .expect("the fork's start, once the copy caught up");
+        send(
+            &mut m.b.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": frame["session_id"],
+                   "fence": 1, "account": "dev"}),
+        )
+        .await;
+        frame
+    };
+    let ((code, body), frame) = tokio::join!(caller, target);
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("accepted")),
+        "{body}"
+    );
+    assert_eq!(frame["fork_of"]["session_id"], sid);
+    let rows = fork_audit(&app, &sid).await;
+    assert_eq!(
+        rows.iter()
+            .map(|(o, r, _)| (o.as_str(), r.as_str()))
+            .collect::<Vec<_>>(),
+        [("refused", "copy_behind"), ("sent", "")]
+    );
+}
+
+/// FR-90 P2f-3b — each gate refuses in its own words, and audits it: a
+/// session with no turn kept, or no checkpoint of one; an archived org; an
+/// owner without `HIVE_RUN`; an adopted session; a device that holds no copy,
+/// or a member that has not taken its copy; one that lacks a restricted tag;
+/// a session moving; one that does not start forks, or is offline; a session
+/// alone has no copy to fork; another person's session, or a server with the
+/// replicaset off, is not there at all.
+#[tokio::test]
+async fn a_fork_is_refused_by_the_gate_it_failed() {
+    let app = fork_app().await;
+
+    // No turn kept yet.
+    let mut m = forkable(&app, "forkgate", FORKS).await;
+    let (tid, admin, sid, b) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+    assert_eq!(body["reason"], "no_conversation", "{body}");
+    // A turn kept, and no checkpoint of it reported by its primary.
+    turn_ended(&app, &mut m).await;
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+    assert_eq!(body["reason"], "no_conversation", "{body}");
+    checkpointed(&app, &mut m, 5).await;
+
+    let sessions = app.db.collection::<Document>("agent_sessions");
+    let this = doc! { "_id": ObjectId::parse_str(&sid).unwrap() };
+    // The org archived.
+    let tenants = app.db.collection::<Document>("tenants");
+    let org = doc! { "_id": ObjectId::parse_str(&tid).unwrap() };
+    for archived in [true, false] {
+        tenants
+            .update_one(org.clone(), doc! { "$set": { "is_archived": archived } })
+            .await
+            .unwrap();
+        if archived {
+            let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+            assert_eq!(body["reason"], "org_archived", "{body}");
+        }
+    }
+    // An owner who lost `HIVE_RUN` since the session started: the session
+    // made the member's, who holds no role with it.
+    let member = m.seeded.member.access_token.clone();
+    for owner in [&m.seeded.member.id, &m.admin_id] {
+        sessions
+            .update_one(
+                this.clone(),
+                doc! { "$set": { "owner_id": ObjectId::parse_str(owner).unwrap() } },
+            )
+            .await
+            .unwrap();
+        if *owner != m.admin_id {
+            let (_, body) = post_fork(&app, &tid, &member, &sid, &b, "/srv/g").await;
+            assert_eq!(body["reason"], "no_permission", "{body}");
+        }
+    }
+    // An adopted session: its terminal holds the harness, and no checkpoint
+    // of it is kept.
+    for origin in ["adopted", "started"] {
+        sessions
+            .update_one(this.clone(), doc! { "$set": { "origin": origin } })
+            .await
+            .unwrap();
+        if origin == "adopted" {
+            let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+            assert_eq!(body["reason"], "not_forkable", "{body}");
+        }
+    }
+
+    // A device of the org that holds no copy.
+    let c = device(&app, &m.seeded, "mach-forkgate-c", FORKS).await;
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &c.agent_id, "/srv/g").await;
+    assert_eq!(body["reason"], "no_copy", "{body}");
+    // A member whose copy is not taken yet.
+    let b_row = doc! {
+        "_id": ObjectId::parse_str(&sid).unwrap(),
+        "replicaset.members.device_id": ObjectId::parse_str(&b).unwrap(),
+    };
+    for state in ["pending", "joined"] {
+        sessions
+            .update_one(
+                b_row.clone(),
+                doc! { "$set": { "replicaset.members.$.state": state } },
+            )
+            .await
+            .unwrap();
+        if state == "pending" {
+            let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+            assert_eq!(body["reason"], "no_copy", "{body}");
+        }
+    }
+
+    // A member without the restricted tag the session carries.
+    set_device(&app, &m.a.agent_id, doc! { "tags": ["prod"] }).await;
+    app.db
+        .collection::<Document>("agent_sessions")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&sid).unwrap() },
+            doc! { "$set": { "replicaset.restricted_tags": ["prod"] } },
+        )
+        .await
+        .unwrap();
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+    assert_eq!(body["reason"], "restricted", "{body}");
+    set_device(&app, &b, doc! { "tags": ["Prod"] }).await;
+
+    // Another person's session: not there.
+    grant_hive_run_to_member(&app, &m.seeded).await;
+    let member = m.seeded.member.access_token.clone();
+    let (code, _) = post_fork(&app, &tid, &member, &sid, &b, "/srv/g").await;
+    assert_eq!(code, 404, "only its owner forks it");
+
+    // Moving.
+    let (body, _) = prepared(&app, &mut m).await;
+    assert_eq!(body["outcome"], "promoting", "{body}");
+    let (_, body) = post_fork(&app, &tid, &admin, &sid, &b, "/srv/g").await;
+    assert_eq!(body["reason"], "in_progress", "{body}");
+
+    let reasons: Vec<String> = fork_audit(&app, &sid)
+        .await
+        .into_iter()
+        .map(|(_, r, _)| r)
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "no_conversation",
+            "no_conversation",
+            "org_archived",
+            "no_permission",
+            "not_forkable",
+            "no_copy",
+            "no_copy",
+            "restricted",
+            "in_progress"
+        ],
+        "every refusal audited, naming the session"
+    );
+
+    // A member that does not start forks.
+    let mut old = forkable(&app, "forkold", PROMOTES).await;
+    kept_a_turn(&app, &mut old, 5).await;
+    let (_, body) = post_fork(
+        &app,
+        &old.tid,
+        &old.admin,
+        &old.sid,
+        &old.b.agent_id,
+        "/srv/g",
+    )
+    .await;
+    assert_eq!(body["reason"], "device_unsupported", "{body}");
+    assert!(
+        body.get("session").is_none(),
+        "refused at the gate, before any record: {body}"
+    );
+    // A member that holds a copy, offline.
+    old.b.ws.close(None).await.unwrap();
+    wait_offline(&app, &old.seeded, &old.b.agent_id).await;
+    let (_, body) = post_fork(
+        &app,
+        &old.tid,
+        &old.admin,
+        &old.sid,
+        &old.b.agent_id,
+        "/srv/g",
+    )
+    .await;
+    assert_eq!(body["reason"], "device_offline", "{body}");
+    assert!(
+        body.get("session").is_none(),
+        "refused at the gate while offline, before any record: {body}"
+    );
+
+    // A session alone.
+    let seeded = app.seed_tenant("forkalone").await;
+    on_pro(&app, &seeded).await;
+    let token = seeded.admin.access_token.clone();
+    let (code, p) = put_policy(&app, &seeded.tenant_id, &token, &policy_min(1, 0)).await;
+    assert_eq!(code, 200, "{p}");
+    let mut alone = device(&app, &seeded, "mach-forkalone", FORKS).await;
+    let (s, _) = started_frame(&app, &seeded.tenant_id, &token, &mut alone, "/srv/alone").await;
+    let alone_sid = s["id"].as_str().unwrap();
+    let (_, body) = post_fork(
+        &app,
+        &seeded.tenant_id,
+        &token,
+        alone_sid,
+        &alone.agent_id,
+        "/srv/alone-2",
+    )
+    .await;
+    assert_eq!(body["reason"], "not_replicated", "{body}");
+
+    // The replicaset off: no fork route at all.
+    let off = hive_app().await;
+    let seeded = off.seed_tenant("forkoff").await;
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&off, &seeded, "mach-forkoff", FORKS).await;
+    let (s, _) = started_frame(&off, &seeded.tenant_id, &token, &mut dev, "/srv/off").await;
+    let (code, _) = post_fork(
+        &off,
+        &seeded.tenant_id,
+        &token,
+        s["id"].as_str().unwrap(),
+        &dev.agent_id,
+        "/srv/off-2",
+    )
+    .await;
+    assert_eq!(code, 404);
+}
+
+/// FR-90 P2f-3b — a fork's unanswered start is sent again on its device's
+/// next connection, naming its parent, but only to a connection that starts
+/// forks: a build that does not would start it empty, so it waits for one
+/// that does.
+#[tokio::test]
+async fn a_forks_start_goes_again_only_to_a_connection_that_starts_forks() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "forkagain", FORKS).await;
+    kept_a_turn(&app, &mut m, 5).await;
+    let (tid, admin, sid, b) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.b.agent_id.clone(),
+    );
+    let caller = post_fork(&app, &tid, &admin, &sid, &b, "/srv/again-b");
+    let target = async { read_until(&mut m.b.ws, "rc:hive.start").await.unwrap() };
+    let ((code, body), first) = tokio::join!(caller, target);
+    assert_eq!(
+        (code, body["outcome"].as_str()),
+        (200, Some("pending")),
+        "{body}"
+    );
+    let fsid = body["session"]["id"].as_str().unwrap().to_string();
+
+    // Back as a build that does not start forks: nothing is sent.
+    let (token, machine) = (m.b.token.clone(), m.b.machine.clone());
+    drop(m.b.ws);
+    wait_offline(&app, &m.seeded, &b).await;
+    let mut ws = connect(&app, &token, &machine, PROMOTES).await;
+    let mut no_start = true;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(f) = arrives(&mut ws, "rc:hive.start", Duration::from_millis(200)).await
+            && f["session_id"] == fsid
+        {
+            no_start = false;
+        }
+    }
+    assert!(
+        no_start,
+        "no fork's start to a build that would start it empty"
+    );
+    assert_eq!(
+        stored(&app, &fsid).await.get_str("status").unwrap(),
+        "starting"
+    );
+
+    // Back as one that does: the start again, naming its parent.
+    drop(ws);
+    wait_offline(&app, &m.seeded, &b).await;
+    let mut ws = connect(&app, &token, &machine, FORKS).await;
+    let again = loop {
+        let f = read_until(&mut ws, "rc:hive.start")
+            .await
+            .expect("the fork's start, again");
+        if f["session_id"] == fsid {
+            break f;
+        }
+    };
+    assert_eq!(
+        again["fork_of"], first["fork_of"],
+        "the start again names its parent: {again}"
+    );
+    assert_eq!(again["harness_session"], first["harness_session"]);
+}
+
+/// FR-90 P2f-3b — a fork moves only to a device that starts forks: a member
+/// of its own replicaset that took its copy, back as a build without
+/// `hive-fork`, is refused `device_unsupported`, and nothing moves.
+#[tokio::test]
+async fn a_fork_moves_only_to_a_device_that_starts_forks() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "forkmove", FORKS).await;
+    kept_a_turn(&app, &mut m, 5).await;
+    let (tid, admin, sid, a) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.a.agent_id.clone(),
+    );
+    let (body, _) = forked(&app, &mut m.b, &tid, &admin, &sid, "/srv/forkmove-b").await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let fsid = body["session"]["id"].as_str().unwrap().to_string();
+    // The fork's own member: `a`, the owner's other device, takes its copy.
+    let join = loop {
+        let j = read_until(&mut m.a.ws, "rc:hive.replica.join")
+            .await
+            .expect("the fork's member is joined");
+        if j["session_id"] == fsid {
+            break j;
+        }
+    };
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": fsid, "fence": join["fence"]}),
+    )
+    .await;
+    wait_member(&app, &tid, &admin, &fsid, &a, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+
+    // Back as a build that promotes but does not start forks.
+    let (token, machine) = (m.a.token.clone(), m.a.machine.clone());
+    drop(m.a.ws);
+    wait_offline(&app, &m.seeded, &a).await;
+    let _ws = connect(&app, &token, &machine, PROMOTES).await;
+    wait_agent_online(&app, &m.seeded, &a).await;
+    let (code, body) = post_promote(&app, &tid, &admin, &fsid, &a, None).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["outcome"].as_str(), body["reason"].as_str()),
+        (Some("refused"), Some("device_unsupported")),
+        "{body}"
+    );
+    assert!(stored(&app, &fsid).await.get_document("promotion").is_err());
+}
+
+/// FR-90 P2f-3b — a fork promoted to its own member, which starts forks: the
+/// moved start names its parent, as its first start did, so the member keeps
+/// the parent's history in the fork's checkpoints.
+#[tokio::test]
+async fn a_promoted_forks_moved_start_names_its_parent() {
+    let app = fork_app().await;
+    let mut m = forkable(&app, "forkmoved", FORKS).await;
+    kept_a_turn(&app, &mut m, 5).await;
+    let (tid, admin, sid, a) = (
+        m.tid.clone(),
+        m.admin.clone(),
+        m.sid.clone(),
+        m.a.agent_id.clone(),
+    );
+    let (body, first) = forked(&app, &mut m.b, &tid, &admin, &sid, "/srv/forkmoved-b").await;
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let fsid = body["session"]["id"].as_str().unwrap().to_string();
+    // The fork's own member: `a`, the owner's other device, takes its copy.
+    let join = loop {
+        let j = read_until(&mut m.a.ws, "rc:hive.replica.join")
+            .await
+            .expect("the fork's member is joined");
+        if j["session_id"] == fsid {
+            break j;
+        }
+    };
+    send(
+        &mut m.a.ws,
+        json!({"t": "rc:hive.replica.join_ack", "session_id": fsid, "fence": join["fence"]}),
+    )
+    .await;
+    wait_member(&app, &tid, &admin, &fsid, &a, "joined", |m| {
+        m["state"] == "joined"
+    })
+    .await;
+
+    // The fork, run by `b`, promoted to `a`: prepared, drained, synced, moved.
+    let Moving {
+        tid,
+        admin,
+        admin_id,
+        a,
+        b,
+        seeded,
+        ..
+    } = m;
+    let mut f = Moving {
+        tid,
+        admin,
+        admin_id,
+        sid: fsid.clone(),
+        a: b,
+        b: a,
+        more: Vec::new(),
+        seeded,
+    };
+    prepared(&app, &mut f).await;
+    read_until(&mut f.a.ws, "rc:hive.drain")
+        .await
+        .expect("the fork's primary is told to drain");
+    send(&mut f.a.ws, drained(&fsid, 5, "ab")).await;
+    send(&mut f.b.ws, tip_at(&fsid, 1, 5, "ab")).await;
+    let to = frames_until(
+        &mut f.b.ws,
+        &["rc:hive.replica.join", "rc:hive.move", "rc:hive.start"],
+    )
+    .await;
+    let moved_start = to
+        .iter()
+        .find(|x| x["t"] == "rc:hive.start")
+        .expect("the fork's moved start");
+    assert_eq!(moved_start["fence"], 2, "{moved_start}");
+    assert_eq!(
+        moved_start["fork_of"], first["fork_of"],
+        "the moved start names its parent: {moved_start}"
     );
 }
 

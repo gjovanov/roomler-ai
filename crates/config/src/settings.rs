@@ -112,6 +112,17 @@ pub struct HiveSettings {
     /// holds the checkpoint without its whole pack's blobs.
     #[serde(default)]
     pub teleport_have_want: bool,
+    /// FR-90 P2f-3 — how long a fork waits for its device's copy to reach
+    /// the session's last checkpoint, as its primary last reported it
+    /// (`ROOMLER__HIVE__FORK_COPY_SECS`), before it is refused
+    /// `copy_behind`: a fork is made at the last checkpoint the device's
+    /// copy holds. ⚠️ A member that follows the session reports where its
+    /// copy ends at once, then at most every
+    /// `replica_limits::TIP_INTERVAL_SECS` (5 s): a bound below that can
+    /// refuse a copy that holds the checkpoint but has not said so yet
+    /// (measured: 5.2 s, two checkpoints 13 ms apart).
+    #[serde(default = "hive_default_fork_copy_secs")]
+    pub fork_copy_secs: u64,
 }
 
 fn hive_default_promote_prepare_secs() -> u64 {
@@ -130,6 +141,10 @@ fn hive_default_promote_sync_secs() -> u64 {
     120
 }
 
+fn hive_default_fork_copy_secs() -> u64 {
+    30
+}
+
 impl Default for HiveSettings {
     fn default() -> Self {
         Self {
@@ -140,6 +155,7 @@ impl Default for HiveSettings {
             promote_sync_secs: hive_default_promote_sync_secs(),
             promote_join_secs: hive_default_promote_join_secs(),
             teleport_have_want: false,
+            fork_copy_secs: hive_default_fork_copy_secs(),
         }
     }
 }

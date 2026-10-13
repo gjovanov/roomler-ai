@@ -40,6 +40,7 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     hive::{HARNESS_CLAUDE_CODE, hive_limits},
+    models::Agent,
     signaling::ServerMsg,
 };
 use roomler_ai_services::dao::base::PaginationParams;
@@ -48,8 +49,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::model::{
-    AgentSession, HarnessRef, HiveAuditEvent, SessionLocation, SessionOrigin, SessionStatus,
-    SessionView,
+    AgentSession, HarnessRef, HiveAuditEvent, ParentLink, SessionLocation, SessionOrigin,
+    SessionStatus, SessionView,
 };
 use crate::{HiveState, placement, room};
 
@@ -139,7 +140,10 @@ pub struct StartResponse {
 }
 
 impl StartResponse {
-    fn refused_by_server(reason: StartDenyReason, session: Option<&AgentSession>) -> Self {
+    pub(crate) fn refused_by_server(
+        reason: StartDenyReason,
+        session: Option<&AgentSession>,
+    ) -> Self {
         Self {
             outcome: "refused",
             reason: Some(reason.as_str().to_string()),
@@ -148,8 +152,19 @@ impl StartResponse {
         }
     }
 
+    /// FR-90 P2f-3 — refused by the server before any record was made, in
+    /// another route's words (a fork's).
+    pub(crate) fn refused_with(reason: &str, message: &str) -> Self {
+        Self {
+            outcome: "refused",
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+            session: None,
+        }
+    }
+
     /// Read off the record — the one place the device's answer lands.
-    fn from_record(s: &AgentSession) -> Self {
+    pub(crate) fn from_record(s: &AgentSession) -> Self {
         if s.status == SessionStatus::Refused {
             let word = s.refusal.clone().unwrap_or_else(|| "other".into());
             return Self {
@@ -366,33 +381,102 @@ pub async fn start(
         .find_live_in_tenant(tid, device_id)
         .await?;
 
-    let user_id = auth.user_id;
-    let audit =
-        |session_id: Option<ObjectId>, outcome: &'static str, reason: Option<&'static str>| Audit {
-            tenant_id: tid,
-            user_id,
-            target_id: None,
-            device_id,
-            session_id,
-            action: "start",
-            outcome,
-            reason,
-        };
-
     if let Err(reason) = authorize(&state, tid, device_id, auth.user_id).await? {
         info!(
             tenant = %tid, device = %device_id, user = %auth.user_id,
             reason = reason.as_str(), "hive: start refused"
         );
-        audit(None, "refused", Some(reason.as_str()))
-            .write(&state)
-            .await;
+        Audit {
+            tenant_id: tid,
+            user_id: auth.user_id,
+            target_id: None,
+            device_id,
+            session_id: None,
+            action: "start",
+            outcome: "refused",
+            reason: Some(reason.as_str()),
+        }
+        .write(&state)
+        .await;
         return Ok(Json(StartResponse::refused_by_server(reason, None)));
     }
+    let new = NewSession {
+        tid,
+        owner: auth.user_id,
+        device_id,
+        device: &device,
+        folder,
+        title,
+        harness: HARNESS_CLAUDE_CODE.to_string(),
+        parent: None,
+        restricted: &[],
+        action: "start",
+        opening: None,
+    };
+    begin(&state, new).await.map(Json)
+}
+
+/// FR-90 P2f-3 — a session [`begin`] makes and starts, its gates passed: a
+/// started one, or a fork, which names the session it was made from and
+/// carries that one's restricted tags.
+pub(crate) struct NewSession<'a> {
+    pub tid: ObjectId,
+    /// Who starts it, and owns it.
+    pub owner: ObjectId,
+    pub device_id: ObjectId,
+    pub device: &'a Agent,
+    pub folder: String,
+    pub title: String,
+    /// The harness kind: a fork's is its parent's.
+    pub harness: String,
+    pub parent: Option<ParentLink>,
+    /// The restricted tags it carries from the start (a fork's parent's).
+    pub restricted: &'a [String],
+    /// The audit's action: `start`, or `fork`.
+    pub action: &'static str,
+    /// What its room says first, once the record is made (a fork's origin).
+    pub opening: Option<String>,
+}
+
+/// A new session: its core memory, where its copies go, its room, its record,
+/// then its start, and the device's answer, waited for within the start's
+/// bound. P2f-3 — a fork's placement must be read, or the fork is not made:
+/// it is restricted as its parent is, and a session placed later is placed
+/// as a new one.
+pub(crate) async fn begin(
+    state: &HiveState,
+    new: NewSession<'_>,
+) -> Result<StartResponse, ApiError> {
+    let NewSession {
+        tid,
+        owner: user_id,
+        device_id,
+        device,
+        folder,
+        title,
+        harness,
+        parent,
+        restricted,
+        action,
+        opening,
+    } = new;
+    let forked_from = parent.as_ref().map(|p| p.session_id);
+    let audit =
+        |session_id: Option<ObjectId>, outcome: &'static str, reason: Option<&'static str>| Audit {
+            tenant_id: tid,
+            user_id,
+            // P2f-3 — a fork's rows name the session it forks.
+            target_id: forked_from,
+            device_id,
+            session_id,
+            action,
+            outcome,
+            reason,
+        };
 
     // The starter as the device will see them: the PROVEN address (or the
     // `.invalid` placeholder `users.email` holds otherwise) and a display name.
-    let user = state.users.base.find_by_id(auth.user_id).await?;
+    let user = state.users.base.find_by_id(user_id).await?;
     let now = DateTime::now();
     let sid = ObjectId::new();
     // P1e — core memory, rendered now and frozen with the session: a fact
@@ -405,7 +489,7 @@ pub async fn start(
             .snapshot(
                 tid,
                 sid,
-                (auth.user_id, &user.display_name),
+                (user_id, &user.display_name),
                 (device_id, &device.name),
             )
             .await
@@ -424,8 +508,9 @@ pub async fn start(
     // is logged, and the session runs on its primary alone, as with the
     // switch off.
     let (replicaset, short) = if state.replicaset {
-        match placement::place_new(&state, tid, auth.user_id, device_id, &device).await {
+        match placement::place_new(state, tid, user_id, device_id, device, restricted).await {
             Ok((r, short)) => (Some(r), short),
+            Err(e) if parent.is_some() => return Err(e.into()),
             Err(e) => {
                 warn!(session = %sid, %e, "hive: placement not read — the session runs on its primary alone");
                 (None, None)
@@ -436,17 +521,17 @@ pub async fn start(
     };
     // The session's room first (P0d): the record names it, and a session
     // nobody could see is no session.
-    let room_id = room::open(&state, tid, sid, &title, auth.user_id).await?;
+    let room_id = room::open(state, tid, sid, &title, user_id).await?;
     let session = AgentSession {
         id: Some(sid),
         tenant_id: tid,
-        owner_id: auth.user_id,
+        owner_id: user_id,
         drivers: Vec::new(),
         title,
         room_id: Some(room_id),
         last_turn: None,
         harness: HarnessRef {
-            id: HARNESS_CLAUDE_CODE.to_string(),
+            id: harness,
             session: uuid::Uuid::new_v4().to_string(),
         },
         location: SessionLocation {
@@ -470,10 +555,14 @@ pub async fn start(
         promotion: None,
         fences: Vec::new(),
         moved: None,
+        parent,
     };
     // The record BEFORE the push: the device's answer, however fast, must
     // find the session it is about.
     state.sessions.create(&session).await?;
+    if let Some(text) = opening {
+        room::note(state, &session, text).await;
+    }
     if session.replicaset.is_some() {
         Audit {
             tenant_id: tid,
@@ -485,7 +574,7 @@ pub async fn start(
             outcome: if short.is_some() { "short" } else { "placed" },
             reason: short.map(placement::Short::as_str),
         }
-        .write(&state)
+        .write(state)
         .await;
     }
     // P1e — the snapshot, kept for a re-send of the start, then sent ahead
@@ -509,7 +598,7 @@ pub async fn start(
         harness_session: session.harness.session.clone(),
         fence: 1,
         folder,
-        user_id: auth.user_id,
+        user_id,
         user_email: user.email,
         caller: user.display_name,
         resume: false,
@@ -519,10 +608,10 @@ pub async fn start(
         // connection it goes to.
         lease: replicated
             && state.fleet.rc_hub.agent_supports_hive_lease(device_id, tid) == Some(true),
-        // P2f-3b — a fork's start says what it was made from.
-        fork_of: None,
+        // P2f-3 — a fork's start says what it was made from.
+        fork_of: session.fork_of(),
     };
-    if let Err(e) = state.fleet.rc_hub.push_hive(device_id, tid, msg) {
+    if let Err(e) = push_start(state, &session, device_id, msg) {
         // The device left — or reconnected as a build without Hive — between
         // the gate and the push. Nothing reached it, and nothing will: the
         // start is not re-sent from here.
@@ -535,17 +624,17 @@ pub async fn start(
             .mark_lost(sid, "the device was gone before the start reached it")
             .await?;
         audit(Some(sid), "refused", Some(reason.as_str()))
-            .write(&state)
+            .write(state)
             .await;
         let s = state.sessions.find(sid).await?;
         if lost && let Some(s) = &s {
-            room::note(&state, s, room::ended_note(s)).await;
+            room::note(state, s, room::ended_note(s)).await;
         }
-        return Ok(Json(StartResponse::refused_by_server(reason, s.as_ref())));
+        return Ok(StartResponse::refused_by_server(reason, s.as_ref()));
     }
-    audit(Some(sid), "sent", None).write(&state).await;
+    audit(Some(sid), "sent", None).write(state).await;
     info!(
-        tenant = %tid, device = %device_id, user = %auth.user_id, session = %sid,
+        tenant = %tid, device = %device_id, user = %user_id, session = %sid, action,
         "hive: start sent"
     );
 
@@ -557,7 +646,24 @@ pub async fn start(
         .find(sid)
         .await?
         .ok_or_else(|| ApiError::Internal("the session record vanished".into()))?;
-    Ok(Json(StartResponse::from_record(&s)))
+    Ok(StartResponse::from_record(&s))
+}
+
+/// FR-90 P2f-3 — push `msg`, a start of `s`, to `device`: a fork's only to a
+/// connection that starts forks, since a build that ignores `fork_of` would
+/// start it empty; every other start as any Hive frame goes.
+pub(crate) fn push_start(
+    state: &HiveState,
+    s: &AgentSession,
+    device: ObjectId,
+    msg: ServerMsg,
+) -> Result<(), HubError> {
+    let hub = &state.fleet.rc_hub;
+    if s.parent.is_some() {
+        hub.push_hive_fork(device, s.tenant_id, msg)
+    } else {
+        hub.push_hive(device, s.tenant_id, msg)
+    }
 }
 
 /// P1e — `rc:hive.memory` for a session's stored snapshot, at `fence`.

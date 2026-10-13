@@ -191,6 +191,30 @@ pub(crate) fn adopted_note(s: &AgentSession) -> String {
     t
 }
 
+/// FR-90 P2f-3 — "Forked", in the parent's room: who made a fork of it, what
+/// it is called and where it runs; the session itself goes on as it was.
+pub(crate) fn forked_note(title: &str, device_name: &str, folder: &str, by: &str) -> String {
+    format!(
+        "🌿 **{}** forked the session into **{}** on {}, in {} — this session goes on as it was",
+        md_escape(by),
+        md_escape(title),
+        name_label(device_name),
+        md_escape(folder)
+    )
+}
+
+/// FR-90 P2f-3 — a fork's room's first note: what it was made from, and by
+/// whom. Its earlier turns are that session's, up to the last checkpoint the
+/// device's copy held.
+pub(crate) fn forked_from_note(parent: &AgentSession, by: &str) -> String {
+    format!(
+        "🌿 A fork of **{}**, made by **{}**: its earlier turns are that session's, up to the \
+         last checkpoint the device held of it",
+        md_escape(&parent.title),
+        md_escape(by)
+    )
+}
+
 /// "Refused" — which of the device's gates said no, in plain words.
 pub(crate) fn refused_note(s: &AgentSession) -> String {
     let word = s.refusal.as_deref().unwrap_or("other");
@@ -825,6 +849,7 @@ mod tests {
             promotion: None,
             fences: Vec::new(),
             moved: None,
+            parent: None,
         };
         assert_eq!(
             moved_note(&s, &p, "Alice"),

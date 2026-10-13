@@ -483,6 +483,11 @@ async fn authorize(
         Some(false) => return Ok(Err(PromoteDenyReason::DeviceUnsupported)),
         Some(true) => {}
     }
+    // P2f-3 — a fork moves only to a device that starts forks: one that does
+    // not would start it empty, or refuse its copy's names.
+    if s.parent.is_some() && hub.agent_supports_hive_fork(target, tid) != Some(true) {
+        return Ok(Err(PromoteDenyReason::DeviceUnsupported));
+    }
     // P2f-1 — a teleport copies the session from its primary, which must
     // be online here: no copy elsewhere can stand in for it yet.
     if kind == Kind::Teleport {
@@ -1826,10 +1831,10 @@ async fn send_start(state: &HiveState, s: &AgentSession, from: &SessionLocation,
                 .rc_hub
                 .agent_supports_hive_lease(device, s.tenant_id)
                 == Some(true),
-        // P2f-3b — a fork's record says what it was made from.
-        fork_of: None,
+        // P2f-3 — a fork's every start says what it was made from.
+        fork_of: s.fork_of(),
     };
-    match state.fleet.rc_hub.push_hive(device, s.tenant_id, msg) {
+    match crate::routes::push_start(state, s, device, msg) {
         Ok(()) => info!(session = %sid, device = %device, fence, "hive: the moved start was sent"),
         Err(e) => {
             debug!(session = %sid, %e, "hive: the moved start was not sent — it is re-sent on connect")
@@ -2079,6 +2084,7 @@ mod tests {
             promotion: Some(p.clone()),
             fences: Vec::new(),
             moved: None,
+            parent: None,
         };
         (s, p)
     }
