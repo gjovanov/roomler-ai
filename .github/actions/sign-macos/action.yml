@@ -231,8 +231,10 @@ runs:
           # Staple only works on a bundle/.dmg/.pkg. The ticket lands as a
           # regular file INSIDE the bundle, so it survives tar/untar and the
           # artifact validates on an offline Mac.
-          xcrun stapler staple "$TARGET"
-          xcrun stapler validate "$TARGET"
+          # Retried: since 2026-10-12 the ticket fetch drops its connection on
+          # GitHub's macOS runners after `Accepted` (exit 68; the script says why).
+          bash "$GITHUB_ACTION_PATH/../../../scripts/signing/stapler-retry.sh" staple "$TARGET"
+          bash "$GITHUB_ACTION_PATH/../../../scripts/signing/stapler-retry.sh" validate "$TARGET"
         else
           echo "::notice::$TARGET is a bare Mach-O -- notarised but NOT stapled (Apple does not support stapling a loose executable). Gatekeeper will perform an ONLINE notarisation lookup; an offline Mac will refuse a browser-downloaded copy. Install paths that use curl|tar do not set the quarantine attribute, so they are unaffected."
         fi
@@ -256,7 +258,7 @@ runs:
           || { echo "::error::hardened runtime NOT enabled on $TARGET"; exit 1; }
 
         if [[ "$NOTARIZE" == "true" && "$IS_BUNDLE" == true ]]; then
-          xcrun stapler validate "$TARGET"
+          bash "$GITHUB_ACTION_PATH/../../../scripts/signing/stapler-retry.sh" validate "$TARGET"
           out="$(spctl -a -vvv "$TARGET" 2>&1 || true)"
           echo "$out"
           echo "$out" | grep -q 'source=Notarized Developer ID' \

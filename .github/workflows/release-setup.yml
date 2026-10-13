@@ -367,7 +367,7 @@ jobs:
           tar xzf "${{ steps.tar.outputs.artifact }}" -C /tmp/roundtrip
           app="$(find /tmp/roundtrip -maxdepth 3 -name '*.app' -type d | head -n1)"
           [ -n "$app" ] || { echo "::error::no .app found in the packed tarball"; exit 1; }
-          xcrun stapler validate "$app"
+          bash "$GITHUB_WORKSPACE/scripts/signing/stapler-retry.sh" validate "$app"
           spctl -a -vvv "$app" 2>&1 | tee /tmp/spctl.txt
           grep -q 'source=Notarized Developer ID' /tmp/spctl.txt \
             || { echo "::error::extracted wizard is not Gatekeeper-clean"; exit 1; }
