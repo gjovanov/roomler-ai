@@ -157,8 +157,15 @@ pub trait TunIo: Send + Sync {
     /// keep the carrier-critical endpoints — the coordination server, the coturn
     /// relay, and the exit peer's own WG endpoint — flowing over the real uplink,
     /// so the default capture can never sever the very tunnel that carries it.
-    /// Default no-op (the in-memory mock, netstack, or when no default route was
-    /// discovered); best-effort — a failure is surfaced by the split-tunnel check.
+    /// Best-effort; a failure is surfaced by the split-tunnel check.
+    ///
+    /// ⚠️ The default `Ok(())` reads as "pinned", so it is safe ONLY for a
+    /// device that installs no OS routes: the in-memory mock, and netstack,
+    /// whose exit "routes" live in WireGuard's allowed-ips alone, out of the
+    /// carrier sockets' path. A device whose [`add_cidr_route`](Self::add_cidr_route)
+    /// reaches the kernel MUST override this and return `Err` where it cannot
+    /// pin, or the exit gate installs the split-default with nothing exempted
+    /// and the host wedges itself (#2081: macOS inherited this default).
     async fn add_host_exemption(&self, _ip: std::net::IpAddr) -> std::io::Result<()> {
         Ok(())
     }
@@ -4332,6 +4339,25 @@ mod system {
             }
         }
 
+        /// #2081 — no host-exemption arm here (macOS among them), so REFUSE.
+        ///
+        /// This device installs real OS routes: `add_cidr_route` has a working
+        /// macOS arm, so the exit-node `/1` halves land in the kernel. Inheriting
+        /// the trait's `Ok(())` told `reconcile_exit_routing` that every carrier
+        /// exemption was pinned when none was, and it then routed the WS, coturn
+        /// and the exit's own endpoint into the utun that carries them: the
+        /// self-wedge the exemption gate exists to stop, re-asserted on every
+        /// guard tick and re-installed after a restart. An `Err` makes the gate
+        /// WITHHOLD, and `roomler status` says why, until a real arm lands
+        /// (FR-97 P1a).
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("no host-exemption route support on this platform; cannot exempt {ip}"),
+            ))
+        }
+
         /// Remove a host exemption installed by [`Self::add_host_exemption`]
         /// (`/32` v4 or `/128` v6). Best-effort.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -5803,5 +5829,35 @@ mod macos_kernel_tests {
         );
 
         tun.del_cidr_route("0.0.0.0/8").await;
+    }
+
+    /// #2081 — a utun installs REAL routes (the exit-node `/1` halves land
+    /// through `add_cidr_route`, exercised above), so a carrier exemption it
+    /// cannot pin must come back as an error. The inherited `Ok(())` is what
+    /// told the exit gate every exemption was pinned, and it then routed the
+    /// WS, coturn and the exit's own endpoint into this utun.
+    #[tokio::test]
+    async fn an_exemption_it_cannot_pin_is_refused_not_reported_pinned() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        // TEST-NET-3 (RFC 5737): a carrier endpoint that routes nowhere real.
+        for ip in [
+            std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            "2001:db8::7".parse().expect("documentation v6"),
+        ] {
+            let err = tun.add_host_exemption(ip).await.expect_err(
+                "an exemption with no route behind it must be refused, never reported pinned",
+            );
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{ip}: {err}");
+        }
     }
 }
