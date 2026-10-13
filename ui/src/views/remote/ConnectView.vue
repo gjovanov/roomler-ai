@@ -78,6 +78,22 @@ const password = ref('')
 const busy = ref(false)
 const error = ref<string | null>(null)
 
+/**
+ * Who is logging in. The layout fetches the signed-in user only after it
+ * mounts (`useAuth`), which on a fresh load of this page is after the route's
+ * own guards: measured ~600 ms after `load`, longer on a slow link. A click in
+ * that window waits for it, rather than telling a signed-in person to sign in
+ * again. `null` once the session turns out not to be real, or never arrives.
+ */
+async function principalReady(timeoutMs = 10_000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs
+  while (!auth.user?.id) {
+    if (!auth.isAuthenticated || Date.now() > deadline) return null
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  return auth.user.id
+}
+
 /** The login rides the user socket; give it a moment to open after a navigation. */
 async function socketReady(timeoutMs = 10_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
@@ -90,15 +106,15 @@ async function socketReady(timeoutMs = 10_000): Promise<boolean> {
 
 async function submit() {
   const connectCode = code.value.trim().toUpperCase()
-  const principal = auth.user?.id
   if (!connectCode || !password.value || busy.value) return
-  if (!principal) {
-    error.value = 'Sign in again, then connect.'
-    return
-  }
   busy.value = true
   error.value = null
   try {
+    const principal = await principalReady()
+    if (!principal) {
+      error.value = 'Sign in again, then connect.'
+      return
+    }
     if (!(await socketReady())) {
       error.value = 'Not connected to the server. Check your connection and try again.'
       return
