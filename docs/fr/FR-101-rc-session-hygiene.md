@@ -112,9 +112,9 @@ still reports. Detail, with the diagram: [`remote-control.md`](../remote-control
 | P1a | The transport: CBC out, the SRTP/SRTCP replay windows pinned (`agents/roomlerd/src/rc_transport.rs`, the vendored `set_dtls_cipher_suites`) | `ROOMLERD_DTLS_LEGACY_SUITES=1`; `ROOMLERD_SRTP_REPLAY_WINDOW` sizes the window, and no value turns it off | **shipped in 0.4.133.** FR-16 L0's `replay` / `legacy` / `unguarded` cells read both halves off the link in CI: DTLS red/green on the agent's real ClientHello, and replays refused on a live session. The window change is behaviour-neutral (§2). The field pcap is owed |
 | P1b | `https` at every entry point, and the IPv6 TURN check | an escape for plaintext labs | — **split from P1a** (see the note below) |
 | P2 | Policy switches and agent-side masking; viewer reasons | each setting defaults to today's behaviour (`on`) | — |
-| P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **built**, PR #2138: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). The field check needs an agent ≥ 0.4.134 and a promote |
+| P3 | The audit producers: clipboard and file traffic as the device's claim, in `transfer_activity` (§3b as built), read at `GET …/transfer-activity/{agent_id}` | none: an older agent sends nothing, and an older server ignores the field | **merged** #2138 `919b44d3f`: wire tests, agent unit tests, and `transfer_activity_tests` (kept for the granted session, dropped without `CLIPBOARD` / `FILES`, for another device or without a valid name hash; a repeated tally adds nothing). The field check needs an agent ≥ 0.4.134 and a promote |
 | P4 | Idle timeout, max duration, the request rate limit | each off by default | P4a below; the timeouts remain |
-| P4a | The request ceiling: 60 `rc:session.request` a minute per (caller, device), after the authz gate (`crates/modules/remote/src/controller.rs`, `SESSION_REQUESTS_PER_MINUTE`); refusals answer `rc:error` `rate_limited` | none. **On, not off as first written:** the ceiling sits where no legitimate client reaches it (the reconnect ladder asks about a dozen times in its first minute), and a ceiling that ships off protects nothing. Changing it is a reviewed change to the constant | **built**, PR #2142: `rc_request_ceiling_tests` (the owner passes 60 and is refused on the 61st; another device is untouched; a member without the right gets `permission_denied` all 61 times). Negative controls: with the ceiling at 0 it fails on request 61; moved ahead of the authz gate it fails on the identity-first assertion |
+| P4a | The request ceiling: 60 `rc:session.request` a minute per (caller, device), after the authz gate (`crates/modules/remote/src/controller.rs`, `SESSION_REQUESTS_PER_MINUTE`); refusals answer `rc:error` `rate_limited` | none. **On, not off as first written:** the ceiling sits where no legitimate client reaches it (the reconnect ladder asks about a dozen times in its first minute), and a ceiling that ships off protects nothing. Changing it is a reviewed change to the constant | **merged** #2142 `216813e7a`: `rc_request_ceiling_tests` (the owner passes 60 and is refused on the 61st; another device is untouched; a member without the right gets `permission_denied` all 61 times). Negative controls: with the ceiling at 0 it fails on request 61; moved ahead of the authz gate it fails on the identity-first assertion |
 | P5 | Docs and the field table | — | — |
 
 ⚠️ **Why P1b was split from P1a (2026-10-13).** Replay windows and GCM-only DTLS
@@ -145,8 +145,12 @@ and gives labs an explicit escape before the default flips.
   bytes, and **no content**. A test asserts no payload bytes reach the row.
 - [ ] **AC6:** an idle session ends after the configured time with `EndReason::IdleTimeout` and an audit
   row. A session past its maximum duration ends the same way.
-- [ ] **AC7:** a caller hammering session requests at one device is refused after the limit with a
-  rate-limit reason, and an unauthenticated caller is refused by identity first.
+- [x] **AC7:** a caller hammering session requests at one device is refused after the limit with a
+  rate-limit reason, and an unauthenticated caller is refused by identity first. **Verified** (#2142
+  `216813e7a`): `rc_request_ceiling_tests` in CI's integration lane
+  ([job 115569893051](https://github.com/gjovanov/roomler-ai/actions/runs/38476959531/job/115569893051),
+  569 passed). The owner is refused `rate_limited` on request 61 of 60, another device is untouched,
+  and a member without the right gets `permission_denied` all 61 times, never `rate_limited`.
 - [ ] **AC8:** TURN over IPv6 is answered, or `listening-ip` is fixed and then answered.
 - [ ] **AC9:** **Docs:** `docs/security-baseline.md` and `docs/remote-control.md` describe the policy switches,
   the audit rows (with a mermaid diagram of where they are written), the timeouts and the transport
