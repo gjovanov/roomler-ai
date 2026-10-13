@@ -499,7 +499,9 @@ the scanout plane below the compositor, FR-36) → **the desktop portal** (Linux
 opt-in `ROOMLERD_PORTAL_CAPTURE=1` — a privilege-dropped `portal-helper` in the
 user's session feeding PipeWire frames over a pipe, FR-45; with
 `ROOMLERD_MUTTER_CAPTURE=1` the same helper takes them from
-`org.gnome.Mutter.ScreenCast` instead, unattended) → **scrap** (DXGI duplication
+`org.gnome.Mutter.ScreenCast` instead, unattended; a per-user install in its own
+Wayland session with no key set switches mutter, else the portal, on by itself,
+FR-93 P2) → **scrap** (DXGI duplication
 / X11 XShm + XDamage / CoreGraphics) → noop carrying the reason (FR-80). The
 Linux arms, their selection order and the **attended-only** rule of the portal
 are [`linux-capture.md`](linux-capture.md). A `DownscalePolicy` box-filters very
