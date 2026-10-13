@@ -351,6 +351,49 @@ describe('useAgentStore', () => {
     const s = useAgentStore()
     await s.fetchOrgExecEnabled(TENANT_ID)
     expect(s.orgExecEnabled).toBe(true)
+    // A server from before FR-94 never names it: unknown, never "off".
+    expect(s.orgExecRequireSystem).toBeNull()
+  })
+
+  it('FR-94: require-SYSTEM carries the kill-switch it holds, and only then', async () => {
+    // The server reads `remote_exec_enabled` as required on every PUT, so this
+    // must send the value it already holds — and refuse to guess one.
+    const s = useAgentStore()
+    await expect(s.setOrgExecRequireSystem(TENANT_ID, true)).rejects.toThrow()
+    expect(mockApi.put).not.toHaveBeenCalled()
+
+    mockApi.get.mockResolvedValueOnce({ remote_exec_enabled: true, exec_require_system: false })
+    asOwner()
+    await s.fetchOrgExecEnabled(TENANT_ID)
+    expect(s.orgExecRequireSystem).toBe(false)
+    mockApi.put.mockResolvedValueOnce({ remote_exec_enabled: true, exec_require_system: true })
+    await s.setOrgExecRequireSystem(TENANT_ID, true)
+    expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/exec-settings`, {
+      remote_exec_enabled: true,
+      exec_require_system: true,
+    })
+    expect(s.orgExecRequireSystem).toBe(true)
+  })
+
+  it('FR-94: flipping the kill-switch never names require-SYSTEM', async () => {
+    // Absent means "leave it alone" server-side; sending a value here would
+    // reset an org's choice every time someone toggled exec.
+    mockApi.put.mockResolvedValueOnce({ remote_exec_enabled: false, exec_require_system: true })
+    const s = useAgentStore()
+    await s.setOrgExecEnabled(TENANT_ID, false)
+    expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/exec-settings`, {
+      remote_exec_enabled: false,
+    })
+    expect(s.orgExecRequireSystem).toBe(true)
+  })
+
+  it('FR-94: unanchorDevice deletes the anchor and clears it on the row', async () => {
+    mockApi.delete.mockResolvedValueOnce({ ok: true, was_anchored: true })
+    const s = useAgentStore()
+    s.agents = [mkAgent({ id: 'a1', exec_anchor: { anchored_at: 'x', anchored_by: 'u' } })]
+    await s.unanchorDevice(TENANT_ID, 'a1')
+    expect(mockApi.delete).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/exec-anchor`)
+    expect(s.agents[0]!.exec_anchor).toBeNull()
   })
 
   it('fetchExecAudit passes the narrowing filters through', async () => {

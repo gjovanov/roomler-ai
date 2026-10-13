@@ -56,6 +56,15 @@
               <v-chip size="x-small" :color="resultColor(e)" variant="flat">
                 {{ resultLabel(e) }}
               </v-chip>
+              <v-chip
+                v-if="ranAsLabel(e)"
+                size="x-small"
+                variant="outlined"
+                class="ml-1"
+                :title="ranAsTitle(e)"
+              >
+                {{ ranAsLabel(e) }}
+              </v-chip>
             </td>
           </tr>
         </tbody>
@@ -93,6 +102,25 @@ const DENY_LABEL: Record<string, string> = {
   consent_denied: 'consent denied',
   rate_limited: 'rate limited',
   agent_disabled: 'disabled on device',
+  system_required: 'SYSTEM required',
+  claim_refused: 'claim refused',
+}
+
+/** FR-94 — the identity the server sent the command to. `worker` stays
+ *  unlabelled on purpose: it is every device before FR-94 (root on Linux). */
+const RAN_AS_LABEL: Record<string, string> = {
+  system: 'SYSTEM',
+  console_user: 'as user',
+}
+
+function ranAsLabel(e: ExecAuditEntry): string | null {
+  return e.ran_as ? (RAN_AS_LABEL[e.ran_as] ?? null) : null
+}
+
+function ranAsTitle(e: ExecAuditEntry): string {
+  return e.ran_as === 'system'
+    ? "Ran as SYSTEM through the device's service"
+    : "Ran through the device's service as the signed-in user"
 }
 
 const deviceNames = computed(() => {
@@ -112,6 +140,8 @@ function deviceName(id: string): string {
 }
 
 function userName(id: string): string {
+  // FR-94 — a refused claim names no user: the device's service asked.
+  if (/^0{24}$/.test(id)) return "device's service"
   return userNames.value[id] ?? id.slice(0, 8)
 }
 

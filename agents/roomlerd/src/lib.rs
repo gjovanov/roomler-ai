@@ -42,6 +42,10 @@ pub mod displays;
 pub mod dpi;
 pub mod encode;
 pub mod exec;
+/// FR-94 — Fleet RPC as SYSTEM on Windows: the anchor, the doorbell between
+/// the worker and the SYSTEM service, and the service's runner. Compiled
+/// everywhere; off Windows it advertises nothing and refuses every ring.
+pub mod exec_service;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;

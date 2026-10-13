@@ -36,10 +36,12 @@
         >
           When enabled, users holding the <strong>EXEC_DEVICE</strong>
           permission can run commands on devices that individually opt in.
-          Commands run as <strong>root</strong> (Linux) or, on Windows, as the
-          <strong>signed-in user</strong> on an attended install and as
-          <strong>SYSTEM</strong> in SystemContext mode. They are all recorded
-          in the audit log below.
+          Commands run as <strong>root</strong> (Linux) or, on Windows, as
+          <strong>SYSTEM</strong> through the device's service once an
+          administrator has anchored it. A Windows device that is not anchored
+          runs them as the <strong>signed-in user</strong> on an attended
+          install, and as SYSTEM in SystemContext mode. They are all recorded in
+          the audit log.
         </v-alert>
 
         <v-switch
@@ -61,6 +63,38 @@
         <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mt-3">
           {{ error }}
         </v-alert>
+
+        <!-- FR-94 — absent on a server from before it (`null`), so hidden
+             rather than shown as a switch that cannot be read. -->
+        <template v-if="agentStore.orgExecRequireSystem !== null">
+          <v-switch
+            :model-value="agentStore.orgExecRequireSystem === true"
+            :loading="savingRequire"
+            :disabled="savingRequire || agentStore.orgExecEnabled === null"
+            color="primary"
+            density="compact"
+            hide-details
+            class="mt-4"
+            label="Windows: require SYSTEM"
+            data-testid="exec-require-system"
+            @update:model-value="onToggleRequireSystem"
+          />
+          <div class="text-caption text-medium-emphasis mt-1">
+            A Windows device runs commands as SYSTEM once an administrator has
+            anchored it (<code>roomlerd anchor create</code>, elevated). With
+            this on, a device that is not anchored refuses commands instead of
+            running them as whoever is signed in.
+          </div>
+          <v-alert
+            v-if="requireError"
+            type="error"
+            variant="tonal"
+            density="compact"
+            class="mt-3"
+          >
+            {{ requireError }}
+          </v-alert>
+        </template>
       </v-card-text>
     </v-card>
 
@@ -252,6 +286,22 @@ async function onToggle(v: boolean | null) {
     error.value = (e as Error).message
   } finally {
     saving.value = false
+  }
+}
+
+// FR-94 — its own pair, so a failure here never renders under the switch above.
+const savingRequire = ref(false)
+const requireError = ref<string | null>(null)
+
+async function onToggleRequireSystem(v: boolean | null) {
+  savingRequire.value = true
+  requireError.value = null
+  try {
+    await agentStore.setOrgExecRequireSystem(props.tenantId, v === true)
+  } catch (e) {
+    requireError.value = (e as Error).message
+  } finally {
+    savingRequire.value = false
   }
 }
 
