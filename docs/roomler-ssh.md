@@ -304,14 +304,19 @@ Three things cost real debugging time and are commented where they live:
   (`STATUS_DLL_INIT_FAILED`) because its console never initialised — visible
   only as an empty session, so check the child's exit code before the pipes.
 
-**`console_user` works here too**, which is the point on a corp-managed
-laptop: the same attribute list goes onto `CreateProcessAsUserW` with the
-`WTSQueryUserToken` token and the user's own environment block, so the shell is
-the signed-in user's, not SYSTEM's. That needs the daemon to be SYSTEM (a
-perMachine service install); a perUser task gets `ERROR_PRIVILEGE_NOT_HELD` and
-is told so rather than quietly handed a SYSTEM shell. `named:<account>` stays
-refused on Windows for the same reason `exec` refuses it — becoming an
-arbitrary local user needs that user's credentials.
+**`console_user` works here too** where the process serving SSH is SYSTEM, which
+is the point on a corp-managed laptop: the same attribute list goes onto
+`CreateProcessAsUserW` with the `WTSQueryUserToken` token and the user's own
+environment block, so the shell is the signed-in user's, not SYSTEM's.
+`WTSQueryUserToken` needs SYSTEM, and the process serving SSH is the
+console-session **worker** (FR-94 §2). That is SYSTEM in SystemContext mode. On
+an **attended** install, perMachine or not, the worker runs as the signed-in user,
+so `console_user` is refused there with that reason rather than quietly handed a
+different shell. The worker's `daemon` mode already opens shells as that user.
+FR-105 moves SYSTEM sessions into the device's SYSTEM service, where
+`console_user` works on attended installs too. `named:<account>` stays refused
+on Windows for the same reason `exec` refuses it — becoming an arbitrary local
+user needs that user's credentials.
 
 ### Which account a session runs as (P5a)
 
@@ -320,9 +325,13 @@ The device's `SshPolicy.account_mode` decides, and the agent maps it through
 
 | Mode | Unix | Windows |
 |---|---|---|
-| `daemon` (default) | root | SYSTEM |
+| `daemon` (default) | root | **the console-session worker's identity**: SYSTEM in SystemContext mode, the **signed-in user** on an attended install (FR-94 §2) |
 | `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials |
-| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`); refused if nobody is signed in, or if the daemon is not SYSTEM |
+| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`) where the worker is SYSTEM (SystemContext mode); refused on an attended install, where the worker cannot ask for that token, and refused if nobody is signed in |
+
+FR-105 (in progress) routes an anchored Windows device's sessions through its
+SYSTEM service instead, so `daemon` is SYSTEM in session 0 and `console_user`
+works on every install type, as Fleet RPC's identity did with FR-94.
 
 **Both paths obey this, and it took a fix to make that true.** A grant carries
 the policy's `account_mode`. A key-list session has no policy behind it, so it
@@ -356,9 +365,11 @@ the policy's explicit choice rather than a side effect of naming an account
 that happens to be uid 0.
 
 ⚠️ `daemon` is still the default, so a device whose policy has not been set
-runs sessions as **SYSTEM / root**, exactly like Fleet RPC and for the same
-reason. Listing a key in `ssh_authorized_keys` grants root to its holder unless
-the policy says otherwise.
+runs sessions as the **daemon's own identity**: root under systemd, and on
+Windows the console-session worker's (SYSTEM in SystemContext mode, the
+signed-in user on an attended install). That is the same identity Fleet RPC had
+before FR-94. Listing a key in `ssh_authorized_keys` grants that identity to its
+holder unless the policy says otherwise.
 
 ### The device's own ceiling — `ssh_max_privilege` (M5)
 
@@ -658,8 +669,9 @@ one path serves both.
 
 ⚠️ **This is a privilege decision, not convenience.** Serving SFTP in-process
 (e.g. with `russh-sftp`, which resolves cleanly and adds no crypto) would run
-every read and write as the DAEMON — SYSTEM on Windows, root under systemd. A
-session resolved to `console_user` would silently touch files as root, and
+every read and write as the DAEMON — root under systemd, and on Windows the
+console-session worker (SYSTEM in SystemContext mode). A session resolved to
+`console_user` would silently touch files as the daemon's identity, and
 file transfer is the worst subsystem to get that wrong in. `exec` and the pty
 both drop privilege by handing work to a child; anything else here would be a
 second, weaker privilege story for the one subsystem that exists to touch
@@ -908,7 +920,8 @@ never "a session happened" — the design that keeps the server out of the data
 path is the same design that stops it from auditing the data path. What
 happened *on* the device is the device's own log. `account_mode` is the field
 worth reading: it is the difference between a shell as the console user and a
-shell as SYSTEM/root.
+shell as the daemon's own identity (root; on Windows SYSTEM where the worker is
+SYSTEM, the signed-in user on an attended install).
 
 ⚠️ `VIEW_SSH_AUDIT` is a new bit, so **existing** admin roles do not carry it
 until their mask is rewritten — the same friction `SSH_DEVICE` has. Owner is

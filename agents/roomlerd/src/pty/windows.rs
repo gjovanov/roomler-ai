@@ -843,28 +843,15 @@ mod tests {
         }
     }
 
-    /// ⚠️ **P4b IS NOT FINISHED — this is the test that says so.**
+    /// P4b (shipped in rc.429): a ConPTY session streams the application's
+    /// output through the pipes and reports its exit status (`exit 3` → 3).
     ///
-    /// What already works, verified on Windows 11:
-    ///
-    /// * the pseudoconsole is created and attached (the child's window title
-    ///   shows the shell, so it really is on a console),
-    /// * the shell runs and its **exit status is correct** (`exit 3` → 3),
-    /// * teardown is clean: the job kills descendants, the console closes, the
-    ///   reader EOFs, no hang,
-    /// * an earlier revision DID stream `conpty-marker-4417` through the pipes,
-    ///   so the crossed ends and the attribute list are right.
-    ///
-    /// What does not: the session now comes back holding only the console
-    /// host's own init/teardown VT (`ESC[?9001h … ESC[2J … title`) and none of
-    /// the application's output — on BOTH cmd.exe and PowerShell, and whether
-    /// the child exits immediately or sleeps 400 ms first. So it is not the
-    /// shell, and not the post-exit drain window (extending it changes
-    /// nothing).
-    ///
-    /// Ignored rather than deleted: it is the precise statement of the
-    /// remaining defect, and un-ignoring it is the definition of done. Windows
-    /// PTY requests are still REFUSED by the SSH server, so nothing ships a
+    /// The defect this test was written to catch, and now guards against: a
+    /// session that came back holding only the console host's own
+    /// init/teardown VT (`ESC[?9001h … ESC[2J … title`) and none of the
+    /// application's output, on cmd.exe and PowerShell alike, however long the
+    /// post-exit drain waited. Until that was fixed the test was ignored and
+    /// the SSH server refused Windows PTY requests, so nothing shipped a
     /// session that would come back empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_streams_output_and_reports_its_exit_status() {
