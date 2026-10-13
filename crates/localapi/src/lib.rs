@@ -721,6 +721,13 @@ pub struct TierWhy {
     /// contradict `eligible`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
+    /// #2089 — did this tier have a dialable candidate at the last decision?
+    /// The selector only considers a tier that is available AND eligible,
+    /// and an untried tier carries no penalty, so `eligible` alone reads
+    /// "yes" for a tier with nothing to dial. `None` before the first
+    /// decision, and from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
     /// The tier's fixed prior.
     pub base: f64,
     /// Measured-quality term (ranking only — never eligibility).
@@ -4936,6 +4943,29 @@ mod tests {
         );
     }
 
+    /// #2089 — `available` is additive in both directions: an old daemon's
+    /// row decodes to `None` (unknown, never "unavailable"), `None` is not
+    /// sent, and `Some(false)` survives the trip.
+    #[test]
+    fn tier_why_available_wire_compat() {
+        let old =
+            r#"{"tier":"public","eligible":true,"base":330.0,"q":0.0,"penalty":0.0,"score":330.0}"#;
+        let t: TierWhy = serde_json::from_str(old).unwrap();
+        assert_eq!(t.available, None, "absent must read as unknown");
+        assert!(
+            !serde_json::to_string(&t).unwrap().contains("available"),
+            "None is not sent"
+        );
+        let unavailable = TierWhy {
+            available: Some(false),
+            ..t
+        };
+        let wire = serde_json::to_string(&unavailable).unwrap();
+        assert!(wire.contains(r#""available":false"#), "{wire}");
+        let round: TierWhy = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round, unavailable);
+    }
+
     /// F/A — `why` and `probes` are wire-compatible in BOTH directions, which
     /// is the property a mixed fleet actually depends on: an old daemon sends
     /// neither field (a current CLI must read that as "unknown", not as "no
@@ -4958,6 +4988,7 @@ mod tests {
                 tier: "lan".into(),
                 eligible: false,
                 blocked_by: Some("peer-relays-instead".into()),
+                available: Some(true),
                 base: 400.0,
                 q: 0.0,
                 penalty: 0.0,

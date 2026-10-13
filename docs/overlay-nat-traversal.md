@@ -268,6 +268,14 @@ cascade's guarantees while replacing its reactive counters:
   packet itself is proof of reachability). `Q` may reorder probing among
   eligible tiers but can never delay or advance eligibility itself — locked
   by the `no_q_state_can_delay_or_advance_eligibility` test family.
+- **Availability: a gate outside both planes.** A tier is considered only if
+  the peer has a dialable candidate for it (`TierAvailability`, built from the
+  netmap candidates in `runtime/establish.rs`): a NATed peer has no public
+  tier at all. An untried tier carries no penalty, so it always reads
+  *eligible*. `roomler why` therefore shows availability as well: an
+  unavailable tier reads `—` in ELIGIBLE and `no candidate` in WHY NOT
+  (#2089). Before that, a NATed peer's `public yes 330` out-scored the relay
+  the pair was actually on, which read as the selector ignoring its best tier.
 - **Hysteresis.** Upgrades require a latched shadow-handshake probe
   (promote-on-latch); demotion happens only on a typed `DeathReason` from the
   lifecycle module; voluntary switches are ≥30 s apart per peer. The
