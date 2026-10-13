@@ -453,6 +453,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/manage",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/hive/session/{session_id}/participant",
       "methods": "GET,HEAD"
     },

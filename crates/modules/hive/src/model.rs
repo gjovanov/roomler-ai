@@ -199,6 +199,40 @@ pub struct AgentSession {
     /// P2f-3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ParentLink>,
+    /// FR-90 P2f-4b — a terminal session made a managed one (decision 11's
+    /// other half, [`crate::manage`]): who asked and when, and the adopted
+    /// record's own end and folder, which a refusal restores. Kept once it is
+    /// managed, as where the session began. Absent for every other session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_terminal: Option<FromTerminal>,
+}
+
+/// FR-90 P2f-4b — the asking to make an adopted session a managed one, as
+/// its record keeps it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FromTerminal {
+    /// The device that adopted it, where it is made managed.
+    pub device_id: ObjectId,
+    pub by: ObjectId,
+    /// When it was asked: what this asking's start and its restore key on.
+    pub at: DateTime,
+    /// The adopted record's own end, put back should the device refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The folder it ran in as an adopted session, put back too: the asking
+    /// may name another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// The word its start was refused with, by the device or for never
+    /// reaching it: the record is the adopted session it was again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_detail: Option<String>,
 }
 
 /// FR-90 P2e-6b — where a moved start came from, by whom, and when.
@@ -495,6 +529,19 @@ impl AgentSession {
             })
     }
 
+    /// FR-90 P2f-4b — a terminal session being made a managed one, whose
+    /// start its device has not answered: every start of it says so
+    /// (`rc:hive.start`'s `from_terminal`), and goes only to a connection
+    /// that makes one (`hive-manage`).
+    pub fn managing(&self) -> bool {
+        self.status == SessionStatus::Starting
+            && self.accepted_at.is_none()
+            && self
+                .from_terminal
+                .as_ref()
+                .is_some_and(|f| f.refused.is_none())
+    }
+
     /// Whether `user` drives this session: its owner, or one the owner named.
     /// ⚠️ Not enough to prompt it: the session must be live and the driver
     /// still able to read it ([`crate::access`]).
@@ -576,6 +623,19 @@ pub struct SessionView {
     /// FR-90 P2f-3 — the session this one was forked from, hex. Absent: none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// FR-90 P2f-4b — the session began in a terminal, and was made, or asked
+    /// to be made, a managed one. Absent: neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_terminal: Option<FromTerminalView>,
+}
+
+/// [`FromTerminal`] as the API answers it: when it was asked, and the word a
+/// refused asking left (the session is the adopted one it was).
+#[derive(Serialize, Debug, Clone)]
+pub struct FromTerminalView {
+    pub at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// [`Promotion`] as the API answers it.
@@ -724,6 +784,10 @@ impl From<&AgentSession> for SessionView {
             replicaset: s.replicaset.as_ref().map(ReplicasetView::from),
             promotion: s.promotion.as_ref().map(PromotionView::from),
             parent_session_id: s.parent.as_ref().map(|p| p.session_id.to_hex()),
+            from_terminal: s.from_terminal.as_ref().map(|f| FromTerminalView {
+                at: rfc3339(f.at),
+                refused: f.refused.clone(),
+            }),
         }
     }
 }
@@ -865,6 +929,112 @@ mod tests {
         assert!(!SessionStatus::LAUNCHED.contains(&SessionStatus::Stopping));
     }
 
+    /// A started session with nothing else set.
+    fn bare_session() -> AgentSession {
+        let now = DateTime::now();
+        AgentSession {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            owner_id: ObjectId::new(),
+            drivers: Vec::new(),
+            title: "t".into(),
+            room_id: None,
+            last_turn: None,
+            harness: HarnessRef {
+                id: "claude-code".into(),
+                session: "u".into(),
+            },
+            location: SessionLocation {
+                device_id: ObjectId::new(),
+                device_name: "mars".into(),
+                folder: "/src".into(),
+                account: None,
+            },
+            status: SessionStatus::Starting,
+            fence: 1,
+            accepted_at: None,
+            refusal: None,
+            end_reason: None,
+            detail: None,
+            created_at: now,
+            updated_at: now,
+            ended_at: None,
+            brain_rev: None,
+            origin: SessionOrigin::Started,
+            replicaset: None,
+            promotion: None,
+            fences: Vec::new(),
+            moved: None,
+            parent: None,
+            from_terminal: None,
+        }
+    }
+
+    /// FR-90 P2f-4b — a terminal session is being made a managed one only
+    /// while its start is unanswered: not another session's start, not once
+    /// the device answered or it runs, not an asking that was refused. The
+    /// record holds no `from_terminal` before one; the view says when it was
+    /// asked, and the word a refused asking left.
+    #[test]
+    fn a_terminal_session_is_being_made_managed_only_until_its_device_answers() {
+        let now = DateTime::now();
+        let base = bare_session();
+        assert!(!base.managing(), "a start of no terminal's");
+        let from = FromTerminal {
+            device_id: base.location.device_id,
+            by: base.owner_id,
+            at: now,
+            ended_at: Some(now),
+            end_reason: Some("exited".into()),
+            detail: None,
+            folder: Some(base.location.folder.clone()),
+            refused: None,
+            refused_detail: None,
+        };
+        let asked = AgentSession {
+            from_terminal: Some(from.clone()),
+            ..base.clone()
+        };
+        assert!(asked.managing());
+        assert!(
+            !AgentSession {
+                accepted_at: Some(now),
+                ..asked.clone()
+            }
+            .managing(),
+            "answered"
+        );
+        assert!(
+            !AgentSession {
+                status: SessionStatus::Idle,
+                ..asked.clone()
+            }
+            .managing(),
+            "it runs"
+        );
+        let refused = AgentSession {
+            status: SessionStatus::Ended,
+            origin: SessionOrigin::Adopted,
+            from_terminal: Some(FromTerminal {
+                refused: Some("launch_failed".into()),
+                ..from
+            }),
+            ..base.clone()
+        };
+        assert!(!refused.managing(), "refused: the adopted session it was");
+        let stored = bson::to_document(&base).unwrap();
+        assert!(stored.get("from_terminal").is_none(), "{stored}");
+        let v = serde_json::to_value(SessionView::from(&refused)).unwrap();
+        assert_eq!(v["from_terminal"]["refused"], "launch_failed", "{v}");
+        assert!(v["from_terminal"]["at"].is_string(), "{v}");
+        assert!(
+            serde_json::to_value(SessionView::from(&base))
+                .unwrap()
+                .get("from_terminal")
+                .is_none()
+        );
+    }
+
     #[test]
     fn the_view_renders_times_as_strings_and_ids_as_hex() {
         let now = DateTime::now();
@@ -902,6 +1072,7 @@ mod tests {
             fences: Vec::new(),
             moved: None,
             parent: None,
+            from_terminal: None,
         };
         let v = serde_json::to_value(SessionView::from(&s)).unwrap();
         assert!(v["created_at"].is_string(), "{v}");

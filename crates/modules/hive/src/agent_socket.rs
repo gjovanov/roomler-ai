@@ -54,6 +54,7 @@ use async_trait::async_trait;
 use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
 use roomler_ai_remote_control::{
+    error::Error as HubError,
     hive::{
         HiveCopyTip, HiveDrainRefusal, HiveJoinRefusal, HiveManifestEntry, HiveRefusal,
         HiveReplicaManifestEntry, HiveRunState, HiveTurnStatus, hive_limits,
@@ -440,6 +441,22 @@ async fn apply_reports(
                 {
                     continue;
                 }
+                // P2f-4b — a terminal session's start as a managed one,
+                // refused: the adopted session it was again, never a refused
+                // managed session. It costs a read only for a refusal.
+                if let Some(word) = refused
+                    && crate::manage::on_start_refused(
+                        state,
+                        session_id,
+                        device_id,
+                        fence,
+                        word,
+                        detail.clone(),
+                    )
+                    .await
+                {
+                    continue;
+                }
                 let applied = match refused {
                     None => {
                         let account = clamp_words(account, MAX_ACCOUNT_LEN);
@@ -478,6 +495,8 @@ async fn apply_reports(
                             && (refused.is_some() || s.fence <= 1)
                         {
                             let text = match refused {
+                                // P2f-4b — a terminal session made a managed one.
+                                None if s.from_terminal.is_some() => room::made_managed_note(&s),
                                 None => room::started_note(&s),
                                 Some(_) => room::refused_note(&s),
                             };
@@ -991,6 +1010,20 @@ pub(crate) async fn reconcile_on_connect(
                     Err(e) => debug!(session = %sid, %e, "hive: stop not re-sent"),
                 }
             }
+            // P2f-4b — a terminal session being made a managed one is never
+            // lost: it is the adopted session it was again.
+            SessionStatus::Starting if !runs_hive && s.managing() => {
+                crate::manage::restore(
+                    state,
+                    &s,
+                    "device_unsupported",
+                    Some(
+                        "the device reconnected with an agent that does not run agent sessions"
+                            .into(),
+                    ),
+                )
+                .await;
+            }
             SessionStatus::Starting if !runs_hive => {
                 if let Ok(true) = state
                     .sessions
@@ -1010,9 +1043,22 @@ pub(crate) async fn reconcile_on_connect(
                 // start, whose caller has gone. A moved session's conversation
                 // lives on, and its record was made long before the move.
                 let moved = s.fence > 1;
-                let age_ms = now_ms.saturating_sub(s.created_at.timestamp_millis());
+                // P2f-4b — a terminal session being made a managed one counts
+                // from its asking: its record is the adoption's, made long
+                // before. Past the window it is the adopted session it was.
+                let managing = s.from_terminal.as_ref().filter(|_| s.managing());
+                let since = managing.map_or(s.created_at, |f| f.at);
+                let age_ms = now_ms.saturating_sub(since.timestamp_millis());
                 if !moved && age_ms > hive_limits::START_REDELIVERY_WINDOW_SECS * 1000 {
-                    if let Ok(true) = state
+                    if managing.is_some() {
+                        crate::manage::restore(
+                            state,
+                            &s,
+                            "never_answered",
+                            Some("the device came back after the start's redelivery window".into()),
+                        )
+                        .await;
+                    } else if let Ok(true) = state
                         .sessions
                         .mark_lost(
                             sid,
@@ -1083,7 +1129,9 @@ pub(crate) async fn reconcile_on_connect(
                     lease,
                     // P2f-3 — a fork's every start says what it was made from.
                     fork_of: s.fork_of(),
-                    from_terminal: false,
+                    // P2f-4b — and a terminal session's, being made a managed
+                    // one, says so again.
+                    from_terminal: managing.is_some(),
                 };
                 match crate::routes::push_start(state, &s, device_id, msg) {
                     Ok(()) => {
@@ -1094,6 +1142,21 @@ pub(crate) async fn reconcile_on_connect(
                     // empty), so it waits for the next one that does.
                     Err(e) if s.parent.is_some() => {
                         warn!(session = %sid, %e, "hive: a fork's start not re-sent — it goes again on a connection that starts forks")
+                    }
+                    // P2f-4b — the device came back as a build that does not
+                    // make one: the adopted session it was again.
+                    Err(HubError::ExecUnsupported(_)) if managing.is_some() => {
+                        crate::manage::restore(
+                            state,
+                            &s,
+                            "device_unsupported",
+                            Some(
+                                "the device reconnected with an agent that does not make \
+                                 terminal sessions managed"
+                                    .into(),
+                            ),
+                        )
+                        .await;
                     }
                     Err(e) => debug!(session = %sid, %e, "hive: start not re-sent"),
                 }

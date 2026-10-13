@@ -419,6 +419,7 @@ mod tests {
             fences: Vec::new(),
             moved: None,
             parent: None,
+            from_terminal: None,
         }
     }
 

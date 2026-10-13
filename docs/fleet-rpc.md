@@ -329,7 +329,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1014` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1021` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it
