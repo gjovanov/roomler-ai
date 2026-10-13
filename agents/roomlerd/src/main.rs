@@ -249,6 +249,20 @@ enum Command {
     /// ⚠️ Blocks while a person answers the consent dialog.
     #[command(hide = true, name = "portal-session")]
     PortalSession,
+    /// FR-16 L4 — open the bench probe target: a small topmost window in the
+    /// primary monitor's bottom-right corner whose marker changes when a
+    /// real pointer move reaches one of its 16 cells. A viewer with
+    /// `roomler-rc-bench=target` moves the remote pointer onto the cells and
+    /// times each move to the first painted frame showing it: input to
+    /// photon on a release build, injection and the host's compositor
+    /// included. Run it in the signed-in desktop session. Windows only.
+    #[command(name = "probe-target")]
+    ProbeTarget {
+        /// Close after this many seconds (it also closes on a right-click),
+        /// so a bench window is never left on a host by accident.
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+    },
     /// (internal, macOS and Linux) The body of the `com.roomler.update`
     /// LaunchDaemon and of the Linux `roomler-update.service` (FR-96): consume
     /// the wake file, then check → download → verify → install as root,
@@ -1547,6 +1561,7 @@ async fn daemon_main() -> Result<()> {
                 )
             }
         }
+        Command::ProbeTarget { seconds } => roomlerd::probe_target::run(seconds),
         Command::EncoderSmoke {
             encoder,
             codec,
