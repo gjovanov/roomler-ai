@@ -18,20 +18,28 @@
 //! 5. a session that can be forked: no adopted terminal session —
 //!    `not_forkable`; one with copies — `not_replicated`; a checkpoint of a
 //!    turn kept — `no_conversation`;
-//! 6. no move of it in flight — `in_progress`;
-//! 7. the device holds a copy: the session's primary, or a member that took
-//!    its copy — `no_copy` (a device with none is P2f-3c's);
-//! 8. not the session's own folder on its own device — `same_folder`;
-//! 9. the device carries every restricted tag the session carries —
+//! 6. no move of it in flight — `in_progress` (another fork's taking of a
+//!    copy is no move: the session stays where it is);
+//! 7. not the session's own folder on its own device — `same_folder`;
+//! 8. the device carries every restricted tag the session carries —
 //!    `restricted`: a fork of a restricted session is restricted;
-//! 10. the device is connected here and starts forks (`hive-fork`) —
-//!     `device_offline` / `device_unsupported`;
+//! 9. the device is connected here and starts forks (`hive-fork`) —
+//!    `device_offline` / `device_unsupported`;
+//! 10. P2f-3c — for a device that holds no copy (neither the session's
+//!     primary nor a member that took its copy): the session runs, so a copy
+//!     can be taken (`no_copy` otherwise); the device takes one as a
+//!     teleport's target does (`hive-teleport`, `device_unsupported`
+//!     otherwise); and the session's primary is here and hands copies over
+//!     (`primary_offline` / `primary_unsupported`);
 //! 11. the per-(user, device) ceiling — `rate_limited`, LAST.
 //!
-//! Then a member's copy is waited for, within `hive.fork_copy_secs`, until it
-//! holds the last checkpoint the session's primary reported: a fork is made
-//! at the last checkpoint the device's copy holds — `copy_behind` otherwise.
-//! The primary's own copy is current by definition.
+//! Then, on a member, its copy is waited for, within `hive.fork_copy_secs`,
+//! until it holds the last checkpoint the session's primary reported: a fork
+//! is made at the last checkpoint the device's copy holds — `copy_behind`
+//! otherwise. The primary's own copy is current by definition. P2f-3c — a
+//! device with no copy takes one first, by a teleport's steps up to the copy
+//! ([`crate::promote::begin_fork_join`]): the answer is `joining`, and the
+//! fork is made there once the copy caught up ([`make_joined`]).
 //!
 //! From 4 on, a refusal is a 200 carrying the reason, and is audited
 //! (`fork`, naming the session it forks), as a start's is. The fork itself
@@ -50,11 +58,14 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::hive::hive_limits;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::HiveState;
-use crate::model::{AgentSession, MemberState, ParentLink, SessionOrigin};
+use crate::model::{
+    AgentSession, ForkPlan, MemberState, ParentLink, Promotion, SessionOrigin, SessionStatus,
+};
 use crate::placement::{MemberRole, carries};
+use crate::promote::{MoveTo, PromoteDenyReason, Started};
 use crate::room;
 use crate::routes::{
     Audit, NewSession, StartResponse, clean_folder, clean_title, member_tenant, parse_oid,
@@ -88,6 +99,11 @@ pub enum ForkDenyReason {
     CopyBehind,
     DeviceOffline,
     DeviceUnsupported,
+    /// P2f-3c — the device takes a copy from the session's primary, which is
+    /// not connected here.
+    PrimaryOffline,
+    /// P2f-3c — the session's primary does not hand copies over.
+    PrimaryUnsupported,
     RateLimited,
 }
 
@@ -106,6 +122,8 @@ impl ForkDenyReason {
             Self::CopyBehind => "copy_behind",
             Self::DeviceOffline => "device_offline",
             Self::DeviceUnsupported => "device_unsupported",
+            Self::PrimaryOffline => "primary_offline",
+            Self::PrimaryUnsupported => "primary_unsupported",
             Self::RateLimited => "rate_limited",
         }
     }
@@ -127,8 +145,8 @@ impl ForkDenyReason {
             Self::NoConversation => "the session has kept no turn yet: there is nothing to fork",
             Self::InProgress => "the session is moving; fork it once the move is done",
             Self::NoCopy => {
-                "the device holds no copy of the session: fork it on its device, or on a \
-                 device that holds a copy"
+                "the device holds no copy of the session, and one is taken only while the \
+                 session runs: fork it on a device that holds a copy"
             }
             Self::SameFolder => {
                 "a fork runs in a folder of its own: name another folder than the session's"
@@ -140,8 +158,16 @@ impl ForkDenyReason {
             }
             Self::DeviceOffline => "the device is offline",
             Self::DeviceUnsupported => {
-                "the device's agent does not start forks — update it, or it was built \
-                 without agent sessions"
+                "the device's agent does not start forks, or (for a device that holds no \
+                 copy) does not take one — update it"
+            }
+            Self::PrimaryOffline => {
+                "the device the session runs on is offline, so no copy of it can be taken: \
+                 fork it on a device that holds a copy"
+            }
+            Self::PrimaryUnsupported => {
+                "the device the session runs on does not hand copies over — update it, or \
+                 fork on a device that holds a copy"
             }
             Self::RateLimited => "too many sessions started on this device in the last minute",
         }
@@ -182,6 +208,45 @@ fn restricted_of(s: &AgentSession) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// P2f-3c — whether a copy of `s` can be taken from its primary now: the
+/// session runs there, as a teleport's copy needs (the promotion's own gate).
+fn runs_on_its_primary(s: &AgentSession) -> bool {
+    SessionStatus::REPORTABLE.contains(&s.status)
+        && (s.accepted_at.is_some() || SessionStatus::LAUNCHED.contains(&s.status))
+}
+
+/// Where a fork's copy comes from, its gates passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFrom {
+    /// The device holds one: the session's primary, or a member that took it.
+    Held,
+    /// P2f-3c — none: the device takes one first, as a teleport's target does.
+    Taken,
+}
+
+/// P2f-3c — a fork-joining move refused at its record or its push, in the
+/// fork's words.
+fn refusal_of(r: PromoteDenyReason) -> ForkDenyReason {
+    match r {
+        PromoteDenyReason::OrgArchived => ForkDenyReason::OrgArchived,
+        PromoteDenyReason::NoPermission => ForkDenyReason::NoPermission,
+        PromoteDenyReason::InProgress => ForkDenyReason::InProgress,
+        PromoteDenyReason::DeviceOffline => ForkDenyReason::DeviceOffline,
+        PromoteDenyReason::DeviceUnsupported => ForkDenyReason::DeviceUnsupported,
+        PromoteDenyReason::PrimaryOffline => ForkDenyReason::PrimaryOffline,
+        PromoteDenyReason::PrimaryUnsupported => ForkDenyReason::PrimaryUnsupported,
+        PromoteDenyReason::RateLimited => ForkDenyReason::RateLimited,
+        // The session stopped running meanwhile, or a move's word a fork
+        // cannot have: no copy can be taken now.
+        PromoteDenyReason::NotRunning
+        | PromoteDenyReason::MovedTooOften
+        | PromoteDenyReason::NotAMember
+        | PromoteDenyReason::AlreadyAMember
+        | PromoteDenyReason::NotFreshest
+        | PromoteDenyReason::AlreadyPrimary => ForkDenyReason::NoCopy,
+    }
+}
+
 /// Gates 4 on, past the session and the device lookups. The outer `Result`
 /// is the infrastructure, the inner one the policy — as a start's.
 async fn authorize(
@@ -191,7 +256,7 @@ async fn authorize(
     target_tags: &[String],
     folder: &str,
     user_id: ObjectId,
-) -> Result<Result<(), ForkDenyReason>, ApiError> {
+) -> Result<Result<CopyFrom, ForkDenyReason>, ApiError> {
     let tid = s.tenant_id;
     let tenant = state.tenants.base.find_by_id(tid).await?;
     if tenant.is_archived {
@@ -212,14 +277,13 @@ async fn authorize(
     if s.last_turn.is_none() || checkpoint_on(s, s.location.device_id).is_none() {
         return Ok(Err(ForkDenyReason::NoConversation));
     }
+    // A move of the session. P2f-3c — another fork's taking of a copy moves
+    // nothing: the session stays where it is.
     if s.promotion
         .as_ref()
-        .is_some_and(|p| p.in_flight(bson::DateTime::now()))
+        .is_some_and(|p| p.in_flight(bson::DateTime::now()) && p.fork.is_none())
     {
         return Ok(Err(ForkDenyReason::InProgress));
-    }
-    if !holds_copy(s, target) {
-        return Ok(Err(ForkDenyReason::NoCopy));
     }
     if target == s.location.device_id && folder == s.location.folder {
         return Ok(Err(ForkDenyReason::SameFolder));
@@ -227,10 +291,31 @@ async fn authorize(
     if !restricted_of(s).iter().all(|t| carries(target_tags, t)) {
         return Ok(Err(ForkDenyReason::Restricted));
     }
-    match state.fleet.rc_hub.agent_supports_hive_fork(target, tid) {
+    let hub = &state.fleet.rc_hub;
+    match hub.agent_supports_hive_fork(target, tid) {
         None => return Ok(Err(ForkDenyReason::DeviceOffline)),
         Some(false) => return Ok(Err(ForkDenyReason::DeviceUnsupported)),
         Some(true) => {}
+    }
+    let from = if holds_copy(s, target) {
+        CopyFrom::Held
+    } else {
+        CopyFrom::Taken
+    };
+    // P2f-3c — no copy there: it is taken from the session's primary, as a
+    // teleport's target takes one, while the session runs.
+    if from == CopyFrom::Taken {
+        if !runs_on_its_primary(s) {
+            return Ok(Err(ForkDenyReason::NoCopy));
+        }
+        if hub.agent_supports_hive_teleport(target, tid) != Some(true) {
+            return Ok(Err(ForkDenyReason::DeviceUnsupported));
+        }
+        match hub.agent_supports_hive_teleport(s.location.device_id, tid) {
+            None => return Ok(Err(ForkDenyReason::PrimaryOffline)),
+            Some(false) => return Ok(Err(ForkDenyReason::PrimaryUnsupported)),
+            Some(true) => {}
+        }
     }
     // LAST: only a fork that would reach the device spends a token.
     if !state
@@ -239,7 +324,7 @@ async fn authorize(
     {
         return Ok(Err(ForkDenyReason::RateLimited));
     }
-    Ok(Ok(()))
+    Ok(Ok(from))
 }
 
 /// How often a fork reads the record again while it waits for the device's
@@ -310,30 +395,78 @@ pub async fn fork(
     };
     let decided =
         match authorize(&state, &parent, target, &device.tags, &folder, auth.user_id).await? {
-            Ok(()) => {
+            Ok(CopyFrom::Held) => {
                 // A member's copy must hold the session's last checkpoint first:
                 // the fork is made at the last one it holds.
                 let wanted = checkpoint_on(&parent, parent.location.device_id).unwrap_or(0);
                 if target == parent.location.device_id
                     || copy_current(&state, sid, target, wanted).await?
                 {
-                    Ok(())
+                    Ok(CopyFrom::Held)
                 } else {
                     Err(ForkDenyReason::CopyBehind)
                 }
             }
+            Ok(CopyFrom::Taken) => Ok(CopyFrom::Taken),
             Err(reason) => Err(reason),
         };
-    if let Err(reason) = decided {
-        info!(
-            tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
-            reason = reason.as_str(), "hive: fork refused"
-        );
-        refused(reason).write(&state).await;
-        return Ok(Json(StartResponse::refused_with(
-            reason.as_str(),
-            reason.message(),
-        )));
+    let from = match decided {
+        Ok(from) => from,
+        Err(reason) => {
+            info!(
+                tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
+                reason = reason.as_str(), "hive: fork refused"
+            );
+            refused(reason).write(&state).await;
+            return Ok(Json(StartResponse::refused_with(
+                reason.as_str(),
+                reason.message(),
+            )));
+        }
+    };
+    // P2f-3c — the device takes a copy first, by a teleport's steps up to the
+    // copy; the fork is made there once it has ([`make_joined`]).
+    if from == CopyFrom::Taken {
+        let to = MoveTo {
+            target,
+            device: &device,
+            folder,
+            fork: Some(ForkPlan { title }),
+        };
+        let started = crate::promote::begin_fork_join(&state, &parent, auth.user_id, to).await?;
+        return Ok(Json(match started {
+            Started::Ready => StartResponse {
+                outcome: "joining",
+                reason: None,
+                message: Some(format!(
+                    "{} takes a copy of the session first; the fork starts there once it has",
+                    device.name
+                )),
+                session: None,
+            },
+            Started::PrepareRefused { reason, message } => {
+                StartResponse::refused_with(&reason, &message)
+            }
+            Started::Pending => StartResponse {
+                outcome: "pending",
+                reason: None,
+                message: Some(
+                    "the device has not answered yet; the session's room says how the fork \
+                     goes on"
+                        .into(),
+                ),
+                session: None,
+            },
+            Started::Refused(r) => {
+                let reason = refusal_of(r);
+                info!(
+                    tenant = %tid, session = %sid, device = %target, user = %auth.user_id,
+                    reason = reason.as_str(), "hive: fork refused"
+                );
+                refused(reason).write(&state).await;
+                StartResponse::refused_with(reason.as_str(), reason.message())
+            }
+        }));
     }
 
     let by = state
@@ -375,6 +508,70 @@ pub async fn fork(
         .await;
     }
     Ok(Json(answer))
+}
+
+/// FR-90 P2f-3c — the fork a fork-joining move was for, made on its target
+/// once that target's copy caught up with the session's primary
+/// ([`crate::promote`]), as the route makes one on a device that held a copy
+/// already. Its route's gates passed when the move began; the device's own
+/// are asked at its start. `parent` is the session's record as the move
+/// ended.
+pub(crate) async fn make_joined(state: &HiveState, parent: &AgentSession, p: &Promotion) {
+    let (Some(sid), Some(plan)) = (parent.id, p.fork.as_ref()) else {
+        return;
+    };
+    let tid = parent.tenant_id;
+    let device = match state.fleet.agents.find_live_in_tenant(tid, p.to).await {
+        Ok(device) => device,
+        Err(e) => {
+            warn!(session = %sid, device = %p.to, %e, "hive: a fork's device was not read — the fork is not made");
+            let why = "its device could not be read (the server's log says why)";
+            room::note(state, parent, room::fork_failed_note(p, why)).await;
+            return;
+        }
+    };
+    let by = match state.users.base.find_by_id(p.by).await {
+        Ok(user) => user.display_name,
+        Err(e) => {
+            warn!(session = %sid, user = %p.by, %e, "hive: a fork's maker was not read");
+            String::new()
+        }
+    };
+    let restricted = restricted_of(parent);
+    let new = NewSession {
+        tid,
+        owner: p.by,
+        device_id: p.to,
+        device: &device,
+        folder: p.folder.clone(),
+        title: plan.title.clone(),
+        harness: parent.harness.id.clone(),
+        parent: Some(ParentLink {
+            session_id: sid,
+            harness_session: parent.harness.session.clone(),
+        }),
+        restricted: &restricted,
+        action: "fork",
+        opening: Some(room::forked_from_note(parent, &by)),
+    };
+    match crate::routes::begin(state, new).await {
+        // As the route: a fork its device took, or has yet to answer.
+        Ok(answer) => {
+            if let Some(fork) = answer
+                .session
+                .as_ref()
+                .filter(|_| answer.outcome != "refused")
+            {
+                let note = room::forked_note(&fork.title, &device.name, &p.folder, &by);
+                room::note(state, parent, note).await;
+            }
+        }
+        Err(e) => {
+            warn!(session = %sid, %e, "hive: a fork whose device took its copy was not made");
+            let why = "the server could not make it (its log says why)";
+            room::note(state, parent, room::fork_failed_note(p, why)).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -492,10 +689,35 @@ mod tests {
             CopyBehind,
             DeviceOffline,
             DeviceUnsupported,
+            PrimaryOffline,
+            PrimaryUnsupported,
             RateLimited,
         ];
         let words: std::collections::HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
         assert_eq!(words.len(), all.len(), "each word once");
         assert!(all.iter().all(|r| !r.message().is_empty()));
+    }
+
+    /// P2f-3c — a fork-joining move refused at its record or its push says
+    /// so in the fork's words: what the gates would have said, and `no_copy`
+    /// for a session that stopped running meanwhile.
+    #[test]
+    fn a_fork_joinings_refusal_is_in_the_forks_words() {
+        let pairs = [
+            (PromoteDenyReason::InProgress, "in_progress"),
+            (PromoteDenyReason::NotRunning, "no_copy"),
+            (PromoteDenyReason::DeviceOffline, "device_offline"),
+            (PromoteDenyReason::DeviceUnsupported, "device_unsupported"),
+            (PromoteDenyReason::PrimaryOffline, "primary_offline"),
+            (PromoteDenyReason::PrimaryUnsupported, "primary_unsupported"),
+            (PromoteDenyReason::RateLimited, "rate_limited"),
+        ];
+        for (r, word) in pairs {
+            assert_eq!(refusal_of(r).as_str(), word, "{r:?}");
+        }
+        // Every word a move can have maps to one a fork knows.
+        for r in PromoteDenyReason::ALL {
+            let _ = refusal_of(r).message();
+        }
     }
 }

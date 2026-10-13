@@ -215,6 +215,29 @@ pub(crate) fn forked_from_note(parent: &AgentSession, by: &str) -> String {
     )
 }
 
+/// FR-90 P2f-3c — a fork onto a device that holds no copy: the device takes a
+/// copy of this session first, and the fork is made there once it has.
+pub(crate) fn fork_joining_note(p: &Promotion, by: &str) -> String {
+    let title = p.fork.as_ref().map(|f| f.title.as_str()).unwrap_or("");
+    format!(
+        "🌿 **{}** is forking the session into **{}** on {}, in {} — {} takes a copy of it \
+         first; this session goes on as it was",
+        md_escape(by),
+        md_escape(title),
+        name_label(&p.to_name),
+        md_escape(&p.folder),
+        name_label(&p.to_name)
+    )
+}
+
+/// FR-90 P2f-3c — a fork onto a device that held no copy did not happen.
+pub(crate) fn fork_failed_note(p: &Promotion, why: &str) -> String {
+    format!(
+        "⛔ The fork onto {} did not happen: {why}. This session goes on as it was",
+        name_label(&p.to_name)
+    )
+}
+
 /// "Refused" — which of the device's gates said no, in plain words.
 pub(crate) fn refused_note(s: &AgentSession) -> String {
     let word = s.refusal.as_deref().unwrap_or("other");
@@ -804,6 +827,7 @@ mod tests {
             unreachable_from: false,
             prior: None,
             teleport: false,
+            fork: None,
         };
         let moving = moving_note(&p, "Alice");
         assert_eq!(
