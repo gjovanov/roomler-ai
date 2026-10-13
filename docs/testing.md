@@ -121,10 +121,70 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, diffed against an expected-failures list; regressions file an issue |
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
+| **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
 are tracked in `scripts/e2e-expected-failures.txt` rather than papered over.
+
+## The L0 latency harness (FR-16)
+
+Remote-desktop latency had no measurement that a change could be held to: the viewer's paint
+age starts at capture, and every field read went through a person moving a window. L0 is the
+first layer of [FR-16](fr/FR-16-rc-quality-benchmark.md)'s benchmark. It is a real session
+in one test process, measured on one clock, so a regression in the pipeline fails CI.
+
+```mermaid
+flowchart LR
+    subgraph P["one test process (agents/roomlerd/tests/l4_latency.rs)"]
+        S["synthetic source<br/>paints seq N, records t_capture(N)"] --> E["production AgentPeer<br/>media pump + openh264"]
+        E -- "RTP over a webrtc-util vnet<br/>(delay · jitter · loss)" --> C["webrtc-rs controller<br/>reassembles the access unit"]
+        C --> D["openh264 decode<br/>read seq N from the luma"]
+        D --> L["latency = t_decode − t_capture(N)"]
+    end
+```
+
+- **The agent side is production code:** `AgentPeer`, its media pump and the openh264 encoder,
+  on the synthetic source. The test's only seam is `peer::l0::set_setting_engine_hook`, which
+  puts the session on a vnet. It is compiled only into the test-only `synthetic-frame-source`
+  build.
+- **The marker** (`capture/synthetic_backend.rs`, `marker`) is the frame's 12-bit sequence
+  number and a CRC-4, painted as a 2×8 grid of 16×16 luma blocks. It survives 4:2:0, a high
+  QP and a 4× downscale, and a misread is a miss, never a wrong number. The browser half of
+  FR-16 (L4) reads the same layout.
+- **The controller reassembles access units itself.** webrtc-rs' `SampleBuilder` holds a
+  frame until the next one's first packet arrives, which would add a whole frame interval to
+  every reading.
+
+| Cell | Link | Must show |
+|---|---|---|
+| `clean` | no delay | ≥ 0.9× the source's 30 fps decoded; no freeze |
+| `delay100` | +100 ms one way | p50 up by ≥ 80 ms: the metric sees the network |
+| `gate50` | a planted 50 ms hold in the capture stage | p50 up by ≥ 20 ms: the metric sees the pipeline. **The negative control** |
+| `lossy` | +20 ms, 5 ms jitter, 3 % of media packets dropped | the session survives and keeps decoding; its numbers are printed |
+
+Run it locally (it prints one `L0 …` line per cell):
+
+```bash
+cargo test -p roomlerd --features openh264-encoder,synthetic-frame-source --test l4_latency -- --nocapture
+```
+
+Reference run (2026-10-13, unoptimised, Windows dev box):
+
+| Cell | fps | p50 | p95 | freezes | IDRs |
+|---|---|---|---|---|---|
+| `clean` | 30.2 | 10.2 ms | 14.8 ms | 0 | 4 |
+| `delay100` | 30.2 | 122.3 ms | 124.9 ms | 0 | 4 |
+| `gate50` | 15.1 | 63.3 ms | 77.9 ms | 0 | 3 |
+| `lossy` | 25.2 | 46.6 ms | 62.1 ms | 3 | 7 |
+
+With `gate50`'s hold set to zero the test fails on `gate50: p50 rose by 0.4 ms, want ≥ 20`. That
+run is the proof that the gate can fail.
+
+⚠️ The numbers come from an **unoptimised** build on whatever machine runs it, so the bounds are
+deltas and generous ceilings, not targets. Field numbers come from L4 in the real viewer.
+⚠️ CI has no FFmpeg, so the session uses the RTP track. A data-channel cell needs a decoder
+binding the test does not have yet.
 
 ## The overlay stress lane (FR-81)
 
