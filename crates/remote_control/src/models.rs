@@ -3803,6 +3803,75 @@ impl RecordingActivityEvent {
     pub const MAX_TEXT: usize = 256;
 }
 
+/// FR-101 P3 — which transfer a [`TransferActivityEvent`] is about.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferActivityKind {
+    /// Writes the controller made to the host's clipboard during one sample
+    /// window: `count` of them, `bytes` in all.
+    ClipboardToHost,
+    /// Clipboard content the host sent the controller during one sample
+    /// window: reads it asked for, and changes pushed to a subscribed viewer.
+    ClipboardFromHost,
+    /// One file the controller sent to the host.
+    FileToHost,
+    /// One file the host sent the controller.
+    FileFromHost,
+}
+
+/// FR-101 P3 — clipboard and file traffic a device reported for a remote
+/// session.
+///
+/// ⚠️ **REPORTED BY THE DEVICE, not observed by the server**, the same split
+/// as [`RecordingActivityEvent`] and [`SshActivityEvent`]. The traffic itself
+/// travels peer to peer, so the server never sees a transfer, only the host's
+/// account of it. The grant that allowed it (`CLIPBOARD`, `FILES`) is the
+/// server's own record, in `remote_audit`. An empty result is therefore not
+/// proof that nothing crossed: a compromised host can stay silent, and a
+/// session that dies with the control WS loses its last sample.
+///
+/// Never content and never a file name: counts, sizes, and a hash of the
+/// name, so that transfers of one file can be told apart from many.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransferActivityEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    /// From the authenticated WS, never from the frame.
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub session_id: ObjectId,
+    /// The controller the session belongs to: the SERVER's record of who was
+    /// connected, not the device's.
+    pub controller_user_id: ObjectId,
+    pub kind: TransferActivityKind,
+    /// A clipboard row counts its window's transfers; a file row is one.
+    pub count: u64,
+    pub bytes: u64,
+    /// File rows only: SHA-256 of the file's name, lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_sha256: Option<String>,
+    /// Stamped by the SERVER. A device clock is not evidence.
+    pub at: DateTime,
+}
+
+impl TransferActivityEvent {
+    pub const COLLECTION: &'static str = "transfer_activity";
+
+    /// Files one sample may list. A host that may be compromised must not be
+    /// able to bloat the collection with one frame; an honest one completes
+    /// nowhere near this many in a 30 s window.
+    pub const MAX_FILES_PER_SAMPLE: usize = 256;
+
+    /// Is `s` a SHA-256 in lowercase hex? Anything else a device sends as a
+    /// name hash is dropped: free text there would let a host store the very
+    /// name the hash exists to keep out.
+    pub fn is_name_hash(s: &str) -> bool {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
 impl SshActivityEvent {
     pub const COLLECTION: &'static str = "ssh_activity";
 
@@ -3940,6 +4009,12 @@ pub enum AuditKind {
     SessionEnded {
         reason: EndReason,
     },
+    // FR-101 P3 — the four clipboard and file kinds below are never written.
+    // A transfer is something the DEVICE reports (the payload never crosses
+    // the server), and a device's claims live apart from the server's
+    // decisions: in `transfer_activity` ([`TransferActivityEvent`]), as
+    // recordings' do in `recording_activity`. Kept so a row from a build
+    // that ever wrote one still reads.
     ClipboardWriteToHost {
         bytes: u32,
     },
@@ -5176,6 +5251,38 @@ mod tests {
             let back: RecordingActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
             assert_eq!(back, k);
         }
+    }
+
+    /// FR-101 P3 — the stored kinds are read by the activity route and by
+    /// anyone querying the collection; a rename strands every row before it.
+    #[test]
+    fn transfer_activity_kinds_keep_their_wire_names() {
+        use TransferActivityKind::*;
+        for (k, w) in [
+            (ClipboardToHost, "clipboard_to_host"),
+            (ClipboardFromHost, "clipboard_from_host"),
+            (FileToHost, "file_to_host"),
+            (FileFromHost, "file_from_host"),
+        ] {
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(w));
+            let back: TransferActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
+            assert_eq!(back, k);
+        }
+    }
+
+    /// FR-101 P3 — a name hash is 64 lowercase hex digits and nothing else.
+    /// The field is what a device sends instead of the name; free text there
+    /// would let a host store the very name the hash keeps out.
+    #[test]
+    fn only_a_sha256_in_lowercase_hex_passes_for_a_name_hash() {
+        let ok = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(TransferActivityEvent::is_name_hash(ok));
+        assert!(!TransferActivityEvent::is_name_hash(&ok.to_uppercase()));
+        assert!(!TransferActivityEvent::is_name_hash(&ok[..63]));
+        assert!(!TransferActivityEvent::is_name_hash(&format!("{ok}0")));
+        assert!(!TransferActivityEvent::is_name_hash("salaries 2026.xlsx"));
+        assert!(!TransferActivityEvent::is_name_hash(&"g".repeat(64)));
+        assert!(!TransferActivityEvent::is_name_hash(""));
     }
 
     /// P3c-2 — `available` says the device HAS a recorder; it is never

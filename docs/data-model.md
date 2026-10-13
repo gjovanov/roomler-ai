@@ -64,6 +64,7 @@ erDiagram
     agents ||--o{ remote_sessions : serves
     remote_sessions ||--o{ remote_audit : logs
     remote_sessions ||--o{ recording_activity : "device claims (FR-85)"
+    remote_sessions ||--o{ transfer_activity : "device claims (FR-101)"
     agents ||--o{ agent_crashes : reports
     agents ||--o{ agent_logs : uploads
     agents ||--o{ exec_audit : "exec attempts"
@@ -93,9 +94,10 @@ erDiagram
 | Collection | Purpose · key fields / indexes |
 |---|---|
 | `agents` | One row per enrolled machine: name, os, version, caps (codecs/transports/rpc), exec policy, status. **Unique `(tenant_id, machine_id)`** — re-enrollment reuses the row. FR-40 adds three records of different trust: `overlay_identity` (the public key + epoch the device last **joined** with, server-verified, stamped on every join), `key_rotation` (the standing order, with `public_key_before`) and `key_rotation_report` (the device's **claim**; a later refusal never overwrites a `rotated` claim for the same order) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
-| `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. 90 d TTL |
+| `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. FR-101 P3: `transfer_totals`, the last cumulative clipboard tallies the device reported. These sit outside `stats` so that `mark_ended`'s whole-`stats` write cannot reset them; a reset would count everything again. 90 d TTL |
 | `remote_audit` | Per-session audit events (connect, consent, input, terminate). 90 d TTL |
 | `recording_activity` | FR-85: what a device **claims** about remote recordings (prompt outcome, started, stopped, refused, downloaded), with name, bytes, duration and reason, never content. Kept only for a session of that device whose grant held `RECORD`; the decision itself is in `remote_audit`. `(tenant_id, agent_id, at desc)`, `(session_id, at)`. 90 d TTL |
+| `transfer_activity` | FR-101 P3: the clipboard and file traffic a device **claims** for a remote session. Two kinds of row: a clipboard row per direction per 30 s sample (`count`, `bytes`), and a file row per completed file (`bytes`, `name_sha256`). Never content, never a file name. Kept only for a session of that device, clipboard rows only under `CLIPBOARD`, file rows only under `FILES`; a name hash that is not 64 lowercase hex digits is dropped. `(tenant_id, agent_id, at desc)`, `(session_id, at)`. 90 d TTL |
 | `consent_requests` | Pending owner-consent decisions (capability token = the auth) |
 | `agent_crashes` | Crash-report ingest. 90 d TTL on `reported_at` |
 | `agent_logs` | Centralized log batches (agent + browser ingest). **7 d TTL**, text index on `lines.msg` |
@@ -136,7 +138,7 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 |---|---|
 | Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
 | Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
-| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` · **never** (permanent, by decision): `keep_busy_events` (FR-92 P7, operator 2026-10-11), `agent_sessions` |
+| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `transfer_activity`, `tunnel_audit`, `exec_audit`, `key_rotation_audit`, `hive_audit`, `agent_approvals`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 d: `hive_session_memory` · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` · **never** (permanent, by decision): `keep_busy_events` (FR-92 P7, operator 2026-10-11), `agent_sessions` |
 
 Two patterns worth knowing when touching this layer:
 
