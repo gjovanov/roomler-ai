@@ -67,7 +67,7 @@ are not a result.
 | C1 | **Slot-first capture gate.** Check the slot first; sleep only when the source is outrunning the target; period in µs | `wgc_backend.rs` L259, L293–302; `scrap_backend.rs` L352, L505–509 | `ROOMLERD_CAPTURE_GATE` = `slot_first` / `legacy` (legacy) |
 | C2 | **GPU clock pin on for NVENC sessions** | `gpu_clock.rs` | `ROOMLERD_GPU_CLOCK_PIN` (unchanged); the flip is a default change after the A/B |
 | C3 | **Input gap 8 → 4 ms** (0 and 2 measured too) | `useRemoteControl.ts` L5552 | viewer knob `roomler-rc-input-gap` |
-| C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `cursor_poll_ms` |
+| C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `ROOMLERD_CURSOR_POLL_MS` (2–50 ms) |
 | C5 | **NVENC preset `p1`–`p3` × tune `ull`** | `encoder.rs` L329–330 | the existing `ROOMLERD_FFMPEG_PRESET` / `_TUNE`; bake the winner per backend |
 | C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `rtp_playout_delay_zero` |
 
@@ -106,7 +106,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 | P0 | This spec and the claim. The **baseline**: L4 on the cells of §9, recorded before any cut | docs only | this PR |
 | P1 | C1, the slot-first gate | `ROOMLERD_CAPTURE_GATE` unset or `legacy` | **built**: `capture/gate.rs` (the token bucket, unit-tested on synthetic timelines); the WGC backend behind the switch, legacy branch unchanged; L0's `gate_lgcy` / `gate_slot` cells (§9). Field A/B owed |
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
-| P3 | C3 + C4, the input and cursor cadences | the viewer knob, `cursor_poll_ms` | — |
+| P3 | C3 + C4, the input and cursor cadences | `roomler-rc-input-gap` unset (8 ms); `ROOMLERD_CURSOR_POLL_MS` unset (8 ms) | **knobs built**, defaults unchanged: `storedInputGapMs` (0–16 ms, read once per viewer) and `capture::cursor::poll_interval` (2–50 ms, read once per session). The 0/2/4 ms A/B on L4 is owed, and open decision 3 waits on it |
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
 | P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `rtp_playout_delay_zero=false` | — |
 | P6 | Docs, and the final field table | — | — |
