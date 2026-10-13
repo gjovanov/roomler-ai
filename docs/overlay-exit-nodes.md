@@ -217,6 +217,37 @@ NIC until the next clean run. On Linux the `dev`-scoped routes auto-cull, but th
 boot-reconciler covers kill-9/reboot there too. The NRPT DNS rule likewise
 persists across reboot, so `purge_exit_dns()` removes the tagged rule.
 
+### IPv4 forwarding on a Windows exit or subnet router (FR-97 P0b-2b)
+
+Windows forwards a packet only when **both** interfaces have
+`Forwarding: Enabled`, and every interface ships `Disabled`. So the router turns
+it on for the overlay adapter and for the egress adapter of every route it
+serves. Until P0b-2b its revert ran `Remove-NetNat` alone, and a device that
+stopped serving kept routing between its adapters for as long as it ran
+(#2077, defect 2).
+
+```mermaid
+flowchart LR
+    SETUP["setup: per interface<br/>FWD guid ifIndex before"] --> HOLD["ForwardingHolds<br/>refcount per interface"]
+    HOLD --> LEDGER["%ProgramData%\roomler\<br/>overlay-host-ledger.json<br/>(GUIDs we turned on)"]
+    DROP["Drop: Remove-NetNat,<br/>release each hold"] --> LAST{"last holder, and<br/>it was Disabled?"}
+    LAST -- yes --> OFF["Set-NetIPInterface<br/>-Forwarding Disabled"]
+    LAST -- no --> KEEP["leave it: another org's<br/>router still needs it,<br/>or it was never ours"]
+    CRASH["crash / kill / process::exit"] -.-> PURGE["purge_exit_routes():<br/>nat::purge_forwarding()<br/>reads the ledger"] --> OFF
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| The setup script reports each interface's adapter GUID and the forwarding state it **found** | `nat.rs` Windows `setup` | Only what we turned on is ours to turn off |
+| Holds are refcounted per interface, and the **first** holder's observation decides | `host_ledger::ForwardingHolds` | Two orgs' routers can share one egress adapter; the second sees `Enabled` because the first enabled it |
+| Only GUID identities reach the disk | `ForwardingHolds::ledger` | An ifIndex can name a different interface after a reboot |
+| GUIDs are validated strictly before going back into PowerShell | `host_ledger::is_guid` | The ledger is read back from disk at boot |
+| `New-NetNat` failures carry WinNAT's own message to the log | `nat.rs` Windows `setup` | `-ErrorAction SilentlyContinue` used to hide why a NAT never appeared (an overlapping Docker/WSL prefix) |
+
+> ⚠️ Linux is deliberately unchanged: the revert there leaves `ip_forward` on.
+> That sysctl is host-global and routinely shared with Docker and Kubernetes,
+> so switching it off on the way out could break them.
+
 ## Platform support
 
 | Capability | Linux (`overlay-l3`) | Windows (`overlay-l3`) | macOS (`overlay-l3`) |

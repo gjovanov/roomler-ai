@@ -34,6 +34,10 @@ pub mod dialer;
 pub mod direct;
 pub mod disco;
 pub mod dns;
+/// FR-97 P0b-2b — host state the daemon changes that must not outlive it
+/// (IPv4 forwarding a Windows router turned on), refcounted in process and
+/// recorded on disk for the boot purge.
+pub mod host_ledger;
 pub mod hosts;
 pub mod ingress;
 /// A LAN interface's own prefix route made unusable underneath it (a next

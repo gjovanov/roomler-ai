@@ -54,7 +54,18 @@ pub struct SubnetRouterGuard {
     /// the commands the single-CIDR version did.
     overlay_cidrs: Vec<String>,
     active: bool,
+    /// FR-97 P0b-2b — the interfaces whose IPv4 forwarding this router relies
+    /// on, as `setup` found them; `Drop` releases each, and the last holder of
+    /// an interface we turned on switches it back off.
+    #[cfg(target_os = "windows")]
+    forwarding: Vec<super::host_ledger::FwdTarget>,
 }
+
+/// FR-97 P0b-2b — this process's forwarding holds, shared by every router
+/// guard (one per org): see [`super::host_ledger::ForwardingHolds`].
+#[cfg(target_os = "windows")]
+static FORWARDING: std::sync::Mutex<super::host_ledger::ForwardingHolds> =
+    std::sync::Mutex::new(super::host_ledger::ForwardingHolds::new());
 
 /// Enable forwarding + NAT for `overlay_cidr` when `advertised_routes` is
 /// non-empty. Returns a guard that reverts on `Drop`. A no-op (inert guard) when
@@ -75,8 +86,13 @@ pub async fn enable(
             if_name: if_name.to_string(),
             overlay_cidrs: overlay_cidrs.to_vec(),
             active: false,
+            #[cfg(target_os = "windows")]
+            forwarding: Vec::new(),
         };
     }
+    #[cfg(target_os = "windows")]
+    let (fully_ok, forwarding) = setup(if_name, overlay_cidrs, advertised_routes).await;
+    #[cfg(not(target_os = "windows"))]
     let fully_ok = setup(if_name, overlay_cidrs, advertised_routes).await;
     // Arm the guard on any platform where `setup` installs rules, so `Drop`
     // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
@@ -96,6 +112,8 @@ pub async fn enable(
         if_name: if_name.to_string(),
         overlay_cidrs: overlay_cidrs.to_vec(),
         active,
+        #[cfg(target_os = "windows")]
+        forwarding,
     }
 }
 
@@ -371,7 +389,11 @@ async fn setup_v6(if_name: &str) {
 }
 
 #[cfg(target_os = "windows")]
-async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[String]) -> bool {
+async fn setup(
+    if_name: &str,
+    overlay_cidrs: &[String],
+    advertised_routes: &[String],
+) -> (bool, Vec<super::host_ledger::FwdTarget>) {
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
     // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
     // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
@@ -405,6 +427,11 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[Str
     // because `run` can only observe the PowerShell process exit code and
     // `-ErrorAction SilentlyContinue` would otherwise report success for a
     // cmdlet that never applied.
+    //
+    // FR-97 P0b-2b — it also reports, per interface, the adapter GUID and the
+    // forwarding state it FOUND (`FWD <guid> <ifIndex> <before>`), so the
+    // revert can switch off exactly what this turned on (#2077, defect 2: it
+    // used to leave every interface forwarding after the router stopped).
     let targets = advertised_routes
         .iter()
         .map(|c| format!("'{}'", c.trim().replace('\'', "")))
@@ -414,32 +441,48 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[Str
     // historical `roomler` literal. Quote-sanitized like `targets` (the name
     // comes from our own constants/config, but a `'` must never break out).
     let alias = if_name.trim().replace('\'', "");
-    let fwd_ok = run(vec![
+    let (fwd_ok, report) = run_capture(vec![
         "powershell".into(),
         "-NoProfile".into(),
         "-Command".into(),
         format!(
-            "$fail = 0; \
-             Set-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
-               -Forwarding Enabled -ErrorAction SilentlyContinue; \
-             if ((Get-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
-               -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
-               -ne 'Enabled') {{ $fail = 1 }}; \
+            "$fail = 0; $idx = @(); \
+             $o = Get-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
+               -ErrorAction SilentlyContinue | Select-Object -First 1; \
+             if ($o) {{ $idx += $o.ifIndex }} else {{ $fail = 1 }}; \
              foreach ($c in @({targets})) {{ \
                $ip = ($c -split '/')[0]; \
                $r = Find-NetRoute -RemoteIPAddress $ip -ErrorAction SilentlyContinue | \
                  Select-Object -First 1; \
-               if (-not $r) {{ continue }}; \
-               Set-NetIPInterface -ifIndex $r.InterfaceIndex -AddressFamily IPv4 \
+               if ($r) {{ $idx += $r.InterfaceIndex }} \
+             }}; \
+             foreach ($i in ($idx | Select-Object -Unique)) {{ \
+               $before = (Get-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
+                 -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding; \
+               $g = (Get-NetAdapter -InterfaceIndex $i -IncludeHidden \
+                 -ErrorAction SilentlyContinue | Select-Object -First 1).InterfaceGuid; \
+               if (-not $g) {{ $g = '-' }}; \
+               Set-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
                  -Forwarding Enabled -ErrorAction SilentlyContinue; \
-               if ((Get-NetIPInterface -ifIndex $r.InterfaceIndex -AddressFamily IPv4 \
+               if ((Get-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
                  -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
-                 -ne 'Enabled') {{ $fail = 1 }} \
+                 -ne 'Enabled') {{ $fail = 1 }}; \
+               Write-Output ('FWD ' + $g + ' ' + $i + ' ' + $before) \
              }}; \
              exit $fail"
         ),
     ])
     .await;
+    // Hold every interface the script touched, whether or not it ended up
+    // Enabled: a partial setup still needs its partial revert.
+    let forwarding = super::host_ledger::parse_forwarding_report(&report);
+    {
+        let mut holds = FORWARDING.lock().unwrap_or_else(|e| e.into_inner());
+        for t in &forwarding {
+            holds.hold(t);
+        }
+        holds.ledger().store();
+    }
     if !fwd_ok {
         warn!(
             "overlay: could not enable IPv4 forwarding on the overlay NIC and/or an \
@@ -462,6 +505,9 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[Str
         } else {
             format!("{NAT_NAME}-{i}")
         };
+        // FR-97 P0b-2b — `-ErrorAction Stop` and the message on stderr, so
+        // `run` logs WHY WinNAT refused (an overlapping prefix from Docker
+        // or WSL, a missing class) rather than a bare failure.
         ok &= run(vec![
             "powershell".into(),
             "-NoProfile".into(),
@@ -469,14 +515,83 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[Str
             format!(
                 "if (-not (Get-NetNat -ErrorAction SilentlyContinue | \
                  Where-Object {{ $_.InternalIPInterfaceAddressPrefix -eq '{cidr}' }})) {{ \
-                 New-NetNat -Name {name} \
-                 -InternalIPInterfaceAddressPrefix '{cidr}' \
-                 -ErrorAction SilentlyContinue }}"
+                 try {{ New-NetNat -Name {name} \
+                   -InternalIPInterfaceAddressPrefix '{cidr}' -ErrorAction Stop | Out-Null }} \
+                 catch {{ [Console]::Error.WriteLine('New-NetNat {name}: ' + \
+                   $_.Exception.Message); exit 1 }} }}"
             ),
         ])
         .await;
     }
-    ok
+    (ok, forwarding)
+}
+
+/// FR-97 P0b-2b — switch IPv4 forwarding back off on the given interfaces:
+/// GUID identities through their adapter, `if:` ones by index. Synchronous,
+/// because `Drop` and the boot purge both call it with no runtime.
+#[cfg(target_os = "windows")]
+fn restore_forwarding(identities: &[String]) {
+    let guids: Vec<String> = identities
+        .iter()
+        .filter_map(|id| id.strip_prefix("guid:"))
+        .filter(|g| super::host_ledger::is_guid(g))
+        .map(|g| format!("'{g}'"))
+        .collect();
+    let indexes: Vec<String> = identities
+        .iter()
+        .filter_map(|id| id.strip_prefix("if:"))
+        .filter_map(|i| i.parse::<u32>().ok())
+        .map(|i| i.to_string())
+        .collect();
+    if guids.is_empty() && indexes.is_empty() {
+        return;
+    }
+    let script = format!(
+        "foreach ($g in @({guids})) {{ \
+           $a = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | \
+             Where-Object {{ $_.InterfaceGuid -eq $g }} | Select-Object -First 1; \
+           if ($a) {{ Set-NetIPInterface -ifIndex $a.ifIndex -AddressFamily IPv4 \
+             -Forwarding Disabled -ErrorAction SilentlyContinue }} \
+         }}; \
+         foreach ($i in @({indexes})) {{ \
+           Set-NetIPInterface -ifIndex $i -AddressFamily IPv4 -Forwarding Disabled \
+             -ErrorAction SilentlyContinue \
+         }}",
+        guids = guids.join(","),
+        indexes = indexes.join(","),
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output();
+    info!(
+        interfaces = identities.len(),
+        "overlay: IPv4 forwarding switched back off where the router had turned it on"
+    );
+}
+
+/// FR-97 P0b-2b — the boot (and pre-`process::exit`) purge: switch forwarding
+/// back off on every interface a previous run turned on and never released,
+/// as its ledger records them. Context-free, like the route purges beside it.
+/// No-op off Windows, and when the ledger is empty.
+pub fn purge_forwarding() {
+    #[cfg(target_os = "windows")]
+    {
+        let ledger = super::host_ledger::HostLedger::load();
+        if ledger.forwarding.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = ledger
+            .forwarding
+            .iter()
+            .map(|g| format!("guid:{g}"))
+            .collect();
+        warn!(
+            adapters = ?ledger.forwarding,
+            "overlay: a previous run left IPv4 forwarding on (unclean exit) — switching it back off"
+        );
+        restore_forwarding(&ids);
+        super::host_ledger::HostLedger::default().store();
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -582,6 +697,22 @@ impl Drop for SubnetRouterGuard {
                     ])
                     .output();
             }
+            // FR-97 P0b-2b — then forwarding: this router's holds go, and the
+            // last holder of an interface we turned on switches it back off
+            // (#2077, defect 2). The ledger follows, so a crash after this
+            // point has nothing left to restore.
+            let restore: Vec<String> = {
+                let mut holds = FORWARDING.lock().unwrap_or_else(|e| e.into_inner());
+                let ids = self
+                    .forwarding
+                    .iter()
+                    .filter(|t| holds.release(&t.identity))
+                    .map(|t| t.identity.clone())
+                    .collect();
+                holds.ledger().store();
+                ids
+            };
+            restore_forwarding(&restore);
         }
         info!(
             if_name = %self.if_name,
@@ -612,6 +743,34 @@ async fn run(args: Vec<String>) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// FR-97 P0b-2b — [`run`], keeping stdout: `(exit 0, stdout)`. The forwarding
+/// setup reports what it found on stdout, and a failed run still reports the
+/// interfaces it touched, which the revert needs.
+#[cfg(target_os = "windows")]
+async fn run_capture(args: Vec<String>) -> (bool, String) {
+    tokio::task::spawn_blocking(move || {
+        let prog = args[0].clone();
+        match std::process::Command::new(&prog).args(&args[1..]).output() {
+            Ok(o) => {
+                if !o.status.success() {
+                    warn!(%prog, stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                        "overlay: subnet-router command failed");
+                }
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                )
+            }
+            Err(e) => {
+                warn!(%prog, %e, "overlay: subnet-router command spawn failed");
+                (false, String::new())
+            }
+        }
+    })
+    .await
+    .unwrap_or((false, String::new()))
 }
 
 #[cfg(test)]
