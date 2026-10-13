@@ -601,12 +601,13 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the dialog answered by the harness).
 - [ ] **AC4** — input reaches a **native** Wayland client (the probe log): pointer within ±2 px at three points,
   click, scroll sign, typed ASCII, a held modifier — on GNOME (both install types) and KDE.
-  ⏳ GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events), and ✅
+  ⏳ System installs, with `drm_capture` + `uinput` (FR-36's arms, opt-in there by D1): ✅ GNOME, `points` 8/8
+  on 0.4.125 and again on the release 0.4.128 (step logs 16, 31); ✅ KDE, 8/8 on the release 0.4.126 (step log
+  23). GNOME per-user: ✅ in the lab on P4a (`3f9ad6464`), all 7 checks, 🔴 first on 0.4.131 (0 events), and ✅
   again on the released 0.4.132, all 7 checks (step log 60). KDE per-user: ✅ in the lab on P4b (`9a8e20699`,
   then `64f00509f`), all 7 checks three times, through the remote control the automatic portal asks for; 🔴
   first on the release (0 events through KWin's gate, `remote-control.md`), and on P4b's first candidate
-  (`helo 123A`, calls unawaited). Owed: KDE on a released build (P4b rides the release after 0.4.132), and both
-  system installs (uinput).
+  (`helo 123A`, calls unawaited). Owed: KDE per-user on a released build (P4b rides the release after 0.4.132).
 - [ ] **AC5** — the remote cursor is visible in the viewer on DRM and mutter/portal sessions.
 - [ ] **AC6** — every refusal names its reason in the viewer; no black stream, no "headless" for a seat with a
   session. Each refusal row shown red on 0.4.124 first.
