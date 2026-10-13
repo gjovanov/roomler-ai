@@ -54,6 +54,8 @@ exclude = [
     # SCTP `a_rwnd` (was hardcoded to 0 = 1 MiB upstream default).
     # Needed for roomler native-to-native peers to advertise
     # 8 MiB so DC throughput stays link-bound at high BDP.
+    # FR-101: plus `set_dtls_cipher_suites`, so a remote-desktop session
+    # can drop the AES-256-CBC-SHA suites upstream's DTLS default carries.
     "crates/vendored/webrtc",
     # Vendored upstream minus the on-drop NetworkList registry deletion —
     # see the wintun-bindings patch note above [patch.crates-io].
