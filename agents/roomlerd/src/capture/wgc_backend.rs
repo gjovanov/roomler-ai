@@ -136,6 +136,10 @@ pub struct WgcCapture {
     monitor: u8,
     target_frame_period: Duration,
     last_frame_at: Option<Instant>,
+    /// FR-98 C1 — `Some` when this open runs the slot-first gate
+    /// (`ROOMLERD_CAPTURE_GATE=slot_first`); `None` keeps the legacy gate
+    /// above, whose code path is unchanged.
+    slot_first: Option<super::gate::SlotFirst>,
     // DownscalePolicy is accepted in the constructor so the call site
     // signature matches the scrap backend, but WGC runs at native
     // resolution today — the MF HW encoder handles 4K natively so
@@ -251,6 +255,9 @@ impl WgcCapture {
             Err(_) => return Err(anyhow!("wgc worker didn't ack within 2s")),
         };
 
+        // FR-98 C1 — read once per open (FR-70: never per frame).
+        let gate_mode = super::gate::GateMode::from_env();
+        tracing::info!(gate = gate_mode.as_str(), target_fps, "wgc capture gate");
         Ok(Self {
             shared,
             width: size.Width.max(0) as u32,
@@ -258,12 +265,51 @@ impl WgcCapture {
             monitor: monitor_index,
             target_frame_period: Duration::from_millis(1000 / target_fps.max(1) as u64),
             last_frame_at: None,
+            slot_first: (gate_mode == super::gate::GateMode::SlotFirst)
+                .then(|| super::gate::SlotFirst::new(target_fps)),
             _downscale: downscale,
             _worker: worker,
             _shutdown: shutdown,
             start: Instant::now(),
             pointer_in_frame,
         })
+    }
+
+    /// FR-98 C1 — the slot first: a frame that is already waiting goes out
+    /// now, unless the source is outrunning the target, and only then does
+    /// the gate pace it (`capture::gate`). The legacy gate in `next_frame`
+    /// sleeps first and looks second.
+    async fn next_frame_slot_first(&mut self) -> Result<Option<Frame>> {
+        let mut payload = self.shared.latest.lock().unwrap().take();
+        if payload.is_none() {
+            // Same wait as the legacy path: bail with None on timeout so the
+            // pump can loop and decide idle behaviour (keepalive).
+            let notified = self.shared.notify.notified();
+            tokio::pin!(notified);
+            if tokio::time::timeout(NEXT_FRAME_TIMEOUT, &mut notified)
+                .await
+                .is_err()
+            {
+                return Ok(None);
+            }
+            payload = self.shared.latest.lock().unwrap().take();
+        }
+        let Some(mut payload) = payload else {
+            return Ok(None);
+        };
+        let Some(gate) = self.slot_first.as_mut() else {
+            return Ok(Some(payload_to_frame(payload, self.monitor, self.start)));
+        };
+        let wait = gate.wait(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+            // A fresher frame may have landed while the source was paced.
+            if let Some(newer) = self.shared.latest.lock().unwrap().take() {
+                payload = newer;
+            }
+        }
+        gate.took(Instant::now());
+        Ok(Some(payload_to_frame(payload, self.monitor, self.start)))
     }
 
     pub fn width(&self) -> u32 {
@@ -290,6 +336,9 @@ impl Drop for WgcCapture {
 #[async_trait::async_trait]
 impl ScreenCapture for WgcCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
+        if self.slot_first.is_some() {
+            return self.next_frame_slot_first().await;
+        }
         // FPS gate — same shape as scrap.
         if let Some(last) = self.last_frame_at {
             let elapsed = last.elapsed();

@@ -36,6 +36,11 @@
 //! | `ROOMLERD_SYNTHETIC_SIZE=WxH` | frame size (even, 64×64 … 3840×2160); default 320×240 |
 //! | `ROOMLERD_BENCH=1` | bench mode: the fps clamp rises from 60 to 240, and the gate below is honoured |
 //! | `ROOMLERD_SYNTHETIC_GATE_MS=N` | bench only: hold each frame N ms after it is stamped, a planted capture-stage delay. The L0 test's negative control: a harness that cannot see it is not measuring latency |
+//!
+//! FR-98 C1: [`set_test_compositor`] (a test hook, bench mode only) makes
+//! the source emulate an event-driven backend, frames landing on their own
+//! clock behind the capture gate WGC would run (`capture::gate`), and the
+//! clock then records when a frame LANDED, so L0 sees what the gate costs.
 
 use crate::capture::{Damage, DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 use anyhow::Result;
@@ -79,6 +84,154 @@ pub struct SyntheticCapture {
     /// FR-16 L0 — a planted delay between stamping a frame and handing it
     /// over (bench mode only). Zero in every real run.
     gate: Duration,
+    /// FR-98 C1 — an emulated event-driven source behind a capture gate,
+    /// set by a test (bench mode only). `None` in every real run.
+    compositor: Option<Compositor>,
+}
+
+/// FR-98 C1 — what a test asks the synthetic source to emulate: a source
+/// that delivers frames on its own clock, the way WGC's `FrameArrived` does,
+/// read through the gate the WGC backend would run.
+#[derive(Debug, Clone, Copy)]
+pub struct TestCompositor {
+    /// The emulated source's rate (a compositor's refresh).
+    pub source_fps: u32,
+    /// The rate the gate caps at, in place of the pump's target, so a test
+    /// can pick one whose legacy period is a whole number of milliseconds.
+    pub target_fps: u32,
+    /// How far ahead of the legacy gate's cadence each frame lands, as a
+    /// fraction of a period: 0 = on it, 0.75 = three quarters early.
+    pub lead: f64,
+    pub gate: super::gate::GateMode,
+}
+
+static TEST_COMPOSITOR: std::sync::Mutex<Option<TestCompositor>> = std::sync::Mutex::new(None);
+
+/// Set (or clear) the emulated source every NEW synthetic session uses.
+/// Honoured in bench mode only.
+pub fn set_test_compositor(c: Option<TestCompositor>) {
+    *TEST_COMPOSITOR.lock().unwrap_or_else(|p| p.into_inner()) = c;
+}
+
+/// The emulated source and its gate. Frame 0 is waiting when the first
+/// call comes; frame `k ≥ 1` lands at `first + (k − lead) × period`, and the
+/// slot holds only the newest frame, as WGC's does.
+struct Compositor {
+    period: Duration,
+    lead: f64,
+    first: Option<Instant>,
+    taken: Option<u64>,
+    gate: EmulatedGate,
+}
+
+enum EmulatedGate {
+    /// `wgc_backend.rs`'s legacy rule, the same shape: sleep out the rest of
+    /// a whole-millisecond period since the last call, then look at the slot.
+    Legacy {
+        period: Duration,
+        last_call: Option<Instant>,
+    },
+    SlotFirst(super::gate::SlotFirst),
+}
+
+impl Compositor {
+    fn new(c: TestCompositor) -> Self {
+        let gate = match c.gate {
+            super::gate::GateMode::Legacy => EmulatedGate::Legacy {
+                period: Duration::from_millis(1000 / u64::from(c.target_fps.max(1))),
+                last_call: None,
+            },
+            super::gate::GateMode::SlotFirst => {
+                EmulatedGate::SlotFirst(super::gate::SlotFirst::new(c.target_fps))
+            }
+        };
+        Self {
+            period: Duration::from_micros(1_000_000 / u64::from(c.source_fps.max(1))),
+            lead: c.lead.clamp(0.0, 0.99),
+            first: None,
+            taken: None,
+            gate,
+        }
+    }
+
+    fn arrival(period: Duration, lead: f64, first: Instant, k: u64) -> Instant {
+        if k == 0 {
+            first
+        } else {
+            first + period.mul_f64(k as f64 - lead)
+        }
+    }
+
+    /// The newest frame that has landed by `t`.
+    fn newest(period: Duration, lead: f64, first: Instant, t: Instant) -> u64 {
+        let since = t.saturating_duration_since(first).as_secs_f64() / period.as_secs_f64();
+        (since + lead).floor().max(0.0) as u64
+    }
+
+    /// Wait for the frame the gate hands out next; return its index and the
+    /// instant it landed in the slot.
+    ///
+    /// A frame already in the slot landed at its scheduled arrival, and any
+    /// wait since then is the gate's. When the slot is empty the frame is
+    /// waited for, and it lands when that wait ends: WGC wakes the reader on
+    /// `FrameArrived` itself, so the timer that stands in for that event
+    /// here must not count its own overshoot (up to a timer tick on Windows)
+    /// against either gate.
+    async fn next(&mut self) -> (u64, Instant) {
+        let (period, lead) = (self.period, self.lead);
+        let first = *self.first.get_or_insert_with(Instant::now);
+        let next = self.taken.map_or(0, |k| k + 1);
+        let next_at = Self::arrival(period, lead, first, next);
+        // The emulated `FrameArrived`: returns when the frame landed.
+        let wait_for_frame = || async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(next_at)).await;
+            Instant::now()
+        };
+        let (k, landed) = match &mut self.gate {
+            EmulatedGate::Legacy {
+                period: gp,
+                last_call,
+            } => {
+                if let Some(last) = *last_call {
+                    let elapsed = last.elapsed();
+                    if elapsed < *gp {
+                        tokio::time::sleep(*gp - elapsed).await;
+                    }
+                }
+                *last_call = Some(Instant::now());
+                let now = Instant::now();
+                if next_at <= now {
+                    let k = Self::newest(period, lead, first, now).max(next);
+                    (k, Self::arrival(period, lead, first, k))
+                } else {
+                    (next, wait_for_frame().await)
+                }
+            }
+            EmulatedGate::SlotFirst(gate) => {
+                let woke = if next_at > Instant::now() {
+                    Some(wait_for_frame().await)
+                } else {
+                    None
+                };
+                let wait = gate.wait(Instant::now());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                let now = Instant::now();
+                gate.took(now);
+                // The newest frame now: a fresher one may have landed while
+                // the gate paced the source.
+                let k = Self::newest(period, lead, first, now).max(next);
+                let landed = match woke {
+                    Some(at) if k == next => at,
+                    _ => Self::arrival(period, lead, first, k),
+                };
+                (k, landed)
+            }
+        };
+        self.taken = Some(k);
+        (k, landed)
+    }
 }
 
 /// L0's planted gate, set by a test in the same process (µs; bench mode
@@ -137,6 +290,14 @@ impl SyntheticCapture {
         } else {
             Duration::ZERO
         };
+        let compositor = if bench {
+            TEST_COMPOSITOR
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(Compositor::new)
+        } else {
+            None
+        };
         Self {
             interval: Duration::from_micros(1_000_000 / fps as u64),
             start: Instant::now(),
@@ -144,6 +305,7 @@ impl SyntheticCapture {
             width,
             height,
             gate,
+            compositor,
         }
     }
 
@@ -221,20 +383,30 @@ impl SyntheticCapture {
 #[async_trait::async_trait]
 impl ScreenCapture for SyntheticCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
-        // Sleep until this frame's nominal emission time. Computed
-        // from the start instant + counter * interval so we don't
-        // drift on a host where the encoder takes variable time per
-        // frame (the deadline stays anchored to wall-clock, not to
-        // "previous frame returned at X").
-        let deadline = self.start + self.interval * (self.counter as u32);
-        let now = Instant::now();
-        if deadline > now {
-            tokio::time::sleep(deadline - now).await;
-        }
-        let data = Self::render_frame(self.counter, self.width, self.height, probe::latest());
-        // L0 — the capture instant, for a same-process test to read back by
-        // the sequence number the marker carries.
-        let captured = Instant::now();
+        let (data, captured) = if let Some(c) = self.compositor.as_mut() {
+            // FR-98 C1 — an emulated event-driven source: the clock records
+            // when the frame LANDED in the slot, so L0's number includes
+            // whatever the gate made it wait.
+            let (k, landed) = c.next().await;
+            self.counter = k;
+            let data = Self::render_frame(k, self.width, self.height, probe::latest());
+            (data, landed)
+        } else {
+            // Sleep until this frame's nominal emission time. Computed
+            // from the start instant + counter * interval so we don't
+            // drift on a host where the encoder takes variable time per
+            // frame (the deadline stays anchored to wall-clock, not to
+            // "previous frame returned at X").
+            let deadline = self.start + self.interval * (self.counter as u32);
+            let now = Instant::now();
+            if deadline > now {
+                tokio::time::sleep(deadline - now).await;
+            }
+            let data = Self::render_frame(self.counter, self.width, self.height, probe::latest());
+            // L0 — the capture instant, for a same-process test to read back
+            // by the sequence number the marker carries.
+            (data, Instant::now())
+        };
         clock::record(marker::seq_of(self.counter), captured);
         if !self.gate.is_zero() {
             tokio::time::sleep(self.gate).await;
