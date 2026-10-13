@@ -54,6 +54,15 @@ pub enum TokenType {
     /// on its WebSocket connection (`role=tunnel-client`). Audience
     /// distinct from `Agent` — agents serve forwards, clients open them.
     TunnelClient,
+    /// FR-94 — the long-lived credential of a Windows device's SYSTEM
+    /// service, minted by `POST /api/agent/anchor` for a device an
+    /// administrator anchored, and kept in a SYSTEM + Administrators-only
+    /// file. It authorises exactly two things, claiming a pending Fleet RPC
+    /// for its own device and posting that command's result. Its own audience
+    /// because the agent token sits in the signed-in user's writable config
+    /// on an attended install: a user who could swap one for the other could
+    /// tell SYSTEM what to run (FR-94 §4).
+    AgentService,
 }
 
 /// Claims carried by a remote-control enrollment token (aud = enroll).
@@ -73,6 +82,22 @@ pub struct EnrollmentClaims {
 pub struct AgentClaims {
     pub sub: String, // agent_id hex
     pub tenant_id: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub token_type: TokenType,
+}
+
+/// FR-94 — claims carried by a Windows device's SYSTEM-service credential.
+/// The agent token's shape plus `anchor_id`, which names the anchor that
+/// minted it: the credential is accepted only while that is still the
+/// device's anchor, so re-anchoring revokes it. Required, not optional, so a
+/// token without the binding does not even parse as one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentServiceClaims {
+    pub sub: String, // agent_id hex
+    pub tenant_id: String,
+    pub anchor_id: String,
     pub iat: i64,
     pub exp: i64,
     pub iss: String,
@@ -462,6 +487,47 @@ impl AuthService {
         Ok(claims)
     }
 
+    /// FR-94 — mint the credential of a device's SYSTEM service: `sub` = the
+    /// agent id, `anchor_id` = the anchor it belongs to, its own audience,
+    /// and the agent token's one-year lifetime. The service renews it
+    /// (`POST /api/agent/service/renew`) under the same anchor, so the year
+    /// is a renewal interval, not the anchor's life; the anchor binding is
+    /// what revokes it.
+    pub fn issue_agent_service_token(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        anchor_id: &str,
+    ) -> Result<String, AuthError> {
+        let now = Utc::now();
+        let claims = AgentServiceClaims {
+            sub: agent_id.to_hex(),
+            tenant_id: tenant_id.to_hex(),
+            anchor_id: anchor_id.to_string(),
+            iat: now.timestamp(),
+            exp: (now + Duration::seconds(365 * 24 * 60 * 60)).timestamp(),
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::AgentService,
+        };
+        encode(&self.header(), &claims, &self.signing.encoding)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    /// FR-94 — verify a device service's credential. Refuses every other
+    /// audience, the agent token included, and [`Self::verify_agent_token`]
+    /// refuses this one: the two never stand in for each other. Whether its
+    /// `anchor_id` is still the device's anchor is the caller's check, against
+    /// the row.
+    pub fn verify_agent_service_token(&self, token: &str) -> Result<AgentServiceClaims, AuthError> {
+        let claims = self.decode_any::<AgentServiceClaims>(token, &self.validation())?;
+        if claims.token_type != TokenType::AgentService {
+            return Err(AuthError::InvalidToken(
+                "Not an agent service token".to_string(),
+            ));
+        }
+        Ok(claims)
+    }
+
     // ─── tunnel client tokens ─────────────────────────────────
 
     /// Mint a single-use tunnel-enrollment token. Returned `jti` is
@@ -644,6 +710,44 @@ mod tests {
             .issue_agent_token(ObjectId::new(), tenant, Some(60))
             .unwrap();
         assert!(s.verify_enrollment_token_any(&agent_token).is_err());
+    }
+
+    /// FR-94 §4 — the SYSTEM service's credential and the agent token never
+    /// stand in for each other, in either direction, and no other verifier
+    /// accepts the service credential. On an attended install the agent token
+    /// sits in the user's writable config, so a crossing either way would let
+    /// that user tell SYSTEM what to run.
+    #[test]
+    fn agent_service_token_audiences() {
+        let s = svc();
+        let agent = ObjectId::new();
+        let tenant = ObjectId::new();
+        let service = s
+            .issue_agent_service_token(agent, tenant, "anchor-1")
+            .unwrap();
+
+        let claims = s.verify_agent_service_token(&service).unwrap();
+        assert_eq!(claims.sub, agent.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.anchor_id, "anchor-1");
+        assert_eq!(claims.token_type, TokenType::AgentService);
+
+        // Not an agent token, an access token, or an enrollment of any kind.
+        assert!(s.verify_agent_token(&service).is_err());
+        assert!(s.verify_access_token(&service).is_err());
+        assert!(s.verify_refresh_token(&service).is_err());
+        assert!(s.verify_enrollment_token(&service).is_err());
+        assert!(s.verify_enrollment_token_any(&service).is_err());
+        assert!(s.verify_tunnel_client_token(&service).is_err());
+
+        // And the agent token, the one the user can read, is not a service
+        // credential.
+        let agent_token = s.issue_agent_token(agent, tenant, Some(60)).unwrap();
+        assert!(s.verify_agent_service_token(&agent_token).is_err());
+        let (enroll, _) = s
+            .issue_enrollment_token(ObjectId::new(), tenant, 600)
+            .unwrap();
+        assert!(s.verify_agent_service_token(&enroll).is_err());
     }
 
     #[test]

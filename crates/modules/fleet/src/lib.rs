@@ -46,7 +46,8 @@ use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
-    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, keep_busy_event::KeepBusyEventDao,
+    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
+    keep_busy_event::KeepBusyEventDao,
 };
 use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
 use tokio::sync::mpsc;
@@ -62,6 +63,7 @@ pub mod consent;
 pub mod consent_consumer;
 pub mod ctrl;
 pub mod enroll_key;
+pub mod exec_service;
 pub mod hub;
 pub mod keep_busy;
 pub mod nudge;
@@ -89,6 +91,10 @@ pub struct FleetState {
     pub consent_requests: Arc<ConsentRequestDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
+    /// FR-94 — commands waiting for a Windows device's SYSTEM service to
+    /// claim them, and the results it posts back. Shared through Mongo: the
+    /// service's calls can land on any pod.
+    pub exec_pending: Arc<ExecPendingDao>,
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
@@ -197,6 +203,7 @@ impl Module for FleetState {
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
             exec_audit: Arc::new(ExecAuditDao::new(db)),
+            exec_pending: Arc::new(ExecPendingDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_hub,
@@ -309,6 +316,8 @@ impl Module for FleetState {
                 post(agent_exec::cancel),
             )
             .route("/{agent_id}/exec-policy", put(agent_exec::set_policy))
+            // FR-94 — revoke a device's SYSTEM service without removing it.
+            .route("/{agent_id}/exec-anchor", delete(exec_service::unanchor))
             // Remote config — records an INTENT for the device to reconcile.
             .route(
                 "/{agent_id}/desired-config",
@@ -351,7 +360,18 @@ impl Module for FleetState {
             )
             .route("/installer/{flavour}", get(agent_release::installer_proxy))
             .route("/crash", post(agent_crash::ingest))
-            .route("/self/unenroll", post(agent::self_unenroll));
+            .route("/self/unenroll", post(agent::self_unenroll))
+            // FR-94 — a Windows device's SYSTEM service. The anchor takes an
+            // admin-issued enrollment token, and the claim and the result take
+            // the service's OWN credential (`AuthAgentService`), never the
+            // agent token the signed-in user can read.
+            .route("/anchor", post(exec_service::anchor))
+            .route("/service/renew", post(exec_service::renew))
+            .route("/service/rpc/{request_id}/claim", post(exec_service::claim))
+            .route(
+                "/service/rpc/{request_id}/result",
+                post(exec_service::result),
+            );
 
         // Public owner-consent routes (Phase 4). No auth extractor — the
         // unguessable token IS the capability.
@@ -407,9 +427,9 @@ impl Module for FleetState {
             .with_state(self.clone())
     }
 
-    /// The nine collections this module owns. The first eight specs are the
+    /// The ten collections this module owns. The first eight specs are the
     /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
-    /// (FR-92 P7) was born here.
+    /// (FR-92 P7) and `exec_pending` (FR-94) were born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -466,6 +486,21 @@ impl Module for FleetState {
                     index(bson::doc! { "agent_id": 1, "at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-94 — commands waiting for a Windows device's SYSTEM service.
+            // `request_id` is unique: the claim, the result, the cancel and
+            // the waiter's poll each address ONE row by it, and nothing lists
+            // a device's rows (the doorbell names the request). The TTL
+            // (`expires_at`, after `claim_by`) only keeps the collection
+            // small. Expiry is enforced by the claim's own `claim_by` filter,
+            // not by the TTL monitor, which runs once a minute.
+            IndexSet {
+                collection: "exec_pending",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "request_id": 1 }),
+                    index_ttl(bson::doc! { "expires_at": 1 }, 0),
                 ],
             },
             // A config change that opens exec is the same class of event as

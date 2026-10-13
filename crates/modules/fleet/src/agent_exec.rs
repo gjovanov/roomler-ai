@@ -46,7 +46,8 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     error::Error as HubError,
     models::{
-        Agent, ExecAuditEvent, ExecDenyReason, ExecMode, ExecOutcome, ExecPolicy, exec_limits,
+        Agent, ExecAuditEvent, ExecDenyReason, ExecMode, ExecOutcome, ExecPending, ExecPolicy,
+        OsKind, exec_limits,
     },
     signaling::ServerMsg,
 };
@@ -202,6 +203,10 @@ pub struct ExecAuditRow {
     pub output_sha256: String,
     pub output_bytes: u64,
     pub truncated: bool,
+    /// FR-94 — `system` / `console_user` / `worker`; absent on a refusal and
+    /// on rows written before FR-94.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 impl From<ExecAuditEvent> for ExecAuditRow {
@@ -224,6 +229,7 @@ impl From<ExecAuditEvent> for ExecAuditRow {
             output_sha256: e.output_sha256,
             output_bytes: e.output_bytes,
             truncated: e.truncated,
+            ran_as: e.ran_as,
         }
     }
 }
@@ -316,6 +322,25 @@ pub async fn authorize(
         }
     }
 
+    // FR-94 — the org requires Windows commands to run as SYSTEM, and this
+    // Windows device cannot: refuse rather than run as the signed-in user.
+    // Here, inside `authorize`, so every entry point (the HTTP route, a bulk
+    // fan-out, a device's `rc:rpc.request`) obeys it. A gate applied at one
+    // entry point only would be a courtesy.
+    if matches!(agent.os, OsKind::Windows)
+        && !crate::exec_service::routes_via_service(state, agent)
+        && state
+            .tenants
+            .base
+            .find_by_id(tenant_id)
+            .await
+            .map(|t| t.settings.exec_require_system)
+            // A failed read cannot prove the org allows the worker. Refuse.
+            .unwrap_or(true)
+    {
+        return Err(ExecDenyReason::SystemRequired);
+    }
+
     // Ceiling, enforced LAST so a refusal is attributable to an identity that
     // already passed the gates (and is audited by `dispatch`) rather than an
     // anonymous throttle. This is the one place both the HTTP route and the
@@ -373,6 +398,8 @@ pub async fn dispatch(
         output_sha256: String::new(),
         output_bytes: 0,
         truncated: false,
+        // Set once the command runs; a refusal names no identity.
+        ran_as: None,
     };
 
     let deny = |mut audit: ExecAuditEvent, reason: ExecDenyReason, message: String| {
@@ -397,6 +424,9 @@ pub async fn dispatch(
         }
         Ok(()) => {
             let consent_mode = agent.exec_policy.effective_consent_mode();
+            // FR-94 — a Windows device anchored for SYSTEM exec gets the
+            // command through its service; every other device, as before.
+            let via_service = crate::exec_service::routes_via_service(state, agent);
             let msg = ServerMsg::RpcExec {
                 request_id: request_id.clone(),
                 shell: shell.clone(),
@@ -406,6 +436,7 @@ pub async fn dispatch(
                 cwd: body.cwd.clone(),
                 caller: caller.display.clone(),
                 consent_mode: Some(consent_mode),
+                via_service,
             };
             // An attended device spends up to the prompt window waiting for a
             // human BEFORE the command's own budget starts, so the two are
@@ -414,12 +445,31 @@ pub async fn dispatch(
             if consent_mode != roomler_ai_remote_control::models::ConsentMode::Auto {
                 deadline += CONSENT_GRACE;
             }
-            match state
-                .rc_hub
-                .exec_on_agent(agent_id, tenant_id, request_id.clone(), msg, deadline)
+            let result = if via_service {
+                run_via_service(
+                    state,
+                    tenant_id,
+                    agent_id,
+                    &request_id,
+                    &shell,
+                    body,
+                    caller,
+                    (timeout_ms, max_output_bytes),
+                    msg,
+                    deadline,
+                )
                 .await
-            {
+            } else {
+                state
+                    .rc_hub
+                    .exec_on_agent(agent_id, tenant_id, request_id.clone(), msg, deadline)
+                    .await
+            };
+            match result {
                 Ok(outcome) => {
+                    // FR-94 — the server's own routing decision. The device's
+                    // claim about its identity rides in `outcome.ran_as`.
+                    audit.ran_as = Some(if via_service { "system" } else { "worker" }.to_string());
                     audit.exit_code = outcome.exit_code;
                     audit.duration_ms = Some(outcome.duration_ms);
                     audit.truncated = outcome.truncated;
@@ -477,6 +527,92 @@ pub async fn dispatch(
     }
 }
 
+/// FR-94 — how long a pending row outlives its claim deadline, so that a
+/// result arriving late still finds it before the TTL monitor deletes it.
+const PENDING_RETAIN_MS: i64 = 10 * 60 * 1000;
+
+/// FR-94 — how long after the dispatch (and after any consent prompt) the
+/// SYSTEM service may still claim a command. Shorter than [`RESULT_GRACE`]
+/// on purpose: a command claimed at the last moment still gets its full
+/// `timeout_ms`, and its result the difference, before the caller gives up.
+const CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// FR-94 — the SYSTEM-service path: queue the command where the service
+/// will claim it, push the frame, and wait on both this pod's waiter and the
+/// shared row ([`crate::exec_service::await_service_result`]).
+///
+/// The claim closes early enough that whatever starts can also finish while
+/// the caller still waits: the consent window if there is one, then
+/// [`CLAIM_WINDOW`]. Nothing may start that nobody will hear the end of.
+#[allow(clippy::too_many_arguments)]
+async fn run_via_service(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    request_id: &str,
+    shell: &str,
+    body: &ExecRequestBody,
+    caller: &Caller,
+    (timeout_ms, max_output_bytes): (u64, u64),
+    msg: ServerMsg,
+    deadline: std::time::Duration,
+) -> Result<ExecOutcome, HubError> {
+    let now_ms = DateTime::now().timestamp_millis();
+    let ms = |d: std::time::Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX / 4);
+    // `deadline` is `timeout + RESULT_GRACE`, plus `CONSENT_GRACE` when a
+    // prompt comes first; take the command's own budget and the result
+    // grace back out, and what is left is the prompt.
+    let prompt =
+        deadline.saturating_sub(std::time::Duration::from_millis(timeout_ms) + RESULT_GRACE);
+    let claim_by_ms = now_ms + ms(prompt + CLAIM_WINDOW);
+    let row = ExecPending {
+        id: None,
+        request_id: request_id.to_string(),
+        tenant_id,
+        agent_id,
+        shell: shell.to_string(),
+        command: body.command.clone(),
+        timeout_ms,
+        max_output_bytes,
+        cwd: body.cwd.clone(),
+        caller: caller.display.clone(),
+        run_as: "system".to_string(),
+        state: ExecPending::PENDING.to_string(),
+        created_at: DateTime::from_millis(now_ms),
+        claim_by: DateTime::from_millis(claim_by_ms),
+        expires_at: DateTime::from_millis(now_ms + ms(deadline) + PENDING_RETAIN_MS),
+        claimed_at: None,
+        outcome: None,
+    };
+    if let Err(e) = state.exec_pending.insert(&row).await {
+        // Nothing was pushed, so nothing can run. Reported as a failed send,
+        // which is what it is from the caller's side.
+        warn!(
+            %agent_id, %request_id, %e,
+            "fleet-rpc: could not queue the command for the device's SYSTEM service"
+        );
+        return Err(HubError::SendFailed);
+    }
+    let started = match state
+        .rc_hub
+        .start_exec(agent_id, tenant_id, request_id.to_string(), msg)
+    {
+        Ok(started) => started,
+        Err(e) => {
+            // The frame never left, so no doorbell can ring; withdraw the row
+            // anyway, so "pending" only ever means "may still run".
+            if let Err(ce) = state.exec_pending.cancel(request_id, tenant_id).await {
+                warn!(%request_id, %ce, "fleet-rpc: could not withdraw an unsent command");
+            }
+            return Err(e);
+        }
+    };
+    crate::exec_service::await_service_result(
+        state, started, tenant_id, agent_id, request_id, deadline,
+    )
+    .await
+}
+
 fn deny_message(reason: ExecDenyReason) -> String {
     match reason {
         ExecDenyReason::OrgDisabled => {
@@ -503,6 +639,15 @@ fn deny_message(reason: ExecDenyReason) -> String {
         ExecDenyReason::RateLimited => "too many commands for this device".to_string(),
         ExecDenyReason::AgentDisabled => {
             "remote execution is disabled on the device itself".to_string()
+        }
+        ExecDenyReason::SystemRequired => {
+            "this organization requires Windows commands to run as SYSTEM, and this device \
+             cannot: an administrator has not anchored it (`roomlerd anchor`), or its service \
+             is not running"
+                .to_string()
+        }
+        ExecDenyReason::ClaimRefused => {
+            "the device's service claimed a command that is not pending for it".to_string()
         }
     }
 }
@@ -681,6 +826,13 @@ pub async fn cancel(
     .await?;
     let agent = load_agent(&state, tid, &agent_id).await?;
     let aid = agent.id.unwrap_or_default();
+    // FR-94 — withdraw a command no SYSTEM service has claimed yet, so a late
+    // doorbell can never start it. A claimed one is the device's to stop,
+    // through the `rc:rpc.cancel` below. Best-effort: there is no row unless
+    // the command took the service path.
+    if let Err(e) = state.exec_pending.cancel(&request_id, tid).await {
+        warn!(%aid, %request_id, %e, "fleet-rpc: could not withdraw a pending command");
+    }
     match state.rc_hub.cancel_exec(aid, tid, request_id) {
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
@@ -740,6 +892,12 @@ pub async fn set_policy(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrgExecSettings {
     pub remote_exec_enabled: bool,
+    /// FR-94 — refuse a Windows command that cannot run as SYSTEM rather than
+    /// run it as the signed-in user. Always present in a response. In a PUT,
+    /// absent means "leave it as it is": every client written before FR-94
+    /// sends only the kill-switch, and must not reset this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_require_system: Option<bool>,
 }
 
 /// `GET /api/tenant/{tenant_id}/exec-settings` — gate 1's current state.
@@ -763,6 +921,7 @@ pub async fn get_org_settings(
     let tenant = state.tenants.base.find_by_id(tid).await?;
     Ok(Json(OrgExecSettings {
         remote_exec_enabled: tenant.settings.remote_exec_enabled,
+        exec_require_system: Some(tenant.settings.exec_require_system),
     }))
 }
 
@@ -786,7 +945,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
-    let tenant = state
+    let mut tenant = state
         .tenants
         .set_remote_exec_enabled(tid, body.remote_exec_enabled)
         .await?;
@@ -795,8 +954,16 @@ pub async fn set_org_settings(
         enabled = body.remote_exec_enabled,
         "fleet-rpc: org kill-switch changed"
     );
+    if let Some(required) = body.exec_require_system {
+        tenant = state.tenants.set_exec_require_system(tid, required).await?;
+        warn!(
+            tenant = %tenant_id, admin = %auth.user_id, required,
+            "fleet-rpc: org exec_require_system changed"
+        );
+    }
     Ok(Json(OrgExecSettings {
         remote_exec_enabled: tenant.settings.remote_exec_enabled,
+        exec_require_system: Some(tenant.settings.exec_require_system),
     }))
 }
 

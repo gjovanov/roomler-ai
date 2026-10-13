@@ -109,6 +109,14 @@ pub struct ConnectedAgent {
     /// with [`Error::ExecUnsupported`] rather than pushing a frame the agent
     /// will silently drop.
     pub supports_exec: bool,
+    /// FR-94 — the agent advertises `exec-system`: an administrator anchored
+    /// this Windows device, and its SYSTEM service answered the worker's
+    /// health ring. Set after registration and on every caps re-announcement,
+    /// because the service can come up or be anchored while the worker is
+    /// connected. Kept per connection, like
+    /// [`Self::supports_ssh_grant_ack`]: a rollback must not leave the server
+    /// routing commands to a doorbell the running agent cannot ring.
+    pub supports_exec_system: bool,
     /// Roomler SSH — the agent advertises `AgentCaps.rpc` containing `ssh`,
     /// i.e. it was built with the `ssh-server` feature and will record an
     /// `rc:ssh.grant`. Same rationale as [`Self::supports_exec`]: pushing a
@@ -271,6 +279,18 @@ impl Drop for ExecWaiterGuard {
     fn drop(&mut self) {
         self.hub.inner.exec_waiters.remove(&self.request_id);
     }
+}
+
+/// FR-94 — a command pushed to a device whose SYSTEM service runs it
+/// ([`Hub::start_exec`]). `rx` resolves when a result reaches THIS pod: the
+/// worker's own `rc:rpc.result` (a refusal, a declined prompt, a doorbell
+/// nobody answered) or the service's result route landing here. A result
+/// posted to another pod is in the shared `exec_pending` row instead, which
+/// the caller polls. Dropping it deregisters the waiter, exactly as
+/// `exec_on_agent` does.
+pub struct StartedExec {
+    pub rx: oneshot::Receiver<ExecOutcome>,
+    _guard: ExecWaiterGuard,
 }
 
 /// Emitted by [`Hub::create_session`] to have the API layer notify the device
@@ -448,6 +468,9 @@ impl Hub {
             // positional bool that every test would have to thread through.
             // `false` is the safe starting point: an agent whose capability is
             // never recorded is treated as unable to serve SSH.
+            // FR-94 — set right after registration, like `supports_ssh`; an
+            // agent whose word is never recorded takes the worker path.
+            supports_exec_system: false,
             supports_ssh: false,
             // Same setter, same reasoning: `false` = answered without waiting,
             // exactly as before FR-83.
@@ -1674,6 +1697,25 @@ impl Hub {
         }
     }
 
+    /// FR-94 — record whether this connection runs exec as SYSTEM through
+    /// its service (`exec-system`). Called after registration and on every
+    /// caps re-announcement. No-op if the agent is already gone.
+    pub fn set_agent_exec_system_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_exec_system = supports;
+        }
+    }
+
+    /// FR-94 — does the agent, connected to THIS pod, run exec as SYSTEM?
+    /// `None` = not connected here. Exec reaches only an agent on this pod
+    /// anyway ([`Self::exec_on_agent`]).
+    pub fn agent_supports_exec_system(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.supports_exec_system)
+    }
+
     /// FR-83 — record whether this connection acknowledges grants
     /// (`ssh-grant-ack`), alongside [`Self::set_agent_ssh_support`] and for
     /// the same reasons. A separate setter rather than a second positional
@@ -2385,6 +2427,41 @@ impl Hub {
             Ok(Err(_)) => Err(Error::AgentOffline(agent_id.to_hex())),
             Err(_) => Err(Error::ExecTimeout(agent_id.to_hex())),
         }
+    }
+
+    /// FR-94 — the service path's first half of [`Self::exec_on_agent`]: the
+    /// same checks (connected here, in this tenant, `exec` advertised), the
+    /// same waiter, the frame pushed. The waiting is the caller's, because it
+    /// must also watch the shared store for a result posted to another pod.
+    pub fn start_exec(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        request_id: String,
+        msg: ServerMsg,
+    ) -> Result<StartedExec> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_exec {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        self.inner.exec_waiters.insert(request_id.clone(), tx);
+        let guard = ExecWaiterGuard {
+            hub: self.clone(),
+            request_id,
+        };
+        // On a send error the guard drops here and takes the waiter with it.
+        self.send_to_agent(agent_id, msg)?;
+        Ok(StartedExec { rx, _guard: guard })
     }
 
     /// Hand a `rc:rpc.result` to whoever is parked on it. `false` = nobody
@@ -4419,6 +4496,7 @@ mod tests {
             cwd: None,
             caller: "tester".into(),
             consent_mode: Some(ConsentMode::Auto),
+            via_service: false,
         }
     }
 

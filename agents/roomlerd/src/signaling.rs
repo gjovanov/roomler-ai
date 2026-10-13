@@ -3985,7 +3985,35 @@ async fn handle_server_msg(
             cwd,
             caller,
             consent_mode,
+            via_service,
         } => {
+            // FR-94 — a command meant for this device's SYSTEM service. This
+            // build has no doorbell, and it never advertises `exec-system`, so
+            // a server should never send this here. If one does, refuse it:
+            // running it in this process would run it as an identity nobody
+            // asked for (see `exec::RunAs`).
+            if via_service {
+                warn!(
+                    %request_id, %caller,
+                    "rc:rpc.exec via the SYSTEM service refused — this build has no service runner"
+                );
+                let _ = outbound_tx
+                    .send(ClientMsg::RpcResult {
+                        request_id,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        truncated: false,
+                        duration_ms: 0,
+                        error: Some(
+                            "this device cannot run commands through its SYSTEM service \
+                             (update the agent)"
+                                .to_string(),
+                        ),
+                    })
+                    .await;
+                return Ok(());
+            }
             // Gate 4, read LIVE (docs/remote-config.md): a pushed change takes
             // effect on the next command, with no restart — which is why
             // this is the atomic and not the startup snapshot.

@@ -117,15 +117,95 @@ pub async fn authenticate(
     let token = bearer_token(headers)
         .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
 
-    // Audience-checked: `verify_agent_token` rejects a user JWT.
+    // Audience-checked: `verify_agent_token` rejects a user JWT, and FR-94's
+    // service credential.
     let claims = fleet
         .auth
         .verify_agent_token(token)
         .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
 
-    let agent_id = ObjectId::parse_str(&claims.sub)
+    let (agent_id, tenant_id, agent) =
+        accepted_agent(fleet, &claims.sub, &claims.tenant_id).await?;
+    Ok(AuthAgent {
+        agent_id,
+        tenant_id,
+        agent,
+    })
+}
+
+/// FR-94 — a Windows device's SYSTEM service, authenticated with its OWN
+/// credential (`TokenType::AgentService`, minted by `POST /api/agent/anchor`)
+/// and still a device we accept. The agent token never passes here, and this
+/// credential never passes [`AuthAgent`]. On an attended install the agent
+/// token sits in the signed-in user's writable config, and nothing that user
+/// can write may decide what SYSTEM runs (FR-94 §4).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AuthAgentService {
+    pub agent_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub agent: Agent,
+}
+
+/// [`authenticate`]'s twin for the service credential: the same bearer rule,
+/// the same row check, a different audience, and one more rule: the
+/// credential must name the device's CURRENT anchor.
+pub async fn authenticate_service(
+    fleet: &FleetState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthAgentService, ApiError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+    let claims = fleet
+        .auth
+        .verify_agent_service_token(token)
+        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+    let (agent_id, tenant_id, agent) =
+        accepted_agent(fleet, &claims.sub, &claims.tenant_id).await?;
+    if !anchor_is_current(&agent, &claims.anchor_id) {
+        tracing::info!(%agent_id, %tenant_id, "refusing service-authed request: anchor superseded");
+        // 401: this credential is dead for good, and the service must hear
+        // "re-anchor", not "try again".
+        return Err(ApiError::Unauthorized(
+            "this device's SYSTEM service was re-anchored or un-anchored; anchor it again".into(),
+        ));
+    }
+    Ok(AuthAgentService {
+        agent_id,
+        tenant_id,
+        agent,
+    })
+}
+
+/// A service credential is live only while it names the device's current
+/// anchor. Re-anchoring writes a new id, so every credential an earlier
+/// anchor minted dies with it: one live SYSTEM service per device, and an
+/// administrator can revoke one without removing the device. An empty id
+/// (a row from before the field) matches nothing.
+fn anchor_is_current(agent: &Agent, anchor_id: &str) -> bool {
+    anchor_matches(
+        agent.exec_anchor.as_ref().map(|a| a.anchor_id.as_str()),
+        anchor_id,
+    )
+}
+
+/// The rule over just the two ids, split out for the tests the same way
+/// [`refusal_reason_parts`] is.
+fn anchor_matches(current: Option<&str>, presented: &str) -> bool {
+    current.is_some_and(|c| !c.is_empty() && c == presented)
+}
+
+/// The row check both credentials share: the ids in the claims, the row
+/// they name, and [`refusal_reason`]. One definition of "this device may
+/// still act", whichever credential is asking.
+async fn accepted_agent(
+    fleet: &FleetState,
+    sub: &str,
+    tenant: &str,
+) -> Result<(ObjectId, ObjectId, Agent), ApiError> {
+    let agent_id = ObjectId::parse_str(sub)
         .map_err(|_| ApiError::Unauthorized("invalid agent_id in claims".to_string()))?;
-    let tenant_id = ObjectId::parse_str(&claims.tenant_id)
+    let tenant_id = ObjectId::parse_str(tenant)
         .map_err(|_| ApiError::Unauthorized("invalid tenant_id in claims".to_string()))?;
 
     // The row is the revocation list. A lookup FAILURE is a 500, not a
@@ -164,11 +244,20 @@ pub async fn authenticate(
         return Err(ApiError::Unauthorized(reason.to_string()));
     }
 
-    Ok(AuthAgent {
-        agent_id,
-        tenant_id,
-        agent,
-    })
+    Ok((agent_id, tenant_id, agent))
+}
+
+impl<S> FromRequestParts<S> for AuthAgentService
+where
+    FleetState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let fleet = FleetState::from_ref(state);
+        authenticate_service(&fleet, &parts.headers).await
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthAgent
@@ -214,6 +303,17 @@ mod tests {
     #[test]
     fn bearer_returns_none_on_missing_header() {
         assert_eq!(bearer_token(&HeaderMap::new()), None);
+    }
+
+    /// FR-94 — a service credential is live only for the device's current
+    /// anchor. No anchor, another anchor, and an empty id on both sides
+    /// (a row from before the field) all refuse.
+    #[test]
+    fn only_the_current_anchor_is_accepted() {
+        assert!(anchor_matches(Some("a1"), "a1"));
+        assert!(!anchor_matches(Some("a2"), "a1"), "re-anchored");
+        assert!(!anchor_matches(None, "a1"), "un-anchored");
+        assert!(!anchor_matches(Some(""), ""), "an empty id matches nothing");
     }
 
     #[test]

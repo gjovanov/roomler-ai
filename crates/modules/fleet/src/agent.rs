@@ -487,6 +487,11 @@ pub struct AgentResponse {
     /// where the difference has teeth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_policy: Option<crate::agent_exec::ExecPolicyBody>,
+    /// FR-94 — an administrator anchored this Windows device for SYSTEM
+    /// exec: when, and by whom (a user id). Absent on every unanchored device.
+    /// Plain strings, like every id and timestamp here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_anchor: Option<ExecAnchorView>,
     /// Roomler-SSH gate 3 as stored, with the same replace-on-save warning as
     /// [`Self::exec_policy`] — and this is the one that makes `Option`
     /// load-bearing rather than tidy.
@@ -1496,12 +1501,24 @@ fn to_agent_response(
         capabilities: a.capabilities,
         relay_home: a.relay_home,
         exec_policy: configured_only(a.exec_policy),
+        exec_anchor: a.exec_anchor.map(|x| ExecAnchorView {
+            anchored_at: fmt_dt(x.anchored_at),
+            anchored_by: x.anchored_by.to_hex(),
+        }),
         ssh_policy: configured_only(a.ssh_policy),
         remote_config,
         overlay_public_key,
         overlay_key_epoch,
         key_rotation,
     }
+}
+
+/// FR-94 — [`roomler_ai_remote_control::models::ExecAnchor`] as the API shows
+/// it.
+#[derive(Debug, Serialize)]
+pub struct ExecAnchorView {
+    pub anchored_at: String,
+    pub anchored_by: String,
 }
 
 pub fn fmt_dt(dt: DateTime) -> String {
