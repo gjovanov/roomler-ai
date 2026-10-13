@@ -642,14 +642,20 @@ const TERMINATE_WAIT: Duration = Duration::from_millis(1500);
 /// reports `STOP_PENDING` (hint: [`SHUTDOWN_BOUND`]) the moment Stop lands.
 pub(super) const WORKER_GRACEFUL_STOP_BUDGET: Duration = Duration::from_secs(8);
 
+/// #2087 — how long the shutdown path waits for netd to be reaped after
+/// `kill()`. `Child::wait` has no timeout, and a netd stuck in a kernel call
+/// would otherwise hold the whole service stop open.
+const NETD_REAP_WAIT: Duration = TERMINATE_WAIT;
+
 /// #2010 — the longest this supervisor's shutdown takes from the moment Stop or
 /// Preshutdown is posted: up to one [`POLL_INTERVAL`] before the loop sees it,
-/// the graceful budget, then `TerminateProcess` and its reap wait. The host's
-/// `STOP_PENDING` wait hint is built from this, so raising a budget here raises
-/// the hint with it.
+/// the graceful budget, then `TerminateProcess` and its reap wait, then netd's
+/// kill and its reap wait (#2087). The host's `STOP_PENDING` wait hint is built
+/// from this, so raising a budget here raises the hint with it.
 pub(super) const SHUTDOWN_BOUND: Duration = POLL_INTERVAL
     .saturating_add(WORKER_GRACEFUL_STOP_BUDGET)
-    .saturating_add(TERMINATE_WAIT);
+    .saturating_add(TERMINATE_WAIT)
+    .saturating_add(NETD_REAP_WAIT);
 
 /// #1683 — mint the per-spawn stop event and the `--stop-event <name>` argv to
 /// hand the worker. On failure it logs and returns `(None, empty)` so a spawn is
@@ -1165,9 +1171,30 @@ impl NetdChild {
 
     fn shutdown(&mut self) {
         if let Some(mut c) = self.child.take() {
-            tracing::info!(pid = c.id(), "supervisor: terminating netd on shutdown");
+            let pid = c.id();
+            tracing::info!(pid, "supervisor: terminating netd on shutdown");
             let _ = c.kill();
-            let _ = c.wait();
+            if !reap_within(&mut c, NETD_REAP_WAIT) {
+                tracing::warn!(
+                    pid,
+                    wait_ms = NETD_REAP_WAIT.as_millis() as u64,
+                    "supervisor: netd not seen to exit after kill; the stop goes on without it"
+                );
+            }
+        }
+    }
+}
+
+/// #2087 — wait up to `timeout` for `child` to exit. `Child::wait` has no
+/// timeout, so this polls `try_wait`. True once the exit is seen; false on the
+/// timeout, or when the status can no longer be read.
+fn reap_within(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) | Err(_) => return false,
         }
     }
 }
@@ -2627,6 +2654,41 @@ mod tests {
 
     /// Track A stage 1 — the env lever's truthiness (the config path is
     /// exercised in the field; this pins the emergency override parse).
+    /// A process that runs ~30 s unless killed: `ping` sends one echo a second
+    /// whatever answers, so the test never depends on the network.
+    fn long_runner() -> std::process::Child {
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping")
+    }
+
+    /// #2087 — a killed child is reaped well inside the bound.
+    #[test]
+    fn reap_within_sees_a_killed_child_exit() {
+        let mut c = long_runner();
+        c.kill().expect("kill");
+        let started = Instant::now();
+        assert!(reap_within(&mut c, Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// #2087 — the shutdown path must not hang on a child that will not die:
+    /// past the bound it gives up and reports so.
+    #[test]
+    fn reap_within_gives_up_at_the_bound() {
+        let mut c = long_runner();
+        let started = Instant::now();
+        assert!(!reap_within(&mut c, Duration::from_millis(300)));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
     #[test]
     fn netd_env_lever_truthiness() {
         for v in ["1", "true", "TRUE", " yes ", "on"] {

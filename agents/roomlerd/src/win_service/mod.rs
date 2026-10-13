@@ -51,12 +51,14 @@ pub mod system_context_probe;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{
@@ -178,10 +180,21 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
     let _ = delete_service(NEW_SERVICE_NAME);
     let _ = delete_service(LEGACY_SERVICE_NAME);
 
-    let access = ServiceAccess::CHANGE_CONFIG;
+    // START as well: a failure action that restarts the service may only be
+    // set through a handle that could start it.
+    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     match manager.create_service(&service_info, access) {
         Ok(s) => {
             let _ = s.set_description(SERVICE_DESCRIPTION);
+            // #2087 — without these a host process that dies stays dead until a
+            // reboot. Best-effort: a refusal must not sink the install.
+            if let Err(e) = apply_recovery_actions(&s) {
+                tracing::warn!(
+                    error = %e,
+                    service = NEW_SERVICE_NAME,
+                    "could not set the service's recovery actions"
+                );
+            }
         }
         // ERROR_SERVICE_EXISTS — a prior NEW service is still marked-for-deletion
         // (a handle is open, e.g. services.msc), so we couldn't recreate it this
@@ -199,6 +212,49 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
     // devbox smoke. The service is AutoStart and is brought up by the
     // `DisableSystemContext` -> `environment::restart_service` action (a fresh
     // SCM handle on a now-clean service — the proven rc.190 path) or on next boot.
+    Ok(())
+}
+
+/// #2087 — the restart delays after the 1st, 2nd and every later failure.
+const RECOVERY_RESTART_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// #2087 — a day without a failure resets the count to the first delay.
+const RECOVERY_RESET_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// #2087 — what the SCM does when the host fails: restart it, only ever
+/// restart (never reboot the machine, never run a command), on a backoff.
+fn recovery_actions() -> ServiceFailureActions {
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(RECOVERY_RESET_PERIOD),
+        reboot_msg: None,
+        command: None,
+        actions: Some(
+            RECOVERY_RESTART_DELAYS
+                .iter()
+                .map(|&delay| ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay,
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// #2087 — write [`recovery_actions`], and have them apply to a non-crash
+/// failure too: a `STOPPED` reported with a non-zero exit code, which is how
+/// the host says it ended on its own ([`exit_code_for`]). The handle needs
+/// `CHANGE_CONFIG` and `START`.
+fn apply_recovery_actions(service: &windows_service::service::Service) -> Result<()> {
+    service
+        .update_failure_actions(recovery_actions())
+        .context("update_failure_actions")?;
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .context("set_failure_actions_on_non_crash_failures")?;
     Ok(())
 }
 
@@ -348,7 +404,18 @@ fn service_main_inner() -> Result<()> {
     let status_cell: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let status_for_handler = Arc::clone(&status_cell);
 
+    // #2087 — whether the SCM asked us to stop. It decides the exit code the
+    // host reports with STOPPED: see `exit_code_for`.
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_requested_by_handler = Arc::clone(&stop_requested);
+
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        if matches!(
+            control_event,
+            ServiceControl::Stop | ServiceControl::Preshutdown
+        ) {
+            stop_requested_by_handler.store(true, Ordering::SeqCst);
+        }
         let mut report = |status: ServiceStatus| match status_for_handler.get() {
             Some(handle) => {
                 if let Err(e) = handle.set_service_status(status) {
@@ -402,11 +469,61 @@ fn service_main_inner() -> Result<()> {
             });
     }
 
+    let outcome = run_host(sup_rx);
+    let exit_code = exit_code_for(stop_requested.load(Ordering::SeqCst), outcome);
+    tracing::info!(?outcome, ?exit_code, "service stopping");
+    status_handle
+        .set_service_status(stopped_status(exit_code))
+        .context("set_service_status(Stopped)")?;
+    Ok(())
+}
+
+/// #2087 — how the host's run ended, after `Running` was reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostOutcome {
+    /// The supervisor returned. It does that only after a stop was posted (or
+    /// its control channel closed), so without a stop request it is unexpected.
+    SupervisorReturned,
+    SupervisorFailed,
+    SupervisorPanicked,
+    /// No supervisor at all: the worker path or the startup sequence failed.
+    StartupFailed,
+}
+
+/// #2087 — the exit code the host reports with STOPPED.
+///
+/// A stop someone asked for (Stop / Preshutdown: an operator, an MSI, the OS)
+/// always ends `0`. The service applies its failure actions to non-crash
+/// failures too, so any other code would have the SCM undo that stop. A host
+/// that ends on its own reports a distinct non-zero code (`sc query` shows it
+/// as `SERVICE_EXIT_CODE`), and the SCM restarts it. Before #2087 every path
+/// reported `0`, and a dead supervisor left the device dark until a reboot.
+fn exit_code_for(stop_requested: bool, outcome: HostOutcome) -> ServiceExitCode {
+    if stop_requested {
+        return ServiceExitCode::Win32(0);
+    }
+    ServiceExitCode::ServiceSpecific(match outcome {
+        HostOutcome::SupervisorReturned => 1,
+        HostOutcome::SupervisorFailed => 2,
+        HostOutcome::SupervisorPanicked => 3,
+        HostOutcome::StartupFailed => 4,
+    })
+}
+
+/// Everything the host does after reporting `Running`: resolve the worker,
+/// run the once-per-start sequence, and wait out the supervisor's whole life.
+fn run_host(sup_rx: mpsc::Receiver<supervisor::SupervisorEvent>) -> HostOutcome {
     // Resolve the worker binary path once. `current_exe` is the same
     // EXE the SCM launched (the service host); we relaunch it with
     // a `run` subcommand to drive the existing user-mode signaling /
     // capture pipeline in the active session's context.
-    let worker_exe = std::env::current_exe().context("resolving current_exe for worker spawn")?;
+    let worker_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "resolving current_exe for worker spawn");
+            return HostOutcome::StartupFailed;
+        }
+    };
     let worker_args = worker_args();
 
     tracing::info!(
@@ -426,23 +543,29 @@ fn service_main_inner() -> Result<()> {
         sup_rx: Some(sup_rx),
         handle: None,
     };
-    run_startup_sequence(&mut steps, worker_exe, worker_args)?;
-    let sup_handle = steps
-        .handle
-        .take()
-        .context("supervisor thread handle missing after spawn")?;
+    if let Err(e) = run_startup_sequence(&mut steps, worker_exe, worker_args) {
+        tracing::error!(error = %e, "service: the startup sequence failed");
+        return HostOutcome::StartupFailed;
+    }
+    let Some(sup_handle) = steps.handle.take() else {
+        tracing::error!("supervisor thread handle missing after spawn");
+        return HostOutcome::StartupFailed;
+    };
 
     match sup_handle.join() {
-        Ok(Ok(())) => tracing::info!("supervisor exited cleanly"),
-        Ok(Err(e)) => tracing::error!(error = %e, "supervisor returned error"),
-        Err(_) => tracing::error!("supervisor thread panicked"),
+        Ok(Ok(())) => {
+            tracing::info!("supervisor exited cleanly");
+            HostOutcome::SupervisorReturned
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "supervisor returned error");
+            HostOutcome::SupervisorFailed
+        }
+        Err(_) => {
+            tracing::error!("supervisor thread panicked");
+            HostOutcome::SupervisorPanicked
+        }
     }
-
-    tracing::info!("service stopping");
-    status_handle
-        .set_service_status(stopped_status())
-        .context("set_service_status(Stopped)")?;
-    Ok(())
 }
 
 /// The argv the supervisor spawns every worker with — the user-session worker
@@ -530,12 +653,12 @@ fn running_status() -> ServiceStatus {
     }
 }
 
-fn stopped_status() -> ServiceStatus {
+fn stopped_status(exit_code: ServiceExitCode) -> ServiceStatus {
     ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
@@ -569,8 +692,8 @@ fn on_control(
 }
 
 /// #2010 — the wait hint `STOP_PENDING` carries: the supervisor's whole
-/// shutdown bound plus slack for netd's teardown on a loaded box. A stop that
-/// outlives its own hint reads as hung to services.msc.
+/// shutdown bound (netd's reap included since #2087) plus slack for a loaded
+/// box. A stop that outlives its own hint reads as hung to services.msc.
 const STOP_PENDING_WAIT_HINT: Duration =
     supervisor::SHUTDOWN_BOUND.saturating_add(Duration::from_secs(10));
 
@@ -776,6 +899,74 @@ mod tests {
             s.wait_hint,
             supervisor::SHUTDOWN_BOUND
         );
+    }
+
+    /// #2087 — the SCM restarts a failed host, and only ever restarts it: a
+    /// reboot or a command would act on the whole machine.
+    #[test]
+    fn recovery_only_restarts_on_a_backoff_and_resets_after_a_quiet_day() {
+        let r = recovery_actions();
+        let actions = r.actions.expect("actions are set");
+        assert!(
+            actions
+                .iter()
+                .all(|a| a.action_type == ServiceActionType::Restart),
+            "{actions:?}"
+        );
+        let delays: Vec<Duration> = actions.iter().map(|a| a.delay).collect();
+        assert_eq!(
+            delays,
+            [
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+                Duration::from_secs(60)
+            ]
+        );
+        assert_eq!(
+            r.reset_period,
+            ServiceFailureResetPeriod::After(Duration::from_secs(86_400))
+        );
+        assert!(r.command.is_none() && r.reboot_msg.is_none());
+    }
+
+    const OUTCOMES: [HostOutcome; 4] = [
+        HostOutcome::SupervisorReturned,
+        HostOutcome::SupervisorFailed,
+        HostOutcome::SupervisorPanicked,
+        HostOutcome::StartupFailed,
+    ];
+
+    /// #2087 — a stop someone asked for ends `0` whatever happened during it,
+    /// or the SCM's non-crash failure actions would undo an operator's stop.
+    #[test]
+    fn a_requested_stop_always_ends_zero() {
+        for o in OUTCOMES {
+            assert_eq!(exit_code_for(true, o), ServiceExitCode::Win32(0), "{o:?}");
+        }
+    }
+
+    /// #2087 — a host that ends on its own reports non-zero, so the SCM brings
+    /// it back, and each cause is told apart in `sc query`.
+    #[test]
+    fn a_host_that_ends_on_its_own_reports_a_distinct_failure() {
+        let codes: Vec<ServiceExitCode> =
+            OUTCOMES.iter().map(|&o| exit_code_for(false, o)).collect();
+        for (o, c) in OUTCOMES.iter().zip(&codes) {
+            assert!(
+                matches!(c, ServiceExitCode::ServiceSpecific(n) if *n != 0),
+                "{o:?} -> {c:?}"
+            );
+        }
+        let unique: std::collections::HashSet<ServiceExitCode> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "{codes:?}");
+    }
+
+    #[test]
+    fn stopped_status_carries_the_exit_code() {
+        let s = stopped_status(ServiceExitCode::ServiceSpecific(3));
+        assert_eq!(s.current_state, ServiceState::Stopped);
+        assert_eq!(s.exit_code, ServiceExitCode::ServiceSpecific(3));
+        assert!(s.controls_accepted.is_empty());
     }
 }
 // RETIRED-NAME-ANCHOR-END
