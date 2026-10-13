@@ -166,6 +166,12 @@ impl SyntheticCapture {
     /// where each pixel column encodes one bit of the counter, plus the L4
     /// [`marker`] in the bottom-left.
     pub fn render_sized(counter: u64, width: u32, height: u32) -> Vec<u8> {
+        Self::render_frame(counter, width, height, None)
+    }
+
+    /// [`Self::render_sized`], plus the last bench probe in the bottom-right
+    /// marker when there is one (FR-16 L4). Pure over its inputs.
+    pub fn render_frame(counter: u64, width: u32, height: u32, probe: Option<u16>) -> Vec<u8> {
         let mut data = vec![0u8; (width * height * 4) as usize];
         let shift = (counter % width as u64) as u32;
         for y in 0..height {
@@ -198,6 +204,16 @@ impl SyntheticCapture {
             }
         }
         marker::paint_bgra(&mut data, width, height, width * 4, marker::seq_of(counter));
+        if let Some(seq) = probe {
+            marker::paint_bgra_at(
+                marker::Corner::BottomRight,
+                &mut data,
+                width,
+                height,
+                width * 4,
+                seq,
+            );
+        }
         data
     }
 }
@@ -215,7 +231,7 @@ impl ScreenCapture for SyntheticCapture {
         if deadline > now {
             tokio::time::sleep(deadline - now).await;
         }
-        let data = Self::render_sized(self.counter, self.width, self.height);
+        let data = Self::render_frame(self.counter, self.width, self.height, probe::latest());
         // L0 — the capture instant, for a same-process test to read back by
         // the sequence number the marker carries.
         let captured = Instant::now();
@@ -309,18 +325,47 @@ pub mod marker {
         (s << 4) | crc4(s) as u16
     }
 
-    /// The grid's top-left corner in a `w × h` frame, or `None` when the
-    /// frame is too small to hold it with its margin.
-    pub fn origin(w: u32, h: u32) -> Option<(u32, u32)> {
-        if w < W + 2 * MARGIN || h < H + 2 * MARGIN {
-            return None;
-        }
-        Some((MARGIN, h - MARGIN - H))
+    /// Which corner a marker sits in. The frame's own sequence number is
+    /// bottom-left; the last bench probe the source saw is bottom-right
+    /// (FR-16 L4, [`super::probe`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Corner {
+        BottomLeft,
+        BottomRight,
     }
 
-    /// Paint `seq` into a BGRA buffer, the quiet margin as mid-grey.
+    /// The bottom-left grid's top-left corner in a `w × h` frame, or `None`
+    /// when the frame is too small to hold it with its margin.
+    pub fn origin(w: u32, h: u32) -> Option<(u32, u32)> {
+        origin_at(Corner::BottomLeft, w, h)
+    }
+
+    /// [`origin`] for either corner. The bottom-right grid needs room for
+    /// both, so the two can never overlap.
+    pub fn origin_at(corner: Corner, w: u32, h: u32) -> Option<(u32, u32)> {
+        let need_w = match corner {
+            Corner::BottomLeft => W + 2 * MARGIN,
+            Corner::BottomRight => 2 * (W + 2 * MARGIN),
+        };
+        if w < need_w || h < H + 2 * MARGIN {
+            return None;
+        }
+        let x = match corner {
+            Corner::BottomLeft => MARGIN,
+            Corner::BottomRight => w - MARGIN - W,
+        };
+        Some((x, h - MARGIN - H))
+    }
+
+    /// Paint `seq` into a BGRA buffer's bottom-left corner, the quiet margin
+    /// as mid-grey.
     pub fn paint_bgra(data: &mut [u8], w: u32, h: u32, stride: u32, seq: u16) {
-        let Some((ox, oy)) = origin(w, h) else {
+        paint_bgra_at(Corner::BottomLeft, data, w, h, stride, seq);
+    }
+
+    /// [`paint_bgra`] into either corner.
+    pub fn paint_bgra_at(corner: Corner, data: &mut [u8], w: u32, h: u32, stride: u32, seq: u16) {
+        let Some((ox, oy)) = origin_at(corner, w, h) else {
             return;
         };
         let word = word(seq);
@@ -350,16 +395,32 @@ pub mod marker {
     /// downscale factor in [`SCALES`]. `None` when no factor yields a grid
     /// whose every block is readable and whose CRC matches.
     pub fn decode_luma(y: &[u8], w: u32, h: u32, stride: usize) -> Option<u16> {
-        SCALES
-            .iter()
-            .find_map(|&k| decode_at_scale(y, w, h, stride, k))
+        decode_luma_at(Corner::BottomLeft, y, w, h, stride)
     }
 
-    fn decode_at_scale(y: &[u8], w: u32, h: u32, stride: usize, k: u32) -> Option<u16> {
-        // The marker sits at (MARGIN, src_h − MARGIN − H) of the SOURCE
-        // frame; a k× downscale divides every coordinate by k.
+    /// [`decode_luma`] for either corner.
+    pub fn decode_luma_at(corner: Corner, y: &[u8], w: u32, h: u32, stride: usize) -> Option<u16> {
+        SCALES
+            .iter()
+            .find_map(|&k| decode_at_scale(corner, y, w, h, stride, k))
+    }
+
+    fn decode_at_scale(
+        corner: Corner,
+        y: &[u8],
+        w: u32,
+        h: u32,
+        stride: usize,
+        k: u32,
+    ) -> Option<u16> {
+        // The marker sits MARGIN in from its side and the bottom of the
+        // SOURCE frame; a k× downscale divides every coordinate by k.
         let block = BLOCK / k;
-        let (ox, oy) = (MARGIN / k, h.checked_sub((MARGIN + H) / k)?);
+        let ox = match corner {
+            Corner::BottomLeft => MARGIN / k,
+            Corner::BottomRight => w.checked_sub((MARGIN + W) / k)?,
+        };
+        let oy = h.checked_sub((MARGIN + H) / k)?;
         if block < 4 || ox + W / k > w || oy + H / k > h {
             return None;
         }
@@ -429,6 +490,59 @@ pub mod marker {
         ]
         .into_iter()
         .all(|m| m.is_some_and(|m| GREY.contains(&m)))
+    }
+}
+
+/// Is this process a bench target: the synthetic source selected AND bench
+/// mode on? What the hello advertises as `bench` in `AgentCaps.video`, so a
+/// viewer turns its probes on only where they mean something.
+pub fn bench_active() -> bool {
+    bench_enabled() && super::synthetic_env_enabled()
+}
+
+/// FR-16 L4 — the bench probe. A viewer in bench mode sends
+/// `{"t":"probe","seq":N}` on the input DataChannel; the synthetic source
+/// paints the last `N` it saw into the bottom-right [`marker`] of every frame
+/// that follows, and the viewer times send → first decoded frame carrying
+/// `N`. That is input to photon through the real pipeline, minus only the
+/// host's own input stack, which `roomlerd probe-target` covers.
+///
+/// A probe never reaches an injector. Outside bench mode it is consumed and
+/// dropped.
+pub mod probe {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const NONE: u32 = u32::MAX;
+    static LATEST: AtomicU32 = AtomicU32::new(NONE);
+
+    /// Is `text` a probe? If it is, it is consumed here, recorded when bench
+    /// mode is on, and the caller must not treat it as input.
+    pub fn accept_json(text: &str) -> bool {
+        // Every input message passes through here: a substring check first,
+        // so pointer moves never pay for a second JSON parse.
+        if !text.contains("\"probe\"") {
+            return false;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return false;
+        };
+        if v.get("t").and_then(|t| t.as_str()) != Some("probe") {
+            return false;
+        }
+        if super::bench_enabled()
+            && let Some(seq) = v.get("seq").and_then(|s| s.as_u64())
+        {
+            LATEST.store((seq & 0x0FFF) as u32, Ordering::Release);
+        }
+        true
+    }
+
+    /// The last probe recorded, if any.
+    pub fn latest() -> Option<u16> {
+        match LATEST.load(Ordering::Acquire) {
+            NONE => None,
+            v => Some(v as u16),
+        }
     }
 }
 
@@ -677,6 +791,51 @@ mod tests {
             "a single misread block must not pass the CRC"
         );
         assert!(read.is_none() || read == Some(0x321), "got {read:?}");
+    }
+
+    #[test]
+    fn the_probe_marker_reads_back_from_the_bottom_right_and_only_when_painted() {
+        let y_of = |probe| {
+            let data = SyntheticCapture::render_frame(0x123, 320, 240, probe);
+            luma_of(&data, 320, 240)
+        };
+        let painted = y_of(Some(0x5A5));
+        assert_eq!(
+            marker::decode_luma_at(marker::Corner::BottomRight, &painted, 320, 240, 320),
+            Some(0x5A5)
+        );
+        // The frame's own number is untouched beside it.
+        assert_eq!(marker::decode_luma(&painted, 320, 240, 320), Some(0x123));
+        // No probe yet: nothing to read, never a stale or invented number.
+        let unpainted = y_of(None);
+        assert_eq!(
+            marker::decode_luma_at(marker::Corner::BottomRight, &unpainted, 320, 240, 320),
+            None
+        );
+    }
+
+    #[test]
+    fn the_two_markers_never_overlap() {
+        // Too narrow for both: the probe marker is refused, not squeezed in.
+        assert!(marker::origin_at(marker::Corner::BottomLeft, 200, 240).is_some());
+        assert_eq!(
+            marker::origin_at(marker::Corner::BottomRight, 200, 240),
+            None
+        );
+        let (lx, _) = marker::origin_at(marker::Corner::BottomLeft, 320, 240).unwrap();
+        let (rx, _) = marker::origin_at(marker::Corner::BottomRight, 320, 240).unwrap();
+        assert!(lx + marker::W + marker::MARGIN <= rx - marker::MARGIN);
+    }
+
+    #[test]
+    fn only_a_probe_message_is_consumed_and_typing_the_word_still_reaches_input() {
+        assert!(probe::accept_json(r#"{"t":"probe","seq":7}"#));
+        assert!(!probe::accept_json(
+            r#"{"t":"mouse_move","x":0.1,"y":0.2,"mon":0}"#
+        ));
+        // The substring pre-check must not swallow a person typing "probe".
+        assert!(!probe::accept_json(r#"{"t":"key_text","text":"probe"}"#));
+        assert!(!probe::accept_json("not json at all \"probe\""));
     }
 
     #[test]
