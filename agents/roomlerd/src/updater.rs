@@ -2790,7 +2790,39 @@ pub async fn run_periodic(
     // A runtime `cfg!` (not an attribute) so both bodies stay type-checked
     // on every platform.
     if cfg!(target_os = "macos") {
-        return macos_forward_triggers(shutdown, trigger_rx).await;
+        return forward_triggers(shutdown, trigger_rx).await;
+    }
+    // FR-96 P2a — Linux has the same root half, `roomler-update.service`, on a
+    // host whose installer enabled it (P3: a per-user install). There a
+    // per-user daemon installs nothing either: it cannot write /usr, which is
+    // the whole of #2046. Decided once, here, at the daemon's start; enabling
+    // or disabling the helper takes effect at the next one (install.sh
+    // restarts the daemon after enabling it).
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let enabled = helper_enable_link_in(&UPDATE_HELPER_ENABLE_LINKS.map(std::path::Path::new));
+        match decide_update_owner(euid, tunnel_core::env::flag("UPDATE_HELPER", true), enabled) {
+            UpdateOwner::Helper(link) => {
+                tracing::info!(
+                    enabled_by = %link.display(),
+                    "auto-updater: the root update helper (roomler-update.service) owns updates \
+                     on this host — forwarding rc:agent.update to its wake file, installing nothing here"
+                );
+                return forward_triggers(shutdown, trigger_rx).await;
+            }
+            UpdateOwner::InProcess(why) => {
+                tracing::info!(%why, "auto-updater: this daemon installs its own updates");
+            }
+            UpdateOwner::InProcessBesideHelper(link) => tracing::warn!(
+                enabled_by = %link.display(),
+                "auto-updater: a ROOT daemon on a host whose roomler-update helper is ALSO enabled — \
+                 this daemon keeps installing its own updates (a system install is unchanged), and \
+                 the two can race on the package manager. The helper is for per-user installs: \
+                 `sudo systemctl disable --now roomler-update.path roomler-update.timer`"
+            ),
+        }
     }
     let mut first = true;
     let mut consecutive_defers: u32 = 0;
@@ -2998,8 +3030,84 @@ pub fn update_trigger_path() -> &'static str {
     }
 }
 
+/// FR-96 P2a — where `systemctl enable` (and `enable --runtime`) puts the
+/// links for the root helper's two wake sources: each unit's `WantedBy=`
+/// target's `.wants` directory (locked to the units by
+/// `the_enable_links_are_where_systemctl_enable_puts_the_units`).
+///
+/// A file check, deliberately not `systemctl is-enabled`: it needs no bus and
+/// no child process, and it reads the same under the per-user unit's sandbox.
+#[cfg(target_os = "linux")]
+const UPDATE_HELPER_ENABLE_LINKS: [&str; 4] = [
+    "/etc/systemd/system/paths.target.wants/roomler-update.path",
+    "/etc/systemd/system/timers.target.wants/roomler-update.timer",
+    "/run/systemd/system/paths.target.wants/roomler-update.path",
+    "/run/systemd/system/timers.target.wants/roomler-update.timer",
+];
+
+/// The first of `links` that leads to a unit file, if any — a host whose root
+/// update helper is enabled.
+///
+/// `exists()` FOLLOWS the link, on purpose: a link left dangling by a removed
+/// package is not an enabled helper, and treating it as one would stop this
+/// daemon updating at all (it would forward wakes nobody hears).
+#[cfg(target_os = "linux")]
+fn helper_enable_link_in(links: &[&std::path::Path]) -> Option<PathBuf> {
+    links.iter().find(|l| l.exists()).map(|l| l.to_path_buf())
+}
+
+/// Who installs this Linux daemon's updates (FR-96 P2a).
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq)]
+enum UpdateOwner {
+    /// The root helper; this daemon forwards pushes to its wake file. Carries
+    /// the enable link that said so, for the log line.
+    Helper(PathBuf),
+    /// This daemon, in-process, as before FR-96 — and why.
+    InProcess(&'static str),
+    /// A ROOT daemon on a host whose helper is ALSO enabled. It keeps
+    /// installing (AC4: a system install is unchanged), and the caller warns:
+    /// two updaters can race on the package manager's lock.
+    InProcessBesideHelper(PathBuf),
+}
+
+/// FR-96 P2a — pure, so every combination is a unit test.
+///
+/// - A **root** daemon installs its own updates, helper or not. The helper is
+///   the root half of a PER-USER install; a system install already has one.
+/// - `ROOMLERD_UPDATE_HELPER=0` (`helper_switch == false`) gives back today's
+///   in-process path exactly — FR-96's kill switch.
+/// - Otherwise a per-user daemon steps aside iff the helper is enabled.
+///
+/// ⚠️ The safe direction on doubt is IN-PROCESS: a wrong "helper" answer
+/// freezes the host (it forwards wakes nobody hears — #2046 again), while a
+/// wrong "in-process" answer costs a failed pkexec at most, and the helper's
+/// own timer still runs if it exists.
+#[cfg(target_os = "linux")]
+fn decide_update_owner(euid: u32, helper_switch: bool, enabled_by: Option<PathBuf>) -> UpdateOwner {
+    if euid == 0 {
+        return match enabled_by {
+            Some(link) => UpdateOwner::InProcessBesideHelper(link),
+            None => UpdateOwner::InProcess("a root daemon installs its own updates"),
+        };
+    }
+    if !helper_switch {
+        return UpdateOwner::InProcess(
+            "ROOMLERD_UPDATE_HELPER=0 — the in-process path, as before FR-96",
+        );
+    }
+    match enabled_by {
+        Some(link) => UpdateOwner::Helper(link),
+        None => UpdateOwner::InProcess(
+            "the root update helper is not enabled on this host (roomler-update.path / .timer)",
+        ),
+    }
+}
+
 /// Touch the update-helper wake file. Portable (plain fs) so the forwarder
-/// type-checks on every platform; only ever called on macOS at runtime.
+/// type-checks on every platform; called at runtime on macOS, and on Linux by
+/// a per-user daemon whose host has the root helper enabled (FR-96 P2a,
+/// through [`forward_triggers`]).
 ///
 /// O_NOFOLLOW + O_EXCL-free create: /var/tmp is sticky, another local user
 /// could have planted a symlink at this exact name — refuse to write
@@ -3025,14 +3133,32 @@ pub(crate) fn queue_update_check_at(path: &std::path::Path) -> std::io::Result<(
     writeln!(f, "{}", chrono::Utc::now().to_rfc3339())
 }
 
-/// macOS replacement for the [`run_periodic`] body: forward every
-/// `rc:agent.update` trigger to the wake file and do nothing else. The
-/// periodic cadence lives in the helper's own `StartInterval` — ONE owner
-/// of "check+download+verify+install", zero in-process installs.
+/// The [`run_periodic`] body wherever a root update helper owns updates:
+/// forward every `rc:agent.update` trigger to the wake file and do nothing
+/// else. The periodic cadence lives in the helper's own schedule (the plist's
+/// `StartInterval` on macOS, `roomler-update.timer` on Linux) — ONE owner of
+/// "check+download+verify+install", zero in-process installs.
 ///
-/// Compiles on every platform (portable tokio + fs) so the whole updater
-/// keeps type-checking in cross-platform CI lanes; only macOS takes it.
-async fn macos_forward_triggers(
+/// Taken by every macOS agent, and from FR-96 P2a by a Linux per-user daemon
+/// on a host whose helper is enabled ([`decide_update_owner`]). Compiles on
+/// every platform (portable tokio + fs) so the whole updater keeps
+/// type-checking in cross-platform CI lanes.
+async fn forward_triggers(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+) {
+    forward_triggers_to(
+        std::path::Path::new(update_trigger_path()),
+        shutdown,
+        trigger_rx,
+    )
+    .await
+}
+
+/// [`forward_triggers`] against an explicit wake path, so a test can prove a
+/// push writes the wake file and takes no install path at all.
+async fn forward_triggers_to(
+    wake: &std::path::Path,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
 ) {
@@ -3046,28 +3172,54 @@ async fn macos_forward_triggers(
                 if let Some(tag) = pin {
                     // Deliberate: pins do NOT cross the trigger boundary
                     // (see MACOS_UPDATE_TRIGGER — content is untrusted).
-                    // The helper installs LATEST; a pinned downgrade on
-                    // macOS is a manual `sudo installer -pkg` by design.
-                    tracing::warn!(
-                        %tag,
-                        "rc:agent.update pin ignored on macOS — the update helper installs \
-                         the latest release; pinned installs are manual (sudo installer -pkg …)"
-                    );
+                    // The helper installs LATEST; a pinned downgrade is a
+                    // manual root install by design, on both platforms.
+                    if cfg!(target_os = "macos") {
+                        tracing::warn!(
+                            %tag,
+                            "rc:agent.update pin ignored on macOS — the update helper installs \
+                             the latest release; pinned installs are manual (sudo installer -pkg …)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            %tag,
+                            "rc:agent.update pin ignored — the root update helper \
+                             (roomler-update.service) installs the latest release; a pinned \
+                             install is manual (sudo apt-get install ./<deb>, or the tarball)"
+                        );
+                    }
                 }
                 // RETIRED-NAME-ANCHOR(2): the anchor now covers only this comment's own
                 // mention of the legacy paths. FR-46 P5a moved the live strings below to
                 // /var/log/roomler and /etc/roomler; the legacy /var/log/roomler-agent and
                 // /etc/roomler-agent are migrated by the .pkg postinstall. docs/fr/FR-46
-                match queue_update_check() {
-                    Ok(()) => tracing::info!(
-                        trigger = MACOS_UPDATE_TRIGGER,
+                match queue_update_check_at(wake) {
+                    Ok(()) if cfg!(target_os = "macos") => tracing::info!(
+                        trigger = %wake.display(),
                         "rc:agent.update queued for the root update helper (com.roomler.update); \
                          watch /var/log/roomler/update.log"
                     ),
-                    Err(e) => tracing::warn!(
+                    Ok(()) => tracing::info!(
+                        trigger = %wake.display(),
+                        "rc:agent.update queued for the root update helper (roomler-update.service); \
+                         watch `journalctl -u roomler-update.service`"
+                    ),
+                    Err(e) if cfg!(target_os = "macos") => tracing::warn!(
                         error = %e,
                         "could not write the update-helper wake file — if this Mac has \
                          /etc/roomler/disable-auto-update set, updates are manual"
+                    ),
+                    // FR-96 P2a — on Linux the likely cause is the unit's own
+                    // sandbox: a `roomler.service` from before P2a has no
+                    // `ReadWritePaths=-/var/tmp`, and ProtectSystem=strict makes
+                    // /var/tmp read-only (EROFS) wherever the user manager
+                    // applies it (Fedora). Nothing is lost but latency.
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        wake = %wake.display(),
+                        "could not write the update-helper wake file — the push waits for the \
+                         helper's own timer (every 6 h). Read-only file system = this daemon's \
+                         unit predates FR-96 P2a: re-run install.sh to refresh it"
                     ),
                 }
             }
@@ -4354,6 +4506,175 @@ mod tests {
             b"keep",
             "the symlink target was not written through"
         );
+    }
+
+    // ── FR-96 P2a: the per-user daemon steps aside for the root helper ─
+
+    /// Every combination of who-is-asking × the kill switch × enabled. The
+    /// only one that steps aside is a per-user daemon, switch on, helper
+    /// enabled; a root daemon never does (AC4), and warns when it sees one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_owner_is_the_helper_only_for_a_per_user_daemon_with_it_enabled() {
+        let link = || Some(PathBuf::from("/etc/systemd/system/paths.target.wants/x"));
+        assert_eq!(
+            decide_update_owner(1000, true, link()),
+            UpdateOwner::Helper(link().unwrap())
+        );
+        assert!(matches!(
+            decide_update_owner(1000, true, None),
+            UpdateOwner::InProcess(_)
+        ));
+        assert!(
+            matches!(
+                decide_update_owner(1000, false, link()),
+                UpdateOwner::InProcess(_)
+            ),
+            "ROOMLERD_UPDATE_HELPER=0 must give back the in-process path"
+        );
+        assert_eq!(
+            decide_update_owner(0, true, link()),
+            UpdateOwner::InProcessBesideHelper(link().unwrap()),
+            "a root daemon keeps installing, and is told the two may race"
+        );
+        assert!(matches!(
+            decide_update_owner(0, true, None),
+            UpdateOwner::InProcess(_)
+        ));
+        assert!(matches!(
+            decide_update_owner(0, false, link()),
+            UpdateOwner::InProcessBesideHelper(_)
+        ));
+    }
+
+    /// An enable link counts only if it LEADS to a unit file: a link left
+    /// dangling by a removed package must not make this daemon forward wakes
+    /// nobody hears (the safe direction is in-process).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_enable_link_follows_the_link_to_the_unit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unit = tmp.path().join("roomler-update.path");
+        let live = tmp.path().join("paths.target.wants-roomler-update.path");
+        let dangling = tmp.path().join("timers.target.wants-roomler-update.timer");
+        let absent = tmp.path().join("never-made");
+        std::fs::write(&unit, b"[Path]\n").expect("unit");
+        std::os::unix::fs::symlink(&unit, &live).expect("live link");
+        std::os::unix::fs::symlink(tmp.path().join("removed.timer"), &dangling)
+            .expect("dangling link");
+
+        assert_eq!(
+            helper_enable_link_in(&[absent.as_path(), dangling.as_path(), live.as_path()]),
+            Some(live.clone()),
+            "the first link that leads to a unit"
+        );
+        assert_eq!(
+            helper_enable_link_in(&[absent.as_path(), dangling.as_path()]),
+            None,
+            "a dangling link is not an enabled helper"
+        );
+        assert_eq!(helper_enable_link_in(&[]), None);
+    }
+
+    /// The links the daemon looks for must be where `systemctl enable` (and
+    /// `enable --runtime`) puts each unit: its `WantedBy=` target's `.wants`.
+    /// Changing a unit's target without this list would leave every per-user
+    /// daemon installing in-process beside an enabled helper, unseen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_enable_links_are_where_systemctl_enable_puts_the_units() {
+        let mut want = Vec::new();
+        for (unit, text) in [
+            (
+                "roomler-update.path",
+                include_str!("../packaging/linux/roomler-update.path"),
+            ),
+            (
+                "roomler-update.timer",
+                include_str!("../packaging/linux/roomler-update.timer"),
+            ),
+        ] {
+            let target = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("WantedBy="))
+                .unwrap_or_else(|| panic!("{unit} has no WantedBy="));
+            for root in ["/etc/systemd/system", "/run/systemd/system"] {
+                want.push(format!("{root}/{target}.wants/{unit}"));
+            }
+        }
+        let mut have: Vec<String> = UPDATE_HELPER_ENABLE_LINKS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        have.sort();
+        assert_eq!(have, want);
+    }
+
+    /// The per-user unit must let the daemon write the wake file: its sandbox
+    /// (ProtectSystem=strict) leaves /var/tmp read-only wherever the user
+    /// manager applies it, and then every push fails EROFS (Fedora).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_user_unit_lets_the_daemon_write_the_wake_file() {
+        let unit = include_str!("../packaging/linux/roomler.service");
+        let dir = std::path::Path::new(LINUX_UPDATE_TRIGGER)
+            .parent()
+            .expect("the wake file has a directory");
+        let granted = unit
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("ReadWritePaths="))
+            .flat_map(str::split_whitespace)
+            .map(|p| p.trim_start_matches('-'))
+            .any(|p| std::path::Path::new(p) == dir);
+        assert!(
+            granted,
+            "roomler.service must carry ReadWritePaths= for {}",
+            dir.display()
+        );
+    }
+
+    /// A push, on a host whose helper owns updates, writes the wake file and
+    /// nothing else — a pinned push too (the pin never crosses the boundary;
+    /// the helper installs the latest). The loop ends on shutdown.
+    #[tokio::test]
+    async fn a_forwarded_push_writes_the_wake_file_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wake = tmp.path().join("roomler-update-check");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(4);
+        let w = wake.clone();
+        let task =
+            tokio::spawn(async move { forward_triggers_to(&w, shutdown_rx, trigger_rx).await });
+
+        async fn appears(p: &std::path::Path) -> bool {
+            for _ in 0..200 {
+                if p.exists() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+
+        trigger_tx.send(None).await.expect("push");
+        assert!(appears(&wake).await, "a push writes the wake file");
+
+        std::fs::remove_file(&wake).expect("the helper consumes it");
+        trigger_tx
+            .send(Some("agent-v0.4.1".to_string()))
+            .await
+            .expect("pinned push");
+        assert!(
+            appears(&wake).await,
+            "a pinned push still only wakes the helper"
+        );
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the forwarder ends on shutdown")
+            .expect("no panic");
     }
 
     // ── Linux .deb install candidates ───────────────────────────────
