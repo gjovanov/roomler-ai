@@ -5804,4 +5804,34 @@ mod macos_kernel_tests {
 
         tun.del_cidr_route("0.0.0.0/8").await;
     }
+
+    /// #2081 — a utun installs REAL routes (the exit-node `/1` halves land
+    /// through `add_cidr_route`, exercised above), so a carrier exemption it
+    /// cannot pin must come back as an error. The inherited `Ok(())` is what
+    /// told the exit gate every exemption was pinned, and it then routed the
+    /// WS, coturn and the exit's own endpoint into this utun.
+    #[tokio::test]
+    async fn an_exemption_it_cannot_pin_is_refused_not_reported_pinned() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        // TEST-NET-3 (RFC 5737): a carrier endpoint that routes nowhere real.
+        for ip in [
+            std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            "2001:db8::7".parse().expect("documentation v6"),
+        ] {
+            let err = tun.add_host_exemption(ip).await.expect_err(
+                "an exemption with no route behind it must be refused, never reported pinned",
+            );
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{ip}: {err}");
+        }
+    }
 }
