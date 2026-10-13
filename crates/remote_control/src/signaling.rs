@@ -1620,6 +1620,14 @@ pub enum ClientMsg {
         /// netmap `routes`. Empty for a normal node (`#[serde(default)]`).
         #[serde(default)]
         advertised_routes: Vec<String>,
+        /// FR-97 P0b — why `advertised_routes` is empty although the device was
+        /// configured to offer routes: the host cannot forward or NAT for the
+        /// overlay (a Mac; Windows Home, #2077). The server can show it beside
+        /// the route approval, so an admin sees "cannot serve" rather than
+        /// nothing at all. Additive both ways: an older agent never sends it,
+        /// an older server ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_offer_withheld: Option<String>,
     },
 
     /// Node trickles updated connectivity candidates; the server fans a
@@ -7250,6 +7258,7 @@ mod tests {
             supports_server_relay_strategy: true,
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
+            route_offer_withheld: Some("WinNAT is not available".into()),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.join""#));
@@ -7265,9 +7274,15 @@ mod tests {
                 supports_server_relay_strategy,
                 supports_derp_floor,
                 advertised_routes,
+                route_offer_withheld,
                 ..
             } => {
                 assert_eq!(wg_public_key, "cHVia2V5");
+                // FR-97 P0b — the reason a device offers nothing round-trips.
+                assert_eq!(
+                    route_offer_withheld.as_deref(),
+                    Some("WinNAT is not available")
+                );
                 assert_eq!(mtu, 1280);
                 assert!(supported.iter().any(|t| t == "wireguard-v1"));
                 assert!(supports_quic, "supports_quic must round-trip");
@@ -7299,9 +7314,12 @@ mod tests {
             ClientMsg::OverlayJoin {
                 supports_forced_derp,
                 supports_overlay_echo,
+                route_offer_withheld,
                 ..
             } => {
                 assert!(!supports_forced_derp, "absent flag must default false");
+                // FR-97 P0b back-compat lock: an older agent says nothing.
+                assert_eq!(route_offer_withheld, None);
                 // Data-probe back-compat lock: a pre-capability join (no
                 // supports_overlay_echo key) defaults false ⇒ peers probe
                 // this node with ICMP, never the overlay-native echo.

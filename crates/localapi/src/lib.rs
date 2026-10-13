@@ -133,6 +133,12 @@ pub struct NodeStatus {
     /// ignore the extra field; a v4-only / non-exit daemon omits it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node: Option<ExitNodeStatus>,
+    /// FR-97 P0b — why this node offers no `/0` and no subnet route although
+    /// it was configured to: the host cannot forward or NAT for the overlay.
+    /// `None` = offering as configured (or nothing configured). Additive both
+    /// ways: an older daemon omits it, an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_offer_withheld: Option<String>,
     /// S1b — the config file this daemon actually LOADED. Ends the desktop's
     /// guessing game about which of the per-user / machine-global copies is
     /// live (their resolution ladders disagreed for plain-SCM installs).
@@ -2214,6 +2220,10 @@ pub struct OverlayView {
     /// unless this node is configured as an exit-node client. The daemon copies
     /// it verbatim into [`NodeStatus::exit_node`].
     pub exit_node: Option<ExitNodeStatus>,
+    /// FR-97 P0b — why this node offers no routes it was configured to, filled
+    /// by the overlay runtime. The daemon copies it verbatim into
+    /// [`NodeStatus::route_offer_withheld`].
+    pub route_offer_withheld: Option<String>,
     /// S2 — MagicDNS status, filled by the overlay runtime after its DNS
     /// bring-up. `None` when MagicDNS is off. The daemon copies it
     /// verbatim into [`NodeStatus::dns`].
@@ -4626,6 +4636,7 @@ mod tests {
                 connected: true,
                 ephemeral: false,
                 exit_node: None,
+                route_offer_withheld: None,
                 config_path: None,
                 dns: None,
                 srflx: None,

@@ -2233,6 +2233,11 @@ fn print_status(s: &NodeStatus) {
         };
         println!("  exit node   {} ({state})", ex.selector);
     }
+    // FR-97 P0b — this node was configured to offer `/0` or subnet routes and
+    // offers none, because the host cannot forward or NAT for its peers.
+    if let Some(why) = &s.route_offer_withheld {
+        println!("  routes      offer withheld — {why}");
+    }
     // S2 — MagicDNS status (only when the tenant has a magic domain and the
     // overlay published it). "resolver down" / "OS steer failed" are the two
     // states worth an operator's eye.
