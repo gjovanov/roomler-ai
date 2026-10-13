@@ -27,6 +27,22 @@ pub fn current() -> Option<DesktopBrief> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// FR-93 P3d — whether the desktop a controller would see is a Wayland one:
+/// the cached brief's session (at most [`REFRESH`] old), else logind asked
+/// now. A greeter counts, a tty or nobody signed in does not.
+#[cfg(target_os = "linux")]
+pub fn seen_is_wayland() -> bool {
+    if let Some(brief) = current() {
+        return brief.kind == "wayland";
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    crate::keep_busy::logind::sessions()
+        .as_deref()
+        .and_then(|all| pick::seen_session(all, uid == 0, uid))
+        .is_some_and(|s| s.kind == "wayland")
+}
+
 /// Start the refresher (once per process; a second call does nothing).
 pub fn start() {
     #[cfg(target_os = "linux")]
