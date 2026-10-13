@@ -117,15 +117,21 @@ const PROBE_JITTER_MS: u64 = 34;
 /// ignored. A real cadence regression (half the rate) still fails it.
 const CLEAN_FPS_FLOOR: f64 = 0.75;
 
-/// FR-101 P1a's replay cells. A replay goes out this long after a keyframe
-/// the agent cut on its own, and a keyframe within `REPLAY_ANSWER` of it is
-/// the agent obeying it. Nothing else cuts one in that window: the encoder's
-/// own period is 60 frames (two seconds at 30 fps), and a clean link never
-/// makes the controller ask. The agent honours one PLI per 500 ms
-/// (`peer.rs` `MIN_KEYFRAME_GAP`), so the next replay waits until the answer
-/// window has closed.
-const REPLAY_AFTER_IDR: Duration = Duration::from_millis(300);
-const REPLAY_ANSWER: Duration = Duration::from_millis(600);
+/// FR-101 P1a's replay cells. Each keyframe past the warm-up triggers one
+/// replay, `REPLAY_AFTER_IDR` after it, and a keyframe within `REPLAY_ANSWER`
+/// of the replay is the agent obeying it. Nothing else cuts one in that
+/// window: the encoder's own period is 60 frames (two seconds at 30 fps), and
+/// a clean link never makes the controller ask.
+///
+/// Where replays are refused, only that period triggers them: three in a
+/// run at 30 fps, two at the clean cell's fps floor. Where they are obeyed,
+/// each answer triggers the next. `REPLAY_AFTER_IDR` is longer than the
+/// agent's one honoured PLI per 500 ms (`peer.rs` `MIN_KEYFRAME_GAP`), so
+/// every replay in that chain can be answered. A first cut that waited for
+/// the encoder's period instead (an obeyed replay restarts it) fit only two
+/// replays in the run on the CI runner: exactly the assertion's floor.
+const REPLAY_AFTER_IDR: Duration = Duration::from_millis(600);
+const REPLAY_ANSWER: Duration = Duration::from_millis(500);
 
 /// One link condition.
 #[derive(Clone, Copy, Debug)]
@@ -150,7 +156,7 @@ struct Cell {
     /// environment: the hardened default here).
     transport: Option<Policy>,
     /// FR-101 P1a: replay the controller's first SRTCP PLI into the agent,
-    /// a moment after each keyframe the agent cuts on its own.
+    /// a moment after each keyframe past the warm-up.
     replay_pli: bool,
     /// Switch the session's SRTP and SRTCP replay protection off outright,
     /// through the setting engine: the replay half's negative control. No
@@ -926,9 +932,9 @@ async fn run_cell(cell: Cell) -> Result<Run> {
     });
 
     // FR-101 P1a: deliver the controller's first PLI to the agent again,
-    // exactly as it crossed the link, REPLAY_AFTER_IDR after each keyframe
-    // the agent cut on its own. A replay accepted is a keyframe within
-    // REPLAY_ANSWER; a replay refused is nothing at all.
+    // exactly as it crossed the link, REPLAY_AFTER_IDR after each keyframe.
+    // A replay accepted is a keyframe within REPLAY_ANSWER; a replay refused
+    // is nothing at all.
     let injected: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::default();
     let replayer = cell.replay_pli.then(|| {
         let wire = Arc::clone(&wire);
@@ -943,12 +949,10 @@ async fn run_cell(cell: Cell) -> Result<Run> {
                     continue;
                 };
                 let now = Instant::now();
-                // A keyframe past the warm-up that does not answer the last
-                // replay, and long enough ago.
+                // A keyframe past the warm-up, newer than the last replay
+                // (each keyframe triggers one), and long enough ago.
                 let due = idr_at.lock().unwrap().iter().any(|&t| {
-                    t >= first + WARMUP
-                        && last.is_none_or(|l| t > l + REPLAY_ANSWER)
-                        && t + REPLAY_AFTER_IDR <= now
+                    t >= first + WARMUP && last.is_none_or(|l| t > l) && t + REPLAY_AFTER_IDR <= now
                 });
                 if !due {
                     continue;
