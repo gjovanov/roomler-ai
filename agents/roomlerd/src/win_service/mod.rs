@@ -469,6 +469,11 @@ fn service_main_inner() -> Result<()> {
             });
     }
 
+    // FR-94 — the doorbell and the runner for commands that run as SYSTEM.
+    // Its own thread and runtime: nothing here waits on it, and it serves
+    // nothing until an administrator anchors the device.
+    crate::exec_service::spawn_service_runner();
+
     let outcome = run_host(sup_rx);
     let exit_code = exit_code_for(stop_requested.load(Ordering::SeqCst), outcome);
     tracing::info!(?outcome, ?exit_code, "service stopping");

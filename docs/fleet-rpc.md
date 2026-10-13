@@ -99,24 +99,112 @@ Design notes worth keeping:
 
 ## Privilege
 
-Commands inherit the daemon's identity: **SYSTEM** under a perMachine Windows
-install, **root** under systemd. That is required for the diagnostics that
-matter (`Get-NetFirewallRule`, `netsh`, route tables, service state), and the
+Commands run privileged on purpose: the diagnostics that matter
+(`Get-NetFirewallRule`, `netsh`, route tables, service state) need it, and the
 admin UI says so in those words on both the console and the policy dialog.
+**Root** under systemd, and on Windows **SYSTEM through the device's
+service** once an administrator has anchored the device (FR-94,
+`docs/fr/FR-94-fleet-rpc-system-on-windows.md`).
 
-> ⚠️ **Measured otherwise on Windows (0.4.129, #2021).** Fleet RPC runs in the
-> process that holds the agent socket. On a perMachine install that process is
-> the **worker in the console session**, not the session-0 service. With someone
-> signed in on an attended install, a command ran as that user (their elevated
-> token, High integrity) in session 1. A host in **SystemContext mode**
-> (`ROOMLERD_ENABLE_SYSTEM_SWAP`, the wizard's other role) runs its worker as
-> SYSTEM in that session from cold start, so exec there is SYSTEM, always.
-> Connecting a controller swaps nothing: since 0.3.0-rc.7 the supervisor's
-> "controller present" input *is* that env var. On an attended install with
-> nobody signed in there is no worker, so there is no exec either. A
-> standard-user host is not measured yet; by the code it runs without admin
-> rights. Until #2021 decides which identity is intended, read the paragraph
-> above as the intent, not the behaviour.
+### Who runs the command
+
+| Device | Without an anchor | Anchored (FR-94) |
+|---|---|---|
+| Linux (systemd), supervised Mac | root | n/a: already root |
+| Windows, SystemContext mode | SYSTEM, in the console session (the worker is SYSTEM) | SYSTEM in session 0, through the service |
+| Windows, attended install, an admin signed in | **that user**, elevated, session 1 (#2021) | SYSTEM in session 0, through the service |
+| Windows, attended install, a standard user signed in | **that user**, Medium integrity: no admin rights | SYSTEM in session 0, through the service |
+| Windows, nobody signed in | offline: no worker holds the socket | offline, the same (D3, the service owning the socket, is out of scope) |
+
+Before FR-94, Fleet RPC ran in whatever process held the agent socket, and on
+an attended Windows install that is the **worker in the console session**,
+running as the signed-in user. A corporate laptop's commands then acted as the
+employee (their Kerberos/NTLM identity on every share), and a standard user's
+had no admin rights at all.
+
+### The SYSTEM path
+
+```mermaid
+sequenceDiagram
+  participant A as admin (roomler exec / UI)
+  participant S as server (any pod)
+  participant W as worker (session 1, the user)
+  participant V as service (session 0, SYSTEM)
+  A->>S: POST /api/tenant/{tid}/agent/{id}/exec
+  S->>S: gates 1–3; exec_pending {request_id, command, run_as, claim_by}
+  S->>W: rc:rpc.exec {request_id, …, via_service: true}
+  W->>W: the person's exec_enabled, then consent
+  W->>V: doorbell {request_id} (a pipe; no authority at all)
+  V->>V: the anchor's exec_enabled
+  V->>S: POST /api/agent/service/rpc/{request_id}/claim (the anchor's credential)
+  S-->>V: the command (single use, this device only, inside the claim window)
+  V->>V: run as SYSTEM: same timeout, output cap, redaction, tree kill
+  V->>S: POST …/rpc/{request_id}/result
+  S->>A: 200 {outcome, ran_as: "system"}
+```
+
+⚠️ **The invariant: nothing the signed-in user can write may decide what
+SYSTEM runs.** The worker is the user's process and its config is the user's
+file, so the service takes nothing from it but a request id. The command comes
+from the server, fetched with a credential the user cannot read, from an
+origin the user cannot change, and the output goes back to the server, never
+to a local pipe. What each attempt to get around that meets:
+
+| Attempt | What stops it |
+|---|---|
+| Ring the doorbell with a made-up or stale request id | the claim: the server has nothing pending under it for this device (404, audited `claim_refused`) |
+| Point the user's config at another server | the service never reads it: its origin is in the anchor |
+| Plant an anchor before an admin makes one (`%ProgramData%` lets users create folders) | the service trusts the file only if it and its directory are owned by SYSTEM or Administrators and grant nobody else write (`exec_service.rs` `check_private`) |
+| Squat the doorbell's pipe name | the worker refuses a pipe SYSTEM does not own; the service's `first_pipe_instance` refuses to share the name |
+| Read SYSTEM's output | it is posted from the service to the server over HTTPS |
+| An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
+
+### Anchoring a device
+
+From an **elevated** prompt on the device:
+
+```
+roomlerd anchor create --server https://roomler.ai --token <enrollment-token> --device <device id>
+roomlerd anchor status            # what is anchored (never the credential)
+roomlerd anchor exec on|off       # the anchor's half of gate 4
+roomlerd anchor remove            # this machine stops offering SYSTEM exec
+```
+
+- The device is **named**, not derived: on an attended install the enrollment
+  belongs to the user who made it, and `machine_id` hashes that user's config
+  path, so "re-enroll this machine" from another account mints another device.
+- The enrollment token is single use and burned only once every check passes
+  (live device, same org, Windows, host name matches the device unless
+  `--force`).
+- The anchor lives in `%ProgramData%\roomler\roomler\exec-service\anchor.json`
+  (Administrators-only). The worker learns from the service, every 30 s,
+  which device it is anchored for, and offers the `exec-system` capability on
+  that connection only. No restart is needed either way.
+
+**One live anchor per device.** The service's credential carries the anchor's
+id, and the server accepts it only while that is the device row's current
+anchor. Anchoring again revokes the earlier one; so does
+`DELETE /api/tenant/{tid}/agent/{id}/exec-anchor` (`MANAGE_AGENTS`), without
+removing the device. The service renews its credential under the same anchor
+well before its year runs out.
+
+**Routing needs both halves:** the server's record of the anchor, and the
+device's `exec-system` word. Either alone sends the command to the worker, as
+before. `rc.exec_via_service = false` on the server turns the SYSTEM path off
+everywhere; `ROOMLERD_EXEC_VIA_SERVICE=0` on a device withdraws its word.
+
+**Gate 4 has two halves on this path**, and both must say yes: the person's
+`exec_enabled` (the worker checks it before it rings, exactly as before) and the
+anchor's (the service checks it before it claims).
+
+**An org can require SYSTEM.** With `exec_require_system` on (workspace
+Settings, `PUT /api/tenant/{tid}/exec-settings`), a Windows command that cannot
+take the SYSTEM path is refused as `system_required` instead of running as the
+signed-in user.
+
+Every `exec_audit` row that ran records `ran_as`: `system` through the service,
+`worker` otherwise. The result the caller gets carries the device's own
+`ran_as` beside it.
 
 There is no command blocklist. A blocklist on a root shell is false security
 and trivially bypassed; the real mitigations are the four gates, the audit
@@ -214,8 +302,9 @@ the machine, on purpose.
   `FirewallRules` verbs promoted from whichever shell bundles prove themselves,
   plus exposing the existing `status` / `peers` / `ping` / `config` /
   `tail-log` LocalAPI verbs remotely.
-- Run-as-interactive-user (the `system_context/` `CreateProcessAsUser`
-  machinery already exists), output streaming **on the RPC wire** (the engine
+- Run-as-interactive-user as a per-device policy (FR-94 P4: the service can
+  already run `console_user`; the policy field and its UI are what is left),
+  output streaming **on the RPC wire** (the engine
   itself streams for Roomler SSH since FR-89; the `rc:rpc.result` row and its
   audit sample would need a different shape), scheduled probes, and an
   `exec_policies` selector collection shaped like `overlay_policies`.

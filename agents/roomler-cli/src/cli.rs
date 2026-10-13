@@ -398,10 +398,11 @@ enum Command {
     /// policy, and the target's own `exec_enabled` key must all allow it,
     /// and this device must be marked as permitted to originate.
     ///
-    /// Commands run as the target daemon's identity — root under systemd;
-    /// on Windows the console-session worker: the signed-in user on an
-    /// attended install, SYSTEM in SystemContext mode — and every attempt is
-    /// audited.
+    /// Commands run privileged — root under systemd; on Windows SYSTEM, through
+    /// the device's service, once an administrator anchored it
+    /// (`roomlerd anchor create`), and otherwise the console-session worker
+    /// (the signed-in user on an attended install, SYSTEM in SystemContext
+    /// mode). Every attempt is audited, with the identity that ran it.
     ///
     /// `roomler exec build-box -- uptime` — or, by dashboard display name,
     /// `roomler exec "Office PC" -- hostname`.

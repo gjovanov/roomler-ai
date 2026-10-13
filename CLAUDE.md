@@ -696,13 +696,15 @@ control WS**, deliberately not the overlay: the diagnostics this exists for are 
 needed when the mesh is broken. Four independent default-deny gates, the last of
 which (`exec_enabled` on the device) is the only refusal that survives a compromised
 server.
-⚠️ Commands inherit the identity of whatever process holds the agent socket: **root
-under systemd**. On Windows that process is the **worker in the console session**,
-not the session-0 service. On an attended install it runs as the signed-in user
-(their elevated token if they are an admin; measured on 0.4.129). In SystemContext
-mode (`ROOMLERD_ENABLE_SYSTEM_SWAP`) it runs as SYSTEM in that session, always.
-Nothing swaps it when a controller connects (that ended in 0.3.0-rc.7). The docs
-and UI still say SYSTEM (#2021).
+⚠️ Who runs a command: **root under systemd**. On Windows, **SYSTEM in session 0
+through the device's service once an administrator anchored it** (FR-94:
+`roomlerd anchor create`, elevated); otherwise the process that holds the agent
+socket, the console-session **worker**, which is the signed-in user on an attended
+install and SYSTEM in SystemContext mode. ⚠️⚠️ On the SYSTEM path the service takes
+**nothing but a request id** from the worker (the user's process): the command is
+claimed from the server with the anchor's own credential, and the result goes back
+to the server, never to a local pipe. Nothing the signed-in user can write may
+decide what SYSTEM runs; `docs/fleet-rpc.md` § Privilege.
 ⚠️ A caller **awaits** this frame, so unlike `Goodbye`/`UpdateNow` it must gate on
 `AgentCaps.rpc` containing `exec` (412 otherwise) — pushing to a pre-feature agent
 would hang the caller until its deadline.

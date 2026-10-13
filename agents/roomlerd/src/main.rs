@@ -131,6 +131,13 @@ enum Command {
         #[arg(long)]
         org: Option<String>,
     },
+    /// FR-94 (Windows) — anchor this machine's device, so Fleet RPC runs as
+    /// SYSTEM through the Roomler service instead of as the signed-in user.
+    /// Every action needs an elevated prompt (Run as administrator).
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorCmd,
+    },
     /// Multi-org: inspect + manage this machine's enrollments. The config's
     /// scalar identity is the PRIMARY org; additional enrollments live in
     /// `[[orgs]]` (appended by `enroll`). Changes apply at the next daemon
@@ -713,6 +720,45 @@ enum Command {
         #[arg(long)]
         installer_already_exited: bool,
     },
+}
+
+/// FR-94 — `roomlerd anchor …`.
+#[derive(Debug, Subcommand)]
+enum AnchorCmd {
+    /// Anchor the device: mint the SYSTEM service's credential and write it
+    /// where only Administrators can.
+    Create {
+        /// The server's origin (`https://…`). Asked for here, never read from
+        /// this machine's config: on an attended install the signed-in user
+        /// can edit that, and the service must not take its server from them.
+        #[arg(long)]
+        server: String,
+        /// A fresh enrollment token from the org's admin (single use).
+        #[arg(long)]
+        token: String,
+        /// The device's id, from its page in the dashboard. Named outright:
+        /// on an attended install this machine's enrollment belongs to the
+        /// user who made it, and another account would mint another device.
+        #[arg(long)]
+        device: String,
+        /// Anchor although this host's name differs from the device's (a
+        /// host renamed since it enrolled).
+        #[arg(long)]
+        force: bool,
+        /// Anchor without turning remote execution on yet
+        /// (`roomlerd anchor exec on` later).
+        #[arg(long)]
+        no_exec: bool,
+    },
+    /// Show this machine's anchor (never its credential).
+    Status,
+    /// Turn remote execution through the SYSTEM service on or off.
+    Exec {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Remove the anchor from this machine.
+    Remove,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1362,6 +1408,28 @@ async fn daemon_main() -> Result<()> {
         }
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
+        }
+        Command::Anchor { action } => {
+            use roomlerd::exec_service::AnchorAction;
+            roomlerd::exec_service::anchor_cli(match action {
+                AnchorCmd::Create {
+                    server,
+                    token,
+                    device,
+                    force,
+                    no_exec,
+                } => AnchorAction::Create {
+                    server,
+                    token,
+                    device,
+                    force,
+                    exec_enabled: !no_exec,
+                },
+                AnchorCmd::Status => AnchorAction::Status,
+                AnchorCmd::Exec { state } => AnchorAction::Exec { on: state == "on" },
+                AnchorCmd::Remove => AnchorAction::Remove,
+            })
+            .await
         }
         Command::Org { action } => org_cmd(&config_path, action),
         Command::Run {
@@ -3829,6 +3897,10 @@ async fn run_cmd(
     // the first hello can carry it. It reads logind on its own thread; the
     // signalling loop only ever reads its cache.
     roomlerd::desktop_brief::start();
+    // FR-94 — ask this machine's SYSTEM service whether it is anchored, and
+    // for which device, so the connection for that device offers
+    // `exec-system` (Windows; nothing elsewhere).
+    roomlerd::exec_service::spawn_health_watch();
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(daemon_state);
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
