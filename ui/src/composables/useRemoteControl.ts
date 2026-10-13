@@ -63,6 +63,18 @@ import {
   type RcConnectRecorder,
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
+import {
+  benchSessionActive,
+  benchStats,
+  createBenchProber,
+  createL4Uploader,
+  createVideoBenchSampler,
+  formatBenchLine,
+  storedBench,
+  type BenchPath,
+  type BenchProber,
+  type VideoBenchSampler,
+} from './rcBench'
 import { useSnackbar } from './useSnackbar'
 import { useRemoteRecording, type RecordChannel } from './useRemoteRecording'
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
@@ -4451,6 +4463,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  been sent — an unframed stream parsed as framed is garbage, not a
    *  degraded picture, so the two must move together. */
   let sessionChunkFraming = false
+  /** FR-16 L4 — true when THIS session runs the bench probe: the knob
+   *  `roomler-rc-bench=1` is set AND the agent advertised `bench` in
+   *  `AgentCaps.video`. Resolved beside `sessionChunkFraming`, before any
+   *  worker gets its `init-canvas`, which carries it. */
+  let sessionBench = false
+  let benchProber: BenchProber | null = null
+  let videoBench: VideoBenchSampler | null = null
+  /** The element `attachInput` was given: the `<video>` the bench sampler
+   *  reads on the plain RTP path lives inside it. */
+  let benchSurface: HTMLElement | null = null
+  const l4Uploader = createL4Uploader()
   // rc.190 (A1) Ã¢ÂÂ true once the USER changed resolution this session, so
   // connect()'s per-agent restore doesn't clobber a pre-connect pick.
   let resolutionUserPickedThisSession = false
@@ -5587,6 +5610,65 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  /** FR-16 L4 — send one bench probe on the input channel. Same gates as
+   *  `sendInput` (an INPUT-less session sends nothing), but it reports
+   *  whether the probe left, so only a probe that did is timed. */
+  function sendBenchProbe(probe: { t: 'probe'; seq: number }): boolean {
+    if (!inputGranted.value) return false
+    const ch = channels.input
+    if (!ch || ch.readyState !== 'open') return false
+    try {
+      ch.send(JSON.stringify(probe))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** FR-16 L4 — a sampler read probe `seq` off a frame painted at
+   *  `paintedAt` (epoch ms). */
+  function onBenchProbe(seq: unknown, paintedAt: unknown, path: BenchPath) {
+    if (typeof seq !== 'number' || typeof paintedAt !== 'number') return
+    benchProber?.onPainted(seq, paintedAt, path)
+  }
+
+  /** FR-16 L4 — start probing: called when the input channel opens, and a
+   *  no-op unless this session resolved `sessionBench`. Every sampler is
+   *  armed per probe; only the one painting frames can answer. */
+  function startBench() {
+    if (!sessionBench || benchProber) return
+    videoBench = createVideoBenchSampler({
+      findVideo: () => (benchSurface?.querySelector('video') as HTMLVideoElement | null) ?? null,
+      onProbe: (seq, paintedAt) => onBenchProbe(seq, paintedAt, 'video'),
+    })
+    benchProber = createBenchProber({
+      send: sendBenchProbe,
+      arm: (seq) => {
+        hevcWorker?.postMessage({ type: 'bench-arm', seq })
+        vp9_444Worker?.postMessage({ type: 'bench-arm', seq })
+        webcodecsWorker?.postMessage({ type: 'bench-arm', seq })
+        videoBench?.arm(seq)
+      },
+      flush: (batch) => {
+        console.info('[rc] bench', formatBenchLine(benchStats(batch.rtts, batch.lost), batch.paths))
+        l4Uploader.send(batch, {
+          tenantId: expectedOrgTid(null, location.pathname) ?? lastConnectArgs?.orgId ?? null,
+          agentOrgId: lastConnectArgs?.orgId ?? null,
+          agentId: lastConnectArgs?.agentId ?? null,
+          sessionId: sessionId.value,
+        })
+      },
+    })
+    benchProber.start()
+  }
+
+  function stopBench() {
+    benchProber?.stop()
+    benchProber = null
+    videoBench?.stop()
+    videoBench = null
+  }
+
   /** Type literal text on the remote host. Used by the on-screen
    *  mobile keyboard and the IME composition path: the agent's
    *  `enigo.text()` invokes the OS Unicode-typing API, so emoji /
@@ -6225,6 +6307,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown>
       if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'bench-probe') {
+        onBenchProbe(msg.seq, msg.paintedAt, 'webcodecs')
+        return
+      }
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
@@ -6305,7 +6391,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return false
     }
     try {
-      webcodecsWorker.postMessage({ type: 'init-canvas', canvas: offscreen }, [offscreen])
+      webcodecsWorker.postMessage(
+        { type: 'init-canvas', canvas: offscreen, bench: sessionBench },
+        [offscreen],
+      )
       console.info('[rc] webcodecs: canvas attached to worker')
       return true
     } catch (err) {
@@ -6513,6 +6602,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown> | undefined
       if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'bench-probe') {
+        onBenchProbe(msg.seq, msg.paintedAt, 'vp9-444')
+        return
+      }
       if (msg.type === 'request-keyframe') {
         // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
         // for a fresh IDR so it can resync.
@@ -6675,6 +6768,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           maxQueue: flowParams.maxQueue,
           // FR-17 — negotiated per session; see `sessionChunkFraming`.
           chunkFraming: sessionChunkFraming,
+          // FR-16 L4 — resolved per session; see `sessionBench`.
+          bench: sessionBench,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -6787,6 +6882,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown> | undefined
       if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'bench-probe') {
+        onBenchProbe(msg.seq, msg.paintedAt, 'hevc')
+        return
+      }
       if (msg.type === 'request-keyframe') {
         // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
         // for a fresh IDR so it can resync.
@@ -6925,6 +7024,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           maxQueue: flowParams.maxQueue,
           // FR-17 — negotiated per session; see `sessionChunkFraming`.
           chunkFraming: sessionChunkFraming,
+          // FR-16 L4 — resolved per session; see `sessionBench`.
+          bench: sessionBench,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -7616,6 +7717,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // FR-1 P7 — clock sync is per-connection (a reconnect may land on a
     // restarted agent process with a fresh epoch).
     resetClockSync()
+    // FR-16 L4 — flush the last batch while the session id still names it.
+    stopBench()
     stopWebCodecsPath()
     stopVp9_444Path()
     stopHevcPath()
@@ -8665,9 +8768,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
     installRcHandlers()
 
-    // Flag the first open so the input pump can start queuing.
-    channels.input.onopen = () => { inputChannelOpen.value = true }
-    channels.input.onclose = () => { inputChannelOpen.value = false }
+    // Flag the first open so the input pump can start queuing. FR-16 L4:
+    // the bench probe rides this channel, so it starts and stops with it.
+    channels.input.onopen = () => {
+      inputChannelOpen.value = true
+      startBench()
+    }
+    channels.input.onclose = () => {
+      inputChannelOpen.value = false
+      stopBench()
+    }
 
     // Re-send the restored quality preference as soon as the control
     // channel opens Ã¢ÂÂ otherwise the agent would stay at its default
@@ -9159,6 +9269,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     sessionChunkFraming =
       preferredTransport !== null
       && (agent?.value?.capabilities?.video ?? []).includes('chunk-framing')
+    // FR-16 L4 — the same rule for the bench probe: on only when the agent
+    // will answer it, decided before any worker is told.
+    sessionBench = benchSessionActive(storedBench(), agent?.value?.capabilities?.video)
+    if (sessionBench) console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
 
     // Everything above this point - the local-relay probe and the
     // browser's MediaCapabilities decode probes - runs before a single
@@ -9382,6 +9496,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       (surface.querySelector('video') as HTMLVideoElement | null) ??
       (surface.firstElementChild as HTMLVideoElement | null)
     const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
+    // FR-16 L4 — the bench sampler finds the `<video>` in here.
+    benchSurface = surface
 
     /**
      * Returns [0,1]-normalised coordinates relative to the *visible video
@@ -10107,6 +10223,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     window.addEventListener('keyup', onKeyUp, { capture: true })
 
     return () => {
+      if (benchSurface === surface) benchSurface = null
       surface.removeEventListener('pointermove', onPointerMove)
       if ('onpointerrawupdate' in surface) {
         surface.removeEventListener(
