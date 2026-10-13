@@ -9066,7 +9066,16 @@ fn attach_cursor_handler(
         // send_text, well under 1 ms even on weak hosts. Idle frames
         // dedupe via the tracker's per-shape cache so we don't burn
         // DC bandwidth on a static cursor.
-        let mut ticker = tokio::time::interval(Duration::from_millis(8));
+        // FR-98 C4 — the period is a knob for the field A/B
+        // (`ROOMLERD_CURSOR_POLL_MS`), read once per session; 8 ms unless set.
+        let poll = crate::capture::cursor::poll_interval(node_env("CURSOR_POLL_MS").as_deref());
+        if poll != crate::capture::cursor::DEFAULT_POLL {
+            info!(
+                poll_ms = poll.as_millis() as u64,
+                "cursor poller: custom period (FR-98 C4)"
+            );
+        }
+        let mut ticker = tokio::time::interval(poll);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Emit cursor:hide once when the cursor disappears so the
         // browser can clear its overlay; don't keep re-emitting.
