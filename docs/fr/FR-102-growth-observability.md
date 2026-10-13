@@ -38,8 +38,8 @@ This FR:
   history, newsletter delivery, satisfaction;
 - (d) gives purestat the generic features this needs (working API keys, conversions, campaigns,
   engagement, funnels, journeys, OAuth sign-in), tracked in purestat's own repository (§3n);
-- (e) feeds the results back to the people and the Claude sessions that run promotion: a results feed, a
-  weekly digest, alerts.
+- (e) feeds the results back to the people and the Claude sessions that run promotion: a **daily digest**
+  (operator, 2026-10-13), a results feed, alerts.
 
 **Principles** (the part not to re-litigate):
 
@@ -373,14 +373,69 @@ sequenceDiagram
   - Repository traffic is optional: views, clones and referrers, read with a read-only token. GitHub keeps
     only 14 days of it, so it is pulled daily.
 
-### 3l. Results feed, digest, alerts (P10)
+### 3l. The daily digest (P1d), the results feed and alerts (P10)
+
+**The daily digest.** The operator asked for it on 2026-10-13: "a daily digest job that reports on the
+mentioned metrics". A host job (`crates/api/src/growth/digest.rs`) reports every closed UTC day. It
+computes the day, stores it, and emails it to the platform admins.
+
+- **When.** At `ROOMLER__GROWTH__DIGEST_HOUR_UTC` (default 6), for the UTC day before. purestat closes a
+  session 30 minutes after its last event, so by 06:00 the day is complete on both planes.
+- **Once, with two pods.** A run first inserts `growth_digests {_id: "yyyy-mm-dd", status: computing}`.
+  The unique `_id` decides which pod computes and sends; the other stops. This is the claim-first shape of
+  the newsletter's send ledger (FR-58). `status` then moves to `sent`, to `stored` (no recipients, or email
+  off), or to `failed` with the error. The next run retries a `failed` day or a stale `computing` one, and
+  never sends a `sent` day again.
+- **Sections.** Each answers a question from §1. A section whose source is not built yet says "not
+  measured — arrives with Pn" and never shows 0.
+
+| Section | Reports | Source | Available |
+|---|---|---|---|
+| Headline | sign-ups, orgs created, devices enrolled, active orgs over the trailing 7 days (a preview of WAO), coverage | §3c, §3d | P1d; coverage after PS1 |
+| Sign-ups | each sign-up: provider, campaign key or landing path, self-reported answer, never the address; above 20 a day, aggregated by source | `users` | P1d |
+| Orgs and devices | orgs created; devices enrolled by OS (by install method from P3); the orgs that enrolled their first device | `tenants`, `agents` | P1d |
+| Usage | remote-desktop sessions and session-minutes, calls and participant-minutes, active orgs; the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
+| Website | visitors, visits and pageviews on the site's own hostnames; top channels, sources and pages | purestat's v1 query | after PS1 |
+| Blog | each post viewed that day: visitors, pageviews, reads (≥ 30 s), median read time, top sources | purestat's v1 query | after PS1 (read time exact after PS0a) |
+| Campaigns | per `utm_source` / `utm_medium` / `utm_campaign`: visitors and goal conversions from purestat, sign-ups from roomler | purestat + `users` | after PS1 |
+| Newsletter | new, confirmed and unsubscribed subscribers; each issue sent that day, accepted (delivered and bounced from P5) | `subscribers`, `newsletter_sends` | P1d |
+| Revenue | orgs by plan and subscription status; the list-price MRR, labelled an estimate (`crates/api/src/routes/cost.rs:22-30`) | `tenants` | P1d; billed from P4 |
+| Quality | sessions that ended on a failure reason; agent crashes by version | `remote_sessions`, `agent_crashes` | P1d; rating and TTFF from P9 |
+| Install | fetches by client class; tokens issued → redeemed | §3e | P3 |
+| Social reach | each platform's own numbers per post | the pipeline's push | P8 |
+| Search | clicks, impressions, top queries and pages | Search Console, Bing | P7 |
+
+- **Small numbers stay honest.** Below n = 30 the digest shows counts, not percentages. Each count of the
+  day sits beside its trailing 7-day and 28-day totals, so a quiet day is read against a baseline, not
+  alone. Internal orgs and people are excluded (§3c.4), and the footer says how many were left out, so
+  nothing vanishes silently.
+- **Delivery.**
+  - An email to the platform admins' addresses. `users.email` holds only proven addresses, and
+    `ROOMLER__GROWTH__DIGEST_TO` overrides it. The HTML and plain-text bodies are rendered from the stored
+    JSON and sent through the existing email service.
+  - `GET /api/admin/growth/digest?day=` (the latest when the day is omitted) and
+    `GET /api/admin/growth/digests?since=`, for platform admins and, from P10, the read key.
+  - A Digest view on `/observability/growth`.
+  - `POST /api/admin/growth/digest/run?day=&send=false` recomputes a day, for a backfill or a test, without
+    mailing it.
+- **Switches.** `ROOMLER__GROWTH__DIGEST_ENABLED` defaults to **off**, so a self-hosted server never starts
+  mailing its admins a report they did not ask for; the hosted configuration turns it on. Without
+  purestat's key, the web sections read "not measured".
+- ⚠️ A digest lands in mailboxes, which keep it longer than any collection here. It names orgs, as
+  `/observability` does, and never a person's address, name or IP. `growth_digests` keeps 25 months.
+
+**The results feed** (P10).
 
 - **`GET /api/admin/growth/*`** answers the platform-admin JWT and a read key (D12). The read key works on
   GET only and on growth routes only, and is answered with 404 everywhere else. It is stored hashed in
   config, and each use is logged at `info` without the key.
-- **A weekly digest**, every Monday, served as JSON at `/api/admin/growth/digest?week=` and emailed to
-  platform admins: WAO, the funnel, the top campaigns and articles, coverage, and what changed. The
-  pipeline's weekly report reads the JSON instead of querying databases by hand.
+- The promotion pipeline and the sessions that run it read the stored digests through it, instead of
+  querying databases by hand.
+- **A weekly roll-up.** On Mondays the digest adds the week's totals, the funnel, and from P2 the cohort
+  lines.
+
+**Alerts** (P10).
+
 - **Alerts.** Each rule has an n floor, and `ROOMLER__GROWTH__ALERTS` switches all of them off. They show
   as a `growth_alerts` row on the Growth page and go out by email:
   - no sign-up for 72 h while the 28-day median is ≥ 1 a day;
@@ -409,10 +464,10 @@ sequenceDiagram
 
 | PS | What | Needed by |
 |---|---|---|
-| PS0 | **Trust**: the hostname allowlist at ingest; the tracker skips localhost, private hosts, webdriver and `purestat_ignore`; pageviews count `pageview` rows only; the entry/exit dimensions read `sessions`; one client-IP rule; a basic bot list; deleting a site deletes its ClickHouse rows; a nightly ClickHouse backup to object storage; the unfinished OAuth routes switched off; docs that match the code | everything |
+| PS0 | **Trust.** *PS0a, the code*: the hostname allowlist (the site's domain, `www.` + domain, and `allowed_hostnames`) applied at ingest **and on every read**, which also keeps apart sites whose ClickHouse ids coincide; new sites get an id no other site can share; the tracker skips localhost, private hosts, webdriver and `purestat_ignore`; pageviews count `pageview` rows only; the entry/exit dimensions read `sessions`; one client-IP rule; a basic bot list; engagement counts visible time only; the unfinished OAuth routes switched off; docs that match the code. *PS0b, the infrastructure*: a nightly ClickHouse backup to object storage; deleting a site deletes its ClickHouse rows (needs the admin user) | everything |
 | PS1 | **API keys work** (`X-API-Key`, site-scoped, `stats:read`), and a v1 query to the §3i contract | P6 |
 | PS2 | **Goals and campaigns in the UI**: conversions and conversion rate per goal, the UTM report with drill-down, more than 10 rows, a filter control, channel grouping (§3b), period comparison | the operator |
-| PS3 | **Engagement**: visible-time-only duration, scroll depth, read rate and median time per page; outbound-link and file-download events behind script attributes | P7 |
+| PS3 | **Engagement**: scroll depth, read rate and median time per page in the UI (visible-time duration lands in PS0a); outbound-link and file-download events behind script attributes | P7 |
 | PS4 | **Funnels**: 2–8 ordered steps (a page pattern or a goal) within a visit, ClickHouse `windowFunnel`, drop-off per step, by source and campaign | the operator |
 | PS5 | **Journeys**: next-page transitions from an entry page, and paths into a goal (a Sankey); paths seen by fewer than 5 visitors fold into "other" | the operator |
 | PS6 | **OAuth sign-in** with Google and GitHub, to the rules roomler-ai's OAuth already follows (`docs/security-baseline.md`): a CSRF state and PKCE; linking by email only when the provider vouches for the address (Google `verified_email`; GitHub `/user/emails`, primary and verified); OAuth-created accounts verified; no credential in a URL; buttons in the SPA | the operator |
@@ -446,6 +501,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | `growth_org_daily` | core | `_id = "<tenant>:<day>"`, the §3d fields | 25 months; with the org | the host's nightly job |
 | `growth_exclusions` | core | `{kind: tenant\|user, id, reason, by, at}` | until removed | platform admins |
 | `growth_alerts` | core | `{rule, fired_at, detail, cleared_at}` | 90 days | the host's alert job |
+| `growth_digests` | core | `_id = "yyyy-mm-dd"`, `{status, computed_at, sent_at, recipients, sections}` | 25 months | the host's digest job |
 | `billing_events` | `saas` | §3g | with the org | the Stripe webhook |
 | `enroll_token_issued` | `fleet` | `_id = jti`, §3e | 90 days | token issuance, the enroll |
 | `setup_diagnostics` | `fleet` | `{run, step, outcome, elapsed_ms, error_code, os, wizard_version, ts}` | 90 days | the wizard, opt-in |
@@ -467,6 +523,7 @@ cross-module jobs run in the host (`crates/api/src/stats_rollup.rs`).
 | session ratings | `session_feedback` | 25 months | the user | new §2.18 |
 | delivery status | `newsletter_sends` | as FR-58 | the subscriber | newsletter section |
 | social, search, GitHub | `growth_daily` | indefinitely | — (aggregates about our own content) | — |
+| daily digests | `growth_digests`; the platform admins' mailboxes | 25 months | — (org names, never a person) | new §2.18 |
 
 The privacy policy (`ui/src/views/legal/PrivacyPolicyView.vue`) gains §2.18, product analytics (purpose:
 improving the product and knowing which channels bring its users; basis Art. 6(1)(f); the retention
@@ -477,9 +534,11 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 
 | P | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | claim: issue, this spec, the ledger row; a private annex with the 2026-10-13 baseline | docs only | **this PR** |
+| P0 | claim: issue, this spec, the ledger row; a private annex with the 2026-10-13 baseline | docs only | **merged** #2128 `9b5c41b4b` |
 | P1 | §3c on our side: the hosted-only loader, the exclusion list, the taxonomy and its normalisation, the coverage figure | `ANALYTICS = null`; an empty exclusion list | — |
-| PS0 | §3n PS0 in purestat | per item | — |
+| PS0a | §3n PS0, the code, in purestat | per item | — |
+| PS0b | §3n PS0, the infrastructure, in purestat-deploy | — | — |
+| P1d | §3l: the daily digest (the job, `growth_digests`, the email, the JSON routes, the Digest view); every section not yet built says which phase brings it | `ROOMLER__GROWTH__DIGEST_ENABLED=false` (the default) | — |
 | P2 | §3d: definitions, `growth_org_daily`, the funnel/cohorts/orgs/timeline endpoints, the Growth page (Overview, Orgs, Cohorts) | `ROOMLER__GROWTH__ENABLED=false` (the routes answer 404) | — |
 | P3 | §3e 1–4 and 6: issuance record, fetch counters, the enroll's `install` (server, agent, scripts, wizard), the Install panel | counters off by config; the agent sends `install` only when it is set | — |
 | P3b | §3e 5: the wizard's opt-in diagnostics, after D4 | the checkbox; `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` | — |
@@ -491,13 +550,14 @@ hosted only). §7's retention list grows, and `docs/data-model.md`'s stale TTLs 
 | P7 | §3k: the Search Console, Bing and GitHub pullers, the Content table | no credential ⇒ "not measured" | — |
 | P8 | §3j: the ingest routes, the Channels table, spend | no ingest key ⇒ 404 | — |
 | P9 | §3f: session outcomes, the frozen time-to-first-frame, crashes per version, the session carrier, the rating | `ROOMLER__GROWTH__FEEDBACK=false` hides the prompt | — |
-| P10 | §3l: the read key, the weekly digest, alerts | `ROOMLER__GROWTH__ALERTS=false` | — |
+| P10 | §3l: the read key, the weekly roll-up, alerts | `ROOMLER__GROWTH__ALERTS=false` | — |
 | PS2, PS4–PS7 | §3n in purestat | per feature | — |
 | P11 | docs: `docs/growth-observability.md`, which also covers the existing `/observability` (no page describes it today); the `docs/data-model.md` TTL fixes; the privacy policy; the `docs/README.md` row | — | — |
 
-**Order.** P1 and PS0 come first, because today's numbers are wrong. P2 and P3 come next: they depend on
-nothing outside this repo. Then PS1 → P6, and the rest by value. At today's volume the leading indicators
-(P6, P7, P8) say more than the account funnel can, so they are not postponed behind P4/P5.
+**Order.** P1, PS0a, PS1 and P1d come first. The first three make today's wrong numbers right and
+readable, and the digest puts them in front of the operator every morning. P2 and P3 come next: they
+depend on nothing outside this repo. Then P6 and the rest, by value. At today's volume the leading
+indicators (P6, P7, P8) say more than the account funnel can, so they are not postponed behind P4/P5.
 
 ## 5. Acceptance criteria
 
@@ -552,8 +612,16 @@ nothing outside this repo. Then PS1 → P6, and the rest by value. At today's vo
 - [ ] **AC22 (docs):** `docs/growth-observability.md` with mermaid diagrams (the two planes, the install
   trace, the funnel definitions) and the `/observability` page as a whole, linked from `docs/README.md`;
   `docs/data-model.md`'s TTLs corrected.
+- [ ] **AC23 (P1d):** with two pods racing, the digest of a closed day is stored once and mailed once
+  (integration test: two concurrent runs, one insert, one send). Its sign-up, org, device, session and
+  newsletter counts equal a hand count from Mongo for the same day (field log). Without a purestat key,
+  the website, blog and campaign sections read "not measured", never 0 (control). Neither the stored JSON
+  nor the email carries an email address, a person's name or an IP (test).
 
 ## 6. Open decisions (defaults in bold)
+
+**Operator, 2026-10-13, "yes proceed": the defaults below stand.** The same answer added the daily digest
+(§3l, P1d).
 
 1. **Where the funnel lives.** **`/observability` → Growth, with purestat as the web plane**; or purestat as
    the hub (the account counts pushed into it); or the promotion app.
@@ -599,6 +667,7 @@ nothing outside this repo. Then PS1 → P6, and the rest by value. At today's vo
 | Date | Build | What was checked | Result |
 |---|---|---|---|
 | 2026-10-13 | production `hosted-20261013-c6bcdb2` (`/health` 0.4.132); purestat v0.1.6 | the §2a baseline: read-only ClickHouse queries on the `roomler.ai` site (90 d and 30 d, by hostname class, event name, UTM values, referrer source, engagement) and read-only Mongo counts | as §2a; the account counts are in the private annex. This is the "before" for AC2, AC3 and the coverage figure |
+| 2026-10-14 | purestat v0.1.6 | before PS0a: every purestat site's domain and `allowed_hostnames` against the hostnames its events carried in 30 days (read-only) | the default allowlist (the domain plus `www.`) covers every legitimate hostname of all five sites, and `allowed_hostnames` is empty everywhere, so PS0a drops only loopback, private hosts and other domains. The same query found sites whose derived ClickHouse ids coincide (detail in the private annex): the read-side allowlist keeps them apart without moving a row |
 
 ## 9. Related
 
