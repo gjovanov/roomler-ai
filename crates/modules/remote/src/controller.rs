@@ -39,8 +39,18 @@ pub struct ControllerFrame<'a> {
     pub connection_id: &'a str,
 }
 
-/// The whole controller path for one `rc:*` frame: the authz gate, then the
-/// dispatch. Returns `false` when the frame was not an `rc:*` message at all
+/// FR-101 P4a — how many session requests one caller may send one device in a
+/// minute. No legitimate client comes near it. The viewer's reconnect ladder
+/// (250 ms doubling to a steady 8 s, `RC_RECONNECT_LADDER_MS`) asks about a
+/// dozen times in its first minute, so this leaves room for several tabs at
+/// once. A refusal still spends a slot (`RateLimiter::check`), so a caller who
+/// keeps hammering stays refused for the window, and `rate_limited` is not a
+/// code the viewer retries.
+pub const SESSION_REQUESTS_PER_MINUTE: u32 = 60;
+
+/// The whole controller path for one `rc:*` frame: the authz gate, the
+/// session-request ceiling, then the dispatch. Returns `false` when the frame
+/// was not an `rc:*` message at all
 /// (the socket then runs its other arms); a denial is answered on the
 /// controller's sender and counts as handled.
 pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame<'_>) -> bool {
@@ -61,6 +71,37 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
             return true;
         }
     };
+    // FR-101 P4a — the ceiling, checked AFTER the authz gate, as exec's is.
+    // A refusal then names a caller who was allowed to ask at all, and a
+    // caller who was not never spends a slot. Session requests ride the
+    // control WS, which the per-IP HTTP governor never sees: without this a
+    // signed-in caller could ask one device for sessions as fast as the socket
+    // carries them, each a consent prompt in front of the person there.
+    if let Ok(ClientMsg::SessionRequest { agent_id, .. }) =
+        serde_json::from_str::<ClientMsg>(frame.text)
+        && !state.session_request_limiter.check(
+            frame.user_id,
+            agent_id,
+            SESSION_REQUESTS_PER_MINUTE,
+        )
+    {
+        warn!(
+            user_id = %frame.user_id,
+            %agent_id,
+            limit = SESSION_REQUESTS_PER_MINUTE,
+            "rc:session.request refused: over the per-device ceiling"
+        );
+        let _ = frame.controller_tx.try_send(ServerMsg::Error {
+            session_id: None,
+            code: "rate_limited".to_string(),
+            message: format!(
+                "Too many session requests to this device: at most {SESSION_REQUESTS_PER_MINUTE} a \
+                 minute. Wait a minute and connect again."
+            ),
+            open_nonce: None,
+        });
+        return true;
+    }
     dispatch_controller_rc(
         state,
         frame.user_id,
