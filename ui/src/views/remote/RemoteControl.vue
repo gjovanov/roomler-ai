@@ -1010,11 +1010,13 @@
              rarely the one on screen. -->
         <div v-else-if="rc.mediaWaiting.value" class="no-media-overlay" data-testid="rc-media-waiting">
           <v-icon size="72" color="info">mdi-timer-sand</v-icon>
-          <p class="text-body-1 mt-3">Waiting for the person at the screen to share it.</p>
+          <!-- FR-93 P5b — worded by what the host waits for: a dialog, or
+               (screen_unlock) GNOME's lock screen, where no request ends. -->
+          <p class="text-body-1 mt-3">{{ mediaWaitingCopy(rc.mediaWaiting.value.for).title }}</p>
           <p v-if="rc.mediaWaiting.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
             {{ rc.mediaWaiting.value.hint }}
           </p>
-          <p class="text-caption text-medium-emphasis mt-2">
+          <p v-if="mediaWaitingCopy(rc.mediaWaiting.value.for).showsDeadline" class="text-caption text-medium-emphasis mt-2">
             If nobody answers, the request ends at {{ mediaWaitingEnds }}.
           </p>
         </div>
@@ -1936,6 +1938,7 @@ import {
   resolutionOverrideHint,
   codecLabelFromDecoderConfig,
   captureArmLabel,
+  mediaWaitingCopy,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3865,8 +3868,9 @@ const degradedLabel = computed(() => {
   // an operator reading "video stalled" has no idea the fix is a permission
   // on the far machine.
   if (rc.mediaUnavailable.value) return 'connected · no screen capture'
-  // FR-93 P2d-2 — not "video stalled": the host said why there is no video yet.
-  if (rc.mediaWaiting.value) return 'connected · waiting for the person at the screen'
+  // FR-93 P2d-2 — not "video stalled": the host said why there is no video yet
+  // (P5b: in its own words, a dialog or a locked screen).
+  if (rc.mediaWaiting.value) return `connected · ${mediaWaitingCopy(rc.mediaWaiting.value.for).status}`
   switch (rc.degraded.value) {
     case 'transport_unstable': return 'connected · unstable link'
     case 'media_stalled': return 'connected · video stalled'

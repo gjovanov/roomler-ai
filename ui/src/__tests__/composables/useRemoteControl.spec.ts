@@ -71,6 +71,7 @@ import {
   nextStallTicks,
   isDeadAir,
   agentIsWaiting,
+  mediaWaitingCopy,
   RC_MEDIA_WAITING_GRACE_MS,
   classifyDegraded,
   RC_REHOME_MAX_REDIALS,
@@ -4118,6 +4119,21 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(agentIsWaiting(w, 999_999)).toBe(true)
     expect(agentIsWaiting(w, 1_000_000 + RC_MEDIA_WAITING_GRACE_MS - 1)).toBe(true)
     expect(agentIsWaiting(w, 1_000_000 + RC_MEDIA_WAITING_GRACE_MS)).toBe(false)
+  })
+
+  // FR-93 P5b — the overlay says what the host waits for. GNOME's lock screen
+  // (#2145) ends no request, so it shows no "if nobody answers" deadline; an
+  // unknown `for` from a newer agent reads as the dialog it most likely is.
+  it('words the waiting overlay by what the host waits for', () => {
+    const lock = mediaWaitingCopy('screen_unlock')
+    expect(lock.title).toMatch(/screen to be unlocked/)
+    expect(lock.status).toBe('waiting for the screen to be unlocked')
+    expect(lock.showsDeadline).toBe(false)
+    const dialog = mediaWaitingCopy('person_at_screen')
+    expect(dialog.title).toBe('Waiting for the person at the screen to share it.')
+    expect(dialog.status).toBe('waiting for the person at the screen')
+    expect(dialog.showsDeadline).toBe(true)
+    expect(mediaWaitingCopy('something_newer')).toEqual(dialog)
   })
 
   it('a frameless two minutes inside a wait neither probes nor re-creates the session', () => {

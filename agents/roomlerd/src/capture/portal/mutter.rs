@@ -159,6 +159,9 @@ pub struct MutterSession {
     /// FR-93 P4 — the RemoteDesktop session driving the screencast, when input
     /// was asked for and mutter granted it.
     pub input: Option<MutterInput>,
+    /// FR-93 P5b — the `org.gnome.Mutter.ScreenCast.Session` object, watched
+    /// for `Closed` when no RemoteDesktop session drives it.
+    screencast: OwnedObjectPath,
     /// ⚠️⚠️ **Holding this open is what keeps the session alive.** Mutter owns
     /// the session against the D-Bus connection that created it and tears it
     /// down when that connection goes — taking the PipeWire node with it. The
@@ -177,6 +180,51 @@ impl MutterSession {
     pub fn connection(&self) -> &zbus::blocking::Connection {
         &self.conn
     }
+
+    /// FR-93 P5b (#2145) — `on_closed` runs, once, when mutter closes this
+    /// session. GNOME closes every remote desktop and screen cast when its
+    /// screen locks, and the stream then goes idle, not to an error, so
+    /// without this the capture waits for frames forever. Watches the session
+    /// that drives the screen cast: the RemoteDesktop one when there is input,
+    /// the ScreenCast one otherwise. On its own thread, on this session's own
+    /// connection; a watcher that cannot subscribe says so and watches nothing.
+    pub fn on_closed(&self, on_closed: impl FnOnce() + Send + 'static) {
+        let (path, iface) = match &self.input {
+            Some(i) => (i.session.clone(), RD_SESSION_IFACE),
+            None => (self.screencast.clone(), SESSION_IFACE),
+        };
+        let conn = self.conn.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mutter-closed".into())
+            .spawn(move || {
+                let proxy = match zbus::blocking::Proxy::new(&conn, MUTTER_BUS, &path, iface) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "portal-helper: could not watch the mutter session for Closed ({e}); \
+                             a screen lock will freeze this capture"
+                        );
+                        return;
+                    }
+                };
+                let mut closed = match proxy.receive_signal("Closed") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "portal-helper: could not subscribe to the mutter session's Closed \
+                             ({e}); a screen lock will freeze this capture"
+                        );
+                        return;
+                    }
+                };
+                if closed.next().is_some() {
+                    on_closed();
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("portal-helper: no thread to watch the mutter session for Closed ({e})");
+        }
+    }
 }
 
 /// FR-93 P4 — where input for a mutter screencast goes.
@@ -188,6 +236,40 @@ pub struct MutterInput {
     /// `NotifyPointerMotionAbsolute` names it, and mutter maps the stream's own
     /// coordinates onto the monitor it records.
     pub stream: OwnedObjectPath,
+}
+
+/// FR-93 P5b (#2145) — GNOME's lock screen, asked over the session bus
+/// (`org.gnome.ScreenSaver.GetActive`). One connection serves a whole wait:
+/// the open polls it every second while the screen stays locked.
+#[derive(Default)]
+pub struct GnomeLockScreen {
+    conn: Option<zbus::blocking::Connection>,
+}
+
+impl GnomeLockScreen {
+    /// Whether the lock screen is up. `None` where nothing answers: not GNOME,
+    /// or no session bus. A failed call drops the connection, so the next one
+    /// starts afresh.
+    pub fn is_up(&mut self) -> Option<bool> {
+        if self.conn.is_none() {
+            self.conn = zbus::blocking::Connection::session().ok();
+        }
+        let conn = self.conn.as_ref()?;
+        let reply = conn.call_method(
+            Some("org.gnome.ScreenSaver"),
+            "/org/gnome/ScreenSaver",
+            Some("org.gnome.ScreenSaver"),
+            "GetActive",
+            &(),
+        );
+        match reply {
+            Ok(msg) => msg.body().deserialize::<bool>().ok(),
+            Err(_) => {
+                self.conn = None;
+                None
+            }
+        }
+    }
 }
 
 /// FR-93 P4 kill switch (`ROOMLERD_MUTTER_INPUT` / `mutter_input`), default
@@ -383,6 +465,7 @@ fn open_blocking(input: bool) -> Result<MutterSession, MutterError> {
             input: input.is_some(),
         },
         input,
+        screencast: session_path.clone(),
         conn,
     })
 }

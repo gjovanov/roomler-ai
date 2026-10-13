@@ -872,6 +872,252 @@ enum AutoMutter {
     Failed(String),
 }
 
+/// FR-93 P5b (#2145) — how long an open waits for GNOME's screen to be
+/// unlocked, before it gives up and says so.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+const UNLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How often the lock screen is asked whether it is still up.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+const UNLOCK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// The open is tried again at least this often while GNOME still says
+/// locked, in case its lock state and mutter's refusal ever disagree.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// mutter's words for "refused while the screen is locked", on both its
+/// ScreenCast and its RemoteDesktop `CreateSession`.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+const MUTTER_INHIBITED: &str = "Session creation inhibited";
+
+/// FR-93 P5b (#2145) — an open that GNOME's lock screen refuses waits for the
+/// unlock instead of failing.
+///
+/// GNOME closes every remote-desktop and screen-cast session when its screen
+/// locks, and refuses new ones (`Session creation inhibited`) until it is
+/// unlocked. So after a lock the pump's reopen lands here, and so does a
+/// session that starts while the screen is locked. A failure while the lock
+/// screen is up (`locked` says so, or mutter's refusal names it) is waited
+/// out: `tell` once (the controller reads why), then `locked` every
+/// [`UNLOCK_POLL`] until it lifts, and the open again, at least every
+/// [`UNLOCK_RETRY`]. Any other failure is returned at once. The wait ends when
+/// the session that asked has gone (`abandoned`), or after [`UNLOCK_WAIT`].
+///
+/// Every effect is passed in, so the rule tests without GNOME.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "portal-capture")),
+    allow(dead_code)
+)]
+fn open_through_lock<T>(
+    mut open: impl FnMut() -> Result<T, String>,
+    mut locked: impl FnMut() -> Option<bool>,
+    abandoned: impl Fn() -> bool,
+    mut tell: impl FnMut(std::time::Duration),
+    mut sleep: impl FnMut(std::time::Duration),
+    now: impl Fn() -> std::time::Instant,
+) -> Result<T, String> {
+    let started = now();
+    let mut told = false;
+    loop {
+        let err = match open() {
+            Ok(t) => return Ok(t),
+            Err(e) => e,
+        };
+        let was_locked = locked() == Some(true);
+        if !was_locked && !err.contains(MUTTER_INHIBITED) {
+            return Err(err);
+        }
+        let waited = now().saturating_duration_since(started);
+        if waited >= UNLOCK_WAIT {
+            return Err(format!(
+                "the screen stayed locked for {} minutes, and GNOME shares no locked screen: {err}",
+                UNLOCK_WAIT.as_secs() / 60
+            ));
+        }
+        if !told {
+            tell(UNLOCK_WAIT - waited);
+            told = true;
+        }
+        // Early only on the lock lifting: a refusal while GNOME already read
+        // unlocked (or could not be asked) waits the whole UNLOCK_RETRY, so
+        // a disagreement costs one helper every 30 s, not one a second.
+        let retry_at = now() + UNLOCK_RETRY;
+        loop {
+            if abandoned() {
+                return Err("the session that waited for the unlock has ended".into());
+            }
+            sleep(UNLOCK_POLL);
+            if (was_locked && locked() == Some(false)) || now() >= retry_at {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::{MUTTER_INHIBITED, UNLOCK_RETRY, UNLOCK_WAIT, open_through_lock};
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    fn refused() -> String {
+        format!(
+            "RemoteDesktop CreateSession: org.freedesktop.DBus.Error.Failed: {MUTTER_INHIBITED}"
+        )
+    }
+
+    #[test]
+    fn an_open_that_works_is_not_delayed() {
+        let told = RefCell::new(Vec::new());
+        let r = open_through_lock(
+            || Ok(7),
+            || panic!("the lock screen is asked only after a failure"),
+            || false,
+            |d| told.borrow_mut().push(d),
+            |_| panic!("no wait"),
+            Instant::now,
+        );
+        assert_eq!(r, Ok(7));
+        assert!(told.borrow().is_empty());
+    }
+
+    /// #2145 — refused while locked, told once, open again when it lifts.
+    #[test]
+    fn a_locked_screen_is_waited_out_and_the_controller_told_once() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let unlocked_at = t0 + Duration::from_secs(5);
+        let opens = Cell::new(0);
+        let told = RefCell::new(Vec::new());
+        let r = open_through_lock(
+            || {
+                opens.set(opens.get() + 1);
+                if now.get() < unlocked_at {
+                    Err(refused())
+                } else {
+                    Ok(42)
+                }
+            },
+            || Some(now.get() < unlocked_at),
+            || false,
+            |d| told.borrow_mut().push(d),
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(r, Ok(42));
+        assert_eq!(
+            *told.borrow(),
+            [UNLOCK_WAIT],
+            "told once, for the whole wait"
+        );
+        assert_eq!(opens.get(), 2, "refused, then open right after the unlock");
+        assert!(
+            now.get() - t0 <= Duration::from_secs(6),
+            "within a poll of the unlock"
+        );
+    }
+
+    #[test]
+    fn any_other_failure_is_returned_at_once() {
+        let told = RefCell::new(Vec::new());
+        let opens = Cell::new(0);
+        let r: Result<u32, String> = open_through_lock(
+            || {
+                opens.set(opens.get() + 1);
+                Err("mutter did not complete the screencast handshake within 10s".into())
+            },
+            || Some(false),
+            || false,
+            |d| told.borrow_mut().push(d),
+            |_| panic!("no wait"),
+            Instant::now,
+        );
+        assert!(r.unwrap_err().contains("handshake"));
+        assert_eq!(opens.get(), 1);
+        assert!(told.borrow().is_empty());
+    }
+
+    /// mutter refuses while GNOME reads unlocked: wait, but retry only every
+    /// UNLOCK_RETRY, never every poll (each open is a helper process).
+    #[test]
+    fn a_refusal_gnome_does_not_explain_is_retried_slowly() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let lifts_at = t0 + Duration::from_secs(40);
+        let opens = Cell::new(0u32);
+        let r = open_through_lock(
+            || {
+                opens.set(opens.get() + 1);
+                if now.get() < lifts_at {
+                    Err(refused())
+                } else {
+                    Ok(1)
+                }
+            },
+            || Some(false),
+            || false,
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert_eq!(r, Ok(1));
+        let most = 2 + 40 / UNLOCK_RETRY.as_secs();
+        assert!(
+            u64::from(opens.get()) <= most,
+            "{} opens in 40 s",
+            opens.get()
+        );
+    }
+
+    /// The session that asked has gone: stop waiting, open nothing more.
+    #[test]
+    fn a_wait_whose_session_ended_stops() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let opens = Cell::new(0);
+        let r: Result<u32, String> = open_through_lock(
+            || {
+                opens.set(opens.get() + 1);
+                Err(refused())
+            },
+            || Some(true),
+            || now.get() >= t0 + Duration::from_secs(3),
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        assert!(r.unwrap_err().contains("has ended"));
+        assert_eq!(opens.get(), 1);
+    }
+
+    #[test]
+    fn a_screen_locked_past_the_bound_gives_up_and_says_so() {
+        let t0 = Instant::now();
+        let now = Cell::new(t0);
+        let r: Result<u32, String> = open_through_lock(
+            || Err(refused()),
+            || Some(true),
+            || false,
+            |_| {},
+            |d| now.set(now.get() + d),
+            || now.get(),
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("stayed locked"), "{e}");
+        assert!(now.get() - t0 >= UNLOCK_WAIT);
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "portal-capture"))]
 fn open_auto_mutter(target_fps: u32) -> AutoMutter {
     use portal::backend::{PortalCapture, PortalOpen};
@@ -886,7 +1132,28 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
         input: portal::mutter::input_enabled(),
         window: false,
     };
-    match PortalCapture::open_with(target_fps, opts) {
+    // FR-93 P5b (#2145) — a locked screen is waited out, with the controller
+    // told why, instead of failing the open.
+    let mut lock = portal::mutter::GnomeLockScreen::default();
+    let opened = open_through_lock(
+        || PortalCapture::open_with(target_fps, opts).map_err(|e| format!("{e:#}")),
+        || lock.is_up(),
+        open_abandoned,
+        |gives_up_in| {
+            tracing::info!(
+                waits_s = gives_up_in.as_secs(),
+                "capture: GNOME's screen is locked, and GNOME shares no locked screen; waiting for \
+                 the unlock, the controller told why (FR-93 P5b)"
+            );
+            tell_open_waiting(OpenWait {
+                gives_up_in,
+                why: WaitFor::Unlock,
+            });
+        },
+        std::thread::sleep,
+        std::time::Instant::now,
+    );
+    match opened {
         Ok(c) => {
             tracing::warn!(
                 width = c.width(),
@@ -899,7 +1166,7 @@ fn open_auto_mutter(target_fps: u32) -> AutoMutter {
         }
         Err(e) => AutoMutter::Failed(format!(
             "mutter capture switched itself on (a per-user GNOME session with no capture key \
-             set), and its screencast could not open: {e:#}"
+             set), and its screencast could not open: {e}"
         )),
     }
 }
@@ -1418,8 +1685,12 @@ pub async fn open_default_async(
 ) -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "linux")]
     {
+        // FR-93 P5b — dropped with this future, so an open still waiting when
+        // its session ends (a locked screen can wait an hour) learns it.
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _mark = SetOnDrop(std::sync::Arc::clone(&abandoned));
         match tokio::task::spawn_blocking(move || {
-            let _hook = ParkHook::install(on_wait);
+            let _hook = ParkHook::install(on_wait, abandoned);
             open_default(target_fps, downscale)
         })
         .await
@@ -1449,6 +1720,21 @@ pub struct OpenWait {
     /// How long until the request gives up on its own. A duration rather than
     /// a time of day, so the viewer reads it on its own clock.
     pub gives_up_in: std::time::Duration,
+    /// FR-93 P5b — what the open waits for, which decides what the controller
+    /// reads.
+    pub why: WaitFor,
+}
+
+/// FR-93 P5b — what an open waits for the person at the screen to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFor {
+    /// Answer the desktop portal's dialog: share the screen, or, when
+    /// `control`, allow remote control (P4b). A refusal there is asked again
+    /// for the screen only, inside the same wait.
+    Dialog { control: bool },
+    /// Unlock the screen: GNOME refuses every screen cast while it is locked,
+    /// and closes the ones it has (#2145).
+    Unlock,
 }
 
 /// What a pump hands [`open_default_async`]: called at most once, if and when
@@ -1462,6 +1748,10 @@ thread_local! {
     /// into the next open, not even after a panic.
     static PARK_HOOK: std::cell::RefCell<Option<OnOpenWait>> =
         const { std::cell::RefCell::new(None) };
+    /// FR-93 P5b — set when the session that asked for this thread's open has
+    /// gone (its pump dropped the open). Cleared with the hook.
+    static PARK_ABANDONED: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Holds an open's [`OnOpenWait`] for as long as that open runs on this thread.
@@ -1470,8 +1760,9 @@ struct ParkHook;
 
 #[cfg(target_os = "linux")]
 impl ParkHook {
-    fn install(hook: OnOpenWait) -> Self {
+    fn install(hook: OnOpenWait, abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         PARK_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        PARK_ABANDONED.with(|a| *a.borrow_mut() = Some(abandoned));
         Self
     }
 }
@@ -1480,6 +1771,34 @@ impl ParkHook {
 impl Drop for ParkHook {
     fn drop(&mut self) {
         PARK_HOOK.with(|h| h.borrow_mut().take());
+        PARK_ABANDONED.with(|a| a.borrow_mut().take());
+    }
+}
+
+/// FR-93 P5b — whether nobody waits for the open on this thread any more: its
+/// session ended while it waited. A wait that can last as long as a locked
+/// screen asks this, so a session that left stops costing a thread and a poll.
+/// A thread with no open behind it (the recorder, a probe, a test) reads
+/// `false`.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+pub(crate) fn open_abandoned() -> bool {
+    PARK_ABANDONED.with(|a| {
+        a.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// Sets the flag when dropped: the pump's open future going away, mid-wait or
+/// after, is what marks the blocking open abandoned.
+#[cfg(target_os = "linux")]
+struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(target_os = "linux")]
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
