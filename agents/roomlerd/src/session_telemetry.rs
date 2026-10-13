@@ -19,6 +19,40 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
+use roomler_ai_remote_control::signaling::{FileNote, Tally, TransferDirection, Transfers};
+use sha2::{Digest, Sha256};
+
+/// FR-101 P3 — the most file notes one session holds between two samples.
+/// A sample goes out every 30 s and drains them; past this, a note is
+/// dropped and logged rather than letting a flood of tiny files grow the
+/// daemon's memory without bound.
+const MAX_PENDING_FILE_NOTES: usize = 512;
+
+/// How many, and how many bytes, as two counters a producer bumps.
+#[derive(Default, Debug)]
+pub struct TallyCounter {
+    count: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl TallyCounter {
+    pub fn add(&self, bytes: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn read(&self) -> Tally {
+        Tally {
+            count: self.count.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_tally(&self, t: Tally) {
+        self.count.fetch_add(t.count, Ordering::Relaxed);
+        self.bytes.fetch_add(t.bytes, Ordering::Relaxed);
+    }
+}
 
 #[derive(Default, Debug)]
 pub struct SessionCounters {
@@ -34,9 +68,71 @@ pub struct SessionCounters {
     /// … of which the viewers' dials (Priority / resolution) were NOT
     /// all equal — the SVC go/no-go dataset (plan Phase 4 gate).
     pub mixed_dial_seconds: AtomicU64,
+    /// FR-101 P3 — writes the controller made to this host's clipboard.
+    pub clipboard_to_host: TallyCounter,
+    /// FR-101 P3 — clipboard content this host sent the controller.
+    pub clipboard_from_host: TallyCounter,
+    /// FR-101 P3 — files completed since the last sample. A name is hashed
+    /// the moment it is noted, so no name is ever held here.
+    file_notes: std::sync::Mutex<Vec<FileNote>>,
 }
 
 impl SessionCounters {
+    /// FR-101 P3 — one completed file transfer. Only a SHA-256 of `name`
+    /// is kept.
+    pub fn note_file(&self, dir: TransferDirection, name: &str, bytes: u64) {
+        let note = FileNote {
+            dir,
+            name_sha256: hex::encode(Sha256::digest(name.as_bytes())),
+            bytes,
+        };
+        let mut notes = self.file_notes.lock().unwrap_or_else(|p| p.into_inner());
+        if notes.len() >= MAX_PENDING_FILE_NOTES {
+            tracing::warn!(
+                held = notes.len(),
+                "file transfer audit: too many notes waiting for the next sample — dropping one"
+            );
+            return;
+        }
+        notes.push(note);
+    }
+
+    /// What `rc:session.stats` carries for the audit: the cumulative
+    /// clipboard tallies, and the file notes waiting, which this TAKES.
+    /// Hand them back with [`Self::restore_file_notes`] if the sample could
+    /// not be sent.
+    pub fn take_transfers(&self) -> Transfers {
+        let files = std::mem::take(&mut *self.file_notes.lock().unwrap_or_else(|p| p.into_inner()));
+        Transfers {
+            clipboard_to_host: self.clipboard_to_host.read(),
+            clipboard_from_host: self.clipboard_from_host.read(),
+            files,
+        }
+    }
+
+    /// Put back the file notes of a sample that was never sent, ahead of
+    /// any noted since.
+    pub fn restore_file_notes(&self, mut files: Vec<FileNote>) {
+        if files.is_empty() {
+            return;
+        }
+        let mut notes = self.file_notes.lock().unwrap_or_else(|p| p.into_inner());
+        files.append(&mut notes);
+        files.truncate(MAX_PENDING_FILE_NOTES);
+        *notes = files;
+    }
+
+    /// Carry a session's previous peer's readings into this entry. A session
+    /// renegotiated under a new peer (a second offer for one session id)
+    /// keeps its cumulative clipboard tallies. The old peer's drop forgets its
+    /// counters, and without this the tallies would restart below the totals
+    /// the server stored, which would then count nothing until they caught up.
+    pub fn carry_transfers(&self, t: Transfers) {
+        self.clipboard_to_host.add_tally(t.clipboard_to_host);
+        self.clipboard_from_host.add_tally(t.clipboard_from_host);
+        self.restore_file_notes(t.files);
+    }
+
     pub fn note_keyframe(&self) {
         self.keyframe_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -111,5 +207,107 @@ mod tests {
         assert_eq!(counters(a).keyframe_requests.load(Ordering::Relaxed), 0);
         forget(a);
         forget(b);
+    }
+
+    // FR-101 P3 — the clipboard tallies are cumulative (a sample never
+    // resets them), and the file notes are taken exactly once.
+    #[test]
+    fn clipboard_tallies_accumulate_and_file_notes_are_taken_once() {
+        let s = ObjectId::new();
+        let c = counters(s);
+        c.clipboard_to_host.add(10);
+        c.clipboard_to_host.add(5);
+        c.clipboard_from_host.add(7);
+        c.note_file(TransferDirection::ToHost, "report.pdf", 1234);
+
+        let first = c.take_transfers();
+        assert_eq!(
+            first.clipboard_to_host,
+            Tally {
+                count: 2,
+                bytes: 15
+            }
+        );
+        assert_eq!(first.clipboard_from_host, Tally { count: 1, bytes: 7 });
+        assert_eq!(first.files.len(), 1);
+
+        c.clipboard_to_host.add(1);
+        let second = c.take_transfers();
+        assert_eq!(
+            second.clipboard_to_host,
+            Tally {
+                count: 3,
+                bytes: 16
+            },
+            "cumulative: the server takes the difference"
+        );
+        assert!(second.files.is_empty(), "a note goes out once");
+        forget(s);
+    }
+
+    // FR-101 P3 — a name never leaves the device: only its SHA-256 is held,
+    // and equal names hash equally.
+    #[test]
+    fn a_file_name_is_held_only_as_its_sha256() {
+        let s = ObjectId::new();
+        let c = counters(s);
+        c.note_file(TransferDirection::FromHost, "salaries 2026.xlsx", 99);
+        c.note_file(TransferDirection::ToHost, "salaries 2026.xlsx", 99);
+        c.note_file(TransferDirection::ToHost, "abc", 3);
+        let t = c.take_transfers();
+        let held = format!("{t:?}");
+        assert!(!held.contains("salaries"), "{held}");
+        assert_eq!(t.files[0].name_sha256, t.files[1].name_sha256);
+        assert_eq!(t.files[0].dir, TransferDirection::FromHost);
+        // FIPS 180-2's test vector, so this checks the hash, not itself.
+        assert_eq!(
+            t.files[2].name_sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        forget(s);
+    }
+
+    // FR-101 P3 — a session renegotiated under a new peer keeps its
+    // readings: the old peer's drop forgets the entry, and the carry seeds the
+    // fresh one, so the cumulative tallies continue instead of restarting.
+    #[test]
+    fn a_replaced_peer_carries_its_readings_into_the_fresh_entry() {
+        let s = ObjectId::new();
+        counters(s).clipboard_to_host.add(40);
+        counters(s).note_file(TransferDirection::ToHost, "a", 1);
+        let carried = counters(s).take_transfers();
+        forget(s); // the old peer's drop
+        counters(s).carry_transfers(carried);
+        counters(s).clipboard_to_host.add(2);
+        let t = counters(s).take_transfers();
+        assert_eq!(
+            t.clipboard_to_host,
+            Tally {
+                count: 2,
+                bytes: 42
+            }
+        );
+        assert_eq!(t.files.len(), 1, "a note waiting on the old peer survives");
+        forget(s);
+    }
+
+    // FR-101 P3 — the notes of a sample that was never sent go back ahead
+    // of newer ones, and the queue stays bounded.
+    #[test]
+    fn unsent_notes_go_back_first_and_the_queue_is_bounded() {
+        let s = ObjectId::new();
+        let c = counters(s);
+        c.note_file(TransferDirection::ToHost, "a", 1);
+        let unsent = c.take_transfers().files;
+        c.note_file(TransferDirection::ToHost, "b", 2);
+        c.restore_file_notes(unsent);
+        let t = c.take_transfers();
+        assert_eq!(t.files.iter().map(|f| f.bytes).collect::<Vec<_>>(), [1, 2]);
+
+        for i in 0..(MAX_PENDING_FILE_NOTES + 10) {
+            c.note_file(TransferDirection::ToHost, "x", i as u64);
+        }
+        assert_eq!(c.take_transfers().files.len(), MAX_PENDING_FILE_NOTES);
+        forget(s);
     }
 }

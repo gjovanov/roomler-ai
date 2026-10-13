@@ -1888,22 +1888,21 @@ async fn connect_once(
                             continue;
                         }
                     };
-                    let msg = ClientMsg::SessionStats {
-                        session_id: session_id.to_hex(),
-                        bytes_sent: t.bytes_sent,
-                        bytes_recv: t.bytes_recv,
-                        fps: t.fps,
-                        rtt_ms: t.rtt_ms,
-                        keyframe_requests: t.keyframe_requests,
-                        input_events: t.input_events,
-                        shared_seconds: t.shared_seconds,
-                        mixed_dial_seconds: t.mixed_dial_seconds,
-                    };
+                    // FR-101 P3 — with the clipboard and file traffic for
+                    // the audit; the file notes are taken, so a failed send
+                    // hands them back.
+                    let transfers =
+                        crate::session_telemetry::counters(*session_id).take_transfers();
+                    let msg = session_stats_msg(*session_id, &t, transfers);
                     // Best-effort: telemetry must never tear down a
                     // working session, so a failed send is only logged —
                     // the heartbeat above is what proves liveness.
                     if let Err(e) = send_msg(&mut ws, &msg).await {
                         debug!(%session_id, %e, "session stats send failed");
+                        if let ClientMsg::SessionStats { transfers, .. } = msg {
+                            crate::session_telemetry::counters(*session_id)
+                                .restore_file_notes(transfers.files);
+                        }
                         break;
                     }
                 }
@@ -1967,6 +1966,14 @@ async fn connect_once(
                 let peer = peers.remove(&sid);
                 if let Some(peer) = &peer {
                     peer.stop_serving();
+                    // FR-101 P3 — the audit's last sample, while the server
+                    // still holds the session live (the terminate follows).
+                    if let Some(stats) = final_session_stats(sid, peer).await
+                        && let Err(e) =
+                            reply_for_session(&mut ws, delegated_out.as_ref(), &stats).await
+                    {
+                        debug!(session_id = %sid, %e, "final session stats send failed");
+                    }
                 }
                 // A delegated session (a supervised Mac) speaks through the
                 // daemon's WS, the way its answer and its ICE did.
@@ -3064,7 +3071,13 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
+                // FR-101 P3 — the session goes on under a new peer, and the
+                // old one's drop forgets its counters: carry the transfer
+                // readings across, so the cumulative tallies never go back.
+                let carried = crate::session_telemetry::counters(session_id).take_transfers();
                 close_within_budget(old.close(), session_id, "replaced_by_offer").await;
+                drop(old);
+                crate::session_telemetry::counters(session_id).carry_transfers(carried);
             }
 
             // Read back the codec picked by `rc:session.request`. If
@@ -3291,6 +3304,12 @@ async fn handle_server_msg(
             #[cfg(feature = "recording")]
             crate::recording::remote::session_ended(session_id);
             if let Some(peer) = peers.remove(&session_id) {
+                // FR-101 P3 — the audit's last sample, before the close.
+                if let Some(stats) = final_session_stats(session_id, &peer).await
+                    && let Err(e) = reply_for_session(ws, delegated, &stats).await
+                {
+                    debug!(%session_id, %e, "final session stats send failed");
+                }
                 close_within_budget(peer.close(), session_id, "terminate").await;
             }
             // 2026-07-27 — last session gone → release the GPU-clock pin
@@ -5353,6 +5372,57 @@ async fn next_delegated(
 /// controller buffers early ICE in `pendingRemoteIce` (`useRemoteControl.ts`)
 /// exactly because `addIceCandidate` throws before `setRemoteDescription`, and
 /// flushes it when the answer lands.
+/// One `rc:session.stats` for `session_id`.
+fn session_stats_msg(
+    session_id: bson::oid::ObjectId,
+    t: &crate::peer::SessionTelemetry,
+    transfers: roomler_ai_remote_control::signaling::Transfers,
+) -> ClientMsg {
+    ClientMsg::SessionStats {
+        session_id: session_id.to_hex(),
+        bytes_sent: t.bytes_sent,
+        bytes_recv: t.bytes_recv,
+        fps: t.fps,
+        rtt_ms: t.rtt_ms,
+        keyframe_requests: t.keyframe_requests,
+        input_events: t.input_events,
+        shared_seconds: t.shared_seconds,
+        mixed_dial_seconds: t.mixed_dial_seconds,
+        transfers,
+    }
+}
+
+/// FR-101 P3 — the last `rc:session.stats` of a session that is ending, so
+/// the clipboard and file traffic since the previous 30 s sample still
+/// reaches the audit. A session shorter than one sample would otherwise
+/// report nothing at all.
+///
+/// Taken before the peer closes: its telemetry needs the live connection,
+/// and its counters are forgotten when it drops. `None` when the session
+/// moved nothing worth auditing, or when its telemetry did not answer within
+/// [`SESSION_STATS_BUDGET`]: a sample of zeros could overwrite the live
+/// totals of a session the server has not ended yet.
+async fn final_session_stats(
+    session_id: bson::oid::ObjectId,
+    peer: &AgentPeer,
+) -> Option<ClientMsg> {
+    let transfers = crate::session_telemetry::counters(session_id).take_transfers();
+    if transfers.is_empty() {
+        return None;
+    }
+    match tokio::time::timeout(SESSION_STATS_BUDGET, peer.telemetry()).await {
+        Ok(t) => Some(session_stats_msg(session_id, &t, transfers)),
+        Err(_elapsed) => {
+            warn!(
+                %session_id,
+                files = transfers.files.len(),
+                "final session stats: telemetry timed out — this session's last transfers go unreported"
+            );
+            None
+        }
+    }
+}
+
 async fn reply_for_session(
     ws: &mut Ws,
     delegated: Option<&mpsc::Sender<ClientMsg>>,

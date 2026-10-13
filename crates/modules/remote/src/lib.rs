@@ -35,7 +35,7 @@ use roomler_ai_db::indexes::{IndexSet, index, index_ttl};
 use roomler_ai_mod_fleet::FleetState;
 use roomler_ai_services::dao::{
     recording_activity::RecordingActivityDao, remote_audit::RemoteAuditDao,
-    remote_session::RemoteSessionDao,
+    remote_session::RemoteSessionDao, transfer_activity::TransferActivityDao,
 };
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Module, TenantCtx};
 
@@ -56,6 +56,10 @@ pub struct RemoteState {
     /// FR-85 P3 — what devices report about remote recordings (the host's
     /// claims; the server's grant decision stays in `remote_audit`).
     pub recording_activity: Arc<RecordingActivityDao>,
+    /// FR-101 P3 — the clipboard and file traffic devices report (again the
+    /// host's claims, beside the `CLIPBOARD` / `FILES` grant in
+    /// `remote_audit`).
+    pub transfer_activity: Arc<TransferActivityDao>,
     /// PR-2 relay — owner-side proxy controllers for cross-pod rc sessions,
     /// keyed by the ORIGIN connection id. See [`relay`].
     pub rc_proxy_controllers: Arc<relay::ProxyControllers>,
@@ -91,6 +95,7 @@ impl Module for RemoteState {
             remote_sessions: Arc::new(RemoteSessionDao::new(db)),
             remote_audit: Arc::new(RemoteAuditDao::new(db)),
             recording_activity: Arc::new(RecordingActivityDao::new(db)),
+            transfer_activity: Arc::new(TransferActivityDao::new(db)),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
             fleet,
@@ -135,19 +140,24 @@ impl Module for RemoteState {
         // FR-85 P3 — what devices reported about remote recordings (read with
         // the session audit, under the same permission).
         let recording = Router::new().route("/{agent_id}", get(routes::recording_activity));
+        // FR-101 P3 — the clipboard and file traffic devices reported, read
+        // the same way.
+        let transfers = Router::new().route("/{agent_id}", get(routes::transfer_activity));
 
         Router::new()
             .nest("/tenant/{tenant_id}/session", session)
             .nest("/tenant/{tenant_id}/recording-activity", recording)
+            .nest("/tenant/{tenant_id}/transfer-activity", transfers)
             .nest("/turn", turn)
             .nest("/relay", relay)
             .with_state(self.clone())
     }
 
-    /// The three collections this module owns. The first two are the specs
+    /// The four collections this module owns. The first two are the specs
     /// the db crate's plan held before P6, unchanged — `remote_sessions` has
     /// two sets there (the session indexes, then the Wave-3 per-tenant usage
-    /// read), in that order. `recording_activity` is FR-85 P3's.
+    /// read), in that order. `recording_activity` is FR-85 P3's,
+    /// `transfer_activity` FR-101 P3's.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             IndexSet {
@@ -180,6 +190,18 @@ impl Module for RemoteState {
             // like the audit it is read with.
             IndexSet {
                 collection: "recording_activity",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
+                    index(bson::doc! { "session_id": 1, "at": 1 }),
+                    index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-101 P3 — clipboard and file traffic the devices report (a
+            // claim, like `recording_activity`) — 90-day retention, like the
+            // audit it is read with.
+            IndexSet {
+                collection: "transfer_activity",
                 pre_ops: Vec::new(),
                 indexes: vec![
                     index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),

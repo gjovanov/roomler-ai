@@ -334,3 +334,75 @@ pub async fn recording_activity(
         total_pages: page.total_pages,
     }))
 }
+
+#[derive(Debug, Serialize)]
+pub struct TransferActivityDto {
+    pub id: String,
+    pub session_id: String,
+    pub controller_user_id: String,
+    pub kind: roomler_ai_remote_control::models::TransferActivityKind,
+    pub count: u64,
+    pub bytes: u64,
+    pub name_sha256: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransferActivityListResponse {
+    pub items: Vec<TransferActivityDto>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// FR-101 P3 — the clipboard and file traffic a device reported, newest
+/// first. Read like the recording trail beside it: under `VIEW_REMOTE_AUDIT`,
+/// with the device resolved WITHIN the tenant (any, not live: removing a
+/// device must not be the way to hide what it reported).
+pub async fn transfer_activity(
+    State(state): State<RemoteState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<TransferActivityListResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_REMOTE_AUDIT,
+        "VIEW_REMOTE_AUDIT",
+    )
+    .await?;
+    let _ = state.fleet.agents.find_any_in_tenant(tid, aid).await?;
+
+    let page = state
+        .transfer_activity
+        .list_for_agent(tid, aid, &params)
+        .await?;
+    Ok(Json(TransferActivityListResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(|e| TransferActivityDto {
+                id: e.id.map(|i| i.to_hex()).unwrap_or_default(),
+                session_id: e.session_id.to_hex(),
+                controller_user_id: e.controller_user_id.to_hex(),
+                kind: e.kind,
+                count: e.count,
+                bytes: e.bytes,
+                name_sha256: e.name_sha256,
+                at: fmt_dt(e.at),
+            })
+            .collect(),
+        total: page.total,
+        page: page.page,
+        per_page: page.per_page,
+        total_pages: page.total_pages,
+    }))
+}

@@ -259,7 +259,7 @@ agent's session can change it.
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device) |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
-| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`) still resolve a removed device |
+| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`, `…/transfer-activity/{aid}`) still resolve a removed device |
 | GET | `…/agent/{aid}/crash` | Crash reports |
 | POST/GET | `…/agent/{aid}/logs` | Log batch ingest (agent JWT) / admin listing |
 | POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |
@@ -274,6 +274,7 @@ agent's session can change it.
 | POST | `…/session/{sid}/terminate` | Force-terminate |
 | GET | `…/session/{sid}/audit` | Session audit trail |
 | GET | `…/recording-activity/{aid}` | What a device reported about remote recordings (FR-85), newest first; `VIEW_REMOTE_AUDIT` — see [recording.md](recording.md) §10 |
+| GET | `…/transfer-activity/{aid}` | The clipboard and file traffic a device reported for remote sessions (FR-101 P3): counts, bytes, and a SHA-256 of each file name. Never content, never a name. Newest first; `VIEW_REMOTE_AUDIT`. A removed device's trail still resolves — see [remote-control.md](remote-control.md) §11.3a |
 
 Exec body (`POST …/exec`): `{shell?: "pwsh"|"powershell"|"cmd"|"bash"|"sh", command,
 timeout_ms?, max_output_bytes?}` — clamped server-side; output is secret-redacted

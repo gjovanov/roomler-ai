@@ -317,6 +317,19 @@ The suite list needs a setter upstream does not have. It is a one-field patch to
 vendored webrtc crate (`SettingEngine::set_dtls_cipher_suites`, noted in the workspace
 `Cargo.toml`). Tunnel and overlay peers build their own engines and are unchanged.
 
+**Clipboard and file traffic is audited as the device's claim** (FR-101 P3,
+`crates/modules/remote/src/agent_socket.rs`, [remote-control.md](remote-control.md) §11.3a).
+The payload travels peer to peer, so the server cannot observe a transfer. The device reports
+counts, bytes and a SHA-256 of each file name on `rc:session.stats`. The hub keeps them in
+`transfer_activity` only for a session of that device whose grant allowed the traffic:
+`CLIPBOARD` for the clipboard, `FILES` for files.
+
+- **Never content, never a name.** A name hash that is not 64 lowercase hex digits is
+  dropped, so a host cannot store a name in its place.
+- ⚠️ **Kept apart from `remote_audit`**, which holds the server's own decisions, as
+  `recording_activity` and `ssh_activity` are. An empty result is not proof that nothing
+  crossed: a compromised host can stay silent.
+
 ---
 
 ## 5 · Network-facing surfaces

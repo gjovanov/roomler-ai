@@ -35,6 +35,7 @@ pub mod ssh_audit;
 pub mod stats;
 pub mod subscriber;
 pub mod tenant;
+pub mod transfer_activity;
 pub mod tunnel_audit;
 pub mod tunnel_client;
 pub mod tunnel_policy;
