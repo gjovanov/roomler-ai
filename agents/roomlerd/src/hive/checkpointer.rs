@@ -62,6 +62,13 @@ pub(crate) struct Request {
     pub sid: String,
     /// The harness's session id (a UUID): the config directory's names.
     pub harness_session: String,
+    /// FR-90 P2f-3a — for a fork, the harness session it was made from:
+    /// its history, sub-agent transcripts and tool results under this
+    /// session's project directory are taken too ([`checkpoint::allowlist_of`]).
+    /// Absent for every other session, so a request of a build before it
+    /// reads the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<String>,
     pub config_dir: PathBuf,
     pub folder: PathBuf,
     pub state_dir: PathBuf,
@@ -91,6 +98,7 @@ pub(crate) fn produce(req: &Request, git: &Git) -> Result<(Checkpoint, Vec<Vec<u
     let (mut cp, mut blobs) = checkpoint::take(
         &req.config_dir,
         &req.harness_session,
+        req.fork_of.as_deref(),
         req.n,
         req.turn,
         &prev,
@@ -205,7 +213,8 @@ pub(crate) fn check(req: &Request, cp: &Checkpoint, blobs: &[Vec<u8>]) -> Result
             cp.n, cp.turn, req.n, req.turn
         ));
     }
-    let allow = checkpoint::allowlist(&req.harness_session).map_err(|e| e.to_string())?;
+    let allow = checkpoint::allowlist_of(&req.harness_session, req.fork_of.as_deref())
+        .map_err(|e| e.to_string())?;
     let mut new_bytes = 0u64;
     let mut next = blobs.iter();
     let mut last_path: Option<&str> = None;
@@ -352,6 +361,8 @@ pub(crate) struct Checkpoints {
     #[cfg_attr(not(unix), allow(dead_code))]
     env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     harness_session: String,
+    /// P2f-3a — the session a fork was made from, for its life.
+    fork_of: Option<String>,
     config_dir: PathBuf,
     folder: PathBuf,
     state_dir: PathBuf,
@@ -370,6 +381,8 @@ pub(crate) struct Place {
     pub owner: Option<(u32, u32)>,
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub harness_session: String,
+    /// P2f-3a — for a fork, the harness session it was made from.
+    pub fork_of: Option<String>,
     pub config_dir: PathBuf,
     pub folder: PathBuf,
     pub state_dir: PathBuf,
@@ -384,6 +397,7 @@ impl Checkpoints {
             owner: place.owner,
             env: place.env,
             harness_session: place.harness_session,
+            fork_of: place.fork_of,
             config_dir: place.config_dir,
             folder: place.folder,
             state_dir: place.state_dir,
@@ -432,6 +446,7 @@ impl Checkpoints {
             v: REQUEST_V,
             sid: sid.to_string(),
             harness_session: self.harness_session.clone(),
+            fork_of: self.fork_of.clone(),
             config_dir: self.config_dir.clone(),
             folder: self.folder.clone(),
             state_dir: self.state_dir.clone(),
@@ -721,6 +736,7 @@ mod tests {
             v: REQUEST_V,
             sid: SID.into(),
             harness_session: HID.into(),
+            fork_of: None,
             config_dir: tmp.join("claude"),
             folder: tmp.join("work"),
             state_dir: tmp.join("state"),
@@ -770,6 +786,48 @@ mod tests {
             .find(|f| f.path.ends_with(".jsonl"))
             .unwrap();
         assert_eq!(history.chunks[0].offset, 8, "only the new line");
+    }
+
+    /// P2f-3a — a fork's checkpoint takes its parent's history beside its own
+    /// and is held to the fork's allowlist: the same checkpoint held to a
+    /// plain session's request is refused. Only a fork's request names a
+    /// parent on the wire.
+    #[test]
+    fn a_forks_checkpoint_keeps_its_parents_history_and_is_held_to_it() {
+        const PARENT: &str = "7d8e9fa0-b1c2-4d3e-8f40-5a6b7c8d9e0f";
+        let tmp = tempfile::tempdir().unwrap();
+        session(tmp.path());
+        let config = tmp.path().join("claude");
+        write(
+            &config,
+            &format!("projects/hive-{HID}/{PARENT}.jsonl"),
+            "{\"p\":1}\n",
+        );
+        write(
+            &config,
+            &format!("projects/hive-{HID}/{PARENT}/tool-results/t1.txt"),
+            "big output",
+        );
+        let mut req = request(tmp.path(), 1, None);
+        req.fork_of = Some(PARENT.into());
+        let (cp, blobs) = produce(&req, &Git::under(tmp.path())).unwrap();
+        check(&req, &cp, &blobs).expect("a fork's checkpoint holds to the fork's request");
+        let parents: Vec<&str> = cp
+            .files
+            .iter()
+            .filter(|f| f.path.contains(PARENT))
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "the parent's history and tool result, taken: {parents:?}"
+        );
+        let plain = request(tmp.path(), 1, None);
+        let e = check(&plain, &cp, &blobs).unwrap_err();
+        assert!(e.contains("not in the allowlist"), "{e}");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("fork_of"));
+        assert!(serde_json::to_string(&req).unwrap().contains(PARENT));
     }
 
     /// Each kind of lie the account could tell is refused before the store

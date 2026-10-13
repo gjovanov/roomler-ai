@@ -519,6 +519,8 @@ pub async fn start(
         // connection it goes to.
         lease: replicated
             && state.fleet.rc_hub.agent_supports_hive_lease(device_id, tid) == Some(true),
+        // P2f-3b — a fork's start says what it was made from.
+        fork_of: None,
     };
     if let Err(e) = state.fleet.rc_hub.push_hive(device_id, tid, msg) {
         // The device left — or reconnected as a build without Hive — between

@@ -20,7 +20,7 @@ Nothing runs until three parties turn it on. The server's switch is `hive.tenant
 carry the `hive` feature since 0.4.122, and the Windows build from P1i-3 on (#1915),
 so from the first Windows release cut after 0.4.123. A device whose owner never
 turns sessions on keeps nothing for them: no data directory, no `hive.db`, no store
-thread ([`store_wanted`](../agents/roomlerd/src/hive/supervisor.rs#L1042)).
+thread ([`store_wanted`](../agents/roomlerd/src/hive/supervisor.rs#L1047)).
 
 ```mermaid
 flowchart LR
@@ -74,7 +74,7 @@ in the device's store and in no Mongo document, object-store file, server log li
 or frame the server sent the browser. It found one leak when it was written: the
 `ended` detail carried the harness's last 400 bytes of stderr to the server. Those
 are a note in the transcript now, and the server hears only how the harness ended
-([`describe_end`](../agents/roomlerd/src/hive/supervisor.rs#L5422)). Since P2d-6 it
+([`describe_end`](../agents/roomlerd/src/hive/supervisor.rs#L5670)). Since P2d-6 it
 runs with the replicaset on and a second device, a member, which must hold every
 canary too, carried to it over the replica stream (§12, P2d-6).
 
@@ -107,7 +107,7 @@ ends, and a report for a turn older than the newest stub changes nothing
 
 The cost is what that turn cost. Claude Code's `total_cost_usd` is its process's
 running total, so the device subtracts what the process had spent at the previous
-turn's end ([`supervisor.rs:4775`](../agents/roomlerd/src/hive/supervisor.rs#L4775)).
+turn's end ([`supervisor.rs:5023`](../agents/roomlerd/src/hive/supervisor.rs#L5023)).
 
 **The transcript** is a hash chain ([`chain.rs`](../crates/hive-node/src/chain.rs)).
 Each event carries the session's `seq` (gapless from 1), the `fence` of the lease
@@ -198,7 +198,7 @@ is what remains when someone probes which devices will run things for them.
 ([`role.rs:408`](../crates/db/src/models/role.rs#L408)). Running a session is remote
 code execution on a device, gated like exec and SSH.
 
-**The device's gates**, in order ([`decide_and_launch`](../agents/roomlerd/src/hive/supervisor.rs#L1613)).
+**The device's gates**, in order ([`decide_and_launch`](../agents/roomlerd/src/hive/supervisor.rs#L1618)).
 Each fails closed, and none takes an answer from the server: the start names who is
 asking and where, never which account.
 
@@ -226,7 +226,7 @@ word from a newer device is still a refusal (`other`), never "accepted"
 Every one is the device owner's, read once when the daemon starts (a change needs a
 restart), and none can be pushed:
 `the_device_owned_refusals_are_not_pushable`
-([`models.rs:5672`](../crates/remote_control/src/models.rs#L5672)) asserts that no
+([`models.rs:5708`](../crates/remote_control/src/models.rs#L5708)) asserts that no
 Hive key appears in a serialised `DesiredConfig`. The user-facing reference is
 [`configuration.md`](../ui/docs/content/reference/configuration.md).
 
@@ -265,8 +265,8 @@ the harness, over that driver's own viewer peer.
 |---|---|---|
 | Naming a driver is the owner's alone, and the person must hold `HIVE_RUN`. At most 16 besides the owner, held by the update's own filter | driving runs code on the device as the session's account, since a driver answers approvals too | [`participants.rs:196`](../crates/modules/hive/src/participants.rs#L196) |
 | A change ends the person's open views (`role_changed`), and the view they reopen is minted afresh | a grant carries `may_prompt` as it was minted | server [`view.rs:624`](../crates/modules/hive/src/view.rs#L624) |
-| ⚠️ The device decides whom it lets act as its account. A driver other than the starter prompts and answers only when the device's own `hive_accounts` maps them to the account the session runs as; otherwise the view is read only, and `hello` says why (`driving_refused`). The starter is recognised by id, from the start order, never through the map | the gate that survives a wrong server (decision 8). A server before P1c-2 sends no address, and the starter must not be locked out of their own session | [`drives_here`](../agents/roomlerd/src/hive/supervisor.rs#L2211) |
-| The model reads who asked, as `[Name] text`. A slash command goes as typed, and the name loses brackets and control characters and is cut to 64 characters | several drivers can share a session, and a display name must not be able to close the label | [`launch.rs:316`](../crates/hive-node/src/launch.rs#L316) `attributed_prompt` |
+| ⚠️ The device decides whom it lets act as its account. A driver other than the starter prompts and answers only when the device's own `hive_accounts` maps them to the account the session runs as; otherwise the view is read only, and `hello` says why (`driving_refused`). The starter is recognised by id, from the start order, never through the map | the gate that survives a wrong server (decision 8). A server before P1c-2 sends no address, and the starter must not be locked out of their own session | [`drives_here`](../agents/roomlerd/src/hive/supervisor.rs#L2368) |
+| The model reads who asked, as `[Name] text`. A slash command goes as typed, and the name loses brackets and control characters and is cut to 64 characters | several drivers can share a session, and a display name must not be able to close the label | [`launch.rs:372`](../crates/hive-node/src/launch.rs#L372) `attributed_prompt` |
 | A stub's `prompted_by` and an approval's `answered_by` are believed only when they name a driver | both are the device's word | [`room.rs:241`](../crates/modules/hive/src/room.rs#L241), [`room.rs:319`](../crates/modules/hive/src/room.rs#L319) |
 | A member removed from the org drives nothing anywhere, and their views end at once | rejoining the org must not hand back a seat nobody offered again | [`hooks.rs:154`](../crates/modules/hive/src/hooks.rs#L154) |
 | Every change is a note in the room, and audited (`participant`) | who may prompt the agent is for everyone there to see | |
@@ -343,12 +343,12 @@ leads its own process group, so a stop reaches the tools it started.
 
 | What | Where |
 |---|---|
-| the session's config directory (`CLAUDE_CONFIG_DIR`) | `~<account>/.roomler/hive/<session>/claude`, with the project name pinned to `hive-<harness uuid>` (`CLAUDE_CODE_PROJECT_DIR_NAME`), so the history and the auto-memory live under one `projects/hive-<uuid>/` whatever the folder is ([`launch.rs:129`](../crates/hive-node/src/launch.rs#L129)) |
+| the session's config directory (`CLAUDE_CONFIG_DIR`) | `~<account>/.roomler/hive/<session>/claude`, with the project name pinned to `hive-<harness uuid>` (`CLAUDE_CODE_PROJECT_DIR_NAME`), so the history and the auto-memory live under one `projects/hive-<uuid>/` whatever the folder is ([`launch.rs:151`](../crates/hive-node/src/launch.rs#L151)) |
 | the runtime directory, the daemon's | `/run/roomler-hive/<session>` on Linux, `/var/run/roomler-hive/<session>` on macOS, root's and `0755`: `settings.json` and `mcp.json` (root's, `0644`), `toolbelt.sock` (the account's, `0600`), and `memory/` |
-| the harness, with `hive_harness` unset | the first executable of `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude` (macOS) and `/usr/bin/claude` ([`supervisor.rs:4100`](../agents/roomlerd/src/hive/supervisor.rs#L4100)) |
+| the harness, with `hive_harness` unset | the first executable of `~/.local/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude` (macOS) and `/usr/bin/claude` ([`supervisor.rs:4270`](../agents/roomlerd/src/hive/supervisor.rs#L4270)) |
 
 **The launch is rebuilt in full every time**, because a resume restores neither
-`--settings` nor `--mcp-config` ([`launch.rs:183`](../crates/hive-node/src/launch.rs#L183)):
+`--settings` nor `--mcp-config` ([`launch.rs:221`](../crates/hive-node/src/launch.rs#L221)):
 
 ```
 claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages
@@ -365,8 +365,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose --inc
 | `--permission-mode default` | ⚠️ unset, a `-p` run that fetches no feature flags, which is every run behind the sidecar, starts in `auto`, where a classifier rather than a person decides what runs. P1a's contract probe found it |
 | `--strict-mcp-config` | a repository's `.mcp.json` cannot shadow `roomler`, the server that decides what runs |
 | `--disallowedTools AskUserQuestion` | it would reach the permission tool as a tool call whose answer must carry the person's choices, which no card asks for; the model asks in its reply instead |
-| `settings.json` holds `permissions.deny: ["Read(//proc/**)"]`, `sandbox.autoAllowBashIfSandboxed: false` and no `apiKeyHelper` ([`launch.rs:364`](../crates/hive-node/src/launch.rs#L364)) | the Read tool runs inside the harness, so `/proc/self/environ` would hand the model its environment; a sandbox that comes on, ours or the user's, must not take Bash out of the approvals; nothing in the session can print the provider's key |
-| `--resume` exactly when Claude Code's own history exists (`projects/hive-<uuid>/<uuid>.jsonl`), `--session-id` otherwise, for every launch ([`supervisor.rs:3823`](../agents/roomlerd/src/hive/supervisor.rs#L3823)) | Claude Code refuses both other ways round: "Session ID … is already in use", "No conversation found". The daemon only checks that the entry exists, and never reads it |
+| `settings.json` holds `permissions.deny: ["Read(//proc/**)"]`, `sandbox.autoAllowBashIfSandboxed: false` and no `apiKeyHelper` ([`launch.rs:421`](../crates/hive-node/src/launch.rs#L421)) | the Read tool runs inside the harness, so `/proc/self/environ` would hand the model its environment; a sandbox that comes on, ours or the user's, must not take Bash out of the approvals; nothing in the session can print the provider's key |
+| `--resume` exactly when Claude Code's own history exists (`projects/hive-<uuid>/<uuid>.jsonl`), `--session-id` otherwise, for every launch ([`supervisor.rs:4634`](../agents/roomlerd/src/hive/supervisor.rs#L4634) `decide_history`) | Claude Code refuses both other ways round: "Session ID … is already in use", "No conversation found". The daemon only checks that the entry exists, and never reads it |
 | ⚠️ no `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` | on Linux it sandboxes every command, and without bubblewrap and socat Bash then refuses everything. It was the real reason P0's sessions could not run `whoami` (P1a-3) |
 
 ### Windows
@@ -400,7 +400,7 @@ flowchart LR
 | The harness is created suspended, assigned to its own Job Object (`KILL_ON_JOB_CLOSE`, no breakaway), and only then resumed. It inherits its three standard handles and nothing else | none of its tools escapes the job, and no other session's pipe leaks into it | [`spawn_into_job`](../agents/roomlerd/src/win_service/supervisor.rs#L2293), [`JobObject`](../agents/roomlerd/src/win_service/supervisor.rs#L2176) |
 | The environment is the user's own block with the session's variables laid over it by name, case-insensitively, and a NUL in a name or a value is refused | `Path` and `PATH` are one variable, and a NUL could smuggle in an entry of its own | [`merge_env_block`](../agents/roomlerd/src/win_service/supervisor.rs#L2589) |
 | The harness is `hive_harness`, else the native installer's `%USERPROFILE%\.local\bin\claude.exe`, else npm's `%APPDATA%\npm\claude.cmd` run through `cmd.exe /d /v:off /s /c`. An argument holding one of cmd's metacharacters is refused, never escaped | npm's shim passes the line on again with `%*` inside an `IF (…)` block, and no quoting is right for both readers | [`hive_win.rs:523`](../agents/roomlerd/src/hive_win.rs#L523) `harness_command_line` |
-| A stop closes the harness's stdin, then ends its job after the grace | no signal reaches a console-less process | [`hive/supervisor.rs:5410`](../agents/roomlerd/src/hive/supervisor.rs#L5410) |
+| A stop closes the harness's stdin, then ends its job after the grace | no signal reaches a console-less process | [`hive/supervisor.rs:5658`](../agents/roomlerd/src/hive/supervisor.rs#L5658) |
 
 ---
 
@@ -432,7 +432,7 @@ Code without its permission tool. Every call that needs one then errors ("MCP to
 mcp__roomler__approve … not found") and the harness exits 1: nothing runs
 unapproved. So a start whose account cannot execute the relay at all is refused
 `launch_failed` at once, rather than dying at its first approval
-([`executable_by`](../agents/roomlerd/src/hive/supervisor.rs#L4330)).
+([`executable_by`](../agents/roomlerd/src/hive/supervisor.rs#L4544)).
 
 ```mermaid
 sequenceDiagram
@@ -505,7 +505,7 @@ session has no model access: its own config directory holds no login of its own.
 A restart still takes every harness down. Under systemd (`KillMode=control-group`)
 a stop reaches the daemon and then every process in its unit. Under launchd, and for
 a daemon nothing supervises, the daemon takes them down itself as it leaves
-([`wind_down`](../agents/roomlerd/src/hive/supervisor.rs#L3071): SIGTERM to each
+([`wind_down`](../agents/roomlerd/src/hive/supervisor.rs#L3232): SIGTERM to each
 harness's process group, SIGKILL after 3 s). On Windows a harness lives in its
 worker's Job Object and goes with it. What survives is the session: the next daemon
 resumes it with the same Claude Code conversation.
@@ -531,15 +531,15 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | `hosted.json` sits beside the store, root's, `0600`, written whole. Per session it holds the launch's inputs (fence, account, the folder as asked, the starter and their address, Claude Code's session id), the turns begun, the turn in progress and who asked for it, its open approvals, and the harness's pid and start time | after a restart the device holds nothing else: the replay of its last reports lived in memory | [`hosted.rs`](../agents/roomlerd/src/hive/hosted.rs) |
-| A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:4730`](../agents/roomlerd/src/hive/supervisor.rs#L4730) |
-| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3616`](../agents/roomlerd/src/main.rs#L3616), [`supervisor.rs:3033`](../agents/roomlerd/src/hive/supervisor.rs#L3033) |
-| A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:3095`](../agents/roomlerd/src/hive/supervisor.rs#L3095) |
-| The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:2865`](../agents/roomlerd/src/hive/supervisor.rs#L2865) |
-| ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:2898`](../agents/roomlerd/src/hive/supervisor.rs#L2898) |
-| A recorded pid is signalled only while its start time still matches: the boot id and the `/proc` start time on Linux, `proc_pidinfo` on macOS, `GetProcessTimes` on Windows. Pids 0 and 1 never are | two harnesses on one history would both write it, and whatever holds that pid since must be left alone | [`procs.rs:30`](../agents/roomlerd/src/hive/procs.rs#L30), [`supervisor.rs:5373`](../agents/roomlerd/src/hive/supervisor.rs#L5373) |
-| The cut turn is reported `interrupted`, naming who asked; its approvals are reported `withdrawn`; the transcript says the session resumed. The first turn of a resumed process reports no cost | Claude Code restores its running total only from a clean exit's `cost-state`, so where that process starts counting is unknown, and no number is better than a wrong one | [`supervisor.rs:3457`](../agents/roomlerd/src/hive/supervisor.rs#L3457) |
+| A new turn's number and a new approval are written before the frame that tells the server, and so is a turn's end; an approval's end is written after its frame | a reused turn number would have every later stub ignored as older than the newest, and a finished turn must never be reported cut. A withdrawal sent twice changes only an approval still open | [`supervisor.rs:4978`](../agents/roomlerd/src/hive/supervisor.rs#L4978) |
+| From `begin_shutdown` on, the record is frozen, the toolbelt is ignored, and new prompts and starts are refused ("this device is restarting"). `begin_shutdown` runs the moment any shutdown is signalled: an update, a requested restart, a rollback, an OS stop | the teardown's frames go into closing connections; recorded, they would be lost twice. Field, 2026-10-08: an approval the teardown withdrew stayed "needed" | [`main.rs:3616`](../agents/roomlerd/src/main.rs#L3616), [`supervisor.rs:3194`](../agents/roomlerd/src/hive/supervisor.rs#L3194) |
+| A harness that ends without a stop waits 1 s before its end counts, and if the daemon was told to stop by then the session is kept and nothing is reported | under systemd the daemon hears its stop a moment before the harness dies | [`supervisor.rs:3256`](../agents/roomlerd/src/hive/supervisor.rs#L3256) |
+| The next daemon resumes at the first connection of its primary enrollment, once, and that connection's manifest waits for it, at most 60 s | a manifest sent first would leave the resuming sessions out, and the server would end every one. A device that never comes back online launches nothing | [`supervisor.rs:3022`](../agents/roomlerd/src/hive/supervisor.rs#L3022) |
+| ⚠️ Every gate a start passes is passed again, as the device is configured now: `hive_enabled`, the starter mapped to the SAME account, the folder inside `hive_roots`, capacity, a harness. A refusal ends the session ("not resumed after the device restarted: …") and forgets it | an owner who turns sessions off, or remaps an account, and restarts must not find the session back | [`supervisor.rs:3055`](../agents/roomlerd/src/hive/supervisor.rs#L3055) |
+| A recorded pid is signalled only while its start time still matches: the boot id and the `/proc` start time on Linux, `proc_pidinfo` on macOS, `GetProcessTimes` on Windows. Pids 0 and 1 never are | two harnesses on one history would both write it, and whatever holds that pid since must be left alone | [`procs.rs:30`](../agents/roomlerd/src/hive/procs.rs#L30), [`supervisor.rs:5621`](../agents/roomlerd/src/hive/supervisor.rs#L5621) |
+| The cut turn is reported `interrupted`, naming who asked; its approvals are reported `withdrawn`; the transcript says the session resumed. The first turn of a resumed process reports no cost | Claude Code restores its running total only from a clean exit's `cost-state`, so where that process starts counting is unknown, and no number is better than a wrong one | [`supervisor.rs:3618`](../agents/roomlerd/src/hive/supervisor.rs#L3618) |
 | A session resumed 3 times in a row, each time without outliving the resume by 2 minutes, is ended instead | a resume that takes the daemon down must not become a crash loop | [`supervisor.rs:219`](../agents/roomlerd/src/hive/supervisor.rs#L219) |
-| A stop that arrives before the session resumed ends it with no launch | | [`supervisor.rs:2354`](../agents/roomlerd/src/hive/supervisor.rs#L2354) |
+| A stop that arrives before the session resumed ends it with no launch | | [`supervisor.rs:2511`](../agents/roomlerd/src/hive/supervisor.rs#L2511) |
 
 ⚠️ Prompts waiting behind a turn are lost when a restart cuts it. An update waits the
 turn out (§7); a crash does not. ⚠️ `hosted.json` is not synced to disk: a clean
@@ -550,7 +550,7 @@ then the manifest ends what could not be resumed.
 
 On every connection of its primary enrollment the device sends `rc:hive.manifest`:
 the sessions it runs NOW, ids and fences only
-([`supervisor.rs:2827`](../agents/roomlerd/src/hive/supervisor.rs#L2827)). The server
+([`supervisor.rs:2984`](../agents/roomlerd/src/hive/supervisor.rs#L2984)). The server
 ends each session it holds as running there that the list leaves out, as
 `not_on_device` (or `stopped`, for one being stopped), tells its room and withdraws
 its open approvals ([`agent_socket.rs:696`](../crates/modules/hive/src/agent_socket.rs#L696)).
@@ -762,13 +762,13 @@ again on one already there.
   unknown, and another session's directory stays closed, its own DACL granting only
   its account. The unit test runs as a restricted Medium copy of its own token, and
   fails on the old DACL
-  ([`supervisor.rs:10115`](../agents/roomlerd/src/hive/supervisor.rs#L10115)).
+  ([`supervisor.rs:10828`](../agents/roomlerd/src/hive/supervisor.rs#L10828)).
 
 ### macOS: the `/var` link
 
 The store's directory is locked to the daemon with no link on its way that someone
 other than root could have made
-([`untrusted_link`](../agents/roomlerd/src/hive/supervisor.rs#L1069)). On a Mac the
+([`untrusted_link`](../agents/roomlerd/src/hive/supervisor.rs#L1074)). On a Mac the
 root daemon's data directory is under `/var/root`, and `/var` is the system's own
 link to `/private/var`. While every link was refused, as FR-85's recording-folder
 check refuses them, a Mac opened no store and refused every session "/var is a
@@ -886,15 +886,15 @@ flowchart LR
 
 | Path, under the config directory | How Claude Code writes it | How a checkpoint takes it |
 |---|---|---|
-| `projects/hive-<id>/<id>.jsonl`, the history | appended to only | the bytes past the last checkpoint, up to the last whole line ([`checkpoint.rs:458`](../crates/hive-node/src/checkpoint.rs#L458)) |
+| `projects/hive-<id>/<id>.jsonl`, the history | appended to only | the bytes past the last checkpoint, up to the last whole line ([`checkpoint.rs:505`](../crates/hive-node/src/checkpoint.rs#L505)) |
 | `projects/hive-<id>/<id>/subagents/`: `agent-<id>.jsonl` | appended to only | the same |
-| the same directory: `agent-<id>.meta.json` | replaced by a rename | whole, when it changed ([`checkpoint.rs:520`](../crates/hive-node/src/checkpoint.rs#L520)) |
+| the same directory: `agent-<id>.meta.json` | replaced by a rename | whole, when it changed ([`checkpoint.rs:567`](../crates/hive-node/src/checkpoint.rs#L567)) |
 | `projects/hive-<id>/<id>/tool-results/` | each output written once | whole |
 | `projects/hive-<id>/memory/` | the auto-memory | whole |
 | `CLAUDE.md` | the session's own instructions (P1e) | whole |
 
 The chain is the state. A file's `len` and `hash` in the last checkpoint are where
-the next starts ([`checkpoint.rs:335`](../crates/hive-node/src/checkpoint.rs#L335)),
+the next starts ([`checkpoint.rs:336`](../crates/hive-node/src/checkpoint.rs#L336)),
 so nothing else is kept between turns. An appended file that shrank, or changed before
 its last offset, is taken again from its first byte. A chunk at offset 0 tells a
 member to start the file over, and an empty one is sent when no whole line has come
@@ -902,16 +902,16 @@ yet, so the old bytes never linger. Chunks are at most 4 MiB, cut at line ends w
 one is within reach. One checkpoint lists at most 10,000 files and adds at most
 512 MiB.
 
-⚠️ **An allowlist, never the directory** ([`checkpoint.rs:394`](../crates/hive-node/src/checkpoint.rs#L394)).
+⚠️ **An allowlist, never the directory** ([`checkpoint.rs:395`](../crates/hive-node/src/checkpoint.rs#L395)).
 The config directory's root holds a `peerToken` beside the harness's messaging socket
 and a `machineID`, so nothing outside the five paths is opened. The harness id must be
 a lowercase, hyphenated UUID, because it is part of every path.
 
-⚠️ **A link is never followed** ([`checkpoint.rs:662`](../crates/hive-node/src/checkpoint.rs#L662)).
+⚠️ **A link is never followed** ([`checkpoint.rs:711`](../crates/hive-node/src/checkpoint.rs#L711)).
 A link in the allowlist to the account's `~/.ssh` would copy a key to every member. A
 link, or a name that is not UTF-8, is listed as skipped and taken nowhere.
 
-A member's [`assemble`](../crates/hive-node/src/checkpoint.rs#L790) refuses what does
+A member's [`assemble`](../crates/hive-node/src/checkpoint.rs#L839) refuses what does
 not add up: a missing blob, a blob that does not hash to its name, a chunk out of
 place, or a whole that does not hash to the last checkpoint's. The event
 ([`event.rs:118`](../crates/hive-node/src/event.rs#L118)) is a flat object beside its
@@ -953,7 +953,7 @@ none of the person's history, because a member has nothing else to resolve a del
 against. Each later commit is the last checkpoint's child, and its pack is thin
 against it, so a target applies the packs in order (`git index-pack --fix-thin`). The
 person's `HEAD` is recorded beside the commit
-([`WorkspaceSnap`](../crates/hive-node/src/checkpoint.rs#L207)), for a teleport into a
+([`WorkspaceSnap`](../crates/hive-node/src/checkpoint.rs#L208)), for a teleport into a
 clone of the same repository (P2f).
 
 ⚠️ A turn that changed no file writes no commit and no pack. A workspace that cannot be
@@ -987,8 +987,8 @@ sequenceDiagram
 | On stdout | What the daemon holds it to |
 |---|---|
 | `HIVECP1\n` | the magic, or nothing is read |
-| u32 · JSON `{"checkpoint": …}` | at most 16 MiB; the request's `n` and `turn`; every path inside the allowlist, in order, taken the way the allowlist says, at most mode `0o777` ([`checkpointer.rs:201`](../agents/roomlerd/src/hive/checkpointer.rs#L201)) |
-| u32 · then u64 · bytes per blob | each the very blob its chunk names, by length and hash, in order (each file's, then the pack's); not one more or fewer; each at most 4 MiB ([`checkpointer.rs:159`](../agents/roomlerd/src/hive/checkpointer.rs#L159)) |
+| u32 · JSON `{"checkpoint": …}` | at most 16 MiB; the request's `n` and `turn`; every path inside the allowlist, in order, taken the way the allowlist says, at most mode `0o777` ([`checkpointer.rs:209`](../agents/roomlerd/src/hive/checkpointer.rs#L209)) |
+| u32 · then u64 · bytes per blob | each the very blob its chunk names, by length and hash, in order (each file's, then the pack's); not one more or fewer; each at most 4 MiB ([`checkpointer.rs:167`](../agents/roomlerd/src/hive/checkpointer.rs#L167)) |
 | the workspace | git's ids only (40 or 64 hex digits), and a prefix that cannot step outside the repository |
 
 ⚠️ **What comes back is the account's word, and the agent runs as that account.** The
@@ -998,9 +998,9 @@ a blob swapped for another, an extra or a missing one, or a `../` prefix is refu
 before the store sees any of it. A member still checks each whole file again when it
 assembles it.
 
-The child gets 120 s ([`checkpointer.rs:304`](../agents/roomlerd/src/hive/checkpointer.rs#L304))
+The child gets 120 s ([`checkpointer.rs:313`](../agents/roomlerd/src/hive/checkpointer.rs#L313))
 and may write at most the limits' sum. On Unix it is started through the session's
-privilege path ([`checkpointer.rs:588`](../agents/roomlerd/src/hive/checkpointer.rs#L588)).
+privilege path ([`checkpointer.rs:603`](../agents/roomlerd/src/hive/checkpointer.rs#L603)).
 On Windows it runs as the user signed in at the console, whom `hive_accounts` must name
 ([`hive_win.rs:1056`](../agents/roomlerd/src/hive_win.rs#L1056)), in a job of its own.
 
@@ -1016,7 +1016,7 @@ group.
 ### P2b-3b: a checkpoint at each turn's end
 
 A replicated session checkpoints each turn's end
-([`checkpointer.rs:414`](../agents/roomlerd/src/hive/checkpointer.rs#L414)). The checkpoint
+([`checkpointer.rs:428`](../agents/roomlerd/src/hive/checkpointer.rs#L428)). The checkpoint
 comes after the turn's `result` and before the next queued prompt begins, so it holds
 the files as the turn left them; nothing writes them while the harness waits for input.
 The blobs go into the store first, then the `checkpoint` event, so a member that sees the
@@ -1038,10 +1038,10 @@ flowchart LR
 | Piece | What it does |
 |---|---|
 | the switch | `StartOrder.replicated`: a session the server joined as replicated (P2c, which sets it from the wire). Kept in `hosted.json`, so a resume after a restart goes on checkpointing; absent from an older file, it reads off |
-| where it runs | in the session's run loop, not inside the event that ended the turn ([`supervisor.rs:5213`](../agents/roomlerd/src/hive/supervisor.rs#L5213) `checkpoint_or_stop`), so the session still listens: a prompt sent meanwhile waits behind it, and a stop is a stop |
+| where it runs | in the session's run loop, not inside the event that ended the turn ([`supervisor.rs:5461`](../agents/roomlerd/src/hive/supervisor.rs#L5461) `checkpoint_or_stop`), so the session still listens: a prompt sent meanwhile waits behind it, and a stop is a stop |
 | a stop during one | abandons it: its child's group is TERMed and no checkpoint is recorded. The next one takes everything since the last one kept |
 | where the next one starts | the last checkpoint, in memory; after a restart, read back from the store ([`store.rs:995`](../crates/hive-node/src/store.rs#L995) `last_of_kind`). A checkpoint an older daemon stored has no `kind` column, so the next one takes everything again: more bytes, never a wrong checkpoint |
-| the request | `checkpoint.json` in the session's runtime directory, the daemon's own: made `0600` and handed to the account through its descriptor, never by a path ([`checkpointer.rs:540`](../agents/roomlerd/src/hive/checkpointer.rs#L540)); on Windows it takes the session directory's DACL |
+| the request | `checkpoint.json` in the session's runtime directory, the daemon's own: made `0600` and handed to the account through its descriptor, never by a path ([`checkpointer.rs:555`](../agents/roomlerd/src/hive/checkpointer.rs#L555)); on Windows it takes the session directory's DACL |
 | a failure | logged with the session and the number, and said once per reason in the transcript ("Checkpoint 3 was not taken: …"); the session goes on |
 | the daemon going down | starts none, and says no failure: the child went down with it (systemd signals the whole cgroup at once), and the next daemon's next checkpoint takes what this one would have (P1d-2) |
 | a lock left behind | a lock on the checkpoint's own index older than 300 s is cleared ([`workspace.rs:277`](../agents/roomlerd/src/hive/workspace.rs#L277)). A KILL or a power cut leaves one, and it would refuse every checkpoint after it for good; no checkpoint holds one longer than its 120 s |
@@ -1092,12 +1092,12 @@ sequenceDiagram
 
 | Step | What it guards | Where |
 |---|---|---|
-| the plan | every path in the allowlist; each file's chunks from its last start-over, adding up to its entry. A history is streamed, never held whole | [`materializer.rs:195`](../agents/roomlerd/src/hive/materializer.rs#L195) · [`checkpoint.rs:740`](../crates/hive-node/src/checkpoint.rs#L740) `chunks_of` |
-| the stream | each blob held to its chunk before it goes; a blob the store lacks ends the stream short, the child writes nothing, and the daemon's own word is the answer | [`materializer.rs:430`](../agents/roomlerd/src/hive/materializer.rs#L430) |
-| the names | the allowlist again, in order. On Windows: no device name (`aux.md` is AUX, `COM1.log` is COM1), none of `<>:"\|?*` or a control character, no trailing dot or space, at most 259 characters where it goes. On Windows and macOS: no two names that differ only in case | [`materializer.rs:806`](../agents/roomlerd/src/hive/materializer.rs#L806) |
-| the places | every directory on the way is one of its own, never a link to one, and no file goes where a directory is | [`materializer.rs:947`](../agents/roomlerd/src/hive/materializer.rs#L947) |
-| the files | staged beside where they go, `0600` whatever mode the checkpoint's OS kept, and each held to its entry's length and hash; only then are they renamed into place | [`materializer.rs:675`](../agents/roomlerd/src/hive/materializer.rs#L675) |
-| what goes | inside the allowlist, a file the checkpoint does not list is removed, never through a link and no deeper than a checkpoint looks; nothing outside it is touched (a login, the harness's own state) | [`materializer.rs:1083`](../agents/roomlerd/src/hive/materializer.rs#L1083) |
+| the plan | every path in the allowlist; each file's chunks from its last start-over, adding up to its entry. A history is streamed, never held whole | [`materializer.rs:202`](../agents/roomlerd/src/hive/materializer.rs#L202) · [`checkpoint.rs:789`](../crates/hive-node/src/checkpoint.rs#L789) `chunks_of` |
+| the stream | each blob held to its chunk before it goes; a blob the store lacks ends the stream short, the child writes nothing, and the daemon's own word is the answer | [`materializer.rs:484`](../agents/roomlerd/src/hive/materializer.rs#L484) |
+| the names | the allowlist again, in order. On Windows: no device name (`aux.md` is AUX, `COM1.log` is COM1), none of `<>:"\|?*` or a control character, no trailing dot or space, at most 259 characters where it goes. On Windows and macOS: no two names that differ only in case | [`materializer.rs:860`](../agents/roomlerd/src/hive/materializer.rs#L860) |
+| the places | every directory on the way is one of its own, never a link to one, and no file goes where a directory is | [`materializer.rs:1001`](../agents/roomlerd/src/hive/materializer.rs#L1001) |
+| the files | staged beside where they go, `0600` whatever mode the checkpoint's OS kept, and each held to its entry's length and hash; only then are they renamed into place | [`materializer.rs:729`](../agents/roomlerd/src/hive/materializer.rs#L729) |
+| what goes | inside the allowlist, a file the checkpoint does not list is removed, never through a link and no deeper than a checkpoint looks; nothing outside it is touched (a login, the harness's own state) | [`materializer.rs:1137`](../agents/roomlerd/src/hive/materializer.rs#L1137) |
 
 ⚠️ **What comes in is another device's word.** A checkpoint was taken by whichever
 member was primary, and this daemon only relays it. Unchecked, a path that climbs out
@@ -1125,7 +1125,7 @@ and restoring that on Linux would leave the account unable to read its own histo
 The same child takes the session's folder back too, after the config directory's files
 are staged ([`workspace.rs`](../agents/roomlerd/src/hive/workspace.rs)). The daemon
 sends the packs that bring the last checkpoint's commit
-([`materializer.rs:263`](../agents/roomlerd/src/hive/materializer.rs#L263)):
+([`materializer.rs:272`](../agents/roomlerd/src/hive/materializer.rs#L272)):
 back from it along each `base` to a whole pack, past the turns that changed nothing,
 and oldest first, so each thin pack finds its base in the repository already.
 
@@ -1148,8 +1148,8 @@ flowchart TD
 |---|---|---|
 | the place | the folder's own repository, at its prefix, or a shadow in the session's state directory; a link where the folder goes is refused | [`workspace.rs:745`](../agents/roomlerd/src/hive/workspace.rs#L745) |
 | the packs | each through `git index-pack --stdin --fix-thin`, which checks every object as it lands. Nothing else of the repository changes; the objects of a materialize refused later are referenced by nothing, and git's own gc takes them | [`workspace.rs:770`](../agents/roomlerd/src/hive/workspace.rs#L770) |
-| the tree | the commit's tree, as git hashed it, must be the one the checkpoint names | [`materializer.rs:753`](../agents/roomlerd/src/hive/materializer.rs#L753) |
-| the names | every path in the tree held to the same rules as the config directory's: Windows' names and lengths where it goes, and on Windows and macOS two names that are one there, files or the directories on their way (`Dir/a` beside `dir/b`) | [`materializer.rs:864`](../agents/roomlerd/src/hive/materializer.rs#L864) |
+| the tree | the commit's tree, as git hashed it, must be the one the checkpoint names | [`materializer.rs:807`](../agents/roomlerd/src/hive/materializer.rs#L807) |
+| the names | every path in the tree held to the same rules as the config directory's: Windows' names and lengths where it goes, and on Windows and macOS two names that are one there, files or the directories on their way (`Dir/a` beside `dir/b`) | [`materializer.rs:918`](../agents/roomlerd/src/hive/materializer.rs#L918) |
 | the folder | only one it is safe to replace: holding nothing yet, exactly its own `HEAD`'s tree (a clean clone), exactly what this session last left in it (a former primary: moving back), or already the checkpoint's. Anything else is the person's own work, and is refused | [`workspace.rs:890`](../agents/roomlerd/src/hive/workspace.rs#L890) |
 | the switch | git's own two-tree `read-tree -m -u`, through the session's temporary index: what the tree lacks is removed, what it changes is rewritten with the repository's line endings and filters, and an untracked file in the way is refused before anything is written | [`workspace.rs:983`](../agents/roomlerd/src/hive/workspace.rs#L983) |
 | a folder inside a repository | the switch is between the whole repository's trees, the index's and the same with the folder's subtree swapped, so nothing outside the folder moves | [`workspace.rs:1030`](../agents/roomlerd/src/hive/workspace.rs#L1030) |
@@ -1174,11 +1174,11 @@ moved, the config files are not placed, and the materialize says so.
 
 Before any frame of the replicaset exists, the device's own refusals do (§3g). Three
 keys, each the device owner's, default off, never pushable, and in the lock test's list
-([`models.rs:5672`](../crates/remote_control/src/models.rs#L5672)):
+([`models.rs:5708`](../crates/remote_control/src/models.rs#L5708)):
 
 | Key | What it is | Where |
 |---|---|---|
-| `hive_replica` | hold copies of the sessions the owner runs on their other devices. While it is on the device keeps a store, as an archive replica's container must although it runs nothing | [`config.rs:471`](../crates/agent-core/src/config.rs#L471) · [`supervisor.rs:1042`](../agents/roomlerd/src/hive/supervisor.rs#L1042) |
+| `hive_replica` | hold copies of the sessions the owner runs on their other devices. While it is on the device keeps a store, as an archive replica's container must although it runs nothing | [`config.rs:471`](../crates/agent-core/src/config.rs#L471) · [`supervisor.rs:1047`](../agents/roomlerd/src/hive/supervisor.rs#L1047) |
 | `hive_archive` | offer the device as the org's archive replica; only ever with `hive_replica`, so alone it reads off | [`gates.rs:79`](../agents/roomlerd/src/hive/gates.rs#L79) |
 | `hive_store_quota_mib` | the most the device keeps as a replica, in MiB; unset, the disk's | |
 
@@ -1353,8 +1353,8 @@ sequenceDiagram
 
 | Frame | From | Says | Where |
 |---|---|---|---|
-| `rc:hive.start` gains `replicated` | the server | the session has members besides its primary: checkpoint each turn's end (P2b-3b). Absent, as from every earlier server, and a device that predates it ignores it | [`signaling.rs:3112`](../crates/remote_control/src/signaling.rs#L3112); the device takes it into its start order, [`signaling.rs:4253`](../agents/roomlerd/src/signaling.rs#L4253) |
-| `rc:hive.replica.join` | the server | `{session_id, fence, role}`: hold a copy, as `archive` or `owner`; or, as `primary` (P2c-4b, below), checkpoint the session you run, which has members now. A role the device cannot name decodes as none, and it refuses | [`signaling.rs:3137`](../crates/remote_control/src/signaling.rs#L3137) |
+| `rc:hive.start` gains `replicated` | the server | the session has members besides its primary: checkpoint each turn's end (P2b-3b). Absent, as from every earlier server, and a device that predates it ignores it | [`signaling.rs:3112`](../crates/remote_control/src/signaling.rs#L3112); the device takes it into its start order, [`signaling.rs:4254`](../agents/roomlerd/src/signaling.rs#L4254) |
+| `rc:hive.replica.join` | the server | `{session_id, fence, role}`: hold a copy, as `archive` or `owner`; or, as `primary` (P2c-4b, below), checkpoint the session you run, which has members now. A role the device cannot name decodes as none, and it refuses | [`signaling.rs:3146`](../crates/remote_control/src/signaling.rs#L3146) |
 | `rc:hive.replica.join_ack` | a member | joined, or `refused`: `replica_disabled`, `archive_disabled`, `secondary_org`, `purged`, `stale_fence` or `quota`. An unknown word is still a refusal | [`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831), [`hive.rs:600`](../crates/remote_control/src/hive.rs#L600) |
 | `rc:hive.replica.tip` | a member, or the primary | `{session_id, fence, seq, hash, checkpoint?}`: where its copy ends, at most every 5 s and at each checkpoint | [`signaling.rs:858`](../crates/remote_control/src/signaling.rs#L858) |
 | `rc:hive.replica.manifest` | each device, on every connection | every session it holds a copy of, its own included, each with its tip; at most 4,096 | [`signaling.rs:876`](../crates/remote_control/src/signaling.rs#L876), [`hive.rs:499`](../crates/remote_control/src/hive.rs#L499) |
@@ -1417,7 +1417,7 @@ flowchart TD
 
 The gates run in that order ([`replica.rs:60`](../agents/roomlerd/src/hive/supervisor/replica.rs#L60)),
 and the answer goes back on the connection the join came on
-([`supervisor.rs:808`](../agents/roomlerd/src/hive/supervisor.rs#L808)). A join that
+([`supervisor.rs:813`](../agents/roomlerd/src/hive/supervisor.rs#L813)). A join that
 passes is one transaction in the store
 ([`store.rs:336`](../crates/hive-node/src/store.rs#L336) `Store::join`): the floor rises to
 the join's fence, and a row in `memberships` keeps the role and fence
@@ -1427,9 +1427,9 @@ ends the membership with the rest ([`store.rs:1255`](../crates/hive-node/src/sto
 
 | What the device says | When | Where |
 |---|---|---|
-| `rc:hive.replica.join_ack` | at once, joined or refused with its word | [`supervisor.rs:808`](../agents/roomlerd/src/hive/supervisor.rs#L808) |
-| `rc:hive.replica.tip` | after each checkpoint of a replicated session it runs | [`supervisor.rs:5255`](../agents/roomlerd/src/hive/supervisor.rs#L5255), [`replica.rs:496`](../agents/roomlerd/src/hive/supervisor/replica.rs#L496) |
-| `rc:hive.replica.manifest` | on every connection, after the P1b manifest: every membership and every replicated session it runs, newest first | [`supervisor.rs:2808`](../agents/roomlerd/src/hive/supervisor.rs#L2808), [`replica.rs:448`](../agents/roomlerd/src/hive/supervisor/replica.rs#L448) |
+| `rc:hive.replica.join_ack` | at once, joined or refused with its word | [`supervisor.rs:813`](../agents/roomlerd/src/hive/supervisor.rs#L813) |
+| `rc:hive.replica.tip` | after each checkpoint of a replicated session it runs | [`supervisor.rs:5503`](../agents/roomlerd/src/hive/supervisor.rs#L5503), [`replica.rs:496`](../agents/roomlerd/src/hive/supervisor/replica.rs#L496) |
+| `rc:hive.replica.manifest` | on every connection, after the P1b manifest: every membership and every replicated session it runs, newest first | [`supervisor.rs:2965`](../agents/roomlerd/src/hive/supervisor.rs#L2965), [`replica.rs:448`](../agents/roomlerd/src/hive/supervisor/replica.rs#L448) |
 
 A tip is the chain's end, the event's fence, `seq` and hash, and the newest `checkpoint`
 event's `seq` and hash. A member that holds nothing yet says `seq` 0 at its floor
@@ -1440,7 +1440,7 @@ The device advertises `hive-replica` while its owner's `hive_replica` is on and 
 opened, and `hive-archive` while `hive_archive` is on too
 ([`caps.rs:1644`](../agents/roomlerd/src/encode/caps.rs#L1644)). A secondary org's
 connection strips both words, in its hello and in every heartbeat that re-announces the
-caps ([`signaling.rs:5380`](../agents/roomlerd/src/signaling.rs#L5380)), so that org's
+caps ([`signaling.rs:5387`](../agents/roomlerd/src/signaling.rs#L5387)), so that org's
 placement never picks this device.
 
 ⚠️ **Only a device with copies to tell about sends a replica frame**
@@ -1552,7 +1552,7 @@ The device answers the primary's join apart from a member's
 its own run.
 
 ⚠️ **The join turns a running session replicated, from its next turn's end.** The flag
-is shared with the session's task ([`supervisor.rs:373`](../agents/roomlerd/src/hive/supervisor.rs#L373)),
+is shared with the session's task ([`supervisor.rs:378`](../agents/roomlerd/src/hive/supervisor.rs#L378)),
 which reads it at each turn's end. So every session now builds its checkpointer at
 launch, and takes a checkpoint only while the flag is on.
 
@@ -1563,9 +1563,9 @@ none does:
 
 | Writer | How the join's mark survives it | Where |
 |---|---|---|
-| the resume, which writes back the record as the daemon found it when it began | it keeps a `replicated` the record holds now. The server sends the primary's join at the very connection the resume runs for, so this is the usual order, not a race | [`supervisor.rs:2970`](../agents/roomlerd/src/hive/supervisor.rs#L2970) |
-| the launch of a resumed session | it reads the record again once the session is live | [`supervisor.rs:3632`](../agents/roomlerd/src/hive/supervisor.rs#L3632) |
-| a new session's first record | written from the live flag, under the record's lock | [`supervisor.rs:3665`](../agents/roomlerd/src/hive/supervisor.rs#L3665) |
+| the resume, which writes back the record as the daemon found it when it began | it keeps a `replicated` the record holds now. The server sends the primary's join at the very connection the resume runs for, so this is the usual order, not a race | [`supervisor.rs:3127`](../agents/roomlerd/src/hive/supervisor.rs#L3127) |
+| the launch of a resumed session | it reads the record again once the session is live | [`supervisor.rs:3793`](../agents/roomlerd/src/hive/supervisor.rs#L3793) |
+| a new session's first record | written from the live flag, under the record's lock | [`supervisor.rs:3826`](../agents/roomlerd/src/hive/supervisor.rs#L3826) |
 
 ⚠️ **A build from before P2c-4b cannot name the role.** P2c-3a and P2c-3b decode it as
 none and refuse it: `other`, or `replica_disabled` while their `hive_replica` is off. An
@@ -1623,14 +1623,14 @@ sequenceDiagram
 | Frame | From → to | Says | Where |
 |---|---|---|---|
 | `rc:hive.replica.want` | member → server | `{session_id, fence, seq, hash, path, derp_pubkey?}`: stream me this session from my tip, on this rung | [`signaling.rs:886`](../crates/remote_control/src/signaling.rs#L886) |
-| `rc:hive.replica.grant` | server → source | `{grant_id, session_id, fence, member_id, path, token, ice_servers, ttl_secs, member_derp_pubkey?}`: stand up an endpoint for this member | [`signaling.rs:3166`](../crates/remote_control/src/signaling.rs#L3166) |
+| `rc:hive.replica.grant` | server → source | `{grant_id, session_id, fence, member_id, path, token, ice_servers, ttl_secs, member_derp_pubkey?}`: stand up an endpoint for this member | [`signaling.rs:3175`](../crates/remote_control/src/signaling.rs#L3175) |
 | `rc:hive.replica.ready` | source → server | `{grant_id, cert_fingerprint, addrs, derp_pubkey?}`, or `{grant_id, refused, detail}` | [`signaling.rs:907`](../crates/remote_control/src/signaling.rs#L907) |
-| `rc:hive.replica.dial` | server → member | `{grant_id, session_id, fence, source_id, path, token, cert_fingerprint, addrs, derp_pubkey?, ice_servers, ttl_secs}` | [`signaling.rs:3196`](../crates/remote_control/src/signaling.rs#L3196) |
-| `rc:hive.replica.candidate` | member → server → source | `{grant_id, addr}`: the member's relayed address, for the source's TURN permission | [`signaling.rs:939`](../crates/remote_control/src/signaling.rs#L939), [`:3223`](../crates/remote_control/src/signaling.rs#L3223) |
-| `rc:hive.replica.refused` | server → member | `{session_id, fence, path, reason, detail?}`: no stream this time, in the server's word or the source's | [`signaling.rs:3232`](../crates/remote_control/src/signaling.rs#L3232), [`hive.rs:830`](../crates/remote_control/src/hive.rs#L830) |
-| `rc:hive.replica.close` | either way | `{grant_id, reason}`: the stream is over | [`signaling.rs:948`](../crates/remote_control/src/signaling.rs#L948), [`:3249`](../crates/remote_control/src/signaling.rs#L3249) |
+| `rc:hive.replica.dial` | server → member | `{grant_id, session_id, fence, source_id, path, token, cert_fingerprint, addrs, derp_pubkey?, ice_servers, ttl_secs}` | [`signaling.rs:3205`](../crates/remote_control/src/signaling.rs#L3205) |
+| `rc:hive.replica.candidate` | member → server → source | `{grant_id, addr}`: the member's relayed address, for the source's TURN permission | [`signaling.rs:939`](../crates/remote_control/src/signaling.rs#L939), [`:3232`](../crates/remote_control/src/signaling.rs#L3232) |
+| `rc:hive.replica.refused` | server → member | `{session_id, fence, path, reason, detail?}`: no stream this time, in the server's word or the source's | [`signaling.rs:3241`](../crates/remote_control/src/signaling.rs#L3241), [`hive.rs:842`](../crates/remote_control/src/hive.rs#L842) |
+| `rc:hive.replica.close` | either way | `{grant_id, reason}`: the stream is over | [`signaling.rs:948`](../crates/remote_control/src/signaling.rs#L948), [`:3258`](../crates/remote_control/src/signaling.rs#L3258) |
 
-**The ladder is the member's to climb** ([`hive.rs:776`](../crates/remote_control/src/hive.rs#L776)).
+**The ladder is the member's to climb** ([`hive.rs:788`](../crates/remote_control/src/hive.rs#L788)).
 Each want names one rung, `direct`, `relay` or `derp`, and the source stands up one
 endpoint for it. A member climbs down a rung when one does not carry, and every renewal
 starts from `direct` again: never ratchet.
@@ -1734,7 +1734,7 @@ The devices' own checks, before anything is dialed:
 | source | `ready` refused `not_held` | its store holds nothing of the session, or is closed |
 | source | `ready` refused `busy` | it serves 32 streams already |
 | member | `close`: `secondary_org`, `path_unavailable`, `not_a_member` | a secondary org's dial, another rung, or a session it never joined, by its own store's record ([`supervisor/stream.rs:1287`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1287)) |
-| member | `close` `no_address` | a dial naming no address a source could hold: the unspecified address, port 0, multicast, broadcast ([`remote_control/src/hive.rs:761`](../crates/remote_control/src/hive.rs#L761)) |
+| member | `close` `no_address` | a dial naming no address a source could hold: the unspecified address, port 0, multicast, broadcast ([`remote_control/src/hive.rs:773`](../crates/remote_control/src/hive.rs#L773)) |
 | source | `close` `auth_failed` | a connection that presents another token |
 | source | `close` `bad_frame` | a frame that announces more than 1 MiB, or is not a message |
 
@@ -1746,7 +1746,7 @@ the member dials, and a NAT that admits nothing it did not ask for falls to the 
 rung.
 
 ⚠️ **The member dials only an address a source could hold**
-([`remote_control/src/hive.rs:761`](../crates/remote_control/src/hive.rs#L761)).
+([`remote_control/src/hive.rs:773`](../crates/remote_control/src/hive.rs#L773)).
 The addresses reach it through the server, from the source, and it dials as SYSTEM or
 root: a multicast address relayed to every member of a tenant would have each of them
 spray its own network. The check is the member's own, so it holds against a
@@ -1817,7 +1817,7 @@ sequenceDiagram
 datagram to the member's relayed address permits that whole IP on its allocation.
 
 ⚠️ **The address check is the device's, mirrored on the server.** One rule, in the wire
-crate ([`remote_control/src/hive.rs:761`](../crates/remote_control/src/hive.rs#L761)), read
+crate ([`remote_control/src/hive.rs:773`](../crates/remote_control/src/hive.rs#L773)), read
 at both ends: the server drops a `ready` or a candidate offering an address no device
 could be reached at (the unspecified address, port 0, multicast, broadcast), as a
 courtesy ([`modules/hive/src/stream.rs:118`](../crates/modules/hive/src/stream.rs#L118)),
@@ -1991,7 +1991,7 @@ source do not all ask again at once; a stream that carried starts them over.
 | A source says whether the session is live there, as it runs there or its hosted record will resume it; a member caught up with one that is over lets the stream go (`caught_up`), and the session is parked | a device holds copies of every session its owner ran, most of them over; the slots go to the sessions that move | [`supervisor/stream.rs:1993`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1993), [`supervisor/stream.rs:1396`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1396) |
 | At most 32 asked for or followed at once, the rest queued in order and given the first slot freed | as many as the stream lets a member follow | [`supervisor/follow.rs:893`](../agents/roomlerd/src/hive/supervisor/follow.rs#L893) |
 | A dial is followed only while the owner lets the device hold copies (`hive_replica`), or for the copy of a teleport the device was prepared for (P2f-1b, below) | the gate that survives a compromised server: without it, a server could have a device go on taking a session its owner said it should no longer hold. A teleport's copy is the one the device will run, admitted by its own prepare's gates | [`supervisor/stream.rs:1233`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1233) |
-| Only the primary organization's connection asks | a device holds copies for its primary organization alone (P2c-3) | [`supervisor.rs:2816`](../agents/roomlerd/src/hive/supervisor.rs#L2816) |
+| Only the primary organization's connection asks | a device holds copies for its primary organization alone (P2c-3) | [`supervisor.rs:2973`](../agents/roomlerd/src/hive/supervisor.rs#L2973) |
 | `hive-stream` is advertised while the store is open, whatever the owner says of holding copies | a primary serves its own sessions' members (P2c-4) | [`agents/roomlerd/src/encode/caps.rs:1657`](../agents/roomlerd/src/encode/caps.rs#L1657) |
 
 ⚠️ **Parked lives in memory.** After a restart the device asks for every copy once more.
@@ -2117,7 +2117,7 @@ sequenceDiagram
 | The member is this test binary again, its one member test asked to be a device by an environment variable; an ordinary run passes that test at once | a process holds one supervisor; and a `[[bin]]` cannot carry the test launcher, which reaches `roomlerd` only as a Linux dev-dependency, so that no build but a test's ever compiles it | [`hive_canary.rs:260`](../crates/tests/tests/hive_canary.rs#L260) |
 | Each copy is waited for until the member's tip, as the server heard it, is the primary's, which the test reads as a viewer does | the test never opens a store a running device writes | [`hive_canary.rs:314`](../crates/tests/tests/hive_canary.rs#L314), [`hive_canary.rs:304`](../crates/tests/tests/hive_canary.rs#L304) |
 | Every canary is in the member's copy, and so is a checkpoint, none of them failed | a member applies a checkpoint only once it holds every blob it names, so its checkpoint is the blobs' crossing too | [`hive_canary.rs:337`](../crates/tests/tests/hive_canary.rs#L337) |
-| An integration test's device takes its checkpoints in process (`hive-test-launcher`) | its binary is a test's, which knows no `hive-checkpoint`: every checkpoint of a replicated session failed before | [`supervisor.rs:1000`](../agents/roomlerd/src/hive/supervisor.rs#L1000) |
+| An integration test's device takes its checkpoints in process (`hive-test-launcher`) | its binary is a test's, which knows no `hive-checkpoint`: every checkpoint of a replicated session failed before | [`supervisor.rs:1005`](../agents/roomlerd/src/hive/supervisor.rs#L1005) |
 
 ⚠️ **Not the server's `/derp`.** The stream rides `direct` here, on loopback. The tests
 build carries no overlay, so neither device has a DERP connection, and no stream frame
@@ -2165,13 +2165,13 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| A start at an older fence than the run here is refused, and so is one at the fence of a run a newer fence took | a stale frame: the server's word only grows | [`supervisor.rs:1637`](../agents/roomlerd/src/hive/supervisor.rs#L1637) |
-| A start at a newer fence fences the run here out and stops it before any other gate, and launches only once that run's task has let go: at most 15 s, then it is refused | two harnesses never run on one history (§3d); whatever the gates say, the server has moved past that run | [`supervisor.rs:2574`](../agents/roomlerd/src/hive/supervisor.rs#L2574), [`supervisor.rs:159`](../agents/roomlerd/src/hive/supervisor.rs#L159), [`supervisor.rs:3701`](../agents/roomlerd/src/hive/supervisor.rs#L3701) |
-| A fenced run's model calls, prompts and approval answers are refused from that moment, before its harness has gone | the sidecar's gate is the run's fence ([`sidecar.rs:143`](../agents/roomlerd/src/hive/sidecar.rs#L143)): a run being stopped must not spend | [`supervisor.rs:2548`](../agents/roomlerd/src/hive/supervisor.rs#L2548), [`supervisor.rs:2241`](../agents/roomlerd/src/hive/supervisor.rs#L2241), [`supervisor.rs:2284`](../agents/roomlerd/src/hive/supervisor.rs#L2284), [`supervisor.rs:3250`](../agents/roomlerd/src/hive/supervisor.rs#L3250) |
-| A run's end removes its live entry and its hosted record only at its own fence, and a run writes its hosted record only at its own fence | an old run's end would take the new run's entry, and with it its model access (§3d ⚠️) | [`supervisor.rs:3446`](../agents/roomlerd/src/hive/supervisor.rs#L3446), [`supervisor.rs:3033`](../agents/roomlerd/src/hive/supervisor.rs#L3033), [`supervisor.rs:3045`](../agents/roomlerd/src/hive/supervisor.rs#L3045), [`hosted.rs:207`](../agents/roomlerd/src/hive/hosted.rs#L207), [`hosted.rs:235`](../agents/roomlerd/src/hive/hosted.rs#L235) |
-| `rc:hive.demote {session, fence}` raises the store's floor to that fence first, then fences out and stops a run at an older fence and forgets its hosted record. A run at that fence or a newer one is left alone | the run's late writes are refused on this device as on every member; no restart resumes it; a session that came back is not the demote's | [`supervisor.rs:2511`](../agents/roomlerd/src/hive/supervisor.rs#L2511), [`supervisor.rs:1240`](../agents/roomlerd/src/hive/supervisor.rs#L1240) |
-| A resume reads the hosted record again under the start lock | a demote or a stop that came while it waited for the lock wins | [`supervisor.rs:2917`](../agents/roomlerd/src/hive/supervisor.rs#L2917) |
-| A stop for a newer fence than the run here ends that run, and reports the newer fence `ended` | a start at that fence may be waiting for this very run to let go; its launch is answered with a stop when it reports in | [`supervisor.rs:2343`](../agents/roomlerd/src/hive/supervisor.rs#L2343) |
+| A start at an older fence than the run here is refused, and so is one at the fence of a run a newer fence took | a stale frame: the server's word only grows | [`supervisor.rs:1674`](../agents/roomlerd/src/hive/supervisor.rs#L1674) |
+| A start at a newer fence fences the run here out and stops it before any other gate, and launches only once that run's task has let go: at most 15 s, then it is refused | two harnesses never run on one history (§3d); whatever the gates say, the server has moved past that run | [`supervisor.rs:2731`](../agents/roomlerd/src/hive/supervisor.rs#L2731), [`supervisor.rs:159`](../agents/roomlerd/src/hive/supervisor.rs#L159), [`supervisor.rs:3870`](../agents/roomlerd/src/hive/supervisor.rs#L3870) |
+| A fenced run's model calls, prompts and approval answers are refused from that moment, before its harness has gone | the sidecar's gate is the run's fence ([`sidecar.rs:143`](../agents/roomlerd/src/hive/sidecar.rs#L143)): a run being stopped must not spend | [`supervisor.rs:2705`](../agents/roomlerd/src/hive/supervisor.rs#L2705), [`supervisor.rs:2398`](../agents/roomlerd/src/hive/supervisor.rs#L2398), [`supervisor.rs:2441`](../agents/roomlerd/src/hive/supervisor.rs#L2441), [`supervisor.rs:3411`](../agents/roomlerd/src/hive/supervisor.rs#L3411) |
+| A run's end removes its live entry and its hosted record only at its own fence, and a run writes its hosted record only at its own fence | an old run's end would take the new run's entry, and with it its model access (§3d ⚠️) | [`supervisor.rs:3607`](../agents/roomlerd/src/hive/supervisor.rs#L3607), [`supervisor.rs:3194`](../agents/roomlerd/src/hive/supervisor.rs#L3194), [`supervisor.rs:3206`](../agents/roomlerd/src/hive/supervisor.rs#L3206), [`hosted.rs:215`](../agents/roomlerd/src/hive/hosted.rs#L215), [`hosted.rs:243`](../agents/roomlerd/src/hive/hosted.rs#L243) |
+| `rc:hive.demote {session, fence}` raises the store's floor to that fence first, then fences out and stops a run at an older fence and forgets its hosted record. A run at that fence or a newer one is left alone | the run's late writes are refused on this device as on every member; no restart resumes it; a session that came back is not the demote's | [`supervisor.rs:2668`](../agents/roomlerd/src/hive/supervisor.rs#L2668), [`supervisor.rs:1245`](../agents/roomlerd/src/hive/supervisor.rs#L1245) |
+| A resume reads the hosted record again under the start lock | a demote or a stop that came while it waited for the lock wins | [`supervisor.rs:3074`](../agents/roomlerd/src/hive/supervisor.rs#L3074) |
+| A stop for a newer fence than the run here ends that run, and reports the newer fence `ended` | a start at that fence may be waiting for this very run to let go; its launch is answered with a stop when it reports in | [`supervisor.rs:2500`](../agents/roomlerd/src/hive/supervisor.rs#L2500) |
 | The server answers a report from a device that is not the session's location with `rc:hive.demote` at the record's fence: a state, a turn, an approval, a manifest, a late answer to its start. Another organization's device that names the session is told nothing | an old primary hears that it no longer holds the session from whichever report it sends first, a reconnect's replay and manifest included | [`agent_socket.rs:859`](../crates/modules/hive/src/agent_socket.rs#L859), [`agent_socket.rs:760`](../crates/modules/hive/src/agent_socket.rs#L760), [`agent_socket.rs:597`](../crates/modules/hive/src/agent_socket.rs#L597), [`agent_socket.rs:624`](../crates/modules/hive/src/agent_socket.rs#L624), [`agent_socket.rs:834`](../crates/modules/hive/src/agent_socket.rs#L834) |
 
 ⚠️ **The demote carries the record's fence, not the run's.** The device ends what it
@@ -2221,13 +2221,13 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| A session is leased when its record names a member besides its primary, on a device that advertises `hive-lease`. Its start says `lease`, and the start is the word on its own connection | a member is what a promotion moves a session to: a session alone keeps P1's behaviour, and so does a build before P2e-2 | [`routes.rs:521`](../crates/modules/hive/src/routes.rs#L521), [`agent_socket.rs:1066`](../crates/modules/hive/src/agent_socket.rs#L1066), [`supervisor.rs:1118`](../agents/roomlerd/src/hive/supervisor.rs#L1118) |
+| A session is leased when its record names a member besides its primary, on a device that advertises `hive-lease`. Its start says `lease`, and the start is the word on its own connection | a member is what a promotion moves a session to: a session alone keeps P1's behaviour, and so does a build before P2e-2 | [`routes.rs:521`](../crates/modules/hive/src/routes.rs#L521), [`agent_socket.rs:1066`](../crates/modules/hive/src/agent_socket.rs#L1066), [`supervisor.rs:1123`](../agents/roomlerd/src/hive/supervisor.rs#L1123) |
 | Every manifest is answered from the record, session by session, in one read: the word for one held here at that fence and leased, a demote for one held elsewhere, a stop for one that is over | the device hears the word on every connection; a held-back session would otherwise wait for a word that never comes | [`agent_socket.rs:810`](../crates/modules/hive/src/agent_socket.rs#L810) |
 | The word goes on the connection whose manifest it answers and on no other. The report loop holds that connection weakly, and the word is sent on its own sender | a word counts only on its own connection: should a newer connection take the slot meanwhile, the word does not move to it | [`hub.rs:1971`](../crates/modules/fleet/src/hub.rs#L1971), [`agent_socket.rs:394`](../crates/modules/hive/src/agent_socket.rs#L394), [`lease.rs:30`](../crates/modules/hive/src/lease.rs#L30) |
 | A session that gains its first member while it runs is leased from then on: the word goes at once, beside its join | its device then holds it to the word from its next connection, not from the one after | [`placement.rs:561`](../crates/modules/hive/src/placement.rs#L561) |
-| The device keeps a word only when it came on the latest connection, and only for a session it runs or hosts. A newer fence's word voids an older one's, and the first word for a running session leases it, in `hosted.json` too | a word that comes late on an older connection must never take the latest one's place, and a server cannot fill the device with words | [`supervisor.rs:2666`](../agents/roomlerd/src/hive/supervisor.rs#L2666), [`supervisor.rs:2597`](../agents/roomlerd/src/hive/supervisor.rs#L2597) |
+| The device keeps a word only when it came on the latest connection, and only for a session it runs or hosts. A newer fence's word voids an older one's, and the first word for a running session leases it, in `hosted.json` too | a word that comes late on an older connection must never take the latest one's place, and a server cannot fill the device with words | [`supervisor.rs:2823`](../agents/roomlerd/src/hive/supervisor.rs#L2823), [`supervisor.rs:2754`](../agents/roomlerd/src/hive/supervisor.rs#L2754) |
 | A leased run's model call waits for the word on the latest connection, at most 30 s, then is refused in the provider's "overloaded" shape, which Claude Code retries | after a reconnect, the server may have moved the session while the device could not hear | [`sidecar.rs:175`](../agents/roomlerd/src/hive/sidecar.rs#L175), [`supervisor.rs:164`](../agents/roomlerd/src/hive/supervisor.rs#L164) |
-| After a restart, a leased hosted session is held back until the word, and listed in the manifest meanwhile. The word or a start at its fence launches it; a stop or a demote ends it | the resume launched before the server had said anything | [`supervisor.rs:2932`](../agents/roomlerd/src/hive/supervisor.rs#L2932), [`supervisor.rs:2845`](../agents/roomlerd/src/hive/supervisor.rs#L2845), [`supervisor.rs:2381`](../agents/roomlerd/src/hive/supervisor.rs#L2381) |
+| After a restart, a leased hosted session is held back until the word, and listed in the manifest meanwhile. The word or a start at its fence launches it; a stop or a demote ends it | the resume launched before the server had said anything | [`supervisor.rs:3089`](../agents/roomlerd/src/hive/supervisor.rs#L3089), [`supervisor.rs:3002`](../agents/roomlerd/src/hive/supervisor.rs#L3002), [`supervisor.rs:2538`](../agents/roomlerd/src/hive/supervisor.rs#L2538) |
 
 ⚠️ **Offline, the word still counts.** While the device is offline, the latest connection is
 the one that closed, so its word stands and `offline_grace` decides, as for every session
@@ -2294,12 +2294,12 @@ stateDiagram-v2
 | The promotion lives on the record (`agent_sessions.promotion`), and every step is a compare-and-set on the state it leaves. A device's frame takes each step, on whichever pod reads it | a frame that arrives twice, late, or after the promotion ended matches nothing | [`dao.rs:428`](../crates/modules/hive/src/dao.rs#L428), [`dao.rs:488`](../crates/modules/hive/src/dao.rs#L488), [`dao.rs:580`](../crates/modules/hive/src/dao.rs#L580) |
 | The owner promotes, holding `HIVE_RUN`, a session that is running (launched, not being stopped, not adopted), to a member that took its copy (`joined`). Both ends must be online and advertise `hive`, `hive-lease` and `hive-promote`. The start's per-(user, device) ceiling is spent last | a promotion starts the session on a device as one of its accounts; a build before P2e-2 runs what it hosts on its own word | [`promote.rs:413`](../crates/modules/hive/src/promote.rs#L413), [`hub.rs:2013`](../crates/modules/fleet/src/hub.rs#L2013) |
 | The member is asked first, with the start's own fields, and the caller hears its answer, in the start's words, within the start's bound | a refusal leaves the session where it was, and the person hears why (FR-83) | [`promote.rs:619`](../crates/modules/hive/src/promote.rs#L619), [`promote.rs:1136`](../crates/modules/hive/src/promote.rs#L1136) |
-| While the primary is drained for the move, its manifest gets no lease word | the word lifts the drain: the lease is in motion | [`promote.rs:1950`](../crates/modules/hive/src/promote.rs#L1950), [`agent_socket.rs:845`](../crates/modules/hive/src/agent_socket.rs#L845) |
+| While the primary is drained for the move, its manifest gets no lease word | the word lifts the drain: the lease is in motion | [`promote.rs:1952`](../crates/modules/hive/src/promote.rs#L1952), [`agent_socket.rs:845`](../crates/modules/hive/src/agent_socket.rs#L845) |
 | The lease moves only once the member's OWN tip is the drained one: behind it is waited for, past it or another event at its `seq` fails the move | the primary's tip says nothing of the member's copy; a copy that is not the primary's is never promoted | [`promote.rs:1618`](../crates/modules/hive/src/promote.rs#L1618), [`promote.rs:1575`](../crates/modules/hive/src/promote.rs#L1575) |
 | The lease CAS moves the fence to n+1 and the location to the member, and sets the roles in the same write: the member is the primary, owed its join; the old primary is a member if placement's rules let it hold a copy, else `leaving`; every other member is owed its join at the new fence. Array filters, never a rewritten member list | members report tips every few seconds, and a list read before the CAS would undo them | [`dao.rs:613`](../crates/modules/hive/src/dao.rs#L613), [`placement.rs:175`](../crates/modules/hive/src/placement.rs#L175) |
 | At the move, in this order: the old run's open approvals withdrawn, every view and stream of the session ended, the old primary demoted, every member joined at the new fence, then the member's own join, the record's `rc:hive.move` and the start, as a resume | nothing the old primary does counts from the move on; its harness stops before the next one starts | [`promote.rs:1652`](../crates/modules/hive/src/promote.rs#L1652), [`promote.rs:1789`](../crates/modules/hive/src/promote.rs#L1789) |
-| The member's acceptance, or a run state it reports at the new fence, ends the promotion, and the room says who moved it where. A moved start posts no "Started" note | the member's own word that it runs it; one note per move | [`promote.rs:1841`](../crates/modules/hive/src/promote.rs#L1841), [`agent_socket.rs:471`](../crates/modules/hive/src/agent_socket.rs#L471) |
-| A moved start the member refuses moves the lease back, to fence n+2, and the session starts again where it ran; it is not refused | a fence handed out once is never handed out again | [`promote.rs:1884`](../crates/modules/hive/src/promote.rs#L1884), [`dao.rs:710`](../crates/modules/hive/src/dao.rs#L710), [`agent_socket.rs:431`](../crates/modules/hive/src/agent_socket.rs#L431) |
+| The member's acceptance, or a run state it reports at the new fence, ends the promotion, and the room says who moved it where. A moved start posts no "Started" note | the member's own word that it runs it; one note per move | [`promote.rs:1843`](../crates/modules/hive/src/promote.rs#L1843), [`agent_socket.rs:471`](../crates/modules/hive/src/agent_socket.rs#L471) |
+| A moved start the member refuses moves the lease back, to fence n+2, and the session starts again where it ran; it is not refused | a fence handed out once is never handed out again | [`promote.rs:1886`](../crates/modules/hive/src/promote.rs#L1886), [`dao.rs:710`](../crates/modules/hive/src/dao.rs#L710), [`agent_socket.rs:431`](../crates/modules/hive/src/agent_socket.rs#L431) |
 | A failure before the move ends the promotion in the state its caller read, gives the primary its lease word back once it was asked to drain, writes the audit and tells the room why. A session stopped meanwhile gets neither the word nor a note | the word lifts the drain; a stopped session's end has its own note | [`promote.rs:1004`](../crates/modules/hive/src/promote.rs#L1004) |
 | One timer per promotion fails a step that runs past its bound, and a promotion past its deadline counts as failed anywhere | a promotion whose pod died strands nothing: the next promotion replaces it, and the primary's next manifest ends it and gets the word | [`promote.rs:1098`](../crates/modules/hive/src/promote.rs#L1098), [`settings.rs:87`](../crates/config/src/settings.rs#L87) |
 | A start past the first fence that is re-sent on connect, however late (P2e-6b), is a resume, preceded by the member's join as the primary and the record's move | a member that was away at the move hears what it would have heard | [`agent_socket.rs:1041`](../crates/modules/hive/src/agent_socket.rs#L1041), [`promote.rs:1746`](../crates/modules/hive/src/promote.rs#L1746) |
@@ -2322,7 +2322,7 @@ stateDiagram-v2
 | Bound | Default | Past it |
 |---|---|---|
 | `hive.promote_prepare_secs` | 30 s | failed `prepare_timeout`, nothing moved |
-| `hive.promote_drain_secs` | 75 s: the device's turn cut, 60 s ([`hive.rs:908`](../crates/remote_control/src/hive.rs#L908)), and a margin | failed `drain_timeout`, the word given back |
+| `hive.promote_drain_secs` | 75 s: the device's turn cut, 60 s ([`hive.rs:920`](../crates/remote_control/src/hive.rs#L920)), and a margin | failed `drain_timeout`, the word given back |
 | `hive.promote_sync_secs` | 120 s | failed `sync_timeout`, the word given back |
 | `hive.promote_join_secs` | 600 s, a teleport's only (P2f-1b, below): under the target's 30 min admission of its join | failed `join_timeout`, nothing moved, the target let go |
 | a moved start unanswered | none: re-sent on the member's every connection, however late (P2e-6b) | nothing moves back on its own; once the member is unreachable for 230 s, its owner may move the session on |
@@ -2405,18 +2405,18 @@ stateDiagram-v2
 
 | Rule | Why | Where |
 |---|---|---|
-| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:4340`](../agents/roomlerd/src/signaling.rs#L4340), [`supervisor.rs:1186`](../agents/roomlerd/src/hive/supervisor.rs#L1186), [`supervisor.rs:2409`](../agents/roomlerd/src/hive/supervisor.rs#L2409) |
-| Only the primary enrollment's drain counts. One for a run this device does not have at that fence, or for one a newer fence took, is refused `not_running` and moves nothing | like every Hive frame: a secondary org's admin has no say over the owner's sessions, and a stale frame moves nothing | [`supervisor.rs:1186`](../agents/roomlerd/src/hive/supervisor.rs#L1186), [`supervisor.rs:2409`](../agents/roomlerd/src/hive/supervisor.rs#L2409) |
-| No prompt begins while the session drains: a new one is refused in words, and one admitted before the drain waits in the queue | the session must go quiet at a tip | [`supervisor.rs:2289`](../agents/roomlerd/src/hive/supervisor.rs#L2289), [`supervisor.rs:4687`](../agents/roomlerd/src/hive/supervisor.rs#L4687), [`supervisor.rs:4696`](../agents/roomlerd/src/hive/supervisor.rs#L4696) |
-| The open approvals are withdrawn at once, and one that opens while the session drains is withdrawn as it opens | a turn waiting on a person could not end; the harness hears the approval withdrawn, and goes on | [`supervisor.rs:4491`](../agents/roomlerd/src/hive/supervisor.rs#L4491), [`supervisor.rs:4627`](../agents/roomlerd/src/hive/supervisor.rs#L4627), [`toolbelt.rs:182`](../agents/roomlerd/src/hive/toolbelt.rs#L182) |
-| A running turn is waited for, at most 60 s ([`hive.rs:912`](../crates/remote_control/src/hive.rs#L912)), then cut with Claude Code's own interrupt on its stream-json input, the transcript saying why first | the server waits 75 s for the answer; the interrupt ends the turn as the SDK's own does, and the process takes the next prompt | [`supervisor.rs:4885`](../agents/roomlerd/src/hive/supervisor.rs#L4885), [`supervisor.rs:4538`](../agents/roomlerd/src/hive/supervisor.rs#L4538), [`supervisor.rs:5141`](../agents/roomlerd/src/hive/supervisor.rs#L5141) |
-| A cut turn is reported `interrupted`, and Claude Code's `[Request interrupted by user]` that follows the cut is not recorded | no person interrupted it, and the note before it says what did. An adopted session's marker is a person's, and is kept | [`supervisor.rs:4800`](../agents/roomlerd/src/hive/supervisor.rs#L4800), [`supervisor.rs:4760`](../agents/roomlerd/src/hive/supervisor.rs#L4760) |
-| A cut turn that has not ended 10 s later is not drained: the drain is refused and lifted, and the turn runs on | the lease must not move while the old primary may still be calling the model | [`supervisor.rs:4885`](../agents/roomlerd/src/hive/supervisor.rs#L4885) |
-| A replicated session's drain ends at a checkpoint: one of its own when it found the session idle, the last turn's when it waited for that turn, never one more. A checkpoint not taken is not drained | the member's copy must hold the files as the session left them; why it was not taken stays in the transcript, on the device | [`supervisor.rs:5308`](../agents/roomlerd/src/hive/supervisor.rs#L5308), [`supervisor.rs:5084`](../agents/roomlerd/src/hive/supervisor.rs#L5084), [`supervisor.rs:5213`](../agents/roomlerd/src/hive/supervisor.rs#L5213) |
-| The answer is the store's tip, read as a member reports its own, and nothing is written to the session's events after it | the lease moves only once the member's own tip is that one (P2e-3), and one more event would fail the move as diverged | [`supervisor.rs:5308`](../agents/roomlerd/src/hive/supervisor.rs#L5308), [`replica.rs:201`](../agents/roomlerd/src/hive/supervisor/replica.rs#L201) |
-| A drain asked again waits for the one under way, or is answered with the tip it gave | a frame that arrives twice drains once | [`supervisor.rs:4491`](../agents/roomlerd/src/hive/supervisor.rs#L4491) |
-| The server's word at the run's fence lifts the drain: one still under way is refused (`the lease stayed on this device`), and the held prompts begin | the server gives the word back when a promotion fails before the move | [`supervisor.rs:2630`](../agents/roomlerd/src/hive/supervisor.rs#L2630), [`supervisor.rs:4839`](../agents/roomlerd/src/hive/supervisor.rs#L4839), [`supervisor.rs:4518`](../agents/roomlerd/src/hive/supervisor.rs#L4518) |
-| A drain not answered within its bound (120 s: the cut, its grace and 50 s for the checkpoint) is refused and lifted | the device never stays drained on a drain it could not finish | [`supervisor.rs:2443`](../agents/roomlerd/src/hive/supervisor.rs#L2443), [`supervisor.rs:171`](../agents/roomlerd/src/hive/supervisor.rs#L171) |
+| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:4344`](../agents/roomlerd/src/signaling.rs#L4344), [`supervisor.rs:1191`](../agents/roomlerd/src/hive/supervisor.rs#L1191), [`supervisor.rs:2566`](../agents/roomlerd/src/hive/supervisor.rs#L2566) |
+| Only the primary enrollment's drain counts. One for a run this device does not have at that fence, or for one a newer fence took, is refused `not_running` and moves nothing | like every Hive frame: a secondary org's admin has no say over the owner's sessions, and a stale frame moves nothing | [`supervisor.rs:1191`](../agents/roomlerd/src/hive/supervisor.rs#L1191), [`supervisor.rs:2566`](../agents/roomlerd/src/hive/supervisor.rs#L2566) |
+| No prompt begins while the session drains: a new one is refused in words, and one admitted before the drain waits in the queue | the session must go quiet at a tip | [`supervisor.rs:2446`](../agents/roomlerd/src/hive/supervisor.rs#L2446), [`supervisor.rs:4935`](../agents/roomlerd/src/hive/supervisor.rs#L4935), [`supervisor.rs:4944`](../agents/roomlerd/src/hive/supervisor.rs#L4944) |
+| The open approvals are withdrawn at once, and one that opens while the session drains is withdrawn as it opens | a turn waiting on a person could not end; the harness hears the approval withdrawn, and goes on | [`supervisor.rs:4739`](../agents/roomlerd/src/hive/supervisor.rs#L4739), [`supervisor.rs:4875`](../agents/roomlerd/src/hive/supervisor.rs#L4875), [`toolbelt.rs:182`](../agents/roomlerd/src/hive/toolbelt.rs#L182) |
+| A running turn is waited for, at most 60 s ([`hive.rs:924`](../crates/remote_control/src/hive.rs#L924)), then cut with Claude Code's own interrupt on its stream-json input, the transcript saying why first | the server waits 75 s for the answer; the interrupt ends the turn as the SDK's own does, and the process takes the next prompt | [`supervisor.rs:5133`](../agents/roomlerd/src/hive/supervisor.rs#L5133), [`supervisor.rs:4786`](../agents/roomlerd/src/hive/supervisor.rs#L4786), [`supervisor.rs:5389`](../agents/roomlerd/src/hive/supervisor.rs#L5389) |
+| A cut turn is reported `interrupted`, and Claude Code's `[Request interrupted by user]` that follows the cut is not recorded | no person interrupted it, and the note before it says what did. An adopted session's marker is a person's, and is kept | [`supervisor.rs:5048`](../agents/roomlerd/src/hive/supervisor.rs#L5048), [`supervisor.rs:5008`](../agents/roomlerd/src/hive/supervisor.rs#L5008) |
+| A cut turn that has not ended 10 s later is not drained: the drain is refused and lifted, and the turn runs on | the lease must not move while the old primary may still be calling the model | [`supervisor.rs:5133`](../agents/roomlerd/src/hive/supervisor.rs#L5133) |
+| A replicated session's drain ends at a checkpoint: one of its own when it found the session idle, the last turn's when it waited for that turn, never one more. A checkpoint not taken is not drained | the member's copy must hold the files as the session left them; why it was not taken stays in the transcript, on the device | [`supervisor.rs:5556`](../agents/roomlerd/src/hive/supervisor.rs#L5556), [`supervisor.rs:5332`](../agents/roomlerd/src/hive/supervisor.rs#L5332), [`supervisor.rs:5461`](../agents/roomlerd/src/hive/supervisor.rs#L5461) |
+| The answer is the store's tip, read as a member reports its own, and nothing is written to the session's events after it | the lease moves only once the member's own tip is that one (P2e-3), and one more event would fail the move as diverged | [`supervisor.rs:5556`](../agents/roomlerd/src/hive/supervisor.rs#L5556), [`replica.rs:201`](../agents/roomlerd/src/hive/supervisor/replica.rs#L201) |
+| A drain asked again waits for the one under way, or is answered with the tip it gave | a frame that arrives twice drains once | [`supervisor.rs:4739`](../agents/roomlerd/src/hive/supervisor.rs#L4739) |
+| The server's word at the run's fence lifts the drain: one still under way is refused (`the lease stayed on this device`), and the held prompts begin | the server gives the word back when a promotion fails before the move | [`supervisor.rs:2787`](../agents/roomlerd/src/hive/supervisor.rs#L2787), [`supervisor.rs:5087`](../agents/roomlerd/src/hive/supervisor.rs#L5087), [`supervisor.rs:4766`](../agents/roomlerd/src/hive/supervisor.rs#L4766) |
+| A drain not answered within its bound (120 s: the cut, its grace and 50 s for the checkpoint) is refused and lifted | the device never stays drained on a drain it could not finish | [`supervisor.rs:2600`](../agents/roomlerd/src/hive/supervisor.rs#L2600), [`supervisor.rs:171`](../agents/roomlerd/src/hive/supervisor.rs#L171) |
 
 | Bound | Default | Past it |
 |---|---|---|
@@ -2487,15 +2487,15 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:1999`](../agents/roomlerd/src/hive/supervisor.rs#L1999), [`supervisor.rs:604`](../agents/roomlerd/src/hive/supervisor.rs#L604), [`signaling.rs:4354`](../agents/roomlerd/src/signaling.rs#L4354) |
-| The prepare also asks for the copy: the session's checkpoints in this device's store. A teleport's prepare does not (P2f-1a): its copy comes after it | a moved start is put in place from them | [`supervisor.rs:2173`](../agents/roomlerd/src/hive/supervisor.rs#L2173) |
-| A run of the session here at an older fence does not count against `hive_max_sessions`, and a run at the fence asked, or a newer one, is refused unless it is that very run | the start supersedes the older run (P2e-1); a newer one is the session come back | [`supervisor.rs:2156`](../agents/roomlerd/src/hive/supervisor.rs#L2156), [`supervisor.rs:2124`](../agents/roomlerd/src/hive/supervisor.rs#L2124) |
-| `rc:hive.move` is kept by (session, fence) for the start right behind it, 10 min and 64 at once, and dropped only once that start has launched | a start refused before its launch finds it again when re-sent | [`supervisor.rs:1360`](../agents/roomlerd/src/hive/supervisor.rs#L1360), [`supervisor.rs:1380`](../agents/roomlerd/src/hive/supervisor.rs#L1380), [`supervisor.rs:1401`](../agents/roomlerd/src/hive/supervisor.rs#L1401) |
-| A moved start counts on from the move's `turns`, in what the device hosts too, and says nothing of a restart | the server ignores a stub older than its newest, and a move is no restart | [`supervisor.rs:3656`](../agents/roomlerd/src/hive/supervisor.rs#L3656), [`supervisor.rs:3681`](../agents/roomlerd/src/hive/supervisor.rs#L3681) |
-| From another device, the session's copy is put in place before the harness is launched: every checkpoint in the store, oldest first, `hive-materialize` as the account, and the folder held to the last checkpoint's tree | the daemon never writes a path in the account's tree; a history only grows, so its chunks span every checkpoint since it began | [`supervisor.rs:1825`](../agents/roomlerd/src/hive/supervisor.rs#L1825), [`supervisor.rs:1854`](../agents/roomlerd/src/hive/supervisor.rs#L1854), [`store.rs:1034`](../crates/hive-node/src/store.rs#L1034) |
-| A move back, whose `from` is this device, puts nothing in place | the session comes back where its state is: the drain checkpointed it there, and nothing ran after | [`supervisor.rs:1412`](../agents/roomlerd/src/hive/supervisor.rs#L1412) |
-| A session that has had turns must find its history, and the history decides between `--resume` and `--session-id` | without it Claude Code would start the conversation afresh, silently; a session moved before its first prompt has none | [`supervisor.rs:1839`](../agents/roomlerd/src/hive/supervisor.rs#L1839), [`supervisor.rs:1777`](../agents/roomlerd/src/hive/supervisor.rs#L1777) |
-| A moved start that cannot take the session over is refused `launch_failed`, in fixed words; why goes to the device's log | what the materializer names can be the account's own files, which never reach the server | [`supervisor.rs:1770`](../agents/roomlerd/src/hive/supervisor.rs#L1770) |
+| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:2150`](../agents/roomlerd/src/hive/supervisor.rs#L2150), [`supervisor.rs:609`](../agents/roomlerd/src/hive/supervisor.rs#L609), [`signaling.rs:4358`](../agents/roomlerd/src/signaling.rs#L4358) |
+| The prepare also asks for the copy: the session's checkpoints in this device's store. A teleport's prepare does not (P2f-1a): its copy comes after it | a moved start is put in place from them | [`supervisor.rs:2330`](../agents/roomlerd/src/hive/supervisor.rs#L2330) |
+| A run of the session here at an older fence does not count against `hive_max_sessions`, and a run at the fence asked, or a newer one, is refused unless it is that very run | the start supersedes the older run (P2e-1); a newer one is the session come back | [`supervisor.rs:2313`](../agents/roomlerd/src/hive/supervisor.rs#L2313), [`supervisor.rs:2281`](../agents/roomlerd/src/hive/supervisor.rs#L2281) |
+| `rc:hive.move` is kept by (session, fence) for the start right behind it, 10 min and 64 at once, and dropped only once that start has launched | a start refused before its launch finds it again when re-sent | [`supervisor.rs:1365`](../agents/roomlerd/src/hive/supervisor.rs#L1365), [`supervisor.rs:1385`](../agents/roomlerd/src/hive/supervisor.rs#L1385), [`supervisor.rs:1406`](../agents/roomlerd/src/hive/supervisor.rs#L1406) |
+| A moved start counts on from the move's `turns`, in what the device hosts too, and says nothing of a restart | the server ignores a stub older than its newest, and a move is no restart | [`supervisor.rs:3817`](../agents/roomlerd/src/hive/supervisor.rs#L3817), [`supervisor.rs:3850`](../agents/roomlerd/src/hive/supervisor.rs#L3850) |
+| From another device, the session's copy is put in place before the harness is launched: every checkpoint in the store, oldest first, `hive-materialize` as the account, and the folder held to the last checkpoint's tree | the daemon never writes a path in the account's tree; a history only grows, so its chunks span every checkpoint since it began | [`supervisor.rs:1885`](../agents/roomlerd/src/hive/supervisor.rs#L1885), [`supervisor.rs:1914`](../agents/roomlerd/src/hive/supervisor.rs#L1914), [`store.rs:1034`](../crates/hive-node/src/store.rs#L1034) |
+| A move back, whose `from` is this device, puts nothing in place | the session comes back where its state is: the drain checkpointed it there, and nothing ran after | [`supervisor.rs:1417`](../agents/roomlerd/src/hive/supervisor.rs#L1417) |
+| A session that has had turns must find its history, and the history decides between `--resume` and `--session-id` | without it Claude Code would start the conversation afresh, silently; a session moved before its first prompt has none | [`supervisor.rs:1899`](../agents/roomlerd/src/hive/supervisor.rs#L1899), [`supervisor.rs:1814`](../agents/roomlerd/src/hive/supervisor.rs#L1814) |
+| A moved start that cannot take the session over is refused `launch_failed`, in fixed words; why goes to the device's log | what the materializer names can be the account's own files, which never reach the server | [`supervisor.rs:1807`](../agents/roomlerd/src/hive/supervisor.rs#L1807) |
 | A folder that holds work of its own is refused: one that is not empty, not at its own `HEAD`, and not what this session last left there | a person's work is never overwritten (P2b-4b) | [`workspace.rs:890`](../agents/roomlerd/src/hive/workspace.rs#L890) |
 
 | Bound | Value | Past it |
@@ -2622,10 +2622,10 @@ sequenceDiagram
 | What the first real promotion found | Now | Where |
 |---|---|---|
 | The target heard its join as the primary before its start, for a session it did not run yet, and refused it (`other`, "this device does not run the session"). After every real move its own row read refused until it next connected, and its floor never rose before it wrote | a primary's join for a session the device holds a copy of, ahead of its start, raises the copy's floor to the join's fence and is taken up; one for a session it holds nothing of is refused, as before | [`supervisor/replica.rs:389`](../agents/roomlerd/src/hive/supervisor/replica.rs#L389) |
-| From the lease's move until its start launched, the target told every member it streamed to that the session was over (`live: false`), since it neither ran nor hosted it yet. A member that held its copy whole parked it while the session went on there | a device keeping a move for the session says the session is live | [`supervisor/stream.rs:1993`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1993), [`supervisor.rs:1392`](../agents/roomlerd/src/hive/supervisor.rs#L1392) |
+| From the lease's move until its start launched, the target told every member it streamed to that the session was over (`live: false`), since it neither ran nor hosted it yet. A member that held its copy whole parked it while the session went on there | a device keeping a move for the session says the session is live | [`supervisor/stream.rs:1993`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1993), [`supervisor.rs:1397`](../agents/roomlerd/src/hive/supervisor.rs#L1397) |
 | A member that asked for a stream as the session moved was granted one toward the old location. The server ends such a grant at the move, before its dial, and a member never hears of a grant it was not dialed for. Its newer join found it still asking, and only raised the fence, so it waited out the ask's whole timeout, 45 s | a newer join that overtakes an ask out asks again at once. The old ask's refusal names its fence and its timer its generation, so neither moves anything | [`supervisor/follow.rs:371`](../agents/roomlerd/src/hive/supervisor/follow.rs#L371) |
 | A stop or a park was taken at its word even when a newer join had overtaken the ask or stream it answered | the session is asked for again from the top, at the new fence: that answer was about the fence the session left | [`supervisor/follow.rs:830`](../agents/roomlerd/src/hive/supervisor/follow.rs#L830) |
-| The move ended every stream of the session, and the move back none. A stream the refusing member had been asked to serve told its member that the session ran nowhere | the move back ends every view and stream of the session, as the move does | [`promote.rs:1931`](../crates/modules/hive/src/promote.rs#L1931) |
+| The move ended every stream of the session, and the move back none. A stream the refusing member had been asked to serve told its member that the session ran nowhere | the move back ends every view and stream of the session, as the move does | [`promote.rs:1933`](../crates/modules/hive/src/promote.rs#L1933) |
 
 ⚠️ **CI green proved none of these.** P2e-3's integration tests drive fake devices that
 answer whatever they are sent, and each device test answers one step on its own. Only two
@@ -2651,9 +2651,9 @@ have stopped its model calls:
 | Clock | Where | Time |
 |---|---|---|
 | the device notices its connection is gone: no frame received, and it closes it | `WS_RX_DEADLINE` ([`signaling.rs:60`](../agents/roomlerd/src/signaling.rs#L60)) | 80 s |
-| from that close, its sidecar keeps serving model calls ([`supervisor.rs:3330`](../agents/roomlerd/src/hive/supervisor.rs#L3330), `lost_connection`) | `OFFLINE_GRACE` ([`sidecar.rs:64`](../agents/roomlerd/src/hive/sidecar.rs#L64)) | 120 s |
+| from that close, its sidecar keeps serving model calls ([`supervisor.rs:3491`](../agents/roomlerd/src/hive/supervisor.rs#L3491), `lost_connection`) | `OFFLINE_GRACE` ([`sidecar.rs:64`](../agents/roomlerd/src/hive/sidecar.rs#L64)) | 120 s |
 | the server may have sent to it after it last recorded hearing from it: a heartbeat comes every 30 s, and a pod can die with no teardown | a margin | 30 s |
-| all of it: `promote_limits::UNREACHABLE_SECS` ([`hive.rs:922`](../crates/remote_control/src/hive.rs#L922)) | | **230 s** |
+| all of it: `promote_limits::UNREACHABLE_SECS` ([`hive.rs:934`](../crates/remote_control/src/hive.rs#L934)) | | **230 s** |
 
 "Unreachable" means two things at once: the device has no connection on this pod, and its
 row's `last_seen_at` is 230 s old. Every hello stamps that field before the connection is
@@ -2704,9 +2704,9 @@ stateDiagram-v2
 | A primary that is not online here may be moved away from only once its row's `last_seen_at` is `UNREACHABLE_SECS` old, and only if its last hello advertised `hive-lease`. Sooner it is `primary_offline`, the message naming the wait; without `hive-lease` it is `primary_unsupported` | by then it calls the model no more, by its own clocks. A build before P2e-2 would run the session again the moment it reconnects, before its demote lands | [`promote.rs:322`](../crates/modules/hive/src/promote.rs#L322) `unreachable_reach`, [`:507`](../crates/modules/hive/src/promote.rs#L507) |
 | The member promoted to must hold at least as much of the session as every other joined member, as the server last heard. Else `not_freshest` | what only the dead primary held is lost anyway; a move to any other member loses more | [`promote.rs:336`](../crates/modules/hive/src/promote.rs#L336) `fresher_than` |
 | How much a copy holds is a `seq` on the session's chain: a fence that ended counts up to its end and no further, and an empty copy, `seq` 0 at the fence it joined at, counts least | past an end is a tail a no-drain move cut off. `(fence, seq)` compared whole would rank an empty copy at a newer fence above a full one | [`promote.rs:356`](../crates/modules/hive/src/promote.rs#L356) `on_chain` |
-| The member's ready names where its copy ends, `tip {fence, seq, hash}`, read from its store as it answers. A ready without one, from a build before P2e-6a, fails the move `no_copy_tip` | the lease moves to the copy the member holds, never to a report seconds old | [`supervisor.rs:1980`](../agents/roomlerd/src/hive/supervisor.rs#L1980), [`supervisor/replica.rs:483`](../agents/roomlerd/src/hive/supervisor/replica.rs#L483), [`signaling.rs:989`](../crates/remote_control/src/signaling.rs#L989) |
+| The member's ready names where its copy ends, `tip {fence, seq, hash}`, read from its store as it answers. A ready without one, from a build before P2e-6a, fails the move `no_copy_tip` | the lease moves to the copy the member holds, never to a report seconds old | [`supervisor.rs:2131`](../agents/roomlerd/src/hive/supervisor.rs#L2131), [`supervisor/replica.rs:483`](../agents/roomlerd/src/hive/supervisor/replica.rs#L483), [`signaling.rs:989`](../crates/remote_control/src/signaling.rs#L989) |
 | That tip must lie on the record's chain: at or before where its fence ended, and at the end, the same event. Else `cut_off` | the next fence would begin on a tail the record cut off, and no member could follow it | [`promote.rs:367`](../crates/modules/hive/src/promote.rs#L367) `within_ends` |
-| The promotion goes to `syncing` first, with `drained` set to the member's tip, and only then is the primary asked about again. Heard from meanwhile, the move fails `primary_back` and the primary gets its word back. Else the lease CAS moves the lease to that tip, and every join at the new fence says the old one ended there | a primary that reconnects after `syncing` gets no word on its manifest, and one that reconnected before it is seen by the second look. One of the two always catches it | [`promote.rs:1435`](../crates/modules/hive/src/promote.rs#L1435), [`:1403`](../crates/modules/hive/src/promote.rs#L1403), [`:1950`](../crates/modules/hive/src/promote.rs#L1950) |
+| The promotion goes to `syncing` first, with `drained` set to the member's tip, and only then is the primary asked about again. Heard from meanwhile, the move fails `primary_back` and the primary gets its word back. Else the lease CAS moves the lease to that tip, and every join at the new fence says the old one ended there | a primary that reconnects after `syncing` gets no word on its manifest, and one that reconnected before it is seen by the second look. One of the two always catches it | [`promote.rs:1435`](../crates/modules/hive/src/promote.rs#L1435), [`:1403`](../crates/modules/hive/src/promote.rs#L1403), [`:1952`](../crates/modules/hive/src/promote.rs#L1952) |
 | A primary heard from again before the member answers is drained, as any online primary is | it can answer now, and its drain loses nothing | [`promote.rs:1177`](../crates/modules/hive/src/promote.rs#L1177) |
 | The caller hears `promoting` once the lease has moved, and the room says the session goes on from the member's copy, and that what the primary did after it is not in it | the owner learns what the move cost (design §12: the unconfirmed call is flagged) | [`room.rs:130`](../crates/modules/hive/src/room.rs#L130) |
 
@@ -2802,7 +2802,7 @@ sequenceDiagram
 | A session waiting on a moved start its device never answered counts as running for a promotion: past the first fence, starting, never accepted, and no run state reported. It is moved on only once that device is unreachable for 230 s; sooner, `primary_offline`. With the device online, it is `promotion_in_progress` while the move is under way, and `session_not_running` after | it runs nowhere yet. By 230 s that device makes no model call, and back, it is demoted before it runs anything | [`promote.rs:557`](../crates/modules/hive/src/promote.rs#L557) `unanswered_move`, [`:510`](../crates/modules/hive/src/promote.rs#L510) |
 | That promotion replaces the move that sent the start, in flight or not, by a compare-and-set on the session still waiting on it | that move is over: its member never answered | [`dao.rs:428`](../crates/modules/hive/src/dao.rs#L428) `begin_promotion` |
 | The record keeps where the start its device holds came from (`moved`), set at every move of the lease, and every start sent again says so | a device takes a session that comes from elsewhere over from its own copy, and one from itself back as it left it. The move that sent a start can be gone before the start is answered | [`model.rs:194`](../crates/modules/hive/src/model.rs#L194), [`dao.rs:627`](../crates/modules/hive/src/dao.rs#L627), [`agent_socket.rs:1036`](../crates/modules/hive/src/agent_socket.rs#L1036) |
-| A move on from a device that never answered keeps where that device's start came from (`prior`), and a move back to it, should the new member refuse the start, restores it | a move back to a device that never ran the session must not tell it the session is its own: it has none of it in place, and it takes it over from its copy | [`model.rs:306`](../crates/modules/hive/src/model.rs#L306), [`dao.rs:718`](../crates/modules/hive/src/dao.rs#L718), [`promote.rs:1941`](../crates/modules/hive/src/promote.rs#L1941) |
+| A move on from a device that never answered keeps where that device's start came from (`prior`), and a move back to it, should the new member refuse the start, restores it | a move back to a device that never ran the session must not tell it the session is its own: it has none of it in place, and it takes it over from its copy | [`model.rs:306`](../crates/modules/hive/src/model.rs#L306), [`dao.rs:718`](../crates/modules/hive/src/dao.rs#L718), [`promote.rs:1943`](../crates/modules/hive/src/promote.rs#L1943) |
 
 ⚠️ **Found while building it: the lost session.** P2e-3's reconnect counted the window from
 the record's creation. It never showed: the tests made each session seconds before its
@@ -2851,13 +2851,13 @@ The last tool call before the move, `cargo test -p roomlerd --lib`, has no resul
 
 | Rule | Why | Where |
 |---|---|---|
-| The note is left only for a start that brings the session from another device. Every other launch removes one an earlier launch left: a first start, a restart, a move back | the history keeps each note once, so a restart's resume adds nothing. A move back comes back to its own state and conversation | [`supervisor.rs:1786`](../agents/roomlerd/src/hive/supervisor.rs#L1786), [`:4212`](../agents/roomlerd/src/hive/supervisor.rs#L4212) `leave_note` |
-| The note is the account's, `0600`, in the daemon-owned runtime directory, written as core memory is; on Windows the directory's DACL hands it to the user | it names folders and a command, and no other local account reads it | [`supervisor.rs:4212`](../agents/roomlerd/src/hive/supervisor.rs#L4212) |
-| Every session's settings carry a `SessionStart` hook with the matcher `resume`. It runs this binary as the session's account (`roomlerd hive-resume-note <file>`), which prints the note when there is one and nothing otherwise | a hook that prints nothing adds nothing (the probe), so one hook serves every launch. The account runs it, as it runs the toolbelt's relay | [`launch.rs:376`](../crates/hive-node/src/launch.rs#L376), [`resume_note.rs:107`](../agents/roomlerd/src/hive/resume_note.rs#L107), [`:143`](../agents/roomlerd/src/hive/resume_note.rs#L143), [`main.rs:1119`](../agents/roomlerd/src/main.rs#L1119) |
-| The note's facts come from the move (who moved the session, when, and from which device and folder) and from the device's own store: the last tool call that no result follows | the server holds the first and never the second; the store holds the transcript | [`resume_note.rs:44`](../agents/roomlerd/src/hive/resume_note.rs#L44), [`supervisor.rs:4229`](../agents/roomlerd/src/hive/supervisor.rs#L4229) `last_open_call` |
-| Every quoted name, folder and command is one line, with no control character and no backtick, at most 200 characters | names and folders come from the server and a command from the model; none may break the note's lines or its quoting | [`resume_note.rs:92`](../agents/roomlerd/src/hive/resume_note.rs#L92) |
-| The note goes into the session's transcript as a `note` event, on the device | a viewer sees what the harness was told; like every transcript event, it never reaches the server | [`supervisor.rs:3572`](../agents/roomlerd/src/hive/supervisor.rs#L3572) |
-| The kept move keeps where the session came from and who moved it | the device used to drop them | [`supervisor.rs:274`](../agents/roomlerd/src/hive/supervisor.rs#L274) |
+| The note is left only for a start that brings the session from another device. Every other launch removes one an earlier launch left: a first start, a restart, a move back | the history keeps each note once, so a restart's resume adds nothing. A move back comes back to its own state and conversation | [`supervisor.rs:1842`](../agents/roomlerd/src/hive/supervisor.rs#L1842), [`:4382`](../agents/roomlerd/src/hive/supervisor.rs#L4382) `leave_note` |
+| The note is the account's, `0600`, in the daemon-owned runtime directory, written as core memory is; on Windows the directory's DACL hands it to the user | it names folders and a command, and no other local account reads it | [`supervisor.rs:4382`](../agents/roomlerd/src/hive/supervisor.rs#L4382) |
+| Every session's settings carry a `SessionStart` hook with the matcher `resume` (and, since P2f-3a, the same hook with `fork`, for a fork's first launch). It runs this binary as the session's account (`roomlerd hive-resume-note <file>`), which prints the note when there is one and nothing otherwise | a hook that prints nothing adds nothing (the probe), so one hook serves every launch. The account runs it, as it runs the toolbelt's relay | [`launch.rs:438`](../crates/hive-node/src/launch.rs#L438), [`resume_note.rs:156`](../agents/roomlerd/src/hive/resume_note.rs#L156), [`:192`](../agents/roomlerd/src/hive/resume_note.rs#L192), [`main.rs:1119`](../agents/roomlerd/src/main.rs#L1119) |
+| The note's facts come from the move (who moved the session, when, and from which device and folder) and from the device's own store: the last tool call that no result follows | the server holds the first and never the second; the store holds the transcript | [`resume_note.rs:56`](../agents/roomlerd/src/hive/resume_note.rs#L56), [`supervisor.rs:4399`](../agents/roomlerd/src/hive/supervisor.rs#L4399) `last_open_call` |
+| Every quoted name, folder and command is one line, with no control character and no backtick, at most 200 characters | names and folders come from the server and a command from the model; none may break the note's lines or its quoting | [`resume_note.rs:141`](../agents/roomlerd/src/hive/resume_note.rs#L141) |
+| The note goes into the session's transcript as a `note` event, on the device | a viewer sees what the harness was told; like every transcript event, it never reaches the server | [`supervisor.rs:3733`](../agents/roomlerd/src/hive/supervisor.rs#L3733) |
+| The kept move keeps where the session came from and who moved it | the device used to drop them | [`supervisor.rs:279`](../agents/roomlerd/src/hive/supervisor.rs#L279) |
 
 ⚠️ **The hook is a command line, and the shell that reads it differs by platform.** Both
 paths are quoted: single quotes on Linux and macOS, and double quotes on Windows, where the
@@ -2902,12 +2902,12 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| A teleport's prepare (`rc:hive.prepare` with `teleport`) asks every gate a promotion's prepare asks but the copy: the primary enrollment's connection, `hive_enabled`, the harness, the account, the folder, capacity, the store, `sudo` on a Mac, the sidecar | the copy comes after the prepare; whether the device may RUN the session is the same question either way. A prepare that does not say `teleport` is a promotion's, and still needs the copy | [`supervisor.rs:2012`](../agents/roomlerd/src/hive/supervisor.rs#L2012) `prepare_teleport`, [`:2096`](../agents/roomlerd/src/hive/supervisor.rs#L2096) `prepare_as`, [`:2170`](../agents/roomlerd/src/hive/supervisor.rs#L2170) |
-| One that passes admits that session's join in a new role, `teleport`, at the record's fence (one before the start's the prepare named), for 30 minutes, whatever the owner's `hive_replica` | a device that will run a session needs `hive_enabled`, not `hive_replica` (spec §3b): the copy it takes is the one it will run. `hive_replica` is its owner's offer to hold copies of sessions run elsewhere, which a teleport is not | [`supervisor.rs:1420`](../agents/roomlerd/src/hive/supervisor.rs#L1420) `admit_teleport`, [`:1499`](../agents/roomlerd/src/hive/supervisor.rs#L1499) `teleport_admitted`, [`hive.rs:929`](../crates/remote_control/src/hive.rs#L929) |
+| A teleport's prepare (`rc:hive.prepare` with `teleport`) asks every gate a promotion's prepare asks but the copy: the primary enrollment's connection, `hive_enabled`, the harness, the account, the folder, capacity, the store, `sudo` on a Mac, the sidecar | the copy comes after the prepare; whether the device may RUN the session is the same question either way. A prepare that does not say `teleport` is a promotion's, and still needs the copy | [`supervisor.rs:2163`](../agents/roomlerd/src/hive/supervisor.rs#L2163) `prepare_teleport`, [`:2253`](../agents/roomlerd/src/hive/supervisor.rs#L2253) `prepare_as`, [`:2327`](../agents/roomlerd/src/hive/supervisor.rs#L2327) |
+| One that passes admits that session's join in a new role, `teleport`, at the record's fence (one before the start's the prepare named), for 30 minutes, whatever the owner's `hive_replica` | a device that will run a session needs `hive_enabled`, not `hive_replica` (spec §3b): the copy it takes is the one it will run. `hive_replica` is its owner's offer to hold copies of sessions run elsewhere, which a teleport is not | [`supervisor.rs:1425`](../agents/roomlerd/src/hive/supervisor.rs#L1425) `admit_teleport`, [`:1504`](../agents/roomlerd/src/hive/supervisor.rs#L1504) `teleport_admitted`, [`hive.rs:941`](../crates/remote_control/src/hive.rs#L941) |
 | A join in the `teleport` role that no prepare admitted is refused `not_prepared`, `hive_replica` on or off; a prepare admits no other role; a secondary org's connection takes none. The store's own gates still hold: the quota, a purge, the floor | the prepare's gates are what make this copy safe to hold, and a server could otherwise put any session on any device with `hive_replica` off | [`replica.rs:77`](../agents/roomlerd/src/hive/supervisor/replica.rs#L77), [`hive.rs:618`](../crates/remote_control/src/hive.rs#L618) |
-| The admission ends when the session launches here at the prepare's fence, or when it runs out; a later prepare of the same session replaces it | a join re-sent at a connection is admitted until then | [`supervisor.rs:1522`](../agents/roomlerd/src/hive/supervisor.rs#L1522) `forget_teleport` |
+| The admission ends when the session launches here at the prepare's fence, or when it runs out; a later prepare of the same session replaces it | a join re-sent at a connection is admitted until then | [`supervisor.rs:1527`](../agents/roomlerd/src/hive/supervisor.rs#L1527) `forget_teleport` |
 | A device prepared for a teleport sends the manifest of the copies it holds at each connection | the server learns where the target's copy ends after a reconnect, as it does for a member | [`replica.rs:433`](../agents/roomlerd/src/hive/supervisor/replica.rs#L433) `reports_copies` |
-| A primary's join takes the session's first checkpoint at once when no turn runs, no checkpoint is due and no drain is under way; with a turn running, that turn's end takes it. Where the copy ends is told either way, and a join again says so too | before, a member that joined a session that ran alone held none of its files until its next turn ended. A teleport waits for its target's copy to reach the primary's tip before it drains, so the full copy moves while the session still runs, and the drain moves only what it added | [`replica.rs:286`](../agents/roomlerd/src/hive/supervisor/replica.rs#L286) `take_up_replication`, [`:363`](../agents/roomlerd/src/hive/supervisor/replica.rs#L363) `tell_replicated`, [`supervisor.rs:5275`](../agents/roomlerd/src/hive/supervisor.rs#L5275) `checkpoint_now` |
+| A primary's join takes the session's first checkpoint at once when no turn runs, no checkpoint is due and no drain is under way; with a turn running, that turn's end takes it. Where the copy ends is told either way, and a join again says so too | before, a member that joined a session that ran alone held none of its files until its next turn ended. A teleport waits for its target's copy to reach the primary's tip before it drains, so the full copy moves while the session still runs, and the drain moves only what it added | [`replica.rs:286`](../agents/roomlerd/src/hive/supervisor/replica.rs#L286) `take_up_replication`, [`:363`](../agents/roomlerd/src/hive/supervisor/replica.rs#L363) `tell_replicated`, [`supervisor.rs:5523`](../agents/roomlerd/src/hive/supervisor.rs#L5523) `checkpoint_now` |
 | `hive-teleport` (`RpcCap::HiveTeleport`), a property of the build like `hive-promote`, and kept on a secondary org's connection like it | a build before it refuses a teleport's prepare for want of a copy, and its primary says nothing at a join: the server must teleport only between two devices that advertise it. No placement chooses a teleport's target, and a secondary org's prepare and join are refused there either way | [`caps.rs:1690`](../agents/roomlerd/src/encode/caps.rs#L1690), [`models.rs:726`](../crates/remote_control/src/models.rs#L726) |
 
 ⚠️ **The admission lives in the daemon's memory.** A daemon that restarts between a
@@ -3004,8 +3004,8 @@ flowchart LR
 | Each have's tree is named as well as the commit (`^h ^h^{tree}`) | `--revs` leaves out what a negative commit reaches only on the edge, a parent of what is packed. A first checkpoint has no parent, so a pack against the person's `HEAD` alone still held the whole tree | [`workspace.rs:660`](../agents/roomlerd/src/hive/workspace.rs#L660) |
 | The child's answer is held to the request: every commit it names is one the request named, once; the pack within 512 MiB, and a pack | the answer is the account's word, and git checks every object of the pack again where it is used | [`packer.rs:226`](../agents/roomlerd/src/hive/packer.rs#L226) `check` |
 | A substitute is kept per session and commit, only once every blob it names is, and goes with the purge | a substitute here always has its bytes, as a checkpoint does | [`store.rs:825`](../crates/hive-node/src/store.rs#L825) `put_substitute` |
-| The materializer reads a checkpoint's own whole pack whenever its blobs are here; only where they are not does a substitute for it stand in, and the walk back from the last checkpoint ends there. A thin pack is never stood in for | the substitute is one way to the same commit, never a second answer to which commit | [`materializer.rs:349`](../agents/roomlerd/src/hive/materializer.rs#L349), [`:263`](../agents/roomlerd/src/hive/materializer.rs#L263) `packs_of` |
-| The materialize holds the folder's repository to every commit the substitute is thin against before a pack goes in, and refuses in words if one is missing | git could resolve none of its deltas there, and the folder would be left between two trees | [`materializer.rs:761`](../agents/roomlerd/src/hive/materializer.rs#L761) |
+| The materializer reads a checkpoint's own whole pack whenever its blobs are here; only where they are not does a substitute for it stand in, and the walk back from the last checkpoint ends there. A thin pack is never stood in for | the substitute is one way to the same commit, never a second answer to which commit | [`materializer.rs:403`](../agents/roomlerd/src/hive/materializer.rs#L403), [`:272`](../agents/roomlerd/src/hive/materializer.rs#L272) `packs_of` |
+| The materialize holds the folder's repository to every commit the substitute is thin against before a pack goes in, and refuses in words if one is missing | git could resolve none of its deltas there, and the folder would be left between two trees | [`materializer.rs:815`](../agents/roomlerd/src/hive/materializer.rs#L815) |
 
 ⚠️ **Nothing sends a substitute yet.** No frame carries a pack against haves in P2f-2a, so
 no device keeps one outside the tests. P2f-2b is the stream's half: the target asks
@@ -3048,12 +3048,12 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| The server's prepare of a teleport says `have_want` only with `hive.teleport_have_want` on (default off). A promotion's never says it, and with the setting off the prepare has no `have_want` key at all, as before | a target that takes a substitute holds the checkpoint without its whole pack's blobs (decision 16). Whether to allow that is the operator's call, and it needs no release | [`promote.rs:771`](../crates/modules/hive/src/promote.rs#L771), [`settings.rs:114`](../crates/config/src/settings.rs#L114), [`signaling.rs:3357`](../crates/remote_control/src/signaling.rs#L3357) |
-| The target's admission keeps the account and folder the prepare's gates passed, and only with `have_want`, for that session until the admission runs out | the holds question runs as that account, in the folder the session will run in | [`supervisor.rs:2012`](../agents/roomlerd/src/hive/supervisor.rs#L2012) `prepare_teleport`, [`:1481`](../agents/roomlerd/src/hive/supervisor.rs#L1481) `have_want_place` |
+| The server's prepare of a teleport says `have_want` only with `hive.teleport_have_want` on (default off). A promotion's never says it, and with the setting off the prepare has no `have_want` key at all, as before | a target that takes a substitute holds the checkpoint without its whole pack's blobs (decision 16). Whether to allow that is the operator's call, and it needs no release | [`promote.rs:771`](../crates/modules/hive/src/promote.rs#L771), [`settings.rs:114`](../crates/config/src/settings.rs#L114), [`signaling.rs:3366`](../crates/remote_control/src/signaling.rs#L3366) |
+| The target's admission keeps the account and folder the prepare's gates passed, and only with `have_want`, for that session until the admission runs out | the holds question runs as that account, in the folder the session will run in | [`supervisor.rs:2163`](../agents/roomlerd/src/hive/supervisor.rs#L2163) `prepare_teleport`, [`:1486`](../agents/roomlerd/src/hive/supervisor.rs#L1486) `have_want_place` |
 | A source says in its hello whether it answers `want_pack` (`packs`). A hello without `packs` comes from a build before P2f-2b, and that source is asked for blobs only | an older source would take `want_pack` for a frame it cannot read, and end the stream | [`stream.rs:160`](../crates/hive-node/src/stream.rs#L160) |
 | For a checkpoint whose workspace pack is whole and not held here, the target asks `hive-pack holds` in its folder for the checkpoint's `head` (the person's `HEAD` where the checkpoint was taken), adds the folder's own `HEAD`, and sends `want_pack {commit, haves}` with what is held, at most 16. If the clone holds none of them, or every blob of the pack is here already, the target takes the whole pack as before | a clone helps only where it holds a commit the session's repository holds too | [`supervisor/stream.rs:1660`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1660) `stand_in`, [`:1794`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1794) `haves_for`, [`workspace.rs:695`](../agents/roomlerd/src/hive/workspace.rs#L695) `head_of` |
 | A `want_pack` is checked before any pack is made: a commit id, 1 to 16 haves, the commit not among them. A stream carries one want per commit and at most 16 in all. Anything else ends the stream `bad_frame` | a member cannot make the source run git for anything but a pack of the session's own. Each want costs a read of the chain's checkpoints | [`stream.rs:348`](../crates/hive-node/src/stream.rs#L348) `check_want_pack`, [`:92`](../crates/hive-node/src/stream.rs#L92) `MAX_WANTS`, [`supervisor/stream.rs:583`](../agents/roomlerd/src/hive/supervisor/stream.rs#L583) |
-| The source answers only for the commit of a whole pack in the session's chain, and only while the session runs there. It makes the pack from its own repository as the session's account (`hive-pack pack`), keeps the pack's chunks as blobs of the session, and answers `pack {commit, against, chunks}`. Anything else gets `no_pack` with a reason: `not_a_whole_pack`, `not_live`, `pack_failed`, `store_error` | the session's objects are in the account's repository. The member then takes the chunks as it takes any blob, through `need` | [`supervisor/stream.rs:1844`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1844) `answer_want_pack`, [`:665`](../agents/roomlerd/src/hive/supervisor/stream.rs#L665) `whole_pack_commit`, [`supervisor.rs:1446`](../agents/roomlerd/src/hive/supervisor.rs#L1446) `workplace` |
+| The source answers only for the commit of a whole pack in the session's chain, and only while the session runs there. It makes the pack from its own repository as the session's account (`hive-pack pack`), keeps the pack's chunks as blobs of the session, and answers `pack {commit, against, chunks}`. Anything else gets `no_pack` with a reason: `not_a_whole_pack`, `not_live`, `pack_failed`, `store_error` | the session's objects are in the account's repository. The member then takes the chunks as it takes any blob, through `need` | [`supervisor/stream.rs:1844`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1844) `answer_want_pack`, [`:665`](../agents/roomlerd/src/hive/supervisor/stream.rs#L665) `whole_pack_commit`, [`supervisor.rs:1451`](../agents/roomlerd/src/hive/supervisor.rs#L1451) `workplace` |
 | The answer comes on a stream of its own (`BlobMsg::Pack`, `BlobMsg::NoPack`), never on the stream the events ride. The member waits for it at most `hive-pack`'s bound plus 30 s | the source may already have sent events ahead on the events stream, up to the stream's window past the last ack, and an answer there would wait behind them | [`stream.rs:247`](../crates/hive-node/src/stream.rs#L247), [`supervisor/stream.rs:1173`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1173), [`:117`](../agents/roomlerd/src/hive/supervisor/stream.rs#L117) |
 | A `pack` is held to the want it answers: the same commit, thin only against commits the want named, and chunks that follow one another from offset 0, each a blob the stream carries. Otherwise the stream ends `bad_pack`, or `bad_blob` for a blob in the pack's place, and nothing is applied or kept | a source cannot make a target keep a substitute for a commit it did not ask about, or one its clone cannot resolve | [`stream.rs:385`](../crates/hive-node/src/stream.rs#L385) `check_pack` |
 | The target asks for the chunks with `need` and keeps them as blobs. Once every chunk is here it keeps the substitute, fetches the checkpoint's other blobs and applies the event. It never asks for the whole pack's own blobs | the store applies a checkpoint only with its blobs or a substitute for its pack (P2f-2a), and the materialize then reads the substitute | [`supervisor/stream.rs:1507`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1507) `take_event`, [`:1562`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1562) `fetch_blobs` |
@@ -3111,7 +3111,7 @@ sequenceDiagram
 | The member holds the list to the wire's rules: commit ids, each once, at most 16. A source that lists anything else is let go `bad_frame`, before anything is taken from it | the list decides what the member asks of the source | [`stream.rs:366`](../crates/hive-node/src/stream.rs#L366) `check_stand_ins`, [`supervisor/stream.rs:1349`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1349) |
 | For a whole pack the source lists, the member asks by `want_pack`, whatever the server said of `have_want`: with what its folder holds where it was given a place to ask (a teleport's target), and with no haves otherwise. It keeps the answer as a substitute (against nothing, for a whole one) | a member of a replicaset has no folder of the session's to offer: it asks for the pack whole | [`supervisor/stream.rs:1660`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1660) `stand_in` |
 | A want with no haves is a want for a whole pack. The wire allows it now. The source answers it only for its own stand-ins; for a whole pack held by its blobs, it answers `held_whole`, with no git run | those blobs are there to ask for, and making a pack again costs the source a run of the account's git | [`stream.rs:348`](../crates/hive-node/src/stream.rs#L348) `check_want_pack`, [`supervisor/stream.rs:1864`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1864) |
-| Each launch keeps where the session is worked on in the store: the account, the folder, the state directory. A source whose session does not run here now packs from there, the account resolved as a start resolves it. Nothing kept: `not_live`. The purge takes it | a finished session leaves `hosted.json`, while its copy still serves members. A member that joins once the session ended, an archive replica among them (P2h), is still packed for | [`supervisor.rs:3590`](../agents/roomlerd/src/hive/supervisor.rs#L3590), [`supervisor/stream.rs:1932`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1932) `kept_workplace`, [`supervisor.rs:1920`](../agents/roomlerd/src/hive/supervisor.rs#L1920) `who_for`, [`store.rs:953`](../crates/hive-node/src/store.rs#L953) `put_workplace` |
+| Each launch keeps where the session is worked on in the store: the account, the folder, the state directory. A source whose session does not run here now packs from there, the account resolved as a start resolves it. Nothing kept: `not_live`. The purge takes it | a finished session leaves `hosted.json`, while its copy still serves members. A member that joins once the session ended, an archive replica among them (P2h), is still packed for | [`supervisor.rs:3751`](../agents/roomlerd/src/hive/supervisor.rs#L3751), [`supervisor/stream.rs:1932`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1932) `kept_workplace`, [`supervisor.rs:2071`](../agents/roomlerd/src/hive/supervisor.rs#L2071) `who_for`, [`store.rs:953`](../crates/hive-node/src/store.rs#L953) `put_workplace` |
 
 ⚠️ **A pack made again need not hash the same, but it can.**
 In the real-device test, the whole pack B made again for C was byte for byte A's original
@@ -3150,11 +3150,11 @@ flowchart LR
 
 | Rule | Why | Where |
 |---|---|---|
-| A teleport's prepare asks `hive-pack clean {sid}` of the folder, as the account, once every start gate has passed. The folder may take the copy when it is missing or empty, when it is exactly what its repository's `HEAD` holds (ignored files aside), or when it is what this session last left there. This is the moved start's own verdict, given with no checkpoint in hand | the moved start refused such a folder only after the lease moved, and moving back cost a promotion | [`supervisor.rs:2020`](../agents/roomlerd/src/hive/supervisor.rs#L2020), [`workspace.rs:908`](../agents/roomlerd/src/hive/workspace.rs#L908) `takes_a_copy`, [`:935`](../agents/roomlerd/src/hive/workspace.rs#L935) `judged` |
+| A teleport's prepare asks `hive-pack clean {sid}` of the folder, as the account, once every start gate has passed. The folder may take the copy when it is missing or empty, when it is exactly what its repository's `HEAD` holds (ignored files aside), or when it is what this session last left there. This is the moved start's own verdict, given with no checkpoint in hand | the moved start refused such a folder only after the lease moved, and moving back cost a promotion | [`supervisor.rs:2171`](../agents/roomlerd/src/hive/supervisor.rs#L2171), [`workspace.rs:908`](../agents/roomlerd/src/hive/workspace.rs#L908) `takes_a_copy`, [`:935`](../agents/roomlerd/src/hive/workspace.rs#L935) `judged` |
 | A folder in no repository is read as a directory: empty, it may take the copy; holding files, it may not. Asking makes nothing for it | a shadow is the session's own, made only when a copy is put there | [`workspace.rs:908`](../agents/roomlerd/src/hive/workspace.rs#L908) |
 | The child holds the session id to 24 lowercase hex before any git sees it | the id names a ref and an index file | [`packer.rs:142`](../agents/roomlerd/src/hive/packer.rs#L142) |
-| Refused `folder_dirty`, the detail saying why and naming `git worktree add <folder>-hive-<the id's last 8 digits>` when that sibling's parent is under `hive_roots`. Nothing is made for the person | a folder must exist to pass the gates (`roots::confine` resolves it), so the person makes it. A worktree of the clone keeps its objects at hand, so the copy still comes against it. The id's first digits are its timestamp, shared by sessions made in the same second | [`supervisor.rs:2046`](../agents/roomlerd/src/hive/supervisor.rs#L2046) `folder_refusal`, [`:4391`](../agents/roomlerd/src/hive/supervisor.rs#L4391) `sibling_for` |
-| A folder that cannot be asked about is refused `other`, in words | the moved start would ask the same git, as the same account | [`supervisor.rs:2073`](../agents/roomlerd/src/hive/supervisor.rs#L2073) |
+| Refused `folder_dirty`, the detail saying why and naming `git worktree add <folder>-hive-<the id's last 8 digits>` when that sibling's parent is under `hive_roots`. Nothing is made for the person | a folder must exist to pass the gates (`roots::confine` resolves it), so the person makes it. A worktree of the clone keeps its objects at hand, so the copy still comes against it. The id's first digits are its timestamp, shared by sessions made in the same second | [`supervisor.rs:2198`](../agents/roomlerd/src/hive/supervisor.rs#L2198) `folder_refusal`, [`:4603`](../agents/roomlerd/src/hive/supervisor.rs#L4603) `sibling_for` |
+| A folder that cannot be asked about is refused `other`, in words | the moved start would ask the same git, as the same account | [`supervisor.rs:2230`](../agents/roomlerd/src/hive/supervisor.rs#L2230) |
 | `folder_dirty` is a new refusal word: the server says it as "the folder on the device holds work of its own", the device's detail with it. An older server reads it as `other`, still a refusal | refusal words are decoded leniently | [`hive.rs:191`](../crates/remote_control/src/hive.rs#L191), [`routes.rs:121`](../crates/modules/hive/src/routes.rs#L121), in `device_refusal_message` |
 
 ⚠️ **The prepare and the move are two looks.** A folder the person changes between them is
@@ -3164,8 +3164,82 @@ still refused at the move by the materialize, and the session moves back, as bef
 has the teleport refused `folder_dirty` with the sibling named, and nothing moves. With the
 file gone, the same teleport goes ahead.
 
-Next, P2f-3: fork. A new record with a parent link, and its own replicaset under the parent's
-restricted tags.
+Next, P2f-3a: a fork, the devices' half.
+
+### P2f-3a: a fork, the devices' half
+
+A fork is a new session made from another one's conversation: the same turns up to the fork,
+then its own, in a folder of its own, while the session it came from goes on (design §6.5,
+spec §3b "Fork"). Claude Code makes one with `--resume <parent> --fork-session`, and takes the
+fork's id from `--session-id` beside them (spec §8, probe 5). P2f-3a is the device's half: a
+start that names the session it forks, put in place from the device's copy of that session and
+launched under the fork's own ids. The server's half, the route and the record, is P2f-3b.
+
+```mermaid
+sequenceDiagram
+    participant S as server
+    participant D as the device's daemon
+    participant St as its store
+    participant A as git and the files, as the account
+    participant H as Claude Code, as the account
+    S->>D: rc:hive.start {fork_of: {session_id, harness_session}}
+    Note over D: every start gate · nothing of the fork on the device yet
+    D->>A: hive-pack clean {the fork's id}: may its folder take a copy?
+    D->>St: the parent's checkpoints
+    Note over D: the parent's files moved under the fork's project name
+    D->>A: hive-materialize: the parent's last checkpoint, under the fork's ids
+    Note over D: the fork's note left for the hook · recorded as a note event
+    D->>H: --resume <parent> --fork-session --session-id <fork>
+    H->>H: the hook (source fork): roomlerd hive-resume-note <file>
+    Note over H: at its first prompt, <fork>.jsonl: the parent's conversation, then its own
+```
+
+| Rule | Why | Where |
+|---|---|---|
+| A start may name the session it forks: `fork_of {session_id, harness_session}`, absent from every other start's frame. The device refuses a fork of itself, by either id, and an id its names cannot hold. A server sends one only to a device that advertises `hive-fork` | `hive` is its prefix and not the same promise: a build before it would start the fork empty, a new conversation in the folder as it is | [`hive.rs:707`](../crates/remote_control/src/hive.rs#L707), [`signaling.rs:3130`](../crates/remote_control/src/signaling.rs#L3130), [`models.rs:736`](../crates/remote_control/src/models.rs#L736), [`caps.rs:1697`](../agents/roomlerd/src/encode/caps.rs#L1697), [`supervisor.rs:1666`](../agents/roomlerd/src/hive/supervisor.rs#L1666) |
+| At a fork's first start here (not moved here, not hosted here at its fence, and nothing of it on the device), its folder is asked first, as a teleport's is: work of its own is refused `folder_dirty`, the sibling named, "and fork there". Then the parent's last checkpoint, as this device's copy holds it, is put in place AS THE ACCOUNT under the fork's ids | a fork into a folder holding the person's own work, or the parent's work since its last turn, would have the copy write over it | [`supervisor.rs:1948`](../agents/roomlerd/src/hive/supervisor.rs#L1948) `fork_in_place`, [`:2006`](../agents/roomlerd/src/hive/supervisor.rs#L2006) `put_fork_in_place` |
+| The parent's own files move from its project directory to the fork's, their names kept: `projects/hive-<fork>/<parent>.jsonl`, `…/<parent>/subagents/`, `…/<parent>/tool-results/`, the memory, `CLAUDE.md`. Every checkpoint moves alike. What the parent keeps of a session further back is left out. The folder takes the parent's tree under the fork's refs | `--resume <parent>` reads the parent's history under the fork's pinned project name (probe 5). The parent's history holds the turns further back already | [`materializer.rs:346`](../agents/roomlerd/src/hive/materializer.rs#L346) `forked` |
+| No copy of the parent here is refused `other`: "this device holds no copy of the session the fork is made from"; a copy whose last checkpoint holds no conversation yet, "…no conversation to fork yet". Nothing is launched | the server's half sees to the copy (P2f-3b); a fork of nothing is no fork | [`supervisor.rs:2026`](../agents/roomlerd/src/hive/supervisor.rs#L2026) |
+| A launch resumes the fork's own history once it has one (`--resume <fork>`, as any session). Until then, it starts from the parent's: `--resume <parent> --fork-session --session-id <fork>`. With neither here, the launch is refused, never started empty | Claude Code writes the fork's history at its first prompt. A restart before then must start from the same place, and a fork that started empty would be a different conversation under the person's fork | [`supervisor.rs:4634`](../agents/roomlerd/src/hive/supervisor.rs#L4634) `decide_history`, [`launch.rs:237`](../crates/hive-node/src/launch.rs#L237), [`:138`](../crates/hive-node/src/launch.rs#L138) `parent_history_in` |
+| A fork's allowlist is its own five and three of its parent's under its own project name, for its life. Every checkpoint of it takes them, and a target of a fork's copy holds the copy to them. The parent's files are written once, so each is taken whole | a copy of the fork then starts anywhere from its own chain, before its first prompt as after. The fork's history names the parent's saved outputs: Claude Code copies none of them | [`checkpoint.rs:439`](../crates/hive-node/src/checkpoint.rs#L439) `allowlist_of`, [`checkpointer.rs:71`](../agents/roomlerd/src/hive/checkpointer.rs#L71) |
+| The hosted record keeps `fork_of`, and a start that does not say it takes it from there at the same fence | a restart is a fork's restart, and its checkpoints never drop the parent's history | [`hosted.rs:107`](../agents/roomlerd/src/hive/hosted.rs#L107), [`supervisor.rs:1637`](../agents/roomlerd/src/hive/supervisor.rs#L1637) |
+| A fork is told it is one at each launch that starts it from the parent's history: that its earlier turns are another session's, which goes on; where they worked, from the parent's last `system/init` in the copy, when that was another folder; where the outputs they saved are now. The hook carries the matcher `fork` beside `resume` | Claude Code starts that launch as `source: "fork"`, and a `resume` hook never fired there (2.1.280, probed 2026-10-13). The parent's folder stays the parent's: its paths in the fork's history are not the fork's to edit | [`supervisor.rs:1824`](../agents/roomlerd/src/hive/supervisor.rs#L1824), [`:4456`](../agents/roomlerd/src/hive/supervisor.rs#L4456) `parent_folder`, [`resume_note.rs:100`](../agents/roomlerd/src/hive/resume_note.rs#L100), [`launch.rs:445`](../crates/hive-node/src/launch.rs#L445) |
+| A fork's first turn claims no cost, as a resumed process's does | Claude Code's running total may begin at the parent's | [`supervisor.rs:3836`](../agents/roomlerd/src/hive/supervisor.rs#L3836) |
+
+A note, as a fork receives it at its first launch:
+
+```text
+This session is a fork: its earlier turns are another session's, which goes on without it. It runs here, in /home/alice/work-try.
+Those turns worked in /home/alice/work, which stays that session's: paths under /home/alice/work in them live under /home/alice/work-try for this one.
+Outputs those turns saved to files under a folder named hive-<parent> are under /home/alice/.roomler/hive/<fork's sid>/claude/projects/hive-<fork> now.
+```
+
+The probe behind the hook ran Claude Code 2.1.280 on Windows 11 against a fake Messages API on
+loopback, at no model spend. With one entry per source, the request of the fork's first launch
+held only the `fork` hook's output, and the fork's next launch, `--resume <fork>`, held both:
+the earlier note stays in its history. A single `resume|fork` matcher matched the fork too.
+
+⚠️ **The fork is made at the last checkpoint the device's copy holds.** A copy behind its
+primary forks from an earlier turn. The server's half makes the copy current first (P2f-3b).
+
+⚠️ **A copy that took a substitute for its first pack (P2f-2b) forks only into a folder that
+holds what that pack is thin against.** A worktree of the clone the copy came into holds it;
+another folder is refused at the materialize, and the device's log says which commit it lacks.
+
+⚠️ **A fork of a fork keeps its parent's history, not what the parent kept of its own
+parent.** The parent's history holds those turns, so the conversation is whole; the
+sub-agent transcripts and saved outputs of the session two back stay with it.
+
+⚠️ **A daemon before P2f-3a resumes a fork as a plain session.** A fork it hosts that was
+never prompted starts empty there. No server sends `fork_of` until P2f-3b, and then only to a
+device that advertises `hive-fork`.
+
+⚠️ **Measured in the supervisor's tests only**, with a fake harness that forks as Claude Code
+was probed to: a fork's first start and its restart, its refusals, and the real materialize of
+the parent's copy under the fork's names. The real harness's fork is the field run's (P2k).
+
+Next, P2f-3b: the fork's route and record, a parent link, a room, a replicaset under the
+parent's restricted tags, and a target that holds no copy joining the parent's replicaset first.
 
 The rest of P2 is next (spec §3b and §4): the rest of P2f, purges and retention (P2g), the
 archive replica image (P2h), full-text search on archive replicas (P2i), the UI (P2j) and the
@@ -3178,10 +3252,10 @@ both off by default.
 
 | Piece | Where |
 |---|---|
-| the wire: frames, refusal words, limits | [`crates/remote_control/src/hive.rs`](../crates/remote_control/src/hive.rs); the `rc:hive.*` variants in [`signaling.rs`](../crates/remote_control/src/signaling.rs) (`ClientMsg` `:661`–`:1070`, `ServerMsg` `:3069`–`:3535`); `RpcCap::Hive`, `HiveView`, `HiveMemory`, `HiveAdopt`, `HiveReplica`, `HiveArchive`, `HiveStream`, `HiveLease`, `HivePromote` and `HiveTeleport` in [`models.rs`](../crates/remote_control/src/models.rs) `:618`–`:726`, matched by equality, since `hive` is a prefix of the other nine |
+| the wire: frames, refusal words, limits | [`crates/remote_control/src/hive.rs`](../crates/remote_control/src/hive.rs); the `rc:hive.*` variants in [`signaling.rs`](../crates/remote_control/src/signaling.rs) (`ClientMsg` `:661`–`:1070`, `ServerMsg` `:3069`–`:3535`); `RpcCap::Hive`, `HiveView`, `HiveMemory`, `HiveAdopt`, `HiveReplica`, `HiveArchive`, `HiveStream`, `HiveLease`, `HivePromote`, `HiveTeleport` and `HiveFork` in [`models.rs`](../crates/remote_control/src/models.rs) `:618`–`:736`, matched by equality, since `hive` is a prefix of the other ten |
 | the server module | [`crates/modules/hive/src/`](../crates/modules/hive/src/): `lib.rs` (the module, routes, indexes), `routes.rs` (start, list, get, stop), `agent_socket.rs` (reports, reconcile, the manifest, the demote), `view.rs` (grants and their signalling, and who serves them: the primary, or a member's copy), `participants.rs`, `access.rs`, `room.rs`, `dao.rs`, `hooks.rs` (removals), `scope.rs` (`hive.tenants`), `adopt.rs`, `brain.rs`, `policy.rs` (the replica policy), `placement.rs` (who holds a session's copies), `replica.rs` (joins, answers and tips), `stream.rs` (the replica stream's grants), `lease.rs` (the lease word), `promote.rs` (the promotion: the route and its gates, its steps, the lease move and the move back, the move away from an unreachable primary or from a target that never answered, and its timer; a teleport's route and its joining step, and its prepare's `have_want`) |
-| the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs` (the substitutes, and where each session was worked on), `launch.rs`, `roots.rs`, `checkpoint.rs`, `stream.rs` (the replica stream's messages, their framing and limits, its opening exchange, and the have and want's frames, `want_pack` and `pack`, and the stand-ins a source's hello lists) |
-| the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the fence, the lease word, the drain, the prepare and the moved start, a teleport's prepare, the folder it asks, and the join it admits, the session task and its first checkpoint at a primary's join, the resume), `supervisor/adopt.rs`, `supervisor/replica.rs` (the join's gates, the teleport's among them, and the fences' ends it keeps, the primary's join, tips), `supervisor/stream.rs` (the replica stream: its endpoints and dials on the direct, relay and derp rungs, a teleport's dial on a device that holds no copies, then its events, blobs and acks, and a teleport's have and want: the target's `want_pack`, the source's pack, made again from where the session was worked on for a whole pack it holds only a substitute for), `supervisor/follow.rs` (the member's wants: the ladder, the waits, the sessions parked, the renewals, a join that overtakes them, a teleport's copy followed at a connection), `toolbelt.rs`, `resume_note.rs` (the resume note and the hook's printer), `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer, and the substitutes and workplaces it keeps), `workspace.rs` (a folder checkpointed and materialized through the account's own git, and a pack against what another repository holds, and whether a folder may take a teleport's copy), `checkpointer.rs` (`hive-checkpoint`), `materializer.rs` (`hive-materialize`, and the substitute it reads in place of a whole pack), `packer.rs` (`hive-pack`: which commits a folder's repository holds, the pack against them, and whether the folder may take a teleport's copy, as the account), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
+| the device core, with no daemon in it | [`crates/hive-node/src/`](../crates/hive-node/src/): `event.rs`, `chain.rs`, `stream_json.rs`, `store.rs` (the substitutes, and where each session was worked on), `launch.rs` (a fork's first launch), `roots.rs`, `checkpoint.rs` (a fork's allowlist), `stream.rs` (the replica stream's messages, their framing and limits, its opening exchange, and the have and want's frames, `want_pack` and `pack`, and the stand-ins a source's hello lists) |
+| the device | [`agents/roomlerd/src/hive/`](../agents/roomlerd/src/hive/): `gates.rs`, `supervisor.rs` (starts, the fence, the lease word, the drain, the prepare and the moved start, a teleport's prepare, the folder it asks, and the join it admits, a fork's first start from its parent's copy, the session task and its first checkpoint at a primary's join, the resume), `supervisor/adopt.rs`, `supervisor/replica.rs` (the join's gates, the teleport's among them, and the fences' ends it keeps, the primary's join, tips), `supervisor/stream.rs` (the replica stream: its endpoints and dials on the direct, relay and derp rungs, a teleport's dial on a device that holds no copies, then its events, blobs and acks, and a teleport's have and want: the target's `want_pack`, the source's pack, made again from where the session was worked on for a whole pack it holds only a substitute for), `supervisor/follow.rs` (the member's wants: the ladder, the waits, the sessions parked, the renewals, a join that overtakes them, a teleport's copy followed at a connection), `toolbelt.rs`, `resume_note.rs` (the resume note, a fork's, and the hook's printer), `sidecar.rs`, `view.rs`, `framing.rs`, `store.rs` (the writer, and the substitutes and workplaces it keeps), `workspace.rs` (a folder checkpointed and materialized through the account's own git, and a pack against what another repository holds, and whether a folder may take a teleport's copy), `checkpointer.rs` (`hive-checkpoint`), `materializer.rs` (`hive-materialize`, the substitute it reads in place of a whole pack, and a parent's chain moved under a fork's names), `packer.rs` (`hive-pack`: which commits a folder's repository holds, the pack against them, and whether the folder may take a teleport's copy, as the account), `hosted.rs`, `procs.rs`; Windows in [`hive_win.rs`](../agents/roomlerd/src/hive_win.rs) |
 | what builds it | the `hive` feature, and `cfg(hive_host)` on Linux, macOS and Windows ([`build.rs:52`](../agents/roomlerd/build.rs#L52)); the capabilities in [`caps.rs:1619`](../agents/roomlerd/src/encode/caps.rs#L1619) |
 | the update wait | [`updater.rs:278`](../agents/roomlerd/src/updater.rs#L278); the macOS hold, `HiveUpdateHold`, in [`crates/localapi/src/lib.rs`](../crates/localapi/src/lib.rs) |
 | `adopt` | the CLI in [`hive_hooks.rs`](../agents/roomler-cli/src/hive_hooks.rs); its protocol in [`crates/localapi/src/hive_adopt.rs`](../crates/localapi/src/hive_adopt.rs) |
@@ -3206,7 +3280,9 @@ both off by default.
   (P2f-2b, off until `hive.teleport_have_want`), and a primary that took a substitute makes that
   whole pack again for a member that joins later, even once the session ended there (P2f-2c). A
   dirty clone is refused at the prepare, before anything moves, a sibling named for the
-  person to make (P2f-2d). Fork is next (P2f-3).
+  person to make (P2f-2d). A device starts a fork from its copy of the session it is made
+  from, under the fork's own ids (P2f-3a); the server's half, its route and record, is next
+  (P2f-3b).
 - The vault and the rest of the toolbelt (P3), knowhow (P4) and the learning loop
   (P5). `docs/vault.md` and `docs/knowhow.md` come with them.
 - `adopt` on Windows, and a Windows session for anyone but the console user.
