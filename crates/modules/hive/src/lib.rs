@@ -53,6 +53,7 @@ mod adopt;
 pub mod agent_socket;
 pub mod brain;
 pub mod dao;
+pub mod fork;
 pub mod hooks;
 pub mod lease;
 pub mod model;
@@ -113,6 +114,9 @@ pub struct HiveState {
     /// workspace against what its clone holds (`hive.teleport_have_want`,
     /// default off).
     pub teleport_have_want: bool,
+    /// P2f-3 — how long a fork waits for its device's copy to reach the
+    /// session's last checkpoint (`hive.fork_copy_secs`).
+    pub fork_copy: std::time::Duration,
 }
 
 impl std::ops::Deref for HiveState {
@@ -159,6 +163,7 @@ impl Module for HiveState {
             prepare_acks: Arc::new(promote::PrepareAcks::new()),
             promote_bounds: promote::Bounds::of(&settings.hive),
             teleport_have_want: settings.hive.teleport_have_want,
+            fork_copy: std::time::Duration::from_secs(settings.hive.fork_copy_secs),
             chat: BoundChat::new(&core),
             fleet,
             core,
@@ -195,6 +200,8 @@ impl Module for HiveState {
             .route("/{session_id}/promote", post(promote::promote))
             // P2f-1 — or to a device that holds no copy of it.
             .route("/{session_id}/teleport", post(promote::teleport))
+            // P2f-3 — a new session, its own, from this one's conversation.
+            .route("/{session_id}/fork", post(fork::fork))
             // P1c — who besides the owner takes part, and how.
             .route("/{session_id}/participant", get(participants::list))
             .route(

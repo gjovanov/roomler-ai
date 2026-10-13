@@ -144,7 +144,9 @@ fn same_tag(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
-fn carries(tags: &[String], tag: &str) -> bool {
+/// Whether `tags` holds `tag`, compared without case: what a restricted tag
+/// asks of every device that holds a copy, and (P2f-3) of a fork's device.
+pub(crate) fn carries(tags: &[String], tag: &str) -> bool {
     tags.iter().any(|t| same_tag(t, tag))
 }
 
@@ -352,13 +354,17 @@ pub fn place(
 
 /// The replicaset of a session `owner` is starting on `primary`, under the
 /// organization's policy (or decision 2's defaults), from the devices'
-/// stored rows; and why it is short of `min`, when it is.
+/// stored rows; and why it is short of `min`, when it is. FR-90 P2f-3 —
+/// `restricted` is what the session carries already: none for a new
+/// session, its parent's for a fork, since a fork of a restricted session
+/// is restricted.
 pub async fn place_new(
     state: &HiveState,
     tid: ObjectId,
     owner: ObjectId,
     primary_id: ObjectId,
     primary: &Agent,
+    restricted: &[String],
 ) -> DaoResult<(Replicaset, Option<Short>)> {
     let policy = state
         .policies
@@ -379,7 +385,7 @@ pub async fn place_new(
             primary: primary_id,
             primary_tags: &primary.tags,
             origin: SessionOrigin::Started,
-            restricted: &[],
+            restricted,
             current: &[],
         },
         &devices,
@@ -623,7 +629,11 @@ pub async fn place_unplaced(
     let mut placed = 0;
     for s in sessions {
         let Some(sid) = s.id else { continue };
-        let (mut replicaset, short) = place_new(state, tid, s.owner_id, device, &primary).await?;
+        // P2f-3 — a session placed late is never a fork: a fork is placed
+        // as its record is made, with its parent's restricted tags, or it
+        // is not made.
+        let (mut replicaset, short) =
+            place_new(state, tid, s.owner_id, device, &primary, &[]).await?;
         let has_members = replicaset
             .members
             .iter()

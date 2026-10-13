@@ -166,6 +166,9 @@ pub async fn handle_agent_socket(
     // FR-90 P2f-1 — and in a teleport, at either end. `hive` is its prefix
     // too.
     let takes_hive_teleports = caps.has_rpc(RpcCap::HiveTeleport);
+    // FR-90 P2f-3 — and starts a fork from its parent's copy. `hive` is its
+    // prefix too: a build before it would start a fork empty.
+    let starts_hive_forks = caps.has_rpc(RpcCap::HiveFork);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -210,6 +213,9 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_hive_teleport_support(agent_id, takes_hive_teleports);
+    state
+        .rc_hub
+        .set_agent_hive_fork_support(agent_id, starts_hive_forks);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
