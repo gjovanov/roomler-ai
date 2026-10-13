@@ -3109,7 +3109,9 @@ jobs:
             exit 1
           fi
 
-          xcrun stapler staple "${{ steps.pkg.outputs.artifact }}"
+          # Retried: since 2026-10-12 the ticket fetch drops its connection on
+          # GitHub's macOS runners after `Accepted` (exit 68; the script says why).
+          bash "$GITHUB_WORKSPACE/scripts/signing/stapler-retry.sh" staple "${{ steps.pkg.outputs.artifact }}"
 
       # Verify rather than assume. `spctl -a -t install` exercises the exact
       # Gatekeeper path an end user hits and is the ONLY check that
@@ -3132,7 +3134,7 @@ jobs:
           pkgutil --check-signature "$PKG"
 
           echo "=== stapled notarisation ticket ==="
-          xcrun stapler validate "$PKG"
+          bash "$GITHUB_WORKSPACE/scripts/signing/stapler-retry.sh" validate "$PKG"
 
           echo "=== Gatekeeper (authoritative end-to-end check) ==="
           out="$(spctl -a -vvv -t install "$PKG" 2>&1 || true)"
