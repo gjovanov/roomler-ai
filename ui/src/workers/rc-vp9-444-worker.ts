@@ -55,10 +55,15 @@ import {
   createChunkFraming,
   stripChunkPrefix,
 } from './rc-chunk-framing'
+import { createBenchSampler } from './rc-bench-sampler'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
   canvas: OffscreenCanvas
+  /** FR-16 L4 — bench mode: sample the probe marker while a probe is armed.
+   *  Set only when the knob is on AND the agent advertised `bench`; sticks
+   *  across the idempotent visible-canvas re-init, like `ctxMode`. */
+  bench?: boolean
   /** FR-17 — true when the controller negotiated per-chunk framing for
    *  this session (the agent advertised `chunk-framing` in
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
@@ -109,6 +114,8 @@ type ViewportMessage = { type: 'viewport'; cssW: number; cssH: number; dpr: numb
 type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: number }
 /** FR-1 P7 — agent-clock offset from the main thread's rc:clock probe. */
 type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
+/** FR-16 L4 — the main thread just sent bench probe `seq`. */
+type BenchArmMessage = { type: 'bench-arm'; seq: number }
 type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
@@ -116,6 +123,7 @@ type IncomingMessage =
   | ViewportMessage
   | RenderModeMessage
   | ClockOffsetMessage
+  | BenchArmMessage
   | CloseMessage
 
 const HEADER_BYTES = 13
@@ -130,6 +138,9 @@ const workerScope = self as unknown as {
   onmessage: ((ev: MessageEvent<IncomingMessage>) => void) | null
   postMessage: (msg: unknown) => void
 }
+
+/** FR-16 L4 — reads the bench probe off painted frames, only while armed. */
+const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now: epochNowMs })
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -385,6 +396,7 @@ workerScope.onmessage = (e) => {
     // P7 — FSR knobs stick across the idempotent visible re-init like ctxMode.
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
+    if (typeof msg.bench === 'boolean') bench.setEnabled(msg.bench)
     ctx = canvas.getContext('2d', ctxOptionsFor(ctxMode))
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
@@ -402,6 +414,8 @@ workerScope.onmessage = (e) => {
     viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
   } else if (msg.type === 'clock-offset') {
     clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
+  } else if (msg.type === 'bench-arm') {
+    bench.arm(msg.seq)
   } else if (msg.type === 'render-mode') {
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
@@ -461,9 +475,13 @@ function initDecoder() {
       // FR-1 P7 — capture the wire timestamp BEFORE paintFrame closes the
       // frame (a closed VideoFrame reports 0).
       const wireTsUs = frame.timestamp
+      // FR-16 L4 — a clone for the probe read, taken before paint closes
+      // `frame`; null unless a bench probe is outstanding.
+      const benchClone = bench.take(frame)
       const paintT0 = performance.now()
       paintFrame(frame, w, h)
       paintStats.add(performance.now() - paintT0)
+      if (benchClone) bench.settle(benchClone, epochNowMs())
       // Age at paint on the agent's clock (mapped via the rc:clock probe).
       const arrivalUs = epochNowUs()
       if (clockOffsetUs !== null) {

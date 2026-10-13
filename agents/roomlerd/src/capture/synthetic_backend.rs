@@ -892,6 +892,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_words_the_browser_decoder_pins_too() {
+        // `ui/src/__tests__/workers/rcBenchMarker.spec.ts` pins the same
+        // table against the browser's decoder: if either side drifts, one
+        // of the two suites fails.
+        for (seq, word) in [
+            (0x000u16, 0x0000u16),
+            (0x001, 0x0013),
+            (0x800, 0x8001),
+            (0x123, 0x1230),
+            (0x5A5, 0x5A5D),
+            (0xABC, 0xABCA),
+            (0xFFF, 0xFFFE),
+        ] {
+            assert_eq!(marker::word(seq), word, "seq {seq:#05x}");
+        }
+        assert_eq!(
+            (marker::BLOCK, marker::COLS, marker::ROWS, marker::MARGIN),
+            (16, 8, 2, 8)
+        );
+    }
+
     /// The BT.601 limited-range luma of a BGRA pixel, as an encoder computes it.
     fn luma_of(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
         let mut y = vec![0u8; (w * h) as usize];
