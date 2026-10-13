@@ -289,7 +289,9 @@ only in how the helper sends its calls (§4.3):
 | one call, event to reply | not waited for | 0.5 ms median, under 4 ms at p99 |
 | the person denies remote control | — | KDE asks again, for the screen only; shared, the session runs view-only and its reach banner says to reconnect and allow remote control. The next session asks for remote control again |
 
-The two awaited builds differ only by a refactor (`Target::delivery`). The lab built each one before the branch was rebased onto master; the commits named carry the same diffs.
+The two awaited builds differ only by a refactor (`Target::delivery`). The lab
+built each candidate before the branch was rebased onto master; the commits
+named carry the same diffs.
 
 The wheel notch went down only after the helper corrected KDE's negated smooth
 scroll (§4.3).
