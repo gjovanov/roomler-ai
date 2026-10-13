@@ -4256,6 +4256,32 @@ pub struct OverlayNode {
 
 impl OverlayNode {
     pub const COLLECTION: &'static str = "overlay_nodes";
+
+    /// FR-97 P0b — the routes this node may carry for its peers: those an admin
+    /// APPROVED **and** the device still ADVERTISES.
+    ///
+    /// `approved_routes` survives a rejoin on purpose (a flapping join must not
+    /// cost an admin's decision), and the join refreshes only
+    /// `advertised_routes`. So an approval on its own is not an offer: a node
+    /// that stopped advertising `0.0.0.0/0` (the operator turned the exit off,
+    /// or the device found it cannot NAT) stayed an exit in every peer's netmap
+    /// until an admin noticed, and each client that picked it lost its whole
+    /// internet egress. Every data-plane reader of a node's routes (the netmap
+    /// fan and every overlay-ACL evaluation) goes through this, so the approval
+    /// takes effect only while the device offers the route, and comes back by
+    /// itself when the offer does.
+    ///
+    /// Exact-string match, like the rest of the approval surface
+    /// (`set_approved_routes` admits only a route the node advertised, by its
+    /// literal spelling): what the admin grid shows as approved-and-offered is
+    /// exactly what peers receive.
+    pub fn effective_routes(&self) -> Vec<String> {
+        self.approved_routes
+            .iter()
+            .filter(|a| self.advertised_routes.contains(a))
+            .cloned()
+            .collect()
+    }
 }
 
 /// P5 — the IPv4 default route. Its presence in a node's `approved_routes`

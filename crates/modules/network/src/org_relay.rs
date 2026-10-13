@@ -457,10 +457,12 @@ async fn plan_mint(
             continue;
         }
         // Gate 2 — BOTH members must be granted this relay; each binds to it.
+        // FR-97 P0b — granted from the routes the relay OFFERS.
+        let relay_routes = node.effective_routes();
         let relay_ref = OverlayPeerRef {
             node_id: relay_id,
             overlay_ip: &node.overlay_ip,
-            approved_routes: &node.approved_routes,
+            approved_routes: &relay_routes,
         };
         if !(evaluate_overlay(&acl.policies, &req_src, relay_ref).visible
             && evaluate_overlay(&acl.policies, &peer_src, relay_ref).visible)
@@ -831,10 +833,12 @@ pub async fn reconcile_acl(state: &NetworkState, tenant_id: ObjectId) {
         let Ok(relay) = state.overlay_nodes.base.find_by_id(s.relay.node_id).await else {
             continue;
         };
+        // FR-97 P0b — granted from the routes the relay OFFERS.
+        let relay_routes = relay.effective_routes();
         let relay_ref = OverlayPeerRef {
             node_id: s.relay.node_id,
             overlay_ip: &relay.overlay_ip,
-            approved_routes: &relay.approved_routes,
+            approved_routes: &relay_routes,
         };
         let mut granted = true;
         for m in &s.members {

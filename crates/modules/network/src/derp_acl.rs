@@ -137,13 +137,15 @@ pub async fn rebuild(state: &NetworkState, tenant_id: ObjectId, network_id: Obje
             let Some(peer_pk) = pubkey_of(peer) else {
                 continue;
             };
+            // FR-97 P0b — the routes the peer OFFERS, as the netmap fans them.
+            let routes = peer.effective_routes();
             let access = evaluate_overlay(
                 &acl.policies,
                 src,
                 OverlayPeerRef {
                     node_id: peer.id.unwrap_or_default(),
                     overlay_ip: &peer.overlay_ip,
-                    approved_routes: &peer.approved_routes,
+                    approved_routes: &routes,
                 },
             );
             if access.visible {
